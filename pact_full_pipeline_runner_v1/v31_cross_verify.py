@@ -55,6 +55,9 @@ required_invariant, которому должна соответствовать
 Верни один полный JSON object. Никаких Markdown и текста вне JSON.
 reason — 2–3 коротких предложения. required_invariant — одно короткое
 проверяемое условие. Не повторяй весь контекст и рассуждения.
+Если decision=keep, используй repair_scope="span" как нейтральное
+schema-compatible значение. Если decision=repair или uncertain, выбери
+фактический span, sentence или paragraph. Не используй "none".
 Строго соблюдай эту схему:
 {{
  "decision":"repair|keep|uncertain",
@@ -126,7 +129,11 @@ def parse(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Missing required fields: {', '.join(missing)}")
     decision = required_enum(data, "decision", {"repair", "keep", "uncertain"})
     confidence = required_enum(data, "confidence", {"high", "medium", "low"})
-    scope = required_enum(data, "repair_scope", {"span", "sentence", "paragraph"})
+    scope = required_enum(data, "repair_scope", {"span", "sentence", "paragraph", "none"})
+    if scope == "none":
+        if decision != "keep":
+            raise ValueError("repair_scope=none is allowed only when decision is keep")
+        scope = "span"
     reason = required_bounded_text(data, "reason", 800)
     required_invariant = required_bounded_text(data, "required_invariant", 500)
     forbidden_raw = data["forbidden_interpretations"]
