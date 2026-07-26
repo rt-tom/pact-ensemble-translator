@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from v31_common import (
     VERSION, add_common_args, api_client, bible_prompt, complete_json,
@@ -16,7 +16,8 @@ from v31_common import (
 
 DEFAULT_QWEN = {
     "temperature": 0.0, "top_p": 1.0, "top_k": 64,
-    "enable_thinking": False, "max_tokens": 800, "attempts": 3,
+    "enable_thinking": False, "max_tokens": 1400,
+    "length_retry_max_tokens": 1600, "attempts": 3,
     "context_size": 2,
 }
 DEFAULT_GEMMA = {
@@ -51,7 +52,10 @@ decision:
 
 Не оценивай предложенную формулировку — её ещё нет. Сформулируй проверяемый
 required_invariant, которому должна соответствовать будущая правка.
-Верни только JSON:
+Верни один полный JSON object. Никаких Markdown и текста вне JSON.
+reason — 2–3 коротких предложения. required_invariant — одно короткое
+проверяемое условие. Не повторяй весь контекст и рассуждения.
+Строго соблюдай эту схему:
 {{
  "decision":"repair|keep|uncertain",
  "confidence":"high|medium|low",
@@ -90,25 +94,69 @@ SOURCE NOTES:
     ]
 
 
+def required_enum(data: dict[str, Any], field: str, allowed: set[str]) -> str:
+    raw = data.get(field)
+    if not isinstance(raw, str):
+        raise ValueError(f"{field} must be a string")
+    value = norm(raw).casefold()
+    if value not in allowed:
+        raise ValueError(f"Invalid {field}: {value}")
+    return value
+
+
+def required_bounded_text(data: dict[str, Any], field: str, limit: int) -> str:
+    raw = data.get(field)
+    if not isinstance(raw, str):
+        raise ValueError(f"{field} must be a string")
+    value = norm(raw)
+    if not value:
+        raise ValueError(f"{field} must not be empty")
+    if len(value) > limit:
+        raise ValueError(f"{field} exceeds {limit} characters")
+    return value
+
+
 def parse(data: dict[str, Any]) -> dict[str, Any]:
-    decision = norm(data.get("decision")).casefold()
-    confidence = norm(data.get("confidence")).casefold()
-    scope = norm(data.get("repair_scope")).casefold()
-    if decision not in {"repair", "keep", "uncertain"}:
-        raise ValueError(f"Invalid decision: {decision}")
-    if confidence not in {"high", "medium", "low"}:
-        raise ValueError(f"Invalid confidence: {confidence}")
-    if scope not in {"span", "sentence", "paragraph"}:
-        scope = "span"
+    required = {
+        "decision", "confidence", "reason", "required_invariant",
+        "forbidden_interpretations", "repair_scope", "target_span",
+    }
+    missing = sorted(required.difference(data))
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+    decision = required_enum(data, "decision", {"repair", "keep", "uncertain"})
+    confidence = required_enum(data, "confidence", {"high", "medium", "low"})
+    scope = required_enum(data, "repair_scope", {"span", "sentence", "paragraph"})
+    reason = required_bounded_text(data, "reason", 800)
+    required_invariant = required_bounded_text(data, "required_invariant", 500)
+    forbidden_raw = data["forbidden_interpretations"]
+    if not isinstance(forbidden_raw, list) or not all(isinstance(x, str) for x in forbidden_raw):
+        raise ValueError("forbidden_interpretations must be a list of strings")
+    target_raw = data["target_span"]
+    if not isinstance(target_raw, str):
+        raise ValueError("target_span must be a string")
+    target_span = norm(target_raw)
+    if len(target_span) > 600:
+        raise ValueError("target_span exceeds 600 characters")
     return {
         "decision": decision,
         "confidence": confidence,
-        "reason": norm(data.get("reason"))[:1200],
-        "required_invariant": norm(data.get("required_invariant"))[:1200],
-        "forbidden_interpretations": [norm(x) for x in (data.get("forbidden_interpretations") or []) if norm(x)],
+        "reason": reason,
+        "required_invariant": required_invariant,
+        "forbidden_interpretations": [norm(x) for x in forbidden_raw if norm(x)],
         "repair_scope": scope,
-        "target_span": norm(data.get("target_span"))[:600],
+        "target_span": target_span,
     }
+
+
+def load_or_generate(
+    cache: Path, force: bool, generator: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    if cache.exists() and not force:
+        return read_json(cache, {})
+    record = generator()
+    write_json(cache, record)
+    return record
 
 
 def main() -> int:
@@ -138,16 +186,19 @@ def main() -> int:
         for index, issue in enumerate(queue, 1):
             issue_id = issue["issue_id"]
             cache = cache_dir / f"{issue_id}.json"
-            if cache.exists() and not args.force:
-                record = read_json(cache, {})
-            else:
+
+            def generate_record() -> dict[str, Any]:
                 stage, prompt = messages(runtime, cfg, work, blocks, block_map, translations, issue, args.judge)
                 verdict, attempts = complete_json(
                     runtime, client, prompt, stage, int(stage["max_tokens"]),
                     f"cross_verify:{args.judge}:{source_path.stem}:{issue_id}", int(stage["attempts"]),
                     validator=parse,
+                    length_retry_max_tokens=(
+                        int(stage["length_retry_max_tokens"])
+                        if stage.get("length_retry_max_tokens") is not None else None
+                    ),
                 )
-                record = {
+                return {
                     "version": VERSION,
                     "issue_id": issue_id,
                     "pid": issue["pid"],
@@ -156,7 +207,8 @@ def main() -> int:
                     **verdict,
                     "attempts": attempts,
                 }
-                write_json(cache, record)
+
+            record = load_or_generate(cache, args.force, generate_record)
             decisions.append(record)
             logging.info("%s cross verify %s: %s/%s %s", args.judge, source_path.name, index, len(queue), record.get("decision"))
         write_json(out, {

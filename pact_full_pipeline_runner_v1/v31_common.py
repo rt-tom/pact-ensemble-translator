@@ -23,7 +23,7 @@ class JsonGenerationError(RuntimeError):
         self.attempt_errors = attempt_errors
 
 
-VERSION = "3.1.2"
+VERSION = "3.1.2e"
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -240,37 +240,73 @@ def api_client(runtime, cfg: dict[str, Any], api_section: str, name: str, model:
 def complete_json(
     runtime, client, messages: list[dict[str, str]], stage: dict[str, Any],
     max_tokens: int, label: str, attempts: int = 3, validator=None,
+    length_retry_max_tokens: int | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Generate JSON and optionally validate/transform its schema inside retries."""
     errors: list[dict[str, Any]] = []
+    base_max_tokens = int(max_tokens)
+    length_retry_budget = (
+        max(base_max_tokens, int(length_retry_max_tokens))
+        if length_retry_max_tokens is not None else None
+    )
+    current_max_tokens = base_max_tokens
     for attempt in range(1, max(1, attempts) + 1):
         retry_messages = messages
         if attempt > 1:
-            prior = errors[-1].get("error", "invalid response") if errors else "invalid response"
-            retry_messages = list(messages) + [{
-                "role": "system",
-                "content": (
+            previous = errors[-1] if errors else {}
+            if length_retry_budget is not None and previous.get("finish_reason") == "length":
+                current_max_tokens = length_retry_budget
+                retry_instruction = (
+                    "Предыдущий ответ был обрезан лимитом длины "
+                    "(finish_reason=length). Сгенерируй заново один полный "
+                    "компактный JSON object. Не продолжай и не дописывай "
+                    "предыдущий текст. Верни только JSON строго по указанной "
+                    "схеме, без markdown, комментариев и текста вне JSON."
+                )
+            else:
+                prior = previous.get("error", "invalid response")
+                retry_instruction = (
                     "Предыдущий ответ был невалидным: " + str(prior)[:800] +
                     ". Верни только краткий JSON, строго по указанной схеме, "
                     "со всеми обязательными PID/полями, без markdown и комментариев."
-                ),
+                )
+            retry_messages = list(messages) + [{
+                "role": "system",
+                "content": retry_instruction,
             }]
         generation = None
+        actual_max_tokens = None
         try:
-            max_out = runtime.fit_output_budget(client, retry_messages, stage, max_tokens)
-            generation = client.complete(retry_messages, stage, max_out, f"{label}:attempt{attempt}")
+            actual_max_tokens = runtime.fit_output_budget(
+                client, retry_messages, stage, current_max_tokens,
+            )
+            generation = client.complete(
+                retry_messages, stage, actual_max_tokens,
+                f"{label}:attempt{attempt}",
+            )
+            if length_retry_budget is not None and generation.finish_reason == "length":
+                raise ValueError(
+                    "finish_reason='length': response was truncated; "
+                    "refusing to parse or repair it"
+                )
             parsed = runtime.safe_json_loads(generation.content)
             value = validator(parsed) if validator is not None else parsed
             return value, errors + [{
                 "attempt": attempt,
                 "ok": True,
+                "max_tokens": actual_max_tokens,
                 "finish_reason": generation.finish_reason,
                 "usage": generation.usage,
                 "wall_seconds": round(generation.wall_seconds, 3),
             }]
         except Exception as exc:
             logging.warning("%s attempt %s failed: %s", label, attempt, exc)
-            item: dict[str, Any] = {"attempt": attempt, "ok": False, "error": str(exc)}
+            item: dict[str, Any] = {
+                "attempt": attempt,
+                "ok": False,
+                "error": str(exc),
+                "max_tokens": actual_max_tokens,
+            }
             if generation is not None:
                 item.update({
                     "finish_reason": generation.finish_reason,
