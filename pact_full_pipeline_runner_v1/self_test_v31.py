@@ -133,6 +133,27 @@ def run(project_root: Path) -> None:
         assert "reason exceeds 800" in str(exc)
     assert v31_cross_verify.parse(verdict())["reason"] == verdict()["reason"]
 
+    keep_none = verdict()
+    keep_none.update({"decision": "keep", "repair_scope": "none"})
+    assert v31_cross_verify.parse(keep_none)["repair_scope"] == "span"
+
+    uncertain_none = verdict()
+    uncertain_none.update({"decision": "uncertain", "repair_scope": "none"})
+    assert v31_cross_verify.parse(uncertain_none)["repair_scope"] == "span"
+
+    repair_none = verdict()
+    repair_none["repair_scope"] = "none"
+    try:
+        v31_cross_verify.parse(repair_none)
+        raise AssertionError("Expected repair + none scope rejection")
+    except ValueError as exc:
+        assert "when decision is repair" in str(exc)
+
+    for valid_scope in ("span", "sentence", "paragraph"):
+        scoped = verdict()
+        scoped["repair_scope"] = valid_scope
+        assert v31_cross_verify.parse(scoped)["repair_scope"] == valid_scope
+
     with tempfile.TemporaryDirectory() as temp:
         cache = Path(temp) / "cached.json"
         cached_record = {"issue_id": "cached", **verdict()}
