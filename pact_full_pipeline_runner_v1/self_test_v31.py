@@ -139,7 +139,11 @@ def run(project_root: Path) -> None:
 
     uncertain_none = verdict()
     uncertain_none.update({"decision": "uncertain", "repair_scope": "none"})
-    assert v31_cross_verify.parse(uncertain_none)["repair_scope"] == "span"
+    try:
+        v31_cross_verify.parse(uncertain_none)
+        raise AssertionError("Expected uncertain + none scope rejection")
+    except ValueError as exc:
+        assert "allowed only when decision is keep" in str(exc)
 
     repair_none = verdict()
     repair_none["repair_scope"] = "none"
@@ -147,12 +151,38 @@ def run(project_root: Path) -> None:
         v31_cross_verify.parse(repair_none)
         raise AssertionError("Expected repair + none scope rejection")
     except ValueError as exc:
-        assert "when decision is repair" in str(exc)
+        assert "allowed only when decision is keep" in str(exc)
+
+    unknown_scope = verdict()
+    unknown_scope["repair_scope"] = "document"
+    try:
+        v31_cross_verify.parse(unknown_scope)
+        raise AssertionError("Expected unknown scope rejection")
+    except ValueError as exc:
+        assert "Invalid repair_scope: document" in str(exc)
 
     for valid_scope in ("span", "sentence", "paragraph"):
         scoped = verdict()
         scoped["repair_scope"] = valid_scope
         assert v31_cross_verify.parse(scoped)["repair_scope"] == valid_scope
+
+    uncertain_sentence = verdict()
+    uncertain_sentence.update({
+        "decision": "uncertain",
+        "confidence": "low",
+        "repair_scope": "sentence",
+        "target_span": "",
+    })
+    parsed_uncertain = v31_cross_verify.parse(uncertain_sentence)
+    original_issue = {"scope": "paragraph", "target_span": "исходный фрагмент"}
+    downstream_scope = parsed_uncertain.get("repair_scope") or original_issue["scope"]
+    downstream_target = parsed_uncertain.get("target_span") or original_issue["target_span"]
+    resolved = v31_finalize_verification.resolve_uncertain_policy(
+        parsed_uncertain["decision"], parsed_uncertain["confidence"], "repair"
+    )
+    assert resolved == ("repair", "medium", True)
+    assert downstream_scope == "sentence"
+    assert downstream_target == "исходный фрагмент"
 
     with tempfile.TemporaryDirectory() as temp:
         cache = Path(temp) / "cached.json"
