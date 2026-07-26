@@ -1,0 +1,20 @@
+{
+  "patch_name": "Pact Pipeline v3.1.2c UTF-8 BOM Hotfix",
+  "patch_version": "3.1.2c",
+  "targets": [
+    {
+      "path": "pact_full_pipeline_runner_v1\\run_full_pipeline_v31.ps1",
+      "accepted_sha256": [
+        "491d4e29f821456eb4f92f021144ef59034b06df003e073717978b8415256fb4"
+      ],
+      "patched_sha256": "18e1541515a2309fc2378deccf30313aa1883905464620724fef2a4886b41fc8"
+    },
+    {
+      "path": "pact_translate_v3.py",
+      "accepted_sha256": [
+        "5ec94e1d2cf20783f6b5751708c28211479aeade241623953fed349d8d0937ef"
+      ],
+      "patched_sha256": "e72c3bbc15f9d0d8f8a5c99e0106eb06d4725c4552f04970dadb930de3bb817b"
+    }
+  ]
+}

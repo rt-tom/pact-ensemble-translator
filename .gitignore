@@ -1,0 +1,49 @@
+/pipeline_runs/
+/pact_chapters/
+/pact_work_v3*/
+/pact_translated_v3*/
+/logs_v3*/
+/benchmark_inputs/
+/benchmark_results/
+/benchmarks/
+/glossary/
+/glossary_test*/
+/book_bible.json
+/book_bible_test*.json
+/config.v3.json
+/config.test*.json
+/server_profiles/
+/backups/
+/patch_backups/
+/pipeline_patch_backup_*/
+/glossary_backup_*/
+**/__pycache__/
+*.pyc
+*.log
+*.zip
+*.7z
+*.tar
+*.tar.gz
+/SHA256SUMS.txt
+**/config.full_pipeline*.json
+**/state.json
+**/status.json
+**/PATCH_RESUME_METADATA.json
+
+# Installed patch markers
+/pact_full_pipeline_runner_v1/PATCH_*_INSTALLED.json
+
+# Historical unpacked patch/glossary packages
+/pact_pipeline_hotfix_v1_1_1/
+/pact_pipeline_patch_v1_0_2/
+/pact_pipeline_patch_v1_1_0/
+/pact_glossary_from_human_translation/
+/pact_production_glossary_v1/
+
+# Generated reviewer outputs
+/chapter1_reviewer_full400_strict.json
+/reviewer_gemma*.json
+/reviewer_qwen*.json
+
+# Confirmed obsolete duplicate
+/reviewer_benchmark_2_2_0.py

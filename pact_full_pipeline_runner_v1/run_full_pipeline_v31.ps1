@@ -1,0 +1,541 @@
+[CmdletBinding()]
+param(
+    [string]$ProjectRoot = 'D:\pact\pact_translator_v3',
+    [int]$Start = 60,
+    [int]$End = 60,
+    [switch]$Reset,
+    [switch]$RedoSourceAnalysis,
+    [switch]$RedoTranslation,
+    [switch]$RedoQuality,
+    [switch]$RedoFormatting,
+    [switch]$SkipPreflight
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$RunnerVersion = '3.1.2d'
+
+$ProjectRoot = (Resolve-Path $ProjectRoot).Path
+$PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LlamaRoot = 'C:\llama-cpp'
+$LlamaExe = Join-Path $LlamaRoot 'llama-server.exe'
+$GemmaModelPath = Join-Path $LlamaRoot 'models\gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+$GemmaModelName = 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'
+$GemmaMtpPath = Join-Path $LlamaRoot 'models\MTP\mtp-gemma-4-26B-A4B-it-Q8_0.gguf'
+$QwenModelPath = Join-Path $LlamaRoot 'models\Qwen3.6-35B-A3B\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf'
+$QwenModelName = 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf'
+$Python = 'py'
+
+$RequiredRunnerFiles = @(
+    'prepare_pipeline_context.py',
+    'v31_common.py',
+    'v31_source_analysis.py',
+    'v31_audit.py',
+    'v31_merge_issues.py',
+    'v31_cross_verify.py',
+    'v31_finalize_verification.py',
+    'v31_repair.py',
+    'v31_postcheck.py',
+    'v31_deterministic_gate.py',
+    'v31_adjudicate.py',
+    'v31_finalize_quality.py',
+    'v31_build_review.py'
+)
+foreach ($required in @($LlamaExe, $GemmaModelPath, $GemmaMtpPath, $QwenModelPath,
+    (Join-Path $ProjectRoot 'pact_translate_v3.py'),
+    (Join-Path $ProjectRoot 'config.v3.json'),
+    (Join-Path $ProjectRoot 'glossary'))) {
+    if (-not (Test-Path $required)) { throw "Required path not found: $required" }
+}
+foreach ($name in $RequiredRunnerFiles) {
+    $path = Join-Path $PackageRoot $name
+    if (-not (Test-Path $path)) { throw "Required runner file not found: $path" }
+}
+
+$RunName = "chapter_${Start}_to_${End}_v31"
+$RunRoot = Join-Path $ProjectRoot "pipeline_runs\$RunName"
+$WorkDir = Join-Path $RunRoot 'work'
+$OutputDir = Join-Path $RunRoot 'output'
+$LogsDir = Join-Path $RunRoot 'logs'
+$ServerLogsDir = Join-Path $RunRoot 'server_logs'
+$GlossaryDir = Join-Path $RunRoot 'glossary'
+$ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
+$BookBiblePath = Join-Path $RunRoot 'book_bible.json'
+
+$AllInputFiles = @(Get-ChildItem (Join-Path $ProjectRoot 'pact_chapters') -Filter '*.html' -File | Sort-Object Name)
+$SelectedInputFiles = @($AllInputFiles | Select-Object -Skip ([math]::Max(0, $Start - 1)) -First ([math]::Max(0, $End - $Start + 1)))
+if ($SelectedInputFiles.Count -ne ($End - $Start + 1)) { throw "Requested chapter range $Start-$End is outside available inputs." }
+$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
+
+if ($Reset -and (Test-Path $RunRoot)) {
+    Write-Host "Removing previous v3.1 run: $RunRoot" -ForegroundColor Yellow
+    Remove-Item $RunRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path @($RunRoot, $WorkDir, $OutputDir, $LogsDir, $ServerLogsDir) | Out-Null
+if (-not (Test-Path $GlossaryDir)) { Copy-Item (Join-Path $ProjectRoot 'glossary') $GlossaryDir -Recurse -Force }
+if (-not (Test-Path $BookBiblePath)) {
+    $sourceBookBible = Join-Path $ProjectRoot 'book_bible.json'
+    if (Test-Path $sourceBookBible) { Copy-Item $sourceBookBible $BookBiblePath -Force }
+    else {
+        [System.IO.File]::WriteAllText(
+            $BookBiblePath,
+            '{}',
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+}
+
+function Get-OrCreateSection {
+    param([System.Collections.IDictionary]$Config, [string]$Name)
+    if (-not $Config.Contains($Name) -or -not ($Config[$Name] -is [System.Collections.IDictionary])) { $Config[$Name] = @{} }
+    return $Config[$Name]
+}
+
+# Do not rely on the optional hashtable-output parameter of ConvertFrom-Json.
+# A user profile or compatibility module may expose an older implementation.
+# Convert the ordinary PSCustomObject result recursively instead.
+function ConvertTo-HashtableRecursive {
+    param($InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $result = @{}
+        foreach ($key in $InputObject.Keys) {
+            $result[[string]$key] = ConvertTo-HashtableRecursive -InputObject $InputObject[$key]
+        }
+        return $result
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $result = @{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $result[$property.Name] = ConvertTo-HashtableRecursive -InputObject $property.Value
+        }
+        return $result
+    }
+
+    if (
+        $InputObject -is [System.Collections.IEnumerable] -and
+        -not ($InputObject -is [string])
+    ) {
+        $items = @()
+        foreach ($item in $InputObject) {
+            $items += ,(ConvertTo-HashtableRecursive -InputObject $item)
+        }
+        return ,$items
+    }
+
+    return $InputObject
+}
+
+$configJson = Get-Content (Join-Path $ProjectRoot 'config.v3.json') -Raw
+$configObject = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $configJson
+$cfg = ConvertTo-HashtableRecursive -InputObject $configObject
+$translatorApi = Get-OrCreateSection $cfg 'translator_api'
+$reviewerApi = Get-OrCreateSection $cfg 'reviewer_api'
+$paths = Get-OrCreateSection $cfg 'paths'
+$chapterBible = Get-OrCreateSection $cfg 'chapter_bible'
+$translation = Get-OrCreateSection $cfg 'translation'
+$audit = Get-OrCreateSection $cfg 'audit'
+$repairLegacy = Get-OrCreateSection $cfg 'repair'
+$formatting = Get-OrCreateSection $cfg 'formatting'
+$glossary = Get-OrCreateSection $cfg 'glossary'
+$validation = Get-OrCreateSection $cfg 'validation'
+$postRepair = Get-OrCreateSection $cfg 'post_repair_verifier'
+$ensemble = Get-OrCreateSection $cfg 'ensemble_v31'
+
+$translatorApi['model'] = $GemmaModelName
+$translatorApi['context_size'] = 32768
+$reviewerApi['enabled'] = $true
+$reviewerApi['model'] = $QwenModelName
+$reviewerApi['context_size'] = 32768
+$paths['input_dir'] = (Join-Path $ProjectRoot 'pact_chapters')
+$paths['output_dir'] = $OutputDir
+$paths['work_dir'] = $WorkDir
+$paths['logs_dir'] = $LogsDir
+$paths['glossary_dir'] = $GlossaryDir
+$paths['book_bible_file'] = $BookBiblePath
+$paths['arc_names_file'] = (Join-Path $ProjectRoot 'arc_names.json')
+
+$chapterBible['enabled'] = $true
+$chapterBible['required'] = $true
+$chapterBible['temperature'] = 0.0
+$chapterBible['enable_thinking'] = $false
+$translation['temperature'] = 0.0
+$translation['top_p'] = 0.95
+$translation['top_k'] = 64
+$translation['enable_thinking'] = $false
+$translation['generation_retries'] = 3
+$audit['enabled'] = $false
+$repairLegacy['enabled'] = $false
+$formatting['enabled'] = $true
+$formatting['required'] = $false
+$formatting['temperature'] = 0.0
+$formatting['enable_thinking'] = $false
+$formatting['retry_unresolved_spans'] = $true
+$glossary['include_provisional_in_prompt'] = $false
+$validation['english_sequence_min_words'] = 2
+$validation['english_residue_is_error'] = $false
+$deterministicQa = Get-OrCreateSection $cfg 'deterministic_qa'
+$deterministicQa['mixed_script_check'] = $true
+if (-not $deterministicQa.Contains('mixed_script_allow')) { $deterministicQa['mixed_script_allow'] = @() }
+$postRepair['enabled'] = $true
+$postRepair['required'] = $true
+$postRepair['fail_on_unresolved'] = $true
+
+$ensemble['version'] = '3.1.2'
+$ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
+$ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
+$ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
+$ensemble['gemma_russian_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1800; attempts=3; batch_pids=6; context_before=3; context_after=3 }
+$ensemble['gemma_discourse_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=2600; attempts=3; window_pids=30; overlap_pids=10 }
+$ensemble['qwen_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=800; attempts=3; context_size=2 }
+$ensemble['gemma_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=800; attempts=3; context_size=2 }
+$ensemble['repair'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1600; attempts=3; context_before=2; context_after=2; alternative_for_multiple_issues=$true; alternative_categories=@('idiom','meaning','register','dialogue','continuity'); max_changed_ratio_span=0.35 }
+$ensemble['qwen_semantic_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=900; attempts=3; context_size=2 }
+$ensemble['gemma_semantic_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=900; attempts=3; context_size=2 }
+$ensemble['gemma_russian_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=900; attempts=3; context_size=2 }
+$ensemble['verification'] = @{ fail_on_uncertain=$false; uncertain_policy='repair' }
+$ensemble['max_repair_rounds'] = 3
+$ensemble['final_quality'] = @{ fail_deterministic_categories=@('missing','mixed_script','english_residue','number','number_word','entity_consistency','name_consistency','narrator_gender') }
+$ensemble['preflight'] = @{ enabled=$true; min_prompt_tps=100.0; min_generation_tps=20.0; max_tokens=512 }
+
+$configJson = $cfg | ConvertTo-Json -Depth 60
+[System.IO.File]::WriteAllText(
+    $ConfigPath,
+    $configJson,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+$script:ServerProcess = $null
+$script:CurrentServerStderr = $null
+$script:CurrentServerProfile = $null
+function Stop-LlamaServer {
+    if ($script:ServerProcess -and -not $script:ServerProcess.HasExited) {
+        Stop-Process -Id $script:ServerProcess.Id -Force -ErrorAction SilentlyContinue
+        try { $script:ServerProcess.WaitForExit(10000) | Out-Null } catch {}
+    }
+    $script:ServerProcess = $null
+    $script:CurrentServerStderr = $null
+    $script:CurrentServerProfile = $null
+    Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+}
+
+function Start-LlamaServer {
+    param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile)
+    Stop-LlamaServer
+    $env:GGML_VK_DISABLE_COOPMAT = '1'
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $stdout = Join-Path $ServerLogsDir "${Profile}_${stamp}_stdout.log"
+    $stderr = Join-Path $ServerLogsDir "${Profile}_${stamp}_stderr.log"
+    switch ($Profile) {
+        'GemmaTranslate' { $serverArgs = @('-m',$GemmaModelPath,'--model-draft',$GemmaMtpPath,'--spec-type','draft-mtp','--spec-draft-n-max','4','--device','Vulkan0','--host','127.0.0.1','--port','8080','-ngl','99','-ncmoe','18','--no-mmap','--reasoning-budget','0','-np','1','-c','32768','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+        'GemmaRepair' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+        'GemmaVerify' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','128','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+        'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+    }
+    Write-Host "Starting $Profile..." -ForegroundColor Cyan
+    $script:CurrentServerStderr = $stderr
+    $script:CurrentServerProfile = $Profile
+    $script:ServerProcess = Start-Process -FilePath $LlamaExe -WorkingDirectory $LlamaRoot -ArgumentList $serverArgs -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+    $ready = $false
+    for ($i=0; $i -lt 240; $i++) {
+        if ($script:ServerProcess.HasExited) { throw "$Profile llama-server exited. See $stderr" }
+        try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/health' -TimeoutSec 2; if ($health.status -in @('ok','no slot available')) { $ready=$true; break } } catch {}
+        Start-Sleep -Seconds 1
+    }
+    if (-not $ready) { throw "$Profile server did not become ready. See $stderr" }
+    Write-Host "$Profile ready (PID $($script:ServerProcess.Id))" -ForegroundColor Green
+}
+
+function Invoke-GemmaPreflight {
+    $preflight = $ensemble['preflight']
+    if (-not $preflight -or -not [bool]$preflight['enabled']) { return }
+    if ($script:CurrentServerProfile -ne 'GemmaTranslate') {
+        throw 'Gemma preflight requires the GemmaTranslate profile.'
+    }
+
+    $minPrompt = [double]$preflight['min_prompt_tps']
+    $minGeneration = [double]$preflight['min_generation_tps']
+    $maxTokens = [int]$preflight['max_tokens']
+    Write-Host "`n=== Preflight: GemmaTranslate performance ===" -ForegroundColor Magenta
+    Write-Host "Required: prompt >= $minPrompt t/s; generation >= $minGeneration t/s" -ForegroundColor DarkGray
+
+    $source = @'
+The rain had stopped sometime before dawn, but the streets were still shining beneath the streetlights. Daniel stood under the narrow awning of the closed bookstore and watched the water run along the curb. He had expected the package to be waiting for him, wrapped in brown paper and hidden behind the loose brick beside the door.
+
+It was not there.
+
+He checked the alley, then crouched and ran his fingers over the wet brickwork. The brick had been moved recently. There was fresh dust beneath it, protected from the rain, and a thin scrape across one corner. Someone had found the hiding place before him.
+
+Across the street, a woman in a dark coat lowered her umbrella. She did not look directly at Daniel, but she had been standing in the same place for several minutes.
+
+Daniel straightened slowly.
+
+“You’re late,” the woman said.
+
+“I wasn’t told there would be anyone else.”
+
+“There wasn’t supposed to be.”
+
+A bus passed between them, spraying water across the empty road. When it was gone, the woman was already walking away.
+
+Daniel hesitated only a moment before following her.
+'@
+
+    $body = @{
+        model = $GemmaModelName
+        messages = @(
+            @{
+                role = 'system'
+                content = 'Translate literary English prose into natural, polished Russian. Preserve meaning, tone, paragraphing, dialogue, and all factual details. Output only the Russian translation.'
+            },
+            @{
+                role = 'user'
+                content = $source
+            }
+        )
+        temperature = 0.0
+        max_tokens = $maxTokens
+        stream = $false
+    } | ConvertTo-Json -Depth 10
+
+    $null = Invoke-RestMethod `
+        -Uri 'http://127.0.0.1:8080/v1/chat/completions' `
+        -Method Post `
+        -ContentType 'application/json; charset=utf-8' `
+        -Body $body `
+        -TimeoutSec 600
+
+    Start-Sleep -Milliseconds 750
+    if (-not $script:CurrentServerStderr -or -not (Test-Path $script:CurrentServerStderr)) {
+        throw 'Gemma preflight could not locate the active llama-server stderr log.'
+    }
+    $logText = Get-Content -LiteralPath $script:CurrentServerStderr -Raw
+    $promptMatches = [regex]::Matches(
+        $logText,
+        'prompt eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens.*?([\d.]+)\s*tokens per second'
+    )
+    $generationMatches = [regex]::Matches(
+        $logText,
+        '(?m)^.*?\|\s+eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens.*?([\d.]+)\s*tokens per second'
+    )
+    $acceptanceMatches = [regex]::Matches($logText, 'draft acceptance\s*=\s*([\d.]+)')
+    if ($promptMatches.Count -eq 0 -or $generationMatches.Count -eq 0) {
+        throw "Gemma preflight could not parse timing data. See $($script:CurrentServerStderr)"
+    }
+
+    $promptTps = [double]$promptMatches[$promptMatches.Count - 1].Groups[1].Value
+    $generationTps = [double]$generationMatches[$generationMatches.Count - 1].Groups[1].Value
+    $acceptance = if ($acceptanceMatches.Count -gt 0) {
+        [double]$acceptanceMatches[$acceptanceMatches.Count - 1].Groups[1].Value
+    } else { $null }
+    $passed = $promptTps -ge $minPrompt -and $generationTps -ge $minGeneration
+
+    $report = [ordered]@{
+        version = $RunnerVersion
+        timestamp = (Get-Date).ToString('o')
+        profile = 'GemmaTranslate'
+        prompt_tps = $promptTps
+        generation_tps = $generationTps
+        mtp_acceptance = $acceptance
+        thresholds = [ordered]@{
+            min_prompt_tps = $minPrompt
+            min_generation_tps = $minGeneration
+        }
+        passed = $passed
+        server_log = $script:CurrentServerStderr
+    }
+    $reportPath = Join-Path $RunRoot 'preflight_performance.json'
+    $reportJson = $report | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText(
+        $reportPath,
+        $reportJson,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    $acceptanceText = if ($null -ne $acceptance) { '; MTP acceptance = {0:P1}' -f $acceptance } else { '' }
+    Write-Host ('Preflight: prompt = {0:N2} t/s; generation = {1:N2} t/s{2}' -f $promptTps, $generationTps, $acceptanceText) -ForegroundColor $(if ($passed) { 'Green' } else { 'Red' })
+    if (-not $passed) {
+        throw (
+            'GemmaTranslate performance preflight failed. ' +
+            "Required >= $minPrompt prompt t/s and >= $minGeneration generation t/s; " +
+            "measured $promptTps / $generationTps. Restart Windows and rerun the pipeline. " +
+            'Use -SkipPreflight only for diagnosis.'
+        )
+    }
+}
+
+function Invoke-PythonStage {
+    param([string]$Label, [string[]]$Arguments)
+    Write-Host "`n=== $Label ===" -ForegroundColor Magenta
+    Push-Location $ProjectRoot
+    try {
+        & $Python @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "$Label failed with exit code $LASTEXITCODE" }
+    } finally { Pop-Location }
+}
+
+function CommonArgs {
+    return @('--project-root',$ProjectRoot,'--config',$ConfigPath,'--start',"$Start",'--end',"$End")
+}
+
+function Remove-SelectedOutputs {
+    foreach ($inputFile in $SelectedInputFiles) {
+        Remove-Item (Join-Path $OutputDir $inputFile.Name) -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-QualityArtifacts {
+    foreach ($stem in $SelectedChapterStems) {
+        $work = Join-Path $WorkDir $stem
+        if (-not (Test-Path $work)) { continue }
+        Remove-Item (Join-Path $work 'v31') -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($name in @('issues.json','verified_issues.json','repaired_translations.json','repaired_translations.preverify.json','repair_records.json','post_repair_report.json','issue_lifecycle.json','v31_primary_translations.json','v31_final_translations.json','v31_quality_gate.json','quality_report.json','audit_report.html','state.json')) {
+            Remove-Item (Join-Path $work $name) -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-SelectedOutputs
+}
+
+function Get-RetryCount {
+    param([string]$PassName)
+    $total = 0
+    foreach ($stem in $SelectedChapterStems) {
+        $path = Join-Path (Join-Path (Join-Path (Join-Path $WorkDir $stem) 'v31') $PassName) 'status.json'
+        if (-not (Test-Path $path)) { continue }
+        $status = Get-Content $path -Raw | ConvertFrom-Json
+        $total += [int]$status.retry_required
+    }
+    return $total
+}
+
+function Run-AuditPass {
+    param([string]$PassName, [string]$TranslationsFile)
+    $extra = @('--pass-name',$PassName)
+    if ($TranslationsFile) { $extra += @('--translations-file',$TranslationsFile) }
+    if ($RedoQuality) { $extra += '--force' }
+
+    Start-LlamaServer Qwen
+    Invoke-PythonStage -Label "$PassName Qwen semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','qwen_semantic','--model',$QwenModelName))
+
+    Start-LlamaServer GemmaVerify
+    Invoke-PythonStage -Label "$PassName Gemma semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_semantic','--model',$GemmaModelName))
+    Invoke-PythonStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName))
+    Invoke-PythonStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_discourse','--model',$GemmaModelName))
+
+    Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $extra)
+
+    Start-LlamaServer GemmaVerify
+    Invoke-PythonStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','gemma','--model',$GemmaModelName))
+
+    Start-LlamaServer Qwen
+    Invoke-PythonStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','qwen','--model',$QwenModelName))
+
+    Invoke-PythonStage -Label "$PassName finalize verification" -Arguments (@((Join-Path $PackageRoot 'v31_finalize_verification.py')) + (CommonArgs) + $extra)
+}
+
+function Run-RepairPass {
+    param([string]$PassName, [string]$InitialTranslationsFile)
+    $maxRounds = [int]$ensemble['max_repair_rounds']
+    $currentFile = $InitialTranslationsFile
+    for ($round=1; $round -le $maxRounds; $round++) {
+        $baseArgs = @('--pass-name',$PassName,'--round',"$round")
+        if ($currentFile) { $baseArgs += @('--translations-file',$currentFile) }
+        if ($RedoQuality) { $baseArgs += '--force' }
+        if ($round -gt 1) { $baseArgs += '--retry-only' }
+
+        Start-LlamaServer GemmaRepair
+        Invoke-PythonStage -Label "$PassName repair round $round" -Arguments (@((Join-Path $PackageRoot 'v31_repair.py')) + (CommonArgs) + $baseArgs + @('--model',$GemmaModelName))
+
+        $gateArgs = @('--pass-name',$PassName,'--round',"$round")
+        if ($currentFile) { $gateArgs += @('--translations-file',$currentFile) }
+        if ($RedoQuality) { $gateArgs += '--force' }
+
+        Start-LlamaServer Qwen
+        Invoke-PythonStage -Label "$PassName Qwen semantic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','qwen_semantic','--model',$QwenModelName))
+
+        Start-LlamaServer GemmaVerify
+        Invoke-PythonStage -Label "$PassName Gemma semantic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_semantic','--model',$GemmaModelName))
+        Invoke-PythonStage -Label "$PassName Gemma Russian gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_russian','--model',$GemmaModelName))
+
+        Invoke-PythonStage -Label "$PassName deterministic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_deterministic_gate.py')) + (CommonArgs) + $gateArgs)
+        Invoke-PythonStage -Label "$PassName adjudication round $round" -Arguments (@((Join-Path $PackageRoot 'v31_adjudicate.py')) + (CommonArgs) + $gateArgs)
+
+        $retry = Get-RetryCount $PassName
+        if ($retry -eq 0) { return }
+        Write-Host "$PassName has $retry unresolved PID(s) after round $round." -ForegroundColor Yellow
+        $currentFile = if ($PassName -eq 'primary') { 'v31_primary_translations.json' } else { 'v31_final_translations.json' }
+    }
+    $remaining = Get-RetryCount $PassName
+    if ($remaining -gt 0) { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
+}
+
+try {
+    Write-Host "Pact ensemble pipeline v$RunnerVersion" -ForegroundColor White
+    Write-Host "Run root: $RunRoot" -ForegroundColor White
+
+    Start-LlamaServer GemmaTranslate
+    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
+    $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)
+    Invoke-PythonStage -Label '1/11 Prepare manifest, chapter bible, frozen glossary' -Arguments $prepareArgs
+
+    if ($RedoFormatting -and -not $RedoTranslation -and -not $RedoQuality) {
+        Remove-SelectedOutputs
+    }
+
+    if ($RedoTranslation) {
+        foreach ($stem in $SelectedChapterStems) {
+            $work = Join-Path $WorkDir $stem
+            Remove-Item (Join-Path $work 'drafts') -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $work 'meta') -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $work 'draft_translations.json') -Force -ErrorAction SilentlyContinue
+        }
+        Remove-QualityArtifacts
+    } elseif ($RedoQuality) { Remove-QualityArtifacts }
+
+    if ($RedoSourceAnalysis -or $RedoTranslation) {
+        Remove-Item (Join-Path $RunRoot 'book_consistency_ledger.json') -Force -ErrorAction SilentlyContinue
+    }
+
+    Start-LlamaServer Qwen
+    $sourceArgs = @((Join-Path $PackageRoot 'v31_source_analysis.py')) + (CommonArgs) + @('--model',$QwenModelName)
+    if ($RedoSourceAnalysis -or $RedoTranslation) { $sourceArgs += '--force' }
+    Invoke-PythonStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs
+
+    Start-LlamaServer GemmaTranslate
+    $translateArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','translate','--start',"$Start",'--end',"$End")
+    Invoke-PythonStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+
+    Run-AuditPass 'primary' 'draft_translations.json'
+    Run-RepairPass 'primary' 'draft_translations.json'
+
+    Run-AuditPass 'residual' 'v31_primary_translations.json'
+    Run-RepairPass 'residual' 'v31_primary_translations.json'
+
+    Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs))
+    Invoke-PythonStage -Label '10b/11 Build v3.1 review report' -Arguments (@((Join-Path $PackageRoot 'v31_build_review.py')) + (CommonArgs))
+
+    Start-LlamaServer GemmaTranslate
+    $finalizeArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','finalize','--start',"$Start",'--end',"$End")
+    if ($RedoFormatting -or $RedoTranslation -or $RedoQuality) { $finalizeArgs += '--redo-formatting' }
+    Invoke-PythonStage -Label '11/11 Restore formatting and finalize HTML' -Arguments $finalizeArgs
+
+    Stop-LlamaServer
+    $bundle = Join-Path $RunRoot "result_${RunName}.zip"
+    $items = @($ConfigPath,$OutputDir,$WorkDir,$LogsDir,$ServerLogsDir) | Where-Object { Test-Path $_ }
+    Compress-Archive -Path $items -DestinationPath $bundle -Force
+    Write-Host "`nPIPELINE V3.1 COMPLETE" -ForegroundColor Green
+    Write-Host "Output: $OutputDir" -ForegroundColor Green
+    Write-Host "Bundle: $bundle" -ForegroundColor Green
+}
+catch {
+    Write-Host "`nPIPELINE V3.1 FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Run data preserved at: $RunRoot" -ForegroundColor Yellow
+    throw
+}
+finally { Stop-LlamaServer }
