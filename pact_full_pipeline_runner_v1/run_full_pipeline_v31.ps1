@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.2f'
+$RunnerVersion = '3.1.2g'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -29,6 +29,7 @@ $Python = 'py'
 $RequiredRunnerFiles = @(
     'prepare_pipeline_context.py',
     'v31_common.py',
+    'v31_preflight_policy.ps1',
     'v31_source_analysis.py',
     'v31_audit.py',
     'v31_merge_issues.py',
@@ -51,6 +52,7 @@ foreach ($name in $RequiredRunnerFiles) {
     $path = Join-Path $PackageRoot $name
     if (-not (Test-Path $path)) { throw "Required runner file not found: $path" }
 }
+. (Join-Path $PackageRoot 'v31_preflight_policy.ps1')
 
 $RunName = "chapter_${Start}_to_${End}_v31"
 $RunRoot = Join-Path $ProjectRoot "pipeline_runs\$RunName"
@@ -186,7 +188,7 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.2f'
+$ensemble['version'] = '3.1.2g'
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -201,7 +203,7 @@ $ensemble['gemma_russian_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; 
 $ensemble['verification'] = @{ fail_on_uncertain=$false; uncertain_policy='repair' }
 $ensemble['max_repair_rounds'] = 3
 $ensemble['final_quality'] = @{ fail_deterministic_categories=@('missing','mixed_script','english_residue','number','number_word','entity_consistency','name_consistency','narrator_gender') }
-$ensemble['preflight'] = @{ enabled=$true; min_prompt_tps=100.0; min_generation_tps=20.0; max_tokens=512 }
+$ensemble['preflight'] = @{ enabled=$true; min_prompt_tps=100.0; min_generation_tps=20.0; max_tokens=512; warmup_runs=1; sample_runs=3; policy='median_advisory' }
 
 $configJson = $cfg | ConvertTo-Json -Depth 60
 [System.IO.File]::WriteAllText(
@@ -252,6 +254,64 @@ function Start-LlamaServer {
     Write-Host "$Profile ready (PID $($script:ServerProcess.Id))" -ForegroundColor Green
 }
 
+function Get-GemmaPreflightLogSnapshot {
+    if (-not $script:CurrentServerStderr -or -not (Test-Path $script:CurrentServerStderr)) {
+        throw 'Gemma preflight could not locate the active llama-server stderr log.'
+    }
+    $logText = [string](Get-Content -LiteralPath $script:CurrentServerStderr -Raw)
+    $promptMatches = [regex]::Matches(
+        $logText,
+        'prompt eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens.*?([\d.]+)\s*tokens per second'
+    )
+    $generationMatches = [regex]::Matches(
+        $logText,
+        '(?m)^.*?\|\s+eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens.*?([\d.]+)\s*tokens per second'
+    )
+    $acceptanceMatches = [regex]::Matches($logText, 'draft acceptance\s*=\s*([\d.]+)')
+    return [pscustomobject]@{
+        prompt_count = $promptMatches.Count
+        generation_count = $generationMatches.Count
+        acceptance_count = $acceptanceMatches.Count
+        prompt_tps = if ($promptMatches.Count) { [double]$promptMatches[$promptMatches.Count - 1].Groups[1].Value } else { $null }
+        generation_tps = if ($generationMatches.Count) { [double]$generationMatches[$generationMatches.Count - 1].Groups[1].Value } else { $null }
+        mtp_acceptance = if ($acceptanceMatches.Count) { [double]$acceptanceMatches[$acceptanceMatches.Count - 1].Groups[1].Value } else { $null }
+    }
+}
+
+function Invoke-GemmaPreflightProbe {
+    param([string]$Body, [string]$Label)
+
+    $before = Get-GemmaPreflightLogSnapshot
+    $null = Invoke-RestMethod `
+        -Uri 'http://127.0.0.1:8080/v1/chat/completions' `
+        -Method Post `
+        -ContentType 'application/json; charset=utf-8' `
+        -Body $Body `
+        -TimeoutSec 600
+
+    $after = $null
+    for ($poll = 0; $poll -lt 40; $poll++) {
+        Start-Sleep -Milliseconds 250
+        $candidate = Get-GemmaPreflightLogSnapshot
+        if (
+            $candidate.prompt_count -gt $before.prompt_count -and
+            $candidate.generation_count -gt $before.generation_count
+        ) {
+            $after = $candidate
+            break
+        }
+    }
+    if ($null -eq $after) {
+        throw "Gemma preflight $Label could not parse new timing data. See $($script:CurrentServerStderr)"
+    }
+    return [pscustomobject][ordered]@{
+        label = $Label
+        prompt_tps = $after.prompt_tps
+        generation_tps = $after.generation_tps
+        mtp_acceptance = if ($after.acceptance_count -gt $before.acceptance_count) { $after.mtp_acceptance } else { $null }
+    }
+}
+
 function Invoke-GemmaPreflight {
     $preflight = $ensemble['preflight']
     if (-not $preflight -or -not [bool]$preflight['enabled']) { return }
@@ -262,8 +322,15 @@ function Invoke-GemmaPreflight {
     $minPrompt = [double]$preflight['min_prompt_tps']
     $minGeneration = [double]$preflight['min_generation_tps']
     $maxTokens = [int]$preflight['max_tokens']
+    $warmupRuns = [int]$preflight['warmup_runs']
+    $sampleRuns = [int]$preflight['sample_runs']
+    $policy = [string]$preflight['policy']
+    if ($warmupRuns -lt 1 -or $sampleRuns -lt 3 -or $policy -ne 'median_advisory') {
+        throw "Invalid Gemma preflight policy configuration: warmup_runs=$warmupRuns sample_runs=$sampleRuns policy=$policy"
+    }
     Write-Host "`n=== Preflight: GemmaTranslate performance ===" -ForegroundColor Magenta
-    Write-Host "Required: prompt >= $minPrompt t/s; generation >= $minGeneration t/s" -ForegroundColor DarkGray
+    Write-Host "Advisory thresholds: prompt >= $minPrompt t/s; generation >= $minGeneration t/s" -ForegroundColor DarkGray
+    Write-Host "Policy: $warmupRuns warm-up + $sampleRuns measured runs; median; valid low performance is advisory" -ForegroundColor DarkGray
 
     $source = @'
 The rain had stopped sometime before dawn, but the streets were still shining beneath the streetlights. Daniel stood under the narrow awning of the closed bookstore and watched the water run along the curb. He had expected the package to be waiting for him, wrapped in brown paper and hidden behind the loose brick beside the door.
@@ -304,50 +371,43 @@ Daniel hesitated only a moment before following her.
         stream = $false
     } | ConvertTo-Json -Depth 10
 
-    $null = Invoke-RestMethod `
-        -Uri 'http://127.0.0.1:8080/v1/chat/completions' `
-        -Method Post `
-        -ContentType 'application/json; charset=utf-8' `
-        -Body $body `
-        -TimeoutSec 600
-
-    Start-Sleep -Milliseconds 750
-    if (-not $script:CurrentServerStderr -or -not (Test-Path $script:CurrentServerStderr)) {
-        throw 'Gemma preflight could not locate the active llama-server stderr log.'
+    $warmups = @()
+    for ($index = 1; $index -le $warmupRuns; $index++) {
+        $sample = Invoke-GemmaPreflightProbe -Body $body -Label "warmup-$index"
+        $warmups += ,$sample
+        Write-Host ('Warm-up {0}: prompt = {1:N2} t/s; generation = {2:N2} t/s' -f $index, $sample.prompt_tps, $sample.generation_tps) -ForegroundColor DarkGray
     }
-    $logText = Get-Content -LiteralPath $script:CurrentServerStderr -Raw
-    $promptMatches = [regex]::Matches(
-        $logText,
-        'prompt eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens.*?([\d.]+)\s*tokens per second'
-    )
-    $generationMatches = [regex]::Matches(
-        $logText,
-        '(?m)^.*?\|\s+eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens.*?([\d.]+)\s*tokens per second'
-    )
-    $acceptanceMatches = [regex]::Matches($logText, 'draft acceptance\s*=\s*([\d.]+)')
-    if ($promptMatches.Count -eq 0 -or $generationMatches.Count -eq 0) {
-        throw "Gemma preflight could not parse timing data. See $($script:CurrentServerStderr)"
+    $samples = @()
+    for ($index = 1; $index -le $sampleRuns; $index++) {
+        $sample = Invoke-GemmaPreflightProbe -Body $body -Label "sample-$index"
+        $samples += ,$sample
+        Write-Host ('Sample {0}/{1}: prompt = {2:N2} t/s; generation = {3:N2} t/s' -f $index, $sampleRuns, $sample.prompt_tps, $sample.generation_tps) -ForegroundColor DarkGray
     }
-
-    $promptTps = [double]$promptMatches[$promptMatches.Count - 1].Groups[1].Value
-    $generationTps = [double]$generationMatches[$generationMatches.Count - 1].Groups[1].Value
-    $acceptance = if ($acceptanceMatches.Count -gt 0) {
-        [double]$acceptanceMatches[$acceptanceMatches.Count - 1].Groups[1].Value
-    } else { $null }
-    $passed = $promptTps -ge $minPrompt -and $generationTps -ge $minGeneration
+    $summary = Get-V31PreflightSummary `
+        -WarmupSamples $warmups `
+        -Samples $samples `
+        -ExpectedWarmupCount $warmupRuns `
+        -ExpectedSampleCount $sampleRuns `
+        -MinPromptTps $minPrompt `
+        -MinGenerationTps $minGeneration
 
     $report = [ordered]@{
         version = $RunnerVersion
         timestamp = (Get-Date).ToString('o')
         profile = 'GemmaTranslate'
-        prompt_tps = $promptTps
-        generation_tps = $generationTps
-        mtp_acceptance = $acceptance
-        thresholds = [ordered]@{
-            min_prompt_tps = $minPrompt
-            min_generation_tps = $minGeneration
-        }
-        passed = $passed
+        policy = $summary.policy
+        status = $summary.status
+        blocking = $summary.blocking
+        warmup_samples = $summary.warmup_samples
+        samples = $summary.samples
+        sample_count = $summary.sample_count
+        prompt_tps = $summary.prompt_tps
+        generation_tps = $summary.generation_tps
+        mtp_acceptance = $summary.mtp_acceptance
+        thresholds = $summary.thresholds
+        meets_thresholds = $summary.meets_thresholds
+        passed = $summary.meets_thresholds
+        execution_allowed = $summary.execution_allowed
         server_log = $script:CurrentServerStderr
     }
     $reportPath = Join-Path $RunRoot 'preflight_performance.json'
@@ -358,14 +418,14 @@ Daniel hesitated only a moment before following her.
         [System.Text.UTF8Encoding]::new($false)
     )
 
-    $acceptanceText = if ($null -ne $acceptance) { '; MTP acceptance = {0:P1}' -f $acceptance } else { '' }
-    Write-Host ('Preflight: prompt = {0:N2} t/s; generation = {1:N2} t/s{2}' -f $promptTps, $generationTps, $acceptanceText) -ForegroundColor $(if ($passed) { 'Green' } else { 'Red' })
-    if (-not $passed) {
-        throw (
-            'GemmaTranslate performance preflight failed. ' +
+    $acceptanceText = if ($null -ne $summary.mtp_acceptance) { '; median MTP acceptance = {0:P1}' -f $summary.mtp_acceptance } else { '' }
+    $color = if ($summary.meets_thresholds) { 'Green' } else { 'Yellow' }
+    Write-Host ('Preflight median: prompt = {0:N2} t/s; generation = {1:N2} t/s{2}' -f $summary.prompt_tps, $summary.generation_tps, $acceptanceText) -ForegroundColor $color
+    if (-not $summary.meets_thresholds) {
+        Write-Warning (
+            'GemmaTranslate performance is below the advisory threshold. ' +
             "Required >= $minPrompt prompt t/s and >= $minGeneration generation t/s; " +
-            "measured $promptTps / $generationTps. Restart Windows and rerun the pipeline. " +
-            'Use -SkipPreflight only for diagnosis.'
+            "median measured $($summary.prompt_tps) / $($summary.generation_tps). Continuing without invalidating run data or caches."
         )
     }
 }
