@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from v31_common import issue_record, merge_duplicate_issues
+from v31_common import JsonGenerationError, complete_json, issue_record, merge_duplicate_issues
+import v31_cross_verify
 import v31_postcheck
 import v31_repair
 import v31_finalize_verification
@@ -24,6 +27,127 @@ def load_runtime(project_root: Path):
 
 def run(project_root: Path) -> None:
     runtime = load_runtime(project_root)
+
+    class FakeJsonRuntime:
+        safe_json_loads = staticmethod(runtime.safe_json_loads)
+
+        @staticmethod
+        def fit_output_budget(client, messages, stage, proposed):
+            return proposed
+
+    class FakeJsonClient:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.budgets = []
+            self.messages = []
+
+        def complete(self, messages, stage, max_tokens, label):
+            self.budgets.append(max_tokens)
+            self.messages.append(messages)
+            content, finish_reason = self.responses.pop(0)
+            return SimpleNamespace(
+                content=content,
+                reasoning="",
+                finish_reason=finish_reason,
+                usage={"completion_tokens": max_tokens},
+                wall_seconds=0.01,
+            )
+
+    def verdict(reason="Краткая причина. Нужна локальная проверка."):
+        return {
+            "decision": "repair",
+            "confidence": "high",
+            "reason": reason,
+            "required_invariant": "Смысл должен быть сохранён.",
+            "forbidden_interpretations": ["Не менять субъект."],
+            "repair_scope": "span",
+            "target_span": "фрагмент",
+        }
+
+    compact_json = json.dumps(verdict(), ensure_ascii=False)
+    json_stage = dict(v31_cross_verify.DEFAULT_QWEN)
+    json_messages = [{"role": "system", "content": "Return JSON."}]
+
+    client = FakeJsonClient([
+        ('{"decision":"repair","reason":"обрезано', "length"),
+        (compact_json, "stop"),
+    ])
+    parsed, diagnostics = complete_json(
+        FakeJsonRuntime, client, json_messages, json_stage, 1400,
+        "test:length-retry", 3, validator=v31_cross_verify.parse,
+        length_retry_max_tokens=1600,
+    )
+    assert parsed["decision"] == "repair"
+    assert client.budgets == [1400, 1600]
+    assert [item["max_tokens"] for item in diagnostics] == [1400, 1600]
+    assert diagnostics[0]["finish_reason"] == "length" and not diagnostics[0]["ok"]
+    assert "обрезан" in client.messages[1][-1]["content"]
+    assert "Не продолжай" in client.messages[1][-1]["content"]
+
+    client = FakeJsonClient([(compact_json, "length"), (compact_json, "stop")])
+    _, diagnostics = complete_json(
+        FakeJsonRuntime, client, json_messages, json_stage, 1400,
+        "test:valid-but-length", 3, validator=v31_cross_verify.parse,
+        length_retry_max_tokens=1600,
+    )
+    assert client.budgets == [1400, 1600]
+    assert diagnostics[0]["finish_reason"] == "length" and not diagnostics[0]["ok"]
+
+    client = FakeJsonClient([(compact_json, "length")])
+    _, diagnostics = complete_json(
+        FakeJsonRuntime, client, json_messages, json_stage, 1400,
+        "test:length-awareness-opt-in", 3, validator=v31_cross_verify.parse,
+    )
+    assert client.budgets == [1400]
+    assert diagnostics[0]["ok"] and diagnostics[0]["finish_reason"] == "length"
+
+    client = FakeJsonClient([(compact_json, "length")] * 3)
+    try:
+        complete_json(
+            FakeJsonRuntime, client, json_messages, json_stage, 1400,
+            "test:all-length", 3, validator=v31_cross_verify.parse,
+            length_retry_max_tokens=1600,
+        )
+        raise AssertionError("Expected JsonGenerationError")
+    except JsonGenerationError as exc:
+        assert client.budgets == [1400, 1600, 1600]
+        assert [item["max_tokens"] for item in exc.attempt_errors] == [1400, 1600, 1600]
+        assert all(item.get("finish_reason") == "length" for item in exc.attempt_errors)
+
+    client = FakeJsonClient([
+        ('{"decision":"repair","reason":"обрезано', "stop"),
+        (compact_json, "stop"),
+    ])
+    _, diagnostics = complete_json(
+        FakeJsonRuntime, client, json_messages, json_stage, 1400,
+        "test:no-json-repair", 3, validator=v31_cross_verify.parse,
+        length_retry_max_tokens=1600,
+    )
+    assert client.budgets == [1400, 1400]
+    assert not diagnostics[0]["ok"] and "Invalid JSON response" in diagnostics[0]["error"]
+
+    try:
+        v31_cross_verify.parse(verdict("x" * 801))
+        raise AssertionError("Expected long reason rejection")
+    except ValueError as exc:
+        assert "reason exceeds 800" in str(exc)
+    assert v31_cross_verify.parse(verdict())["reason"] == verdict()["reason"]
+
+    with tempfile.TemporaryDirectory() as temp:
+        cache = Path(temp) / "cached.json"
+        cached_record = {"issue_id": "cached", **verdict()}
+        cache.write_text(json.dumps(cached_record, ensure_ascii=False), encoding="utf-8")
+        before = cache.read_bytes()
+        calls = 0
+
+        def should_not_generate():
+            nonlocal calls
+            calls += 1
+            raise AssertionError("Cached issue called model generator")
+
+        reused = v31_cross_verify.load_or_generate(cache, False, should_not_generate)
+        assert calls == 0 and reused["issue_id"] == "cached"
+        assert cache.read_bytes() == before
 
     qwen = issue_record(
         pid="p00001", category="meaning", problem="wrong idiom",
@@ -164,7 +288,7 @@ def run(project_root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project-root", type=Path, required=True)
+    parser.add_argument("--project-root", type=Path, default=HERE.parent)
     args = parser.parse_args()
     run(args.project_root.resolve())
     print("Pact v3.1 offline self-tests passed")
