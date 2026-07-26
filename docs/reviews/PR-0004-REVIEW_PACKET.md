@@ -95,8 +95,10 @@ is not a stable blocking signal.
 
 - Cache format, identity, keys, paths, and reuse logic are unchanged.
 - Development did not write production run artifacts or cache files.
-- Production cache count changed externally from 34 to 37 during investigation
+- Production cache count changed externally from 34 to 49 during investigation
   due to later user-run activity; the production tracked tree remained clean.
+  The final observed 49-file manifest SHA-256 was
+  `B076EAA28FBC77309EC4A37888B1EBCDABAC205B2E1354F646927D3D9312A6E0`.
 - Plain resume is structurally safe after reviewed deployment: preflight runs,
   valid results continue, and existing caches are reused normally.
 - `preflight_performance.json` will be overwritten by the next run with the
