@@ -30,6 +30,7 @@ $Python = 'py'
 $RequiredRunnerFiles = @(
     'prepare_pipeline_context.py',
     'v31_chapter_resolver.py',
+    'v31_final_ledger_scope.py',
     'v31_common.py',
     'v31_preflight_policy.ps1',
     'v31_runner_model_policy.ps1',
@@ -611,11 +612,13 @@ function Get-RetryCount {
 }
 
 function Run-AuditPass {
-    param([string]$PassName, [string]$TranslationsFile, [string]$PidFile = '')
+    param([string]$PassName, [string]$TranslationsFile, [string]$PidFile = '', [string]$PidMap = '')
     $extra = @('--pass-name',$PassName)
     if ($TranslationsFile) { $extra += @('--translations-file',$TranslationsFile) }
     if ($PidFile) { $extra += @('--pids-file',$PidFile) }
+    if ($PidMap) { $extra += @('--pids-map',$PidMap) }
     if ($RedoQuality) { $extra += '--force' }
+    $downstreamExtra = @($extra | Where-Object { $_ -ne '--pids-file' -and $_ -ne $PidFile -and $_ -ne '--pids-map' -and $_ -ne $PidMap })
 
     Invoke-AggregateModelStage -Label "$PassName Qwen semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','qwen_semantic','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_semantic.json" -Force ([bool]$RedoQuality)
 
@@ -623,20 +626,20 @@ function Run-AuditPass {
     Invoke-AggregateModelStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_russian.json" -Force ([bool]$RedoQuality)
     # Final smoke is intentionally one source-grounded Qwen chapter pass;
     # local semantic/Russian audits remain restricted to ledger PIDs.
-    $discourseExtra = @($extra | Where-Object { $_ -ne '--pids-file' -and $_ -ne $PidFile })
+    $discourseExtra = $downstreamExtra
     if ($PassName -eq 'final') {
         Invoke-AggregateModelStage -Label 'final Qwen source-grounded global smoke' -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','qwen_global_smoke','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_global_smoke.json" -Force ([bool]$RedoQuality)
     } else {
         Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
     }
 
-    Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $extra)
+    Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $downstreamExtra)
 
-    Invoke-AggregateModelStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','gemma','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\cross_verify_gemma.json" -Force ([bool]$RedoQuality)
+    Invoke-AggregateModelStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $downstreamExtra + @('--judge','gemma','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\cross_verify_gemma.json" -Force ([bool]$RedoQuality)
 
-    Invoke-AggregateModelStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','qwen','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\cross_verify_qwen.json" -Force ([bool]$RedoQuality)
+    Invoke-AggregateModelStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $downstreamExtra + @('--judge','qwen','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\cross_verify_qwen.json" -Force ([bool]$RedoQuality)
 
-    Invoke-PythonStage -Label "$PassName finalize verification" -Arguments (@((Join-Path $PackageRoot 'v31_finalize_verification.py')) + (CommonArgs) + $extra)
+    Invoke-PythonStage -Label "$PassName finalize verification" -Arguments (@((Join-Path $PackageRoot 'v31_finalize_verification.py')) + (CommonArgs) + $downstreamExtra)
 }
 
 function Run-RepairPass {
@@ -709,17 +712,16 @@ try {
 
     # The ledger is append-only and starts before the final targeted pass.
     Invoke-PythonStage -Label '9a/11 Append residual changed-PID lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','v31_primary_translations.json','--after','v31_final_translations.json','--stage','residual_repair','--reason','accepted residual repair'))
-    $finalLedger = Join-Path $WorkDir '*\v31_final_changed_pid_ledger.json'
-    # Per chapter paths are resolved by the audit script; the runner expands one
-    # ledger only because selected chapter runs are currently one chapter.
-    $finalLedger = (Get-ChildItem $WorkDir -Filter 'v31_final_changed_pid_ledger.json' -Recurse | Select-Object -First 1).FullName
-    Run-AuditPass 'final' 'v31_final_translations.json' $finalLedger
+    $finalLedgerScope = Join-Path $RunRoot 'v31_final_changed_pid_ledger_scope.json'
+    Invoke-PythonStage -Label '9a/11 Resolve canonical final changed-PID ledgers' -Arguments (@((Join-Path $PackageRoot 'v31_final_ledger_scope.py')) + @('--manifest',$ChapterManifestPath,'--work-dir',$WorkDir,'--output',$finalLedgerScope))
+    Run-AuditPass 'final' 'v31_final_translations.json' '' $finalLedgerScope
     foreach ($chapter in Get-ChildItem $WorkDir -Directory) {
         Copy-Item (Join-Path $chapter.FullName 'v31_final_translations.json') (Join-Path $chapter.FullName 'v31_pre_final_repair_translations.json') -Force
     }
     Run-RepairPass 'final' 'v31_final_translations.json' 1
     Invoke-PythonStage -Label '9b/11 Append final repair lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','v31_pre_final_repair_translations.json','--after','v31_final_translations.json','--stage','final_repair','--reason','accepted final repair'))
-    Run-AuditPass 'final' 'v31_final_translations.json' $finalLedger
+    Invoke-PythonStage -Label '9b/11 Refresh canonical final changed-PID ledgers' -Arguments (@((Join-Path $PackageRoot 'v31_final_ledger_scope.py')) + @('--manifest',$ChapterManifestPath,'--work-dir',$WorkDir,'--output',$finalLedgerScope))
+    Run-AuditPass 'final' 'v31_final_translations.json' '' $finalLedgerScope
 
     Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs) + '--final-lifecycle')
     $quarantined = @(Get-ChildItem $WorkDir -Filter 'v31_quality_gate.json' -Recurse | Where-Object {

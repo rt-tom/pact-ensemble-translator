@@ -529,7 +529,7 @@ def add_common_args(parser: argparse.ArgumentParser, *, include_pass: bool = Tru
     parser.add_argument("--start", type=int, required=True)
     parser.add_argument("--end", type=int, required=True)
     if include_pass:
-        parser.add_argument("--pass-name", choices=["primary", "residual"], default="primary")
+        parser.add_argument("--pass-name", choices=["primary", "residual", "final"], default="primary")
     parser.add_argument("--model")
     parser.add_argument("--force", action="store_true")
 
