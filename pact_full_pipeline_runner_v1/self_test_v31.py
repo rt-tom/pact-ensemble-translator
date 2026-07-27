@@ -83,6 +83,7 @@ def run(project_root: Path) -> None:
     assert diagnostics[0]["finish_reason"] == "length" and not diagnostics[0]["ok"]
     assert "обрезан" in client.messages[1][-1]["content"]
     assert "Не продолжай" in client.messages[1][-1]["content"]
+    assert "не более 800 символов" not in client.messages[1][-1]["content"]
 
     client = FakeJsonClient([(compact_json, "length"), (compact_json, "stop")])
     _, diagnostics = complete_json(
@@ -125,6 +126,29 @@ def run(project_root: Path) -> None:
     )
     assert client.budgets == [1400, 1400]
     assert not diagnostics[0]["ok"] and "Invalid JSON response" in diagnostics[0]["error"]
+
+    long_reason_json = json.dumps(verdict("x" * 801), ensure_ascii=False)
+    client = FakeJsonClient([
+        (long_reason_json, "stop"),
+        ('{"decision":"repair","reason":"обрезано', "length"),
+        (compact_json, "stop"),
+    ])
+    parsed, diagnostics = complete_json(
+        FakeJsonRuntime, client, json_messages, json_stage, 1400,
+        "test:mixed-validation-length-retry", 3,
+        validator=v31_cross_verify.parse,
+        length_retry_max_tokens=1600,
+        retry_guidance=v31_cross_verify.CROSS_VERIFY_RETRY_GUIDANCE,
+    )
+    assert parsed["reason"] == verdict()["reason"]
+    assert client.budgets == [1400, 1400, 1600]
+    assert "reason exceeds 800" in diagnostics[0]["error"]
+    assert diagnostics[1]["finish_reason"] == "length"
+    assert "не более 800 символов" in client.messages[1][-1]["content"]
+    assert "не более 800 символов" in client.messages[2][-1]["content"]
+    assert "Не продолжай" in client.messages[2][-1]["content"]
+    assert long_reason_json not in client.messages[1][-1]["content"]
+    assert long_reason_json not in client.messages[2][-1]["content"]
 
     try:
         v31_cross_verify.parse(verdict("x" * 801))

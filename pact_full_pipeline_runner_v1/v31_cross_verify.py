@@ -26,6 +26,14 @@ DEFAULT_GEMMA = {
     "context_size": 2,
 }
 
+CROSS_VERIFY_RETRY_GUIDANCE = (
+    "Для cross-verification заново сформируй весь JSON object. "
+    "reason должен содержать 2–3 коротких предложения, не более 800 символов "
+    "(предпочтительно до 400), без пересказа контекста и подробных рассуждений. "
+    "required_invariant должен быть одним коротким проверяемым условием не более "
+    "500 символов; target_span — не более 600 символов."
+)
+
 
 def messages(runtime, cfg, work, blocks, block_map, translations, issue, judge):
     defaults = DEFAULT_QWEN if judge == "qwen" else DEFAULT_GEMMA
@@ -53,8 +61,10 @@ decision:
 Не оценивай предложенную формулировку — её ещё нет. Сформулируй проверяемый
 required_invariant, которому должна соответствовать будущая правка.
 Верни один полный JSON object. Никаких Markdown и текста вне JSON.
-reason — 2–3 коротких предложения. required_invariant — одно короткое
-проверяемое условие. Не повторяй весь контекст и рассуждения.
+reason — 2–3 коротких предложения, максимум 800 символов
+(предпочтительно до 400). required_invariant — одно короткое проверяемое
+условие, максимум 500 символов. target_span — максимум 600 символов.
+Не повторяй весь контекст и рассуждения.
 Если decision=keep, используй repair_scope="span" как нейтральное
 schema-compatible значение. Если decision=repair или uncertain, выбери
 фактический span, sentence или paragraph. Не используй "none".
@@ -204,6 +214,7 @@ def main() -> int:
                         int(stage["length_retry_max_tokens"])
                         if stage.get("length_retry_max_tokens") is not None else None
                     ),
+                    retry_guidance=CROSS_VERIFY_RETRY_GUIDANCE,
                 )
                 return {
                     "version": VERSION,

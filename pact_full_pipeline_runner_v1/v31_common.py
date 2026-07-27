@@ -23,7 +23,7 @@ class JsonGenerationError(RuntimeError):
         self.attempt_errors = attempt_errors
 
 
-VERSION = "3.1.2g"
+VERSION = "3.1.2h"
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -241,6 +241,7 @@ def complete_json(
     runtime, client, messages: list[dict[str, str]], stage: dict[str, Any],
     max_tokens: int, label: str, attempts: int = 3, validator=None,
     length_retry_max_tokens: int | None = None,
+    retry_guidance: str | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Generate JSON and optionally validate/transform its schema inside retries."""
     errors: list[dict[str, Any]] = []
@@ -270,6 +271,8 @@ def complete_json(
                     ". Верни только краткий JSON, строго по указанной схеме, "
                     "со всеми обязательными PID/полями, без markdown и комментариев."
                 )
+            if retry_guidance:
+                retry_instruction += " " + retry_guidance.strip()
             retry_messages = list(messages) + [{
                 "role": "system",
                 "content": retry_instruction,
