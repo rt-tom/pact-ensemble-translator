@@ -595,6 +595,19 @@ function CommonArgs {
     return @('--project-root',$ProjectRoot,'--config',$ConfigPath,'--start',"$Start",'--end',"$End")
 }
 
+function Test-PrepareContextModelRequired {
+    # Preparing a manifest is deterministic, but a missing chapter bible is not:
+    # prepare_pipeline_context calls GemmaTranslate to create it.  Keep resumes
+    # with every bible present model-free, and start only our owned server before
+    # the first genuinely model-required preparation.
+    foreach ($stem in $SelectedChapterStems) {
+        if (-not (Test-Path (Join-Path (Join-Path $WorkDir $stem) 'chapter_bible.json'))) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Remove-SelectedOutputs {
     foreach ($inputFile in $SelectedInputFiles) {
         Remove-Item (Join-Path $OutputDir $inputFile.Name) -Force -ErrorAction SilentlyContinue
@@ -694,6 +707,9 @@ try {
     Write-Host "Run root: $RunRoot" -ForegroundColor White
 
     $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)
+    if (Test-PrepareContextModelRequired) {
+        Start-LlamaServer GemmaTranslate
+    }
     Invoke-PythonStage -Label '1/11 Prepare manifest, chapter bible, frozen glossary' -Arguments $prepareArgs
 
     $dagArgs = @((Join-Path $PackageRoot 'v31_artifact_dag.py'), '--work-dir',$WorkDir,'--output-dir',$OutputDir,'--run-root',$RunRoot)
