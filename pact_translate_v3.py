@@ -56,6 +56,8 @@ DEFAULTS: dict[str, Any] = {
         "work_dir": "./pact_work_v3",
         "logs_dir": "./logs_v3",
         "glossary_dir": "./glossary",
+        "run_glossary_candidate_ledger": "./pact_work_v3/glossary_candidates.run.json",
+        "book_glossary_candidate_ledger": "./glossary_candidates.json",
         "arc_names_file": "./arc_names.json",
         "book_bible_file": "./book_bible.json",
     },
@@ -470,6 +472,10 @@ class Glossary:
         self.established = read_json(self.established_path, {})
         self.provisional = read_json(self.provisional_path, {})
         self.conflicts = read_json(self.conflicts_path, {})
+        self.candidate_ledger = GlossaryCandidateLedger(
+            Path(cfg["paths"]["run_glossary_candidate_ledger"]),
+            Path(cfg["paths"]["book_glossary_candidate_ledger"]),
+        )
 
     @staticmethod
     def target(record: Any) -> Optional[str]:
@@ -515,7 +521,7 @@ class Glossary:
                     )
         return "\n".join(lines) or "(пусто)"
 
-    def update(
+    def legacy_update(
         self, chapter_name: str, source_text: str,
         candidates: list[dict[str, Any]],
     ) -> dict[str, int]:
@@ -592,6 +598,115 @@ class Glossary:
         atomic_json(self.established_path, self.established)
         atomic_json(self.provisional_path, self.provisional)
         atomic_json(self.conflicts_path, self.conflicts)
+        return stats
+
+    def update(
+        self, chapter_name: str, source_text: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        return self.candidate_ledger.observe_chapter(
+            chapter_name, source_text, candidates,
+            stage="chapter_bible", detector="translator",
+        )
+
+
+class GlossaryCandidateLedger:
+    """Append-only, non-authoritative proposals kept outside the glossary."""
+
+    VERSION = 1
+
+    def __init__(self, run_path: Path, book_path: Path):
+        self.run_path, self.book_path = run_path, book_path
+
+    @staticmethod
+    def _empty() -> dict[str, Any]:
+        return {"version": GlossaryCandidateLedger.VERSION, "candidates": {}}
+
+    @staticmethod
+    def _identity(prefix: str, value: Any) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        return prefix + hashlib.sha256(encoded).hexdigest()[:20]
+
+    @classmethod
+    def candidate_id(cls, source: str, kind: str) -> str:
+        return cls._identity("glc_", {"source": source.casefold(), "type": kind.casefold()})
+
+    @staticmethod
+    def _load(path: Path) -> dict[str, Any]:
+        data = read_json(path, GlossaryCandidateLedger._empty())
+        if not isinstance(data, dict) or not isinstance(data.get("candidates"), dict):
+            raise PipelineError(f"Invalid glossary candidate ledger: {path}")
+        return data
+
+    @staticmethod
+    def _merge(data: dict[str, Any], incoming: dict[str, Any]) -> dict[str, int]:
+        stats = {"candidates": 0, "observations": 0, "conflicts": 0}
+        all_records = data.setdefault("candidates", {})
+        for candidate_id, record in incoming.items():
+            current = all_records.setdefault(candidate_id, {
+                "candidate_id": candidate_id, "source": record["source"],
+                "type": record["type"], "status": "candidate",
+                "proposals": {}, "observations": [],
+            })
+            if current.get("status") not in {"candidate", "rejected", "promoted"}:
+                raise PipelineError(f"Invalid glossary candidate status: {candidate_id}")
+            known = {item["observation_id"] for item in current["observations"]}
+            for observation in record["observations"]:
+                proposal = observation["proposed_translation"]
+                proposal_state = current["proposals"].setdefault(proposal, {
+                    "sightings": 0, "observation_ids": [], "alternatives": [],
+                })
+                for alternative in observation["alternatives"]:
+                    if alternative not in proposal_state["alternatives"]:
+                        proposal_state["alternatives"].append(alternative)
+                proposal_state["sightings"] += 1
+                if observation["observation_id"] not in known:
+                    current["observations"].append(observation)
+                    proposal_state["observation_ids"].append(observation["observation_id"])
+                    known.add(observation["observation_id"])
+                    stats["observations"] += 1
+            stats["candidates"] += 1
+            stats["conflicts"] += int(len(current["proposals"]) > 1)
+        return stats
+
+    def observe_chapter(self, chapter: str, source_text: str,
+                        raw_candidates: list[dict[str, Any]], *, stage: str,
+                        detector: str) -> dict[str, int]:
+        incoming: dict[str, Any] = {}
+        for raw in raw_candidates:
+            source = norm(str(raw.get("english") or raw.get("source") or ""))
+            target = norm(str(raw.get("russian") or raw.get("target") or ""))
+            kind = norm(str(raw.get("type") or "other")).casefold()
+            occurrences = len(re.findall(re.escape(source), source_text, flags=re.I)) if source else 0
+            if not source or not target or not occurrences or "/" in target or "→" in target:
+                continue
+            alternatives = [norm(str(item)) for item in raw.get("alternatives", [])
+                            if norm(str(item)) and norm(str(item)) != target]
+            observation = {
+                "proposed_translation": target, "alternatives": alternatives,
+                "confidence": raw.get("confidence"),
+                "provenance": {
+                    "chapter": chapter,
+                    "pids": sorted({str(pid) for pid in raw.get("source_pids", [])}),
+                    "stage": stage, "detector": detector,
+                    "model": str(raw.get("model") or ""),
+                    "evidence": raw.get("evidence") or source,
+                    "occurrences": occurrences,
+                },
+            }
+            observation["observation_id"] = self._identity("obs_", observation)
+            candidate_id = self.candidate_id(source, kind)
+            incoming.setdefault(candidate_id, {
+                "source": source, "type": kind, "observations": [],
+            })["observations"].append(observation)
+        run = self._load(self.run_path)
+        stats = self._merge(run, incoming)
+        atomic_json(self.run_path, run)
+        book = self._load(self.book_path)
+        self._merge(book, incoming)
+        atomic_json(self.book_path, book)
+        stats["promoted"] = 0
         return stats
 
 
@@ -948,7 +1063,8 @@ def chapter_bible_messages(
               "gender":"male|female|unknown","notes":"","forbidden_targets":[]}],
  "address_register":[{"from":"","to":"","register":"ты|вы|unknown","source_pids":[]}],
  "facts":[{"fact":"","source_pids":[]}],
- "terms":[{"english":"","russian":"","type":"character|term|place|entity"}]
+ "terms":[{"english":"","russian":"","type":"character|term|place|entity",
+           "source_pids":[],"evidence":"","alternatives":[],"confidence":null}]
 }
 Особенно фиксируй пол, родство, транспорт, животных, возраст, точное время,
 числа, ты/вы и устойчивые имена.
@@ -3139,6 +3255,21 @@ class Runner:
         atomic_json(path, bible)
         source_text = "\n".join(block.source_text for block in blocks)
         terms = bible.get("terms") or []
+        if isinstance(terms, list):
+            enriched_terms = []
+            for term in terms:
+                if not isinstance(term, dict):
+                    continue
+                item = dict(term)
+                source = norm(str(item.get("english") or item.get("source") or ""))
+                if not item.get("source_pids") and source:
+                    item["source_pids"] = [
+                        block.pid for block in blocks
+                        if re.search(re.escape(source), block.source_text, flags=re.I)
+                    ]
+                item.setdefault("model", self.translator.cfg.get("model", ""))
+                enriched_terms.append(item)
+            terms = enriched_terms
         glossary_stats = (
             self.glossary.update(source_path.name, source_text, terms)
             if isinstance(terms, list) else {}
