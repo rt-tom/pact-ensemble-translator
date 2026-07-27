@@ -12,7 +12,7 @@ from v31_common import (
     chapter_context, complete_json, dialogue_scene_notes, glossary_prompt, issue_record,
     load_cfg, load_manifest, load_runtime, load_translations, norm,
     read_json, render_pairs, scene_notes_for_pids, selected_chapters,
-    cache_identity, cache_reuse, setup_logging, stage_cfg, with_cache_identity, write_json,
+    setup_logging, stage_cfg, write_json,
 )
 
 DEFAULTS = {
@@ -369,6 +369,9 @@ def main() -> int:
         detector = f"{args.mode}_{args.pass_name}"
         root = work / "v31" / args.pass_name / "audits" / args.mode
         consolidated = work / "v31" / args.pass_name / f"{args.mode}.json"
+        if consolidated.exists() and not args.force:
+            logging.info("Reusing %s", consolidated)
+            continue
         root.mkdir(parents=True, exist_ok=True)
         all_issues: list[dict[str, Any]] = []
         covered: set[str] = set()
@@ -387,6 +390,9 @@ def main() -> int:
             units = list(batched(pids, int(stage["batch_pids"])))
 
         def evaluate_unit(unit_pids: list[str], cache_path: Path, label: str):
+            if cache_path.exists() and not args.force:
+                saved = read_json(cache_path, {})
+                return saved.get("issues") or [], saved.get("coverage") or []
             if args.mode == "qwen_semantic":
                 local_stage, messages = qwen_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
             elif args.mode == "gemma_semantic":
@@ -395,19 +401,6 @@ def main() -> int:
                 local_stage, messages = gemma_local_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
             else:
                 local_stage, messages = discourse_messages(cfg, work, block_map, translations, unit_pids, args.pass_name)
-            identity = cache_identity(
-                producer="v31_audit", schema="audit-unit/v1",
-                source={"chapter": source_path.name, "blocks": blocks},
-                inputs={"pids": unit_pids, "translations": translations, "pass": args.pass_name, "mode": args.mode},
-                config=local_stage, prompt=messages,
-                profile={"model": args.model or cfg[api_section].get("model"), "api": api_section},
-            )
-            if not args.force:
-                saved, reason = cache_reuse(cache_path, identity)
-                if saved is not None:
-                    return saved.get("issues") or [], saved.get("coverage") or []
-                if cache_path.exists():
-                    logging.info("Cache miss %s: %s", cache_path, reason)
             validator = (
                 (lambda data, expected=unit_pids, source=detector: parse_discourse(data, expected, source))
                 if args.mode == "gemma_discourse"
@@ -450,7 +443,7 @@ def main() -> int:
                     "split": True,
                     "children": [left_pids, right_pids],
                 }
-            write_json(cache_path, with_cache_identity(record, identity))
+            write_json(cache_path, record)
             return local_issues, local_covered
 
         for index, unit in enumerate(units, 1):
