@@ -69,6 +69,35 @@ function Test-OwnedProcess($State) {
     if ($null -eq $ownedPid) { return $false }
     return $null -ne (Get-Process -Id ([int]$ownedPid) -ErrorAction SilentlyContinue)
 }
+function Get-LiveDiagnostics($Root, $Work, $Profile) {
+    # Diagnostics are deliberately one-way: they are never used by the state
+    # machine below to decide ACTIVE/COMPLETE/READY.
+    $logs = Join-Path $Root 'server_logs'
+    $log = if (Test-Path -LiteralPath $logs) {
+        Get-ChildItem -LiteralPath $logs -Filter $(if ($Profile -and $Profile -ne 'none') { "${Profile}_*_stderr.log" } else { '*_stderr.log' }) -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    }
+    if (-not $log) { return @{ summary='server log: N/A'; progress=@() } }
+    $age = ((Get-Date).ToUniversalTime() - $log.LastWriteTimeUtc).TotalSeconds
+    $tail = @(Get-Content -LiteralPath $log.FullName -Tail 700 -ErrorAction SilentlyContinue)
+    $prompt = ($tail | Where-Object { $_ -match 'prompt eval time\s*=' } | Select-Object -Last 1)
+    $generation = ($tail | Where-Object { $_ -match '\beval time\s*=' -and $_ -notmatch 'prompt eval time' } | Select-Object -Last 1)
+    $live = ($tail | Where-Object { $_ -match '\bn_decoded\s*=' -and $_ -match '\btg\s*=' } | Select-Object -Last 1)
+    $pt = if ($prompt -match '([\d.]+)\s+tokens per second') { $Matches[1] } else { 'N/A' }
+    $gt = if ($generation -match '([\d.]+)\s+tokens per second') { $Matches[1] } else { 'N/A' }
+    $decoded = if ($live -match '\bn_decoded\s*=\s*(\d+)') { $Matches[1] } else { 'N/A' }
+    $liveTps = if ($live -match '\btg\s*=\s*([\d.]+)\s+t/s') { $Matches[1] } else { 'N/A' }
+    $label = if ($age -gt 30) { 'stale' } else { 'live' }
+    $progress = @()
+    foreach ($dir in @(Get-ChildItem -LiteralPath $Work -Directory -ErrorAction SilentlyContinue)) {
+        $batches = @(Get-ChildItem -LiteralPath (Join-Path $dir.FullName 'v31_source_analysis') -Filter 'batch_*.json' -File -ErrorAction SilentlyContinue).Count
+        if ($batches -gt 0) { $progress += "$($dir.Name) source batches: $batches" }
+        $draft = Read-JsonSafe (Join-Path $dir.FullName 'draft_translations.json')
+        $total = @((Read-JsonSafe (Join-Path $dir.FullName 'manifest.json')).blocks).Count
+        if ($draft) { $progress += "$($dir.Name) translation: $(@($draft.PSObject.Properties).Count)/$total" }
+    }
+    return @{ summary="server log: $label; prompt: $pt t/s; generation: $gt t/s; live: $liveTps t/s; decoded: $decoded; MTP: N/A"; progress=$progress }
+}
 function Show-Monitor {
     if (-not (Test-Path -LiteralPath $RunRoot)) { Write-Host "Run has not started: $RunRoot" -ForegroundColor Yellow; return }
     $config = Read-JsonSafe (Join-Path $RunRoot 'config.full_pipeline.v31.json')
@@ -122,7 +151,9 @@ function Show-Monitor {
     $failure = Get-Value $state 'failure_reason' 'none'
     $blocked = ($status -eq 'FAILED' -or $mixed.Count -gt 0)
     if ($stale) { $blocked = $true }
+    $diagnostics = Get-LiveDiagnostics $RunRoot $WorkDir $profile
     Write-Host "PACT MONITOR v$MonitorVersion  build: $buildIdentity; artifact version: $expectedArtifactVersion"
+    Write-Host 'AUTHORITATIVE STATE'
     Write-Host "Stage: $stage"
     Write-Host "Outcome/status: $status"
     Write-Host "Owned model: $profile; process active: $processActive"
@@ -135,5 +166,8 @@ function Show-Monitor {
     Write-Host "Mixed-version artifacts: $(if ($mixed) { $mixed -join ', ' } else { 'none' })"
     Write-Host "Legacy-compatible artifacts: $(if ($legacyCompatible) { $legacyCompatible -join ', ' } else { 'none' })"
     Write-Host "Resume: $(if ($blocked) { 'BLOCKED' } else { 'READY' })"
+    Write-Host 'LIVE DIAGNOSTICS (non-authoritative)'
+    Write-Host $diagnostics.summary
+    Write-Host "Progress: $(if ($diagnostics.progress) { $diagnostics.progress -join '; ' } else { 'N/A' })"
 }
 while ($true) { if (-not $Once) { Clear-Host }; Show-Monitor; if ($Once) { break }; Start-Sleep -Seconds ([math]::Max(1,$RefreshSeconds)) }
