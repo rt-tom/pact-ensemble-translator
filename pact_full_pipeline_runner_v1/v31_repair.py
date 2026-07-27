@@ -139,6 +139,15 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
             # field remains authoritative in every other case.
             elif text == current and new and new != current:
                 after = new
+            # Models can also copy EN into ``text`` while producing a complete
+            # valid Russian replacement in ``new``.  Keep ``text``
+            # authoritative unless it fails repair validation and ``new``
+            # independently passes it.
+            elif new and new != current:
+                text_errors = runtime.validate_single_repair(pid, text, block_map, cfg, current)
+                new_errors = runtime.validate_single_repair(pid, new, block_map, cfg, current)
+                if text_errors and not new_errors:
+                    after = new
         else:
             if not challenge:
                 errors.append("challenge reason is empty")

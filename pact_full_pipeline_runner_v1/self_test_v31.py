@@ -329,6 +329,18 @@ def run(project_root: Path) -> None:
     assert candidates[0]["after"] == "Их трудно прикончить."
     assert candidates[0]["valid"]
 
+    # A replace_full response can place EN in ``text`` while ``new`` contains
+    # the complete valid Russian repair.  The valid field must recover it.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_full",
+            "old": "", "new": "Их трудно прикончить.",
+            "text": "They are hard to put down.", "reason": "idiom", "challenge_reason": "",
+        }]
+    }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["after"] == "Их трудно прикончить."
+    assert candidates[0]["valid"]
+
     qgate = v31_postcheck.parse({
         "verdict": "accept", "confidence": "high", "issue_valid": True,
         "faithful_to_source": True, "all_issues_fixed": True,
