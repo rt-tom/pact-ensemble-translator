@@ -29,6 +29,7 @@ $Python = 'py'
 
 $RequiredRunnerFiles = @(
     'prepare_pipeline_context.py',
+    'v31_chapter_resolver.py',
     'v31_common.py',
     'v31_preflight_policy.ps1',
     'v31_runner_model_policy.ps1',
@@ -68,11 +69,10 @@ $ServerLogsDir = Join-Path $RunRoot 'server_logs'
 $GlossaryDir = Join-Path $RunRoot 'glossary'
 $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
+$ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
 
-$AllInputFiles = @(Get-ChildItem (Join-Path $ProjectRoot 'pact_chapters') -Filter '*.html' -File | Sort-Object Name)
-$SelectedInputFiles = @($AllInputFiles | Select-Object -Skip ([math]::Max(0, $Start - 1)) -First ([math]::Max(0, $End - $Start + 1)))
-if ($SelectedInputFiles.Count -ne ($End - $Start + 1)) { throw "Requested chapter range $Start-$End is outside available inputs." }
-$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
+$SelectedInputFiles = @()
+$SelectedChapterStems = @()
 
 if ($Reset -and (Test-Path $RunRoot)) {
     Write-Host "Removing previous v3.1 run: $RunRoot" -ForegroundColor Yellow
@@ -166,6 +166,7 @@ $paths['logs_dir'] = $LogsDir
 $paths['glossary_dir'] = $GlossaryDir
 $paths['book_bible_file'] = $BookBiblePath
 $paths['arc_names_file'] = (Join-Path $ProjectRoot 'arc_names.json')
+$paths['chapter_manifest_file'] = $ChapterManifestPath
 
 $chapterBible['enabled'] = $true
 $chapterBible['required'] = $true
@@ -216,6 +217,12 @@ $configJson = $cfg | ConvertTo-Json -Depth 60
     $configJson,
     [System.Text.UTF8Encoding]::new($false)
 )
+
+$resolverPath = Join-Path $PackageRoot 'v31_chapter_resolver.py'
+$chapterManifest = & $Python $resolverPath --project-root $ProjectRoot --input-dir $paths['input_dir'] --start $Start --end $End --manifest $ChapterManifestPath | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "Canonical chapter resolver failed with exit code $LASTEXITCODE" }
+$SelectedInputFiles = @($chapterManifest.chapters | ForEach-Object { Get-Item (Join-Path $ProjectRoot $_.source_path) })
+$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
 
 $script:ServerProcess = $null
 $script:CurrentServerStderr = $null
