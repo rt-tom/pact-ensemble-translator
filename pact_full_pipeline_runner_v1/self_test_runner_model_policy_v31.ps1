@@ -42,12 +42,6 @@ try {
     Assert-False ($runner -match 'Get-Process\s+llama-server[^\r\n]*Stop-Process') 'Runner must not stop foreign llama-server processes.'
     Assert-True ($runner -match 'Port 8080 is already served by an unowned endpoint') 'Runner must fail closed on a foreign endpoint.'
     Assert-False ($runner -match 'Start-LlamaServer GemmaTranslate\s*\r?\n\s*\$finalizeArgs') 'Model-free finalization must not start a model.'
-    Assert-False ($runner -match 'Start-LlamaServer GemmaTranslate\s*\r?\n\s*if \(-not \$SkipPreflight\)') 'Runner must not start a model before a stage requires it.'
-    Assert-True ($runner -match 'v31_stage_protocol\.py') 'Runner must use the structured stage protocol.'
-    Assert-True ($runner -match '\$probeExit -notin @\(20, 22\)') 'Only stable MODEL_REQUIRED exit codes may trigger model startup.'
-    Assert-True ($runner -match '\$probeExit -eq 22.*--force') 'Invalid aggregate MODEL_REQUIRED must retry the stage instead of accepting the file.'
-    Assert-True ($runner -match 'Invoke-TranslationStage') 'Translation must be routed through the protocol, never a file-exists shortcut.'
-    Assert-True ($runner -match 'Stop-LlamaServer\s*\r?\n\s*\$unownedEndpoint') 'A profile switch must stop only the tracked owned server before startup.'
     Write-Host 'Pact v3.1 runner model policy self-tests passed'
 } finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

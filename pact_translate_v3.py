@@ -3421,16 +3421,6 @@ def resolve_paths(
 def select_files(
     cfg: dict[str, Any], start: Optional[int], end: Optional[int],
 ) -> list[Path]:
-    manifest_value = cfg["paths"].get("chapter_manifest_file")
-    if manifest_value:
-        resolver_dir = Path(__file__).resolve().parent / "pact_full_pipeline_runner_v1"
-        if str(resolver_dir) not in sys.path:
-            sys.path.insert(0, str(resolver_dir))
-        from v31_chapter_resolver import chapters_from_manifest
-        return chapters_from_manifest(
-            Path(manifest_value), Path(__file__).resolve().parent,
-            Path(cfg["paths"]["input_dir"]), start, end,
-        )
     files = sorted(
         Path(cfg["paths"]["input_dir"]).glob("*.html"),
         key=lambda path: natural_key(path.name),
