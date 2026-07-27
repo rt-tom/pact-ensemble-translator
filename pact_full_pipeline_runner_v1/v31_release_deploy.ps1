@@ -18,6 +18,34 @@ Set-StrictMode -Version Latest
 $ReleaseManifestSchema = 'pact-v31-release-manifest/v1'
 $DeploymentProvenanceSchema = 'pact-v31-installed-provenance/v1'
 
+function Assert-SupportedPowerShell {
+    $edition = [string]$PSVersionTable.PSEdition
+    $version = $PSVersionTable.PSVersion
+    $supported = ($edition -eq 'Desktop' -and $version.Major -eq 5 -and $version.Minor -ge 1) -or
+                 ($edition -eq 'Core' -and $version.Major -ge 7)
+    if (-not $supported) {
+        throw "Unsupported PowerShell environment: $edition $version. v31 release deployment supports Windows PowerShell 5.1 and PowerShell 7+."
+    }
+}
+
+function Get-Sha256Hex {
+    param([byte[]]$Bytes)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha256.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+    if ($Value.Length -eq 0) { return '""' }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
 function Invoke-Git {
     param([string]$Root, [string[]]$Arguments)
     $result = & git -C $Root @Arguments 2>&1
@@ -45,12 +73,17 @@ function Get-TagCommit {
 }
 
 function Get-Hash {
-    param([string]$Path)
+    param([string]$Path, [switch]$NormalizeText)
     $bytes = [IO.File]::ReadAllBytes($Path)
+    if (-not $NormalizeText) { return Get-Sha256Hex $bytes }
+    # Never decode binary content before hashing. Git's ordinary text checkout
+    # conversion is the only case where the active-path comparison needs CRLF
+    # normalization.
+    if ($bytes -contains [byte]0) { return Get-Sha256Hex $bytes }
     # Git checkout may materialize CRLF on Windows. Release hashes are of the
     # canonical Git text; normalize only line endings for the active-path check.
     $normalized = [Text.Encoding]::UTF8.GetBytes(([Text.Encoding]::UTF8.GetString($bytes) -replace "`r`n", "`n"))
-    return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($normalized))).ToLowerInvariant()
+    return Get-Sha256Hex $normalized
 }
 
 function Read-JsonFile {
@@ -148,16 +181,17 @@ function Get-GitBlobSha256 {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    [void]$psi.ArgumentList.Add('cat-file')
-    [void]$psi.ArgumentList.Add('blob')
-    [void]$psi.ArgumentList.Add("${Commit}:$RelativePath")
+    # ProcessStartInfo.ArgumentList is absent in Windows PowerShell 5.1.
+    # Build a Windows command line explicitly, then read stdout as bytes rather
+    # than permitting PowerShell text decoding or newline normalization.
+    $psi.Arguments = (@('cat-file', 'blob', "${Commit}:$RelativePath") | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' '
     $process = [Diagnostics.Process]::Start($psi)
     $buffer = [IO.MemoryStream]::new()
     $process.StandardOutput.BaseStream.CopyTo($buffer)
     $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) { throw "Cannot hash $RelativePath from ${Commit}: $stderr" }
-    return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($buffer.ToArray()))).ToLowerInvariant()
+    return Get-Sha256Hex $buffer.ToArray()
 }
 
 function New-Manifest {
@@ -235,7 +269,9 @@ function Assert-InstalledFiles {
     foreach ($item in @($Manifest.files)) {
         $path = Join-Path $Root ([string]$item.path)
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Installed file is absent from active path: $($item.path)" }
-        if ((Get-Hash $path) -ne $item.sha256) { throw "Installed hash differs from release manifest: $($item.path)" }
+        $rawHash = Get-Hash $path
+        $normalizedHash = Get-Hash $path -NormalizeText
+        if ($item.sha256 -ne $rawHash -and $item.sha256 -ne $normalizedHash) { throw "Installed hash differs from release manifest: $($item.path)" }
     }
 }
 
@@ -277,6 +313,7 @@ function Write-Provenance {
     if ($provenance.commit -ne $Manifest.commit -or $provenance.version -ne $Manifest.version) { throw 'Installed provenance read-back failed.' }
 }
 
+Assert-SupportedPowerShell
 $root = Get-ProjectRoot $ProjectRoot
 if (-not $ManifestPath) { $ManifestPath = Join-Path $root 'release_manifest.v31.json' }
 
