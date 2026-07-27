@@ -67,7 +67,9 @@ $WorkDir = Join-Path $RunRoot 'work'
 $OutputDir = Join-Path $RunRoot 'output'
 $LogsDir = Join-Path $RunRoot 'logs'
 $ServerLogsDir = Join-Path $RunRoot 'server_logs'
-$GlossaryDir = Join-Path $RunRoot 'glossary'
+$GlossaryDir = Join-Path $ProjectRoot 'glossary'
+$RunGlossaryCandidateLedger = Join-Path $RunRoot 'glossary_candidates.run.json'
+$BookGlossaryCandidateLedger = Join-Path $ProjectRoot 'pipeline_runs\glossary_candidates.book.json'
 $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
 $ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
@@ -81,7 +83,6 @@ if ($Reset -and (Test-Path $RunRoot)) {
     Remove-Item $RunRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path @($RunRoot, $WorkDir, $OutputDir, $LogsDir, $ServerLogsDir) | Out-Null
-if (-not (Test-Path $GlossaryDir)) { Copy-Item (Join-Path $ProjectRoot 'glossary') $GlossaryDir -Recurse -Force }
 if (-not (Test-Path $BookBiblePath)) {
     $sourceBookBible = Join-Path $ProjectRoot 'book_bible.json'
     if (Test-Path $sourceBookBible) { Copy-Item $sourceBookBible $BookBiblePath -Force }
@@ -166,6 +167,8 @@ $paths['output_dir'] = $OutputDir
 $paths['work_dir'] = $WorkDir
 $paths['logs_dir'] = $LogsDir
 $paths['glossary_dir'] = $GlossaryDir
+$paths['run_glossary_candidate_ledger'] = $RunGlossaryCandidateLedger
+$paths['book_glossary_candidate_ledger'] = $BookGlossaryCandidateLedger
 $paths['book_bible_file'] = $BookBiblePath
 $paths['arc_names_file'] = (Join-Path $ProjectRoot 'arc_names.json')
 $paths['chapter_manifest_file'] = $ChapterManifestPath
