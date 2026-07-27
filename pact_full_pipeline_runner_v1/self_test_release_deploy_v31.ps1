@@ -53,6 +53,12 @@ try {
     $failed = $false; try { & $script -NewReleaseManifest -ProjectRoot $temp -ReleaseRef v3.1.3-test -BaseReleaseRef v3.1.3-base -ManifestPath $manifest | Out-Null } catch { $failed = $true }
     Assert-V31Release $failed 'Schema change without migrations must fail.'
     $planPath = Join-Path $temp 'migrations.json'
+    $introduction = @{ record_type='schema_introduction'; target_schema='new/v1'; affected_artifacts=@('pact_full_pipeline_runner_v1/v31_common.py::NEW_SCHEMA'); introduction_reason='new run artifact'; creation_policy='lazy'; existing_run_behavior='no migration'; backward_compatibility='read compatible'; rollback_implications=@{plan='preserve'}; reversible=$true; approval_provenance='test approval' }
+    [IO.File]::AppendAllText((Join-Path $temp 'pact_full_pipeline_runner_v1\v31_common.py'), "NEW_SCHEMA = 'new/v1'`n", [Text.UTF8Encoding]::new($false))
+    & git -C $temp add .; & git -C $temp commit -qm introduce; & git -C $temp tag -a v3.1.3-intro -m intro
+    [IO.File]::WriteAllText($planPath, (@{migrations=@($introduction)} | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    & $script -NewReleaseManifest -ProjectRoot $temp -ReleaseRef v3.1.3-intro -BaseReleaseRef v3.1.3-test -MigrationPlanPath $planPath -ManifestPath $manifest | Out-Null
+    $bad = $introduction.Clone(); $bad.source_schema='invented/v1'; [IO.File]::WriteAllText($planPath, (@{migrations=@($bad)} | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false)); $failed=$false; try { & $script -NewReleaseManifest -ProjectRoot $temp -ReleaseRef v3.1.3-intro -BaseReleaseRef v3.1.3-test -MigrationPlanPath $planPath -ManifestPath $manifest | Out-Null } catch { $failed=$true }; Assert-V31Release $failed 'Introduction with source must fail.'
     $migration = @{ source_schema='test/v1'; target_schema='test/v2'; affected_artifacts=@('pact_full_pipeline_runner_v1/v31_common.py::TEST_SCHEMA'); migration_tool='test-migrate'; backward_compatibility_policy='reversible'; rollback_implications=@{plan='revert'}; approval_provenance='test approval' }
     $unknown = $migration.Clone(); $unknown.affected_artifacts=@('unknown::SCHEMA')
     [IO.File]::WriteAllText($planPath, (@{migrations=@($unknown)} | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
