@@ -328,6 +328,75 @@ def run(project_root: Path) -> None:
     }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
     assert candidates[0]["after"] == "Их трудно прикончить."
     assert candidates[0]["valid"]
+    assert candidates[0]["text"] == "Их трудно прикончить."
+    assert candidates[0]["text_source"] == "new_fallback"
+    assert candidates[0]["model_text"] == "Их трудно отложить."
+
+    # If primary text is valid, it remains authoritative even when ``new`` is
+    # invalid or independently valid but different.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_full",
+            "old": "", "new": "They are hard to put down.",
+            "text": "Их трудно прикончить.", "reason": "idiom", "challenge_reason": "",
+        }]
+    }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["valid"]
+    assert candidates[0]["after"] == "Их трудно прикончить."
+    assert candidates[0]["text_source"] == "text"
+
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_full",
+            "old": "", "new": "Их сложно прикончить.",
+            "text": "Их трудно прикончить.", "reason": "idiom", "challenge_reason": "",
+        }]
+    }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["valid"]
+    assert candidates[0]["after"] == "Их трудно прикончить."
+    assert candidates[0]["text"] == "Их трудно прикончить."
+    assert candidates[0]["text_source"] == "text"
+
+    # Both fields invalid: do not combine or recover them heuristically.
+    try:
+        v31_repair.parse_candidates({
+            "candidates": [{
+                "candidate_id": "A", "action": "replace_full",
+                "old": "", "new": "Still English.",
+                "text": "They are hard to put down.", "reason": "idiom", "challenge_reason": "",
+            }]
+        }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
+        raise AssertionError("both-invalid candidate was accepted")
+    except ValueError:
+        pass
+
+    # Fallback applies the same active validator, including strict numeric
+    # invariants, before it can replace the primary text.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_full",
+            "old": "", "new": "3 правила.",
+            "text": "Three rules.", "reason": "digits", "challenge_reason": "",
+        }]
+    }, "p00005", "3 старых правила.", False, runtime, strict_cfg, {"p00005": digit_block})
+    assert candidates[0]["valid"]
+    assert candidates[0]["text"] == "3 правила."
+    assert candidates[0]["text_source"] == "new_fallback"
+
+    # A replace_full response can place EN in ``text`` while ``new`` contains
+    # the complete valid Russian repair.  The valid field must recover it.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_full",
+            "old": "", "new": "Их трудно прикончить.",
+            "text": "They are hard to put down.", "reason": "idiom", "challenge_reason": "",
+        }]
+    }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["after"] == "Их трудно прикончить."
+    assert candidates[0]["valid"]
+    assert candidates[0]["text"] == "Их трудно прикончить."
+    assert candidates[0]["text_source"] == "new_fallback"
+    assert candidates[0]["model_text"] == "They are hard to put down."
 
     qgate = v31_postcheck.parse({
         "verdict": "accept", "confidence": "high", "issue_valid": True,
