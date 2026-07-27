@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.2h'
+$RunnerVersion = '3.1.2j'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -30,6 +30,7 @@ $RequiredRunnerFiles = @(
     'prepare_pipeline_context.py',
     'v31_common.py',
     'v31_preflight_policy.ps1',
+    'v31_runner_model_policy.ps1',
     'v31_source_analysis.py',
     'v31_audit.py',
     'v31_merge_issues.py',
@@ -53,6 +54,7 @@ foreach ($name in $RequiredRunnerFiles) {
     if (-not (Test-Path $path)) { throw "Required runner file not found: $path" }
 }
 . (Join-Path $PackageRoot 'v31_preflight_policy.ps1')
+. (Join-Path $PackageRoot 'v31_runner_model_policy.ps1')
 
 $RunName = "chapter_${Start}_to_${End}_v31"
 $RunRoot = Join-Path $ProjectRoot "pipeline_runs\$RunName"
@@ -188,7 +190,7 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.2h'
+$ensemble['version'] = '3.1.2j'
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -215,35 +217,92 @@ $configJson = $cfg | ConvertTo-Json -Depth 60
 $script:ServerProcess = $null
 $script:CurrentServerStderr = $null
 $script:CurrentServerProfile = $null
+$script:ServerMetadata = $null
 function Stop-LlamaServer {
-    if ($script:ServerProcess -and -not $script:ServerProcess.HasExited) {
+    $owned = (
+        $script:ServerProcess -and $script:ServerMetadata -and
+        [int]$script:ServerMetadata.pid -eq [int]$script:ServerProcess.Id
+    )
+    if ($owned -and -not $script:ServerProcess.HasExited) {
         Stop-Process -Id $script:ServerProcess.Id -Force -ErrorAction SilentlyContinue
         try { $script:ServerProcess.WaitForExit(10000) | Out-Null } catch {}
+        Start-Sleep -Seconds 2
+    } elseif ($script:ServerProcess -and -not $script:ServerProcess.HasExited) {
+        Write-Warning "Refusing to stop unowned llama-server PID $($script:ServerProcess.Id)."
     }
     $script:ServerProcess = $null
     $script:CurrentServerStderr = $null
     $script:CurrentServerProfile = $null
-    Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    $script:ServerMetadata = $null
 }
 
-function Start-LlamaServer {
+function Get-LlamaServerProfile {
     param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile)
-    Stop-LlamaServer
-    $env:GGML_VK_DISABLE_COOPMAT = '1'
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $stdout = Join-Path $ServerLogsDir "${Profile}_${stamp}_stdout.log"
-    $stderr = Join-Path $ServerLogsDir "${Profile}_${stamp}_stderr.log"
     switch ($Profile) {
         'GemmaTranslate' { $serverArgs = @('-m',$GemmaModelPath,'--model-draft',$GemmaMtpPath,'--spec-type','draft-mtp','--spec-draft-n-max','4','--device','Vulkan0','--host','127.0.0.1','--port','8080','-ngl','99','-ncmoe','18','--no-mmap','--reasoning-budget','0','-np','1','-c','32768','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaRepair' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaVerify' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','128','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
     }
+    return ,$serverArgs
+}
+
+function Get-LlamaProcessCommandLine {
+    param([int]$ProcessId)
+    try { return [string](Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop).CommandLine }
+    catch { return '' }
+}
+
+function Test-OwnedHealthyLlamaServer {
+    param([string]$Profile,[string[]]$ServerArgs)
+    if (-not $script:ServerProcess) { return $false }
+    $actualCommandLine = Get-LlamaProcessCommandLine $script:ServerProcess.Id
+    try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/health' -TimeoutSec 2 }
+    catch { return $false }
+    $signature = Get-V31ServerCommandSignature $LlamaExe $Profile $ServerArgs
+    return Test-V31OwnedServerIdentity `
+        -ProcessId $script:ServerProcess.Id `
+        -HasExited $script:ServerProcess.HasExited `
+        -Metadata $script:ServerMetadata `
+        -ExpectedProfile $Profile `
+        -ExpectedExecutable $LlamaExe `
+        -ExpectedCommandSignature $signature `
+        -ActualCommandLine $actualCommandLine `
+        -HealthStatus ([string]$health.status)
+}
+
+function Start-LlamaServer {
+    param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile)
+    $serverArgs = @(Get-LlamaServerProfile $Profile)
+    if (Test-OwnedHealthyLlamaServer $Profile $serverArgs) {
+        Write-Host "Reusing owned healthy $Profile server (PID $($script:ServerProcess.Id))" -ForegroundColor Green
+        return
+    }
+    Stop-LlamaServer
+    $unownedEndpoint = $false
+    try {
+        $probe = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/health' -TimeoutSec 2
+        if ($null -ne $probe) { $unownedEndpoint = $true }
+    } catch {}
+    if ($unownedEndpoint) {
+        throw 'Port 8080 is already served by an unowned endpoint; refusing to attach to or stop it.'
+    }
+    $env:GGML_VK_DISABLE_COOPMAT = '1'
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $stdout = Join-Path $ServerLogsDir "${Profile}_${stamp}_stdout.log"
+    $stderr = Join-Path $ServerLogsDir "${Profile}_${stamp}_stderr.log"
     Write-Host "Starting $Profile..." -ForegroundColor Cyan
     $script:CurrentServerStderr = $stderr
     $script:CurrentServerProfile = $Profile
     $script:ServerProcess = Start-Process -FilePath $LlamaExe -WorkingDirectory $LlamaRoot -ArgumentList $serverArgs -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+    $script:ServerMetadata = [pscustomobject]@{
+        pid = $script:ServerProcess.Id
+        profile = $Profile
+        executable = $LlamaExe
+        command_signature = Get-V31ServerCommandSignature $LlamaExe $Profile $serverArgs
+        command_line = ''
+        health_uri = 'http://127.0.0.1:8080/health'
+    }
     $ready = $false
     for ($i=0; $i -lt 240; $i++) {
         if ($script:ServerProcess.HasExited) { throw "$Profile llama-server exited. See $stderr" }
@@ -251,6 +310,10 @@ function Start-LlamaServer {
         Start-Sleep -Seconds 1
     }
     if (-not $ready) { throw "$Profile server did not become ready. See $stderr" }
+    $script:ServerMetadata.command_line = Get-LlamaProcessCommandLine $script:ServerProcess.Id
+    if ([string]::IsNullOrWhiteSpace($script:ServerMetadata.command_line)) {
+        Write-Warning "$Profile command metadata unavailable; this server will not be reused across stages."
+    }
     Write-Host "$Profile ready (PID $($script:ServerProcess.Id))" -ForegroundColor Green
 }
 
@@ -440,6 +503,23 @@ function Invoke-PythonStage {
     } finally { Pop-Location }
 }
 
+function Invoke-AggregateModelStage {
+    param(
+        [string]$Label,
+        [string[]]$Arguments,
+        [ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile,
+        [string]$AggregateRelativePath,
+        [bool]$Force
+    )
+    if (Test-V31AggregateSetComplete $WorkDir $SelectedChapterStems $AggregateRelativePath $Force) {
+        Write-Host "`nModel startup skipped: all selected aggregate outputs exist for $Label" -ForegroundColor DarkGray
+        Invoke-PythonStage -Label $Label -Arguments $Arguments
+        return
+    }
+    Start-LlamaServer $Profile
+    Invoke-PythonStage -Label $Label -Arguments $Arguments
+}
+
 function CommonArgs {
     return @('--project-root',$ProjectRoot,'--config',$ConfigPath,'--start',"$Start",'--end',"$End")
 }
@@ -480,21 +560,17 @@ function Run-AuditPass {
     if ($TranslationsFile) { $extra += @('--translations-file',$TranslationsFile) }
     if ($RedoQuality) { $extra += '--force' }
 
-    Start-LlamaServer Qwen
-    Invoke-PythonStage -Label "$PassName Qwen semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','qwen_semantic','--model',$QwenModelName))
+    Invoke-AggregateModelStage -Label "$PassName Qwen semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','qwen_semantic','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_semantic.json" -Force ([bool]$RedoQuality)
 
-    Start-LlamaServer GemmaVerify
-    Invoke-PythonStage -Label "$PassName Gemma semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_semantic','--model',$GemmaModelName))
-    Invoke-PythonStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName))
-    Invoke-PythonStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_discourse','--model',$GemmaModelName))
+    Invoke-AggregateModelStage -Label "$PassName Gemma semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_semantic','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_semantic.json" -Force ([bool]$RedoQuality)
+    Invoke-AggregateModelStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_russian.json" -Force ([bool]$RedoQuality)
+    Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
 
     Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $extra)
 
-    Start-LlamaServer GemmaVerify
-    Invoke-PythonStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','gemma','--model',$GemmaModelName))
+    Invoke-AggregateModelStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','gemma','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\cross_verify_gemma.json" -Force ([bool]$RedoQuality)
 
-    Start-LlamaServer Qwen
-    Invoke-PythonStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','qwen','--model',$QwenModelName))
+    Invoke-AggregateModelStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','qwen','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\cross_verify_qwen.json" -Force ([bool]$RedoQuality)
 
     Invoke-PythonStage -Label "$PassName finalize verification" -Arguments (@((Join-Path $PackageRoot 'v31_finalize_verification.py')) + (CommonArgs) + $extra)
 }
@@ -509,19 +585,16 @@ function Run-RepairPass {
         if ($RedoQuality) { $baseArgs += '--force' }
         if ($round -gt 1) { $baseArgs += '--retry-only' }
 
-        Start-LlamaServer GemmaRepair
-        Invoke-PythonStage -Label "$PassName repair round $round" -Arguments (@((Join-Path $PackageRoot 'v31_repair.py')) + (CommonArgs) + $baseArgs + @('--model',$GemmaModelName))
+        Invoke-AggregateModelStage -Label "$PassName repair round $round" -Arguments (@((Join-Path $PackageRoot 'v31_repair.py')) + (CommonArgs) + $baseArgs + @('--model',$GemmaModelName)) -Profile GemmaRepair -AggregateRelativePath ("v31\{0}\repair_candidates_round_{1:D2}.json" -f $PassName,$round) -Force ([bool]$RedoQuality)
 
         $gateArgs = @('--pass-name',$PassName,'--round',"$round")
         if ($currentFile) { $gateArgs += @('--translations-file',$currentFile) }
         if ($RedoQuality) { $gateArgs += '--force' }
 
-        Start-LlamaServer Qwen
-        Invoke-PythonStage -Label "$PassName Qwen semantic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','qwen_semantic','--model',$QwenModelName))
+        Invoke-AggregateModelStage -Label "$PassName Qwen semantic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','qwen_semantic','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath ("v31\{0}\post_gate_qwen_semantic_round_{1:D2}.json" -f $PassName,$round) -Force ([bool]$RedoQuality)
 
-        Start-LlamaServer GemmaVerify
-        Invoke-PythonStage -Label "$PassName Gemma semantic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_semantic','--model',$GemmaModelName))
-        Invoke-PythonStage -Label "$PassName Gemma Russian gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_russian','--model',$GemmaModelName))
+        Invoke-AggregateModelStage -Label "$PassName Gemma semantic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_semantic','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath ("v31\{0}\post_gate_gemma_semantic_round_{1:D2}.json" -f $PassName,$round) -Force ([bool]$RedoQuality)
+        Invoke-AggregateModelStage -Label "$PassName Gemma Russian gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath ("v31\{0}\post_gate_gemma_russian_round_{1:D2}.json" -f $PassName,$round) -Force ([bool]$RedoQuality)
 
         Invoke-PythonStage -Label "$PassName deterministic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_deterministic_gate.py')) + (CommonArgs) + $gateArgs)
         Invoke-PythonStage -Label "$PassName adjudication round $round" -Arguments (@((Join-Path $PackageRoot 'v31_adjudicate.py')) + (CommonArgs) + $gateArgs)
@@ -562,10 +635,9 @@ try {
         Remove-Item (Join-Path $RunRoot 'book_consistency_ledger.json') -Force -ErrorAction SilentlyContinue
     }
 
-    Start-LlamaServer Qwen
     $sourceArgs = @((Join-Path $PackageRoot 'v31_source_analysis.py')) + (CommonArgs) + @('--model',$QwenModelName)
     if ($RedoSourceAnalysis -or $RedoTranslation) { $sourceArgs += '--force' }
-    Invoke-PythonStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs
+    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]($RedoSourceAnalysis -or $RedoTranslation))
 
     Start-LlamaServer GemmaTranslate
     $translateArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','translate','--start',"$Start",'--end',"$End")
@@ -580,7 +652,6 @@ try {
     Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs))
     Invoke-PythonStage -Label '10b/11 Build v3.1 review report' -Arguments (@((Join-Path $PackageRoot 'v31_build_review.py')) + (CommonArgs))
 
-    Start-LlamaServer GemmaTranslate
     $finalizeArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','finalize','--start',"$Start",'--end',"$End")
     if ($RedoFormatting -or $RedoTranslation -or $RedoQuality) { $finalizeArgs += '--redo-formatting' }
     Invoke-PythonStage -Label '11/11 Restore formatting and finalize HTML' -Arguments $finalizeArgs
