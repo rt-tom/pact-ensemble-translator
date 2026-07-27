@@ -8,12 +8,11 @@ import hashlib
 import importlib.util
 import json
 import logging
-import os
 import re
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 
 class JsonGenerationError(RuntimeError):
@@ -24,8 +23,7 @@ class JsonGenerationError(RuntimeError):
         self.attempt_errors = attempt_errors
 
 
-VERSION = "3.1.3"
-CACHE_IDENTITY_SCHEMA = "pact-v31-cache-identity/v1"
+VERSION = "3.1.2j"
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -34,34 +32,16 @@ def read_json(path: Path, default: Any = None) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def write_text_atomic(path: Path, text: str, *, validator: Callable[[str], Any] | None = None) -> None:
-    """Durably publish UTF-8 text only after the complete temp file validates."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        published = tmp.read_text(encoding="utf-8")
-        if published != text:
-            raise ValueError(f"atomic write read-back mismatch: {path}")
-        if validator is not None:
-            validator(published)
-        os.replace(tmp, path)
-    finally:
-        # A malformed/interrupted temp must never replace the last good artifact.
-        if tmp.exists():
-            tmp.unlink()
-
-
 def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if is_dataclass(data):
         data = asdict(data)
-    write_text_atomic(
-        path, json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        validator=json.loads,
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
+    tmp.replace(path)
 
 
 def norm(value: Any) -> str:
@@ -75,49 +55,6 @@ def fold(value: Any) -> str:
 def sha256_json(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def cache_identity(*, producer: str, schema: str, source: Any, inputs: Any,
-                   config: Any, prompt: Any, profile: Any) -> dict[str, str]:
-    """Identity is explicit and content-based; mtime is deliberately excluded."""
-    fields = {
-        "producer": producer, "schema": schema, "source": source,
-        "inputs": inputs, "config": config, "prompt": prompt, "profile": profile,
-    }
-    return {
-        "identity_schema": CACHE_IDENTITY_SCHEMA,
-        "producer": producer,
-        "schema": schema,
-        **{f"{name}_sha256": sha256_json(value) for name, value in fields.items()
-           if name not in {"producer", "schema"}},
-    }
-
-
-def cache_reuse(path: Path, expected: dict[str, str]) -> tuple[Any | None, str]:
-    """Return a validated cache value or a machine-readable miss reason."""
-    if not path.exists():
-        return None, "missing"
-    try:
-        value = read_json(path)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None, "malformed_artifact"
-    if not isinstance(value, dict):
-        return None, "invalid_artifact_schema"
-    actual = value.get("_cache_identity")
-    if not isinstance(actual, dict):
-        return None, "legacy_missing_identity"
-    if actual.get("identity_schema") != CACHE_IDENTITY_SCHEMA:
-        return None, "identity_schema_mismatch"
-    for key, wanted in expected.items():
-        if actual.get(key) != wanted:
-            return None, f"identity_mismatch:{key}"
-    return value, "reused"
-
-
-def with_cache_identity(record: dict[str, Any], identity: dict[str, str]) -> dict[str, Any]:
-    result = dict(record)
-    result["_cache_identity"] = identity
-    return result
 
 
 def pid_num(pid: str) -> int:
