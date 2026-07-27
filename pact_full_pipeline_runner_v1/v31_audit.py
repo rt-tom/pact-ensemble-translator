@@ -356,6 +356,7 @@ def main() -> int:
     add_common_args(parser)
     parser.add_argument("--mode", choices=list(DEFAULTS), required=True)
     parser.add_argument("--translations-file")
+    parser.add_argument("--pids-file", help="JSON ledger or list restricting TARGET_PIDS; context remains adjacent manifest PIDs")
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
@@ -373,6 +374,16 @@ def main() -> int:
         all_issues: list[dict[str, Any]] = []
         covered: set[str] = set()
         pids = [str(block["pid"]) for block in blocks]
+        if args.pids_file:
+            requested = read_json(Path(args.pids_file), {})
+            requested = requested.get("changed_pids", []) if isinstance(requested, dict) else requested
+            if not isinstance(requested, list):
+                raise ValueError("--pids-file must contain a list or changed_pids list")
+            requested_set = {str(pid) for pid in requested}
+            unknown = requested_set - set(pids)
+            if unknown:
+                raise ValueError(f"Final ledger contains unknown PIDs: {sorted(unknown)}")
+            pids = [pid for pid in pids if pid in requested_set]
 
         if args.mode == "gemma_discourse":
             stage = stage_cfg(cfg, "gemma_discourse_audit", DEFAULTS["gemma_discourse"])
