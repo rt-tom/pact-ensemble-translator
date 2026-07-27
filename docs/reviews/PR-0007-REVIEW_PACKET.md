@@ -1,4 +1,4 @@
-# PR #6 Review Packet — v3.1.2i advisory cross-verification reason length
+# PR #7 Review Packet — v3.1.2i advisory cross-verification reason length
 
 ## Risk classification
 
