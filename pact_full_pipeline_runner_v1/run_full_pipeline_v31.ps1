@@ -44,6 +44,7 @@ $RequiredRunnerFiles = @(
     'v31_postcheck.py',
     'v31_deterministic_gate.py',
     'v31_adjudicate.py',
+    'v31_final_lifecycle.py',
     'v31_finalize_quality.py',
     'v31_build_review.py'
 )
@@ -610,16 +611,24 @@ function Get-RetryCount {
 }
 
 function Run-AuditPass {
-    param([string]$PassName, [string]$TranslationsFile)
+    param([string]$PassName, [string]$TranslationsFile, [string]$PidFile = '')
     $extra = @('--pass-name',$PassName)
     if ($TranslationsFile) { $extra += @('--translations-file',$TranslationsFile) }
+    if ($PidFile) { $extra += @('--pids-file',$PidFile) }
     if ($RedoQuality) { $extra += '--force' }
 
     Invoke-AggregateModelStage -Label "$PassName Qwen semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','qwen_semantic','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_semantic.json" -Force ([bool]$RedoQuality)
 
     Invoke-AggregateModelStage -Label "$PassName Gemma semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_semantic','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_semantic.json" -Force ([bool]$RedoQuality)
     Invoke-AggregateModelStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_russian.json" -Force ([bool]$RedoQuality)
-    Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
+    # Final smoke is intentionally one source-grounded Qwen chapter pass;
+    # local semantic/Russian audits remain restricted to ledger PIDs.
+    $discourseExtra = @($extra | Where-Object { $_ -ne '--pids-file' -and $_ -ne $PidFile })
+    if ($PassName -eq 'final') {
+        Invoke-AggregateModelStage -Label 'final Qwen source-grounded global smoke' -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','qwen_global_smoke','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_global_smoke.json" -Force ([bool]$RedoQuality)
+    } else {
+        Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
+    }
 
     Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $extra)
 
@@ -631,8 +640,8 @@ function Run-AuditPass {
 }
 
 function Run-RepairPass {
-    param([string]$PassName, [string]$InitialTranslationsFile)
-    $maxRounds = [int]$ensemble['max_repair_rounds']
+    param([string]$PassName, [string]$InitialTranslationsFile, [int]$MaxRounds = 0)
+    $maxRounds = if ($MaxRounds -gt 0) { $MaxRounds } else { [int]$ensemble['max_repair_rounds'] }
     $currentFile = $InitialTranslationsFile
     for ($round=1; $round -le $maxRounds; $round++) {
         $baseArgs = @('--pass-name',$PassName,'--round',"$round")
@@ -660,7 +669,7 @@ function Run-RepairPass {
         $currentFile = if ($PassName -eq 'primary') { 'v31_primary_translations.json' } else { 'v31_final_translations.json' }
     }
     $remaining = Get-RetryCount $PassName
-    if ($remaining -gt 0) { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
+    if ($remaining -gt 0 -and $PassName -ne 'final') { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
 }
 
 try {
@@ -693,11 +702,33 @@ try {
 
     Run-AuditPass 'primary' 'draft_translations.json'
     Run-RepairPass 'primary' 'draft_translations.json'
+    Invoke-PythonStage -Label '6b/11 Record primary changed-PID lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','draft_translations.json','--after','v31_primary_translations.json','--stage','primary_repair','--reason','accepted primary repair'))
 
     Run-AuditPass 'residual' 'v31_primary_translations.json'
     Run-RepairPass 'residual' 'v31_primary_translations.json'
 
-    Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs))
+    # The ledger is append-only and starts before the final targeted pass.
+    Invoke-PythonStage -Label '9a/11 Append residual changed-PID lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','v31_primary_translations.json','--after','v31_final_translations.json','--stage','residual_repair','--reason','accepted residual repair'))
+    $finalLedger = Join-Path $WorkDir '*\v31_final_changed_pid_ledger.json'
+    # Per chapter paths are resolved by the audit script; the runner expands one
+    # ledger only because selected chapter runs are currently one chapter.
+    $finalLedger = (Get-ChildItem $WorkDir -Filter 'v31_final_changed_pid_ledger.json' -Recurse | Select-Object -First 1).FullName
+    Run-AuditPass 'final' 'v31_final_translations.json' $finalLedger
+    foreach ($chapter in Get-ChildItem $WorkDir -Directory) {
+        Copy-Item (Join-Path $chapter.FullName 'v31_final_translations.json') (Join-Path $chapter.FullName 'v31_pre_final_repair_translations.json') -Force
+    }
+    Run-RepairPass 'final' 'v31_final_translations.json' 1
+    Invoke-PythonStage -Label '9b/11 Append final repair lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','v31_pre_final_repair_translations.json','--after','v31_final_translations.json','--stage','final_repair','--reason','accepted final repair'))
+    Run-AuditPass 'final' 'v31_final_translations.json' $finalLedger
+
+    Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs) + '--final-lifecycle')
+    $quarantined = @(Get-ChildItem $WorkDir -Filter 'v31_quality_gate.json' -Recurse | Where-Object {
+        (Get-Content $_.FullName -Raw | ConvertFrom-Json).status -eq 'quarantined'
+    })
+    if ($quarantined.Count -gt 0) {
+        Write-Host "FINAL QUALITY QUARANTINED: $($quarantined.Count) chapter(s); finalization was not run." -ForegroundColor Yellow
+        return
+    }
     Invoke-PythonStage -Label '10b/11 Build v3.1 review report' -Arguments (@((Join-Path $PackageRoot 'v31_build_review.py')) + (CommonArgs))
 
     $finalizeArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','finalize','--start',"$Start",'--end',"$End")
