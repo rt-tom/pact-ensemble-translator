@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.2j'
+$RunnerVersion = '3.1.3-03'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -32,6 +32,7 @@ $RequiredRunnerFiles = @(
     'v31_common.py',
     'v31_preflight_policy.ps1',
     'v31_runner_model_policy.ps1',
+    'v31_stage_protocol.py',
     'v31_source_analysis.py',
     'v31_artifact_dag.py',
     'v31_audit.py',
@@ -192,7 +193,7 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.2j'
+$ensemble['version'] = '3.1.3'
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -513,12 +514,31 @@ function Invoke-AggregateModelStage {
         [string]$AggregateRelativePath,
         [bool]$Force
     )
-    if (Test-V31AggregateSetComplete $WorkDir $SelectedChapterStems $AggregateRelativePath $Force) {
-        Write-Host "`nModel startup skipped: all selected aggregate outputs exist for $Label" -ForegroundColor DarkGray
+    $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--aggregate-relative-path', $AggregateRelativePath)
+    foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
+    if ($Force) { $probeArgs += '--force' }
+    Push-Location $ProjectRoot
+    try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -eq 0) {
+        Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
         Invoke-PythonStage -Label $Label -Arguments $Arguments
         return
     }
+    if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }
+    $runArguments = @($Arguments)
+    if ($probeExit -eq 22 -and $runArguments -notcontains '--force') { $runArguments += '--force' }
     Start-LlamaServer $Profile
+    Invoke-PythonStage -Label $Label -Arguments $runArguments
+}
+
+function Invoke-TranslationStage {
+    param([string]$Label, [string[]]$Arguments)
+    $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--translation')
+    foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
+    Push-Location $ProjectRoot
+    try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -ne 20) { throw "$Label stage probe FAILED with exit code $probeExit" }
+    Start-LlamaServer GemmaTranslate
     Invoke-PythonStage -Label $Label -Arguments $Arguments
 }
 
@@ -614,8 +634,6 @@ try {
     Write-Host "Pact ensemble pipeline v$RunnerVersion" -ForegroundColor White
     Write-Host "Run root: $RunRoot" -ForegroundColor White
 
-    Start-LlamaServer GemmaTranslate
-    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
     $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)
     Invoke-PythonStage -Label '1/11 Prepare manifest, chapter bible, frozen glossary' -Arguments $prepareArgs
 
@@ -636,9 +654,9 @@ try {
     if ($RedoSourceAnalysis) { $sourceArgs += '--force' }
     Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]$RedoSourceAnalysis)
 
-    Start-LlamaServer GemmaTranslate
     $translateArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','translate','--start',"$Start",'--end',"$End")
-    Invoke-PythonStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+    Invoke-TranslationStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
 
     Run-AuditPass 'primary' 'draft_translations.json'
     Run-RepairPass 'primary' 'draft_translations.json'
