@@ -24,6 +24,7 @@ import v31_merge_issues
 import v31_artifact_dag
 import v31_audit
 import v31_final_lifecycle
+import v31_finalize_quality
 
 
 def load_runtime(project_root: Path):
@@ -97,6 +98,72 @@ def run(project_root: Path) -> None:
         ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
         blocking_findings=[], final_repair_rounds=1, prior_status="quarantined",
     ) == "quarantined"  # quarantine is monotonic and never becomes complete
+
+    # Exercise the active finalize-quality entry point, not only terminal_status.
+    def final_quality_fixture(work: Path, *, prior: str | None = None, technical_failure: bool = False) -> None:
+        coverage = {"ok": True, "completed": 1}
+        write_json(work / "source_scene_map.json", {"coverage": coverage})
+        write_json(work / "draft_translations.json", {"p00001": "Текст."})
+        write_json(work / "v31_final_translations.json", {"p00001": "Текст."})
+        write_json(work / "v31_final_changed_pid_ledger.json", {"entries": [], "changed_pids": []})
+        for pass_name in ("primary", "residual"):
+            root = work / "v31" / pass_name
+            for detector in ("qwen_semantic", "gemma_semantic", "gemma_russian", "gemma_discourse"):
+                write_json(root / f"{detector}.json", {"coverage": coverage})
+            write_json(root / "merged_issues.json", {"merged_issue_count": 0})
+            write_json(root / "verification_report.json", {"total": 0, "repair": 0, "keep": 0, "uncertain": 0})
+            write_json(root / "verified_issues.json", [])
+            write_json(root / "lifecycle.json", [])
+            write_json(root / "uncertain_issues.json", [])
+            write_json(root / "status.json", {"retry_required": 0, "total": 0, "resolved": 0})
+            for judge in ("qwen", "gemma"):
+                write_json(root / f"verify_queue_{judge}.json", [])
+                write_json(root / f"cross_verify_{judge}.json", {"expected": 0, "completed": 0})
+        final = work / "v31" / "final"
+        for detector in ("qwen_semantic", "gemma_semantic", "gemma_russian"):
+            write_json(final / f"{detector}.json", {"coverage": {"ok": True, "expected": 0, "completed": 0}})
+        write_json(final / "verified_issues.json", [])
+        write_json(final / "qwen_global_smoke.json", {
+            "coverage": {"ok": not technical_failure, "expected": 1, "completed": 1}, "issues": [],
+        })
+        if prior:
+            write_json(work / "state.json", {"status": prior})
+            write_json(work / "v31_quality_gate.json", {"status": prior})
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        original = (v31_finalize_quality.load_runtime, v31_finalize_quality.load_cfg,
+                    v31_finalize_quality.selected_chapters, v31_finalize_quality.load_manifest,
+                    v31_finalize_quality.deterministic, v31_finalize_quality.setup_logging, sys.argv)
+        source = root / "001.html"
+        source.write_text("fixture", encoding="utf-8")
+        v31_finalize_quality.load_runtime = lambda _: object()
+        v31_finalize_quality.load_cfg = lambda *_: {}
+        v31_finalize_quality.selected_chapters = lambda *_: [(source, current_work)]
+        v31_finalize_quality.load_manifest = lambda _: ({}, [{"pid": "p00001"}], {})
+        v31_finalize_quality.deterministic = lambda *_: []
+        v31_finalize_quality.setup_logging = lambda: None
+        try:
+            for prior, technical_failure, expected in (
+                ("quarantined", False, "quarantined"),  # clean recompute cannot promote quarantine
+                ("complete", False, "complete"),
+                ("quarantined", True, "failed"),  # technical failure wins over old quarantine
+                (None, False, "complete"),  # new work/run identity inherits no old terminal state
+            ):
+                current_work = root / f"case-{prior or 'new'}-{technical_failure}"
+                final_quality_fixture(current_work, prior=prior, technical_failure=technical_failure)
+                sys.argv = ["v31_finalize_quality.py", "--project-root", str(root), "--config", str(root / "cfg.json"), "--start", "1", "--end", "1", "--final-lifecycle"]
+                try:
+                    v31_finalize_quality.main()
+                    assert not technical_failure
+                except RuntimeError:
+                    assert technical_failure
+                assert json.loads((current_work / "state.json").read_text(encoding="utf-8"))["status"] == expected
+                assert json.loads((current_work / "v31_quality_gate.json").read_text(encoding="utf-8"))["status"] == expected
+        finally:
+            (v31_finalize_quality.load_runtime, v31_finalize_quality.load_cfg,
+             v31_finalize_quality.selected_chapters, v31_finalize_quality.load_manifest,
+             v31_finalize_quality.deterministic, v31_finalize_quality.setup_logging, sys.argv) = original
 
     class FakeJsonRuntime:
         safe_json_loads = staticmethod(runtime.safe_json_loads)

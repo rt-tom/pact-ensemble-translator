@@ -13,6 +13,30 @@ from v31_common import add_common_args, load_cfg, load_runtime, read_json, selec
 TERMINAL = {"complete", "quarantined", "failed"}
 
 
+def prior_terminal_status(work: Path) -> str | None:
+    """Read the authoritative terminal record for this work directory.
+
+    ``state.json`` is authoritative because it is the chapter lifecycle record.
+    The quality gate is its runner-facing projection and must agree whenever it
+    has a terminal status; disagreement is an execution failure, never a reason
+    to silently promote a quarantined chapter.
+    """
+    state = read_json(work / "state.json", {})
+    gate = read_json(work / "v31_quality_gate.json", {})
+    state_status = state.get("status") if isinstance(state, dict) else None
+    gate_status = gate.get("status") if isinstance(gate, dict) else None
+    if state_status not in TERMINAL:
+        state_status = None
+    if gate_status not in TERMINAL:
+        gate_status = None
+    if state_status and gate_status and state_status != gate_status:
+        raise RuntimeError(
+            f"conflicting terminal status: state.json={state_status}, "
+            f"v31_quality_gate.json={gate_status}"
+        )
+    return state_status
+
+
 def changed_pids(before: dict[str, str], after: dict[str, str]) -> list[str]:
     """Return textual changes only; normalization-only cache rewrites do not count."""
     return [pid for pid in after if " ".join(before.get(pid, "").split()) != " ".join(after[pid].split())]
@@ -47,12 +71,12 @@ def terminal_status(*, ledger_ok: bool, coverage_ok: bool, verification_ok: bool
     A terminal quarantine is monotonic: a later stale artifact can never turn it
     into complete.  The runner is allowed exactly one final repair round.
     """
-    if prior_status == "quarantined":
-        return "quarantined"
     if not ledger_ok or not coverage_ok or not verification_ok or not smoke_ok:
         return "failed"
     if final_repair_rounds > 1:
         return "failed"
+    if prior_status == "quarantined":
+        return "quarantined"
     if blocking_findings:
         return "quarantined"
     return "complete"
