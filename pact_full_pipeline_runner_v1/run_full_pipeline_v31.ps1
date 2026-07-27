@@ -8,12 +8,18 @@ param(
     [switch]$RedoTranslation,
     [switch]$RedoQuality,
     [switch]$RedoFormatting,
-    [switch]$SkipPreflight
+    [switch]$DryRun,
+    [switch]$SkipPreflight,
+    # Temporary, explicit migration switch. Remove once 3.1.2j runs are retired.
+    [switch]$AllowLegacyArtifactReuse
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.2j'
+# BuildIdentity is for release/milestone reporting only.  ArtifactVersion is
+# the semantic identity shared by the config and every Python stage artifact.
+$BuildIdentity = '3.1.3-03'
+$ArtifactVersion = '3.1.3'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -28,10 +34,14 @@ $Python = 'py'
 
 $RequiredRunnerFiles = @(
     'prepare_pipeline_context.py',
+    'v31_chapter_resolver.py',
+    'v31_final_ledger_scope.py',
     'v31_common.py',
     'v31_preflight_policy.ps1',
     'v31_runner_model_policy.ps1',
+    'v31_stage_protocol.py',
     'v31_source_analysis.py',
+    'v31_artifact_dag.py',
     'v31_audit.py',
     'v31_merge_issues.py',
     'v31_cross_verify.py',
@@ -40,6 +50,7 @@ $RequiredRunnerFiles = @(
     'v31_postcheck.py',
     'v31_deterministic_gate.py',
     'v31_adjudicate.py',
+    'v31_final_lifecycle.py',
     'v31_finalize_quality.py',
     'v31_build_review.py'
 )
@@ -62,21 +73,23 @@ $WorkDir = Join-Path $RunRoot 'work'
 $OutputDir = Join-Path $RunRoot 'output'
 $LogsDir = Join-Path $RunRoot 'logs'
 $ServerLogsDir = Join-Path $RunRoot 'server_logs'
-$GlossaryDir = Join-Path $RunRoot 'glossary'
+$GlossaryDir = Join-Path $ProjectRoot 'glossary'
+$RunGlossaryCandidateLedger = Join-Path $RunRoot 'glossary_candidates.run.json'
+$BookGlossaryCandidateLedger = Join-Path $ProjectRoot 'pipeline_runs\glossary_candidates.book.json'
 $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
+$ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
+$MonitorStatePath = Join-Path $RunRoot 'monitor_state.v31.json'
+$LegacyReuseProvenancePath = Join-Path $RunRoot 'v31\legacy_reuse_provenance.json'
 
-$AllInputFiles = @(Get-ChildItem (Join-Path $ProjectRoot 'pact_chapters') -Filter '*.html' -File | Sort-Object Name)
-$SelectedInputFiles = @($AllInputFiles | Select-Object -Skip ([math]::Max(0, $Start - 1)) -First ([math]::Max(0, $End - $Start + 1)))
-if ($SelectedInputFiles.Count -ne ($End - $Start + 1)) { throw "Requested chapter range $Start-$End is outside available inputs." }
-$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
+$SelectedInputFiles = @()
+$SelectedChapterStems = @()
 
 if ($Reset -and (Test-Path $RunRoot)) {
     Write-Host "Removing previous v3.1 run: $RunRoot" -ForegroundColor Yellow
     Remove-Item $RunRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path @($RunRoot, $WorkDir, $OutputDir, $LogsDir, $ServerLogsDir) | Out-Null
-if (-not (Test-Path $GlossaryDir)) { Copy-Item (Join-Path $ProjectRoot 'glossary') $GlossaryDir -Recurse -Force }
 if (-not (Test-Path $BookBiblePath)) {
     $sourceBookBible = Join-Path $ProjectRoot 'book_bible.json'
     if (Test-Path $sourceBookBible) { Copy-Item $sourceBookBible $BookBiblePath -Force }
@@ -161,8 +174,11 @@ $paths['output_dir'] = $OutputDir
 $paths['work_dir'] = $WorkDir
 $paths['logs_dir'] = $LogsDir
 $paths['glossary_dir'] = $GlossaryDir
+$paths['run_glossary_candidate_ledger'] = $RunGlossaryCandidateLedger
+$paths['book_glossary_candidate_ledger'] = $BookGlossaryCandidateLedger
 $paths['book_bible_file'] = $BookBiblePath
 $paths['arc_names_file'] = (Join-Path $ProjectRoot 'arc_names.json')
+$paths['chapter_manifest_file'] = $ChapterManifestPath
 
 $chapterBible['enabled'] = $true
 $chapterBible['required'] = $true
@@ -190,7 +206,9 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.2j'
+$ensemble['version'] = $ArtifactVersion
+$ensemble['legacy_compatible_artifact_versions'] = $(if ($AllowLegacyArtifactReuse) { @('3.1.2j') } else { @() })
+$ensemble['legacy_compatibility_policy'] = $(if ($AllowLegacyArtifactReuse) { 'temporary-v31-legacy-3.1.2j-remove-after-migration' } else { $null })
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -214,10 +232,35 @@ $configJson = $cfg | ConvertTo-Json -Depth 60
     [System.Text.UTF8Encoding]::new($false)
 )
 
+$resolverPath = Join-Path $PackageRoot 'v31_chapter_resolver.py'
+$chapterManifest = & $Python $resolverPath --project-root $ProjectRoot --input-dir $paths['input_dir'] --start $Start --end $End --manifest $ChapterManifestPath | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "Canonical chapter resolver failed with exit code $LASTEXITCODE" }
+$SelectedInputFiles = @($chapterManifest.chapters | ForEach-Object { Get-Item (Join-Path $ProjectRoot $_.source_path) })
+$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
+
 $script:ServerProcess = $null
 $script:CurrentServerStderr = $null
 $script:CurrentServerProfile = $null
 $script:ServerMetadata = $null
+$script:MonitorStage = $null
+function Write-MonitorState {
+    param([string]$Stage,[string]$Status,[string]$FailureReason='')
+    if ($Stage) { $script:MonitorStage = $Stage }
+    $state = [ordered]@{
+        schema = 'pact-v31-monitor-state/v1'
+        runner_version = $BuildIdentity
+        artifact_version = $ArtifactVersion
+        stage = $script:MonitorStage
+        status = $Status
+        updated_at = (Get-Date).ToString('o')
+        active_profile = if ($script:CurrentServerProfile) { $script:CurrentServerProfile } else { $null }
+        owned_pid = if ($script:ServerProcess -and -not $script:ServerProcess.HasExited) { $script:ServerProcess.Id } else { $null }
+        failure_reason = if ($FailureReason) { $FailureReason } else { $null }
+    }
+    $temporary = "$MonitorStatePath.tmp"
+    [System.IO.File]::WriteAllText($temporary, ($state | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $MonitorStatePath -Force
+}
 function Stop-LlamaServer {
     $owned = (
         $script:ServerProcess -and $script:ServerMetadata -and
@@ -303,6 +346,7 @@ function Start-LlamaServer {
         command_line = ''
         health_uri = 'http://127.0.0.1:8080/health'
     }
+    Write-MonitorState -Stage $script:MonitorStage -Status 'LOADING_MODEL'
     $ready = $false
     for ($i=0; $i -lt 240; $i++) {
         if ($script:ServerProcess.HasExited) { throw "$Profile llama-server exited. See $stderr" }
@@ -315,6 +359,7 @@ function Start-LlamaServer {
         Write-Warning "$Profile command metadata unavailable; this server will not be reused across stages."
     }
     Write-Host "$Profile ready (PID $($script:ServerProcess.Id))" -ForegroundColor Green
+    Write-MonitorState -Stage $script:MonitorStage -Status 'ACTIVE'
 }
 
 function Get-GemmaPreflightLogSnapshot {
@@ -455,7 +500,8 @@ Daniel hesitated only a moment before following her.
         -MinGenerationTps $minGeneration
 
     $report = [ordered]@{
-        version = $RunnerVersion
+        version = $BuildIdentity
+        artifact_version = $ArtifactVersion
         timestamp = (Get-Date).ToString('o')
         profile = 'GemmaTranslate'
         policy = $summary.policy
@@ -494,12 +540,17 @@ Daniel hesitated only a moment before following her.
 }
 
 function Invoke-PythonStage {
-    param([string]$Label, [string[]]$Arguments)
+    param([string]$Label, [string[]]$Arguments, [string]$Outcome='COMPLETE')
     Write-Host "`n=== $Label ===" -ForegroundColor Magenta
+    Write-MonitorState -Stage $Label -Status 'ACTIVE'
     Push-Location $ProjectRoot
     try {
         & $Python @Arguments
         if ($LASTEXITCODE -ne 0) { throw "$Label failed with exit code $LASTEXITCODE" }
+        Write-MonitorState -Stage $Label -Status $Outcome
+    } catch {
+        Write-MonitorState -Stage $Label -Status 'FAILED' -FailureReason $_.Exception.Message
+        throw
     } finally { Pop-Location }
 }
 
@@ -511,12 +562,32 @@ function Invoke-AggregateModelStage {
         [string]$AggregateRelativePath,
         [bool]$Force
     )
-    if (Test-V31AggregateSetComplete $WorkDir $SelectedChapterStems $AggregateRelativePath $Force) {
-        Write-Host "`nModel startup skipped: all selected aggregate outputs exist for $Label" -ForegroundColor DarkGray
-        Invoke-PythonStage -Label $Label -Arguments $Arguments
+    $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--aggregate-relative-path', $AggregateRelativePath)
+    foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
+    if ($Force) { $probeArgs += '--force' }
+    if ($AllowLegacyArtifactReuse) { $probeArgs += @('--allow-legacy-artifact-version', '--stage', $Label, '--legacy-provenance-path', $LegacyReuseProvenancePath) }
+    Push-Location $ProjectRoot
+    try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -eq 0) {
+        Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
+        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
         return
     }
+    if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }
+    $runArguments = @($Arguments)
+    if ($probeExit -eq 22 -and $runArguments -notcontains '--force') { $runArguments += '--force' }
     Start-LlamaServer $Profile
+    Invoke-PythonStage -Label $Label -Arguments $runArguments
+}
+
+function Invoke-TranslationStage {
+    param([string]$Label, [string[]]$Arguments)
+    $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--translation')
+    foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
+    Push-Location $ProjectRoot
+    try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -ne 20) { throw "$Label stage probe FAILED with exit code $probeExit" }
+    Start-LlamaServer GemmaTranslate
     Invoke-PythonStage -Label $Label -Arguments $Arguments
 }
 
@@ -535,7 +606,7 @@ function Remove-QualityArtifacts {
         $work = Join-Path $WorkDir $stem
         if (-not (Test-Path $work)) { continue }
         Remove-Item (Join-Path $work 'v31') -Recurse -Force -ErrorAction SilentlyContinue
-        foreach ($name in @('issues.json','verified_issues.json','repaired_translations.json','repaired_translations.preverify.json','repair_records.json','post_repair_report.json','issue_lifecycle.json','v31_primary_translations.json','v31_final_translations.json','v31_quality_gate.json','quality_report.json','audit_report.html','state.json')) {
+        foreach ($name in @('issues.json','verified_issues.json','repaired_translations.json','repaired_translations.preverify.json','repair_records.json','post_repair_report.json','issue_lifecycle.json','v31_primary_translations.json','v31_final_translations.json','quality_report.json','audit_report.html')) {
             Remove-Item (Join-Path $work $name) -Force -ErrorAction SilentlyContinue
         }
     }
@@ -555,29 +626,39 @@ function Get-RetryCount {
 }
 
 function Run-AuditPass {
-    param([string]$PassName, [string]$TranslationsFile)
+    param([string]$PassName, [string]$TranslationsFile, [string]$PidFile = '', [string]$PidMap = '')
     $extra = @('--pass-name',$PassName)
     if ($TranslationsFile) { $extra += @('--translations-file',$TranslationsFile) }
+    if ($PidFile) { $extra += @('--pids-file',$PidFile) }
+    if ($PidMap) { $extra += @('--pids-map',$PidMap) }
     if ($RedoQuality) { $extra += '--force' }
+    $downstreamExtra = @($extra | Where-Object { $_ -ne '--pids-file' -and $_ -ne $PidFile -and $_ -ne '--pids-map' -and $_ -ne $PidMap })
 
     Invoke-AggregateModelStage -Label "$PassName Qwen semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','qwen_semantic','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_semantic.json" -Force ([bool]$RedoQuality)
 
     Invoke-AggregateModelStage -Label "$PassName Gemma semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_semantic','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_semantic.json" -Force ([bool]$RedoQuality)
     Invoke-AggregateModelStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_russian.json" -Force ([bool]$RedoQuality)
-    Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
+    # Final smoke is intentionally one source-grounded Qwen chapter pass;
+    # local semantic/Russian audits remain restricted to ledger PIDs.
+    $discourseExtra = $downstreamExtra
+    if ($PassName -eq 'final') {
+        Invoke-AggregateModelStage -Label 'final Qwen source-grounded global smoke' -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','qwen_global_smoke','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_global_smoke.json" -Force ([bool]$RedoQuality)
+    } else {
+        Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
+    }
 
-    Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $extra)
+    Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $downstreamExtra)
 
-    Invoke-AggregateModelStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','gemma','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\cross_verify_gemma.json" -Force ([bool]$RedoQuality)
+    Invoke-AggregateModelStage -Label "$PassName Gemma cross-verifies Qwen issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $downstreamExtra + @('--judge','gemma','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\cross_verify_gemma.json" -Force ([bool]$RedoQuality)
 
-    Invoke-AggregateModelStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $extra + @('--judge','qwen','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\cross_verify_qwen.json" -Force ([bool]$RedoQuality)
+    Invoke-AggregateModelStage -Label "$PassName Qwen cross-verifies Gemma issues" -Arguments (@((Join-Path $PackageRoot 'v31_cross_verify.py')) + (CommonArgs) + $downstreamExtra + @('--judge','qwen','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\cross_verify_qwen.json" -Force ([bool]$RedoQuality)
 
-    Invoke-PythonStage -Label "$PassName finalize verification" -Arguments (@((Join-Path $PackageRoot 'v31_finalize_verification.py')) + (CommonArgs) + $extra)
+    Invoke-PythonStage -Label "$PassName finalize verification" -Arguments (@((Join-Path $PackageRoot 'v31_finalize_verification.py')) + (CommonArgs) + $downstreamExtra)
 }
 
 function Run-RepairPass {
-    param([string]$PassName, [string]$InitialTranslationsFile)
-    $maxRounds = [int]$ensemble['max_repair_rounds']
+    param([string]$PassName, [string]$InitialTranslationsFile, [int]$MaxRounds = 0)
+    $maxRounds = if ($MaxRounds -gt 0) { $MaxRounds } else { [int]$ensemble['max_repair_rounds'] }
     $currentFile = $InitialTranslationsFile
     for ($round=1; $round -le $maxRounds; $round++) {
         $baseArgs = @('--pass-name',$PassName,'--round',"$round")
@@ -605,51 +686,65 @@ function Run-RepairPass {
         $currentFile = if ($PassName -eq 'primary') { 'v31_primary_translations.json' } else { 'v31_final_translations.json' }
     }
     $remaining = Get-RetryCount $PassName
-    if ($remaining -gt 0) { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
+    if ($remaining -gt 0 -and $PassName -ne 'final') { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
 }
 
 try {
-    Write-Host "Pact ensemble pipeline v$RunnerVersion" -ForegroundColor White
+    Write-Host "Pact ensemble pipeline build $BuildIdentity (artifact v$ArtifactVersion)" -ForegroundColor White
     Write-Host "Run root: $RunRoot" -ForegroundColor White
 
-    Start-LlamaServer GemmaTranslate
-    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
     $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)
     Invoke-PythonStage -Label '1/11 Prepare manifest, chapter bible, frozen glossary' -Arguments $prepareArgs
 
-    if ($RedoFormatting -and -not $RedoTranslation -and -not $RedoQuality) {
-        Remove-SelectedOutputs
+    $dagArgs = @((Join-Path $PackageRoot 'v31_artifact_dag.py'), '--work-dir',$WorkDir,'--output-dir',$OutputDir,'--run-root',$RunRoot)
+    if ($RedoSourceAnalysis) { $dagArgs += '--redo-source-analysis' }
+    if ($RedoTranslation) { $dagArgs += '--redo-translation' }
+    if ($RedoQuality) { $dagArgs += '--redo-quality' }
+    if ($RedoFormatting) { $dagArgs += '--redo-formatting' }
+    if ($DryRun) {
+        Invoke-PythonStage -Label 'Artifact dependency plan (dry run)' -Arguments $dagArgs
+        return
     }
-
-    if ($RedoTranslation) {
-        foreach ($stem in $SelectedChapterStems) {
-            $work = Join-Path $WorkDir $stem
-            Remove-Item (Join-Path $work 'drafts') -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $work 'meta') -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $work 'draft_translations.json') -Force -ErrorAction SilentlyContinue
-        }
-        Remove-QualityArtifacts
-    } elseif ($RedoQuality) { Remove-QualityArtifacts }
-
-    if ($RedoSourceAnalysis -or $RedoTranslation) {
-        Remove-Item (Join-Path $RunRoot 'book_consistency_ledger.json') -Force -ErrorAction SilentlyContinue
+    if ($RedoSourceAnalysis -or $RedoTranslation -or $RedoQuality -or $RedoFormatting) {
+        Invoke-PythonStage -Label 'Apply artifact dependency plan' -Arguments ($dagArgs + '--apply')
     }
 
     $sourceArgs = @((Join-Path $PackageRoot 'v31_source_analysis.py')) + (CommonArgs) + @('--model',$QwenModelName)
-    if ($RedoSourceAnalysis -or $RedoTranslation) { $sourceArgs += '--force' }
-    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]($RedoSourceAnalysis -or $RedoTranslation))
+    if ($RedoSourceAnalysis) { $sourceArgs += '--force' }
+    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]$RedoSourceAnalysis)
 
-    Start-LlamaServer GemmaTranslate
     $translateArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','translate','--start',"$Start",'--end',"$End")
-    Invoke-PythonStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+    Invoke-TranslationStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
 
     Run-AuditPass 'primary' 'draft_translations.json'
     Run-RepairPass 'primary' 'draft_translations.json'
+    Invoke-PythonStage -Label '6b/11 Record primary changed-PID lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','draft_translations.json','--after','v31_primary_translations.json','--stage','primary_repair','--reason','accepted primary repair'))
 
     Run-AuditPass 'residual' 'v31_primary_translations.json'
     Run-RepairPass 'residual' 'v31_primary_translations.json'
 
-    Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs))
+    # The ledger is append-only and starts before the final targeted pass.
+    Invoke-PythonStage -Label '9a/11 Append residual changed-PID lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','v31_primary_translations.json','--after','v31_final_translations.json','--stage','residual_repair','--reason','accepted residual repair'))
+    $finalLedgerScope = Join-Path $RunRoot 'v31_final_changed_pid_ledger_scope.json'
+    Invoke-PythonStage -Label '9a/11 Resolve canonical final changed-PID ledgers' -Arguments (@((Join-Path $PackageRoot 'v31_final_ledger_scope.py')) + @('--manifest',$ChapterManifestPath,'--work-dir',$WorkDir,'--output',$finalLedgerScope))
+    Run-AuditPass 'final' 'v31_final_translations.json' '' $finalLedgerScope
+    foreach ($chapter in Get-ChildItem $WorkDir -Directory) {
+        Copy-Item (Join-Path $chapter.FullName 'v31_final_translations.json') (Join-Path $chapter.FullName 'v31_pre_final_repair_translations.json') -Force
+    }
+    Run-RepairPass 'final' 'v31_final_translations.json' 1
+    Invoke-PythonStage -Label '9b/11 Append final repair lineage' -Arguments (@((Join-Path $PackageRoot 'v31_final_lifecycle.py')) + (CommonArgs) + @('--before','v31_pre_final_repair_translations.json','--after','v31_final_translations.json','--stage','final_repair','--reason','accepted final repair'))
+    Invoke-PythonStage -Label '9b/11 Refresh canonical final changed-PID ledgers' -Arguments (@((Join-Path $PackageRoot 'v31_final_ledger_scope.py')) + @('--manifest',$ChapterManifestPath,'--work-dir',$WorkDir,'--output',$finalLedgerScope))
+    Run-AuditPass 'final' 'v31_final_translations.json' '' $finalLedgerScope
+
+    Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs) + '--final-lifecycle')
+    $quarantined = @(Get-ChildItem $WorkDir -Filter 'state.json' -Recurse | Where-Object {
+        (Get-Content $_.FullName -Raw | ConvertFrom-Json).status -eq 'quarantined'
+    })
+    if ($quarantined.Count -gt 0) {
+        Write-Host "FINAL QUALITY QUARANTINED: $($quarantined.Count) chapter(s); finalization was not run." -ForegroundColor Yellow
+        return
+    }
     Invoke-PythonStage -Label '10b/11 Build v3.1 review report' -Arguments (@((Join-Path $PackageRoot 'v31_build_review.py')) + (CommonArgs))
 
     $finalizeArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','finalize','--start',"$Start",'--end',"$End")
@@ -665,6 +760,7 @@ try {
     Write-Host "Bundle: $bundle" -ForegroundColor Green
 }
 catch {
+    Write-MonitorState -Stage $script:MonitorStage -Status 'FAILED' -FailureReason $_.Exception.Message
     Write-Host "`nPIPELINE V3.1 FAILED: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Run data preserved at: $RunRoot" -ForegroundColor Yellow
     throw

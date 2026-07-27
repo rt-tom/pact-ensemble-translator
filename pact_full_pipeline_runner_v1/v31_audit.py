@@ -12,10 +12,15 @@ from v31_common import (
     chapter_context, complete_json, dialogue_scene_notes, glossary_prompt, issue_record,
     load_cfg, load_manifest, load_runtime, load_translations, norm,
     read_json, render_pairs, scene_notes_for_pids, selected_chapters,
-    setup_logging, stage_cfg, write_json,
+    cache_identity, cache_reuse, setup_logging, stage_cfg, with_cache_identity, write_json,
 )
+from v31_final_ledger_scope import SCHEMA as FINAL_LEDGER_SCOPE_SCHEMA
 
 DEFAULTS = {
+    "qwen_global_smoke": {
+        "temperature": 0.0, "top_p": 1.0, "top_k": 64,
+        "enable_thinking": False, "max_tokens": 2600, "attempts": 3,
+    },
     "qwen_semantic": {
         "temperature": 0.0, "top_p": 1.0, "top_k": 64,
         "enable_thinking": False, "max_tokens": 1900, "attempts": 3,
@@ -37,6 +42,32 @@ DEFAULTS = {
         "window_pids": 30, "overlap_pids": 10,
     },
 }
+
+
+def qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translations, pids, pass_name):
+    """One source-grounded chapter smoke, deliberately not a second cascade."""
+    stage = stage_cfg(cfg, "qwen_global_smoke", DEFAULTS["qwen_global_smoke"])
+    source_text = "\n".join(norm(block_map[pid].get("source_text")) for pid in pids)
+    bible = read_json(work / "chapter_bible.json", {})
+    system = f"""Ты — Qwen, source-grounded финальный smoke-аудитор главы EN→RU.
+Это РОВНО ОДИН глобальный проход, не полный каскад аудитов и не литературная
+редактура. Сравни фактический финальный текст с исходной главой. Для КАЖДОГО
+PID верни results/status; отмечай только крупные блокирующие дефекты:
+gross omissions, дубли или переставленные passages, сломанную continuity
+субъекта/референта, важную несогласованность имени/термина, mixed-script или
+English residue, грубую formatting corruption, chapter-level contradiction.
+Не отмечай допустимый стиль и не предлагай полный переписанный перевод.
+
+Верни JSON {{"results":[{{"pid":"p00001","status":"ok|issue","issues":[{{
+"severity":"critical|major", "category":"missing|duplication|ordering|reference|entity_consistency|mixed_script|english_residue|formatting|continuity|meaning",
+"source_span":"", "target_span":"", "problem":"", "required_invariant":"",
+"repair_instruction":"локальная безопасная инструкция", "scope":"span|sentence|paragraph|cross_pid", "confidence":"high|medium|low"
+}}]}}]}}.
+
+ГЛОССАРИЙ:\n{glossary_prompt(runtime, cfg, source_text)}
+БИБЛИЯ:\n{bible_prompt(runtime, cfg, source_text, bible)}"""
+    user = "<FINAL_CHAPTER_SOURCE_AND_RU>\n" + render_pairs(block_map, translations, pids, True, "PAIR") + "\n</FINAL_CHAPTER_SOURCE_AND_RU>"
+    return stage, [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def qwen_messages(runtime, cfg, work, blocks, block_map, translations, pids, pass_name):
@@ -351,17 +382,62 @@ def windows(pids: list[str], size: int, overlap: int):
             break
 
 
+def scoped_ledger_paths(path: Path) -> dict[str, Path]:
+    payload = read_json(path, {})
+    if payload.get("schema") != FINAL_LEDGER_SCOPE_SCHEMA or not isinstance(payload.get("chapters"), list):
+        raise ValueError(f"Invalid final ledger scope map: {path}")
+    result: dict[str, Path] = {}
+    for entry in payload["chapters"]:
+        if not isinstance(entry, dict) or not entry.get("work_stem") or not entry.get("ledger_path"):
+            raise ValueError(f"Invalid final ledger scope entry: {entry!r}")
+        stem = str(entry["work_stem"])
+        if stem in result:
+            raise ValueError(f"Duplicate final ledger scope entry for chapter work stem: {stem}")
+        result[stem] = Path(str(entry["ledger_path"]))
+    return result
+
+
+def ledger_target_pids(manifest_pids: list[str], ledger_path: Path, work_stem: str) -> list[str]:
+    """Restrict a chapter to its own ledger; never substitute another chapter's."""
+    if not ledger_path.is_file():
+        raise FileNotFoundError(f"Final ledger is missing for selected chapter {work_stem}: {ledger_path}")
+    requested = read_json(ledger_path, {})
+    requested = requested.get("changed_pids", []) if isinstance(requested, dict) else requested
+    if not isinstance(requested, list):
+        raise ValueError("--pids-file must contain a list or changed_pids list")
+    requested_set = {str(pid) for pid in requested}
+    unknown = requested_set - set(manifest_pids)
+    if unknown:
+        raise ValueError(f"Final ledger contains unknown PIDs for selected chapter {work_stem}: {sorted(unknown)}")
+    return [pid for pid in manifest_pids if pid in requested_set]
+
+
+def scoped_ledger_path_for_work(ledger_paths: dict[str, Path], work: Path) -> Path:
+    ledger_path = ledger_paths.get(work.name)
+    if ledger_path is None:
+        raise ValueError(f"Final ledger scope map has no entry for selected chapter: {work.name}")
+    expected = (work / "v31_final_changed_pid_ledger.json").resolve()
+    if ledger_path.resolve() != expected:
+        raise ValueError(f"Final ledger scope map points outside selected chapter {work.name}: {ledger_path}")
+    return ledger_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
     parser.add_argument("--mode", choices=list(DEFAULTS), required=True)
     parser.add_argument("--translations-file")
+    parser.add_argument("--pids-file", help="JSON ledger or list restricting TARGET_PIDS; context remains adjacent manifest PIDs")
+    parser.add_argument("--pids-map", type=Path, help="Canonical per-chapter final changed-PID ledger scope map")
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
     cfg = load_cfg(runtime, args.config.resolve())
-    api_section = "reviewer_api" if args.mode == "qwen_semantic" else "translator_api"
+    api_section = "reviewer_api" if args.mode in {"qwen_semantic", "qwen_global_smoke"} else "translator_api"
     client = api_client(runtime, cfg, api_section, args.mode, args.model)
+    if args.pids_file and args.pids_map:
+        raise ValueError("Use either --pids-file or --pids-map, not both")
+    ledger_paths = scoped_ledger_paths(args.pids_map) if args.pids_map else {}
 
     for source_path, work in selected_chapters(runtime, cfg, args.start, args.end):
         _, blocks, block_map = load_manifest(work)
@@ -369,15 +445,18 @@ def main() -> int:
         detector = f"{args.mode}_{args.pass_name}"
         root = work / "v31" / args.pass_name / "audits" / args.mode
         consolidated = work / "v31" / args.pass_name / f"{args.mode}.json"
-        if consolidated.exists() and not args.force:
-            logging.info("Reusing %s", consolidated)
-            continue
         root.mkdir(parents=True, exist_ok=True)
         all_issues: list[dict[str, Any]] = []
         covered: set[str] = set()
         pids = [str(block["pid"]) for block in blocks]
+        ledger_path = Path(args.pids_file) if args.pids_file else (scoped_ledger_path_for_work(ledger_paths, work) if args.pids_map else None)
+        if ledger_path:
+            pids = ledger_target_pids(pids, ledger_path, work.name)
 
-        if args.mode == "gemma_discourse":
+        if args.mode == "qwen_global_smoke":
+            stage = stage_cfg(cfg, "qwen_global_smoke", DEFAULTS[args.mode])
+            units = [pids]
+        elif args.mode == "gemma_discourse":
             stage = stage_cfg(cfg, "gemma_discourse_audit", DEFAULTS["gemma_discourse"])
             units = list(windows(pids, int(stage["window_pids"]), int(stage["overlap_pids"])))
         else:
@@ -390,10 +469,9 @@ def main() -> int:
             units = list(batched(pids, int(stage["batch_pids"])))
 
         def evaluate_unit(unit_pids: list[str], cache_path: Path, label: str):
-            if cache_path.exists() and not args.force:
-                saved = read_json(cache_path, {})
-                return saved.get("issues") or [], saved.get("coverage") or []
-            if args.mode == "qwen_semantic":
+            if args.mode == "qwen_global_smoke":
+                local_stage, messages = qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
+            elif args.mode == "qwen_semantic":
                 local_stage, messages = qwen_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
             elif args.mode == "gemma_semantic":
                 local_stage, messages = gemma_semantic_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
@@ -401,6 +479,19 @@ def main() -> int:
                 local_stage, messages = gemma_local_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
             else:
                 local_stage, messages = discourse_messages(cfg, work, block_map, translations, unit_pids, args.pass_name)
+            identity = cache_identity(
+                producer="v31_audit", schema="audit-unit/v1",
+                source={"chapter": source_path.name, "blocks": blocks},
+                inputs={"pids": unit_pids, "translations": translations, "pass": args.pass_name, "mode": args.mode},
+                config=local_stage, prompt=messages,
+                profile={"model": args.model or cfg[api_section].get("model"), "api": api_section},
+            )
+            if not args.force:
+                saved, reason = cache_reuse(cache_path, identity)
+                if saved is not None:
+                    return saved.get("issues") or [], saved.get("coverage") or []
+                if cache_path.exists():
+                    logging.info("Cache miss %s: %s", cache_path, reason)
             validator = (
                 (lambda data, expected=unit_pids, source=detector: parse_discourse(data, expected, source))
                 if args.mode == "gemma_discourse"
@@ -421,7 +512,7 @@ def main() -> int:
                     "split": False,
                 }
             except RuntimeError as exc:
-                if args.mode == "gemma_discourse" or len(unit_pids) <= 1:
+                if args.mode in {"gemma_discourse", "qwen_global_smoke"} or len(unit_pids) <= 1:
                     raise
                 midpoint = len(unit_pids) // 2
                 left_pids, right_pids = unit_pids[:midpoint], unit_pids[midpoint:]
@@ -443,7 +534,7 @@ def main() -> int:
                     "split": True,
                     "children": [left_pids, right_pids],
                 }
-            write_json(cache_path, record)
+            write_json(cache_path, with_cache_identity(record, identity))
             return local_issues, local_covered
 
         for index, unit in enumerate(units, 1):
