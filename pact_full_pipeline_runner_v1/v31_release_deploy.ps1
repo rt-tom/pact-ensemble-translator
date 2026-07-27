@@ -77,9 +77,16 @@ function Get-ReleaseVersion {
         if (-not (Test-Path -LiteralPath $common)) { throw "Version identity source not found: $common" }
         $text = [System.IO.File]::ReadAllText($common, [System.Text.UTF8Encoding]::new($false))
     }
-    $match = [regex]::Match($text, '(?m)^VERSION\s*=\s*["''](?<version>[^"'']+)["'']\s*$')
-    if (-not $match.Success) { throw "Could not resolve release version from $common" }
-    return $match.Groups['version'].Value
+    $artifact = [regex]::Match($text, '(?m)^ARTIFACT_VERSION\s*=\s*(?<value>VERSION|["''][^"'']+["''])\s*$')
+    if (-not $artifact.Success) { throw "Could not resolve ARTIFACT_VERSION from $common" }
+    $value = $artifact.Groups['value'].Value.Trim("'`"")
+    if ($value -eq 'VERSION') {
+        $version = [regex]::Match($text, '(?m)^VERSION\s*=\s*["''](?<version>[^"'']+)["'']\s*$')
+        if (-not $version.Success) { throw "ARTIFACT_VERSION aliases missing VERSION in $common" }
+        $value = $version.Groups['version'].Value
+    }
+    if ($value -match '(?i)(rc|build)') { throw "Semantic artifact version must not contain RC/build label: $value" }
+    return $value
 }
 
 function Get-TrackedFilesAtRef {
@@ -189,7 +196,7 @@ function Assert-CachePreserved { param($Before, $After)
     if ($a -ne $b) { throw 'Cache preservation check failed; deployment must not alter pipeline_runs.' }
 }
 
-function Invoke-OfflineChecks { param([string]$Root, [switch]$SkipSmoke)
+function Invoke-OfflineChecks { param([string]$Root, [string]$ExpectedVersion, [switch]$SkipSmoke)
     $pythonFiles = @(Get-ChildItem -LiteralPath (Join-Path $Root 'pact_full_pipeline_runner_v1') -Filter '*.py' -File | Select-Object -ExpandProperty FullName) + (Join-Path $Root 'pact_translate_v3.py')
     & py -m py_compile @pythonFiles
     if ($LASTEXITCODE -ne 0) { throw 'Python compilation failed.' }
@@ -199,6 +206,8 @@ function Invoke-OfflineChecks { param([string]$Root, [switch]$SkipSmoke)
     if (-not $SkipSmoke) {
         & py (Join-Path $Root 'pact_translate_v3.py') --version
         if ($LASTEXITCODE -ne 0) { throw 'Installed smoke test (--version) failed.' }
+        $runtimeVersion = (& py -c "import sys; sys.path.insert(0, r'$Root\\pact_full_pipeline_runner_v1'); from v31_common import ARTIFACT_VERSION; print(ARTIFACT_VERSION)" | Select-Object -Last 1).Trim()
+        if ($LASTEXITCODE -ne 0 -or $runtimeVersion -ne $ExpectedVersion) { throw "Active semantic version mismatch: expected $ExpectedVersion, got $runtimeVersion" }
     }
 }
 
@@ -232,7 +241,7 @@ Save-Backup -Root $root -OldCommit $current -NewCommit $target -Destination $Bac
 $cacheBefore = Get-CacheSnapshot $root
 if ($Deploy) { Invoke-Git -Root $root -Arguments @('merge', '--ff-only', $ReleaseRef) | Out-Null }
 else { Invoke-Git -Root $root -Arguments @('revert', '--no-edit', "$target..$current") | Out-Null }
-Invoke-OfflineChecks -Root $root -SkipSmoke:$SkipSmokeTest
+Invoke-OfflineChecks -Root $root -ExpectedVersion ([string]$manifest.version) -SkipSmoke:$SkipSmokeTest
 Assert-CleanTrackedTree $root
 Assert-InstalledFiles -Root $root -Manifest $manifest
 Assert-CachePreserved -Before $cacheBefore -After (Get-CacheSnapshot $root)

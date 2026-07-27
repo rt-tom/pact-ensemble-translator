@@ -12,7 +12,7 @@ try {
     & git -C $temp config user.name 'Pact Test'
     New-Item -ItemType Directory -Force -Path (Join-Path $temp 'pact_full_pipeline_runner_v1') | Out-Null
     [IO.File]::WriteAllText((Join-Path $temp 'pact_translate_v3.py'), "print('ok')`n", [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $temp 'pact_full_pipeline_runner_v1\v31_common.py'), "VERSION = '3.1.3'`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $temp 'pact_full_pipeline_runner_v1\v31_common.py'), "VERSION = '3.1.3'`nARTIFACT_VERSION = VERSION`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $temp 'pact_full_pipeline_runner_v1\run_full_pipeline_v31.ps1'), "Write-Output 'ok'`n", [Text.UTF8Encoding]::new($false))
     & git -C $temp add .; & git -C $temp commit -qm base; & git -C $temp tag -a v3.1.3-base -m base
     [IO.File]::AppendAllText((Join-Path $temp 'pact_translate_v3.py'), "# release change`n", [Text.UTF8Encoding]::new($false))
@@ -22,6 +22,16 @@ try {
     Assert-V31Release (Test-Path $manifest) 'Manifest was not created.'
     $raw = [IO.File]::ReadAllBytes($manifest)
     Assert-V31Release (-not ($raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)) 'Manifest contains a BOM.'
+    New-Item -ItemType Directory -Force -Path (Join-Path $temp 'not-active') | Out-Null
+    $failed = $false; try { & $script -ProjectRoot (Join-Path $temp 'not-active') -ReleaseRef v3.1.3-test -ManifestPath $manifest | Out-Null } catch { $failed = $true }
+    Assert-V31Release $failed 'Nested non-active path must fail.'
+    [IO.File]::WriteAllBytes($manifest, [byte[]](@(0xEF,0xBB,0xBF) + $raw))
+    $failed = $false; try { & $script -ProjectRoot $temp -ReleaseRef v3.1.3-test -ManifestPath $manifest | Out-Null } catch { $failed = $true }
+    Assert-V31Release $failed 'BOM manifest must fail.'
+    & $script -NewReleaseManifest -ProjectRoot $temp -ReleaseRef v3.1.3-test -ManifestPath $manifest | Out-Null
+    [IO.File]::WriteAllText((Join-Path $temp 'PATCH_RELEASE_INSTALLED.json'), '{"marker":true}', [Text.UTF8Encoding]::new($false))
+    $failed = $false; try { & $script -ProjectRoot $temp -ReleaseRef v3.1.3-test -ManifestPath (Join-Path $temp 'missing_manifest.json') | Out-Null } catch { $failed = $true }
+    Assert-V31Release $failed 'Marker-only validation must fail.'
     & git -C $temp checkout -q v3.1.3-base
     & $script -ProjectRoot $temp -ReleaseRef v3.1.3-test -ManifestPath $manifest -Deploy | Out-Null
     Assert-V31Release ((& git -C $temp describe --exact-match --tags) -eq 'v3.1.3-test') 'Fast-forward deploy did not activate exact tag.'
