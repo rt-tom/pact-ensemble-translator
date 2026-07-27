@@ -3239,7 +3239,7 @@ class Runner:
         )
 
     def prepare_chapter(
-        self, source_path: Path, force: bool,
+        self, source_path: Path, force: bool, *, manifest_version: str | None = None,
     ) -> tuple[Path, str, list[Block], list[Chunk], dict[str, Block]]:
         work = Path(self.cfg["paths"]["work_dir"]) / source_path.stem
         manifest_path = work / "manifest.json"
@@ -3249,6 +3249,12 @@ class Runner:
             shutil.rmtree(work)
         if manifest_path.exists():
             manifest = read_json(manifest_path, {})
+            if manifest_version is not None and manifest.get("version") != manifest_version:
+                raise PipelineError(
+                    f"{source_path.name}: work manifest version "
+                    f"{manifest.get('version')!r} is incompatible with required "
+                    f"semantic artifact version {manifest_version!r}; create a new run."
+                )
             if manifest.get("source_sha256") != source_hash:
                 raise PipelineError(
                     f"{source_path.name}: source changed; use --force."
@@ -3264,7 +3270,7 @@ class Runner:
             work.mkdir(parents=True, exist_ok=True)
             atomic_text(work / "source.normalized.html", normalized)
             atomic_json(manifest_path, {
-                "version": __version__, "chapter": source_path.name,
+                "version": manifest_version or __version__, "chapter": source_path.name,
                 "source_sha256": source_hash,
                 "blocks": blocks_to_manifest(blocks),
                 "chunks": [asdict(chunk) for chunk in chunks],
