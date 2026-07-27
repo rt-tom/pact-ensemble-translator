@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import argparse
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from v31_common import add_common_args, load_cfg, load_runtime, read_json, selec
 
 
 TERMINAL = {"complete", "quarantined", "failed"}
+TRANSACTION_FILE = "v31_terminal_transaction.json"
 
 
 def prior_terminal_status(work: Path) -> str | None:
@@ -21,17 +23,50 @@ def prior_terminal_status(work: Path) -> str | None:
     has a terminal status; disagreement is an execution failure, never a reason
     to silently promote a quarantined chapter.
     """
-    state = read_json(work / "state.json", {})
-    gate = read_json(work / "v31_quality_gate.json", {})
+    state = recover_terminal_pair(work)
     state_status = state.get("status") if isinstance(state, dict) else None
-    gate_status = gate.get("status") if isinstance(gate, dict) else None
     if state_status not in TERMINAL:
         state_status = None
-    if gate_status not in TERMINAL:
-        gate_status = None
     # A stale gate is never authoritative.  The active finalizer will replace
     # it from state.json before allowing any terminal transition.
     return state_status
+
+
+def publish_terminal_pair(work: Path, state: dict[str, Any], gate: dict[str, Any]) -> None:
+    """Publish terminal state and its derived gate with restart-safe recovery."""
+    generation = uuid.uuid4().hex
+    gate = {**gate, "status": state["status"], "terminal_generation": generation}
+    state = {**state, "terminal_generation": generation, "quality_gate": gate}
+    marker = work / TRANSACTION_FILE
+    payload = {"generation": generation, "state": state, "gate": gate}
+    write_json(marker, payload)  # prepared and validated before either public file changes
+    write_json(work / "state.json", state)
+    write_json(work / "v31_quality_gate.json", gate)
+    marker.unlink(missing_ok=True)
+
+
+def recover_terminal_pair(work: Path) -> dict[str, Any]:
+    """Fail closed and reconstruct a stale/incomplete derived gate from state."""
+    state = read_json(work / "state.json", {})
+    gate = read_json(work / "v31_quality_gate.json", {})
+    marker = read_json(work / TRANSACTION_FILE, {})
+    if not isinstance(state, dict) or state.get("status") not in TERMINAL:
+        return state if isinstance(state, dict) else {}
+    generation = state.get("terminal_generation")
+    derived = state.get("quality_gate")
+    if not isinstance(derived, dict) or not generation:
+        # Legacy state has no reconstructable projection: it is still authoritative
+        # and cannot be promoted by a gate.
+        return state
+    expected = {**derived, "status": state["status"], "terminal_generation": generation}
+    if not isinstance(gate, dict) or gate.get("terminal_generation") != generation or gate.get("status") != state["status"]:
+        write_json(work / "v31_quality_gate.json", expected)
+    if isinstance(marker, dict):
+        if marker.get("generation") == generation:
+            (work / TRANSACTION_FILE).unlink(missing_ok=True)
+        # A marker for an unpublished candidate is intentionally ignored: state
+        # remains the authoritative old terminal record.
+    return state
 
 
 def changed_pids(before: dict[str, str], after: dict[str, str]) -> list[str]:
