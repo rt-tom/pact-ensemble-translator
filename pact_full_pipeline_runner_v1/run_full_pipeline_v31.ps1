@@ -8,6 +8,7 @@ param(
     [switch]$RedoTranslation,
     [switch]$RedoQuality,
     [switch]$RedoFormatting,
+    [switch]$DryRun,
     [switch]$SkipPreflight
 )
 
@@ -32,6 +33,7 @@ $RequiredRunnerFiles = @(
     'v31_preflight_policy.ps1',
     'v31_runner_model_policy.ps1',
     'v31_source_analysis.py',
+    'v31_artifact_dag.py',
     'v31_audit.py',
     'v31_merge_issues.py',
     'v31_cross_verify.py',
@@ -617,27 +619,22 @@ try {
     $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)
     Invoke-PythonStage -Label '1/11 Prepare manifest, chapter bible, frozen glossary' -Arguments $prepareArgs
 
-    if ($RedoFormatting -and -not $RedoTranslation -and -not $RedoQuality) {
-        Remove-SelectedOutputs
+    $dagArgs = @((Join-Path $PackageRoot 'v31_artifact_dag.py'), '--work-dir',$WorkDir,'--output-dir',$OutputDir,'--run-root',$RunRoot)
+    if ($RedoSourceAnalysis) { $dagArgs += '--redo-source-analysis' }
+    if ($RedoTranslation) { $dagArgs += '--redo-translation' }
+    if ($RedoQuality) { $dagArgs += '--redo-quality' }
+    if ($RedoFormatting) { $dagArgs += '--redo-formatting' }
+    if ($DryRun) {
+        Invoke-PythonStage -Label 'Artifact dependency plan (dry run)' -Arguments $dagArgs
+        return
     }
-
-    if ($RedoTranslation) {
-        foreach ($stem in $SelectedChapterStems) {
-            $work = Join-Path $WorkDir $stem
-            Remove-Item (Join-Path $work 'drafts') -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $work 'meta') -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $work 'draft_translations.json') -Force -ErrorAction SilentlyContinue
-        }
-        Remove-QualityArtifacts
-    } elseif ($RedoQuality) { Remove-QualityArtifacts }
-
-    if ($RedoSourceAnalysis -or $RedoTranslation) {
-        Remove-Item (Join-Path $RunRoot 'book_consistency_ledger.json') -Force -ErrorAction SilentlyContinue
+    if ($RedoSourceAnalysis -or $RedoTranslation -or $RedoQuality -or $RedoFormatting) {
+        Invoke-PythonStage -Label 'Apply artifact dependency plan' -Arguments ($dagArgs + '--apply')
     }
 
     $sourceArgs = @((Join-Path $PackageRoot 'v31_source_analysis.py')) + (CommonArgs) + @('--model',$QwenModelName)
-    if ($RedoSourceAnalysis -or $RedoTranslation) { $sourceArgs += '--force' }
-    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]($RedoSourceAnalysis -or $RedoTranslation))
+    if ($RedoSourceAnalysis) { $sourceArgs += '--force' }
+    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]$RedoSourceAnalysis)
 
     Start-LlamaServer GemmaTranslate
     $translateArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','translate','--start',"$Start",'--end',"$End")
