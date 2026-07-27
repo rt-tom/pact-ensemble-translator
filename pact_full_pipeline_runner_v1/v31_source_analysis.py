@@ -10,8 +10,8 @@ from typing import Any
 from v31_common import (
     VERSION, add_common_args, api_client, batched, bible_prompt,
     complete_json, glossary_prompt, load_cfg, load_manifest, load_runtime,
-    norm, read_json, render_pairs, selected_chapters, setup_logging,
-    stage_cfg, write_json,
+    cache_identity, cache_reuse, norm, read_json, render_pairs, selected_chapters, setup_logging,
+    stage_cfg, with_cache_identity, write_json,
 )
 
 DEFAULT_STAGE = {
@@ -337,17 +337,6 @@ def main() -> int:
         _, blocks, block_map = load_manifest(work)
         out = work / "source_scene_map.json"
         cache_dir = work / "v31_source_analysis"
-        if out.exists() and not args.force:
-            logging.info("Reusing %s", out)
-            existing = read_json(out, {})
-            book_ledger["address_matrix"] = merge_address_matrix(
-                book_ledger.get("address_matrix") or {},
-                [dict(value) for value in (existing.get("address_matrix") or {}).values() if isinstance(value, dict)],
-                source_path.name,
-            )
-            write_json(ledger_path, book_ledger)
-            continue
-
         cache_dir.mkdir(parents=True, exist_ok=True)
         by_pid: dict[str, dict[str, Any]] = {}
         address_updates: list[dict[str, Any]] = []
@@ -355,17 +344,22 @@ def main() -> int:
         pids = [str(block["pid"]) for block in blocks]
 
         def evaluate_batch(batch_pids: list[str], cache_path: Path, label: str):
-            if cache_path.exists() and not args.force:
-                saved = read_json(cache_path, {})
-                return (
-                    saved.get("by_pid") or {},
-                    saved.get("address_updates") or [],
-                    saved.get("statistics") or blank_stats(),
-                )
-
             messages = messages_for_batch(
                 runtime, cfg, work, blocks, block_map, batch_pids, book_ledger
             )
+            identity = cache_identity(
+                producer="v31_source_analysis", schema="source-analysis-batch/v1",
+                source={"chapter": source_path.name, "blocks": blocks},
+                inputs={"pids": batch_pids, "ledger": book_ledger}, config=stage,
+                prompt=messages, profile={"model": args.model or cfg["reviewer_api"].get("model")},
+            )
+            if not args.force:
+                saved, reason = cache_reuse(cache_path, identity)
+                if saved is not None:
+                    return (saved.get("by_pid") or {}, saved.get("address_updates") or [],
+                            saved.get("statistics") or blank_stats())
+                if cache_path.exists():
+                    logging.info("Cache miss %s: %s", cache_path, reason)
             try:
                 (local_by_pid, local_updates, validation_stats), attempts = complete_json(
                     runtime, client, messages, stage, int(stage["max_tokens"]),
@@ -411,7 +405,7 @@ def main() -> int:
                     "split": True,
                     "children": [left_pids, right_pids],
                 }
-            write_json(cache_path, record)
+            write_json(cache_path, with_cache_identity(record, identity))
             return local_by_pid, local_updates, local_stats
 
         for index, batch in enumerate(batched(pids, int(stage["batch_pids"])), 1):
