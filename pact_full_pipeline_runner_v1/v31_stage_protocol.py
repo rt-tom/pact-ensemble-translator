@@ -11,6 +11,8 @@ import argparse
 import json
 from pathlib import Path
 
+from v31_common import compatible_artifact_version
+
 REUSED = 0
 MODEL_REQUIRED = 20
 MODEL_REQUIRED_INVALID = 22
@@ -24,7 +26,7 @@ def emit(outcome: str, **detail: object) -> int:
     return {"REUSED": REUSED, "MODEL_REQUIRED": MODEL_REQUIRED, "FAILED": FAILED}[outcome]
 
 
-def valid_aggregate(path: Path) -> bool:
+def valid_aggregate(path: Path, *, allow_legacy_artifact_version: bool = False) -> bool:
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -33,7 +35,9 @@ def valid_aggregate(path: Path) -> bool:
     # checked when present, so a truncated but parseable aggregate cannot be
     # promoted to REUSED.  Fine-grained cache identity remains validated by the
     # stage itself on the MODEL_REQUIRED execution path.
-    if not isinstance(value, dict) or not isinstance(value.get("version"), str):
+    if not isinstance(value, dict) or not compatible_artifact_version(
+        value.get("version"), allow_legacy=allow_legacy_artifact_version
+    ):
         return False
     expected, completed = value.get("expected"), value.get("completed")
     if expected is not None or completed is not None:
@@ -49,6 +53,8 @@ def main() -> int:
     parser.add_argument("--aggregate-relative-path")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--translation", action="store_true")
+    parser.add_argument("--allow-legacy-artifact-version", action="store_true",
+                        help="Allow only explicitly listed legacy artifact versions to be reused.")
     args = parser.parse_args()
     if not args.chapter_stem:
         return emit("FAILED", reason="empty_chapter_selection")
@@ -63,7 +69,12 @@ def main() -> int:
         return emit("FAILED", reason="missing_aggregate_relative_path")
     paths = [args.work_dir / stem / args.aggregate_relative_path for stem in args.chapter_stem]
     missing = [str(path) for path in paths if not path.exists()]
-    invalid = [str(path) for path in paths if path.exists() and not valid_aggregate(path)]
+    invalid = [
+        str(path) for path in paths
+        if path.exists() and not valid_aggregate(
+            path, allow_legacy_artifact_version=args.allow_legacy_artifact_version
+        )
+    ]
     if missing or invalid:
         return emit("MODEL_REQUIRED", reason="missing_partial_or_invalid_aggregate", missing=missing, invalid=invalid, has_invalid=bool(invalid))
     return emit("REUSED", aggregate_count=len(paths))

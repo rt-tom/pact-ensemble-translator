@@ -8,6 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from v31_common import VERSION
+
 ROOT = Path(__file__).resolve().parent
 PROBE = ROOT / "v31_stage_protocol.py"
 
@@ -31,15 +33,20 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp); relative = "v31/primary/qwen_semantic.json"
         common = ("--aggregate-relative-path", relative, "--chapter-stem", "one", "--chapter-stem", "two")
-        aggregate(root, "one", relative, {"version": "3.1.3", "expected": 1, "completed": 1}); aggregate(root, "two", relative, {"version": "3.1.3", "expected": 1, "completed": 1})
+        aggregate(root, "one", relative, {"version": VERSION, "expected": 1, "completed": 1}); aggregate(root, "two", relative, {"version": VERSION, "expected": 1, "completed": 1})
         assert_outcome(probe(root, *common), 0, "REUSED")  # aggregate reuse: no model start
         (root / "two" / relative).unlink()
         assert_outcome(probe(root, *common), 20, "MODEL_REQUIRED")  # partial cache
         aggregate(root, "two", relative, [])
         assert_outcome(probe(root, *common), 22, "MODEL_REQUIRED")  # invalid aggregate, retry with force
-        aggregate(root, "two", relative, {"version": "3.1.3", "expected": 2, "completed": 1})
+        aggregate(root, "two", relative, {"version": VERSION, "expected": 2, "completed": 1})
         assert_outcome(probe(root, *common), 22, "MODEL_REQUIRED")  # truncated aggregate
         assert_outcome(probe(root, *common, "--force"), 20, "MODEL_REQUIRED")
+        aggregate(root, "two", relative, {"version": "not-compatible", "expected": 1, "completed": 1})
+        assert_outcome(probe(root, *common), 22, "MODEL_REQUIRED")  # incompatible version never reuses
+        aggregate(root, "two", relative, {"version": "3.1.2j", "expected": 1, "completed": 1})
+        assert_outcome(probe(root, *common), 22, "MODEL_REQUIRED")  # legacy is not silently reused
+        assert_outcome(probe(root, *common, "--allow-legacy-artifact-version"), 0, "REUSED")
         assert_outcome(probe(root, "--translation", "--chapter-stem", "one"), 20, "MODEL_REQUIRED")
     print("Pact v3.1 stage protocol offline integration tests passed")
     return 0
