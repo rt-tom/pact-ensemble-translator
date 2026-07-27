@@ -130,6 +130,18 @@ For every incident:
 Use `hotfix/<version-or-incident>` for a failure blocking the current production
 run. Otherwise use `fix/<short-description>`.
 
+When another unmerged PR exists:
+
+- Start a new independent incident branch from current `main` by default.
+- Do not base a new branch on an unmerged PR unless the new change explicitly
+  depends on that PR.
+- Report any file overlap with open PRs.
+- Before merging, refresh the branch against latest `main` and rerun all tests.
+- Never combine unrelated fixes into one PR merely because they are pending at
+  the same time.
+- Each PR requires its own approval unless the user explicitly approves
+  multiple named PRs together.
+
 ### Phase D: implementation
 
 - Implement the smallest complete fix.
