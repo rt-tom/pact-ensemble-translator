@@ -86,6 +86,10 @@ def run(project_root: Path) -> None:
         blocking_findings=[], final_repair_rounds=0,
     ) == "failed"  # incomplete coverage
     assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=False,
+        blocking_findings=[], final_repair_rounds=0,
+    ) == "failed"  # technical global-smoke failure
+    assert v31_final_lifecycle.terminal_status(
         ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
         blocking_findings=[], final_repair_rounds=2,
     ) == "failed"  # a second final-repair round is forbidden
@@ -393,6 +397,8 @@ def run(project_root: Path) -> None:
     smoke_prompt = "\n".join(message["content"] for message in smoke_messages)
     assert "gross omissions" in smoke_prompt and "<EN>Mary nodded.</EN>" in smoke_prompt and "<RU>Мэри кивнула.</RU>" in smoke_prompt
     assert smoke_stage == v31_audit.DEFAULTS["qwen_global_smoke"]
+    runner_text = (HERE / "run_full_pipeline_v31.ps1").read_text(encoding="utf-8")
+    assert runner_text.count("'qwen_global_smoke'") == 1  # exactly one global smoke stage
 
     digit_block = runtime.Block(
         pid="p00005", index=0, tag="p", source_html="<p>3 rules.</p>",
