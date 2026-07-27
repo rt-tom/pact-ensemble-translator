@@ -1,10 +1,26 @@
 # Pact Translator Agent Instructions
 
+## Goals
+
+Use this priority order:
+
+1. translation quality and integrity;
+2. reliability of the fully automated pipeline;
+3. development and execution speed;
+4. economical use of Codex tokens.
+
+Do not spend context restating established state. Read only the files needed
+for the current task.
+
 ## Repository roles
 
 Production repository and worktree:
 
 `D:\pact\pact_translator_v3`
+
+Development worktrees:
+
+`D:\pact\pact_translator_worktrees\`
 
 GitHub repository: `rt-tom/pact-ensemble-translator`
 
@@ -13,8 +29,8 @@ Stable branch: `main`
 The production worktree is used only to:
 
 - run the stable pipeline;
-- install an already reviewed release;
-- inspect production state.
+- perform read-only investigation;
+- perform guarded deployment of an already reviewed release.
 
 All development must happen on a separate branch **and** in a separate Git
 worktree. Never edit production source files directly during development.
@@ -50,6 +66,34 @@ Use this priority order:
 
 A patch marker or successful installer message is not proof that code was
 installed. Compare the active code.
+
+## Token-efficient working mode
+
+By default:
+
+- do not retell project history;
+- do not reread the entire repository;
+- do not open documentation unrelated to the task;
+- do not print complete diffs or logs;
+- do not repeat unchanged HEADs, paths, settings, or cache counts;
+- do not narrate every command or keep a step-by-step diary;
+- do not create a review packet for a `LOW RISK` PR;
+- reuse facts already established in the current Codex task and Git history.
+
+Open these first:
+
+1. the traceback or specific artifact;
+2. the directly implicated file;
+3. its direct downstream consumers;
+4. tests for that lifecycle.
+
+Expand the investigation only for a concrete reason. Produce a full diff,
+detailed logs, or a full lifecycle report only when the user asks, the PR is
+`REVIEW REQUIRED`, the cause is ambiguous, validation fails, or data loss is
+possible.
+
+Summarize commands and files. In responses, cite paths and relevant lines
+instead of reproducing large files.
 
 ## Short command: `Вот ошибка`
 
@@ -92,9 +136,10 @@ Determine:
 Before changing any enum, decision, confidence, category, scope, target span,
 required invariant, detector family, issue identity, status, coverage, cache
 field, completion/finalization field, formatting incident, or policy outcome,
-trace its entire downstream lifecycle. Check creation, merge, verification,
+trace its actual downstream consumers. Inspect creation, merge, verification,
 uncertain resolution, repair, gates, postcheck, finalization, monitor, and
-resume/cache reuse. Do not stop at the producer of the value.
+resume/cache reuse only where the value really flows. Do not stop at the
+producer of the value, but do not expand the trace without evidence.
 
 Incident inspection must not be used to analyze chapter 60 translation quality.
 Inspect only the code, structure, state, and metadata required to diagnose the
@@ -157,17 +202,23 @@ When another unmerged PR exists:
 
 ### Phase E: validation
 
-Run all applicable checks:
+Run the relevant checks, not every possible check without cause. Normally:
 
-- Python compilation;
-- offline self-tests and unit tests;
+- Python compilation for changed files;
 - targeted regression tests;
-- PowerShell AST syntax check;
+- the relevant offline self-test;
+- PowerShell AST syntax checks for a changed runner;
 - `git diff --check`;
-- exact changed-file scope check;
+- exact changed-file scope checks.
+
+Add only when needed:
+
 - cache reuse and resume tests;
 - lifecycle and validation-failure tests;
-- rollback feasibility check.
+- production cache hashes;
+- full integration tests.
+
+Do not run a model or the production pipeline for offline validation.
 
 Verify that:
 
@@ -227,7 +278,7 @@ Required if any change affects:
 - multiple defensible policies, possible data recomputation/loss, or unknown
   downstream consequences.
 
-For `REVIEW REQUIRED`, add `docs/reviews/PR-XXXX-REVIEW_PACKET.md` containing:
+For `REVIEW REQUIRED`, include in the PR body:
 
 - root cause and chosen policy;
 - downstream lifecycle trace and behavioral matrix;
@@ -237,6 +288,9 @@ For `REVIEW REQUIRED`, add `docs/reviews/PR-XXXX-REVIEW_PACKET.md` containing:
 - tests and remaining risks;
 - one exact review question.
 
+Create `docs/reviews/PR-XXXX-REVIEW_PACKET.md` only when the PR body is
+insufficient or the user explicitly asks for a separate review packet.
+
 Do not ask the user to relay intermediate messages between assistants.
 
 ## Compact incident report
@@ -244,28 +298,29 @@ Do not ask the user to relay intermediate messages between assistants.
 After `Вот ошибка`, return one compact report rather than a long action diary:
 
 ```text
-PR: #N and URL
-Branch:
-Commit:
+PR: #N — URL
 Risk: LOW RISK / REVIEW REQUIRED
-
-Root cause:
-Fix:
-Changed files:
-Tests:
-Caches/run artifacts:
-Production:
-Resume safety:
-Open decision: none, or one precise question
+Cause: 1-3 sentences
+Fix: 1-3 sentences
+Files: list or count
+Tests: PASS / FAIL
+Caches: preserved / invalidated
+Production: unchanged
+Resume: safe / blocked
+Decision needed: none / one precise question
 ```
+
+Do not repeat the full Git status, every SHA, unchanged settings, a long diff,
+or full test logs. Keep those details locally or in the PR and show them on
+request.
 
 ## Short command: `Утвержден` / `PR утвержден`
 
-When the user writes `Утвержден` or `PR утвержден`, the current open draft PR
-has received the required external approval. This authorizes the complete
-release and guarded deployment workflow below without separate requests for
-ready-for-review, merge, tag, backup, cache hashing, production update, or
-offline tests.
+When the user writes `Утвержден`, `PR утвержден`, or `PR #N утвержден`, the
+named or current open draft PR has received the required external approval.
+This authorizes the complete release and guarded deployment workflow below
+without separate requests for ready-for-review, merge, tag, backup, cache
+hashing, production update, or offline tests.
 
 If multiple plausible PRs are open, ask one short question listing their
 numbers. Approval does not authorize running or resuming the pipeline.
@@ -314,8 +369,8 @@ Before changing production:
 3. verify a clean tracked tree and exact release changed-file diff;
 4. back up every changed tracked file;
 5. save old HEAD, new tag SHA, and diff manifest;
-6. save an affected-cache manifest containing relative path, size, SHA-256,
-   and `LastWriteTimeUtc`;
+6. save a manifest only for caches actually affected by the release or critical
+   for resume, containing relative path, size, SHA-256, and `LastWriteTimeUtc`;
 7. verify the expected cache count when known.
 
 If the cache count changed unexpectedly, stop before deployment.
@@ -339,8 +394,8 @@ files, or an old ZIP patch over a Git release.
 After deployment:
 
 1. verify exact production HEAD, clean tracked tree, and changed-file scope;
-2. run Python compilation, offline self-tests, targeted regression tests,
-   PowerShell AST checks, and `git diff --check` where applicable;
+2. run relevant Python compilation, offline self-tests, targeted regression
+   tests, PowerShell AST checks, and `git diff --check` where applicable;
 3. read actual version strings and stage settings;
 4. compare model/profile settings before and after;
 5. recompute the cache manifest and compare path, size, SHA-256, and
@@ -353,21 +408,17 @@ safe rollback commit/tag, and backup path.
 ### Phase G: compact release report
 
 ```text
-PR:
-Merge commit:
+PR: #N merged
 Tag:
-Old production HEAD:
-New production HEAD:
+Production: old SHA -> new SHA
 Backup:
-Changed files:
-Tests:
-Cache comparison:
-Production tracked status:
-Pipeline: not started
+Tests: PASS / FAIL
+Caches: unchanged / exact difference
 Deployment: PASS / FAILED
 Resume: READY / BLOCKED
-Reason: only when failed
 ```
+
+Do not print the full deployment log when deployment passes.
 
 ## Short command: `Запускай` / `Возобновляй`
 
@@ -388,6 +439,16 @@ Before starting:
 
 If the user only asks how to start, show the command without executing it.
 
+After startup, report briefly:
+
+- the exact command;
+- version and stage;
+- whether cache reuse was confirmed;
+- the first actually unfinished item.
+
+Do not keep the Codex task open to monitor a long-running pipeline unless the
+user explicitly asks for ongoing monitoring.
+
 ## Working style
 
 - Inspect before editing.
@@ -406,6 +467,17 @@ The normal interaction points are:
 2. external review when required;
 3. `Утвержден` — merge, tag, guarded deploy, and offline validation;
 4. `Возобновляй` — start the production pipeline.
+
+## Permanent safety rules
+
+- Do not interfere with another process's `llama-server`.
+- Reuse a server only when its ownership and matching profile are proven.
+- Do not treat a partial cache as a completed stage.
+- Do not skip a model call merely because individual issue caches exist.
+- Do not accept truncated JSON.
+- Do not treat a green JSON status as proof of text quality.
+- Do not change tuned model settings to work around a software defect.
+- Treat merge, deployment, and pipeline execution as three separate stages.
 
 ## Data restrictions
 
