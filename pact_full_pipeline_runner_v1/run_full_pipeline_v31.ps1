@@ -244,7 +244,7 @@ function Get-LlamaServerProfile {
         'GemmaVerify' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','128','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
     }
-    return ,$serverArgs
+    return $serverArgs
 }
 
 function Get-LlamaProcessCommandLine {
@@ -273,7 +273,7 @@ function Test-OwnedHealthyLlamaServer {
 
 function Start-LlamaServer {
     param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile)
-    $serverArgs = @(Get-LlamaServerProfile $Profile)
+    [string[]]$serverArgs = @(Get-LlamaServerProfile $Profile)
     if (Test-OwnedHealthyLlamaServer $Profile $serverArgs) {
         Write-Host "Reusing owned healthy $Profile server (PID $($script:ServerProcess.Id))" -ForegroundColor Green
         return
