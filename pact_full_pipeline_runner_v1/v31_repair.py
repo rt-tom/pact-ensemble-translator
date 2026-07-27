@@ -114,8 +114,10 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
         action = norm(item.get("action")).casefold()
         if action not in {"replace_span", "replace_full", "challenge_issue"}:
             continue
+        declared_action = action
         errors = []
-        old = norm(item.get("old"))
+        raw_old = item.get("old")
+        old = norm(raw_old) if isinstance(raw_old, str) else ""
         new = norm(item.get("new"))
         text = norm(item.get("text"))
         challenge = norm(item.get("challenge_reason"))
@@ -124,12 +126,19 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
         if action == "replace_span":
             if not old:
                 errors.append("old span is empty")
-            elif current.count(old) != 1:
-                errors.append(f"old span occurrence count={current.count(old)}")
+            # A span is a literal edit address, never a normalized or fuzzy
+            # match.  This also rejects a missing or ambiguous target span.
+            elif not isinstance(raw_old, str) or current.count(raw_old) != 1:
+                errors.append(f"old span occurrence count={current.count(raw_old) if isinstance(raw_old, str) else 0}")
             if not new:
                 errors.append("new span is empty")
             if not errors:
-                after = current.replace(old, new, 1)
+                after = current.replace(raw_old, new, 1)
+                # Only byte-for-byte equality is whole-PID scope.  Preserve
+                # the declared operation in provenance, but normalize the
+                # lifecycle action so it follows replace_full downstream.
+                if raw_old == current:
+                    action = "replace_full"
         elif action == "replace_full":
             after = text
             if not text:
@@ -157,11 +166,13 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
         if action != "challenge_issue":
             errors.extend(runtime.validate_single_repair(pid, after, block_map, cfg, current))
             ratio = changed_ratio(current, after)
-            if action == "replace_span" and ratio > float(cfg.get("ensemble_v31", {}).get("repair", {}).get("max_changed_ratio_span", DEFAULT_STAGE["max_changed_ratio_span"])):
+            if action == "replace_span" and old != current and ratio > float(cfg.get("ensemble_v31", {}).get("repair", {}).get("max_changed_ratio_span", DEFAULT_STAGE["max_changed_ratio_span"])):
                 errors.append(f"span repair changed_ratio={ratio:.3f}")
         candidates.append({
             "candidate_id": cid,
             "action": action,
+            "declared_action": declared_action,
+            "operation_provenance": "whole_pid_replace_span_normalized_to_replace_full" if declared_action == "replace_span" and action == "replace_full" else "declared_action",
             "old": old,
             "new": new,
             # Downstream gates receive the one normalized candidate text.  The
