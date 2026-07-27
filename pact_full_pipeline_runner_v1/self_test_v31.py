@@ -21,6 +21,7 @@ import v31_postcheck
 import v31_repair
 import v31_finalize_verification
 import v31_merge_issues
+import v31_artifact_dag
 
 
 def load_runtime(project_root: Path):
@@ -30,6 +31,22 @@ def load_runtime(project_root: Path):
 
 def run(project_root: Path) -> None:
     runtime = load_runtime(project_root)
+
+    # DAG lifecycle: redo invalidates only direct consumers and their descendants.
+    def actions(**kwargs):
+        return {row["stage"]: row["action"] for row in v31_artifact_dag.plan(**kwargs)}
+    source = actions(redo_source=True)
+    assert source["translation"] == "INVALIDATE" and source["finalization"] == "INVALIDATE"
+    assert source["source_analysis"] == "INVALIDATE"
+    translation = actions(redo_translation=True)
+    assert translation["source_analysis"] == "REUSE" and translation["primary_audit"] == "INVALIDATE"
+    quality = actions(redo_quality=True)
+    assert quality["translation"] == "REUSE" and quality["primary_repair"] == "INVALIDATE"
+    assert quality["residual_audit"] == "INVALIDATE" and quality["residual_repair"] == "INVALIDATE"
+    assert quality["final_quality"] == "INVALIDATE" and quality["finalization"] == "INVALIDATE"
+    formatting = actions(redo_formatting=True)
+    assert formatting["finalization"] == "INVALIDATE"
+    assert formatting["final_quality"] == "REUSE" and formatting["review"] == "REUSE"
 
     class FakeJsonRuntime:
         safe_json_loads = staticmethod(runtime.safe_json_loads)

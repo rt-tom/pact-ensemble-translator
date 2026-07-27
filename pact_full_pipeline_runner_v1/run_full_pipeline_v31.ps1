@@ -8,12 +8,13 @@ param(
     [switch]$RedoTranslation,
     [switch]$RedoQuality,
     [switch]$RedoFormatting,
+    [switch]$DryRun,
     [switch]$SkipPreflight
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.2j'
+$RunnerVersion = '3.1.3-03'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -28,10 +29,13 @@ $Python = 'py'
 
 $RequiredRunnerFiles = @(
     'prepare_pipeline_context.py',
+    'v31_chapter_resolver.py',
     'v31_common.py',
     'v31_preflight_policy.ps1',
     'v31_runner_model_policy.ps1',
+    'v31_stage_protocol.py',
     'v31_source_analysis.py',
+    'v31_artifact_dag.py',
     'v31_audit.py',
     'v31_merge_issues.py',
     'v31_cross_verify.py',
@@ -65,11 +69,10 @@ $ServerLogsDir = Join-Path $RunRoot 'server_logs'
 $GlossaryDir = Join-Path $RunRoot 'glossary'
 $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
+$ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
 
-$AllInputFiles = @(Get-ChildItem (Join-Path $ProjectRoot 'pact_chapters') -Filter '*.html' -File | Sort-Object Name)
-$SelectedInputFiles = @($AllInputFiles | Select-Object -Skip ([math]::Max(0, $Start - 1)) -First ([math]::Max(0, $End - $Start + 1)))
-if ($SelectedInputFiles.Count -ne ($End - $Start + 1)) { throw "Requested chapter range $Start-$End is outside available inputs." }
-$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
+$SelectedInputFiles = @()
+$SelectedChapterStems = @()
 
 if ($Reset -and (Test-Path $RunRoot)) {
     Write-Host "Removing previous v3.1 run: $RunRoot" -ForegroundColor Yellow
@@ -163,6 +166,7 @@ $paths['logs_dir'] = $LogsDir
 $paths['glossary_dir'] = $GlossaryDir
 $paths['book_bible_file'] = $BookBiblePath
 $paths['arc_names_file'] = (Join-Path $ProjectRoot 'arc_names.json')
+$paths['chapter_manifest_file'] = $ChapterManifestPath
 
 $chapterBible['enabled'] = $true
 $chapterBible['required'] = $true
@@ -190,7 +194,7 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.2j'
+$ensemble['version'] = '3.1.3'
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -213,6 +217,12 @@ $configJson = $cfg | ConvertTo-Json -Depth 60
     $configJson,
     [System.Text.UTF8Encoding]::new($false)
 )
+
+$resolverPath = Join-Path $PackageRoot 'v31_chapter_resolver.py'
+$chapterManifest = & $Python $resolverPath --project-root $ProjectRoot --input-dir $paths['input_dir'] --start $Start --end $End --manifest $ChapterManifestPath | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "Canonical chapter resolver failed with exit code $LASTEXITCODE" }
+$SelectedInputFiles = @($chapterManifest.chapters | ForEach-Object { Get-Item (Join-Path $ProjectRoot $_.source_path) })
+$SelectedChapterStems = @($SelectedInputFiles | ForEach-Object BaseName)
 
 $script:ServerProcess = $null
 $script:CurrentServerStderr = $null
@@ -511,12 +521,31 @@ function Invoke-AggregateModelStage {
         [string]$AggregateRelativePath,
         [bool]$Force
     )
-    if (Test-V31AggregateSetComplete $WorkDir $SelectedChapterStems $AggregateRelativePath $Force) {
-        Write-Host "`nModel startup skipped: all selected aggregate outputs exist for $Label" -ForegroundColor DarkGray
+    $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--aggregate-relative-path', $AggregateRelativePath)
+    foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
+    if ($Force) { $probeArgs += '--force' }
+    Push-Location $ProjectRoot
+    try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -eq 0) {
+        Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
         Invoke-PythonStage -Label $Label -Arguments $Arguments
         return
     }
+    if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }
+    $runArguments = @($Arguments)
+    if ($probeExit -eq 22 -and $runArguments -notcontains '--force') { $runArguments += '--force' }
     Start-LlamaServer $Profile
+    Invoke-PythonStage -Label $Label -Arguments $runArguments
+}
+
+function Invoke-TranslationStage {
+    param([string]$Label, [string[]]$Arguments)
+    $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--translation')
+    foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
+    Push-Location $ProjectRoot
+    try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -ne 20) { throw "$Label stage probe FAILED with exit code $probeExit" }
+    Start-LlamaServer GemmaTranslate
     Invoke-PythonStage -Label $Label -Arguments $Arguments
 }
 
@@ -612,36 +641,29 @@ try {
     Write-Host "Pact ensemble pipeline v$RunnerVersion" -ForegroundColor White
     Write-Host "Run root: $RunRoot" -ForegroundColor White
 
-    Start-LlamaServer GemmaTranslate
-    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
     $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)
     Invoke-PythonStage -Label '1/11 Prepare manifest, chapter bible, frozen glossary' -Arguments $prepareArgs
 
-    if ($RedoFormatting -and -not $RedoTranslation -and -not $RedoQuality) {
-        Remove-SelectedOutputs
+    $dagArgs = @((Join-Path $PackageRoot 'v31_artifact_dag.py'), '--work-dir',$WorkDir,'--output-dir',$OutputDir,'--run-root',$RunRoot)
+    if ($RedoSourceAnalysis) { $dagArgs += '--redo-source-analysis' }
+    if ($RedoTranslation) { $dagArgs += '--redo-translation' }
+    if ($RedoQuality) { $dagArgs += '--redo-quality' }
+    if ($RedoFormatting) { $dagArgs += '--redo-formatting' }
+    if ($DryRun) {
+        Invoke-PythonStage -Label 'Artifact dependency plan (dry run)' -Arguments $dagArgs
+        return
     }
-
-    if ($RedoTranslation) {
-        foreach ($stem in $SelectedChapterStems) {
-            $work = Join-Path $WorkDir $stem
-            Remove-Item (Join-Path $work 'drafts') -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $work 'meta') -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item (Join-Path $work 'draft_translations.json') -Force -ErrorAction SilentlyContinue
-        }
-        Remove-QualityArtifacts
-    } elseif ($RedoQuality) { Remove-QualityArtifacts }
-
-    if ($RedoSourceAnalysis -or $RedoTranslation) {
-        Remove-Item (Join-Path $RunRoot 'book_consistency_ledger.json') -Force -ErrorAction SilentlyContinue
+    if ($RedoSourceAnalysis -or $RedoTranslation -or $RedoQuality -or $RedoFormatting) {
+        Invoke-PythonStage -Label 'Apply artifact dependency plan' -Arguments ($dagArgs + '--apply')
     }
 
     $sourceArgs = @((Join-Path $PackageRoot 'v31_source_analysis.py')) + (CommonArgs) + @('--model',$QwenModelName)
-    if ($RedoSourceAnalysis -or $RedoTranslation) { $sourceArgs += '--force' }
-    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]($RedoSourceAnalysis -or $RedoTranslation))
+    if ($RedoSourceAnalysis) { $sourceArgs += '--force' }
+    Invoke-AggregateModelStage -Label '2/11 Qwen source scene analysis' -Arguments $sourceArgs -Profile Qwen -AggregateRelativePath 'source_scene_map.json' -Force ([bool]$RedoSourceAnalysis)
 
-    Start-LlamaServer GemmaTranslate
     $translateArgs = @('.\pact_translate_v3.py','--config',$ConfigPath,'--phase','translate','--start',"$Start",'--end',"$End")
-    Invoke-PythonStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+    Invoke-TranslationStage -Label '3/11 Gemma translation with source invariants' -Arguments $translateArgs
+    if (-not $SkipPreflight) { Invoke-GemmaPreflight }
 
     Run-AuditPass 'primary' 'draft_translations.json'
     Run-RepairPass 'primary' 'draft_translations.json'
