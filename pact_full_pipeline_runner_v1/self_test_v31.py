@@ -316,6 +316,19 @@ def run(project_root: Path) -> None:
     }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
     assert candidates[0]["after"] == "Их трудно прикончить."
 
+    # Some repair responses put a full replacement in ``new`` and echo
+    # CURRENT_RU in ``text``.  The candidate must remain usable rather than
+    # failing as unchanged.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_full",
+            "old": "", "new": "Их трудно прикончить.",
+            "text": "Их трудно отложить.", "reason": "idiom", "challenge_reason": "",
+        }]
+    }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["after"] == "Их трудно прикончить."
+    assert candidates[0]["valid"]
+
     qgate = v31_postcheck.parse({
         "verdict": "accept", "confidence": "high", "issue_valid": True,
         "faithful_to_source": True, "all_issues_fixed": True,
