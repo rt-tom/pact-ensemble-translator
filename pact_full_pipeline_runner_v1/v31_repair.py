@@ -120,6 +120,7 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
         text = norm(item.get("text"))
         challenge = norm(item.get("challenge_reason"))
         after = current
+        text_source = "text"
         if action == "replace_span":
             if not old:
                 errors.append("old span is empty")
@@ -139,6 +140,7 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
             # field remains authoritative in every other case.
             elif text == current and new and new != current:
                 after = new
+                text_source = "new_fallback"
             # Models can also copy EN into ``text`` while producing a complete
             # valid Russian replacement in ``new``.  Keep ``text``
             # authoritative unless it fails repair validation and ``new``
@@ -148,6 +150,7 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
                 new_errors = runtime.validate_single_repair(pid, new, block_map, cfg, current)
                 if text_errors and not new_errors:
                     after = new
+                    text_source = "new_fallback"
         else:
             if not challenge:
                 errors.append("challenge reason is empty")
@@ -161,7 +164,12 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
             "action": action,
             "old": old,
             "new": new,
-            "text": text,
+            # Downstream gates receive the one normalized candidate text.  The
+            # source field records whether it came from the primary JSON field
+            # or the narrowly validated fallback.
+            "text": after,
+            "text_source": text_source,
+            "model_text": text,
             "before": current,
             "after": after,
             "reason": norm(item.get("reason")),
