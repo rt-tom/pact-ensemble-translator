@@ -22,6 +22,7 @@ import v31_repair
 import v31_finalize_verification
 import v31_merge_issues
 import v31_artifact_dag
+import v31_audit
 import v31_final_lifecycle
 
 
@@ -384,6 +385,14 @@ def run(project_root: Path) -> None:
         [det_block], {"p00004": "Мэри кивнула."}, cfg, glossary, {}, book
     )
     assert "mixed_script" not in {item.category for item in clean_issues}
+    smoke_blocks = [{"pid": "p00004", "source_text": "Mary nodded."}]
+    smoke_stage, smoke_messages = v31_audit.qwen_global_smoke_messages(
+        runtime, cfg, Path("."), smoke_blocks, {"p00004": smoke_blocks[0]},
+        {"p00004": "Мэри кивнула."}, ["p00004"], "final",
+    )
+    smoke_prompt = "\n".join(message["content"] for message in smoke_messages)
+    assert "gross omissions" in smoke_prompt and "<EN>Mary nodded.</EN>" in smoke_prompt and "<RU>Мэри кивнула.</RU>" in smoke_prompt
+    assert smoke_stage == v31_audit.DEFAULTS["qwen_global_smoke"]
 
     digit_block = runtime.Block(
         pid="p00005", index=0, tag="p", source_html="<p>3 rules.</p>",

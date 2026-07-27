@@ -595,10 +595,14 @@ function Run-AuditPass {
 
     Invoke-AggregateModelStage -Label "$PassName Gemma semantic audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_semantic','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_semantic.json" -Force ([bool]$RedoQuality)
     Invoke-AggregateModelStage -Label "$PassName Gemma Russian audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $extra + @('--mode','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_russian.json" -Force ([bool]$RedoQuality)
-    # Final smoke is intentionally one chapter-wide discourse pass; local
-    # semantic/Russian audits remain restricted to ledger PIDs.
+    # Final smoke is intentionally one source-grounded Qwen chapter pass;
+    # local semantic/Russian audits remain restricted to ledger PIDs.
     $discourseExtra = @($extra | Where-Object { $_ -ne '--pids-file' -and $_ -ne $PidFile })
-    Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
+    if ($PassName -eq 'final') {
+        Invoke-AggregateModelStage -Label 'final Qwen source-grounded global smoke' -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','qwen_global_smoke','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_global_smoke.json" -Force ([bool]$RedoQuality)
+    } else {
+        Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
+    }
 
     Invoke-PythonStage -Label "$PassName merge and deduplicate" -Arguments (@((Join-Path $PackageRoot 'v31_merge_issues.py')) + (CommonArgs) + $extra)
 

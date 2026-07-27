@@ -217,9 +217,9 @@ def main() -> int:
                 coverage[f"final:{detector}"] = cov
                 if int(cov.get("expected", -1)) != len(targets) or int(cov.get("completed", -1)) != len(targets) or not cov.get("ok"):
                     unresolved.append({"stage": "final_verification", "detector": detector, "reason": "incomplete changed-PID coverage", "coverage": cov})
-            smoke = read_json(root / "gemma_discourse.json", {})
+            smoke = read_json(root / "qwen_global_smoke.json", {})
             smoke_cov = smoke.get("coverage") or {}
-            coverage["final:global_smoke"] = smoke_cov
+            coverage["final:qwen_global_smoke"] = smoke_cov
             if int(smoke_cov.get("expected", -1)) != len(expected_pids) or int(smoke_cov.get("completed", -1)) != len(expected_pids) or not smoke_cov.get("ok"):
                 unresolved.append({"stage": "global_smoke", "reason": "incomplete coverage", "coverage": smoke_cov})
             final_blockers = list(read_json(root / "verified_issues.json", [])) + list(smoke.get("issues") or [])
