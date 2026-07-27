@@ -77,6 +77,7 @@ $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
 $ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
 $MonitorStatePath = Join-Path $RunRoot 'monitor_state.v31.json'
+$LegacyReuseProvenancePath = Join-Path $RunRoot 'v31\legacy_reuse_provenance.json'
 
 $SelectedInputFiles = @()
 $SelectedChapterStems = @()
@@ -560,7 +561,7 @@ function Invoke-AggregateModelStage {
     $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--aggregate-relative-path', $AggregateRelativePath)
     foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
     if ($Force) { $probeArgs += '--force' }
-    if ($AllowLegacyArtifactReuse) { $probeArgs += '--allow-legacy-artifact-version' }
+    if ($AllowLegacyArtifactReuse) { $probeArgs += @('--allow-legacy-artifact-version', '--stage', $Label, '--legacy-provenance-path', $LegacyReuseProvenancePath) }
     Push-Location $ProjectRoot
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {

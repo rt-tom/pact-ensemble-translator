@@ -77,6 +77,8 @@ function Show-Monitor {
     $ensemble = Get-Value $config 'ensemble_v31'
     $expectedArtifactVersion = Get-Value $state 'artifact_version' (Get-Value $ensemble 'version' 'unknown')
     $legacyVersions = @((Get-Value $ensemble 'legacy_compatible_artifact_versions' @()))
+    $legacyProvenance = Read-JsonSafe (Join-Path $RunRoot 'v31\legacy_reuse_provenance.json')
+    $durableLegacyRecords = @((Get-Value $legacyProvenance 'records' @()))
     $buildIdentity = Get-Value $state 'runner_version' 'unknown'
     $chapters = @($manifest.chapters)
     $profile = Get-Value $state 'active_profile' 'none'
@@ -87,6 +89,9 @@ function Show-Monitor {
     if ($status -eq 'LOADING_MODEL') { $stage = "$stage (model loading; stage not executing)" }
     $complete = 0; $reused = 0; $mixed = @(); $missing = @(); $partial = @()
     $legacyCompatible = @()
+    foreach ($record in $durableLegacyRecords) {
+        $legacyCompatible += ("{0} ({1})" -f (Get-Value $record 'artifact_path' 'unknown'), (Get-Value $record 'artifact_version' 'unknown'))
+    }
     foreach ($chapter in $chapters) {
         $stem = [IO.Path]::GetFileNameWithoutExtension((Get-Value $chapter 'filename'))
         $work = Join-Path $WorkDir $stem

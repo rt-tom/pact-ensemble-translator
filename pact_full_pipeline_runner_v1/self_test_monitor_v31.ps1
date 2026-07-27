@@ -22,7 +22,10 @@ function New-Fixture { param([string]$Root,[string]$Kind,[string]$ArtifactVersio
     if ($Kind -eq 'failed') { Put-Json (Join-Path $run 'monitor_state.v31.json') @{runner_version='3.1.3-03';artifact_version=$ArtifactVersion;stage='repair';status='FAILED';failure_reason='synthetic failure'}; return }
     Put-Json (Join-Path $work 'v31_quality_gate.json') @{version=$ArtifactVersion;expected=2;completed=2}
     if ($Kind -eq 'mixed') { Put-Json (Join-Path $work 'v31\primary\legacy.json') @{version='3.1.2'}; return }
-    if ($Kind -eq 'legacy-compatible') { Put-Json (Join-Path $work 'v31\primary\legacy.json') @{version='3.1.2j'} }
+    if ($Kind -eq 'legacy-compatible') {
+        Put-Json (Join-Path $work 'v31\primary\legacy.json') @{version='3.1.2j'}
+        Put-Json (Join-Path $run 'v31\legacy_reuse_provenance.json') @{schema='pact-v31-legacy-reuse-provenance/v1';records=@(@{chapter='001_test';stage='primary-qwen';artifact_path='001_test/v31/primary/legacy.json';artifact_version='3.1.2j';expected_semantic_version=$ArtifactVersion;compatibility_policy='temporary-v31-legacy-3.1.2j-remove-after-migration';reuse_decision='legacy-compatible-reused';timestamp='2026-01-01T00:00:00Z';artifact_hash='synthetic'})}
+    }
     if ($Kind -eq 'reused') { Put-Json (Join-Path $run 'monitor_state.v31.json') @{runner_version='3.1.3';stage='source';status='REUSED'}; return }
     if ($Kind -in @('complete','legacy-compatible')) { New-Item -ItemType Directory -Force -Path (Join-Path $run 'output') | Out-Null; Set-Content -LiteralPath (Join-Path $run 'output\001_test.html') -Value 'done'; return }
 }
@@ -35,7 +38,7 @@ finally { Pop-Location }
 if (-not $actualArtifactVersion) { throw 'Could not read v31_common.VERSION.' }
 try {
     $cases = @{
-        fresh='First missing: 001_test:source_analysis'; 'partial-audit'='Partial: 001_test primary audit/qwen_semantic 1/2'; 'partial-cross'='Partial: 001_test primary cross-verify/cross_verify_qwen 1/2'; reused='reused 1/1'; failed='Failure reason: synthetic failure'; stale='Stale complete: True'; mixed='Mixed-version artifacts: legacy.json'; inactive='INTERRUPTED \(owned process inactive\)'; complete='Aggregate: complete 1/1'; 'legacy-compatible'='Legacy-compatible artifacts: legacy.json \(3.1.2j\)'
+        fresh='First missing: 001_test:source_analysis'; 'partial-audit'='Partial: 001_test primary audit/qwen_semantic 1/2'; 'partial-cross'='Partial: 001_test primary cross-verify/cross_verify_qwen 1/2'; reused='reused 1/1'; failed='Failure reason: synthetic failure'; stale='Stale complete: True'; mixed='Mixed-version artifacts: legacy.json'; inactive='INTERRUPTED \(owned process inactive\)'; complete='Aggregate: complete 1/1'; 'legacy-compatible'='Legacy-compatible artifacts: 001_test/v31/primary/legacy.json \(3.1.2j\)'
     }
     foreach ($kind in $cases.Keys) {
         $caseRoot = Join-Path $root $kind; New-Fixture $caseRoot $kind $actualArtifactVersion
