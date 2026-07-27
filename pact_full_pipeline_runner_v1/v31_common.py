@@ -32,6 +32,7 @@ ARTIFACT_VERSION = VERSION
 # explicit compatibility policy.  Keeping this list here makes that policy
 # visible to both the execution protocol and its tests.
 LEGACY_COMPATIBLE_ARTIFACT_VERSIONS = frozenset({"3.1.2j"})
+TEMPORARY_LEGACY_COMPATIBILITY_POLICY = "temporary-v31-legacy-3.1.2j-remove-after-migration"
 CACHE_IDENTITY_SCHEMA = "pact-v31-cache-identity/v1"
 
 

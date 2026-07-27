@@ -35,7 +35,7 @@ finally { Pop-Location }
 if (-not $actualArtifactVersion) { throw 'Could not read v31_common.VERSION.' }
 try {
     $cases = @{
-        fresh='First missing: 001_test:source_analysis'; 'partial-audit'='Partial: 001_test primary audit/qwen_semantic 1/2'; 'partial-cross'='Partial: 001_test primary cross-verify/cross_verify_qwen 1/2'; reused='reused 1/1'; failed='Failure reason: synthetic failure'; stale='Stale complete: True'; mixed='Mixed-version artifacts: legacy.json'; inactive='INTERRUPTED \(owned process inactive\)'; complete='Aggregate: complete 1/1'; 'legacy-compatible'='Resume: READY'
+        fresh='First missing: 001_test:source_analysis'; 'partial-audit'='Partial: 001_test primary audit/qwen_semantic 1/2'; 'partial-cross'='Partial: 001_test primary cross-verify/cross_verify_qwen 1/2'; reused='reused 1/1'; failed='Failure reason: synthetic failure'; stale='Stale complete: True'; mixed='Mixed-version artifacts: legacy.json'; inactive='INTERRUPTED \(owned process inactive\)'; complete='Aggregate: complete 1/1'; 'legacy-compatible'='Legacy-compatible artifacts: legacy.json \(3.1.2j\)'
     }
     foreach ($kind in $cases.Keys) {
         $caseRoot = Join-Path $root $kind; New-Fixture $caseRoot $kind $actualArtifactVersion
@@ -45,6 +45,10 @@ try {
         if ($kind -eq 'complete') {
             Assert-Match $text 'Mixed-version artifacts: none' 'Real v31_common.VERSION must be healthy.'
             Assert-Match $text 'Resume: READY' 'Healthy artifacts must allow resume.'
+        }
+        if ($kind -eq 'legacy-compatible') {
+            Assert-Match $text 'Mixed-version artifacts: none' 'Approved legacy artifact must not be mixed-version.'
+            Assert-Match $text 'Resume: READY' 'Approved legacy artifact must allow resume.'
         }
         $after = Get-ChildItem -LiteralPath $caseRoot -Recurse -File | Get-FileHash | Select-Object Path,Hash
         if (Compare-Object $before $after) { throw "Monitor changed synthetic fixture $kind." }

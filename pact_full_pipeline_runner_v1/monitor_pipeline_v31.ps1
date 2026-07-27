@@ -86,6 +86,7 @@ function Show-Monitor {
     if ($status -eq 'ACTIVE' -and -not $processActive) { $status = 'INTERRUPTED (owned process inactive)' }
     if ($status -eq 'LOADING_MODEL') { $stage = "$stage (model loading; stage not executing)" }
     $complete = 0; $reused = 0; $mixed = @(); $missing = @(); $partial = @()
+    $legacyCompatible = @()
     foreach ($chapter in $chapters) {
         $stem = [IO.Path]::GetFileNameWithoutExtension((Get-Value $chapter 'filename'))
         $work = Join-Path $WorkDir $stem
@@ -95,7 +96,9 @@ function Show-Monitor {
         foreach ($path in @(Get-ChildItem -LiteralPath $work -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
             $data = Read-JsonSafe $path.FullName
             $observedArtifactVersion = Get-Value $data 'version'
-            if ($observedArtifactVersion -and -not (Test-CompatibleArtifactVersion $observedArtifactVersion $expectedArtifactVersion $legacyVersions)) { $mixed += $path.Name }
+            if ($observedArtifactVersion -and $observedArtifactVersion -ne $expectedArtifactVersion -and $legacyVersions -contains $observedArtifactVersion) {
+                $legacyCompatible += ("{0} ({1})" -f $path.Name, $observedArtifactVersion)
+            } elseif ($observedArtifactVersion -and -not (Test-CompatibleArtifactVersion $observedArtifactVersion $expectedArtifactVersion $legacyVersions)) { $mixed += $path.Name }
         }
         foreach ($pass in @('primary','residual')) {
             foreach ($name in @('qwen_semantic','gemma_semantic','gemma_russian','gemma_discourse')) {
@@ -125,6 +128,7 @@ function Show-Monitor {
     Write-Host "Failure reason: $failure"
     Write-Host "Stale complete: $stale"
     Write-Host "Mixed-version artifacts: $(if ($mixed) { $mixed -join ', ' } else { 'none' })"
+    Write-Host "Legacy-compatible artifacts: $(if ($legacyCompatible) { $legacyCompatible -join ', ' } else { 'none' })"
     Write-Host "Resume: $(if ($blocked) { 'BLOCKED' } else { 'READY' })"
 }
 while ($true) { if (-not $Once) { Clear-Host }; Show-Monitor; if ($Once) { break }; Start-Sleep -Seconds ([math]::Max(1,$RefreshSeconds)) }

@@ -11,7 +11,11 @@ import argparse
 import json
 from pathlib import Path
 
-from v31_common import compatible_artifact_version
+from v31_common import (
+    ARTIFACT_VERSION,
+    TEMPORARY_LEGACY_COMPATIBILITY_POLICY,
+    compatible_artifact_version,
+)
 
 REUSED = 0
 MODEL_REQUIRED = 20
@@ -77,7 +81,17 @@ def main() -> int:
     ]
     if missing or invalid:
         return emit("MODEL_REQUIRED", reason="missing_partial_or_invalid_aggregate", missing=missing, invalid=invalid, has_invalid=bool(invalid))
-    return emit("REUSED", aggregate_count=len(paths))
+    versions = {json.loads(path.read_text(encoding="utf-8-sig"))["version"] for path in paths}
+    legacy_versions = sorted(version for version in versions if version != ARTIFACT_VERSION)
+    provenance: dict[str, object] = {
+        "compatibility_policy": (
+            TEMPORARY_LEGACY_COMPATIBILITY_POLICY if legacy_versions else "strict-semantic-version"
+        ),
+        "reuse_decision": "legacy-compatible-reused" if legacy_versions else "semantic-version-reused",
+    }
+    if legacy_versions:
+        provenance["legacy_version"] = legacy_versions
+    return emit("REUSED", aggregate_count=len(paths), provenance=provenance)
 
 
 if __name__ == "__main__":

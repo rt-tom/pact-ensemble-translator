@@ -23,6 +23,10 @@ def assert_outcome(result: subprocess.CompletedProcess[str], code: int, outcome:
     assert json.loads(result.stdout)["outcome"] == outcome
 
 
+def response(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
+    return json.loads(result.stdout)
+
+
 def aggregate(root: Path, stem: str, relative: str, value: object) -> None:
     path = root / stem / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,7 +38,9 @@ def main() -> int:
         root = Path(tmp); relative = "v31/primary/qwen_semantic.json"
         common = ("--aggregate-relative-path", relative, "--chapter-stem", "one", "--chapter-stem", "two")
         aggregate(root, "one", relative, {"version": VERSION, "expected": 1, "completed": 1}); aggregate(root, "two", relative, {"version": VERSION, "expected": 1, "completed": 1})
-        assert_outcome(probe(root, *common), 0, "REUSED")  # aggregate reuse: no model start
+        strict = probe(root, *common)
+        assert_outcome(strict, 0, "REUSED")  # aggregate reuse: no model start
+        assert response(strict)["provenance"] == {"compatibility_policy": "strict-semantic-version", "reuse_decision": "semantic-version-reused"}
         (root / "two" / relative).unlink()
         assert_outcome(probe(root, *common), 20, "MODEL_REQUIRED")  # partial cache
         aggregate(root, "two", relative, [])
@@ -46,7 +52,13 @@ def main() -> int:
         assert_outcome(probe(root, *common), 22, "MODEL_REQUIRED")  # incompatible version never reuses
         aggregate(root, "two", relative, {"version": "3.1.2j", "expected": 1, "completed": 1})
         assert_outcome(probe(root, *common), 22, "MODEL_REQUIRED")  # legacy is not silently reused
-        assert_outcome(probe(root, *common, "--allow-legacy-artifact-version"), 0, "REUSED")
+        legacy = probe(root, *common, "--allow-legacy-artifact-version")
+        assert_outcome(legacy, 0, "REUSED")
+        assert response(legacy)["provenance"] == {"legacy_version": ["3.1.2j"], "compatibility_policy": "temporary-v31-legacy-3.1.2j-remove-after-migration", "reuse_decision": "legacy-compatible-reused"}
+        aggregate(root, "two", relative, {"version": "3.1.2j", "expected": 2, "completed": 1})
+        assert_outcome(probe(root, *common, "--allow-legacy-artifact-version"), 22, "MODEL_REQUIRED")  # stale legacy aggregate
+        aggregate(root, "two", relative, [])
+        assert_outcome(probe(root, *common, "--allow-legacy-artifact-version"), 22, "MODEL_REQUIRED")  # malformed legacy aggregate
         assert_outcome(probe(root, "--translation", "--chapter-stem", "one"), 20, "MODEL_REQUIRED")
     print("Pact v3.1 stage protocol offline integration tests passed")
     return 0

@@ -9,7 +9,9 @@ param(
     [switch]$RedoQuality,
     [switch]$RedoFormatting,
     [switch]$DryRun,
-    [switch]$SkipPreflight
+    [switch]$SkipPreflight,
+    # Temporary, explicit migration switch. Remove once 3.1.2j runs are retired.
+    [switch]$AllowLegacyArtifactReuse
 )
 
 $ErrorActionPreference = 'Stop'
@@ -200,6 +202,8 @@ $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
 $ensemble['version'] = $ArtifactVersion
+$ensemble['legacy_compatible_artifact_versions'] = $(if ($AllowLegacyArtifactReuse) { @('3.1.2j') } else { @() })
+$ensemble['legacy_compatibility_policy'] = $(if ($AllowLegacyArtifactReuse) { 'temporary-v31-legacy-3.1.2j-remove-after-migration' } else { $null })
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -556,6 +560,7 @@ function Invoke-AggregateModelStage {
     $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--aggregate-relative-path', $AggregateRelativePath)
     foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
     if ($Force) { $probeArgs += '--force' }
+    if ($AllowLegacyArtifactReuse) { $probeArgs += '--allow-legacy-artifact-version' }
     Push-Location $ProjectRoot
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {
