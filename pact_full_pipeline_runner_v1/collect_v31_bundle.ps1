@@ -10,6 +10,12 @@ $ErrorActionPreference = 'Stop'
 $runner = Split-Path -Parent $MyInvocation.MyCommand.Path
 $run = Join-Path $ProjectRoot "pipeline_runs\chapter_${Start}_to_${End}_v31"
 if (-not (Test-Path $run)) { throw "Run not found: $run" }
+$config = Join-Path $run 'config.full_pipeline.v31.json'
+$chapterManifest = Join-Path $run 'chapter_manifest.v31.json'
+if (-not (Test-Path $config) -or -not (Test-Path $chapterManifest)) { throw "Canonical run manifest/config not found in $run" }
+$inputDir = (Get-Content $config -Raw | ConvertFrom-Json).paths.input_dir
+& py (Join-Path $runner 'v31_chapter_resolver.py') --project-root $ProjectRoot --input-dir $inputDir --start $Start --end $End --manifest $chapterManifest | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Canonical chapter manifest verification failed" }
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $stage = Join-Path $env:TEMP "pact_v31_bundle_$stamp"
 $zip = Join-Path $Destination "chapter_${Start}_to_${End}_v31_bundle_$stamp.zip"

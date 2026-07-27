@@ -12,6 +12,7 @@ $RunRoot = Join-Path $ProjectRoot "pipeline_runs\chapter_${Start}_to_${End}_v31"
 $WorkDir = Join-Path $RunRoot 'work'
 $OutputDir = Join-Path $RunRoot 'output'
 $ServerLogs = Join-Path $RunRoot 'server_logs'
+$ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
 
 function Read-JsonSafe([string]$Path) {
     if (-not (Test-Path $Path)) { return $null }
@@ -225,10 +226,11 @@ while ($true) {
     if (-not (Test-Path $RunRoot)) {
         Write-Host "`nRun has not started." -ForegroundColor Yellow
     } else {
-        $stems = @()
-        if (Test-Path $WorkDir) { $stems = @(Get-ChildItem $WorkDir -Directory | Sort-Object Name) }
-        foreach ($chapter in $stems) {
-            $work = $chapter.FullName
+        $chapters = @()
+        $chapterManifest = Read-JsonSafe $ChapterManifestPath
+        if ($chapterManifest -and $chapterManifest.chapters) { $chapters = @($chapterManifest.chapters) }
+        foreach ($chapter in $chapters) {
+            $work = Join-Path $WorkDir ([System.IO.Path]::GetFileNameWithoutExtension([string]$chapter.filename))
             $manifest = Read-JsonSafe (Join-Path $work 'manifest.json')
             $total = if ($manifest) { @($manifest.blocks).Count } else { 0 }
             $scene = Read-JsonSafe (Join-Path $work 'source_scene_map.json')
@@ -236,7 +238,7 @@ while ($true) {
             $draftDone = if ($draft) { @($draft.PSObject.Properties).Count } else { 0 }
 
             Write-Host ""
-            Write-Host $chapter.Name -ForegroundColor White
+            Write-Host ("Chapter {0}: {1}" -f $chapter.chapter_id,$chapter.filename) -ForegroundColor White
             Write-Host (Line '1. Manifest/context' $(if ($manifest){$total}else{0}) $total)
             $sceneDone = if ($scene) { [int]$scene.coverage.completed } else { 0 }
             Write-Host (Line '2. Qwen source analysis' $sceneDone $total)
