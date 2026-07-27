@@ -24,8 +24,23 @@ class JsonGenerationError(RuntimeError):
         self.attempt_errors = attempt_errors
 
 
+# VERSION is the semantic identity stamped into every v3.1 artifact.  It must
+# not be replaced with a runner build/milestone label (for example 3.1.3-03).
 VERSION = "3.1.3"
+ARTIFACT_VERSION = VERSION
+# Old production artifacts can be inspected or deliberately reused only by an
+# explicit compatibility policy.  Keeping this list here makes that policy
+# visible to both the execution protocol and its tests.
+LEGACY_COMPATIBLE_ARTIFACT_VERSIONS = frozenset({"3.1.2j"})
+TEMPORARY_LEGACY_COMPATIBILITY_POLICY = "temporary-v31-legacy-3.1.2j-remove-after-migration"
 CACHE_IDENTITY_SCHEMA = "pact-v31-cache-identity/v1"
+
+
+def compatible_artifact_version(version: Any, *, allow_legacy: bool = False) -> bool:
+    """Return whether an artifact version is reusable under the stated policy."""
+    if version == ARTIFACT_VERSION:
+        return True
+    return allow_legacy and version in LEGACY_COMPATIBLE_ARTIFACT_VERSIONS
 
 
 def read_json(path: Path, default: Any = None) -> Any:

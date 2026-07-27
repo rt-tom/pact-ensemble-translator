@@ -9,12 +9,17 @@ param(
     [switch]$RedoQuality,
     [switch]$RedoFormatting,
     [switch]$DryRun,
-    [switch]$SkipPreflight
+    [switch]$SkipPreflight,
+    # Temporary, explicit migration switch. Remove once 3.1.2j runs are retired.
+    [switch]$AllowLegacyArtifactReuse
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.3-03'
+# BuildIdentity is for release/milestone reporting only.  ArtifactVersion is
+# the semantic identity shared by the config and every Python stage artifact.
+$BuildIdentity = '3.1.3-03'
+$ArtifactVersion = '3.1.3'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -75,6 +80,7 @@ $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
 $ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
 $MonitorStatePath = Join-Path $RunRoot 'monitor_state.v31.json'
+$LegacyReuseProvenancePath = Join-Path $RunRoot 'v31\legacy_reuse_provenance.json'
 
 $SelectedInputFiles = @()
 $SelectedChapterStems = @()
@@ -200,7 +206,9 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.3'
+$ensemble['version'] = $ArtifactVersion
+$ensemble['legacy_compatible_artifact_versions'] = $(if ($AllowLegacyArtifactReuse) { @('3.1.2j') } else { @() })
+$ensemble['legacy_compatibility_policy'] = $(if ($AllowLegacyArtifactReuse) { 'temporary-v31-legacy-3.1.2j-remove-after-migration' } else { $null })
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
@@ -240,7 +248,8 @@ function Write-MonitorState {
     if ($Stage) { $script:MonitorStage = $Stage }
     $state = [ordered]@{
         schema = 'pact-v31-monitor-state/v1'
-        runner_version = $RunnerVersion
+        runner_version = $BuildIdentity
+        artifact_version = $ArtifactVersion
         stage = $script:MonitorStage
         status = $Status
         updated_at = (Get-Date).ToString('o')
@@ -491,7 +500,8 @@ Daniel hesitated only a moment before following her.
         -MinGenerationTps $minGeneration
 
     $report = [ordered]@{
-        version = $RunnerVersion
+        version = $BuildIdentity
+        artifact_version = $ArtifactVersion
         timestamp = (Get-Date).ToString('o')
         profile = 'GemmaTranslate'
         policy = $summary.policy
@@ -555,6 +565,7 @@ function Invoke-AggregateModelStage {
     $probeArgs = @((Join-Path $PackageRoot 'v31_stage_protocol.py'), '--work-dir', $WorkDir, '--aggregate-relative-path', $AggregateRelativePath)
     foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
     if ($Force) { $probeArgs += '--force' }
+    if ($AllowLegacyArtifactReuse) { $probeArgs += @('--allow-legacy-artifact-version', '--stage', $Label, '--legacy-provenance-path', $LegacyReuseProvenancePath) }
     Push-Location $ProjectRoot
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {
@@ -679,7 +690,7 @@ function Run-RepairPass {
 }
 
 try {
-    Write-Host "Pact ensemble pipeline v$RunnerVersion" -ForegroundColor White
+    Write-Host "Pact ensemble pipeline build $BuildIdentity (artifact v$ArtifactVersion)" -ForegroundColor White
     Write-Host "Run root: $RunRoot" -ForegroundColor White
 
     $prepareArgs = @((Join-Path $PackageRoot 'prepare_pipeline_context.py')) + (CommonArgs)

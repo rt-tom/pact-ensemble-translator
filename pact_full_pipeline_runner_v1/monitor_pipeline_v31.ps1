@@ -33,6 +33,10 @@ function Test-CompleteAggregate($Data) {
     }
     return $true
 }
+function Test-CompatibleArtifactVersion($Version, [string]$ExpectedVersion, [string[]]$LegacyVersions) {
+    if ($Version -eq $ExpectedVersion) { return $true }
+    return $LegacyVersions -contains $Version
+}
 function Get-Progress($Data, [int]$FallbackTotal) {
     if ($null -eq $Data) { return @{ done=0; total=$FallbackTotal } }
     $coverage = Get-Value $Data 'coverage'
@@ -70,7 +74,12 @@ function Show-Monitor {
     $config = Read-JsonSafe (Join-Path $RunRoot 'config.full_pipeline.v31.json')
     $state = Read-JsonSafe (Join-Path $RunRoot 'monitor_state.v31.json')
     $manifest = Read-JsonSafe (Join-Path $RunRoot 'chapter_manifest.v31.json')
-    $version = Get-Value $state 'runner_version' (Get-Value (Get-Value $config 'ensemble_v31') 'version' 'unknown')
+    $ensemble = Get-Value $config 'ensemble_v31'
+    $expectedArtifactVersion = Get-Value $state 'artifact_version' (Get-Value $ensemble 'version' 'unknown')
+    $legacyVersions = @((Get-Value $ensemble 'legacy_compatible_artifact_versions' @()))
+    $legacyProvenance = Read-JsonSafe (Join-Path $RunRoot 'v31\legacy_reuse_provenance.json')
+    $durableLegacyRecords = @((Get-Value $legacyProvenance 'records' @()))
+    $buildIdentity = Get-Value $state 'runner_version' 'unknown'
     $chapters = @($manifest.chapters)
     $profile = Get-Value $state 'active_profile' 'none'
     $processActive = Test-OwnedProcess $state
@@ -79,6 +88,10 @@ function Show-Monitor {
     if ($status -eq 'ACTIVE' -and -not $processActive) { $status = 'INTERRUPTED (owned process inactive)' }
     if ($status -eq 'LOADING_MODEL') { $stage = "$stage (model loading; stage not executing)" }
     $complete = 0; $reused = 0; $mixed = @(); $missing = @(); $partial = @()
+    $legacyCompatible = @()
+    foreach ($record in $durableLegacyRecords) {
+        $legacyCompatible += ("{0} ({1})" -f (Get-Value $record 'artifact_path' 'unknown'), (Get-Value $record 'artifact_version' 'unknown'))
+    }
     foreach ($chapter in $chapters) {
         $stem = [IO.Path]::GetFileNameWithoutExtension((Get-Value $chapter 'filename'))
         $work = Join-Path $WorkDir $stem
@@ -87,8 +100,10 @@ function Show-Monitor {
         if ($first -eq 'finalization' -and (Test-Path -LiteralPath (Join-Path $RunRoot ("output\\" + (Get-Value $chapter 'filename'))))) { $complete++ } else { $missing += "${stem}:$first" }
         foreach ($path in @(Get-ChildItem -LiteralPath $work -Recurse -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
             $data = Read-JsonSafe $path.FullName
-            $artifactVersion = Get-Value $data 'version'
-            if ($artifactVersion -and $artifactVersion -ne $version) { $mixed += $path.Name }
+            $observedArtifactVersion = Get-Value $data 'version'
+            if ($observedArtifactVersion -and $observedArtifactVersion -ne $expectedArtifactVersion -and $legacyVersions -contains $observedArtifactVersion) {
+                $legacyCompatible += ("{0} ({1})" -f $path.Name, $observedArtifactVersion)
+            } elseif ($observedArtifactVersion -and -not (Test-CompatibleArtifactVersion $observedArtifactVersion $expectedArtifactVersion $legacyVersions)) { $mixed += $path.Name }
         }
         foreach ($pass in @('primary','residual')) {
             foreach ($name in @('qwen_semantic','gemma_semantic','gemma_russian','gemma_discourse')) {
@@ -107,7 +122,7 @@ function Show-Monitor {
     $failure = Get-Value $state 'failure_reason' 'none'
     $blocked = ($status -eq 'FAILED' -or $mixed.Count -gt 0)
     if ($stale) { $blocked = $true }
-    Write-Host "PACT MONITOR v$MonitorVersion  run version: $version"
+    Write-Host "PACT MONITOR v$MonitorVersion  build: $buildIdentity; artifact version: $expectedArtifactVersion"
     Write-Host "Stage: $stage"
     Write-Host "Outcome/status: $status"
     Write-Host "Owned model: $profile; process active: $processActive"
@@ -118,6 +133,7 @@ function Show-Monitor {
     Write-Host "Failure reason: $failure"
     Write-Host "Stale complete: $stale"
     Write-Host "Mixed-version artifacts: $(if ($mixed) { $mixed -join ', ' } else { 'none' })"
+    Write-Host "Legacy-compatible artifacts: $(if ($legacyCompatible) { $legacyCompatible -join ', ' } else { 'none' })"
     Write-Host "Resume: $(if ($blocked) { 'BLOCKED' } else { 'READY' })"
 }
 while ($true) { if (-not $Once) { Clear-Host }; Show-Monitor; if ($Once) { break }; Start-Sleep -Seconds ([math]::Max(1,$RefreshSeconds)) }
