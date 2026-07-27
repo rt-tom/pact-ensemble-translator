@@ -5,6 +5,8 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Rollback')][switch]$Rollback,
     [Parameter(Mandatory)][string]$ProjectRoot,
     [Parameter(Mandatory)][string]$ReleaseRef,
+    [string]$BaseReleaseRef,
+    [string]$MigrationPlanPath,
     [string]$ManifestPath,
     [string]$BackupRoot,
     [switch]$SkipSmokeTest
@@ -94,6 +96,50 @@ function Get-TrackedFilesAtRef {
     return @(Invoke-Git -Root $Root -Arguments @('ls-tree', '-r', '--name-only', $Commit) | Where-Object { $_ })
 }
 
+function Get-AuthoritativeSchemas {
+    param([string]$Root, [string]$Commit)
+    $result = [ordered]@{}
+    foreach ($relative in Get-TrackedFilesAtRef $Root $Commit) {
+        if ($relative -notmatch '\.(py|ps1)$') { continue }
+        $text = (& git -C $Root show "${Commit}:$relative") -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "Cannot inspect schema declarations in $relative" }
+        foreach ($match in [regex]::Matches($text, '(?m)^(?:\$)?(?<name>[A-Z][A-Z0-9_]*SCHEMA(?:_VERSION)?)\s*=\s*["''](?<value>[^"'']+)["'']\s*$')) {
+            $result["$relative::$($match.Groups['name'].Value)"] = $match.Groups['value'].Value
+        }
+    }
+    return $result
+}
+
+function Get-MigrationPlan { param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
+    $plan = Read-JsonFile $Path
+    if ($plan -is [array]) { return @($plan) }
+    return @($plan.migrations)
+}
+
+function Assert-Migrations {
+    param($BaseSchemas, $TargetSchemas, $Migrations)
+    $migrationItems = @($Migrations | Where-Object { $null -ne $_ })
+    $changed = @()
+    foreach ($key in @($BaseSchemas.Keys + $TargetSchemas.Keys | Sort-Object -Unique)) {
+        if ($BaseSchemas[$key] -ne $TargetSchemas[$key]) { $changed += $key }
+    }
+    if (-not $changed.Count) {
+        if ($migrationItems.Count) { throw 'Migrations are forbidden when no authoritative schema changed.' }
+        return [ordered]@{ schema_changes=$false; changed=@() }
+    }
+    if (-not $migrationItems.Count) { throw 'Authoritative schema changed; approved non-empty migrations list is required.' }
+    foreach ($migration in $migrationItems) {
+        foreach ($field in @('source_schema','target_schema','affected_artifacts','migration_tool','backward_compatibility_policy','rollback_implications','approval_provenance')) {
+            if ($null -eq $migration.$field -or -not [string]$migration.$field) { throw "Migration lacks required $field" }
+        }
+        if (-not (@($BaseSchemas.Values) -contains [string]$migration.source_schema) -or -not (@($TargetSchemas.Values) -contains [string]$migration.target_schema)) { throw 'Migration references unknown source or target schema.' }
+        foreach ($artifact in @($migration.affected_artifacts)) { if (-not $TargetSchemas.Contains($artifact)) { throw "Migration references unknown affected artifact: $artifact" } }
+        if ([string]$migration.backward_compatibility_policy -eq 'irreversible' -and -not [string]$migration.rollback_implications.blocker_approval) { throw 'Irreversible migration requires rollback blocker approval.' }
+    }
+    return [ordered]@{ schema_changes=$true; changed=@($changed) }
+}
+
 function Get-GitBlobSha256 {
     param([string]$Root, [string]$Commit, [string]$RelativePath)
     $psi = [Diagnostics.ProcessStartInfo]::new()
@@ -115,19 +161,28 @@ function Get-GitBlobSha256 {
 }
 
 function New-Manifest {
-    param([string]$Root, [string]$Ref, [string]$Path)
+    param([string]$Root, [string]$Ref, [string]$BaseRef, [string]$Path, [string]$PlanPath)
     $commit = Get-TagCommit $Root $Ref
+    if (-not $BaseRef) { throw 'BaseReleaseRef is required: schema comparison must use a base annotated release.' }
+    $baseCommit = Get-TagCommit $Root $BaseRef
+    $baseSchemas = Get-AuthoritativeSchemas $Root $baseCommit
+    $targetSchemas = Get-AuthoritativeSchemas $Root $commit
+    $migrations = Get-MigrationPlan $PlanPath
+    $schemaState = Assert-Migrations -BaseSchemas $baseSchemas -TargetSchemas $targetSchemas -Migrations $migrations
     $files = foreach ($relative in Get-TrackedFilesAtRef $Root $commit) {
         [ordered]@{ path = $relative; sha256 = Get-GitBlobSha256 -Root $Root -Commit $commit -RelativePath $relative }
     }
     $manifest = [ordered]@{
         schema = $ReleaseManifestSchema
         release_tag = $Ref
+        base_release_tag = $BaseRef
         commit = $commit
         version = Get-ReleaseVersion $Root $commit
         files = @($files)
-        schemas = @('pact-v31-release-manifest/v1', 'pact-v31-installed-provenance/v1')
-        migrations = @()
+        schemas = $targetSchemas
+        schema_changes = $schemaState.schema_changes
+        schema_changes_from_base = $schemaState.changed
+        migrations = @($migrations)
     }
     Write-JsonNoBom -Path $Path -Value $manifest
     return $manifest
@@ -154,6 +209,9 @@ function Assert-Manifest {
             throw "Manifest hash mismatch for $($item.path)"
         }
     }
+    $baseCommit = Get-TagCommit $Root ([string]$manifest.base_release_tag)
+    $state = Assert-Migrations -BaseSchemas (Get-AuthoritativeSchemas $Root $baseCommit) -TargetSchemas (Get-AuthoritativeSchemas $Root $commit) -Migrations @($manifest.migrations)
+    if ([bool]$manifest.schema_changes -ne [bool]$state.schema_changes) { throw 'Manifest schema_changes contradicts actual base release diff.' }
     return $manifest
 }
 
@@ -214,7 +272,7 @@ function Invoke-OfflineChecks { param([string]$Root, [string]$ExpectedVersion, [
 function Write-Provenance {
     param([string]$Root, $Manifest, [string]$PreviousCommit, [string]$Backup)
     $path = Join-Path $Root 'deployment_provenance.v31.json'
-    Write-JsonNoBom -Path $path -Value ([ordered]@{ schema=$DeploymentProvenanceSchema; tag=$Manifest.release_tag; commit=$Manifest.commit; version=$Manifest.version; previous_commit=$PreviousCommit; backup=$Backup; installed_at=(Get-Date).ToUniversalTime().ToString('o') })
+    Write-JsonNoBom -Path $path -Value ([ordered]@{ schema=$DeploymentProvenanceSchema; tag=$Manifest.release_tag; commit=$Manifest.commit; version=$Manifest.version; previous_commit=$PreviousCommit; backup=$Backup; migrations=@($Manifest.migrations); rollback_implications=@($Manifest.migrations | ForEach-Object { $_.rollback_implications }); installed_at=(Get-Date).ToUniversalTime().ToString('o') })
     $provenance = Read-JsonFile $path
     if ($provenance.commit -ne $Manifest.commit -or $provenance.version -ne $Manifest.version) { throw 'Installed provenance read-back failed.' }
 }
@@ -222,7 +280,7 @@ function Write-Provenance {
 $root = Get-ProjectRoot $ProjectRoot
 if (-not $ManifestPath) { $ManifestPath = Join-Path $root 'release_manifest.v31.json' }
 
-if ($NewReleaseManifest) { New-Manifest -Root $root -Ref $ReleaseRef -Path $ManifestPath | ConvertTo-Json -Depth 5; exit 0 }
+if ($NewReleaseManifest) { New-Manifest -Root $root -Ref $ReleaseRef -BaseRef $BaseReleaseRef -Path $ManifestPath -PlanPath $MigrationPlanPath | ConvertTo-Json -Depth 8; exit 0 }
 
 $manifest = Assert-Manifest -Root $root -Ref $ReleaseRef -Path $ManifestPath
 if (-not $Deploy -and -not $Rollback) { Write-Output 'Release manifest and active path verified.'; exit 0 }
