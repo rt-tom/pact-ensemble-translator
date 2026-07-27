@@ -363,6 +363,12 @@ class ApiClient:
         self.name = name
         self.session = requests.Session()
         self.calls: list[dict[str, Any]] = []
+        self._json_response_format_supported = True
+
+    @staticmethod
+    def _rejects_json_response_format(exc: PipelineError) -> bool:
+        """Recognize llama-server's Gemma grammar incompatibility response."""
+        return "does not match the expected peg-gemma4 format" in str(exc)
 
     def _post(self, url: str, payload: dict[str, Any]) -> requests.Response:
         last: Optional[Exception] = None
@@ -434,9 +440,26 @@ class ApiClient:
         call_label: str,
     ) -> Generation:
         payload = self.payload(messages, stage, max_tokens)
-        payload["response_format"] = {"type": "json_object"}
+        if self._json_response_format_supported:
+            payload["response_format"] = {"type": "json_object"}
         started = time.perf_counter()
-        data = self._post(self.cfg["chat_url"], payload).json()
+        try:
+            data = self._post(self.cfg["chat_url"], payload).json()
+        except PipelineError as exc:
+            if (
+                not self._json_response_format_supported
+                or not self._rejects_json_response_format(exc)
+            ):
+                raise
+            # Some llama-server Gemma builds reject json_object's generated
+            # grammar. The pipeline still parses and validates JSON below.
+            logging.warning(
+                "%s server rejects response_format=json_object; retrying without it",
+                self.name,
+            )
+            self._json_response_format_supported = False
+            payload.pop("response_format", None)
+            data = self._post(self.cfg["chat_url"], payload).json()
         wall = time.perf_counter() - started
         try:
             choice = data["choices"][0]
