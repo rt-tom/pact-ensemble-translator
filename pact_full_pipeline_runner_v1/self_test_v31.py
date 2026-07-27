@@ -47,6 +47,8 @@ def run(project_root: Path) -> None:
     assert quality["translation"] == "REUSE" and quality["primary_repair"] == "INVALIDATE"
     assert quality["residual_audit"] == "INVALIDATE" and quality["residual_repair"] == "INVALIDATE"
     assert quality["final_quality"] == "INVALIDATE" and quality["finalization"] == "INVALIDATE"
+    final_quality_artifacts = next(row["artifacts"] for row in v31_artifact_dag.plan(redo_quality=True) if row["stage"] == "final_quality")
+    assert "state.json" not in final_quality_artifacts and "v31_quality_gate.json" not in final_quality_artifacts
     formatting = actions(redo_formatting=True)
     assert formatting["finalization"] == "INVALIDATE"
     assert formatting["final_quality"] == "REUSE" and formatting["review"] == "REUSE"
@@ -100,7 +102,7 @@ def run(project_root: Path) -> None:
     ) == "quarantined"  # quarantine is monotonic and never becomes complete
 
     # Exercise the active finalize-quality entry point, not only terminal_status.
-    def final_quality_fixture(work: Path, *, prior: str | None = None, technical_failure: bool = False) -> None:
+    def final_quality_fixture(work: Path, *, prior: str | None = None, gate_status: str | None = None, technical_failure: bool = False) -> None:
         coverage = {"ok": True, "completed": 1}
         write_json(work / "source_scene_map.json", {"coverage": coverage})
         write_json(work / "draft_translations.json", {"p00001": "Текст."})
@@ -128,7 +130,7 @@ def run(project_root: Path) -> None:
         })
         if prior:
             write_json(work / "state.json", {"status": prior})
-            write_json(work / "v31_quality_gate.json", {"status": prior})
+            write_json(work / "v31_quality_gate.json", {"status": gate_status or prior})
 
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -144,20 +146,22 @@ def run(project_root: Path) -> None:
         v31_finalize_quality.deterministic = lambda *_: []
         v31_finalize_quality.setup_logging = lambda: None
         try:
-            for prior, technical_failure, expected in (
-                ("quarantined", False, "quarantined"),  # clean recompute cannot promote quarantine
-                ("complete", False, "complete"),
-                ("quarantined", True, "failed"),  # technical failure wins over old quarantine
-                (None, False, "complete"),  # new work/run identity inherits no old terminal state
+            for prior, gate_status, technical_failure, expected in (
+                ("quarantined", None, False, "quarantined"),  # clean recompute cannot promote quarantine
+                ("complete", None, False, "complete"),
+                ("quarantined", "complete", False, "quarantined"),  # stale gate cannot promote state
+                ("failed", None, False, "failed"),
+                ("quarantined", None, True, "failed"),  # technical failure wins over old quarantine
+                (None, None, False, "complete"),  # new work/run identity inherits no old terminal state
             ):
-                current_work = root / f"case-{prior or 'new'}-{technical_failure}"
-                final_quality_fixture(current_work, prior=prior, technical_failure=technical_failure)
+                current_work = root / f"case-{prior or 'new'}-{gate_status or 'same'}-{technical_failure}"
+                final_quality_fixture(current_work, prior=prior, gate_status=gate_status, technical_failure=technical_failure)
                 sys.argv = ["v31_finalize_quality.py", "--project-root", str(root), "--config", str(root / "cfg.json"), "--start", "1", "--end", "1", "--final-lifecycle"]
                 try:
                     v31_finalize_quality.main()
-                    assert not technical_failure
+                    assert not technical_failure and prior != "failed"
                 except RuntimeError:
-                    assert technical_failure
+                    assert technical_failure or prior == "failed"
                 assert json.loads((current_work / "state.json").read_text(encoding="utf-8"))["status"] == expected
                 assert json.loads((current_work / "v31_quality_gate.json").read_text(encoding="utf-8"))["status"] == expected
         finally:

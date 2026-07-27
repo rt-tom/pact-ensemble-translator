@@ -594,7 +594,7 @@ function Remove-QualityArtifacts {
         $work = Join-Path $WorkDir $stem
         if (-not (Test-Path $work)) { continue }
         Remove-Item (Join-Path $work 'v31') -Recurse -Force -ErrorAction SilentlyContinue
-        foreach ($name in @('issues.json','verified_issues.json','repaired_translations.json','repaired_translations.preverify.json','repair_records.json','post_repair_report.json','issue_lifecycle.json','v31_primary_translations.json','v31_final_translations.json','v31_quality_gate.json','quality_report.json','audit_report.html','state.json')) {
+        foreach ($name in @('issues.json','verified_issues.json','repaired_translations.json','repaired_translations.preverify.json','repair_records.json','post_repair_report.json','issue_lifecycle.json','v31_primary_translations.json','v31_final_translations.json','quality_report.json','audit_report.html')) {
             Remove-Item (Join-Path $work $name) -Force -ErrorAction SilentlyContinue
         }
     }
@@ -725,7 +725,7 @@ try {
     Run-AuditPass 'final' 'v31_final_translations.json' $finalLedger
 
     Invoke-PythonStage -Label '10/11 Final coverage and deterministic quality gate' -Arguments (@((Join-Path $PackageRoot 'v31_finalize_quality.py')) + (CommonArgs) + '--final-lifecycle')
-    $quarantined = @(Get-ChildItem $WorkDir -Filter 'v31_quality_gate.json' -Recurse | Where-Object {
+    $quarantined = @(Get-ChildItem $WorkDir -Filter 'state.json' -Recurse | Where-Object {
         (Get-Content $_.FullName -Raw | ConvertFrom-Json).status -eq 'quarantined'
     })
     if ($quarantined.Count -gt 0) {

@@ -102,8 +102,8 @@ function Show-Monitor {
         }
     }
     if ($status -eq 'REUSED') { $reused = $chapters.Count }
-    $final = Read-JsonSafe (Join-Path $WorkDir ((Get-Value $chapters[0] 'filename' '').Replace('.html','') + '\v31_quality_gate.json'))
-    $stale = ($final -and $complete -lt $chapters.Count)
+    $terminal = Read-JsonSafe (Join-Path $WorkDir ((Get-Value $chapters[0] 'filename' '').Replace('.html','') + '\state.json'))
+    $stale = ($terminal -and $complete -lt $chapters.Count)
     $failure = Get-Value $state 'failure_reason' 'none'
     $blocked = ($status -eq 'FAILED' -or $mixed.Count -gt 0)
     if ($stale) { $blocked = $true }

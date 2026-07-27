@@ -19,6 +19,7 @@ function New-Fixture { param([string]$Root,[string]$Kind)
     foreach ($pass in @('primary','residual')) { foreach ($name in @('qwen_semantic','gemma_semantic','gemma_russian','gemma_discourse','cross_verify_gemma','cross_verify_qwen','verification_report')) { Put-Json (Join-Path $work "v31\$pass\$name.json") @{version='3.1.3';expected=2;completed=2} } }
     if ($Kind -eq 'failed') { Put-Json (Join-Path $run 'monitor_state.v31.json') @{runner_version='3.1.3';stage='repair';status='FAILED';failure_reason='synthetic failure'}; return }
     Put-Json (Join-Path $work 'v31_quality_gate.json') @{version='3.1.3';expected=2;completed=2}
+    if ($Kind -eq 'stale') { Put-Json (Join-Path $work 'state.json') @{status='complete'} }
     if ($Kind -eq 'mixed') { Put-Json (Join-Path $work 'v31\primary\legacy.json') @{version='3.1.2'}; return }
     if ($Kind -eq 'reused') { Put-Json (Join-Path $run 'monitor_state.v31.json') @{runner_version='3.1.3';stage='source';status='REUSED'}; return }
     if ($Kind -eq 'complete') { New-Item -ItemType Directory -Force -Path (Join-Path $run 'output') | Out-Null; Set-Content -LiteralPath (Join-Path $run 'output\001_test.html') -Value 'done'; return }

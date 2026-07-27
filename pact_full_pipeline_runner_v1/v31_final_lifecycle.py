@@ -29,11 +29,8 @@ def prior_terminal_status(work: Path) -> str | None:
         state_status = None
     if gate_status not in TERMINAL:
         gate_status = None
-    if state_status and gate_status and state_status != gate_status:
-        raise RuntimeError(
-            f"conflicting terminal status: state.json={state_status}, "
-            f"v31_quality_gate.json={gate_status}"
-        )
+    # A stale gate is never authoritative.  The active finalizer will replace
+    # it from state.json before allowing any terminal transition.
     return state_status
 
 
@@ -74,6 +71,8 @@ def terminal_status(*, ledger_ok: bool, coverage_ok: bool, verification_ok: bool
     if not ledger_ok or not coverage_ok or not verification_ok or not smoke_ok:
         return "failed"
     if final_repair_rounds > 1:
+        return "failed"
+    if prior_status == "failed":
         return "failed"
     if prior_status == "quarantined":
         return "quarantined"
