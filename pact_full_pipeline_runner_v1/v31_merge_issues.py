@@ -157,7 +157,8 @@ def main() -> int:
             continue
 
         issues = deterministic_for_chapter(runtime, cfg, work, blocks, translations)
-        for detector in ("qwen_semantic", "gemma_semantic", "gemma_russian", "gemma_discourse"):
+        detectors = ("qwen_semantic", "gemma_semantic", "gemma_russian", "qwen_global_smoke") if args.pass_name == "final" else ("qwen_semantic", "gemma_semantic", "gemma_russian", "gemma_discourse")
+        for detector in detectors:
             data = read_json(root / f"{detector}.json", {})
             coverage = data.get("coverage") or {}
             if not coverage.get("ok"):

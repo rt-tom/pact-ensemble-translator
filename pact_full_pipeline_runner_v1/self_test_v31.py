@@ -22,6 +22,8 @@ import v31_repair
 import v31_finalize_verification
 import v31_merge_issues
 import v31_artifact_dag
+import v31_audit
+import v31_final_lifecycle
 
 
 def load_runtime(project_root: Path):
@@ -47,6 +49,54 @@ def run(project_root: Path) -> None:
     formatting = actions(redo_formatting=True)
     assert formatting["finalization"] == "INVALIDATE"
     assert formatting["final_quality"] == "REUSE" and formatting["review"] == "REUSE"
+
+    # v3.1.3-07: final text lineage and bounded terminal policy.
+    blocks_for_final = [{"pid": "p00001"}, {"pid": "p00002"}, {"pid": "p00003"}]
+    initial = {"p00001": "Первый.", "p00002": "Второй.", "p00003": "Третий."}
+    residual = dict(initial, p00002="Исправленный второй.")
+    ledger = v31_final_lifecycle.append_ledger(None, initial, residual, "residual", "accepted residual repair")
+    final = dict(residual, p00003="Исправленный третий.")
+    ledger = v31_final_lifecycle.append_ledger(ledger, residual, final, "final_repair", "accepted final repair")
+    assert ledger["changed_pids"] == ["p00002", "p00003"]  # residual PID is never lost
+    assert v31_final_lifecycle.changed_pids(final, dict(final)) == []  # unchanged PIDs are not recomputed
+    assert v31_final_lifecycle.context_pids(blocks_for_final, ["p00002"], 1) == ["p00001", "p00002", "p00003"]
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
+        blocking_findings=[], final_repair_rounds=1,
+    ) == "complete"  # clean final text
+    gross_omission = [{"pid": "p00002", "category": "missing", "severity": "critical"}]
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
+        blocking_findings=gross_omission, final_repair_rounds=1,
+    ) == "quarantined"  # global smoke catches gross omission
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
+        blocking_findings=[{"ambiguous": True}], final_repair_rounds=0,
+    ) == "quarantined"  # ambiguous blockers are not sent to repair
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=False, smoke_ok=True,
+        blocking_findings=[], final_repair_rounds=0,
+    ) == "failed"  # final verification execution failure
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=False, coverage_ok=True, verification_ok=True, smoke_ok=True,
+        blocking_findings=[], final_repair_rounds=0,
+    ) == "failed"  # missing/corrupt ledger
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=False, verification_ok=True, smoke_ok=True,
+        blocking_findings=[], final_repair_rounds=0,
+    ) == "failed"  # incomplete coverage
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=False,
+        blocking_findings=[], final_repair_rounds=0,
+    ) == "failed"  # technical global-smoke failure
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
+        blocking_findings=[], final_repair_rounds=2,
+    ) == "failed"  # a second final-repair round is forbidden
+    assert v31_final_lifecycle.terminal_status(
+        ledger_ok=True, coverage_ok=True, verification_ok=True, smoke_ok=True,
+        blocking_findings=[], final_repair_rounds=1, prior_status="quarantined",
+    ) == "quarantined"  # quarantine is monotonic and never becomes complete
 
     class FakeJsonRuntime:
         safe_json_loads = staticmethod(runtime.safe_json_loads)
@@ -339,6 +389,16 @@ def run(project_root: Path) -> None:
         [det_block], {"p00004": "Мэри кивнула."}, cfg, glossary, {}, book
     )
     assert "mixed_script" not in {item.category for item in clean_issues}
+    smoke_blocks = [{"pid": "p00004", "source_text": "Mary nodded."}]
+    smoke_stage, smoke_messages = v31_audit.qwen_global_smoke_messages(
+        runtime, cfg, Path("."), smoke_blocks, {"p00004": smoke_blocks[0]},
+        {"p00004": "Мэри кивнула."}, ["p00004"], "final",
+    )
+    smoke_prompt = "\n".join(message["content"] for message in smoke_messages)
+    assert "gross omissions" in smoke_prompt and "<EN>Mary nodded.</EN>" in smoke_prompt and "<RU>Мэри кивнула.</RU>" in smoke_prompt
+    assert smoke_stage == v31_audit.DEFAULTS["qwen_global_smoke"]
+    runner_text = (HERE / "run_full_pipeline_v31.ps1").read_text(encoding="utf-8")
+    assert runner_text.count("'qwen_global_smoke'") == 1  # exactly one global smoke stage
 
     digit_block = runtime.Block(
         pid="p00005", index=0, tag="p", source_html="<p>3 rules.</p>",

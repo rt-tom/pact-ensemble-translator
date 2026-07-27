@@ -16,6 +16,10 @@ from v31_common import (
 )
 
 DEFAULTS = {
+    "qwen_global_smoke": {
+        "temperature": 0.0, "top_p": 1.0, "top_k": 64,
+        "enable_thinking": False, "max_tokens": 2600, "attempts": 3,
+    },
     "qwen_semantic": {
         "temperature": 0.0, "top_p": 1.0, "top_k": 64,
         "enable_thinking": False, "max_tokens": 1900, "attempts": 3,
@@ -37,6 +41,32 @@ DEFAULTS = {
         "window_pids": 30, "overlap_pids": 10,
     },
 }
+
+
+def qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translations, pids, pass_name):
+    """One source-grounded chapter smoke, deliberately not a second cascade."""
+    stage = stage_cfg(cfg, "qwen_global_smoke", DEFAULTS["qwen_global_smoke"])
+    source_text = "\n".join(norm(block_map[pid].get("source_text")) for pid in pids)
+    bible = read_json(work / "chapter_bible.json", {})
+    system = f"""Ты — Qwen, source-grounded финальный smoke-аудитор главы EN→RU.
+Это РОВНО ОДИН глобальный проход, не полный каскад аудитов и не литературная
+редактура. Сравни фактический финальный текст с исходной главой. Для КАЖДОГО
+PID верни results/status; отмечай только крупные блокирующие дефекты:
+gross omissions, дубли или переставленные passages, сломанную continuity
+субъекта/референта, важную несогласованность имени/термина, mixed-script или
+English residue, грубую formatting corruption, chapter-level contradiction.
+Не отмечай допустимый стиль и не предлагай полный переписанный перевод.
+
+Верни JSON {{"results":[{{"pid":"p00001","status":"ok|issue","issues":[{{
+"severity":"critical|major", "category":"missing|duplication|ordering|reference|entity_consistency|mixed_script|english_residue|formatting|continuity|meaning",
+"source_span":"", "target_span":"", "problem":"", "required_invariant":"",
+"repair_instruction":"локальная безопасная инструкция", "scope":"span|sentence|paragraph|cross_pid", "confidence":"high|medium|low"
+}}]}}]}}.
+
+ГЛОССАРИЙ:\n{glossary_prompt(runtime, cfg, source_text)}
+БИБЛИЯ:\n{bible_prompt(runtime, cfg, source_text, bible)}"""
+    user = "<FINAL_CHAPTER_SOURCE_AND_RU>\n" + render_pairs(block_map, translations, pids, True, "PAIR") + "\n</FINAL_CHAPTER_SOURCE_AND_RU>"
+    return stage, [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def qwen_messages(runtime, cfg, work, blocks, block_map, translations, pids, pass_name):
@@ -356,11 +386,12 @@ def main() -> int:
     add_common_args(parser)
     parser.add_argument("--mode", choices=list(DEFAULTS), required=True)
     parser.add_argument("--translations-file")
+    parser.add_argument("--pids-file", help="JSON ledger or list restricting TARGET_PIDS; context remains adjacent manifest PIDs")
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
     cfg = load_cfg(runtime, args.config.resolve())
-    api_section = "reviewer_api" if args.mode == "qwen_semantic" else "translator_api"
+    api_section = "reviewer_api" if args.mode in {"qwen_semantic", "qwen_global_smoke"} else "translator_api"
     client = api_client(runtime, cfg, api_section, args.mode, args.model)
 
     for source_path, work in selected_chapters(runtime, cfg, args.start, args.end):
@@ -373,8 +404,21 @@ def main() -> int:
         all_issues: list[dict[str, Any]] = []
         covered: set[str] = set()
         pids = [str(block["pid"]) for block in blocks]
+        if args.pids_file:
+            requested = read_json(Path(args.pids_file), {})
+            requested = requested.get("changed_pids", []) if isinstance(requested, dict) else requested
+            if not isinstance(requested, list):
+                raise ValueError("--pids-file must contain a list or changed_pids list")
+            requested_set = {str(pid) for pid in requested}
+            unknown = requested_set - set(pids)
+            if unknown:
+                raise ValueError(f"Final ledger contains unknown PIDs: {sorted(unknown)}")
+            pids = [pid for pid in pids if pid in requested_set]
 
-        if args.mode == "gemma_discourse":
+        if args.mode == "qwen_global_smoke":
+            stage = stage_cfg(cfg, "qwen_global_smoke", DEFAULTS[args.mode])
+            units = [pids]
+        elif args.mode == "gemma_discourse":
             stage = stage_cfg(cfg, "gemma_discourse_audit", DEFAULTS["gemma_discourse"])
             units = list(windows(pids, int(stage["window_pids"]), int(stage["overlap_pids"])))
         else:
@@ -387,7 +431,9 @@ def main() -> int:
             units = list(batched(pids, int(stage["batch_pids"])))
 
         def evaluate_unit(unit_pids: list[str], cache_path: Path, label: str):
-            if args.mode == "qwen_semantic":
+            if args.mode == "qwen_global_smoke":
+                local_stage, messages = qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
+            elif args.mode == "qwen_semantic":
                 local_stage, messages = qwen_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
             elif args.mode == "gemma_semantic":
                 local_stage, messages = gemma_semantic_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
@@ -428,7 +474,7 @@ def main() -> int:
                     "split": False,
                 }
             except RuntimeError as exc:
-                if args.mode == "gemma_discourse" or len(unit_pids) <= 1:
+                if args.mode in {"gemma_discourse", "qwen_global_smoke"} or len(unit_pids) <= 1:
                     raise
                 midpoint = len(unit_pids) // 2
                 left_pids, right_pids = unit_pids[:midpoint], unit_pids[midpoint:]
