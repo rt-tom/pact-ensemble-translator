@@ -133,6 +133,12 @@ def parse_candidates(data: dict[str, Any], pid: str, current: str, difficult: bo
             after = text
             if not text:
                 errors.append("full replacement is empty")
+            # Models sometimes preserve CURRENT_RU in ``text`` while placing
+            # the full replacement in ``new``.  Accept that unambiguous form
+            # only when it supplies an actual replacement; the normal ``text``
+            # field remains authoritative in every other case.
+            elif text == current and new and new != current:
+                after = new
         else:
             if not challenge:
                 errors.append("challenge reason is empty")
