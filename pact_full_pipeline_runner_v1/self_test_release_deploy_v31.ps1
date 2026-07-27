@@ -33,6 +33,11 @@ try {
     Assert-V31Release $failed 'Irreversible migration without blocker approval must fail.'
     [IO.File]::WriteAllText($planPath, (@{migrations=@($migration)} | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
     & $script -NewReleaseManifest -ProjectRoot $temp -ReleaseRef v3.1.3-test -BaseReleaseRef v3.1.3-base -MigrationPlanPath $planPath -ManifestPath $manifest | Out-Null
+    $falseFlag = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json; $falseFlag.schema_changes = $false
+    [IO.File]::WriteAllText($manifest, ($falseFlag | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+    $failed = $false; try { & $script -ProjectRoot $temp -ReleaseRef v3.1.3-test -ManifestPath $manifest | Out-Null } catch { $failed = $true }
+    Assert-V31Release $failed 'False schema_changes flag must not hide an actual schema diff.'
+    & $script -NewReleaseManifest -ProjectRoot $temp -ReleaseRef v3.1.3-test -BaseReleaseRef v3.1.3-base -MigrationPlanPath $planPath -ManifestPath $manifest | Out-Null
     Assert-V31Release (Test-Path $manifest) 'Manifest was not created.'
     $raw = [IO.File]::ReadAllBytes($manifest)
     Assert-V31Release (-not ($raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)) 'Manifest contains a BOM.'
@@ -49,6 +54,7 @@ try {
     & git -C $temp checkout -q v3.1.3-base
     & $script -ProjectRoot $temp -ReleaseRef v3.1.3-test -ManifestPath $manifest -Deploy | Out-Null
     Assert-V31Release ((& git -C $temp describe --exact-match --tags) -eq 'v3.1.3-test') 'Fast-forward deploy did not activate exact tag.'
+    Assert-V31Release ((Get-Content (Join-Path $temp 'deployment_provenance.v31.json') -Raw | ConvertFrom-Json).rollback_implications.Count -eq 1) 'Rollback plan must include migration implications.'
     & $script -ProjectRoot $temp -ReleaseRef v3.1.3-base -BaseReleaseRef v3.1.3-base -NewReleaseManifest -ManifestPath (Join-Path $temp 'rollback_manifest.v31.json') | Out-Null
     & $script -ProjectRoot $temp -ReleaseRef v3.1.3-base -ManifestPath (Join-Path $temp 'rollback_manifest.v31.json') -Rollback | Out-Null
     Assert-V31Release ((Get-Content (Join-Path $temp 'pact_translate_v3.py') -Raw) -notmatch 'release change') 'Rollback did not restore tagged content.'
