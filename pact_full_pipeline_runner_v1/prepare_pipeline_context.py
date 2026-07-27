@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from v31_common import ARTIFACT_VERSION
+
 VERSION = "1.1.0"
 
 
@@ -209,7 +211,12 @@ def main() -> int:
     runner = module.Runner(cfg)
 
     for source_path in files:
-        work, _, blocks, _, _ = runner.prepare_chapter(source_path, False)
+        # The generic runtime predates v3.1 and carries its own release label.
+        # v3.1 work manifests are cache-identity artifacts, so they must use the
+        # single semantic version shared by every v3.1 producer.
+        work, _, blocks, _, _ = runner.prepare_chapter(
+            source_path, False, manifest_version=ARTIFACT_VERSION
+        )
         bible_path = work / "chapter_bible.json"
         if bible_path.exists() and not (work / "chapter_bible.raw.json").exists():
             # Existing bible may be from an interrupted run. Preserve then sanitize.
