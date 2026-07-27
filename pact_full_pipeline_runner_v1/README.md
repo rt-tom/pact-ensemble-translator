@@ -11,6 +11,14 @@
 
 Проектный glossary копируется в отдельный каталог запуска и не изменяется.
 
+## Release deployment tooling
+
+`v31_release_deploy.ps1` supports Windows PowerShell 5.1 and PowerShell 7+.
+Its release-manifest hashes are calculated from the exact bytes emitted by
+`git cat-file blob`; the script never sends a Git blob through a PowerShell
+string pipeline. Unsupported editions or versions stop during preflight with
+a clear error.
+
 ## Установка
 
 Распаковать папку рядом с проектом или внутрь него. Файлы проекта не заменяются.
