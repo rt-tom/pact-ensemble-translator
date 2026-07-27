@@ -70,6 +70,7 @@ $GlossaryDir = Join-Path $RunRoot 'glossary'
 $ConfigPath = Join-Path $RunRoot 'config.full_pipeline.v31.json'
 $BookBiblePath = Join-Path $RunRoot 'book_bible.json'
 $ChapterManifestPath = Join-Path $RunRoot 'chapter_manifest.v31.json'
+$MonitorStatePath = Join-Path $RunRoot 'monitor_state.v31.json'
 
 $SelectedInputFiles = @()
 $SelectedChapterStems = @()
@@ -228,6 +229,24 @@ $script:ServerProcess = $null
 $script:CurrentServerStderr = $null
 $script:CurrentServerProfile = $null
 $script:ServerMetadata = $null
+$script:MonitorStage = $null
+function Write-MonitorState {
+    param([string]$Stage,[string]$Status,[string]$FailureReason='')
+    if ($Stage) { $script:MonitorStage = $Stage }
+    $state = [ordered]@{
+        schema = 'pact-v31-monitor-state/v1'
+        runner_version = $RunnerVersion
+        stage = $script:MonitorStage
+        status = $Status
+        updated_at = (Get-Date).ToString('o')
+        active_profile = if ($script:CurrentServerProfile) { $script:CurrentServerProfile } else { $null }
+        owned_pid = if ($script:ServerProcess -and -not $script:ServerProcess.HasExited) { $script:ServerProcess.Id } else { $null }
+        failure_reason = if ($FailureReason) { $FailureReason } else { $null }
+    }
+    $temporary = "$MonitorStatePath.tmp"
+    [System.IO.File]::WriteAllText($temporary, ($state | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $MonitorStatePath -Force
+}
 function Stop-LlamaServer {
     $owned = (
         $script:ServerProcess -and $script:ServerMetadata -and
@@ -313,6 +332,7 @@ function Start-LlamaServer {
         command_line = ''
         health_uri = 'http://127.0.0.1:8080/health'
     }
+    Write-MonitorState -Stage $script:MonitorStage -Status 'LOADING_MODEL'
     $ready = $false
     for ($i=0; $i -lt 240; $i++) {
         if ($script:ServerProcess.HasExited) { throw "$Profile llama-server exited. See $stderr" }
@@ -325,6 +345,7 @@ function Start-LlamaServer {
         Write-Warning "$Profile command metadata unavailable; this server will not be reused across stages."
     }
     Write-Host "$Profile ready (PID $($script:ServerProcess.Id))" -ForegroundColor Green
+    Write-MonitorState -Stage $script:MonitorStage -Status 'ACTIVE'
 }
 
 function Get-GemmaPreflightLogSnapshot {
@@ -504,12 +525,17 @@ Daniel hesitated only a moment before following her.
 }
 
 function Invoke-PythonStage {
-    param([string]$Label, [string[]]$Arguments)
+    param([string]$Label, [string[]]$Arguments, [string]$Outcome='COMPLETE')
     Write-Host "`n=== $Label ===" -ForegroundColor Magenta
+    Write-MonitorState -Stage $Label -Status 'ACTIVE'
     Push-Location $ProjectRoot
     try {
         & $Python @Arguments
         if ($LASTEXITCODE -ne 0) { throw "$Label failed with exit code $LASTEXITCODE" }
+        Write-MonitorState -Stage $Label -Status $Outcome
+    } catch {
+        Write-MonitorState -Stage $Label -Status 'FAILED' -FailureReason $_.Exception.Message
+        throw
     } finally { Pop-Location }
 }
 
@@ -528,7 +554,7 @@ function Invoke-AggregateModelStage {
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {
         Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
-        Invoke-PythonStage -Label $Label -Arguments $Arguments
+        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
         return
     }
     if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }
@@ -687,6 +713,7 @@ try {
     Write-Host "Bundle: $bundle" -ForegroundColor Green
 }
 catch {
+    Write-MonitorState -Stage $script:MonitorStage -Status 'FAILED' -FailureReason $_.Exception.Message
     Write-Host "`nPIPELINE V3.1 FAILED: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Run data preserved at: $RunRoot" -ForegroundColor Yellow
     throw
