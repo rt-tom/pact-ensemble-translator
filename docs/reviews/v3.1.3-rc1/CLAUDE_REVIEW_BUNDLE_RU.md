@@ -2,7 +2,7 @@
 
 ## Задание
 
-Проведи adversarial integration review кандидата `b06599d` (`develop/v3.1.3` против `main`). Не оценивай перевод и не запускай модель. Проверь, что feature contracts не отменяют друг друга на границах resume/redo/finalization.
+Проведи adversarial integration review кандидата `2f93961` (`release/v3.1.3-rc1-pr21` против production commit `b3c6add`, merged PR #21). Не оценивай перевод и не запускай модель. Проверь, что feature contracts не отменяют друг друга на границах resume/redo/finalization.
 
 ## Behavioral matrix
 
@@ -39,6 +39,8 @@ All offline tests below passed in a development worktree. No model, production p
 - Python compileall; PowerShell AST; `git diff --check`
 
 The production/profile comparison found no inference change: all model names, context settings and sampling/thinking values are identical. Only release metadata changes from `3.1.2j` to `3.1.3`.
+
+PR #21 is included as the direct base. The manual final-lineage conflict resolution retains PR #21 aggregate cache reuse before selecting the new Qwen global-smoke message path.
 
 ## Required output
 

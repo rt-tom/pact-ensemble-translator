@@ -2,7 +2,7 @@
 
 ## Роль и границы
 
-Проведи статическое архитектурное ревью кандидата `b06599d` (`develop/v3.1.3`) относительно `main`. Не предлагай запуск модели, pipeline, reset/redo в production или ручное редактирование текста книги. Интересуют только корректность жизненного цикла артефактов, resume, cache safety, форматирование и finalization.
+Проведи статическое архитектурное ревью кандидата `2f93961` (`release/v3.1.3-rc1-pr21`) относительно production commit `b3c6add` (merged PR #21). Не предлагай запуск модели, pipeline, reset/redo в production или ручное редактирование текста книги. Интересуют только корректность жизненного цикла артефактов, resume, cache safety, форматирование и finalization.
 
 ## Изменённые feature contracts
 
@@ -32,6 +32,7 @@
 - Runner preflight/startup/model-policy/monitor PowerShell self-tests: PASS.
 - Python compilation, PowerShell AST and `git diff --check`: PASS.
 - Production profile comparison: only `ensemble.version` differs (`3.1.2j` -> `3.1.3`); model, context, temperature, top-p, top-k and thinking settings match.
+- PR #21 is a direct base of this candidate; the final-lineage merge preserves its `v31_audit` aggregate cache reuse path.
 
 ## Review questions
 
