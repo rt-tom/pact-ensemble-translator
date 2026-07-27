@@ -23,7 +23,7 @@ class JsonGenerationError(RuntimeError):
         self.attempt_errors = attempt_errors
 
 
-VERSION = "3.1.2h"
+VERSION = "3.1.2i"
 
 
 def read_json(path: Path, default: Any = None) -> Any:
