@@ -21,6 +21,7 @@ function New-Fixture { param([string]$Root,[string]$Kind,[string]$ArtifactVersio
     foreach ($pass in @('primary','residual')) { foreach ($name in @('qwen_semantic','gemma_semantic','gemma_russian','gemma_discourse','cross_verify_gemma','cross_verify_qwen','verification_report')) { Put-Json (Join-Path $work "v31\$pass\$name.json") @{version=$ArtifactVersion;expected=2;completed=2} } }
     if ($Kind -eq 'failed') { Put-Json (Join-Path $run 'monitor_state.v31.json') @{runner_version='3.1.3-03';artifact_version=$ArtifactVersion;stage='repair';status='FAILED';failure_reason='synthetic failure'}; return }
     Put-Json (Join-Path $work 'v31_quality_gate.json') @{version=$ArtifactVersion;expected=2;completed=2}
+    if ($Kind -eq 'stale') { Put-Json (Join-Path $work 'state.json') @{status='complete'} }
     if ($Kind -eq 'mixed') { Put-Json (Join-Path $work 'v31\primary\legacy.json') @{version='3.1.2'}; return }
     if ($Kind -eq 'legacy-compatible') {
         Put-Json (Join-Path $work 'v31\primary\legacy.json') @{version='3.1.2j'}

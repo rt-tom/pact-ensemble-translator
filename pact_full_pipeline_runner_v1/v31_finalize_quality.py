@@ -12,6 +12,7 @@ from v31_common import (
     VERSION, add_common_args, load_cfg, load_manifest, load_runtime,
     norm, read_json, selected_chapters, setup_logging, write_json,
 )
+from v31_final_lifecycle import prior_terminal_status, publish_terminal_pair, terminal_status
 
 DEFAULT_FAIL_CATEGORIES = {
     "missing", "mixed_script", "english_residue", "number", "number_word",
@@ -62,6 +63,7 @@ def main() -> int:
     }
 
     for source_path, work in selected_chapters(runtime, cfg, args.start, args.end):
+        prior_status = prior_terminal_status(work) if args.final_lifecycle else None
         _, blocks_raw, _ = load_manifest(work)
         expected_pids = [str(block["pid"]) for block in blocks_raw]
         expected_set = set(expected_pids)
@@ -224,8 +226,18 @@ def main() -> int:
                 unresolved.append({"stage": "global_smoke", "reason": "incomplete coverage", "coverage": smoke_cov})
             final_blockers = list(read_json(root / "verified_issues.json", [])) + list(smoke.get("issues") or [])
 
-        if unresolved:
-            write_json(work / "v31_quality_gate.json", {
+        terminal = terminal_status(
+            ledger_ok=not any(row.get("stage") == "final_changed_pid_ledger" for row in unresolved),
+            coverage_ok=not unresolved,
+            verification_ok=not unresolved,
+            smoke_ok=not any(row.get("stage") == "global_smoke" for row in unresolved),
+            blocking_findings=final_blockers,
+            final_repair_rounds=1 if args.final_lifecycle else 0,
+            prior_status=prior_status,
+        )
+
+        if terminal == "failed":
+            gate = {
                 "version": VERSION,
                 "chapter": source_path.name,
                 "ok": False,
@@ -233,20 +245,23 @@ def main() -> int:
                 "coverage": coverage,
                 "final_deterministic_issues": final_det,
                 "status": "failed",
-            })
+            }
+            publish_terminal_pair(work, {"status": "failed", "reason": "final quality execution or accounting failure"}, gate)
             raise RuntimeError(
                 f"v3.1 final quality gate failed for {source_path.name}: "
                 f"{len(unresolved)} blocking condition(s)"
             )
 
-        if args.final_lifecycle and final_blockers:
-            write_json(work / "v31_quality_gate.json", {
+        if args.final_lifecycle and terminal == "quarantined":
+            gate = {
                 "version": VERSION, "chapter": source_path.name, "ok": False,
                 "status": "quarantined", "coverage": coverage,
                 "changed_pids": read_json(work / "v31_final_changed_pid_ledger.json", {}).get("changed_pids", []),
                 "blocking_findings": final_blockers,
-            })
-            write_json(work / "state.json", {"status": "quarantined", "reason": "blocking final quality findings"})
+                "prior_terminal_status": prior_status,
+            }
+            reason = "blocking final quality findings" if final_blockers else "prior quarantine is monotonic within this run identity"
+            publish_terminal_pair(work, {"status": "quarantined", "reason": reason}, gate)
             logging.warning("%s quarantined: %s final blocking finding(s)", source_path.name, len(final_blockers))
             continue
 
@@ -288,7 +303,7 @@ def main() -> int:
             "final_deterministic_issue_count": len(final_det),
             "changed_pids": changed_pids,
         })
-        write_json(work / "v31_quality_gate.json", {
+        gate = {
             "version": VERSION,
             "chapter": source_path.name,
             "ok": True,
@@ -298,7 +313,11 @@ def main() -> int:
             "changed_pids": changed_pids,
             "final_deterministic_issues": final_det,
             "status": "complete",
-        })
+        }
+        if args.final_lifecycle:
+            publish_terminal_pair(work, {"status": "complete", "reason": "final quality gate passed"}, gate)
+        else:
+            write_json(work / "v31_quality_gate.json", gate)
         logging.info(
             "v3.1 quality gate passed %s: verified=%s changed=%s",
             source_path.name, len(verified), len(changed_pids),

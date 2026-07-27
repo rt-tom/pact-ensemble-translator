@@ -32,7 +32,9 @@ NODES = (
     Node("primary_repair", ("primary_audit",), ("repaired_translations.json", "repaired_translations.preverify.json", "repair_records.json", "post_repair_report.json", "issue_lifecycle.json", "v31_primary_translations.json")),
     Node("residual_audit", ("primary_repair",), ("v31/residual",)),
     Node("residual_repair", ("residual_audit",), ("v31_final_translations.json",)),
-    Node("final_quality", ("residual_repair",), ("v31/final", "v31_final_changed_pid_ledger.json", "v31_pre_final_repair_translations.json", "v31_quality_gate.json", "quality_report.json", "state.json")),
+    # Terminal status remains authoritative for the current run identity across
+    # a redo-quality.  Reset creates a new run identity and removes it instead.
+    Node("final_quality", ("residual_repair",), ("v31/final", "v31_final_changed_pid_ledger.json", "v31_pre_final_repair_translations.json", "quality_report.json")),
     # review is an independent diagnostic consumer; it is intentionally not a finalization input.
     Node("review", ("final_quality",), ("audit_report.html",)),
     Node("finalization", ("final_quality",), ("output",)),
