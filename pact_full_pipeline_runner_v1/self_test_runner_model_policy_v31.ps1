@@ -1,0 +1,48 @@
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'v31_runner_model_policy.ps1')
+
+function Assert-True { param([bool]$Value,[string]$Message) if (-not $Value) { throw $Message } }
+function Assert-False { param([bool]$Value,[string]$Message) if ($Value) { throw $Message } }
+
+$root = Join-Path ([System.IO.Path]::GetTempPath()) ("pact-v31-policy-" + [guid]::NewGuid())
+try {
+    New-Item -ItemType Directory -Path (Join-Path $root 'one\v31\primary') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $root 'two\v31\primary\cross_verify\qwen') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $root 'one\v31\primary\cross_verify_qwen.json') -Value '{}'
+
+    Assert-False (Test-V31AggregateSetComplete $root @('one','two') 'v31\primary\cross_verify_qwen.json' $false) 'Partial cache must never skip a model.'
+    Set-Content -LiteralPath (Join-Path $root 'two\v31\primary\cross_verify_qwen.json') -Value '{}'
+    Assert-True (Test-V31AggregateSetComplete $root @('one','two') 'v31\primary\cross_verify_qwen.json' $false) 'All aggregates should skip model startup.'
+    Assert-False (Test-V31AggregateSetComplete $root @('one','two') 'v31\primary\cross_verify_qwen.json' $true) 'Force must disable aggregate skip.'
+
+    $exe = 'C:\llama-cpp\llama-server.exe'
+    $args = @('-m','model.gguf','--port','8080')
+    $signature = Get-V31ServerCommandSignature $exe 'Qwen' $args
+    Assert-True ($signature -eq (Get-V31ServerCommandSignature $exe 'Qwen' $args)) 'Command signature must be stable.'
+    Assert-False ($signature -eq (Get-V31ServerCommandSignature $exe 'Qwen' (@($args) + '--jinja'))) 'Command signature must cover arguments.'
+
+    $metadata = [pscustomobject]@{
+        pid=42; profile='Qwen'; executable=$exe; command_signature=$signature
+        command_line='llama-server.exe -m model.gguf --port 8080'
+        health_uri='http://127.0.0.1:8080/health'
+    }
+    $valid = @{ ProcessId=42; HasExited=$false; Metadata=$metadata; ExpectedProfile='Qwen'; ExpectedExecutable=$exe; ExpectedCommandSignature=$signature; ActualCommandLine=$metadata.command_line; HealthStatus='ok' }
+    Assert-True (Test-V31OwnedServerIdentity @valid) 'Owned healthy same-profile server should be reusable.'
+    foreach ($change in @(
+        @{ProcessId=43}, @{HasExited=$true}, @{ExpectedProfile='GemmaVerify'},
+        @{ExpectedCommandSignature='wrong'}, @{ActualCommandLine='foreign'}, @{HealthStatus='loading model'}
+    )) {
+        $case = $valid.Clone()
+        foreach ($key in $change.Keys) { $case[$key] = $change[$key] }
+        Assert-False (Test-V31OwnedServerIdentity @case) "Ownership mismatch $($change.Keys) must reject reuse."
+    }
+
+    $runner = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'run_full_pipeline_v31.ps1') -Raw
+    Assert-False ($runner -match 'Get-Process\s+llama-server[^\r\n]*Stop-Process') 'Runner must not stop foreign llama-server processes.'
+    Assert-True ($runner -match 'Port 8080 is already served by an unowned endpoint') 'Runner must fail closed on a foreign endpoint.'
+    Assert-False ($runner -match 'Start-LlamaServer GemmaTranslate\s*\r?\n\s*\$finalizeArgs') 'Model-free finalization must not start a model.'
+    Write-Host 'Pact v3.1 runner model policy self-tests passed'
+} finally {
+    if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+}
