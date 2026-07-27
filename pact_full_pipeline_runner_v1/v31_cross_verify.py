@@ -11,7 +11,7 @@ from v31_common import (
     VERSION, add_common_args, api_client, bible_prompt, complete_json,
     glossary_prompt, load_cfg, load_manifest, load_runtime, load_translations,
     norm, read_json, scene_notes_for_pids, selected_chapters, setup_logging,
-    stage_cfg, write_json,
+    cache_identity, cache_reuse, stage_cfg, with_cache_identity, write_json,
 )
 
 DEFAULT_QWEN = {
@@ -177,11 +177,15 @@ def parse(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_or_generate(
-    cache: Path, force: bool, generator: Callable[[], dict[str, Any]],
+    cache: Path, force: bool, identity: dict[str, str], generator: Callable[[], dict[str, Any]],
 ) -> dict[str, Any]:
     if cache.exists() and not force:
-        return read_json(cache, {})
-    record = generator()
+        cached, reason = cache_reuse(cache, identity)
+        if cached is not None:
+            logging.info("Reusing %s", cache)
+            return cached
+        logging.info("Cache miss %s: %s", cache, reason)
+    record = with_cache_identity(generator(), identity)
     write_json(cache, record)
     return record
 
@@ -213,9 +217,16 @@ def main() -> int:
         for index, issue in enumerate(queue, 1):
             issue_id = issue["issue_id"]
             cache = cache_dir / f"{issue_id}.json"
+            stage, prompt = messages(runtime, cfg, work, blocks, block_map, translations, issue, args.judge)
+            identity = cache_identity(
+                producer="v31_cross_verify", schema="cross-verify-record/v1",
+                source={"chapter": source_path.name, "blocks": blocks},
+                inputs={"issue": issue, "translations": translations, "pass": args.pass_name},
+                config=stage, prompt=prompt,
+                profile={"judge": args.judge, "model": args.model or cfg[api_section].get("model")},
+            )
 
             def generate_record() -> dict[str, Any]:
-                stage, prompt = messages(runtime, cfg, work, blocks, block_map, translations, issue, args.judge)
                 verdict, attempts = complete_json(
                     runtime, client, prompt, stage, int(stage["max_tokens"]),
                     f"cross_verify:{args.judge}:{source_path.stem}:{issue_id}", int(stage["attempts"]),
@@ -236,7 +247,7 @@ def main() -> int:
                     "attempts": attempts,
                 }
 
-            record = load_or_generate(cache, args.force, generate_record)
+            record = load_or_generate(cache, args.force, identity, generate_record)
             decisions.append(record)
             logging.info("%s cross verify %s: %s/%s %s", args.judge, source_path.name, index, len(queue), record.get("decision"))
         write_json(out, {
