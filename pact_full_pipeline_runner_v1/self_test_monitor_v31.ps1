@@ -12,6 +12,12 @@ function New-Fixture { param([string]$Root,[string]$Kind,[string]$ArtifactVersio
     Put-Json (Join-Path $run 'config.full_pipeline.v31.json') @{ensemble_v31=$ensemble}
     Put-Json (Join-Path $run 'monitor_state.v31.json') @{runner_version='3.1.3-03';artifact_version=$ArtifactVersion;stage='primary audit';status='ACTIVE';active_profile='Qwen';owned_pid=999999;updated_at='2026-01-01T00:00:00Z'}
     Put-Json (Join-Path $work 'manifest.json') @{blocks=@(@{pid=1},@{pid=2})}
+    New-Item -ItemType Directory -Force -Path (Join-Path $run 'server_logs') | Out-Null
+    $logPath = Join-Path $run 'server_logs\Qwen_fixture_stderr.log'
+    Set-Content -LiteralPath $logPath -Value @('prompt eval time = 10 ms / 100 tokens (10.0 tokens per second)','eval time = 20 ms / 100 tokens (5.0 tokens per second)','n_decoded = 12, tg = 6.0 t/s')
+    New-Item -ItemType Directory -Force -Path (Join-Path $work 'v31_source_analysis') | Out-Null
+    Put-Json (Join-Path $work 'v31_source_analysis\batch_0001.json') @{version=$ArtifactVersion}
+    if ($Kind -eq 'inactive') { (Get-Item -LiteralPath $logPath).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddMinutes(-2) }
     if ($Kind -eq 'fresh') { return }
     Put-Json (Join-Path $work 'source_scene_map.json') @{version=$ArtifactVersion;expected=2;completed=2}
     Put-Json (Join-Path $work 'draft_translations.json') @{a='x';b='y'}
@@ -46,10 +52,16 @@ try {
         $before = Get-ChildItem -LiteralPath $caseRoot -Recurse -File | Get-FileHash | Select-Object Path,Hash
         $text = (& $monitor -ProjectRoot $caseRoot -Start 1 -End 1 -Once 6>&1 | Out-String)
         Assert-Match $text $cases[$kind] "Monitor did not report $kind correctly."
+        Assert-Match $text 'AUTHORITATIVE STATE' 'Monitor must separate authoritative state.'
+        Assert-Match $text 'LIVE DIAGNOSTICS \(non-authoritative\)' 'Monitor must label diagnostics.'
+        Assert-Match $text 'prompt: 10.0 t/s; generation: 5.0 t/s; live: 6.0 t/s; decoded: 12' 'Monitor did not parse live token diagnostics.'
+        Assert-Match $text 'source batches: 1' 'Monitor did not report observed batch progress.'
+        if ($kind -eq 'inactive') { Assert-Match $text 'server log: stale' 'Stale log must not be presented as live.' }
         if ($kind -eq 'complete') {
             Assert-Match $text 'Mixed-version artifacts: none' 'Real v31_common.VERSION must be healthy.'
             Assert-Match $text 'Resume: READY' 'Healthy artifacts must allow resume.'
         }
+        if ($kind -eq 'mixed') { Assert-Match $text 'Resume: BLOCKED' 'Mixed version must remain blocked despite diagnostics.' }
         if ($kind -eq 'legacy-compatible') {
             Assert-Match $text 'Mixed-version artifacts: none' 'Approved legacy artifact must not be mixed-version.'
             Assert-Match $text 'Resume: READY' 'Approved legacy artifact must allow resume.'

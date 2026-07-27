@@ -13,6 +13,7 @@ PROJECT = HERE.parent
 sys.path.insert(0, str(PROJECT))
 
 import pact_translate_v3 as runtime
+from v31_common import ARTIFACT_VERSION
 
 
 def write_json(path: Path, value: object) -> None:
@@ -40,14 +41,31 @@ def run() -> None:
                                "token_count_url": "http://127.0.0.1:1/input_tokens"},
         })
         runner = runtime.Runner(cfg)
-        work, _, blocks, chunks, _ = runner.prepare_chapter(source, False)
+        work, _, blocks, chunks, _ = runner.prepare_chapter(
+            source, False, manifest_version=ARTIFACT_VERSION
+        )
+        manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["version"] == ARTIFACT_VERSION
+        assert manifest["source_sha256"]
+        original_block_ids = [block.pid for block in blocks]
         write_json(work / "chapter_bible.json", {"terms": [], "facts": []})
         original_token_count = runner.translator.token_count
         runner.translator.token_count = lambda *_: (_ for _ in ()).throw(AssertionError("hidden HTTP/token count"))
-        resumed_work, _, resumed_blocks, resumed_chunks, _ = runner.prepare_chapter(source, False)
+        resumed_work, _, resumed_blocks, resumed_chunks, _ = runner.prepare_chapter(
+            source, False, manifest_version=ARTIFACT_VERSION
+        )
         assert resumed_work == work and len(resumed_blocks) == len(blocks)
+        assert [block.pid for block in resumed_blocks] == original_block_ids
         assert [item.__dict__ for item in resumed_chunks] == [item.__dict__ for item in chunks]
         runner.translator.token_count = original_token_count
+        manifest["version"] = "3.1.2d"
+        write_json(work / "manifest.json", manifest)
+        try:
+            runner.prepare_chapter(source, False, manifest_version=ARTIFACT_VERSION)
+        except runtime.PipelineError as exc:
+            assert "incompatible" in str(exc) and "create a new run" in str(exc)
+        else:
+            raise AssertionError("stale work manifest was silently reused")
 
 
 if __name__ == "__main__":
