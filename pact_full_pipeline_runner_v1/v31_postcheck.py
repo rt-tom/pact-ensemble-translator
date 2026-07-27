@@ -11,7 +11,7 @@ from v31_common import (
     VERSION, add_common_args, api_client, bible_prompt, complete_json,
     dialogue_scene_notes, glossary_prompt, load_cfg, load_manifest,
     load_runtime, load_translations, norm, read_json, scene_notes_for_pids,
-    selected_chapters, setup_logging, stage_cfg, strict_bool, write_json,
+    cache_identity, cache_reuse, selected_chapters, setup_logging, stage_cfg, strict_bool, with_cache_identity, write_json,
 )
 
 DEFAULTS = {
@@ -217,9 +217,6 @@ def main() -> int:
         records = candidate_report.get("records") or []
         out = root / f"post_gate_{args.judge}_round_{args.round:02d}.json"
         cache_dir = root / "post_gates" / args.judge / f"round_{args.round:02d}"
-        if out.exists() and not args.force:
-            logging.info("Reusing %s", out)
-            continue
         cache_dir.mkdir(parents=True, exist_ok=True)
         decisions = []
         total = sum(len(record.get("candidates") or []) for record in records)
@@ -229,13 +226,23 @@ def main() -> int:
             for candidate in record.get("candidates") or []:
                 cid = candidate["candidate_id"]
                 cache = cache_dir / f"{pid}_{cid}.json"
-                if cache.exists() and not args.force:
-                    decision = read_json(cache, {})
-                else:
-                    stage, messages = build_prompt(
-                        runtime, cfg, work, blocks, block_map,
-                        translations, record, candidate, args.judge,
-                    )
+                stage, messages = build_prompt(
+                    runtime, cfg, work, blocks, block_map,
+                    translations, record, candidate, args.judge,
+                )
+                identity = cache_identity(
+                    producer="v31_postcheck", schema="post-gate-decision/v1",
+                    source={"chapter": source_path.name, "blocks": blocks},
+                    inputs={"record": record, "candidate": candidate, "translations": translations, "round": args.round},
+                    config=stage, prompt=messages,
+                    profile={"judge": args.judge, "model": args.model or cfg[api_section].get("model")},
+                )
+                decision = None
+                if not args.force:
+                    decision, reason = cache_reuse(cache, identity)
+                    if decision is None and cache.exists():
+                        logging.info("Cache miss %s: %s", cache, reason)
+                if decision is None:
                     verdict, attempts = complete_json(
                         runtime, client, messages, stage, int(stage["max_tokens"]),
                         f"post_gate:{args.judge}:{args.pass_name}:{source_path.stem}:{pid}:{cid}:round{args.round}",
@@ -253,7 +260,7 @@ def main() -> int:
                         **verdict,
                         "attempts": attempts,
                     }
-                    write_json(cache, decision)
+                    write_json(cache, with_cache_identity(decision, identity))
                 decisions.append(decision)
                 done += 1
                 logging.info(

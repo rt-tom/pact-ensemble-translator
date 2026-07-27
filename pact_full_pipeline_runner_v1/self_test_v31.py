@@ -12,7 +12,10 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from v31_common import JsonGenerationError, complete_json, issue_record, merge_duplicate_issues
+from v31_common import (
+    JsonGenerationError, cache_identity, cache_reuse, complete_json, issue_record,
+    merge_duplicate_issues, with_cache_identity, write_json, write_text_atomic,
+)
 import v31_cross_verify
 import v31_postcheck
 import v31_repair
@@ -202,8 +205,10 @@ def run(project_root: Path) -> None:
 
     with tempfile.TemporaryDirectory() as temp:
         cache = Path(temp) / "cached.json"
-        cached_record = {"issue_id": "cached", **verdict()}
-        cache.write_text(json.dumps(cached_record, ensure_ascii=False), encoding="utf-8")
+        identity = cache_identity(producer="test", schema="v1", source="en", inputs="ru",
+                                  config={"batch": 1}, prompt="prompt", profile="model")
+        cached_record = with_cache_identity({"issue_id": "cached", **verdict()}, identity)
+        write_json(cache, cached_record)
         before = cache.read_bytes()
         calls = 0
 
@@ -212,9 +217,36 @@ def run(project_root: Path) -> None:
             calls += 1
             raise AssertionError("Cached issue called model generator")
 
-        reused = v31_cross_verify.load_or_generate(cache, False, should_not_generate)
+        reused = v31_cross_verify.load_or_generate(cache, False, identity, should_not_generate)
         assert calls == 0 and reused["issue_id"] == "cached"
         assert cache.read_bytes() == before
+
+        # Relevant inputs invalidate deterministically; mtime is never consulted.
+        for field, changed in (("source", "other en"), ("inputs", "other ru"),
+                               ("config", {"batch": 2})):
+            values = {"source": "en", "inputs": "ru", "config": {"batch": 1}}
+            values[field] = changed
+            stale = cache_identity(producer="test", schema="v1", prompt="prompt", profile="model", **values)
+            _, reason = cache_reuse(cache, stale)
+            assert reason.startswith("identity_mismatch:"), reason
+        reused, reason = cache_reuse(cache, identity)
+        assert reused is not None and reason == "reused"
+
+        legacy = Path(temp) / "legacy.json"
+        write_json(legacy, {"issue_id": "legacy", **verdict()})
+        value, reason = cache_reuse(legacy, identity)
+        assert value is None and reason == "legacy_missing_identity"
+
+        artifact = Path(temp) / "authoritative.json"
+        write_json(artifact, {"good": True})
+        before_good = artifact.read_bytes()
+        try:
+            write_text_atomic(artifact, '{"bad":', validator=json.loads)
+            raise AssertionError("Expected malformed temp rejection")
+        except json.JSONDecodeError:
+            pass
+        assert artifact.read_bytes() == before_good
+        assert not artifact.with_suffix(".json.tmp").exists()
 
     qwen = issue_record(
         pid="p00001", category="meaning", problem="wrong idiom",

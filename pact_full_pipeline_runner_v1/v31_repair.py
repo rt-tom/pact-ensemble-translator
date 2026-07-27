@@ -13,8 +13,8 @@ from typing import Any
 from v31_common import (
     VERSION, add_common_args, api_client, bible_prompt, complete_json,
     glossary_prompt, load_cfg, load_manifest, load_runtime, load_translations,
-    norm, read_json, scene_notes_for_pids, selected_chapters, setup_logging,
-    stage_cfg, write_json,
+    cache_identity, cache_reuse, norm, read_json, scene_notes_for_pids, selected_chapters, setup_logging,
+    stage_cfg, with_cache_identity, write_json,
 )
 
 DEFAULT_STAGE = {
@@ -192,18 +192,24 @@ def main() -> int:
         pids = sorted(retry_by_pid if args.retry_only else by_pid, key=lambda p: block_map[p].index)
         out = root / f"repair_candidates_round_{args.round:02d}.json"
         cache_dir = root / "repairs" / f"round_{args.round:02d}"
-        if out.exists() and not args.force:
-            logging.info("Reusing %s", out)
-            continue
         cache_dir.mkdir(parents=True, exist_ok=True)
         records = []
         for index, pid in enumerate(pids, 1):
             cache = cache_dir / f"{pid}.json"
-            if cache.exists() and not args.force:
-                record = read_json(cache, {})
-            else:
-                feedback = retry_by_pid.get(pid, {}).get("feedback", [])
-                stage, messages, difficult = prompt(runtime, cfg, work, blocks_raw, {b.pid: {"source_text": b.source_text} for b in block_objs}, translations, pid, by_pid[pid], feedback)
+            feedback = retry_by_pid.get(pid, {}).get("feedback", [])
+            stage, messages, difficult = prompt(runtime, cfg, work, blocks_raw, {b.pid: {"source_text": b.source_text} for b in block_objs}, translations, pid, by_pid[pid], feedback)
+            identity = cache_identity(
+                producer="v31_repair", schema="repair-record/v1",
+                source={"chapter": source_path.name, "blocks": blocks_raw},
+                inputs={"pid": pid, "issues": by_pid[pid], "feedback": feedback, "translations": translations, "round": args.round},
+                config=stage, prompt=messages, profile={"model": args.model or cfg["translator_api"].get("model")},
+            )
+            record = None
+            if not args.force:
+                record, reason = cache_reuse(cache, identity)
+                if record is None and cache.exists():
+                    logging.info("Cache miss %s: %s", cache, reason)
+            if record is None:
                 candidates, attempts = complete_json(
                     runtime, client, messages, stage, int(stage["max_tokens"]),
                     f"v31_repair:{args.pass_name}:{source_path.stem}:{pid}:round{args.round}", int(stage["attempts"]),
@@ -221,7 +227,7 @@ def main() -> int:
                     "candidates": candidates,
                     "attempts": attempts,
                 }
-                write_json(cache, record)
+                write_json(cache, with_cache_identity(record, identity))
             records.append(record)
             logging.info("repair %s %s round %s: %s/%s candidates=%s", args.pass_name, source_path.name, args.round, index, len(pids), len(record.get("candidates") or []))
         write_json(out, {

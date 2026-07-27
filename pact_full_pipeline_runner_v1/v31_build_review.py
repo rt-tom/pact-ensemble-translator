@@ -9,7 +9,7 @@ from pathlib import Path
 
 from v31_common import (
     VERSION, add_common_args, load_cfg, load_manifest, load_runtime, norm,
-    read_json, selected_chapters, setup_logging, write_json,
+    read_json, selected_chapters, setup_logging, write_json, write_text_atomic,
 )
 
 
@@ -84,7 +84,11 @@ p{{white-space:pre-wrap}}code{{background:#eee;padding:.1rem .25rem;border-radiu
 <h2>Detector contribution</h2><pre>{esc(dict(detector_counts))}</pre>
 {''.join(rows) if rows else '<p>No changed paragraphs.</p>'}
 </body></html>"""
-        (out_dir / "index.html").write_text(doc, encoding="utf-8")
+        write_text_atomic(
+            out_dir / "index.html", doc,
+            validator=lambda value: None if "</html>" in value.casefold()
+            else (_ for _ in ()).throw(ValueError("invalid review HTML")),
+        )
     return 0
 
 
