@@ -25,6 +25,8 @@
 *.tar
 *.tar.gz
 /SHA256SUMS.txt
+release_manifest.v31.json
+deployment_provenance.v31.json
 **/config.full_pipeline*.json
 **/state.json
 **/status.json
