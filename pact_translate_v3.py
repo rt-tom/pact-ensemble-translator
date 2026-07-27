@@ -140,6 +140,10 @@ DEFAULTS: dict[str, Any] = {
         "max_tokens": 1600,
         "generation_retries": 2,
         "tags": ["em", "strong", "i", "b", "a"],
+        # Formatting is semantic by default.  Cosmetic tags must be opted in
+        # explicitly here rather than being silently downgraded on failure.
+        "required_tags": ["em", "strong", "i", "b", "a"],
+        "optional_tags": [],
         "max_blocks_per_call": 12,
         "retry_unresolved_spans": True,
         "on_failure": "omit_tag",
@@ -214,6 +218,7 @@ class InlineSpan:
     tag: str
     source_text: str
     attrs: dict[str, Any]
+    required: bool = True
 
 
 @dataclass
@@ -681,7 +686,9 @@ def leaf_blocks(soup: BeautifulSoup, names: list[str]) -> list[Tag]:
     return result
 
 
-def extract_inline_spans(tag: Tag, names: list[str]) -> list[InlineSpan]:
+def extract_inline_spans(
+    tag: Tag, names: list[str], required_tags: list[str], optional_tags: list[str],
+) -> list[InlineSpan]:
     counters: Counter[str] = Counter()
     result: list[InlineSpan] = []
     for child in tag.find_all(names):
@@ -698,6 +705,7 @@ def extract_inline_spans(tag: Tag, names: list[str]) -> list[InlineSpan]:
         result.append(InlineSpan(
             span_id=f"{child.name}{counters[child.name]:02d}",
             tag=child.name, source_text=source_text, attrs=attrs,
+            required=child.name in required_tags and child.name not in optional_tags,
         ))
     return result
 
@@ -725,7 +733,9 @@ def prepare_html(raw: str, cfg: dict[str, Any]) -> tuple[str, list[Block]]:
             source_html=str(tag), source_text=source_text,
             word_count=count_words(source_text), digits=digits(source_text),
             inline_spans=extract_inline_spans(
-                tag, cfg["formatting"]["tags"]
+                tag, cfg["formatting"]["tags"],
+                cfg["formatting"].get("required_tags", cfg["formatting"]["tags"]),
+                cfg["formatting"].get("optional_tags", []),
             ),
         ))
     if not blocks:
@@ -2717,6 +2727,8 @@ def apply_inline_mappings(
                 "pid": pid, "span_id": span.span_id,
                 "status": "missing_mapping",
                 "source_text": span.source_text,
+                "required": span.required,
+                "severity": "blocking" if span.required else "warning",
             })
             continue
         location = find_nonoverlapping_occurrence(
@@ -2734,6 +2746,8 @@ def apply_inline_mappings(
                 "status": status,
                 "source_text": span.source_text,
                 "target_text": mapping["target_text"],
+                "required": span.required,
+                "severity": "blocking" if span.required else "warning",
             })
             continue
         start, end = location
@@ -2810,16 +2824,19 @@ def run_formatting(
                     "attempt": attempt, "error": str(exc),
                     "generation": client.calls[-1],
                 })
-        if not mappings and cfg["formatting"]["required"]:
-            raise PipelineError(f"Formatting batch {batch} failed")
+        # A failed batch always becomes per-span incidents below.  Do not
+        # return a flat fallback without durable evidence of what was lost.
+        if not mappings:
+            attempts.append({"attempt": "final", "error": "no valid mappings", "generation": {}})
         local_formatted = {}
         local_incidents = []
         retry_attempts = []
         for pid in batch:
-            inner, found = apply_inline_mappings(
+            inner, initial_found = apply_inline_mappings(
                 translations[pid], block_map[pid].inline_spans,
                 mappings, pid,
             )
+            found = initial_found
             unresolved_ids = {
                 item["span_id"] for item in found
                 if item.get("status") in {"missing_mapping", "target_not_found"}
@@ -2861,8 +2878,15 @@ def run_formatting(
                         "generation": client.calls[-1]
                         if client.calls else {},
                     })
+            unresolved_keys = {(item["pid"], item["span_id"]) for item in found}
+            resolved = [
+                {**item, "status": "resolved", "resolution": "retry_restored"}
+                for item in initial_found
+                if (item["pid"], item["span_id"]) not in unresolved_keys
+            ]
             local_formatted[pid] = inner
-            local_incidents.extend(found)
+            local_incidents.extend(resolved)
+            local_incidents.extend({**item, "resolution": "unresolved"} for item in found)
         formatted.update(local_formatted)
         incidents.extend(local_incidents)
         atomic_json(path, {
@@ -2956,13 +2980,42 @@ def final_integrity(
             )
         ):
             errors.append(f"{block.pid}: final numeric value mismatch")
-    if formatting_incidents:
-        warnings.append(
-            f"{len(formatting_incidents)} inline spans were not restored."
-        )
+    unresolved_incidents = [
+        item for item in formatting_incidents
+        if item.get("resolution") != "retry_restored" and item.get("status") != "resolved"
+    ]
+    blocking_incidents = [item for item in unresolved_incidents if item.get("required", True)]
+    optional_incidents = [item for item in unresolved_incidents if not item.get("required", True)]
+    if blocking_incidents:
+        errors.append(f"{len(blocking_incidents)} required inline spans remain unresolved.")
+    if optional_incidents:
+        warnings.append(f"{len(optional_incidents)} optional inline spans were not restored.")
+
+    # Validate the produced HTML itself, not the model JSON or mapping cache.
+    # data-pid may have been removed, so match the preserved leaf-block order.
+    output_blocks = leaf_blocks(BeautifulSoup(final_html, "html.parser"), cfg["html"]["block_tags"])
+    if len(output_blocks) != len(blocks):
+        errors.append("Final HTML block structure mismatch.")
+    else:
+        for source, output_block in zip(blocks, output_blocks):
+            required_by_tag = Counter(
+                span.tag for span in source.inline_spans if span.required
+            )
+            for tag, expected in required_by_tag.items():
+                actual = len(output_block.find_all(tag))
+                if actual < expected:
+                    errors.append(
+                        f"{source.pid}: required {tag} spans missing from final HTML "
+                        f"({actual}/{expected})"
+                    )
     return {
         "ok": not errors, "errors": errors, "warnings": warnings,
         "formatting_incidents": formatting_incidents,
+        "formatting_incident_counts": {
+            "resolved": sum(item.get("status") == "resolved" for item in formatting_incidents),
+            "unresolved_required": len(blocking_incidents),
+            "unresolved_optional": len(optional_incidents),
+        },
     }
 
 
