@@ -16,6 +16,7 @@ from v31_common import JsonGenerationError, complete_json, issue_record, merge_d
 import v31_cross_verify
 import v31_postcheck
 import v31_repair
+import v31_adjudicate
 import v31_finalize_verification
 import v31_merge_issues
 
@@ -315,6 +316,60 @@ def run(project_root: Path) -> None:
         }]
     }, "p00001", "Их трудно отложить.", False, runtime, cfg, {"p00001": block})
     assert candidates[0]["after"] == "Их трудно прикончить."
+
+    # An exact whole-PID replace_span is normalized to replace_full, preserves
+    # provenance, and bypasses only the local span-ratio guard.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_span",
+            "old": "Дункан подчинился.", "new": "Дункан так и сделал.",
+            "text": "", "reason": "meaning", "challenge_reason": "",
+        }]
+    }, "p00001", "Дункан подчинился.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["valid"]
+    assert candidates[0]["after"] == "Дункан так и сделал."
+    assert candidates[0]["changed_ratio"] > 0.35
+    assert candidates[0]["action"] == "replace_full"
+    assert candidates[0]["operation_provenance"] == "whole_pid_replace_span_normalized_to_replace_full"
+
+    # Exact whole-PID edits are also valid below the partial-span ratio limit.
+    candidates = v31_repair.parse_candidates({
+        "candidates": [{
+            "candidate_id": "A", "action": "replace_span",
+            "old": "Он был дома.", "new": "Он был дома!",
+            "text": "", "reason": "punctuation", "challenge_reason": "",
+        }]
+    }, "p00001", "Он был дома.", False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["valid"] and candidates[0]["changed_ratio"] <= 0.35
+    assert candidates[0]["action"] == "replace_full"
+
+    # Partial edits retain the 0.35 guard.
+    try:
+        v31_repair.parse_candidates({"candidates": [{
+            "candidate_id": "A", "action": "replace_span", "old": "подчинился",
+            "new": "так и сделал", "text": "", "reason": "meaning", "challenge_reason": "",
+        }]}, "p00001", "Дункан подчинился.", False, runtime, cfg, {"p00001": block})
+        raise AssertionError("high-ratio partial span was accepted")
+    except ValueError:
+        pass
+
+    # Near matches and repeated target spans are not whole-PID replacements.
+    for current, target in (("Дункан подчинился.", "Дункан подчинился. "), ("абв абв", "абв")):
+        try:
+            v31_repair.parse_candidates({"candidates": [{
+                "candidate_id": "A", "action": "replace_span", "old": target,
+                "new": "где", "text": "", "reason": "meaning", "challenge_reason": "",
+            }]}, "p00001", current, False, runtime, cfg, {"p00001": block})
+            raise AssertionError("non-exact or ambiguous span was accepted")
+        except ValueError:
+            pass
+
+    # Normalized whole-PID candidates retain the mandatory four independent
+    # downstream decisions; adjudication cannot accept a candidate without one.
+    adjudicate_source = (HERE / "v31_adjudicate.py").read_text(encoding="utf-8")
+    for gate in ("qwen_semantic", "gemma_semantic", "gemma_russian", "deterministic"):
+        assert gate in adjudicate_source
+    assert "Missing gate decision" in adjudicate_source
 
     # Some repair responses put a full replacement in ``new`` and echo
     # CURRENT_RU in ``text``.  The candidate must remain usable rather than
