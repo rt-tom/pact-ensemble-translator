@@ -12,6 +12,7 @@ from v31_common import (
     VERSION, add_common_args, load_cfg, load_manifest, load_runtime,
     norm, read_json, selected_chapters, setup_logging, write_json,
 )
+from v31_final_lifecycle import prior_terminal_status, publish_terminal_pair, terminal_status
 
 DEFAULT_FAIL_CATEGORIES = {
     "missing", "mixed_script", "english_residue", "number", "number_word",
@@ -50,6 +51,7 @@ def deterministic(runtime, cfg, work, blocks_raw, translations):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser, include_pass=False)
+    parser.add_argument("--final-lifecycle", action="store_true")
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
@@ -61,11 +63,22 @@ def main() -> int:
     }
 
     for source_path, work in selected_chapters(runtime, cfg, args.start, args.end):
+        prior_status = prior_terminal_status(work) if args.final_lifecycle else None
         _, blocks_raw, _ = load_manifest(work)
         expected_pids = [str(block["pid"]) for block in blocks_raw]
         expected_set = set(expected_pids)
         unresolved: list[dict[str, Any]] = []
         coverage: dict[str, Any] = {}
+        final_blockers: list[dict[str, Any]] = []
+        if args.final_lifecycle:
+            ledger = read_json(work / "v31_final_changed_pid_ledger.json", {})
+            entries = ledger.get("entries") if isinstance(ledger, dict) else None
+            if not isinstance(entries, list) or any(not isinstance(row, dict) or str(row.get("pid")) not in expected_set for row in entries):
+                unresolved.append({"stage": "final_changed_pid_ledger", "reason": "missing or corrupt immutable lineage"})
+            else:
+                changed = list(ledger.get("changed_pids") or [])
+                if set(changed) != {str(row["pid"]) for row in entries}:
+                    unresolved.append({"stage": "final_changed_pid_ledger", "reason": "changed PID accounting mismatch"})
 
         scene = read_json(work / "source_scene_map.json", {})
         scene_cov = dict(scene.get("coverage") or {})
@@ -196,19 +209,61 @@ def main() -> int:
         if blocking_det:
             unresolved.append({"final_deterministic": blocking_det})
 
-        if unresolved:
-            write_json(work / "v31_quality_gate.json", {
+        if args.final_lifecycle and not unresolved:
+            root = work / "v31" / "final"
+            ledger = read_json(work / "v31_final_changed_pid_ledger.json", {})
+            targets = list(ledger.get("changed_pids") or [])
+            for detector in ("qwen_semantic", "gemma_semantic", "gemma_russian"):
+                report = read_json(root / f"{detector}.json", {})
+                cov = report.get("coverage") or {}
+                coverage[f"final:{detector}"] = cov
+                if int(cov.get("expected", -1)) != len(targets) or int(cov.get("completed", -1)) != len(targets) or not cov.get("ok"):
+                    unresolved.append({"stage": "final_verification", "detector": detector, "reason": "incomplete changed-PID coverage", "coverage": cov})
+            smoke = read_json(root / "qwen_global_smoke.json", {})
+            smoke_cov = smoke.get("coverage") or {}
+            coverage["final:qwen_global_smoke"] = smoke_cov
+            if int(smoke_cov.get("expected", -1)) != len(expected_pids) or int(smoke_cov.get("completed", -1)) != len(expected_pids) or not smoke_cov.get("ok"):
+                unresolved.append({"stage": "global_smoke", "reason": "incomplete coverage", "coverage": smoke_cov})
+            final_blockers = list(read_json(root / "verified_issues.json", [])) + list(smoke.get("issues") or [])
+
+        terminal = terminal_status(
+            ledger_ok=not any(row.get("stage") == "final_changed_pid_ledger" for row in unresolved),
+            coverage_ok=not unresolved,
+            verification_ok=not unresolved,
+            smoke_ok=not any(row.get("stage") == "global_smoke" for row in unresolved),
+            blocking_findings=final_blockers,
+            final_repair_rounds=1 if args.final_lifecycle else 0,
+            prior_status=prior_status,
+        )
+
+        if terminal == "failed":
+            gate = {
                 "version": VERSION,
                 "chapter": source_path.name,
                 "ok": False,
                 "unresolved": unresolved,
                 "coverage": coverage,
                 "final_deterministic_issues": final_det,
-            })
+                "status": "failed",
+            }
+            publish_terminal_pair(work, {"status": "failed", "reason": "final quality execution or accounting failure"}, gate)
             raise RuntimeError(
                 f"v3.1 final quality gate failed for {source_path.name}: "
                 f"{len(unresolved)} blocking condition(s)"
             )
+
+        if args.final_lifecycle and terminal == "quarantined":
+            gate = {
+                "version": VERSION, "chapter": source_path.name, "ok": False,
+                "status": "quarantined", "coverage": coverage,
+                "changed_pids": read_json(work / "v31_final_changed_pid_ledger.json", {}).get("changed_pids", []),
+                "blocking_findings": final_blockers,
+                "prior_terminal_status": prior_status,
+            }
+            reason = "blocking final quality findings" if final_blockers else "prior quarantine is monotonic within this run identity"
+            publish_terminal_pair(work, {"status": "quarantined", "reason": reason}, gate)
+            logging.warning("%s quarantined: %s final blocking finding(s)", source_path.name, len(final_blockers))
+            continue
 
         compat = [compatible(issue) for issue in verified]
         changed_pids = [pid for pid in expected_pids if draft.get(pid) != translations.get(pid)]
@@ -248,7 +303,7 @@ def main() -> int:
             "final_deterministic_issue_count": len(final_det),
             "changed_pids": changed_pids,
         })
-        write_json(work / "v31_quality_gate.json", {
+        gate = {
             "version": VERSION,
             "chapter": source_path.name,
             "ok": True,
@@ -257,7 +312,12 @@ def main() -> int:
             "lifecycle_count": len(lifecycle),
             "changed_pids": changed_pids,
             "final_deterministic_issues": final_det,
-        })
+            "status": "complete",
+        }
+        if args.final_lifecycle:
+            publish_terminal_pair(work, {"status": "complete", "reason": "final quality gate passed"}, gate)
+        else:
+            write_json(work / "v31_quality_gate.json", gate)
         logging.info(
             "v3.1 quality gate passed %s: verified=%s changed=%s",
             source_path.name, len(verified), len(changed_pids),

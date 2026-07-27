@@ -204,38 +204,28 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     glossary_dir = Path(cfg["paths"]["glossary_dir"])
-    snapshots = {
-        name: read_json(glossary_dir / name, {})
-        for name in ("locked.json", "established.json", "provisional.json", "conflicts.json")
-    }
     known = load_known(glossary_dir)
     files = module.select_files(cfg, args.start, args.end)
     runner = module.Runner(cfg)
 
-    try:
-        for source_path in files:
-            work, _, blocks, _, _ = runner.prepare_chapter(source_path, False)
-            bible_path = work / "chapter_bible.json"
-            if bible_path.exists() and not (work / "chapter_bible.raw.json").exists():
-                # Existing bible may be from an interrupted run. Preserve then sanitize.
-                write_json(work / "chapter_bible.raw.json", read_json(bible_path, {}))
-            if not bible_path.exists():
-                bible = runner.get_chapter_bible(source_path, work, blocks)
-                write_json(work / "chapter_bible.raw.json", bible)
-            else:
-                bible = read_json(bible_path, {})
-            sanitized = sanitize_bible(bible, known)
-            write_json(bible_path, sanitized)
-            sanitize_book_bible(Path(cfg["paths"]["book_bible_file"]), known)
-            print(
-                f"Prepared {source_path.name}: glossary overrides="
-                f"{len((sanitized.get('glossary_enforcement') or {}).get('changes', []))}"
-            )
-    finally:
-        # The model-generated chapter bible may propose glossary changes. Keep the
-        # production glossary frozen and retain candidates only inside chapter files.
-        for name, data in snapshots.items():
-            write_json(glossary_dir / name, data)
+    for source_path in files:
+        work, _, blocks, _, _ = runner.prepare_chapter(source_path, False)
+        bible_path = work / "chapter_bible.json"
+        if bible_path.exists() and not (work / "chapter_bible.raw.json").exists():
+            # Existing bible may be from an interrupted run. Preserve then sanitize.
+            write_json(work / "chapter_bible.raw.json", read_json(bible_path, {}))
+        if not bible_path.exists():
+            bible = runner.get_chapter_bible(source_path, work, blocks)
+            write_json(work / "chapter_bible.raw.json", bible)
+        else:
+            bible = read_json(bible_path, {})
+        sanitized = sanitize_bible(bible, known)
+        write_json(bible_path, sanitized)
+        sanitize_book_bible(Path(cfg["paths"]["book_bible_file"]), known)
+        print(
+            f"Prepared {source_path.name}: glossary overrides="
+            f"{len((sanitized.get('glossary_enforcement') or {}).get('changes', []))}"
+        )
     return 0
 
 
