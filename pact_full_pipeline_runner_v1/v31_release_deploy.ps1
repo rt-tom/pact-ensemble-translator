@@ -163,6 +163,21 @@ function Assert-Migrations {
     }
     if (-not $migrationItems.Count) { throw 'Authoritative schema changed; approved non-empty migrations list is required.' }
     foreach ($migration in $migrationItems) {
+        $recordTypeProperty = $migration.PSObject.Properties['record_type']
+        $recordType = if ($null -eq $recordTypeProperty) { '' } else { [string]$recordTypeProperty.Value }
+        if ($recordType -eq 'schema_introduction') {
+            foreach ($field in @('target_schema','affected_artifacts','introduction_reason','creation_policy','existing_run_behavior','backward_compatibility','rollback_implications','reversible','approval_provenance')) {
+                if ($null -eq $migration.$field -or -not [string]$migration.$field) { throw "Schema introduction lacks required $field" }
+            }
+            $sourceProperty = $migration.PSObject.Properties['source_schema']
+            if ($null -ne $sourceProperty -and $null -ne $sourceProperty.Value -and [string]$sourceProperty.Value) { throw 'Schema introduction must not declare source_schema.' }
+            if (@($BaseSchemas.Values) -contains [string]$migration.target_schema -or -not (@($TargetSchemas.Values) -contains [string]$migration.target_schema)) { throw 'Schema introduction target must be new in release.' }
+            foreach ($artifact in @($migration.affected_artifacts)) { if (-not $TargetSchemas.Contains($artifact)) { throw "Schema introduction references unknown affected artifact: $artifact" } }
+            if ([string]$migration.creation_policy -notin @('eager', 'lazy', 'on_first_use')) { throw 'Schema introduction has invalid creation_policy.' }
+            if (-not [bool]$migration.reversible -and -not [string]$migration.rollback_implications.blocker_approval) { throw 'Irreversible schema introduction requires rollback blocker approval.' }
+            continue
+        }
+        if ($recordType -and $recordType -ne 'schema_migration') { throw "Unknown migration record_type: $recordType" }
         foreach ($field in @('source_schema','target_schema','affected_artifacts','migration_tool','backward_compatibility_policy','rollback_implications','approval_provenance')) {
             if ($null -eq $migration.$field -or -not [string]$migration.$field) { throw "Migration lacks required $field" }
         }
