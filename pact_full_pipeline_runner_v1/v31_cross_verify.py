@@ -28,8 +28,8 @@ DEFAULT_GEMMA = {
 
 CROSS_VERIFY_RETRY_GUIDANCE = (
     "Для cross-verification заново сформируй весь JSON object. "
-    "reason должен содержать 2–3 коротких предложения, не более 800 символов "
-    "(предпочтительно до 400), без пересказа контекста и подробных рассуждений. "
+    "reason должен содержать 2–3 коротких предложения, предпочтительно до "
+    "400 символов, без пересказа контекста и подробных рассуждений. "
     "required_invariant должен быть одним коротким проверяемым условием не более "
     "500 символов; target_span — не более 600 символов."
 )
@@ -61,8 +61,8 @@ decision:
 Не оценивай предложенную формулировку — её ещё нет. Сформулируй проверяемый
 required_invariant, которому должна соответствовать будущая правка.
 Верни один полный JSON object. Никаких Markdown и текста вне JSON.
-reason — 2–3 коротких предложения, максимум 800 символов
-(предпочтительно до 400). required_invariant — одно короткое проверяемое
+reason — 2–3 коротких предложения, предпочтительно до 400 символов.
+required_invariant — одно короткое проверяемое
 условие, максимум 500 символов. target_span — максимум 600 символов.
 Не повторяй весь контекст и рассуждения.
 Если decision=keep, используй repair_scope="span" как нейтральное
@@ -129,6 +129,16 @@ def required_bounded_text(data: dict[str, Any], field: str, limit: int) -> str:
     return value
 
 
+def required_text(data: dict[str, Any], field: str) -> str:
+    raw = data.get(field)
+    if not isinstance(raw, str):
+        raise ValueError(f"{field} must be a string")
+    value = norm(raw)
+    if not value:
+        raise ValueError(f"{field} must not be empty")
+    return value
+
+
 def parse(data: dict[str, Any]) -> dict[str, Any]:
     required = {
         "decision", "confidence", "reason", "required_invariant",
@@ -144,7 +154,7 @@ def parse(data: dict[str, Any]) -> dict[str, Any]:
         if decision != "keep":
             raise ValueError("repair_scope=none is allowed only when decision is keep")
         scope = "span"
-    reason = required_bounded_text(data, "reason", 800)
+    reason = required_text(data, "reason")
     required_invariant = required_bounded_text(data, "required_invariant", 500)
     forbidden_raw = data["forbidden_interpretations"]
     if not isinstance(forbidden_raw, list) or not all(isinstance(x, str) for x in forbidden_raw):

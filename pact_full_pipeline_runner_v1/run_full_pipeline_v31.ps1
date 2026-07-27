@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$RunnerVersion = '3.1.2h'
+$RunnerVersion = '3.1.2i'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -188,7 +188,7 @@ $postRepair['enabled'] = $true
 $postRepair['required'] = $true
 $postRepair['fail_on_unresolved'] = $true
 
-$ensemble['version'] = '3.1.2h'
+$ensemble['version'] = '3.1.2i'
 $ensemble['source_analysis'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=2400; attempts=3; batch_pids=4; context_before=2; context_after=2 }
 $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
