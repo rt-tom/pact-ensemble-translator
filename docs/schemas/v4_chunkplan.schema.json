@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ChunkPlan",
+  "description": "Structure-aware chunk boundary. 20 PIDs is a hard ceiling (never relaxed); 8 PIDs is a soft target that undersized_exception may document missing.",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "chunk_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left_ru": {
+          "type": "string"
+        },
+        "right_en": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "chunk_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshot_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "pids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "context": {
+      "$ref": "#/$defs/chunk_context"
+    },
+    "undersized_exception": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "chunk_id",
+    "snapshot_hash",
+    "pids"
+  ]
+}

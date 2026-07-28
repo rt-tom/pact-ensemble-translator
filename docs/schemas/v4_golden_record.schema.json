@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pact-v4-golden-record/v1",
+  "title": "Pact v4 golden record",
+  "description": "One PID entry in the Phase 0B golden set. Reference RU is a translation aid, not an exact-match ground truth.",
+  "type": "object",
+  "required": [
+    "schema",
+    "record_id",
+    "chapter",
+    "pid",
+    "source",
+    "risk",
+    "invariants",
+    "reference",
+    "verdict",
+    "provenance"
+  ],
+  "properties": {
+    "schema": { "const": "pact-v4-golden-record/v1" },
+    "record_id": {
+      "type": "string",
+      "pattern": "^ch\\d{3}-p\\d{5}$"
+    },
+    "chapter": {
+      "type": "string",
+      "pattern": "^\\d{3}$"
+    },
+    "pid": {
+      "type": "string",
+      "pattern": "^p\\d{5}$"
+    },
+    "source": {
+      "type": "object",
+      "required": ["language", "text", "structural_role", "word_count"],
+      "properties": {
+        "language": { "const": "en" },
+        "text": { "type": "string" },
+        "html": { "type": "string" },
+        "structural_role": {
+          "enum": [
+            "paragraph",
+            "dialogue",
+            "heading",
+            "list_item",
+            "blockquote",
+            "unknown"
+          ]
+        },
+        "inline_spans": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/inline_span" }
+        },
+        "word_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "required": ["band", "types"],
+      "properties": {
+        "band": { "enum": ["low", "med", "high", "unknown"] },
+        "types": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/risk_type" }
+        },
+        "signals": {
+          "type": "object"
+        }
+      }
+    },
+    "invariants": {
+      "type": "object",
+      "required": ["must_preserve"],
+      "properties": {
+        "must_preserve": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/invariant" }
+        },
+        "must_not_add": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "formatting_expectation": {
+          "type": "object",
+          "properties": {
+            "required_spans": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/required_span" }
+            }
+          }
+        }
+      }
+    },
+    "known_violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "example", "why"],
+        "properties": {
+          "category": { "type": "string" },
+          "example": { "type": "string" },
+          "why": { "type": "string" }
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "required": ["source", "note", "alignment"],
+      "properties": {
+        "text": { "type": "string" },
+        "html": { "type": "string" },
+        "source": { "const": "human_translation_epub" },
+        "note": { "const": "reference only; not an exact-match ground truth" },
+        "alignment": {
+          "type": "object",
+          "required": ["method", "confidence"],
+          "properties": {
+            "method": {
+              "enum": [
+                "structural_order",
+                "heuristic_length",
+                "manual",
+                "none"
+              ]
+            },
+            "confidence": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "reference_index": { "type": "integer", "minimum": 1 },
+            "notes": { "type": "string" }
+          }
+        }
+      }
+    },
+    "verdict": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["unreviewed", "accepted", "needs_review", "rejected"]
+        },
+        "reviewer": { "type": "string" },
+        "reviewed_at": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "source_file",
+        "reference_file",
+        "source_hash",
+        "reference_hash",
+        "tool_version",
+        "generated_at"
+      ],
+      "properties": {
+        "source_file": { "type": "string" },
+        "reference_file": { "type": "string" },
+        "reference_entry": { "type": "string" },
+        "source_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "reference_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "tool_version": { "type": "string" },
+        "generated_at": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "inline_span": {
+      "type": "object",
+      "required": ["span_id", "tag", "text", "occurrence"],
+      "properties": {
+        "span_id": { "type": "string" },
+        "tag": { "type": "string" },
+        "text": { "type": "string" },
+        "occurrence": { "type": "integer", "minimum": 1 },
+        "attrs": { "type": "object" }
+      }
+    },
+    "required_span": {
+      "type": "object",
+      "required": ["span_id", "tag", "occurrence"],
+      "properties": {
+        "span_id": { "type": "string" },
+        "tag": { "type": "string" },
+        "occurrence": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "invariant": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "number",
+            "name",
+            "term",
+            "inline_span",
+            "quote",
+            "list_marker",
+            "html_tag"
+          ]
+        },
+        "value": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+    "risk_type": {
+      "enum": [
+        "numbers",
+        "negation",
+        "modality",
+        "names",
+        "idiom",
+        "cultural",
+        "dialogue",
+        "ty_vy",
+        "referent",
+        "glossary_conflict",
+        "mixed_script",
+        "formatting",
+        "quotation",
+        "temporal",
+        "measurement",
+        "code_switch",
+        "wordplay",
+        "long_span",
+        "structural"
+      ]
+    }
+  }
+}
