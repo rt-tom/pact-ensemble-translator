@@ -6,11 +6,11 @@ golden-set tooling module, and the project avoids adding a `jsonschema`
 requirement for a handful of draft-07/2020-12 documents that only use a
 small, known subset of keywords.
 
-Supports: type, const, enum, pattern, minimum/maximum, minItems/maxItems,
-uniqueItems, items (list-form tuple validation and single-schema form),
-required, properties, and local `$ref`/`$defs` resolution. Unsupported
-schema constructs raise ``SchemaError`` loudly rather than silently
-under-validating.
+Supports: type, const, enum, pattern, minLength, minimum/maximum,
+minItems/maxItems, uniqueItems, items (list-form tuple validation and
+single-schema form), required, properties, ``additionalProperties=false``,
+and local `$ref`/`$defs` resolution. Unsupported schema constructs raise
+``SchemaError`` loudly rather than silently under-validating.
 """
 from __future__ import annotations
 
@@ -97,6 +97,8 @@ def _validate(
 
     if isinstance(value, str) and "pattern" in node and not re.search(node["pattern"], value):
         errors.append(f"{path}: {value!r} does not match pattern {node['pattern']!r}")
+    if isinstance(value, str) and "minLength" in node and len(value) < node["minLength"]:
+        errors.append(f"{path}: length {len(value)} < minLength {node['minLength']}")
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in node and value < node["minimum"]:
@@ -124,6 +126,12 @@ def _validate(
                 _validate(item, items_schema, f"{path}[{i}]", defs, errors)
 
     if isinstance(value, dict):
+        if "additionalProperties" in node and node["additionalProperties"] is not False:
+            raise SchemaError("Only additionalProperties=false is supported")
+        if node.get("additionalProperties") is False:
+            allowed = set(node.get("properties", {}))
+            for key in sorted(value.keys() - allowed):
+                errors.append(f"{path}.{key}: unexpected property")
         for key in node.get("required", []):
             if key not in value:
                 errors.append(f"{path}.{key}: missing required")

@@ -3,9 +3,11 @@
   "title": "ChunkPlan",
   "description": "Structure-aware chunk boundary. 20 PIDs is a hard ceiling (never relaxed); 8 PIDs is a soft target that undersized_exception may document missing.",
   "type": "object",
+  "additionalProperties": false,
   "$defs": {
     "chunk_context": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "left_ru": {
           "type": "string"

@@ -3,9 +3,11 @@
   "title": "Repair",
   "description": "Targeted region/PID repair, finding-linked. full_sentence_rewrite requires a documented reason; auto_accepted must always be false.",
   "type": "object",
+  "additionalProperties": false,
   "$defs": {
     "gate_result": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "gate": {
           "type": "string",

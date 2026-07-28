@@ -3,9 +3,11 @@
   "title": "Candidate",
   "description": "A/B/C generation candidate. No score field — V4_MVP_SPEC_RU.md #4 forbids a scoring engine; selection is decided by decision_trace.",
   "type": "object",
+  "additionalProperties": false,
   "$defs": {
     "gate_result": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "gate": {
           "type": "string",
@@ -74,7 +76,7 @@
     },
     "config_identity": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^[a-f0-9]{64}$"
     },
     "decision_trace": {
       "type": "array",
