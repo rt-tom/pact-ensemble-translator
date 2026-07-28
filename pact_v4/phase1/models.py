@@ -25,10 +25,16 @@ class Snapshot:
 class ChunkPlan:
     chunk_id: str
     pids: List[str]
+    left_context: List[str] = field(default_factory=list)
+    right_context: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if len(self.pids) != len(set(self.pids)):
             raise ValueError("Duplicate PIDs are not allowed")
+        if len(set(self.left_context) & set(self.pids)):
+            raise ValueError("PID in both pids and left_context")
+        if len(set(self.right_context) & set(self.pids)):
+            raise ValueError("PID in both pids and right_context")
 
 @dataclass
 class Candidate:
