@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Repair",
+  "type": "object",
+  "properties": {
+    "repair_id": { "type": "string" },
+    "instructions": { "type": "string" },
+    "target_pids": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["repair_id", "instructions", "target_pids"]
+}
