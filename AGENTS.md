@@ -11,7 +11,7 @@ This is a home project. Prefer the smallest reliable workflow; do not add enterp
 ## Repository and safety
 
 - Production: `D:\pact\pact_translator_v3`
-- Development worktrees: `D:\pact\pact_translator_worktrees\`
+- Development worktrees: `D:\pact\pact_translator_worktrees\` or `%LOCALAPPDATA%\Temp\vibe-kanban\worktrees\` (Vibe Kanban-managed)
 - Stable branch: `main`
 - Develop only in a separate branch/worktree. Never edit tracked production files directly.
 - Do not stop a pipeline or `llama-server` without explicit authorization.
@@ -28,8 +28,10 @@ This is a home project. Prefer the smallest reliable workflow; do not add enterp
 3. Generated run config.
 4. Run artifacts and caches.
 5. Tests.
-6. Documentation.
-7. Patch markers and installer messages.
+6. `DECISIONS.md` — architectural decisions and their rationale.
+7. Documentation.
+8. Patch markers and installer messages.
+
 
 Do not trust a marker or success message without checking active code.
 
@@ -78,6 +80,8 @@ Start the normal production pipeline only after successful deployment checks.
 4. Otherwise make the smallest complete change in a separate worktree, add a regression test, run targeted validation, commit, push, and open a draft PR.
 
 Never refactor unrelated code in an incident fix.
+
+When a change reverses a prior decision, abandons a branch, or resolves a non-obvious tradeoff, append a dated entry to `DECISIONS.md` in the same commit. A one-line "what and why" is sufficient. Default `git revert` messages are not acceptable as the sole record.
 
 ## Open PRs and parallel agents
 
