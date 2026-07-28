@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ChunkPlan",
-  "description": "Structure-aware chunk boundary, 8-20 owned PIDs (hard cap) with an explicit single-PID exception.",
+  "description": "Structure-aware chunk boundary. 20 PIDs is a hard ceiling (never relaxed); 8 PIDs is a soft target that undersized_exception may document missing.",
   "type": "object",
   "$defs": {
     "chunk_context": {
@@ -39,7 +39,7 @@
     "context": {
       "$ref": "#/$defs/chunk_context"
     },
-    "single_pid_exception": {
+    "undersized_exception": {
       "type": "boolean"
     }
   },

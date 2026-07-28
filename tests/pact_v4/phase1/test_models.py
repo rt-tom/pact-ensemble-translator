@@ -144,9 +144,9 @@ def test_snapshot_is_frozen():
 
 # --- ChunkPlan -------------------------------------------------------------
 
-def test_chunk_plan_hard_cap_enforced():
+def test_chunk_plan_below_soft_min_rejected_without_exception():
     snap = _snapshot(pids=tuple(f"p{i:05d}" for i in range(1, 4)))  # only 3 PIDs
-    with pytest.raises(ValueError, match="hard cap"):
+    with pytest.raises(ValueError, match="below soft minimum"):
         _chunk_plan(snap, pids=snap.pids)
 
 
@@ -156,16 +156,26 @@ def test_chunk_plan_within_cap_accepted():
     assert len(plan.pids) == 8
 
 
-def test_chunk_plan_single_pid_exception():
+def test_chunk_plan_above_hard_max_always_rejected():
+    # undersized_exception only documents missing the *soft* minimum; it
+    # must never relax the hard maximum (V4_MVP_SPEC_RU.md §3.2).
+    snap = _snapshot(pids=tuple(f"p{i:05d}" for i in range(1, 26)))  # 25 PIDs
+    with pytest.raises(ValueError, match="exceeds hard cap"):
+        _chunk_plan(snap, pids=snap.pids, undersized_exception=True)
+
+
+def test_chunk_plan_undersized_exception_allows_below_soft_min():
+    # Not just exactly one PID: any documented undersized case (e.g. a
+    # short chapter) is allowed as long as the hard max still holds.
+    snap = _snapshot(pids=tuple(f"p{i:05d}" for i in range(1, 4)))  # 3 PIDs
+    plan = _chunk_plan(snap, pids=snap.pids, undersized_exception=True)
+    assert len(plan.pids) == 3
+
+
+def test_chunk_plan_undersized_exception_single_pid():
     snap = _snapshot(pids=("p00001",))
-    plan = _chunk_plan(snap, pids=("p00001",), single_pid_exception=True)
+    plan = _chunk_plan(snap, pids=("p00001",), undersized_exception=True)
     assert plan.pids == ("p00001",)
-
-
-def test_chunk_plan_single_pid_exception_requires_exactly_one():
-    snap = _snapshot()
-    with pytest.raises(ValueError, match="single_pid_exception"):
-        _chunk_plan(snap, pids=snap.pids[:2], single_pid_exception=True)
 
 
 def test_chunk_plan_duplicate_pids_rejected():
@@ -409,7 +419,7 @@ def test_chunk_plan_matches_its_schema():
         "snapshot_hash": plan.snapshot_hash,
         "pids": list(plan.pids),
         "context": {"left_ru": plan.context.left_ru, "right_en": list(plan.context.right_en)},
-        "single_pid_exception": plan.single_pid_exception,
+        "undersized_exception": plan.undersized_exception,
     }
     assert schema_validate(payload, _schema("v4_chunkplan.schema.json")) == []
 

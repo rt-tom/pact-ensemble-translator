@@ -167,8 +167,15 @@ class ChunkContext:
 class ChunkPlan:
     """Structure-aware chunk boundary (contract item 7).
 
-    8-20 owned PIDs per chunk, hard-capped, with an explicit single-PID
-    exception (e.g. an oversized leaf block that cannot be split further).
+    V4_MVP_SPEC_RU.md §3.2: "целевое окно 8-20 PID, мягкий min/max... но
+    жёсткий верхний cap" — the upper bound (20) is a hard ceiling, always
+    enforced, with no exception. The lower bound (8) is a *soft* target:
+    it can be legitimately missed (a whole chapter shorter than 8 PIDs, an
+    unavoidable undersized tail after rebalancing, or a single oversized
+    leaf block that cannot be split) — such cases must set
+    ``undersized_exception=True`` to document why the soft minimum was not
+    met; the flag never relaxes the hard maximum.
+
     ``snapshot_hash`` ties the plan back to the frozen snapshot it was
     computed from.
     """
@@ -177,7 +184,7 @@ class ChunkPlan:
     snapshot_hash: str
     pids: Tuple[str, ...]
     context: ChunkContext = field(default_factory=ChunkContext)
-    single_pid_exception: bool = False
+    undersized_exception: bool = False
 
     MIN_PIDS = 8
     MAX_PIDS = 20
@@ -187,17 +194,16 @@ class ChunkPlan:
         _require_hash(self.snapshot_hash, "snapshot_hash")
         _require_unique_pids(self.pids, "ChunkPlan")
         count = len(self.pids)
-        if self.single_pid_exception:
-            if count != 1:
-                raise ValueError(
-                    "single_pid_exception chunks must own exactly one PID, "
-                    f"got {count}"
-                )
-        elif not (self.MIN_PIDS <= count <= self.MAX_PIDS):
+        if count > self.MAX_PIDS:
             raise ValueError(
-                f"ChunkPlan {self.chunk_id}: {count} PIDs outside hard cap "
-                f"[{self.MIN_PIDS}, {self.MAX_PIDS}] (use single_pid_exception "
-                f"for a documented exception)"
+                f"ChunkPlan {self.chunk_id}: {count} PIDs exceeds hard cap "
+                f"{self.MAX_PIDS} (no exception relaxes the upper bound)"
+            )
+        if count < self.MIN_PIDS and not self.undersized_exception:
+            raise ValueError(
+                f"ChunkPlan {self.chunk_id}: {count} PIDs below soft minimum "
+                f"{self.MIN_PIDS} (set undersized_exception=True if this is a "
+                f"documented, unavoidable case)"
             )
 
 
