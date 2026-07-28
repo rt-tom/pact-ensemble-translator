@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TerminalState",
+  "type": "object",
+  "properties": {
+    "state_id": { "type": "string" },
+    "status": { "type": "string", "enum": ["pending", "in_progress", "failed", "completed"] },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "source_system": { "type": "string" },
+        "foreign_id": { "type": "string", "minLength": 1 },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["source_system", "foreign_id", "timestamp"]
+    }
+  },
+  "required": ["state_id", "status", "provenance"]
+}
