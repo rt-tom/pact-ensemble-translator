@@ -8,4 +8,6 @@
 
 Аудиты V313\_INDEPENDENT\_AUDIT\_FINDINGS.md и V313\_RC2\_DELTA\_REAUDIT.md писались против develop/v3.1.3, а не против main. К текущему коду применимы частично — требуют перепроверки перед использованием как списка задач.
 
+2026-07-28. Translation resume may be declared `REUSED` before model startup only when every chunk in each current manifest has a draft cache containing all of that chunk's PIDs; this replaces the deliberately pessimistic always-`MODEL_REQUIRED` probe without trusting a single aggregate output file.
+
 2026-07-28. V4 identity считается проверенной только после содержательной привязки к ожидаемым source/snapshot/authoritative chunk plan/config artifacts; один лишь SHA-256-shaped regex не отвергает foreign identity и недостаточен для cache/resume.
