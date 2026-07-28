@@ -586,6 +586,10 @@ function Invoke-TranslationStage {
     foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
     Push-Location $ProjectRoot
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -eq 0) {
+        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
+        return
+    }
     if ($probeExit -ne 20) { throw "$Label stage probe FAILED with exit code $probeExit" }
     Start-LlamaServer GemmaTranslate
     Invoke-PythonStage -Label $Label -Arguments $Arguments
