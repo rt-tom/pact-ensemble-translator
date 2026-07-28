@@ -1,14 +1,25 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Snapshot",
+  "description": "Frozen per-chapter book-context snapshot (V4_MVP_SPEC_RU.md §6). snapshot_hash is derived from content, not caller-supplied.",
   "type": "object",
+  "additionalProperties": false,
   "properties": {
+    "chapter_id": { "type": "string", "minLength": 1 },
     "pids": {
       "type": "array",
       "items": { "type": "string" },
-      "uniqueItems": true
+      "uniqueItems": true,
+      "minItems": 1
     },
-    "context": { "type": "string" }
+    "context": { "type": "string" },
+    "glossary_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "book_memory_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "chapter_memory_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
   },
-  "required": ["pids", "context"]
+  "required": [
+    "chapter_id", "pids", "context", "glossary_hash",
+    "book_memory_hash", "chapter_memory_hash", "snapshot_hash"
+  ]
 }

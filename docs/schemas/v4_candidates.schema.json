@@ -1,11 +1,98 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Candidate",
+  "description": "A/B/C generation candidate. No score field — V4_MVP_SPEC_RU.md #4 forbids a scoring engine; selection is decided by decision_trace.",
   "type": "object",
-  "properties": {
-    "candidate_id": { "type": "string" },
-    "translation": { "type": "string" },
-    "score": { "type": "number" }
+  "additionalProperties": false,
+  "$defs": {
+    "gate_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gate",
+        "passed"
+      ]
+    },
+    "pid_entry": {
+      "type": "array",
+      "items": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    }
   },
-  "required": ["candidate_id", "translation", "score"]
+  "properties": {
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "chunk_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "enum": [
+        "fidelity_first",
+        "balanced_literary",
+        "synthesis"
+      ]
+    },
+    "translation": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pid_entry"
+      },
+      "minItems": 1
+    },
+    "source_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "snapshot_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "chunk_plan_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "config_identity": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "decision_trace": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/gate_result"
+      }
+    }
+  },
+  "required": [
+    "candidate_id",
+    "chunk_id",
+    "role",
+    "translation",
+    "source_hash",
+    "snapshot_hash",
+    "chunk_plan_hash",
+    "config_identity"
+  ]
 }
