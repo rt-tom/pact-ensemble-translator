@@ -49,3 +49,5 @@ deployment_provenance.v31.json
 
 # Confirmed obsolete duplicate
 /reviewer_benchmark_2_2_0.py
+deployment_backups/
+*_before_*_2026*.ps1
