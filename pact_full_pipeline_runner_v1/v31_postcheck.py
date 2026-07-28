@@ -122,7 +122,7 @@ SOURCE NOTES:
 - repair не ухудшил хороший текст.
 
 Для action=challenge_issue оцени, существует ли русскоязычная проблема.
-accept_challenge допустим только если ВСЕ issues ложны.
+accept_challenge допустим только если ВСЕ issues ложны. Иначе reject_challenge.
 
 Верни только JSON:
 {{
