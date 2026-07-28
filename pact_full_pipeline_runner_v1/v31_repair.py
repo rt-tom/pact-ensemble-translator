@@ -26,6 +26,15 @@ DEFAULT_STAGE = {
     "max_changed_ratio_span": 0.35,
 }
 
+# A short PID can legitimately need a local wording correction whose character
+# diff exceeds the partial-span safety cap. The validator rejects that form;
+# retries must use the existing whole-PID lifecycle instead of repeating it.
+REPAIR_RETRY_GUIDANCE = (
+    "Если причина отказа содержит `span repair changed_ratio`, не повторяй "
+    "replace_span. Верни replace_full и укажи полный исправленный CURRENT_RU "
+    "в поле text; это нужно даже для локальной замены в коротком PID."
+)
+
 
 def changed_ratio(before: str, after: str) -> float:
     matcher = difflib.SequenceMatcher(a=before, b=after)
@@ -244,6 +253,7 @@ def main() -> int:
                     validator=lambda data, target_pid=pid, original=translations[pid], hard=difficult: parse_candidates(
                         data, target_pid, original, hard, runtime, cfg, block_map
                     ),
+                    retry_guidance=REPAIR_RETRY_GUIDANCE,
                 )
                 record = {
                     "version": VERSION,
