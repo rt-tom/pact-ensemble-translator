@@ -51,3 +51,8 @@ deployment_provenance.v31.json
 /reviewer_benchmark_2_2_0.py
 deployment_backups/
 *_before_*_2026*.ps1
+
+# v4 Phase 0B golden-set outputs (chapter text, alignment drafts,
+# curated records). Local only — never commit these.
+/golden_sets/
+/pact_v4/**/_out/
