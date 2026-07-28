@@ -128,6 +128,26 @@ def run(project_root: Path) -> None:
     assert client.budgets == [1400, 1400]
     assert not diagnostics[0]["ok"] and "Invalid JSON response" in diagnostics[0]["error"]
 
+    retry_calls = 0
+
+    def reject_once(data):
+        nonlocal retry_calls
+        retry_calls += 1
+        if retry_calls == 1:
+            raise ValueError("span repair changed_ratio=0.433")
+        return data
+
+    client = FakeJsonClient([(compact_json, "stop"), (compact_json, "stop")])
+    parsed, diagnostics = complete_json(
+        FakeJsonRuntime, client, json_messages, json_stage, 1400,
+        "test:repair-span-ratio-guidance", 2, validator=reject_once,
+        retry_guidance=v31_repair.REPAIR_RETRY_GUIDANCE,
+    )
+    assert parsed == json.loads(compact_json)
+    assert not diagnostics[0]["ok"] and diagnostics[1]["ok"]
+    assert "replace_full" in client.messages[1][-1]["content"]
+    assert "полный исправленный CURRENT_RU" in client.messages[1][-1]["content"]
+
     long_reason_json = json.dumps(verdict("x" * 801), ensure_ascii=False)
     client = FakeJsonClient([(long_reason_json, "stop")])
     parsed, diagnostics = complete_json(
