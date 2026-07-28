@@ -1,14 +1,51 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ChunkPlan",
+  "description": "Structure-aware chunk boundary, 8-20 owned PIDs (hard cap) with an explicit single-PID exception.",
   "type": "object",
-  "properties": {
-    "chunk_id": { "type": "string" },
-    "pids": {
-      "type": "array",
-      "items": { "type": "string" },
-      "uniqueItems": true
+  "$defs": {
+    "chunk_context": {
+      "type": "object",
+      "properties": {
+        "left_ru": {
+          "type": "string"
+        },
+        "right_en": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     }
   },
-  "required": ["chunk_id", "pids"]
+  "properties": {
+    "chunk_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshot_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "pids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "context": {
+      "$ref": "#/$defs/chunk_context"
+    },
+    "single_pid_exception": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "chunk_id",
+    "snapshot_hash",
+    "pids"
+  ]
 }

@@ -1,18 +1,28 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "TerminalState",
+  "description": "Write-once terminal state machine. Terminal states are exactly complete/quarantined/failed (V4_MVP_SPEC_RU.md §7).",
   "type": "object",
   "properties": {
-    "state_id": { "type": "string" },
-    "status": { "type": "string", "enum": ["pending", "in_progress", "failed", "completed"] },
+    "state_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": ["pending", "in_progress", "complete", "quarantined", "failed"]
+    },
     "provenance": {
       "type": "object",
       "properties": {
-        "source_system": { "type": "string" },
-        "foreign_id": { "type": "string", "minLength": 1 },
-        "timestamp": { "type": "number" }
+        "source_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "chapter_snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "chunk_plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "prompt_bundle_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "code_version": { "type": "string", "minLength": 1 },
+        "policy_versions": { "type": "object" },
+        "model_config": { "type": "object" }
       },
-      "required": ["source_system", "foreign_id", "timestamp"]
+      "required": [
+        "source_hash", "chapter_snapshot_hash", "chunk_plan_hash",
+        "prompt_bundle_hash", "code_version", "policy_versions"
+      ]
     }
   },
   "required": ["state_id", "status", "provenance"]
