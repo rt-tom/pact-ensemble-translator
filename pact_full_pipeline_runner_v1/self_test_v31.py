@@ -295,7 +295,7 @@ def run(project_root: Path) -> None:
     )
     cfg = runtime.merge(runtime.DEFAULTS, {
         "validation": {"strict_digits": False, "english_sequence_min_words": 2},
-        "ensemble_v31": {"repair": {"max_changed_ratio_span": 0.35}},
+        "ensemble_v31": {"repair": {"max_changed_ratio_span": 0.55}},
     })
     glossary = runtime.Glossary(cfg)
     book = runtime.BookBible(Path(cfg["paths"]["book_bible_file"]))
@@ -363,12 +363,12 @@ def run(project_root: Path) -> None:
     assert candidates[0]["valid"] and candidates[0]["changed_ratio"] <= 0.35
     assert candidates[0]["action"] == "replace_full"
 
-    # Partial edits retain the 0.35 guard.
+    # Partial edits with extreme ratio (> 0.55) are still rejected.
     try:
         v31_repair.parse_candidates({"candidates": [{
             "candidate_id": "A", "action": "replace_span", "old": "подчинился",
-            "new": "так и сделал", "text": "", "reason": "meaning", "challenge_reason": "",
-        }]}, "p00001", "Дункан подчинился.", False, runtime, cfg, {"p00001": block})
+            "new": "сделал так быстро", "text": "", "reason": "meaning", "challenge_reason": "",
+        }]}, "p00001", "он подчинился", False, runtime, cfg, {"p00001": block})
         raise AssertionError("high-ratio partial span was accepted")
     except ValueError:
         pass
@@ -383,6 +383,22 @@ def run(project_root: Path) -> None:
             raise AssertionError("non-exact or ambiguous span was accepted")
         except ValueError:
             pass
+
+    # Regression: a legitimate partial span repair with changed_ratio between
+    # 0.35 and 0.55 is accepted with the updated threshold (production incident:
+    # repair looped 3 times because the old 0.35 cap rejected both candidates).
+    repar_current = "Он закончить распятие одной из них!"
+    repar_old = "закончить распятие одной"
+    repar_new = "пригвоздить одну"
+    candidates = v31_repair.parse_candidates({"candidates": [{
+        "candidate_id": "A", "action": "replace_span",
+        "old": repar_old, "new": repar_new,
+        "text": "", "reason": "register", "challenge_reason": "",
+    }]}, "p00001", repar_current, False, runtime, cfg, {"p00001": block})
+    assert candidates[0]["valid"]
+    assert candidates[0]["action"] == "replace_span"
+    assert candidates[0]["changed_ratio"] > 0.35
+    assert candidates[0]["changed_ratio"] < 0.55
 
     # Normalized whole-PID candidates retain the mandatory four independent
     # downstream decisions; adjudication cannot accept a candidate without one.

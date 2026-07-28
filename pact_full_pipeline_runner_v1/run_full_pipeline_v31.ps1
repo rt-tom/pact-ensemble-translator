@@ -216,7 +216,7 @@ $ensemble['gemma_russian_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enab
 $ensemble['gemma_discourse_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=2600; attempts=3; window_pids=30; overlap_pids=10 }
 $ensemble['qwen_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1400; length_retry_max_tokens=1600; attempts=3; context_size=2 }
 $ensemble['gemma_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=800; attempts=3; context_size=2 }
-$ensemble['repair'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1600; attempts=3; context_before=2; context_after=2; alternative_for_multiple_issues=$true; alternative_categories=@('idiom','meaning','register','dialogue','continuity'); max_changed_ratio_span=0.35 }
+$ensemble['repair'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1600; attempts=3; context_before=2; context_after=2; alternative_for_multiple_issues=$true; alternative_categories=@('idiom','meaning','register','dialogue','continuity'); max_changed_ratio_span=0.55 }
 $ensemble['qwen_semantic_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=900; attempts=3; context_size=2 }
 $ensemble['gemma_semantic_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=900; attempts=3; context_size=2 }
 $ensemble['gemma_russian_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=900; attempts=3; context_size=2 }
