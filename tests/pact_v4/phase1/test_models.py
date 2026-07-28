@@ -16,13 +16,17 @@ from pact_v4.phase1.models import (
     Candidate,
     ChunkContext,
     ChunkPlan,
+    ChunkPlanArtifact,
+    ConfigArtifact,
     Finding,
     GateResult,
     Provenance,
     Region,
     Repair,
     Snapshot,
+    SourceArtifact,
     TerminalState,
+    canonical_json_hash,
     validate_candidate_ownership,
     validate_full_pid_ownership,
     validate_json_complete,
@@ -79,10 +83,21 @@ def _candidate(chunk: ChunkPlan, **overrides) -> Candidate:
         source_hash=_hash("source"),
         snapshot_hash=chunk.snapshot_hash,
         chunk_plan_hash=_hash("chunkplan"),
-        config_identity="gemma/temp0/seed1",
+        config_identity=_hash("config"),
     )
     kwargs.update(overrides)
     return Candidate(**kwargs)
+
+
+def _identity_context(snapshot: Snapshot):
+    source = SourceArtifact(
+        chapter_id=snapshot.chapter_id,
+        source=tuple((pid, f"en-{pid}") for pid in snapshot.pids),
+    )
+    chunk = _chunk_plan(snapshot)
+    plan = ChunkPlanArtifact.create(snapshot, (chunk,))
+    config = ConfigArtifact(version="generation-v1", values={"model": "gemma", "seed": 1})
+    return source, plan, config
 
 
 # --- Provenance --------------------------------------------------------
@@ -106,6 +121,35 @@ def test_provenance_is_frozen():
     p = _provenance()
     with pytest.raises(dataclasses.FrozenInstanceError):
         p.code_version = "other"
+
+
+def test_provenance_rejects_well_formed_foreign_identity():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    prompt_bundle = {"version": "prompts-v1", "roles": ["fidelity_first"]}
+    provenance = Provenance(
+        source_hash=_hash("foreign-source"),
+        chapter_snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash,
+        prompt_bundle_hash=canonical_json_hash(prompt_bundle),
+        code_version="v4.0-phase1a",
+        policy_versions={"risk_policy": "v1"},
+        model_config=dict(config.values),
+    )
+    with pytest.raises(ValueError, match="Foreign identity: source_hash"):
+        provenance.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan,
+            prompt_bundle=prompt_bundle, config=config,
+        )
+
+
+def test_config_identity_is_stable_after_caller_mutation():
+    values = {"model": "gemma", "sampling": {"seed": 1}}
+    config = ConfigArtifact(version="generation-v1", values=values)
+    identity = config.config_identity
+    values["sampling"]["seed"] = 2
+    assert config.config_identity == identity
+    assert config.values["sampling"]["seed"] == 1
 
 
 # --- Snapshot ------------------------------------------------------------
@@ -222,6 +266,14 @@ def test_full_pid_ownership_detects_foreign_plan():
         validate_full_pid_ownership((plan_from_b,), snap_a)
 
 
+def test_chunk_plan_artifact_hash_is_content_derived():
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    same = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    assert artifact.plan_hash == same.plan_hash
+    assert artifact.snapshot_hash == snap.snapshot_hash
+
+
 # --- Candidate ---------------------------------------------------------
 
 def test_candidate_has_no_score_field():
@@ -230,6 +282,60 @@ def test_candidate_has_no_score_field():
     cand = _candidate(chunk)
     assert not hasattr(cand, "score")
     assert "score" not in {f.name for f in dataclasses.fields(cand)}
+
+
+def test_candidate_factory_binds_all_content_identities():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    chunk = plan.chunk("c0001")
+    cand = Candidate.create(
+        candidate_id="cand-a",
+        chunk_id=chunk.chunk_id,
+        role="fidelity_first",
+        translation=tuple((pid, f"ru-{pid}") for pid in chunk.pids),
+        source=source,
+        snapshot=snap,
+        chunk_plan=plan,
+        config=config,
+    )
+    assert cand.source_hash == source.source_hash
+    assert cand.chunk_plan_hash == plan.plan_hash
+    assert cand.config_identity == config.config_identity
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["source_hash", "snapshot_hash", "chunk_plan_hash", "config_identity"],
+)
+def test_candidate_rejects_well_formed_foreign_identity(field_name):
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    chunk = plan.chunk("c0001")
+    cand = Candidate.create(
+        candidate_id="cand-a", chunk_id=chunk.chunk_id, role="fidelity_first",
+        translation=tuple((pid, f"ru-{pid}") for pid in chunk.pids),
+        source=source, snapshot=snap, chunk_plan=plan, config=config,
+    )
+    foreign = dataclasses.replace(cand, **{field_name: _hash(f"foreign-{field_name}")})
+    with pytest.raises(ValueError, match=f"Foreign identity: {field_name}"):
+        foreign.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan, config=config
+        )
+
+
+def test_candidate_rejects_foreign_chunk_with_valid_hashes():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    cand = Candidate(
+        candidate_id="cand-a", chunk_id="foreign", role="fidelity_first",
+        translation=tuple((pid, "ru") for pid in snap.pids),
+        source_hash=source.source_hash, snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash, config_identity=config.config_identity,
+    )
+    with pytest.raises(ValueError, match="is not in chunk plan"):
+        cand.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan, config=config
+        )
 
 
 def test_candidate_ordered_pid_map_matches_chunk():
@@ -424,6 +530,28 @@ def test_chunk_plan_matches_its_schema():
     assert schema_validate(payload, _schema("v4_chunkplan.schema.json")) == []
 
 
+def test_authoritative_chunk_plan_artifact_matches_its_schema():
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    payload = {
+        "snapshot_hash": artifact.snapshot_hash,
+        "chunks": [{
+            "chunk_id": chunk.chunk_id,
+            "snapshot_hash": chunk.snapshot_hash,
+            "pids": list(chunk.pids),
+            "context": {
+                "left_ru": chunk.context.left_ru,
+                "right_en": list(chunk.context.right_en),
+            },
+            "undersized_exception": chunk.undersized_exception,
+        } for chunk in artifact.chunks],
+        "plan_hash": artifact.plan_hash,
+    }
+    assert schema_validate(
+        payload, _schema("v4_chunk_plan_artifact.schema.json")
+    ) == []
+
+
 def test_candidate_matches_its_schema():
     snap = _snapshot()
     chunk = _chunk_plan(snap)
@@ -443,11 +571,36 @@ def test_candidate_matches_its_schema():
 
 
 def test_candidate_schema_rejects_score_field_style_payload():
-    # A payload shaped like the old (rejected) contract must fail: it is
-    # missing the now-required identity/role fields entirely.
-    legacy_style = {"candidate_id": "c1", "translation": "plain string", "score": 0.9}
-    errs = schema_validate(legacy_style, _schema("v4_candidates.schema.json"))
-    assert errs
+    snap = _snapshot()
+    chunk = _chunk_plan(snap)
+    cand = _candidate(chunk)
+    valid_payload = {
+        "candidate_id": cand.candidate_id, "chunk_id": cand.chunk_id,
+        "role": cand.role, "translation": [list(pair) for pair in cand.translation],
+        "source_hash": cand.source_hash, "snapshot_hash": cand.snapshot_hash,
+        "chunk_plan_hash": cand.chunk_plan_hash,
+        "config_identity": cand.config_identity, "decision_trace": [],
+    }
+    assert schema_validate(valid_payload, _schema("v4_candidates.schema.json")) == []
+    valid_payload["score"] = 0.9
+    assert schema_validate(valid_payload, _schema("v4_candidates.schema.json")) == [
+        "$.score: unexpected property"
+    ]
+
+
+def test_candidate_schema_rejects_extra_gate_result_property():
+    snap = _snapshot()
+    cand = _candidate(_chunk_plan(snap))
+    payload = {
+        "candidate_id": cand.candidate_id, "chunk_id": cand.chunk_id,
+        "role": cand.role, "translation": [list(pair) for pair in cand.translation],
+        "source_hash": cand.source_hash, "snapshot_hash": cand.snapshot_hash,
+        "chunk_plan_hash": cand.chunk_plan_hash, "config_identity": cand.config_identity,
+        "decision_trace": [{"gate": "fidelity", "passed": True, "score": 0.9}],
+    }
+    assert "$.decision_trace[0].score: unexpected property" in schema_validate(
+        payload, _schema("v4_candidates.schema.json")
+    )
 
 
 def test_finding_matches_its_schema():

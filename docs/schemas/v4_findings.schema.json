@@ -3,9 +3,11 @@
   "title": "Finding",
   "description": "Immutable audit finding: stable id + detector/category/evidence/region. Findings are never merged by span overlap.",
   "type": "object",
+  "additionalProperties": false,
   "$defs": {
     "region": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "pid": {
           "type": "string",

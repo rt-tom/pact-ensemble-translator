@@ -8,7 +8,7 @@ small, known subset of keywords.
 
 Supports: type, const, enum, pattern, minimum/maximum, minItems/maxItems,
 uniqueItems, items (list-form tuple validation and single-schema form),
-required, properties, and local `$ref`/`$defs` resolution. Unsupported
+required, properties, additionalProperties=false, and local `$ref`/`$defs` resolution. Unsupported
 schema constructs raise ``SchemaError`` loudly rather than silently
 under-validating.
 """
@@ -124,6 +124,10 @@ def _validate(
                 _validate(item, items_schema, f"{path}[{i}]", defs, errors)
 
     if isinstance(value, dict):
+        if node.get("additionalProperties") is False:
+            allowed = set(node.get("properties", {}))
+            for key in sorted(value.keys() - allowed):
+                errors.append(f"{path}.{key}: unexpected property")
         for key in node.get("required", []):
             if key not in value:
                 errors.append(f"{path}.{key}: missing required")
