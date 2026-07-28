@@ -17,13 +17,14 @@
         "chapter_snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "chunk_plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "prompt_bundle_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "config_identity": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "code_version": { "type": "string", "minLength": 1 },
         "policy_versions": { "type": "object" },
         "model_config": { "type": "object" }
       },
       "required": [
         "source_hash", "chapter_snapshot_hash", "chunk_plan_hash",
-        "prompt_bundle_hash", "code_version", "policy_versions"
+        "prompt_bundle_hash", "config_identity", "code_version", "policy_versions"
       ]
     }
   },

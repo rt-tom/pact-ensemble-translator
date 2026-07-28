@@ -37,6 +37,7 @@
     }
   },
   "properties": {
+    "artifact": { "const": "pact-v4-chunk-plan/v1" },
     "snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "chunks": {
       "type": "array",
@@ -45,5 +46,5 @@
     },
     "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
   },
-  "required": ["snapshot_hash", "chunks", "plan_hash"]
+  "required": ["artifact", "snapshot_hash", "chunks", "plan_hash"]
 }
