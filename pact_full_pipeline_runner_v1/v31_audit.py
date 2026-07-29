@@ -51,18 +51,19 @@ def qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translatio
     bible = read_json(work / "chapter_bible.json", {})
     system = f"""Ты — Qwen, source-grounded финальный smoke-аудитор главы EN→RU.
 Это РОВНО ОДИН глобальный проход, не полный каскад аудитов и не литературная
-редактура. Сравни фактический финальный текст с исходной главой. Для КАЖДОГО
-PID верни results/status; отмечай только крупные блокирующие дефекты:
+редактура. Сравни фактический финальный текст с исходной главой. Проверь
+КАЖДЫЙ PID, но в `issues` возвращай ТОЛЬКО проблемные PID; не создавай
+пустые `status: ok`-записи. Отмечай только крупные блокирующие дефекты:
 gross omissions, дубли или переставленные passages, сломанную continuity
 субъекта/референта, важную несогласованность имени/термина, mixed-script или
 English residue, грубую formatting corruption, chapter-level contradiction.
 Не отмечай допустимый стиль и не предлагай полный переписанный перевод.
 
-Верни JSON {{"results":[{{"pid":"p00001","status":"ok|issue","issues":[{{
+Верни JSON {{"coverage":{{"first_pid":"{pids[0]}","last_pid":"{pids[-1]}","pid_count":{len(pids)}}},"issues":[{{"pid":"p00001",
 "severity":"critical|major", "category":"missing|duplication|ordering|reference|entity_consistency|mixed_script|english_residue|formatting|continuity|meaning",
 "source_span":"", "target_span":"", "problem":"", "required_invariant":"",
 "repair_instruction":"локальная безопасная инструкция", "scope":"span|sentence|paragraph|cross_pid", "confidence":"high|medium|low"
-}}]}}]}}.
+}}]}}. Если проблем нет, верни пустой массив `issues`.
 
 ГЛОССАРИЙ:\n{glossary_prompt(runtime, cfg, source_text)}
 БИБЛИЯ:\n{bible_prompt(runtime, cfg, source_text, bible)}"""
@@ -344,6 +345,28 @@ def parse_per_pid(data: dict[str, Any], pids: list[str], detector: str) -> tuple
     return issues, list(pids)
 
 
+def parse_global_smoke(data: dict[str, Any], pids: list[str], detector: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate compact whole-chapter smoke output without per-PID `ok` noise."""
+    if not isinstance(data, dict) or not isinstance(data.get("issues"), list):
+        raise ValueError("global smoke issues must be a JSON list")
+    coverage = data.get("coverage")
+    expected_coverage = {
+        "first_pid": pids[0], "last_pid": pids[-1], "pid_count": len(pids),
+    }
+    if coverage != expected_coverage:
+        raise ValueError(f"global smoke coverage must equal {expected_coverage}")
+    allowed = set(pids)
+    issues: list[dict[str, Any]] = []
+    for item in data["issues"]:
+        if not isinstance(item, dict):
+            raise ValueError("every global smoke issue must be an object")
+        pid = norm(item.get("pid"))
+        if pid not in allowed:
+            raise ValueError(f"global smoke returned unexpected PID: {pid or '<empty>'}")
+        issues.append(_parse_issue_item(item, pid, detector))
+    return issues, list(pids)
+
+
 def parse_discourse(data: dict[str, Any], pids: list[str], detector: str) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(data, dict) or not isinstance(data.get("coverage"), list):
         raise ValueError("discourse coverage must be a JSON list")
@@ -500,11 +523,12 @@ def main() -> int:
                     return saved.get("issues") or [], saved.get("coverage") or []
                 if cache_path.exists():
                     logging.info("Cache miss %s: %s", cache_path, reason)
-            validator = (
-                (lambda data, expected=unit_pids, source=detector: parse_discourse(data, expected, source))
-                if args.mode == "gemma_discourse"
-                else (lambda data, expected=unit_pids, source=detector: parse_per_pid(data, expected, source))
-            )
+            if args.mode == "qwen_global_smoke":
+                validator = lambda data, expected=unit_pids, source=detector: parse_global_smoke(data, expected, source)
+            elif args.mode == "gemma_discourse":
+                validator = lambda data, expected=unit_pids, source=detector: parse_discourse(data, expected, source)
+            else:
+                validator = lambda data, expected=unit_pids, source=detector: parse_per_pid(data, expected, source)
             try:
                 (local_issues, local_covered), attempts = complete_json(
                     runtime, client, messages, local_stage, int(local_stage["max_tokens"]),
