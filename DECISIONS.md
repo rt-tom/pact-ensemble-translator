@@ -12,3 +12,5 @@
 2026-07-28. Translation resume may be declared `REUSED` before model startup only when every chunk in each current manifest has a draft cache containing all of that chunk's PIDs; this replaces the deliberately pessimistic always-`MODEL_REQUIRED` probe without trusting a single aggregate output file.
 
 2026-07-29. Для завершения chapter-wide final Qwen smoke контекст увеличивается только в выделенном профиле `QwenGlobalSmoke` и только при явном параметре runner; остальные Qwen-этапы сохраняют 32K, чтобы не менять их проверенный runtime/cache профиль.
+
+2026-07-29. После трёх невалидных JSON-ответов, каждый из которых достиг лимита 2600 токенов, бюджет вывода `qwen_global_smoke` повышен только для финального chapter-wide smoke до 5000; при контексте 40K это остаётся внутри доступного окна, а остальные Qwen-стадии не меняются.

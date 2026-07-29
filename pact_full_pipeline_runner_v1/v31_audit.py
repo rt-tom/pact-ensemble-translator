@@ -19,7 +19,7 @@ from v31_final_ledger_scope import SCHEMA as FINAL_LEDGER_SCOPE_SCHEMA
 DEFAULTS = {
     "qwen_global_smoke": {
         "temperature": 0.0, "top_p": 1.0, "top_k": 64,
-        "enable_thinking": False, "max_tokens": 2600, "attempts": 3,
+        "enable_thinking": False, "max_tokens": 5000, "attempts": 3,
     },
     "qwen_semantic": {
         "temperature": 0.0, "top_p": 1.0, "top_k": 64,
