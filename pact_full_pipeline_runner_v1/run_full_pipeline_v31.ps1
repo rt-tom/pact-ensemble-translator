@@ -10,6 +10,10 @@ param(
     [switch]$RedoFormatting,
     [switch]$DryRun,
     [switch]$SkipPreflight,
+    # Explicit per-run override for full-chapter Qwen checks; default preserves
+    # the validated 32K profile.
+    [ValidateRange(32768, 65536)]
+    [int]$QwenContextSize = 32768,
     # Temporary, explicit migration switch. Remove once 3.1.2j runs are retired.
     [switch]$AllowLegacyArtifactReuse
 )
@@ -168,7 +172,7 @@ $translatorApi['model'] = $GemmaModelName
 $translatorApi['context_size'] = 32768
 $reviewerApi['enabled'] = $true
 $reviewerApi['model'] = $QwenModelName
-$reviewerApi['context_size'] = 32768
+$reviewerApi['context_size'] = $QwenContextSize
 $paths['input_dir'] = (Join-Path $ProjectRoot 'pact_chapters')
 $paths['output_dir'] = $OutputDir
 $paths['work_dir'] = $WorkDir
@@ -285,7 +289,7 @@ function Get-LlamaServerProfile {
         'GemmaTranslate' { $serverArgs = @('-m',$GemmaModelPath,'--model-draft',$GemmaMtpPath,'--spec-type','draft-mtp','--spec-draft-n-max','4','--device','Vulkan0','--host','127.0.0.1','--port','8080','-ngl','99','-ncmoe','18','--no-mmap','--reasoning-budget','0','-np','1','-c','32768','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaRepair' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaVerify' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','128','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
-        'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+        'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c',[string]$QwenContextSize,'-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
     }
     return $serverArgs
 }

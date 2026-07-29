@@ -27,6 +27,11 @@ def load_runtime(project_root: Path):
 
 
 def run(project_root: Path) -> None:
+    runner_script = (HERE / "run_full_pipeline_v31.ps1").read_text(encoding="utf-8")
+    assert "[int]$QwenContextSize = 32768" in runner_script
+    assert "$reviewerApi['context_size'] = $QwenContextSize" in runner_script
+    assert "'-c',[string]$QwenContextSize" in runner_script
+
     runtime = load_runtime(project_root)
 
     class FakeJsonRuntime:
