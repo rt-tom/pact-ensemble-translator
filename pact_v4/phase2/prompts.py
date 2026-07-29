@@ -40,23 +40,25 @@ class PromptTemplate:
 
 
 _OWNERSHIP_GUARD = (
-    "You will be given: (1) a frozen book/chapter memory snapshot, (2) the "
-    "chunk's own source PIDs in source order, (3) read-only left_context "
-    "(already-committed Russian translation), and (4) read-only right_context "
-    "(English source only, not yet translated). "
-    "You must translate ONLY the chunk's own owned PIDs listed under "
-    "'OWNED_PIDS'. Never translate, return, echo, or paraphrase any PID that "
-    "appears only in left_context or right_context — those are read-only "
-    "context and are not part of your output. "
-    "Return STRICT JSON: an object mapping each owned PID to its Russian "
-    "translation, with keys in exactly the same order as OWNED_PIDS, no "
-    "missing keys, no extra keys, no duplicate keys, and no keys outside "
-    "OWNED_PIDS. Do not wrap the JSON in markdown fences or add commentary."
+    "You will be given: (1) a frozen book/chapter memory snapshot (glossary "
+    "and style/voice constraints), (2) the chunk's own source PIDs and their "
+    "English text under 'OWNED_SOURCE', in source order, (3) read-only "
+    "left_context (already-committed Russian translation), and (4) read-only "
+    "right_context (English source only, not yet translated). "
+    "You must translate ONLY the PIDs listed under 'OWNED_SOURCE'. Never "
+    "translate, return, echo, or paraphrase any PID that appears only in "
+    "left_context or right_context — those are read-only context and are not "
+    "part of your output. "
+    "Return STRICT JSON: an object mapping each PID from OWNED_SOURCE to its "
+    "Russian translation, with keys in exactly the same order as "
+    "OWNED_SOURCE, no missing keys, no extra keys, no duplicate keys, and no "
+    "keys outside OWNED_SOURCE. Do not wrap the JSON in markdown fences or "
+    "add commentary."
 )
 
 FIDELITY_FIRST_V1 = PromptTemplate(
     role="fidelity_first",
-    version="pact-v4-prompt-fidelity-first/v1",
+    version="pact-v4-prompt-fidelity-first/v2",
     instructions=(
         "You are translating English fiction into Russian with maximum "
         "fidelity to the source: preserve meaning, register, negation scope, "
@@ -69,7 +71,7 @@ FIDELITY_FIRST_V1 = PromptTemplate(
 
 BALANCED_LITERARY_V1 = PromptTemplate(
     role="balanced_literary",
-    version="pact-v4-prompt-balanced-literary/v1",
+    version="pact-v4-prompt-balanced-literary/v2",
     instructions=(
         "You are translating English fiction into natural, idiomatic "
         "literary Russian. Balance fidelity to the source with fluency and "

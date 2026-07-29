@@ -753,3 +753,31 @@ def test_candidate_provenance_carries_the_full_bundle_hash():
     ]
     assert matching, "full bundle_hash must be recoverable from Candidate.decision_trace"
     assert candidate.candidate_id.endswith(bundle.bundle_hash[:16])
+
+
+def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
+    """The instructions must not tell the model to look for an 'OWNED_PIDS'
+    section that render_prompt never emits (it emits 'OWNED_SOURCE')."""
+    from pact_v4.phase2.prompts import (
+        BALANCED_LITERARY_V1,
+        FIDELITY_FIRST_V1,
+        render_prompt,
+    )
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.HIGH), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V1):
+        assert "OWNED_PIDS" not in template.instructions
+        assert "OWNED_SOURCE" in template.instructions
+
+    for bundle in generator.calls:
+        rendered = render_prompt(bundle)
+        assert "OWNED_SOURCE" in rendered
+        assert "OWNED_PIDS" not in rendered
