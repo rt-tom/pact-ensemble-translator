@@ -427,12 +427,20 @@ def main() -> int:
     add_common_args(parser)
     parser.add_argument("--mode", choices=list(DEFAULTS), required=True)
     parser.add_argument("--translations-file")
+    parser.add_argument("--reviewer-context-size", type=int,
+                        help="override reviewer context only for qwen_global_smoke")
     parser.add_argument("--pids-file", help="JSON ledger or list restricting TARGET_PIDS; context remains adjacent manifest PIDs")
     parser.add_argument("--pids-map", type=Path, help="Canonical per-chapter final changed-PID ledger scope map")
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
     cfg = load_cfg(runtime, args.config.resolve())
+    if args.reviewer_context_size is not None:
+        if args.mode != "qwen_global_smoke":
+            parser.error("--reviewer-context-size is only valid for qwen_global_smoke")
+        if args.reviewer_context_size < 32768:
+            parser.error("--reviewer-context-size must be at least 32768")
+        cfg["reviewer_api"]["context_size"] = args.reviewer_context_size
     api_section = "reviewer_api" if args.mode in {"qwen_semantic", "qwen_global_smoke"} else "translator_api"
     client = api_client(runtime, cfg, api_section, args.mode, args.model)
     if args.pids_file and args.pids_map:
