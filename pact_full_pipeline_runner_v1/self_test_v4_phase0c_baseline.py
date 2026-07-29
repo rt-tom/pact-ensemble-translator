@@ -170,9 +170,14 @@ class GridTests(unittest.TestCase):
             make_golden(golden, accepted=2, needs_review=1)
             rec = m.build_result_record(golden, None)
             self.assertEqual(PENDING_LIVE_RUN, rec["track_a"]["aggregated"]["status"])
-            # supply one measured cell + three pending -> aggregated measured
             grid = rec["track_a"]["grid"]
+            # 1 measured + 3 pending -> still pending (not all 4 done)
             outs = {grid["cells"][0]["cell_id"]: {"p00000": "RU 0", "p00001": "RU 1"}}
+            m.attach_grid_metrics(grid, m.load_golden_records(golden), outs)
+            self.assertEqual(PENDING_LIVE_RUN, m._grid_aggregated_status(grid))
+            # all 4 measured -> aggregated measured
+            for i, cell in enumerate(grid["cells"][1:], start=1):
+                outs[cell["cell_id"]] = {f"p{i:05d}": f"RU {i}"}
             m.attach_grid_metrics(grid, m.load_golden_records(golden), outs)
             self.assertEqual(MEASURED, m._grid_aggregated_status(grid))
 

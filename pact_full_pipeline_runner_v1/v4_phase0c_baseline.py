@@ -51,7 +51,7 @@ MEASURED = "measured"
 NO_RUN = "no_run"
 
 NEEDS_REVIEW_POLICY = (
-    "needs_review records (43) are excluded from numeric Track A metrics. "
+    "needs_review records ({n}) are excluded from numeric Track A metrics. "
     "This is a sample limitation — those records have not reached a final "
     "verdict — not a conscious design choice. If they are later curated, "
     "the baseline must be recomputed."
@@ -721,7 +721,7 @@ def build_result_record(
                 "rejected_count": 0,
                 "known_violations_populated_count": 0,
                 "semantic_recall": {"status": NO_RUN, "reason": "no golden set provided"},
-                "needs_review_policy": NEEDS_REVIEW_POLICY,
+"needs_review_policy": NEEDS_REVIEW_POLICY.format(n="<unknown>"),
             },
             "grid": build_grid(chapter_id_for_grid, config_path),
             "fp_candidate_metric_definition": FP_CANDIDATE_DEFINITION,
@@ -760,8 +760,6 @@ def _grid_aggregated_status(grid: dict[str, Any]) -> str:
         return MEASURED
     if statuses == {PENDING_LIVE_RUN}:
         return PENDING_LIVE_RUN
-    if MEASURED in statuses:
-        return MEASURED
     return PENDING_LIVE_RUN
 
 
