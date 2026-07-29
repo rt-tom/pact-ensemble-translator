@@ -1,5 +1,15 @@
 """Pact v4 Phase 2: risk, generation, and selection contracts."""
 
+from .generation import (
+    GenerationCache,
+    GenerationError,
+    GenerationErrorCode,
+    GenerationOutcome,
+    GenerationParams,
+    ModelCaller,
+    PromptBundle,
+    generate_for_chunk,
+)
 from .risk import (
     RISK_POLICY,
     GlossaryEntry,
@@ -16,4 +26,12 @@ __all__ = [
     "RiskBand",
     "RiskFeature",
     "assess_source_risk",
+    "GenerationCache",
+    "GenerationError",
+    "GenerationErrorCode",
+    "GenerationOutcome",
+    "GenerationParams",
+    "ModelCaller",
+    "PromptBundle",
+    "generate_for_chunk",
 ]
