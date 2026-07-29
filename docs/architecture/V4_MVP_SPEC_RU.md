@@ -339,5 +339,25 @@ Phase 7  A/B release; switch только после доказанного вы
    дополнительной model-review. Решает, остаётся ли Gemma review в Step 6
    обязательной или переходит в high-risk-only escalation (см. §1 п.5, §2
    Step 6/8).
+6. Partial memory promotion при `quarantined`. Сейчас promotion в §6 —
+   all-or-nothing на уровне главы: если хотя бы один регион ушёл в quarantine,
+   ни один термин/факт из этой главы не попадает в `glossary.json` /
+   `book_memory.json`, даже если остальные PID полностью чисты (0 findings за
+   весь repair-lifecycle). Риск: если реальный quarantine rate на golden set
+   окажется высоким, общая память будет расти намного медленнее, чем ожидалось.
+   Измерить фактический quarantine rate в Phase 0/2 (метрика уже собирается
+   для критерия A/B в §8.4) и по результату решить, нужен ли partial promotion:
+   - promote только термины/факты из PID с нулевыми findings за весь
+     lifecycle **и** вне discourse-окрестности любого quarantined-региона
+     (эти окрестности уже считает Step 7 convergence);
+   - promote только до `observed`/`provisional`, никогда сразу
+     `established`/`locked` — сохраняет консервативность лестницы promotion
+     из §6 даже при ошибке;
+   - результат явно маркируется как promoted из partial (не complete) главы,
+     чтобы отличать от обычного promotion при аудите.
+   Не включать в MVP по умолчанию — это возврат части сложности
+   (region-level granularity terminal state), которую v4 сознательно убрал
+   из v3 (см. §5). Делать только если Phase 0/2 числа покажут, что проблема
+   реальна.
 
 Эти решения принимаются числами из Phase 0, а не заранее.
