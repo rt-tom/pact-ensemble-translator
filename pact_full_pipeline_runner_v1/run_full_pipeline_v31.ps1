@@ -10,6 +10,10 @@ param(
     [switch]$RedoFormatting,
     [switch]$DryRun,
     [switch]$SkipPreflight,
+    # The final source-grounded smoke needs one whole-chapter Qwen context;
+    # all other Qwen stages retain their established 32K profile.
+    [ValidateRange(32768, 65536)]
+    [int]$QwenGlobalSmokeContextSize = 32768,
     # Temporary, explicit migration switch. Remove once 3.1.2j runs are retired.
     [switch]$AllowLegacyArtifactReuse
 )
@@ -280,12 +284,13 @@ function Stop-LlamaServer {
 }
 
 function Get-LlamaServerProfile {
-    param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile)
+    param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen','QwenGlobalSmoke')][string]$Profile)
     switch ($Profile) {
         'GemmaTranslate' { $serverArgs = @('-m',$GemmaModelPath,'--model-draft',$GemmaMtpPath,'--spec-type','draft-mtp','--spec-draft-n-max','4','--device','Vulkan0','--host','127.0.0.1','--port','8080','-ngl','99','-ncmoe','18','--no-mmap','--reasoning-budget','0','-np','1','-c','32768','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaRepair' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaVerify' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','128','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+        'QwenGlobalSmoke' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c',[string]$QwenGlobalSmokeContextSize,'-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
     }
     return $serverArgs
 }
@@ -315,7 +320,7 @@ function Test-OwnedHealthyLlamaServer {
 }
 
 function Start-LlamaServer {
-    param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile)
+    param([ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen','QwenGlobalSmoke')][string]$Profile)
     [string[]]$serverArgs = @(Get-LlamaServerProfile $Profile)
     if (Test-OwnedHealthyLlamaServer $Profile $serverArgs) {
         Write-Host "Reusing owned healthy $Profile server (PID $($script:ServerProcess.Id))" -ForegroundColor Green
@@ -558,7 +563,7 @@ function Invoke-AggregateModelStage {
     param(
         [string]$Label,
         [string[]]$Arguments,
-        [ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen')][string]$Profile,
+        [ValidateSet('GemmaTranslate','GemmaRepair','GemmaVerify','Qwen','QwenGlobalSmoke')][string]$Profile,
         [string]$AggregateRelativePath,
         [bool]$Force
     )
@@ -659,7 +664,7 @@ function Run-AuditPass {
     # local semantic/Russian audits remain restricted to ledger PIDs.
     $discourseExtra = $downstreamExtra
     if ($PassName -eq 'final') {
-        Invoke-AggregateModelStage -Label 'final Qwen source-grounded global smoke' -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','qwen_global_smoke','--model',$QwenModelName)) -Profile Qwen -AggregateRelativePath "v31\$PassName\qwen_global_smoke.json" -Force ([bool]$RedoQuality)
+        Invoke-AggregateModelStage -Label 'final Qwen source-grounded global smoke' -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','qwen_global_smoke','--model',$QwenModelName,'--reviewer-context-size',"$QwenGlobalSmokeContextSize")) -Profile QwenGlobalSmoke -AggregateRelativePath "v31\$PassName\qwen_global_smoke.json" -Force ([bool]$RedoQuality)
     } else {
         Invoke-AggregateModelStage -Label "$PassName Gemma discourse audit" -Arguments (@((Join-Path $PackageRoot 'v31_audit.py')) + (CommonArgs) + $discourseExtra + @('--mode','gemma_discourse','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath "v31\$PassName\gemma_discourse.json" -Force ([bool]$RedoQuality)
     }
