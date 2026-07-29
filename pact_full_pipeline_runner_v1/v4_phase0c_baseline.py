@@ -167,7 +167,7 @@ def summarize_golden_source(records: list[dict[str, Any]], records_hash: str) ->
                 ),
             }
         ),
-        "needs_review_policy": NEEDS_REVIEW_POLICY,
+        "needs_review_policy": NEEDS_REVIEW_POLICY.format(n=needs_review),
     }
 
 

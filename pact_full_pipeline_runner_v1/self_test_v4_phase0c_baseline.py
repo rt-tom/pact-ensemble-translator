@@ -197,6 +197,9 @@ class NeedsReviewExclusionTests(unittest.TestCase):
             self.assertEqual(0, src["known_violations_populated_count"])
             self.assertEqual(NOT_MEASURABLE, src["semantic_recall"]["status"])
             self.assertIn("limitation", src["needs_review_policy"])
+            # the number must be the real needs_review count, not a literal placeholder
+            self.assertIn("3", src["needs_review_policy"])
+            self.assertNotIn("{n}", src["needs_review_policy"])
 
 
 class GapDetectionTests(unittest.TestCase):
