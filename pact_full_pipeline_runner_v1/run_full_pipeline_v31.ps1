@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # BuildIdentity is for release/milestone reporting only.  ArtifactVersion is
 # the semantic identity shared by the config and every Python stage artifact.
-$BuildIdentity = '3.1.3-03'
+$BuildIdentity = '3.1.3-04'
 $ArtifactVersion = '3.1.3'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
@@ -695,7 +695,9 @@ function Run-RepairPass {
         Invoke-AggregateModelStage -Label "$PassName Gemma Russian gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath ("v31\{0}\post_gate_gemma_russian_round_{1:D2}.json" -f $PassName,$round) -Force ([bool]$RedoQuality)
 
         Invoke-PythonStage -Label "$PassName deterministic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_deterministic_gate.py')) + (CommonArgs) + $gateArgs)
-        Invoke-PythonStage -Label "$PassName adjudication round $round" -Arguments (@((Join-Path $PackageRoot 'v31_adjudicate.py')) + (CommonArgs) + $gateArgs)
+        $adjudicationArgs = @($gateArgs)
+        if ($round -eq $maxRounds) { $adjudicationArgs += '--terminal-round' }
+        Invoke-PythonStage -Label "$PassName adjudication round $round" -Arguments (@((Join-Path $PackageRoot 'v31_adjudicate.py')) + (CommonArgs) + $adjudicationArgs)
 
         $retry = Get-RetryCount $PassName
         if ($retry -eq 0) { return }
@@ -703,7 +705,7 @@ function Run-RepairPass {
         $currentFile = if ($PassName -eq 'primary') { 'v31_primary_translations.json' } else { 'v31_final_translations.json' }
     }
     $remaining = Get-RetryCount $PassName
-    if ($remaining -gt 0 -and $PassName -ne 'final') { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
+    if ($remaining -gt 0) { throw "$PassName failed to terminalize $remaining PID(s) after $maxRounds repair rounds." }
 }
 
 try {
