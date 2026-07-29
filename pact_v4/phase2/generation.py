@@ -7,18 +7,27 @@ generation"):
   * risk medium / high  -> exactly 2 candidates, A (``fidelity_first``) and
     B (``balanced_literary``), using the two versioned templates in
     ``pact_v4.phase2.prompts``.
-  * Each generation request exposes only: the frozen snapshot, the chunk's
-    own owned PIDs in source order, read-only left context (already
-    committed Russian) and right context (English source), and the
-    glossary/style constraints carried by the snapshot.
+  * Each generation request exposes only: the frozen snapshot identity, the
+    chunk's own owned PIDs *and their English text* in source order,
+    read-only left context (already committed Russian) and right context
+    (English source), and the glossary/style constraints the caller reads
+    from the frozen snapshot (passed in structured, not as an opaque
+    string) — all of it actually rendered into the request text by
+    ``pact_v4.phase2.prompts.render_prompt``, not merely hashed for cache
+    purposes.
   * Model output is a strict ordered PID -> Russian-text JSON map, fully
     validated (well-formed JSON, exact PID set/order/ownership, no context
     leakage) before it is wrapped in the immutable ``Candidate`` contract
-    from Phase 1A.
+    from Phase 1A. The full ``bundle_hash`` is recorded in the candidate's
+    ``decision_trace`` so provenance is recoverable, not just its 16-char
+    prefix in ``candidate_id``.
   * Generation identity (prompt template + version, role, risk-routing
-    decision, frozen context inputs, model/config identity, generation
-    params) hashes to a deterministic cache key; any change to any of those
-    inputs invalidates cache reuse.
+    decision, frozen context inputs including the owned PIDs' actual text,
+    model/config identity, generation params) hashes to a deterministic
+    cache key; any change to any of those inputs invalidates cache reuse.
+    A cache *hit* is still re-verified against the requested chunk_id/role
+    and against the candidate's own ownership contract before being
+    returned — reuse never depends solely on trusting the hash.
 
 Explicitly OUT of scope for this module (Phase 2C, "Cascaded selection"):
 Qwen fidelity/semantic analysis, the deterministic consistency gate, Gemma
@@ -38,6 +47,7 @@ from pact_v4.phase1.models import (
     Candidate,
     ChunkPlanArtifact,
     ConfigArtifact,
+    GateResult,
     Snapshot,
     SourceArtifact,
     canonical_json_hash,
@@ -47,7 +57,7 @@ from pact_v4.phase2.prompts import (
     FIDELITY_FIRST_V1,
     PromptTemplate,
 )
-from pact_v4.phase2.risk import RiskAssessment, RiskBand
+from pact_v4.phase2.risk import GlossaryEntry, RiskAssessment, RiskBand
 
 __all__ = [
     "GenerationParams",
@@ -119,9 +129,11 @@ class PromptBundle:
     source_hash: str
     chunk_id: str
     owned_pids: Tuple[str, ...]
+    owned_source: Tuple[Tuple[str, str], ...]
     left_context: Tuple[Tuple[str, str], ...]
     right_context: Tuple[Tuple[str, str], ...]
-    glossary_context: str
+    glossary: Tuple[Tuple[str, Tuple[str, ...]], ...]
+    style_constraints: Tuple[Tuple[str, str], ...]
     config_identity: str
     params: GenerationParams
     bundle_hash: str = field(init=False)
@@ -132,11 +144,16 @@ class PromptBundle:
                 f"PromptBundle: role {self.role!r} does not match template role "
                 f"{self.template.role!r}"
             )
+        if tuple(pid for pid, _ in self.owned_source) != self.owned_pids:
+            raise ValueError(
+                "PromptBundle: owned_source PIDs/order must exactly match owned_pids "
+                f"({tuple(pid for pid, _ in self.owned_source)!r} != {self.owned_pids!r})"
+            )
         object.__setattr__(self, "bundle_hash", canonical_json_hash(self._identity_payload()))
 
     def _identity_payload(self) -> dict:
         return {
-            "artifact": "pact-v4-prompt-bundle/v1",
+            "artifact": "pact-v4-prompt-bundle/v2",
             "template_role": self.template.role,
             "template_version": self.template.version,
             "template_instructions_hash": canonical_json_hash(self.template.instructions),
@@ -146,9 +163,17 @@ class PromptBundle:
             "source_hash": self.source_hash,
             "chunk_id": self.chunk_id,
             "owned_pids": list(self.owned_pids),
+            # owned_source is already implied by source_hash + owned_pids (the
+            # source artifact's identity is content-derived), but it is
+            # hashed explicitly too: it is the actual text sent to the
+            # model, and this bundle's job is to be the full, auditable
+            # identity of *the request*, not merely a value that happens to
+            # be collision-resistant with it.
+            "owned_source": [list(item) for item in self.owned_source],
             "left_context": [list(item) for item in self.left_context],
             "right_context": [list(item) for item in self.right_context],
-            "glossary_context": self.glossary_context,
+            "glossary": [[term, list(targets)] for term, targets in self.glossary],
+            "style_constraints": [list(item) for item in self.style_constraints],
             "config_identity": self.config_identity,
             "params": {
                 "temperature": self.params.temperature,
@@ -342,6 +367,22 @@ def _validate_pid_map(
     return tuple((pid, data[pid]) for pid in owned_pids)
 
 
+def _owned_source_for(source: SourceArtifact, owned_pids: Tuple[str, ...]) -> Tuple[Tuple[str, str], ...]:
+    source_map = dict(source.source)
+    return tuple((pid, source_map[pid]) for pid in owned_pids)
+
+
+def _glossary_identity(glossary: Tuple[GlossaryEntry, ...]) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    return tuple((entry.source_term, tuple(entry.target_terms)) for entry in glossary)
+
+
+class _CachePoisoned(AssertionError):
+    """Raised if a cache hit's candidate doesn't match the identity that
+    produced its cache key — this indicates an internal bug (e.g. a caller
+    writing into ``GenerationCache`` directly), never an expected runtime
+    path, hence ``AssertionError`` rather than a typed/recoverable error."""
+
+
 def _generate_one(
     *,
     role: str,
@@ -352,7 +393,8 @@ def _generate_one(
     chunk_id: str,
     left_context: Tuple[Tuple[str, str], ...],
     right_context: Tuple[Tuple[str, str], ...],
-    glossary_context: str,
+    glossary: Tuple[GlossaryEntry, ...],
+    style_constraints: Tuple[Tuple[str, str], ...],
     config: ConfigArtifact,
     params: GenerationParams,
     model_caller: ModelCaller,
@@ -370,15 +412,33 @@ def _generate_one(
         source_hash=source.source_hash,
         chunk_id=chunk_id,
         owned_pids=chunk.pids,
+        owned_source=_owned_source_for(source, chunk.pids),
         left_context=left_context,
         right_context=right_context,
-        glossary_context=glossary_context,
+        glossary=_glossary_identity(glossary),
+        style_constraints=style_constraints,
         config_identity=config.config_identity,
         params=params,
     )
 
     cached = cache.get(bundle.bundle_hash)
     if cached is not None:
+        # Defense in depth: a bundle_hash collision or a bug/tamper in a
+        # caller that writes into GenerationCache directly must never
+        # silently hand back a candidate for the wrong chunk/role. This is
+        # not "trust the hash" — it re-verifies the cached candidate against
+        # the artifacts that were actually requested, on every hit.
+        if cached.candidate is not None:
+            if cached.candidate.chunk_id != chunk_id or cached.candidate.role != role:
+                raise _CachePoisoned(
+                    f"Cache identity corruption: bundle_hash {bundle.bundle_hash} "
+                    f"resolved to chunk_id={cached.candidate.chunk_id!r} "
+                    f"role={cached.candidate.role!r}, expected "
+                    f"chunk_id={chunk_id!r} role={role!r}"
+                )
+            cached.candidate.validate_against(
+                source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config
+            )
         return cached
 
     context_pids = frozenset(
@@ -401,6 +461,13 @@ def _generate_one(
             snapshot=snapshot,
             chunk_plan=chunk_plan,
             config=config,
+            decision_trace=(
+                GateResult(
+                    gate="phase2b_prompt_bundle",
+                    passed=True,
+                    detail=bundle.bundle_hash,
+                ),
+            ),
         )
         result = GenerationCandidateResult(candidate=candidate, error=None)
     except ValueError as exc:
@@ -429,7 +496,8 @@ def generate_for_chunk(
     chunk_plan: ChunkPlanArtifact,
     left_context: Tuple[Tuple[str, str], ...] = (),
     right_context: Tuple[Tuple[str, str], ...] = (),
-    glossary_context: str = "",
+    glossary: Tuple[GlossaryEntry, ...] = (),
+    style_constraints: Mapping[str, str] = MappingProxyType({}),
     config: ConfigArtifact,
     params: GenerationParams,
     model_caller: ModelCaller,
@@ -441,11 +509,20 @@ def generate_for_chunk(
     medium/high risk -> exactly two candidates, ``fidelity_first`` (A) and
     ``balanced_literary`` (B). There is no third candidate and no
     selection/winner logic here (Phase 2C).
+
+    ``glossary``/``style_constraints`` are the frozen snapshot's actual
+    character/style/voice constraints (structured, not a caller-flattened
+    opaque string) — they are both part of the hashed prompt-bundle identity
+    and are rendered into the request text (see
+    ``pact_v4.phase2.prompts.render_prompt``), so a snapshot with different
+    constraints both invalidates the cache and actually changes what the
+    model sees.
     """
     if cache is None:
         cache = GenerationCache()
 
     roles = _roles_for_band(risk.band)
+    style_pairs = tuple(sorted(style_constraints.items()))
 
     candidates: Dict[str, Candidate] = {}
     errors: Dict[str, GenerationError] = {}
@@ -460,7 +537,8 @@ def generate_for_chunk(
             chunk_id=chunk_id,
             left_context=left_context,
             right_context=right_context,
-            glossary_context=glossary_context,
+            glossary=glossary,
+            style_constraints=style_pairs,
             config=config,
             params=params,
             model_caller=model_caller,
