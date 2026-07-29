@@ -241,12 +241,6 @@ def deterministic_consistency_gate(
             errors.append({"pid": pid, "category": "missing", "problem": "Translation is empty or missing."})
             continue
 
-    for pid in candidate.pid_order():
-        en_text = source.get(pid, "")
-        target = translation.get(pid, "")
-        if not target:
-            continue
-
         source_digits = _extract_digits(en_text)
         if source_digits:
             missing = _missing_numeric_values(source_digits, target)
@@ -342,21 +336,28 @@ def check_semantic_disagreement(
     candidates: Sequence[Candidate],
     source: Mapping[str, str],
 ) -> Tuple[bool, str]:
-    """Check whether multiple passing candidates semantically disagree.
+    """Check whether passing A/B candidates semantically disagree.
 
-    The check is heuristic and lightweight (Phase 2C is NOT a Qwen
-    comparison pass — that belongs to a dedicated evaluation call).
+    Per spec, semantic disagreement is checked only between the primary
+    generation candidates (fidelity_first / balanced_literary), not
+    against a synthesis candidate that may already be present in the set.
+
+    The check is heuristic and lightweight — this is a cheap escalation
+    trigger, NOT a definitive semantic comparison (Phase 2C is NOT a Qwen
+    comparison pass; that belongs to a dedicated evaluation call).
 
     Returns ``(disagreement_detected, reason)``.
     """
-    if len(candidates) < 2:
+    # Only compare fidelity_first vs balanced_literary (A vs B), per spec
+    a_b = [c for c in candidates if c.role in ("fidelity_first", "balanced_literary")]
+    if len(a_b) < 2:
         return False, ""
 
     def _normalised_text(candidate: Candidate) -> str:
         parts = [text for _, text in candidate.translation if text]
         return " ".join(parts).casefold()
 
-    texts = {candidate.candidate_id: _normalised_text(candidate) for candidate in candidates}
+    texts = {candidate.candidate_id: _normalised_text(candidate) for candidate in a_b}
     ids = list(texts)
     reasons: list[str] = []
 
@@ -446,10 +447,15 @@ def select_candidate(
       7. Record decision trace on the selected candidate.
 
     ``gemma_selector`` is optional: if omitted and multiple candidates
-    pass without disagreement, the first (lexicographically by role)
-    passing candidate is selected. This ensures the cascade works even
-    when Gemma is unavailable, though this is NOT the intended production
-    path.
+    pass without disagreement, passing candidates are sorted
+    lexicographically by role (``fidelity_first`` before
+    ``balanced_literary`` before ``synthesis``) and the first is
+    selected. This ensures the cascade works even when Gemma is
+    unavailable, though this is NOT the intended production path.
+
+    If ``gemma_selector`` returns ``passed=False`` (unable to choose),
+    the cascade quarantines the chunk — a selector that cannot choose
+    is treated as an error, never silently resolved to a fallback.
     """
     if not candidates:
         return SelectionResult(
@@ -546,18 +552,50 @@ def select_candidate(
 
     # Multiple passed, no disagreement OR disagreement with synthesis present
     # → Gemma Russian preference (or fallback)
+    _ROLE_ORDER = {"fidelity_first": 0, "balanced_literary": 1, "synthesis": 2}
     if gemma_selector is not None:
         gemma_input: list[Tuple[str, Dict[str, str]]] = [
             (candidate.candidate_id, dict(candidate.translation))
             for candidate in passed
         ]
         gemma_result = gemma_selector(gemma_input)
+        if not gemma_result.passed:
+            return SelectionResult(
+                chunk_id=chunk_id,
+                quarantine=True,
+                quarantine_reason=(
+                    "Gemma Russian preference selector could not choose "
+                    f"among {num_passed} passing candidates. "
+                    f"Reason: {gemma_result.detail}"
+                ),
+                disagreement_detected=disagreement,
+                disagreement_reason=dis_reason,
+                candidates_evaluated=len(candidates),
+                candidates_passed=num_passed,
+                candidates_failed=num_failed,
+            )
         preferred_id = gemma_result.detail  # By convention, detail holds preferred_id
     else:
-        preferred_id = passed[0].candidate_id
+        passed_sorted = sorted(passed, key=lambda c: _ROLE_ORDER.get(c.role, 99))
+        preferred_id = passed_sorted[0].candidate_id
 
-    # Find the preferred candidate
-    winner = next((c for c in passed if c.candidate_id == preferred_id), passed[0])
+    # Find the preferred candidate; if not found, quarantine (corrupted selector)
+    matching = [c for c in passed if c.candidate_id == preferred_id]
+    if not matching:
+        return SelectionResult(
+            chunk_id=chunk_id,
+            quarantine=True,
+            quarantine_reason=(
+                f"Gemma-preferred candidate {preferred_id!r} not found "
+                f"among the {num_passed} passing candidates."
+            ),
+            disagreement_detected=disagreement,
+            disagreement_reason=dis_reason,
+            candidates_evaluated=len(candidates),
+            candidates_passed=num_passed,
+            candidates_failed=num_failed,
+        )
+    winner = matching[0]
     trace = tuple(traces.get(winner.candidate_id, ()))
 
     return SelectionResult(

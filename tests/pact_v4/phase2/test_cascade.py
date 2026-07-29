@@ -113,9 +113,10 @@ class StubQwen:
 class StubGemma:
     """Returns a GateResult mimicking Gemma Russian preference."""
 
-    def __init__(self, preferred_id: str = "", reason: str = "Better Russian"):
+    def __init__(self, preferred_id: str = "", reason: str = "Better Russian", passed: bool = True):
         self._preferred = preferred_id
         self._reason = reason
+        self._passed = passed
         self.calls: list[list] = []
 
     def __call__(
@@ -125,7 +126,7 @@ class StubGemma:
         cid = self._preferred or (candidates[0][0] if candidates else "")
         return GateResult(
             gate="gemma_russian_preference",
-            passed=True,
+            passed=self._passed,
             detail=cid,
         )
 
@@ -766,3 +767,99 @@ def test_all_candidates_go_through_qwen_even_low_risk_single():
     )
     assert len(qwen.calls) == 1
     assert result.selected_candidate_id == "A"
+
+
+# ---------------------------------------------------------------------------
+# Tests: review follow-ups (gemma error handling, role ordering, A/B-only
+#         disagreement comparison)
+# ---------------------------------------------------------------------------
+
+
+def test_gemma_selector_failure_quarantines():
+    """When gemma_selector returns passed=False (cannot choose), the
+    cascade must quarantine — never silently select a fallback."""
+    source = make_source()
+    a = make_candidate("A", "c1", role="fidelity_first")
+    b = make_candidate("B", "c1", role="balanced_literary")
+    qwen = StubQwen(passed=True)
+    gemma = StubGemma(preferred_id="B", passed=False, reason="Both equally bad")
+    result = select_candidate(
+        chunk_id="c1",
+        candidates=[a, b],
+        source=source,
+        qwen_evaluator=qwen,
+        gemma_selector=gemma,
+    )
+    assert result.quarantine
+    assert result.selected_candidate_id is None
+    assert "could not choose" in result.quarantine_reason
+    assert result.candidates_passed == 2
+
+
+def test_gemma_preferred_id_not_in_passed_quarantines():
+    """When gemma returns a preferred_id not present among passed candidates,
+    the cascade quarantines — corrupted selector output must not produce
+    a silent fallback."""
+    source = make_source()
+    a = make_candidate("A", "c1", role="fidelity_first")
+    b = make_candidate("B", "c1", role="balanced_literary")
+    qwen = StubQwen(passed=True)
+    gemma = StubGemma(preferred_id="X", reason="Invalid")
+    result = select_candidate(
+        chunk_id="c1",
+        candidates=[a, b],
+        source=source,
+        qwen_evaluator=qwen,
+        gemma_selector=gemma,
+    )
+    assert result.quarantine
+    assert "not found" in result.quarantine_reason
+    assert result.candidates_passed == 2
+
+
+def test_gemma_fallback_respects_role_order():
+    """When gemma_selector is None, the fallback must sort by role
+    (fidelity_first before balanced_literary), not by input order."""
+    source = make_source()
+    a = make_candidate("A", "c1", role="fidelity_first")
+    b = make_candidate("B", "c1", role="balanced_literary")
+    qwen = StubQwen(passed=True)
+    # Pass B first in input list — fidelity_first must still win the fallback
+    result = select_candidate(
+        chunk_id="c1",
+        candidates=[b, a],
+        source=source,
+        qwen_evaluator=qwen,
+        gemma_selector=None,
+    )
+    assert result.selected_candidate_id == "A"
+    assert result.selected_role == "fidelity_first"
+    assert result.candidates_passed == 2
+
+
+def test_disagreement_only_compares_a_b_not_synthesis():
+    """check_semantic_disagreement must compare only fidelity_first vs
+    balanced_literary candidates, ignoring any synthesis candidate that
+    may already be present."""
+    source = make_source()
+    a = make_candidate("A", "c1", role="fidelity_first")
+    b = make_candidate("B", "c1", role="balanced_literary",
+        translation=(
+            ("p0", "Стюард открыл тяжёлую дубовую дверь."),
+            ("p1", "Три фигуры стояли под холодным дождём."),
+            ("p2", "Она пересчитала двадцать серебряных монет на столе."),
+        ),
+    )
+    c_diff = make_candidate(
+        "C", "c1", role="synthesis",
+        translation=(
+            ("p0", "Управляющий распахнул тяжёлую дубовую дверь."),
+            ("p1", "Под проливным дождём застыли три силуэта."),
+            ("p2", "На столе она насчитала двадцать серебряных монет."),
+        ),
+    )
+    # A and B are near-identical (Jaccard > 0.40), so no disagreement.
+    # C is very different, but must be ignored by the check.
+    disagree, reason = check_semantic_disagreement([a, b, c_diff], dict(source.source))
+    assert not disagree
+
