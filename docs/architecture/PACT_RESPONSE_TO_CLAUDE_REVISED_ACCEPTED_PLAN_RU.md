@@ -922,7 +922,15 @@ quarantined
 
 ---
 
-## 8.13. Final global smoke audit
+## 8.13. Final global smoke audit — SUPERSEDED (ревизия 2026-07-29)
+
+> Этот раздел описывает исходную (отменённую) формулировку и сохранён для
+> истории. Действующая policy Step 8 — `V4_MVP_SPEC_RU.md` §2 Step 8 (см.
+> также ревизию в конце этого документа): deterministic integrity по
+> умолчанию, model smoke только condition-gated, full Qwen+Gemma audit по
+> всей главе в Step 8 не выполняется.
+
+Исходная (отменённая) формулировка:
 
 После завершения convergence и до formatting:
 
@@ -1159,9 +1167,12 @@ Resume/invalidation строится по зависимостям, а не им
 
 ---
 
-## 11.7. Final global smoke audit
+## 11.7. Final global smoke audit — SUPERSEDED (ревизия 2026-07-29, см. §8.13)
 
 После convergence проверяется вся неподвижная глава.
+
+> Актуальная policy: `V4_MVP_SPEC_RU.md` §2 Step 8 — deterministic integrity
+> по умолчанию, model smoke condition-gated, не blanket full audit.
 
 ---
 
@@ -1349,6 +1360,53 @@ Production switch допускается только если:
 8. Нужна ли третья модель?
 9. Какой минимальный prototype быстрее всего проверит главную гипотезу?
 10. Какие элементы можно удалить, чтобы не повторить сложность v3?
+
+### Ревизия (2026-07-29): вопросы 1, 6, 7 закрыты для v4.0
+
+Разбор показал внутреннее противоречие: §8.13 (final global smoke audit —
+полный Qwen + Gemma + deterministic по всей главе) прямо противоречит
+принципу «никаких повторных полных тяжёлых аудитов» из V4_MVP_SPEC_RU.md §1
+п.5. Это дефект спецификации, а не осознанно принятый компромисс — вопрос
+v3.1.3 §2 («достаточны ли targeted final checks + global smoke audit?»)
+остался открытым и не был явно перенесён/переподтверждён для v4.0 policy.
+
+Также: §8.11 отмечает Gemma semantic gate как «не полноценную independent
+model family» только для Step 5/selection-контекста. Ранее ошибочно
+предполагалось, что это же квалификация автоматически распространяется на
+Gemma Russian-only review в Step 6/8 — документ этого прямо не утверждает,
+перенос сделан по аналогии как гипотеза, требующая ablation-подтверждения,
+а не как факт из текста.
+
+Принятое решение (детали и точная формулировка шагов — в
+`V4_MVP_SPEC_RU.md` §1 п.5, §2 Step 6–8, §10 п.5):
+
+- Step 6 остаётся единственным full-chapter audit (Qwen source↔RU +
+  Gemma RU-only + deterministic). Gemma RU-only review квалифицируется как
+  коррелированный (не независимый) сигнал — генератор и ревьюер одна и та
+  же модель; добавочная ценность подтверждается ablation, не считается
+  готовым фактом.
+- Step 7 convergence: Gemma re-check ОБЯЗАТЕЛЕН для региона, если repair
+  устраняет finding, изначально созданный Gemma Russian review в Step 6 —
+  иначе закрытие Russian-finding ничем не подтверждено. Дополнительно
+  Gemma re-check остаётся risk-triggered (диалог/регистр/ты-вы/имена) для
+  соседних регионов без исходного Gemma finding; blanket-повтор не
+  делается.
+- Step 8 по умолчанию — deterministic integrity + неизменность финального
+  артефакта, без модельных вызовов; закрытие Gemma Russian-findings
+  подтверждается обязательным Step 7 re-check, а не Step 8. Narrow Qwen
+  semantic smoke — условно, ТОЛЬКО если после Step 7 текст изменился вне
+  scope, уже покрытого Step 7 re-audit (например, model-based formatting
+  fallback после convergence, или repair расширил межрегиональный риск за
+  пределы проверенной discourse-окрестности); сам факт «≥1 repair round»
+  недостаточен, так как Step 7 уже даёт свежий Qwen verdict по изменённому
+  региону. Gemma smoke в Step 8 убран по умолчанию (третий проход той же
+  модели по тому же тексту).
+- Formatting-контракт (§8.14) применяется до Step 8, чтобы final check
+  видел тот же текст, что уходит в `complete`.
+- Необходимость третьей модели и реальная (не предполагаемая) добавочная
+  ценность Gemma self-review в Step 6 — решается только ablation-бенчмарком
+  на golden set (recall дефектов / false positives / latency / reload
+  cost), см. V4_MVP_SPEC_RU.md §10 п.5.
 
 ---
 

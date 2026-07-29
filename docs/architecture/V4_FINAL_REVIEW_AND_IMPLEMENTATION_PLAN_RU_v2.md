@@ -133,12 +133,28 @@ coverage, resumable partial units, audit cannot claim complete on model failure.
 Exact finding-linked region/PID repair; full sentence only with documented
 reason. Challenge needs evidence and never auto-accepts. Relevant gates pass.
 
+### 4A2. Gemma finding closure — Codex; review Claude
+
+If repair resolves a finding originally raised by Gemma Russian review in
+Step 6, Gemma re-check of that region is mandatory (not just risk-triggered)
+— deterministic checks alone cannot prove a Russian-only finding is closed.
+
 ### 4B. Targeted convergence — Codex; review Claude
 
-Re-audit changed PID plus discourse neighbours; hard maximum two rounds; final
-smoke and monotonic terminal transition. Quarantined output segregated.
+Re-audit changed PID plus discourse neighbours; hard maximum two rounds;
+final integrity check (deterministic default, conditional narrow Qwen smoke
+only when post-convergence text changes fall outside Step 7's re-audited
+scope — see `V4_MVP_SPEC_RU.md` §2 Step 8) and monotonic terminal
+transition. Quarantined output segregated.
 
 ## Phase 5 — formatting alignment
+
+> Порядок фаз здесь — порядок РАЗРАБОТКИ (Phase 4 реализуется и тестируется
+> до Phase 5), не порядок RUNTIME-шагов. В runtime pipeline formatting
+> contract применяется ДО Step 8 (см. `V4_MVP_SPEC_RU.md` §2 Step 6). Phase 4
+> нельзя реализовывать и принимать как самостоятельный финальный pipeline
+> без formatting contract — Step 8/terminal transition runtime-корректны
+> только вместе с Phase 5.
 
 **Codex; review Claude.** Exact → occurrence-aware → conservative fuzzy → model
 fallback, all with provenance. Any unrecovered required span quarantines output.
