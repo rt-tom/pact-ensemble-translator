@@ -47,6 +47,11 @@ def main() -> int:
     add_common_args(parser)
     parser.add_argument("--round", type=int, required=True)
     parser.add_argument("--translations-file")
+    parser.add_argument(
+        "--terminal-round",
+        action="store_true",
+        help="Keep the current translation when no candidate passes on the final allowed round.",
+    )
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
@@ -126,6 +131,8 @@ def main() -> int:
             elif accepted_challenges:
                 selected = accepted_challenges[0]
                 outcome = "issue_challenge_accepted"
+            elif args.terminal_round:
+                outcome = "kept_after_retry_exhausted"
             else:
                 feedback = []
                 for row in evaluated:
@@ -168,6 +175,7 @@ def main() -> int:
                     "status": (
                         "resolved_repair" if outcome == "repair_accepted"
                         else "resolved_false_positive" if outcome == "issue_challenge_accepted"
+                        else "resolved_retry_exhausted" if outcome == "kept_after_retry_exhausted"
                         else "retry_required"
                     ),
                     "detected_by": issue.get("detected_by") or [],
@@ -188,6 +196,7 @@ def main() -> int:
             "pid_count": len(decisions),
             "accepted_repairs": sum(1 for x in decisions if x["outcome"] == "repair_accepted"),
             "accepted_challenges": sum(1 for x in decisions if x["outcome"] == "issue_challenge_accepted"),
+            "kept_after_retry_exhausted": sum(1 for x in decisions if x["outcome"] == "kept_after_retry_exhausted"),
             "retry_required": len(retry_requests),
             "decisions": decisions,
         })
@@ -197,6 +206,9 @@ def main() -> int:
             "pass": args.pass_name,
             "last_round": args.round,
             "retry_required": len(retry_requests),
+            "kept_after_retry_exhausted": sum(
+                1 for x in decisions if x["outcome"] == "kept_after_retry_exhausted"
+            ),
             "resolved": len(lifecycle_by_issue) - sum(1 for x in lifecycle_by_issue.values() if x["status"] == "retry_required"),
             "total": len(lifecycle_by_issue),
         })
