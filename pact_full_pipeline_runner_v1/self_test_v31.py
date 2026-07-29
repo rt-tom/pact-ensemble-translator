@@ -496,6 +496,15 @@ def run(project_root: Path) -> None:
     }, "qwen_semantic", "replace_span")
     assert qgate["faithful_to_source"] and not qgate["introduced_new_semantic_error"]
 
+    # A challenge response can use the generic label while its structured
+    # finding is unambiguous; the gate must preserve it as a challenge result.
+    challenge_gate = v31_postcheck.parse({
+        "verdict": "accept", "confidence": "high", "issue_valid": False,
+        "faithful_to_source": True, "all_issues_fixed": True,
+        "introduced_new_semantic_error": False, "reason": "no issue", "feedback": "",
+    }, "qwen_semantic", "challenge_issue")
+    assert challenge_gate["verdict"] == "accept_challenge"
+
     extended = {
         "pid": "p00001", "severity": "minor", "category": "grammar",
         "problem": "x", "repair_instruction": "fix", "issue_id": "v31i00001",
