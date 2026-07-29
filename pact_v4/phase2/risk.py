@@ -212,8 +212,10 @@ def assess_source_risk(
         add("address_t_v_ambiguity", "English second-person address does not encode Russian ты/вы.", address)
 
     referents = _snippets(_THIRD_PERSON_RE, text)
-    names = tuple(dict.fromkeys(_NAME_RE.findall(text)))
-    if referents and (len(names) >= 2 or len(rows) >= 2):
+    # Prime the lookbehind so the very first word of the whole text is
+    # treated as sentence-initial too, not just words after mid-text ". ".
+    names = tuple(dict.fromkeys(_NAME_RE.findall(". " + text)))
+    if referents and len(names) >= 2:
         add("ambiguous_referent", "Pronoun/demonstrative has multiple plausible discourse referents.", referents + names[:2])
 
     negations = _snippets(_NEGATION_RE, text)

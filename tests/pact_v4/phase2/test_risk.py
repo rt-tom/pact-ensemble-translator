@@ -108,6 +108,33 @@ def test_glossary_single_prescribed_form_is_not_a_conflict() -> None:
     assert "glossary_conflict" not in _codes(result)
 
 
+def test_unambiguous_multi_row_pronoun_is_not_flagged_ambiguous() -> None:
+    # Regression: a single-antecedent, three-row scene must stay low risk.
+    # ``len(rows) >= 2`` used to be an alternative trigger for
+    # ``ambiguous_referent`` and fired on almost any multi-PID chunk that
+    # contained a pronoun, defeating the "low risk = majority" design intent.
+    result = assess_source_risk(
+        (
+            ("p001", "Maria opened the door."),
+            ("p002", "She smiled and stepped inside."),
+            ("p003", "It was cold outside."),
+        ),
+        glossary=(),
+    )
+    assert result.band is RiskBand.LOW
+    assert "ambiguous_referent" not in _codes(result)
+
+
+def test_sentence_initial_capitalized_word_is_not_a_name() -> None:
+    # Regression: _NAME_RE's exclusion of sentence-initial capitals relied on
+    # a preceding ". " and never matched the very first word of the whole
+    # text, so it was misdetected as a proper name (e.g. "At").
+    result = assess_source_risk(
+        (("p001", "At dawn, Alice said it was cold outside."),), glossary=()
+    )
+    assert "ambiguous_referent" not in _codes(result)
+
+
 def test_policy_is_centralized_versioned_and_read_only() -> None:
     assert RISK_POLICY.medium_threshold < RISK_POLICY.high_threshold
     assert set(RISK_POLICY.weights) >= {
