@@ -44,6 +44,15 @@ DEFAULTS = {
 }
 
 
+def should_split_failed_unit(mode: str, unit_pids: list[str], exc: Exception) -> bool:
+    """Return whether a failed audit unit has a safe recursive fallback."""
+    if len(unit_pids) <= 1 or mode == "gemma_discourse":
+        return False
+    if mode == "qwen_global_smoke":
+        return "Prompt too large:" in str(exc)
+    return True
+
+
 def qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translations, pids, pass_name):
     """One source-grounded chapter smoke, deliberately not a second cascade."""
     stage = stage_cfg(cfg, "qwen_global_smoke", DEFAULTS["qwen_global_smoke"])
@@ -498,6 +507,12 @@ def main() -> int:
                 else (lambda data, expected=unit_pids, source=detector: parse_per_pid(data, expected, source))
             )
             try:
+                # A chapter-wide smoke is preferred, but its size can be known
+                # to be impossible before making three identical API attempts.
+                if args.mode == "qwen_global_smoke":
+                    runtime.fit_output_budget(
+                        client, messages, local_stage, int(local_stage["max_tokens"]),
+                    )
                 (local_issues, local_covered), attempts = complete_json(
                     runtime, client, messages, local_stage, int(local_stage["max_tokens"]),
                     f"{detector}:{source_path.stem}:{label}", int(local_stage["attempts"]),
@@ -512,7 +527,7 @@ def main() -> int:
                     "split": False,
                 }
             except RuntimeError as exc:
-                if args.mode in {"gemma_discourse", "qwen_global_smoke"} or len(unit_pids) <= 1:
+                if not should_split_failed_unit(args.mode, unit_pids, exc):
                     raise
                 midpoint = len(unit_pids) // 2
                 left_pids, right_pids = unit_pids[:midpoint], unit_pids[midpoint:]

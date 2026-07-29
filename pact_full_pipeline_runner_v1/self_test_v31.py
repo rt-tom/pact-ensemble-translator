@@ -19,6 +19,7 @@ import v31_repair
 import v31_adjudicate
 import v31_finalize_verification
 import v31_merge_issues
+import v31_audit
 
 
 def load_runtime(project_root: Path):
@@ -28,6 +29,20 @@ def load_runtime(project_root: Path):
 
 def run(project_root: Path) -> None:
     runtime = load_runtime(project_root)
+
+    oversized = RuntimeError("Prompt too large: 30213 tokens for context 32768.")
+    assert v31_audit.should_split_failed_unit(
+        "qwen_global_smoke", ["p00001", "p00002"], oversized,
+    )
+    assert not v31_audit.should_split_failed_unit(
+        "qwen_global_smoke", ["p00001"], oversized,
+    )
+    assert not v31_audit.should_split_failed_unit(
+        "qwen_global_smoke", ["p00001", "p00002"], RuntimeError("API timeout"),
+    )
+    assert not v31_audit.should_split_failed_unit(
+        "gemma_discourse", ["p00001", "p00002"], oversized,
+    )
 
     class FakeJsonRuntime:
         safe_json_loads = staticmethod(runtime.safe_json_loads)
