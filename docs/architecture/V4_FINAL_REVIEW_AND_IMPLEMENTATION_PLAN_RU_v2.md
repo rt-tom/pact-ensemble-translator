@@ -149,6 +149,13 @@ transition. Quarantined output segregated.
 
 ## Phase 5 — formatting alignment
 
+> Порядок фаз здесь — порядок РАЗРАБОТКИ (Phase 4 реализуется и тестируется
+> до Phase 5), не порядок RUNTIME-шагов. В runtime pipeline formatting
+> contract применяется ДО Step 8 (см. `V4_MVP_SPEC_RU.md` §2 Step 6). Phase 4
+> нельзя реализовывать и принимать как самостоятельный финальный pipeline
+> без formatting contract — Step 8/terminal transition runtime-корректны
+> только вместе с Phase 5.
+
 **Codex; review Claude.** Exact → occurrence-aware → conservative fuzzy → model
 fallback, all with provenance. Any unrecovered required span quarantines output.
 No marker leakage; duplicate occurrence/HTML/PID/number fixtures pass.
