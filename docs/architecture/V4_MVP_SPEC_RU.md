@@ -48,9 +48,10 @@ v4: «Сначала создай хорошие варианты в конте�
 4. **Selection — лексикографический каскад, без scoring-движка:**
    Qwen semantic pass/fail → детерминированный consistency-gate (model-free) →
    Gemma Russian preference.
-5. **Один assembled-chapter аудит** + targeted convergence по изменённым
-   регионам + один финальный smoke-check. Никаких повторных полных тяжёлых
-   аудитов.
+5. **Один assembled-chapter аудит** (Step 6) + targeted convergence по
+   изменённым регионам (Step 7). Step 8 (final integrity check) по умолчанию
+   не является модельным аудитом — см. §2 Step 8 и §11. Никаких повторных
+   полных тяжёлых аудитов обеими моделями по всей главе.
 6. **Reasoning в MVP выключен** (Gemma `reasoning=0`), но архитектура
    reasoning-ready: risk score и per-chunk конфиг уже в плайпе, включение —
    флагом позже, отдельным benchmark'ом.
@@ -95,17 +96,36 @@ v4: «Сначала создай хорошие варианты в конте�
 6. Assembled-chapter audit (один раз, по собранной главе)
    Qwen        : source ↔ translation (пропуски/добавления/референты/сцена)
    Gemma       : Russian-only review (кальки, регистр, повторы, диалог, ты/вы)
+                 — коррелированный сигнал (та же модель, что генерировала
+                 текст в Step 4/5), НЕ независимое доказательство качества;
+                 добавочная ценность против отсутствия проверки должна быть
+                 подтверждена ablation-бенчмарком (см. §10)
    deterministic: PID coverage / numbers / mixed-script / glossary / names /
                   formatting contract / HTML structure
+   formatting контракт (§8.14) применяется ДО Step 8, не после — final smoke
+   должен видеть тот же текст, что попадёт в `complete`
 
 7. Targeted repair
    region-level minimal repair (semantic + Russian findings)
    optional full-sentence rewrite ТОЛЬКО если локальная правка невозможна
    convergence: re-audit только изменённых PID + discourse-окрестностей
+     - Qwen: semantic re-check изменённого региона
+     - Gemma: Russian re-check только если правка затронула
+       диалог/регистр/ты-вы/имена (risk-triggered, не blanket)
    max 2 rounds → иначе quarantined
 
-8. Final smoke + memory promotion
-   финальная проверка неподвижного результата (Qwen sem / Gemma Rus / determ.)
+8. Final integrity check + memory promotion
+   ОБЯЗАТЕЛЬНО, без модели:
+     - неподвижность финального результата (frozen hash)
+     - PID coverage / numbers / glossary / mixed-script / formatting / HTML —
+       вся глава
+     - подтверждение, что все findings Step 6/7 закрыты
+   УСЛОВНО, одна модель (не обе):
+     - narrow Qwen semantic smoke по изменённым/рисковым регионам, ТОЛЬКО
+       если в Step 7 был ≥1 repair round или иной измеримый risk trigger
+     - Gemma smoke по умолчанию отсутствует (уже проверяла тот же текст в
+       Step 5 и Step 6 как коррелированный сигнал — третий проход не даёт
+       независимого сигнала)
    memory promotion ТОЛЬКО после complete
 ```
 
@@ -282,7 +302,8 @@ Phase 1  memory foundation: glossary / book_memory / chapter snapshot (shadow mo
 Phase 2  risk pre-screen + scene/chunk generation + A/B + cascaded selection
          → benchmark против single-draft v3
 Phase 3  assembled-chapter audit (Qwen sem / Gemma Rus / determ.) + immutable findings
-Phase 4  region repair + convergence (max 2) + quarantine + final smoke
+Phase 4  region repair + convergence (max 2) + quarantine + final integrity check
+         (deterministic default, conditional narrow Qwen smoke — см. §2 Step 8)
 Phase 5  translation-time formatting contract (exact → occurrence → fuzzy → model fallback)
 Phase 6+ ops: batching по ролям, меньше reloads; опц. risk-gated reasoning; опц. 3-я модель
 Phase 7  A/B release; switch только после доказанного выигрыша
@@ -299,5 +320,11 @@ Phase 7  A/B release; switch только после доказанного вы
 2. Temperature/seed для A/B — калибровать на golden set.
 3. Порог risk score (low/med/high).
 4. Даёт ли risk-gated reasoning выигрыш на high-risk EN→RU — отдельный эксперимент Phase 6+.
+5. Ablation на golden set для Step 6 Gemma Russian review: сравнить recall
+   реальных дефектов / false positives / latency / reload cost для (a) Gemma
+   self-review, (b) Qwen Russian review, (c) третья модель, (d) отсутствие
+   дополнительной model-review. Решает, остаётся ли Gemma review в Step 6
+   обязательной или переходит в high-risk-only escalation (см. §1 п.5, §2
+   Step 6/8).
 
 Эти решения принимаются числами из Phase 0, а не заранее.
