@@ -20,6 +20,8 @@ This is a home project. Prefer the smallest reliable workflow; do not add enterp
 - Do not change tuned Qwen/Gemma settings without explicit reason and benchmark evidence.
 - Do not attach to or stop a foreign `llama-server`.
 - Do not run production pipeline during development/testing.
+- Treat a mismatch between production `HEAD` and `deployment_provenance.v31.json` as release drift: stop deployment work, preserve the active tree/runs, and reconcile through a reviewed release path. Never repair drift with reset, force, destructive checkout, or manual replacement of tracked files.
+- Keep V3 production releases and unfinished V4 development in separate worktrees. Do not use a `main` tag for V3 deployment when it contains unapproved V4 runtime/schema changes.
 
 ## Source of truth
 
@@ -115,7 +117,7 @@ Confirm reviewed diff has not materially changed, tests pass, and whether pipeli
 
 ## Lightweight guarded deployment
 
-Before deployment: verify exact tag target, expected production HEAD, clean tracked tree, stopped pipeline, changed files, and create a backup.
+Before deployment: verify exact tag target, expected production HEAD, clean tracked tree, stopped pipeline, changed files, and create a backup. Also verify that `deployment_provenance.v31.json` exists, its tag resolves to its recorded commit, and that commit equals active production `HEAD`; otherwise classify the state as release drift and stop.
 
 Hash caches only if the change affects cache/resume/repair/terminal artifacts, the user asks, or the cache is known fragile.
 
