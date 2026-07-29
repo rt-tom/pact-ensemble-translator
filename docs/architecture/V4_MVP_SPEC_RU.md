@@ -102,7 +102,7 @@ v4: «Сначала создай хорошие варианты в конте�
                  подтверждена ablation-бенчмарком (см. §10)
    deterministic: PID coverage / numbers / mixed-script / glossary / names /
                   formatting contract / HTML structure
-   formatting контракт (§8.14) применяется ДО Step 8, не после — final smoke
+   formatting контракт (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) применяется ДО Step 8, не после — final smoke
    должен видеть тот же текст, что попадёт в `complete`
 
 7. Targeted repair
@@ -110,8 +110,13 @@ v4: «Сначала создай хорошие варианты в конте�
    optional full-sentence rewrite ТОЛЬКО если локальная правка невозможна
    convergence: re-audit только изменённых PID + discourse-окрестностей
      - Qwen: semantic re-check изменённого региона
-     - Gemma: Russian re-check только если правка затронула
-       диалог/регистр/ты-вы/имена (risk-triggered, не blanket)
+     - Gemma: Russian re-check ОБЯЗАТЕЛЕН для региона, если repair устраняет
+       finding, изначально созданный Gemma Russian review в Step 6 (иначе
+       нет доказательства, что именно этот finding закрыт — deterministic
+       Step 8 закрытие Russian-findings подтвердить не может)
+     - Gemma: Russian re-check ДОПОЛНИТЕЛЬНО, risk-triggered (не blanket),
+       для соседних регионов, если правка затронула
+       диалог/регистр/ты-вы/имена, даже без исходного Gemma finding там
    max 2 rounds → иначе quarantined
 
 8. Final integrity check + memory promotion
@@ -119,13 +124,21 @@ v4: «Сначала создай хорошие варианты в конте�
      - неподвижность финального результата (frozen hash)
      - PID coverage / numbers / glossary / mixed-script / formatting / HTML —
        вся глава
-     - подтверждение, что все findings Step 6/7 закрыты
+     - подтверждение, что все findings Step 6/7 закрыты (для Gemma
+       Russian-findings подтверждением служит обязательный re-check из
+       Step 7, а не deterministic layer)
    УСЛОВНО, одна модель (не обе):
-     - narrow Qwen semantic smoke по изменённым/рисковым регионам, ТОЛЬКО
-       если в Step 7 был ≥1 repair round или иной измеримый risk trigger
+     - narrow Qwen semantic smoke по region'ам, ТОЛЬКО если после Step 7
+       текст изменился ВНЕ scope, уже покрытого Step 7 re-audit — например,
+       model-based formatting fallback (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) исправил span после
+       convergence, либо repair расширил межрегиональный риск за пределы
+       проверенной discourse-окрестности. Сам факт «≥1 repair round» НЕ
+       является достаточным триггером — Step 7 уже даёт свежий Qwen verdict
+       по изменённому региону, повторный проход того же региона избыточен
      - Gemma smoke по умолчанию отсутствует (уже проверяла тот же текст в
-       Step 5 и Step 6 как коррелированный сигнал — третий проход не даёт
-       независимого сигнала)
+       Step 5 и Step 6 как коррелированный сигнал; закрытие её findings
+       обеспечено обязательным re-check в Step 7, третий blanket-проход не
+       даёт независимого сигнала)
    memory promotion ТОЛЬКО после complete
 ```
 

@@ -922,7 +922,15 @@ quarantined
 
 ---
 
-## 8.13. Final global smoke audit
+## 8.13. Final global smoke audit — SUPERSEDED (ревизия 2026-07-29)
+
+> Этот раздел описывает исходную (отменённую) формулировку и сохранён для
+> истории. Действующая policy Step 8 — `V4_MVP_SPEC_RU.md` §2 Step 8 (см.
+> также ревизию в конце этого документа): deterministic integrity по
+> умолчанию, model smoke только condition-gated, full Qwen+Gemma audit по
+> всей главе в Step 8 не выполняется.
+
+Исходная (отменённая) формулировка:
 
 После завершения convergence и до formatting:
 
@@ -1159,9 +1167,12 @@ Resume/invalidation строится по зависимостям, а не им
 
 ---
 
-## 11.7. Final global smoke audit
+## 11.7. Final global smoke audit — SUPERSEDED (ревизия 2026-07-29, см. §8.13)
 
 После convergence проверяется вся неподвижная глава.
+
+> Актуальная policy: `V4_MVP_SPEC_RU.md` §2 Step 8 — deterministic integrity
+> по умолчанию, model smoke condition-gated, не blanket full audit.
 
 ---
 
@@ -1374,13 +1385,22 @@ Gemma Russian-only review в Step 6/8 — документ этого прямо
   коррелированный (не независимый) сигнал — генератор и ревьюер одна и та
   же модель; добавочная ценность подтверждается ablation, не считается
   готовым фактом.
-- Step 7 convergence: Gemma re-check только risk-triggered (диалог/регистр/
-  ты-вы/имена), не blanket повтор.
+- Step 7 convergence: Gemma re-check ОБЯЗАТЕЛЕН для региона, если repair
+  устраняет finding, изначально созданный Gemma Russian review в Step 6 —
+  иначе закрытие Russian-finding ничем не подтверждено. Дополнительно
+  Gemma re-check остаётся risk-triggered (диалог/регистр/ты-вы/имена) для
+  соседних регионов без исходного Gemma finding; blanket-повтор не
+  делается.
 - Step 8 по умолчанию — deterministic integrity + неизменность финального
-  артефакта, без модельных вызовов. Narrow Qwen semantic smoke — условно,
-  только при ≥1 repair round в Step 7 или ином измеримом risk trigger.
-  Gemma smoke в Step 8 убран по умолчанию (третий проход той же модели по
-  тому же тексту).
+  артефакта, без модельных вызовов; закрытие Gemma Russian-findings
+  подтверждается обязательным Step 7 re-check, а не Step 8. Narrow Qwen
+  semantic smoke — условно, ТОЛЬКО если после Step 7 текст изменился вне
+  scope, уже покрытого Step 7 re-audit (например, model-based formatting
+  fallback после convergence, или repair расширил межрегиональный риск за
+  пределы проверенной discourse-окрестности); сам факт «≥1 repair round»
+  недостаточен, так как Step 7 уже даёт свежий Qwen verdict по изменённому
+  региону. Gemma smoke в Step 8 убран по умолчанию (третий проход той же
+  модели по тому же тексту).
 - Formatting-контракт (§8.14) применяется до Step 8, чтобы final check
   видел тот же текст, что уходит в `complete`.
 - Необходимость третьей модели и реальная (не предполагаемая) добавочная
