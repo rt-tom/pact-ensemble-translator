@@ -25,7 +25,7 @@ from pact_v4.phase2.generation import (
     GenerationParams,
     generate_for_chunk,
 )
-from pact_v4.phase2.risk import RiskAssessment, RiskBand
+from pact_v4.phase2.risk import GlossaryEntry, RiskAssessment, RiskBand
 
 
 def _hash(seed: str) -> str:
@@ -287,9 +287,11 @@ def test_changing_prompt_version_or_content_invalidates_cache():
         source_hash=_hash("source"),
         chunk_id="c1",
         owned_pids=("p0", "p1"),
+        owned_source=(("p0", "Hello."), ("p1", "World.")),
         left_context=(),
         right_context=(),
-        glossary_context="",
+        glossary=(),
+        style_constraints=(),
         config_identity=_hash("config"),
         params=make_params(),
     )
@@ -571,3 +573,183 @@ def test_one_of_ab_failing_yields_incomplete_never_a_substitute():
     # The successful role's candidate must never be relabelled/duplicated to
     # stand in for the missing one.
     assert outcome.candidates["fidelity_first"].role == "fidelity_first"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: owned source text, snapshot glossary/style content,
+# cache-hit defense in depth, and full provenance of the bundle hash.
+# ---------------------------------------------------------------------------
+
+
+def test_owned_source_text_is_actually_sent_to_the_generator():
+    """The model must receive the English text of its owned PIDs, not just
+    the PID labels — otherwise it cannot translate anything."""
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+
+    bundle = generator.calls[0]
+    assert bundle.owned_source == tuple(
+        (pid, text) for pid, text in source.source if pid in set(chunk.pids)
+    )
+    from pact_v4.phase2.prompts import render_prompt
+
+    rendered = render_prompt(bundle)
+    for pid, text in bundle.owned_source:
+        assert pid in rendered
+        assert text in rendered
+
+
+def test_changing_glossary_or_style_constraints_invalidates_cache_and_prompt():
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    glossary_a = (GlossaryEntry(source_term="steward", target_terms=("стюард",)),)
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache, glossary=glossary_a,
+        style_constraints={"narrator_voice": "formal"},
+    )
+
+    glossary_b = (GlossaryEntry(source_term="steward", target_terms=("дворецкий",)),)
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache, glossary=glossary_b,
+        style_constraints={"narrator_voice": "formal"},
+    )
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache, glossary=glossary_b,
+        style_constraints={"narrator_voice": "informal"},
+    )
+
+    assert generator.call_count == 3
+
+    from pact_v4.phase2.prompts import render_prompt
+
+    first_prompt = render_prompt(generator.calls[0])
+    second_prompt = render_prompt(generator.calls[1])
+    assert "стюард" in first_prompt
+    assert "дворецкий" in second_prompt
+    assert "стюард" not in second_prompt
+
+
+def test_style_constraints_dict_order_does_not_cause_spurious_cache_miss():
+    """Two calls with the same style constraints but different dict
+    insertion order must hit the same cache entry — order isn't semantic."""
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+        style_constraints={"a": "1", "b": "2"},
+    )
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+        style_constraints={"b": "2", "a": "1"},
+    )
+
+    assert generator.call_count == 1
+
+
+def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
+    """A cache entry that (by bug or tamper) maps a bundle_hash to a
+    candidate for a different chunk/role must never be handed back
+    silently — Phase 2B must not "trust the hash" alone on read."""
+    from pact_v4.phase2.generation import GenerationCandidateResult
+    from pact_v4.phase1.models import Candidate
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+    real_candidate = outcome.candidates["fidelity_first"]
+
+    # Simulate cache poisoning: plant a *different-role* candidate under
+    # some other bundle hash, then generate again with a request whose
+    # bundle hash happens to collide with that planted key (we simulate the
+    # collision directly by writing under the exact hash the next call will
+    # compute, rather than trying to find a real sha256 collision).
+    other_source, other_snapshot, other_chunk_plan, other_chunk, other_config = make_env(
+        pid_count=4, chunk_id="other-chunk"
+    )
+    other_generator = ConstantGenerator(lambda bundle: valid_output_for(other_chunk))
+    other_outcome = generate_for_chunk(
+        chunk_id=other_chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=other_source,
+        snapshot=other_snapshot, chunk_plan=other_chunk_plan, config=other_config,
+        params=make_params(), model_caller=other_generator,
+    )
+    foreign_candidate = other_outcome.candidates["fidelity_first"]
+
+    # Recompute the exact bundle_hash our victim call will use, then poison
+    # the shared cache at that key with the foreign candidate.
+    from pact_v4.phase2.generation import PromptBundle
+    from pact_v4.phase2.prompts import FIDELITY_FIRST_V1
+
+    victim_bundle = PromptBundle(
+        template=FIDELITY_FIRST_V1,
+        role="fidelity_first",
+        risk_band="low",
+        risk_policy_version=make_risk(RiskBand.LOW).policy_version,
+        snapshot_hash=snapshot.snapshot_hash,
+        source_hash=source.source_hash,
+        chunk_id=chunk.chunk_id,
+        owned_pids=chunk.pids,
+        owned_source=tuple((pid, text) for pid, text in source.source if pid in set(chunk.pids)),
+        left_context=(),
+        right_context=(),
+        glossary=(),
+        style_constraints=(),
+        config_identity=config.config_identity,
+        params=make_params(),
+    )
+    cache.put(victim_bundle.bundle_hash, GenerationCandidateResult(candidate=foreign_candidate, error=None))
+
+    with pytest.raises(AssertionError):
+        generate_for_chunk(
+            chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+            snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+            model_caller=generator, cache=cache,
+        )
+
+
+def test_candidate_provenance_carries_the_full_bundle_hash():
+    """16 hex characters in candidate_id is not provenance; the full
+    bundle_hash must be recoverable from the Candidate itself."""
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    candidate = outcome.candidates["fidelity_first"]
+    bundle = generator.calls[0]
+
+    matching = [
+        gate for gate in candidate.decision_trace
+        if gate.gate == "phase2b_prompt_bundle" and gate.detail == bundle.bundle_hash
+    ]
+    assert matching, "full bundle_hash must be recoverable from Candidate.decision_trace"
+    assert candidate.candidate_id.endswith(bundle.bundle_hash[:16])

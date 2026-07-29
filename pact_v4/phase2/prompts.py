@@ -91,19 +91,31 @@ def render_prompt(bundle: "Any") -> str:
     into request text; nothing here adds any input that isn't already part
     of ``PromptBundle.bundle_hash``.
     """
-    owned_pids = ", ".join(bundle.owned_pids)
+    owned_source = (
+        "\n".join(f"  {pid}: {text}" for pid, text in bundle.owned_source) or "  (none)"
+    )
     left_context = (
         ", ".join(f"{pid}: {text}" for pid, text in bundle.left_context) or "(none)"
     )
     right_context = (
         ", ".join(f"{pid}: {text}" for pid, text in bundle.right_context) or "(none)"
     )
+    glossary = (
+        "\n".join(
+            f"  {term} -> {'/'.join(targets)}" for term, targets in bundle.glossary
+        )
+        or "  (none)"
+    )
+    style_constraints = (
+        ", ".join(f"{key}={value}" for key, value in bundle.style_constraints) or "(none)"
+    )
     return (
         f"{bundle.template.instructions}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
         f"RISK_BAND: {bundle.risk_band}\n"
-        f"OWNED_PIDS: {owned_pids}\n"
-        f"left_context: {left_context}\n"
-        f"right_context: {right_context}\n"
-        f"GLOSSARY_AND_STYLE_CONTEXT: {bundle.glossary_context}\n"
+        f"OWNED_SOURCE (translate exactly these PIDs, in this order):\n{owned_source}\n"
+        f"left_context (read-only, already-committed Russian): {left_context}\n"
+        f"right_context (read-only English source): {right_context}\n"
+        f"GLOSSARY:\n{glossary}\n"
+        f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n"
     )
