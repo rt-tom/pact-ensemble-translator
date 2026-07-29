@@ -510,6 +510,9 @@ def main() -> int:
                     runtime, client, messages, local_stage, int(local_stage["max_tokens"]),
                     f"{detector}:{source_path.stem}:{label}", int(local_stage["attempts"]),
                     validator=validator,
+                    diagnostics_dir=(work / "v31" / args.pass_name / "diagnostics" / "qwen_global_smoke")
+                    if args.mode == "qwen_global_smoke" else None,
+                    diagnostics_stem=f"{source_path.stem}_{label}" if args.mode == "qwen_global_smoke" else None,
                 )
                 record = {
                     "version": VERSION,

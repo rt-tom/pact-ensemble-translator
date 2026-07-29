@@ -320,8 +320,14 @@ def complete_json(
     max_tokens: int, label: str, attempts: int = 3, validator=None,
     length_retry_max_tokens: int | None = None,
     retry_guidance: str | None = None,
+    diagnostics_dir: Path | None = None,
+    diagnostics_stem: str | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Generate JSON and optionally validate/transform its schema inside retries."""
+    """Generate JSON and optionally validate/transform its schema inside retries.
+
+    diagnostics_dir, when supplied, records rejected raw responses for operator
+    diagnosis only. They are never parsed as artifacts or used for cache reuse.
+    """
     errors: list[dict[str, Any]] = []
     base_max_tokens = int(max_tokens)
     length_retry_budget = (
@@ -394,6 +400,24 @@ def complete_json(
                     "usage": generation.usage,
                     "wall_seconds": round(generation.wall_seconds, 3),
                 })
+                if diagnostics_dir is not None and diagnostics_stem:
+                    raw_path = diagnostics_dir / f"{diagnostics_stem}.attempt_{attempt:02d}.invalid.json.txt"
+                    try:
+                        write_text_atomic(raw_path, generation.content)
+                        write_json(diagnostics_dir / f"{diagnostics_stem}.attempt_{attempt:02d}.meta.json", {
+                            "authoritative": False,
+                            "purpose": "diagnostic_only",
+                            "label": label,
+                            "attempt": attempt,
+                            "error": str(exc),
+                            "finish_reason": generation.finish_reason,
+                            "max_tokens": actual_max_tokens,
+                            "usage": generation.usage,
+                            "wall_seconds": round(generation.wall_seconds, 3),
+                        })
+                        item["diagnostic_raw_response"] = str(raw_path)
+                    except Exception as diagnostic_exc:
+                        logging.warning("%s attempt %s diagnostic capture failed: %s", label, attempt, diagnostic_exc)
             errors.append(item)
     raise JsonGenerationError(
         f"{label} failed after {attempts} attempts: {errors[-1] if errors else 'unknown'}",
