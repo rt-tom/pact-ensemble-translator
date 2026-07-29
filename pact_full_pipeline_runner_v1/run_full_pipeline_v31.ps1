@@ -218,6 +218,8 @@ $ensemble['qwen_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enab
 $ensemble['gemma_semantic_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1900; attempts=3; batch_pids=5; context_before=2; context_after=2 }
 $ensemble['gemma_russian_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=1800; attempts=3; batch_pids=6; context_before=3; context_after=3 }
 $ensemble['gemma_discourse_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=2600; attempts=3; window_pids=30; overlap_pids=10 }
+# Whole-chapter final smoke is the only Qwen stage allowed this larger JSON budget.
+$ensemble['qwen_global_smoke'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=5000; attempts=3 }
 $ensemble['qwen_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1400; length_retry_max_tokens=1600; attempts=3; context_size=2 }
 $ensemble['gemma_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=800; attempts=3; context_size=2 }
 $ensemble['repair'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1600; attempts=3; context_before=2; context_after=2; alternative_for_multiple_issues=$true; alternative_categories=@('idiom','meaning','register','dialogue','continuity'); max_changed_ratio_span=0.55 }

@@ -52,6 +52,7 @@ try {
     Assert-True ($runner -match 'Invoke-TranslationStage') 'Translation must be routed through the protocol, never a file-exists shortcut.'
     Assert-True ($runner -match '\$probeExit -eq 0\)\s*\{\s*Invoke-PythonStage -Label \$Label -Arguments \$Arguments -Outcome ''REUSED''') 'A complete translation cache must run model-free without starting GemmaTranslate.'
     Assert-True ($runner -match 'Stop-LlamaServer\s*\r?\n\s*\$unownedEndpoint') 'A profile switch must stop only the tracked owned server before startup.'
+    Assert-True ($runner -match '\$ensemble\[''qwen_global_smoke''\].*max_tokens=5000') 'Only final Qwen global smoke must receive the 5K JSON output budget.'
     Write-Host 'Pact v3.1 runner model policy self-tests passed'
 } finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
