@@ -185,13 +185,19 @@ class ApiClient:
     def _post_with_retry(
         self, payload: Mapping[str, Any]
     ) -> tuple[Dict[str, Any], int, bool]:
-        """POST with bounded retries.
+        """POST with bounded transient-error retries, plus a single
+        free fallback for the well-known Gemma grammar-reject message.
 
-        On a 5xx / network error we retry the *same* payload (up to
-        ``http_retries`` total attempts). On a 4xx we only retry once —
-        and only when the 4xx is the well-known Gemma grammar-reject
-        message, in which case we disable ``response_format`` permanently
-        and retry. All other 4xx errors propagate as ``ApiClientError``.
+        Transient errors (network exceptions and 5xx) retry the *same*
+        payload up to ``http_retries`` total attempts. The Gemma
+        ``peg-gemma4`` grammar-reject (a 400 with that marker) is a
+        permanent client-level recovery, not a transient failure: the
+        client disables ``response_format=json_object`` for the rest
+        of its lifetime and retries the same payload once. That retry
+        does **not** consume an attempt slot, so even
+        ``http_retries=1`` still gets the fallback.
+
+        All other 4xx errors propagate as ``ApiClientError``.
         """
         last_error: Optional[Exception] = None
         for attempt in range(1, int(self._cfg.http_retries) + 1):
@@ -239,18 +245,51 @@ class ApiClient:
                 and self._GRAMMAR_REJECT_MARKER in body
                 and self._json_response_format_supported
             ):
+                # Free fallback: disable response_format permanently
+                # for this client, retry once, and crucially **do not**
+                # consume an attempt slot. We achieve that by
+                # post-processing the result instead of looping back
+                # into the retry counter.
                 LOG.warning(
                     "%s: server rejects response_format=json_object; "
                     "disabling for the rest of this client lifetime",
                     self._name,
                 )
                 self._json_response_format_supported = False
-                payload = {
+                stripped_payload = {
                     key: value
                     for key, value in payload.items()
                     if key != "response_format"
                 }
-                continue  # retry without the flag, do not consume an attempt slot
+                try:
+                    retry_response = self._session.post(
+                        self._cfg.chat_url,
+                        json=stripped_payload,
+                        timeout=float(self._cfg.timeout_seconds),
+                    )
+                except requests.RequestException as exc:
+                    raise ApiClientError(
+                        f"{self._name}: HTTP retry after grammar reject "
+                        f"failed: {exc}"
+                    ) from exc
+                if not (200 <= retry_response.status_code < 300):
+                    raise ApiClientError(
+                        f"{self._name}: HTTP "
+                        f"{retry_response.status_code} "
+                        f"{retry_response.reason}; "
+                        f"body={retry_response.text[:500]!r}"
+                    )
+                try:
+                    return (
+                        retry_response.json(),
+                        retry_response.status_code,
+                        False,
+                    )
+                except ValueError as exc:
+                    raise ApiClientError(
+                        f"{self._name}: non-JSON response body: "
+                        f"{retry_response.text[:500]!r}"
+                    ) from exc
 
             raise ApiClientError(
                 f"{self._name}: HTTP {status} {response.reason}; "

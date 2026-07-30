@@ -210,6 +210,33 @@ def test_complete_gives_up_after_http_retries():
         client.complete([{"role": "user", "content": "x"}], max_tokens=10)
 
 
+def test_complete_grammar_reject_does_not_consume_retry_slot_with_http_retries_1():
+    """Regression: with http_retries=1, the Gemma peg-gemma4 grammar-
+    reject fallback must still take effect, because that fallback is a
+    permanent client-level recovery, not a transient retry. The
+    previous implementation used ``continue`` inside the same retry
+    loop, which silently consumed the only attempt and surfaced a
+    misleading ``API failed after 1 attempts: None`` error."""
+    reject_text = "error: response does not match the expected peg-gemma4 format"
+    session = _FakeSession([
+        _FakeResponse(status_code=400, text=reject_text),
+        _ok_text_response("ok"),
+    ])
+    client = ApiClient(
+        ApiClientConfig(http_retries=1, retry_delay_seconds=0.0),
+        session=session,
+    )
+    out = client.complete(
+        [{"role": "user", "content": "x"}], max_tokens=10,
+    )
+    assert out == "ok"
+    # First attempt: with response_format. Second attempt: without.
+    # The second attempt must NOT have consumed a retry slot — the
+    # fallback is free.
+    assert "response_format" in session.posts[0]["json"]
+    assert "response_format" not in session.posts[1]["json"]
+
+
 def test_complete_retries_network_errors():
     from requests.exceptions import ConnectionError as RequestsConnectionError
     session = _FakeSession([

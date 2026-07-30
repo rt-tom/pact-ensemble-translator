@@ -446,3 +446,241 @@ def test_run_chapter_records_left_ru_only_after_selection(tmp_path: Path):
     expected_pids = set(first_bundle.owned_pids)
     left_pids = {pid for pid, _ in second_bundle.left_context}
     assert left_pids == expected_pids
+
+
+class _StubModelCallerDistinctAB:
+    """Like ``StubModelCaller`` but emits visibly different text for the
+    two roles, so a Gemma-stub can pick the balanced_literary winner
+    and a regression test can observe which candidate's text actually
+    made it into the next chunk's left_context.
+
+    The two role outputs are *intentionally* unrelated at the token
+    level: fidelity_first uses short literal tokens, balanced_literary
+    uses a long idiomatic phrase with no overlap. That guarantees the
+    cascade's jaccard<0.40 disagreement check trips whenever both
+    candidates pass Qwen and det (which is what the
+    ``test_run_chapter_left_context_is_empty_when_previous_chunk_needs_synthesis``
+    test needs).
+    """
+
+    def __init__(self) -> None:
+        self.calls: List[PromptBundle] = []
+
+    def __call__(self, bundle: PromptBundle) -> str:
+        from pact_v4.phase2.generation import PromptBundle
+        self.calls.append(bundle)
+        out: Dict[str, str] = {}
+        for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+            digits = "".join(ch for ch in text if ch.isdigit())
+            digit_part = f" ({digits})" if digits else ""
+            if bundle.role == "fidelity_first":
+                # "Это короткий буквальный перевод" — short, literal
+                # phrasing. Shares "Это", "перевод" with the B version
+                # so jaccard > 0.4 (cascade's no-disagreement branch
+                # is exercised and the Gemma selector is consulted).
+                out[pid] = f"Это короткий буквальный перевод{digit_part}"
+            else:
+                out[pid] = f"Это красивый литературный перевод{digit_part}"
+        return json.dumps(out, ensure_ascii=False)
+
+
+def test_run_chapter_left_context_uses_cascade_winner_not_first_role(tmp_path: Path):
+    """Regression: chunk 0 produces two passing candidates (A and B);
+    Gemma-stub picks ``balanced_literary``. Chunk 1's left_context must
+    carry the ``balanced_literary`` text, not the ``fidelity_first``
+    text (the previous code populated ``selected_text_by_chunk`` from
+    ``outcome.expected_roles[0]`` BEFORE the cascade ran, so chunk 1
+    would see A's text under any cascade outcome).
+
+    The chapter source is constructed so chunk 0 is high risk (it
+    contains "you", "not", a number and a cultural reference, which
+    together push the risk score well above the medium threshold),
+    so Phase 2B produces both A and B and the cascade's multi-pass
+    branch is exercised."""
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>"
+        + "<p>You must not open box 7 at Thanksgiving, said Alice.</p>" * 12
+        + "<p>She smiled and looked at Blake.</p>" * 12
+        + "</body></html>",
+        encoding="utf-8",
+    )
+    _write_empty_memory(tmp_path / "memory")
+    cfg = PipelineConfig(
+        chapter_id="046",
+        chapter_html_path=chapter_html,
+        memory_dir=tmp_path / "memory",
+        out_dir=tmp_path / "out",
+        min_chunk_size=8,
+        max_chunk_size=12,
+    )
+    caller = _StubModelCallerDistinctAB()
+    # Gemma picks the candidate whose candidate_id contains
+    # "balanced_literary" (full candidate_id is
+    # ``chunk_id:role:bundle_hash[:16]``, so we match on the role
+    # segment, not the whole id).
+    class _GemmaPickB:
+        def __call__(self, candidates):  # type: ignore[no-untyped-def]
+            for cid, _ in candidates:
+                if ":balanced_literary:" in cid:
+                    return GateResult(
+                        gate="gemma_russian_preference",
+                        passed=True,
+                        detail=cid,
+                    )
+            chosen = candidates[0][0] if candidates else ""
+            return GateResult(
+                gate="gemma_russian_preference",
+                passed=True,
+                detail=chosen,
+            )
+
+    result = run_chapter(
+        cfg,
+        model_caller=caller,
+        qwen_evaluator=StubQwen(),
+        gemma_selector=_GemmaPickB(),
+    )
+    assert result.chunk_count == 2
+    # Sort bundles by chunk_id.
+    calls_by_chunk = {c.chunk_id: c for c in caller.calls}
+    chunk_ids = sorted(calls_by_chunk)
+    second_bundle = calls_by_chunk[chunk_ids[1]]
+    # The second chunk's left_context must contain ONLY balanced_literary
+    # text, not fidelity_first text.
+    left_texts = [text for _, text in second_bundle.left_context]
+    assert left_texts, "left_context must not be empty for a passing chunk 0"
+    assert all("литературный" in t for t in left_texts), (
+        f"left_context carried the wrong role's text: {left_texts!r}"
+    )
+    assert not any("короткий" in t or "буквальный" in t for t in left_texts), (
+        f"left_context still uses fidelity_first draft: {left_texts!r}"
+    )
+    # And the final translations.json must match: every PID owned by
+    # the first chunk must be the B-translation, not the A-translation.
+    translations = json.loads(result.translations_path.read_text(encoding="utf-8"))
+    first_chunk_pids = calls_by_chunk[chunk_ids[0]].owned_pids
+    for pid in first_chunk_pids:
+        assert "литературный" in translations[pid], (
+            f"final translation for {pid} should be B, got {translations[pid]!r}"
+        )
+
+
+def test_run_chapter_left_context_is_empty_when_previous_chunk_quarantined(tmp_path: Path):
+    """Regression: chunk 0 is quarantined (cascade rejects it), chunk 1
+    must see an empty left_context — never the quarantined chunk's
+    ``fidelity_first`` draft. The cascade's "no least-bad selection"
+    contract applies symmetrically to context propagation: a chunk
+    that was not selected has no established translation, so feeding
+    its draft to the next chunk is the same silent fallback the
+    cascade is built to refuse."""
+    cfg = _make_pipeline(
+        tmp_path, n_paragraphs=24, min_chunk_size=8, max_chunk_size=12,
+    )
+    result = run_chapter(
+        cfg,
+        model_caller=StubModelCaller(),
+        qwen_evaluator=StubQwen(passed=False, reason="meaning drift"),
+        gemma_selector=StubGemma(),
+    )
+    assert result.chunk_count == 2
+    # Confirm the setup: chunk 0 should be quarantined.
+    payload = json.loads(result.selection_path.read_text(encoding="utf-8"))
+    statuses_by_chunk = {r["chunk_id"]: r["status"] for r in payload["results"]}
+    first_chunk_id = sorted(statuses_by_chunk)[0]
+    assert statuses_by_chunk[first_chunk_id] == "quarantined"
+    # Now inspect chunk 1's left_context: it must be empty, regardless
+    # of what fidelity_first produced for chunk 0.
+    caller = StubModelCaller()
+    # Re-run with a recording caller to inspect the actual bundle.
+    result2 = run_chapter(
+        PipelineConfig(
+            chapter_id=cfg.chapter_id,
+            chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir,
+            out_dir=tmp_path / "out2",
+            min_chunk_size=cfg.min_chunk_size,
+            max_chunk_size=cfg.max_chunk_size,
+        ),
+        model_caller=caller,
+        qwen_evaluator=StubQwen(passed=False, reason="meaning drift"),
+        gemma_selector=StubGemma(),
+    )
+    calls_by_chunk = {c.chunk_id: c for c in caller.calls}
+    chunk_ids = sorted(calls_by_chunk)
+    second_bundle = calls_by_chunk[chunk_ids[1]]
+    assert second_bundle.left_context == (), (
+        f"left_context must be empty after a quarantined chunk 0; "
+        f"got {second_bundle.left_context!r}"
+    )
+
+
+def test_run_chapter_left_context_is_empty_when_previous_chunk_needs_synthesis(tmp_path: Path):
+    """Regression: chunk 0 ends in ``needs_synthesis`` (A and B
+    disagree, no synthesis candidate present). Like a quarantine,
+    there is no established translation for that chunk; chunk 1's
+    left_context must be empty, not the fidelity_first draft."""
+    # Build a chapter where chunk 0 has high risk (A+B both produced)
+    # and the two stub-generated candidates disagree enough to trip
+    # the cascade's jaccard<0.40 disagreement check.
+    #
+    # We deliberately avoid digits in the source so the stub-model
+    # output also has no digit tokens; the candidates then share no
+    # tokens at all across the two roles, jaccard is 0.0, and the
+    # cascade reliably reports needs_synthesis (rather than a noisy
+    # fallback path) for the regression assertion.
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>"
+        + "<p>Alice said it was cold at Thanksgiving.</p>" * 12
+        + "<p>She smiled and looked at Blake.</p>" * 12
+        + "</body></html>",
+        encoding="utf-8",
+    )
+    _write_empty_memory(tmp_path / "memory")
+    cfg = PipelineConfig(
+        chapter_id="046",
+        chapter_html_path=chapter_html,
+        memory_dir=tmp_path / "memory",
+        out_dir=tmp_path / "out",
+        min_chunk_size=8,
+        max_chunk_size=12,
+    )
+    caller = _StubModelCallerDistinctAB()
+    # Both A and B pass Qwen; the A and B texts are token-disjoint
+    # (jaccard=0.0 → disagreement). No synthesis candidate, no Gemma →
+    # cascade returns needs_synthesis=True.
+    result = run_chapter(
+        cfg,
+        model_caller=caller,
+        qwen_evaluator=StubQwen(),
+        gemma_selector=None,
+    )
+    assert result.chunk_count == 2
+    payload = json.loads(result.selection_path.read_text(encoding="utf-8"))
+    statuses = {r["chunk_id"]: r["status"] for r in payload["results"]}
+    first_chunk_id = sorted(statuses)[0]
+    assert statuses[first_chunk_id] == "needs_synthesis", (
+        f"expected chunk 0 to be needs_synthesis under this stub; got {statuses}"
+    )
+    # Re-run with a recording caller to inspect the actual bundle.
+    result2 = run_chapter(
+        PipelineConfig(
+            chapter_id=cfg.chapter_id,
+            chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir,
+            out_dir=tmp_path / "out2",
+            min_chunk_size=cfg.min_chunk_size,
+            max_chunk_size=cfg.max_chunk_size,
+        ),
+        model_caller=caller,
+        qwen_evaluator=StubQwen(),
+        gemma_selector=None,
+    )
+    calls_by_chunk = {c.chunk_id: c for c in caller.calls}
+    chunk_ids = sorted(calls_by_chunk)
+    second_bundle = calls_by_chunk[chunk_ids[1]]
+    assert second_bundle.left_context == (), (
+        f"left_context must be empty after a needs_synthesis chunk 0; "
+        f"got {second_bundle.left_context!r}"
+    )

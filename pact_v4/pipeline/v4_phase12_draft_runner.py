@@ -156,10 +156,17 @@ def _left_ru_for_chunk(
     The plan is generated before any translation exists, so the static
     ``ChunkPlan.context.left_ru`` is empty (per
     ``pact_v4.phase1.chunker``). At generation time the driver looks up
-    the *previous* chunk's selected translation and returns its PIDs and
-    Russian text in the same order they appear in the source.
+    the *previous* chunk's **selected** translation and returns its PIDs
+    and Russian text in the same order they appear in the source.
 
-    Returns an empty tuple for the first chunk (no prior chunk).
+    **Empty-tuple contract:** ``left_context`` is empty when the
+    previous chunk was quarantined, flagged for synthesis, or never
+    reached a selection. A chunk that did not produce a selected
+    candidate has no established translation, and feeding its
+    ``fidelity_first`` draft into the next chunk would be the same
+    silent "least-bad" fallback the cascade refuses to do at the
+    selection stage. The first chunk of the chapter also gets an
+    empty ``left_context`` by construction.
     """
     if chunk_index <= 0:
         return ()
@@ -277,10 +284,16 @@ def run_chapter(
 
     The function is purely sequential: the chapter is small enough
     (golden-set chapter 046 is one file) that we do not need an
-    async/parallel model. Each chunk is fully generated, selected, and
-    its decision is recorded before the next chunk starts, so a crash
-    mid-chapter leaves a partial provenance trail that can still be
-    diffed against a later re-run.
+    async/parallel model. **Phase 2B and Phase 2C run interleaved per
+    chunk, not in two separate passes** — this matters because chunk
+    N+1's left_context must come from chunk N's *cascade winner*, not
+    from ``outcome.candidates[expected_roles[0]]`` (which is just the
+    first generation role, before the cascade has had a chance to pick
+    ``balanced_literary``, to quarantine the chunk, or to flag it for
+    synthesis). The cascade's "no least-bad selection" contract
+    applies symmetrically here: a chunk that was not selected has no
+    established translation, so feeding its draft to the next chunk
+    is the same silent fallback the cascade is built to refuse.
     """
     now_fn = now or (lambda: datetime.now(timezone.utc))
 
@@ -332,6 +345,11 @@ def run_chapter(
 
     # ------------------------------------------------------------------
     # Phase 2A: per-chunk deterministic risk pre-screen.
+    #
+    # Risk is purely source-side and model-free, so it can be computed
+    # for every chunk in one pass before the per-chunk generation
+    # loop. The risk band decides how many candidates the cascade
+    # expects (1 for low, 2 for medium/high).
     # ------------------------------------------------------------------
     glossary = _glossary_entries(memory)
     source_map = dict(source.source)
@@ -368,15 +386,36 @@ def run_chapter(
     })
 
     # ------------------------------------------------------------------
-    # Phase 2B: risk-gated A/B generation, per chunk, sequential.
+    # Phase 2B + 2C, interleaved per chunk.
+    #
+    # We deliberately do NOT split this into two separate "generate
+    # everything" / "select everything" passes: chunk N+1's left_context
+    # must come from chunk N's *selected* candidate, which the cascade
+    # is the only thing that knows. Generating first, selecting second
+    # would force us to either (a) feed chunk N+1 the first-role
+    # candidate's draft regardless of cascade outcome (the original
+    # bug) or (b) record a "stale" first-role draft as left_context
+    # and then... do nothing useful with it. Interleaving keeps the
+    # invariants tight and matches the docstring's claim.
     # ------------------------------------------------------------------
     generation_params = GenerationParams(
         temperature=cfg.temperature, seed=cfg.seed, max_tokens=cfg.max_tokens,
     )
     gen_cache = GenerationCache()
     generation_records: List[Dict[str, Any]] = []
-    outcomes_by_chunk: Dict[str, GenerationOutcome] = {}
+    selection_records: List[Dict[str, Any]] = []
+    final_text_by_pid: Dict[str, str] = {}
+    selected_role_counts: Dict[str, int] = {}
     selected_text_by_chunk: Dict[str, Dict[str, str]] = {}
+    quarantined_count = 0
+    needs_synthesis_count = 0
+    incomplete_generation_count = 0
+    det_data = DeterministicGateData(
+        glossary_terms=cfg.deterministic_glossary_terms,
+        names=cfg.deterministic_names,
+        mixed_script_allow=cfg.deterministic_mixed_script_allow,
+    )
+
     for index, plan_chunk in enumerate(chunk_plan.chunks):
         risk = risk_by_chunk[plan_chunk.chunk_id]
         left_context = _left_ru_for_chunk(
@@ -389,6 +428,8 @@ def run_chapter(
             for pid in plan_chunk.context.right_en
             if pid in source_map
         )
+
+        # ---- Phase 2B: generate candidates for this chunk ----------
         outcome = generate_for_chunk(
             chunk_id=plan_chunk.chunk_id,
             risk=risk,
@@ -404,70 +445,9 @@ def run_chapter(
             model_caller=model_caller,
             cache=gen_cache,
         )
-        outcomes_by_chunk[plan_chunk.chunk_id] = outcome
-        generation_records.append({
-            "chunk_id": plan_chunk.chunk_id,
-            "risk_band": outcome.risk_band,
-            "expected_roles": list(outcome.expected_roles),
-            "status": outcome.status,
-            "candidates": {
-                role: {
-                    "candidate_id": cand.candidate_id,
-                    "role": cand.role,
-                    "translation": dict(cand.translation),
-                    "decision_trace": [
-                        {"gate": g.gate, "passed": g.passed, "detail": g.detail}
-                        for g in cand.decision_trace
-                    ],
-                }
-                for role, cand in outcome.candidates.items()
-            },
-            "errors": {
-                role: {"code": err.code.value, "detail": err.detail}
-                for role, err in outcome.errors.items()
-            },
-        })
-        if outcome.status == "complete" and len(outcome.candidates) >= 1:
-            # The first-role candidate is a fine stand-in until Phase 2C
-            # picks a winner — we'll overwrite this with the cascade's
-            # selection below.
-            first_role = outcome.expected_roles[0]
-            first_cand = outcome.candidates[first_role]
-            selected_text_by_chunk[plan_chunk.chunk_id] = dict(first_cand.as_pid_map())
-    LOG.info("Phase 2B: generated candidates for %d chunks", len(outcomes_by_chunk))
-    generation_path = cfg.out_dir / "generation_outcomes.json"
-    _write_json(generation_path, {
-        "chapter_id": cfg.chapter_id,
-        "snapshot_hash": snapshot.snapshot_hash,
-        "chunk_plan_hash": chunk_plan.plan_hash,
-        "config_identity": config.config_identity,
-        "params": {
-            "temperature": cfg.temperature,
-            "seed": cfg.seed,
-            "max_tokens": cfg.max_tokens,
-            "reasoning": 0,
-        },
-        "outcomes": generation_records,
-    })
+        generation_records.append(_serialize_generation_outcome(outcome))
 
-    # ------------------------------------------------------------------
-    # Phase 2C: cascaded selection, per chunk.
-    # ------------------------------------------------------------------
-    det_data = DeterministicGateData(
-        glossary_terms=cfg.deterministic_glossary_terms,
-        names=cfg.deterministic_names,
-        mixed_script_allow=cfg.deterministic_mixed_script_allow,
-    )
-    selection_records: List[Dict[str, Any]] = []
-    final_text_by_pid: Dict[str, str] = {}
-    selected_role_counts: Dict[str, int] = {}
-    quarantined_count = 0
-    needs_synthesis_count = 0
-    incomplete_generation_count = 0
-    for plan_chunk in chunk_plan.chunks:
-        outcome = outcomes_by_chunk.get(plan_chunk.chunk_id)
-        if outcome is None:
-            continue
+        # ---- Phase 2C: select a winner for this chunk --------------
         if outcome.status != "complete":
             incomplete_generation_count += 1
             selection_records.append({
@@ -481,7 +461,11 @@ def run_chapter(
                     for role, err in outcome.errors.items()
                 },
             })
+            # No selection → no established translation. The next
+            # chunk sees an empty left_context, per the cascade's
+            # "no least-bad selection" contract.
             continue
+
         candidates: List[Candidate] = list(outcome.candidates.values())
         try:
             result = select_candidate(
@@ -510,7 +494,8 @@ def run_chapter(
             })
             quarantined_count += 1
             continue
-        q_delta, n_delta = _record_selection(
+
+        q_delta, n_delta, selected_text = _record_selection(
             selection_records=selection_records,
             final_text_by_pid=final_text_by_pid,
             selected_role_counts=selected_role_counts,
@@ -519,11 +504,32 @@ def run_chapter(
         )
         quarantined_count += q_delta
         needs_synthesis_count += n_delta
+        # Only the cascade winner is allowed to flow into the next
+        # chunk's left_context. If this chunk was quarantined or
+        # needs_synthesis, ``selected_text`` is None and the next
+        # chunk's left_context is empty by construction.
+        if selected_text is not None:
+            selected_text_by_chunk[plan_chunk.chunk_id] = selected_text
+
     LOG.info(
-        "Phase 2C: %d selected, %d quarantined, %d needs_synthesis, %d incomplete_generation",
+        "Phase 2B/2C: %d selected, %d quarantined, %d needs_synthesis, %d incomplete_generation",
         sum(selected_role_counts.values()), quarantined_count,
         needs_synthesis_count, incomplete_generation_count,
     )
+    generation_path = cfg.out_dir / "generation_outcomes.json"
+    _write_json(generation_path, {
+        "chapter_id": cfg.chapter_id,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "params": {
+            "temperature": cfg.temperature,
+            "seed": cfg.seed,
+            "max_tokens": cfg.max_tokens,
+            "reasoning": 0,
+        },
+        "outcomes": generation_records,
+    })
     translations_path = cfg.out_dir / "translations.json"
     _write_json(translations_path, final_text_by_pid)
     selection_path = cfg.out_dir / "selection_results.json"
@@ -615,6 +621,37 @@ def run_chapter(
 # ---------------------------------------------------------------------------
 
 
+def _serialize_generation_outcome(outcome: GenerationOutcome) -> Dict[str, Any]:
+    """Render one Phase 2B outcome to the JSON-friendly form used in
+    ``generation_outcomes.json``.
+
+    Centralised so the on-disk schema lives in exactly one place and
+    the per-chunk driver loop stays readable.
+    """
+    return {
+        "chunk_id": outcome.chunk_id,
+        "risk_band": outcome.risk_band,
+        "expected_roles": list(outcome.expected_roles),
+        "status": outcome.status,
+        "candidates": {
+            role: {
+                "candidate_id": cand.candidate_id,
+                "role": cand.role,
+                "translation": dict(cand.translation),
+                "decision_trace": [
+                    {"gate": g.gate, "passed": g.passed, "detail": g.detail}
+                    for g in cand.decision_trace
+                ],
+            }
+            for role, cand in outcome.candidates.items()
+        },
+        "errors": {
+            role: {"code": err.code.value, "detail": err.detail}
+            for role, err in outcome.errors.items()
+        },
+    }
+
+
 def _record_selection(
     *,
     selection_records: List[Dict[str, Any]],
@@ -622,14 +659,20 @@ def _record_selection(
     selected_role_counts: Dict[str, int],
     result: SelectionResult,
     outcome: GenerationOutcome,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, Optional[Dict[str, str]]]:
     """Mutate the run-level state for one chunk's SelectionResult.
 
-    Returns ``(quarantined_delta, needs_synthesis_delta)``: 0 or 1 each,
-    so the caller can update its own totals. The helper also appends
-    one record to ``selection_records`` and may update
-    ``final_text_by_pid`` (only for selected chunks) and
-    ``selected_role_counts`` (only for selected chunks).
+    Returns ``(quarantined_delta, needs_synthesis_delta,
+    selected_translation)``: 0 or 1 for the first two, and the cascade
+    winner's PID->text map (or ``None`` if the chunk was quarantined or
+    needs_synthesis) for the third. The caller uses the third return
+    value to populate ``selected_text_by_chunk`` — the table that
+    feeds the next chunk's ``left_context`` — so only the cascade
+    winner is ever allowed to flow forward, never an unselected draft.
+
+    The helper also appends one record to ``selection_records`` and
+    may update ``final_text_by_pid`` / ``selected_role_counts`` (only
+    for selected chunks).
     """
     chunk_id = result.chunk_id
     record: Dict[str, Any] = {
@@ -650,6 +693,7 @@ def _record_selection(
     }
     quarantined_delta = 0
     needs_synthesis_delta = 0
+    selected_translation: Optional[Dict[str, str]] = None
 
     if result.quarantine:
         record["quarantine"] = True
@@ -667,10 +711,11 @@ def _record_selection(
         )
         winner = outcome.candidates.get(result.selected_role)
         if winner is not None:
-            final_text_by_pid.update(winner.as_pid_map())
+            selected_translation = dict(winner.as_pid_map())
+            final_text_by_pid.update(selected_translation)
 
     selection_records.append(record)
-    return quarantined_delta, needs_synthesis_delta
+    return quarantined_delta, needs_synthesis_delta, selected_translation
 
 
 # ---------------------------------------------------------------------------
