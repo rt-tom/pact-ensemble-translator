@@ -57,11 +57,17 @@ Resumability and the "cannot claim complete on model failure" guard mirror
 ``GenerationOutcome.status`` shape exactly: ``AuditCache`` is a plain
 in-memory exact-match cache (no disk I/O — persisting/reloading it across
 process restarts is the pipeline's job), keyed by a deterministic per-
-``(chunk_id, detector)`` identity hash; a cached *successful* unit is reused
-untouched on resume (never re-called), while a missing or previously failed
-unit is (re)attempted. ``AuditOutcome.status`` is ``"complete"`` if and only
-if every unit succeeded — a model failure can never be silently read as "no
-issues found".
+``(chunk_id, candidate_id, detector, policy_version)`` identity hash over
+``chapter_hash`` — ``candidate_id`` is included precisely because two
+different winning candidates for the same chunk can produce identical
+output text (and therefore the same ``chapter_hash``); a cache hit's
+findings are also revalidated against the requested ``candidate_id`` before
+being reused, the same defense-in-depth ``GenerationCache`` applies to its
+own hits. A cached *successful* unit is reused untouched on resume (never
+re-called), while a missing or previously failed unit is (re)attempted.
+``AuditOutcome.status`` is ``"complete"`` if and only if every unit
+succeeded — a model failure can never be silently read as "no issues
+found".
 """
 from __future__ import annotations
 
@@ -158,6 +164,15 @@ class AuditUnitResult:
     error: str = ""
 
 
+class _AuditCachePoisoned(AssertionError):
+    """Raised if a cache hit's findings don't match the identity that
+    produced its cache key — mirrors ``pact_v4.phase2.generation.
+    _CachePoisoned``: this indicates an internal bug (e.g. a unit-hash
+    change that dropped an identity field, or a caller writing into
+    ``AuditCache`` directly), never an expected runtime path, hence
+    ``AssertionError`` rather than a typed/recoverable error."""
+
+
 class AuditCache:
     """Exact-match in-memory cache keyed on a deterministic unit identity hash.
 
@@ -188,11 +203,25 @@ def _candidate_id_for(chunk_id: str, candidates: Mapping[str, Candidate]) -> str
     return candidate.candidate_id
 
 
-def _unit_hash(*, chapter_hash: str, chunk_id: str, detector: str, policy_version: str) -> str:
+def _unit_hash(
+    *, chapter_hash: str, chunk_id: str, candidate_id: str, detector: str, policy_version: str
+) -> str:
+    """Identity of one resumable (chunk, detector) audit unit.
+
+    ``candidate_id`` is part of the identity, not just ``chapter_hash``:
+    two different winning ``Candidate``s for the same chunk can produce
+    byte-identical ``translation`` text (and therefore the same
+    ``chapter_hash``) while still being different generation events with
+    different provenance. Keying only on ``chapter_hash`` would let a
+    resumed run silently reuse cached findings tagged with a stale
+    ``candidate_id`` after the winning candidate changed but its output
+    text happened not to.
+    """
     return canonical_json_hash({
-        "artifact": "pact-v4-audit-unit/v1",
+        "artifact": "pact-v4-audit-unit/v2",
         "chapter_hash": chapter_hash,
         "chunk_id": chunk_id,
+        "candidate_id": candidate_id,
         "detector": detector,
         "policy_version": policy_version,
     })
@@ -464,11 +493,24 @@ def run_chapter_audit(
             unit_hash = _unit_hash(
                 chapter_hash=chapter.chapter_hash,
                 chunk_id=chunk.chunk_id,
+                candidate_id=candidate_id,
                 detector=detector,
                 policy_version=policy_version,
             )
             cached = cache.get(unit_hash)
             if cached is not None and cached.ok:
+                # Defense in depth, mirroring generation.py's GenerationCache
+                # hit-revalidation: never trust the hash alone. A finding
+                # whose tagged candidate_id doesn't match what was actually
+                # requested here would misrepresent provenance even though
+                # the cache key matched.
+                for finding in cached.findings:
+                    if finding.candidate_id != candidate_id:
+                        raise _AuditCachePoisoned(
+                            f"Cache identity corruption: unit_hash {unit_hash} "
+                            f"resolved to candidate_id={finding.candidate_id!r}, "
+                            f"expected {candidate_id!r}"
+                        )
                 all_findings.extend(cached.findings)
                 continue
 

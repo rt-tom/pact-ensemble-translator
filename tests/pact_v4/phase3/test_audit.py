@@ -250,6 +250,58 @@ def test_resume_retries_only_failed_units():
     assert gemma.call_count(chunk2.chunk_id) == 1
 
 
+# 5b. Resumability must key on candidate_id, not just chapter_hash: two different winning
+#     candidates for the same chunk that happen to produce byte-identical translation text
+#     yield the same chapter_hash, but must NOT share a cache hit -- otherwise a resumed
+#     run could return findings tagged with a stale candidate_id (wrong provenance).
+def test_resume_does_not_reuse_cache_across_different_candidate_ids_same_text():
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, chapter = _env()
+    # Same translation text as the default `chunk1_a`, deliberately built as a second,
+    # differently-identified winning Candidate for chunk1.
+    chunk1_b = _candidate(
+        chunk=chunk1, suffix="B", source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
+    assert chunk1_b.translation == candidates[chunk1.chunk_id].translation
+    assert chunk1_b.candidate_id != candidates[chunk1.chunk_id].candidate_id
+
+    candidates_v2 = dict(candidates)
+    candidates_v2[chunk1.chunk_id] = chunk1_b
+    chapter_v2 = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config, candidates=candidates_v2
+    )
+    # The premise of the bug: identical text -> identical chapter_hash despite a different
+    # winning candidate_id for chunk1.
+    assert chapter_v2.chapter_hash == chapter.chapter_hash
+
+    cache = AuditCache()
+    qwen = ScriptedEvaluator({
+        chunk1.chunk_id: [
+            _issues_json([{"pid": "p00000", "category": "omission", "note": "first candidate"}]),
+            _issues_json([{"pid": "p00000", "category": "omission", "note": "second candidate"}]),
+        ],
+        chunk2.chunk_id: [_issues_json([]), _issues_json([])],
+    })
+    gemma = _no_issue_evaluator([chunk1.chunk_id, chunk2.chunk_id], repeats=2)
+
+    first = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
+        qwen_evaluator=qwen, gemma_evaluator=gemma, cache=cache,
+    )
+    second = run_chapter_audit(
+        chapter=chapter_v2, source=source, chunk_plan=chunk_plan, candidates=candidates_v2,
+        qwen_evaluator=qwen, gemma_evaluator=gemma, cache=cache,
+    )
+
+    # Not a stale cache hit: the evaluator was actually called again for chunk1.
+    assert qwen.call_count(chunk1.chunk_id) == 2
+
+    first_finding = [f for f in first.store if f.detector == "qwen_chapter_audit"][0]
+    second_finding = [f for f in second.store if f.detector == "qwen_chapter_audit"][0]
+    assert first_finding.candidate_id == candidates[chunk1.chunk_id].candidate_id
+    assert second_finding.candidate_id == chunk1_b.candidate_id
+    assert second_finding.candidate_id != first_finding.candidate_id
+
+
 # 6. Malformed/truncated JSON from an evaluator is a failure, not zero findings.
 def test_malformed_json_is_a_failure_not_zero_findings():
     source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, chapter = _env()
