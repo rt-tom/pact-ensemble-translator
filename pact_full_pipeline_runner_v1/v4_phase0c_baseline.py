@@ -40,7 +40,7 @@ from typing import Any
 import v4_measurement_harness as h0a
 
 SCHEMA_VERSION = "pact-v4-phase0c-result-record/v1"
-TOOL_VERSION = "pact-0c/0.1"
+TOOL_VERSION = "pact-0c/0.2"
 UNKNOWN = h0a.UNKNOWN
 
 PENDING_LIVE_RUN = "pending_live_run"
@@ -373,6 +373,10 @@ def load_v31_lifecycle(chapter_dir: Path) -> list[dict[str, Any]]:
     return read_v31_json(chapter_dir / "v31" / "primary" / "lifecycle.json", [])
 
 
+def load_v31_residual_lifecycle(chapter_dir: Path) -> list[dict[str, Any]]:
+    return read_v31_json(chapter_dir / "v31" / "residual" / "lifecycle.json", [])
+
+
 def load_v31_verification_report(chapter_dir: Path) -> dict[str, Any]:
     return read_v31_json(chapter_dir / "v31" / "primary" / "verification_report.json", {})
 
@@ -488,6 +492,40 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         completion_status = PENDING_RUN_COMPLETION
         completion_reason = "primary pass not adjudicated yet"
 
+    # ---- Track B top-level annotations ----
+    # Track B carries visible operator notes (not numerical metrics) so the
+    # Gate and downstream consumers can see historical anomalies without
+    # having to dig through raw run artifacts.
+    notes: list[str] = []
+    terminal_discrepancy: dict[str, Any] | None = None
+    if monitor_status in ("FAILED", "ACTIVE", "REUSED"):
+        # monitor_state is informative, not authoritative for terminal status.
+        # The v3.1 artifacts (state.json / final HTML) are authoritative for
+        # "the chapter is complete and translation is frozen". A divergence
+        # between monitor and artifacts is a Gate-visible fact, never masked.
+        if monitor_status == "FAILED" and primary_complete:
+            terminal_discrepancy = {
+                "detected": True,
+                "monitor_status": monitor_status,
+                "artifacts_say": "primary state.json and lifecycle.json present",
+                "reason": (
+                    "historical monitor_state.v31.json reports FAILED "
+                    "while primary pass artifacts are complete; reconciliation "
+                    "required before this run is treated as a quality success"
+                ),
+            }
+            notes.append(
+                "track_b.terminal_discrepancy detected: monitor=FAILED vs "
+                "primary artifacts complete (state.json + lifecycle.json present)"
+            )
+        elif monitor_status == "ACTIVE":
+            notes.append(
+                f"track_b monitor_status=ACTIVE at stage {monitor_stage!r}; "
+                "residual pass may still be in progress"
+            )
+        elif monitor_status == "REUSED":
+            notes.append("track_b monitor_status=REUSED (cache reuse path)")
+
     metrics: dict[str, Any] = {}
     # ---- PID coverage ----
     manifest = read_v31_json(chapter_dir / "manifest.json", {})
@@ -526,6 +564,38 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
     fp_primary = int(lc_status_dist.get("resolved_false_positive", 0))
     repaired_primary = int(lc_status_dist.get("resolved_repair", 0))
     total_lifecycle = len(lifecycle)
+    # ---- typed final_residual_total ----
+    # The bare-string form (status-in-value-slot) mixed status and value, which
+    # the Gate requires be replaced with a typed object. The producer now
+    # always emits {status, value_numeric, reason}: value_numeric is the actual
+    # residual-pass retry_exhausted count when the residual lifecycle is
+    # present, otherwise null with a reason.
+    if residual_complete:
+        residual_lifecycle = load_v31_residual_lifecycle(chapter_dir)
+        residual_retry_exhausted = sum(
+            1 for i in residual_lifecycle
+            if isinstance(i, dict) and i.get("status") == "resolved_retry_exhausted"
+        )
+        final_residual_obj: dict[str, Any] = {
+            "status": MEASURED,
+            "value_numeric": int(residual_retry_exhausted),
+            "reason": "",
+        }
+    elif primary_complete:
+        final_residual_obj = {
+            "status": PENDING_RUN_COMPLETION,
+            "value_numeric": None,
+            "reason": (
+                "primary pass adjudicated; residual pass lifecycle.json absent, "
+                "final residual count not yet measurable"
+            ),
+        }
+    else:
+        final_residual_obj = {
+            "status": PENDING_RUN_COMPLETION,
+            "value_numeric": None,
+            "reason": "primary pass not adjudicated yet",
+        }
     metrics["residual_errors"] = {
         "status": MEASURED if primary_complete else PENDING_RUN_COMPLETION,
         "primary_total_issues": total_lifecycle,
@@ -533,13 +603,9 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         "primary_retry_exhausted": residual_primary,
         "primary_false_positive": fp_primary,
         "primary_keep_decisions": int(decision_dist.get("keep", 0)),
-        "final_residual_total": (
-            MEASURED if residual_complete else PENDING_RUN_COMPLETION
-        ),
+        "final_residual_total": final_residual_obj,
         "reason": (
-            "final residual count requires the residual pass lifecycle (run ACTIVE)"
-            if not residual_complete
-            else ""
+            "" if primary_complete else "primary adjudication not finalised"
         ),
     }
 
@@ -646,6 +712,8 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
             "primary_pass_complete": primary_complete,
             "residual_pass_complete": residual_complete,
         },
+        "notes": notes,
+        "terminal_discrepancy": terminal_discrepancy,
         "metrics": metrics,
     }
 
@@ -676,10 +744,24 @@ def _track_b_no_run(run_identity: str = UNKNOWN) -> dict[str, Any]:
             "reason": "no v31 run root found",
             "primary_pass_complete": False,
         },
+        "notes": [],
+        "terminal_discrepancy": None,
         "metrics": {
             "pid_coverage": dict(pending),
             "bad_repair": dict(pending),
-            "residual_errors": dict(pending),
+            "residual_errors": {
+                **pending,
+                "primary_total_issues": 0,
+                "primary_resolved_repair": 0,
+                "primary_retry_exhausted": 0,
+                "primary_false_positive": 0,
+                "primary_keep_decisions": 0,
+                "final_residual_total": {
+                    "status": NO_RUN,
+                    "value_numeric": None,
+                    "reason": "no v31 run root found",
+                },
+            },
             "deterministic_integrity": dict(pending),
             "russian_rubric": {
                 "status": NOT_MEASURABLE,
@@ -804,6 +886,18 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
     comp = tb.get("completion", {})
     if comp.get("status") not in (MEASURED, PENDING_RUN_COMPLETION, NO_RUN):
         errors.append("track_b.completion.status invalid")
+    # notes + terminal_discrepancy (Gate-visible annotations)
+    notes_v = tb.get("notes")
+    if not isinstance(notes_v, list) or any(not isinstance(n, str) for n in notes_v):
+        errors.append("track_b.notes must be a list of strings")
+    td_v = tb.get("terminal_discrepancy")
+    if td_v is not None:
+        if not isinstance(td_v, dict):
+            errors.append("track_b.terminal_discrepancy must be an object or null")
+        else:
+            for k in ("detected", "monitor_status", "artifacts_say"):
+                if k not in td_v:
+                    errors.append(f"track_b.terminal_discrepancy missing: {k}")
     mtcs = tb.get("metrics", {})
     for k in ("pid_coverage", "bad_repair", "residual_errors",
               "deterministic_integrity", "russian_rubric", "ltcr", "time_tokens"):
@@ -814,6 +908,29 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
             if st not in (MEASURED, PENDING_LIVE_RUN, PENDING_RUN_COMPLETION,
                           PENDING_DEFINITION, NOT_MEASURABLE, NO_RUN):
                 errors.append(f"track_b.metrics.{k}.status invalid: {st!r}")
+    # typed final_residual_total: must be {status, value_numeric: number|null, reason}
+    frt = (mtcs.get("residual_errors") or {}).get("final_residual_total")
+    if isinstance(frt, dict):
+        if frt.get("status") not in (MEASURED, PENDING_RUN_COMPLETION):
+            errors.append(
+                "track_b.metrics.residual_errors.final_residual_total.status invalid"
+            )
+        if "value_numeric" not in frt:
+            errors.append(
+                "track_b.metrics.residual_errors.final_residual_total.value_numeric missing"
+            )
+        elif frt["value_numeric"] is not None and not isinstance(
+            frt["value_numeric"], (int, float)
+        ):
+            errors.append(
+                "track_b.metrics.residual_errors.final_residual_total.value_numeric "
+                "must be a number or null"
+            )
+    elif frt is not None:
+        errors.append(
+            "track_b.metrics.residual_errors.final_residual_total must be a typed "
+            "object {status, value_numeric, reason}; bare strings are not allowed"
+        )
     # records hash shape when a real golden set is used
     rh = src.get("records_hash_sha256")
     if rh not in (None, UNKNOWN) and not _HEX_RE.match(str(rh)):

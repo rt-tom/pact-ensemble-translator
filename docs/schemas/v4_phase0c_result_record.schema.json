@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "pact-v4-phase0c-result-record/v1",
   "title": "Pact v4 Phase 0C baseline result record",
-  "description": "Versioned baseline artifact produced by Phase 0C. Combines Track A (chunk-size x right-context grid over chapter_046 golden accepted PIDs) and Track B (internal pipeline metrics from a v3.1 production run of chapter_100). Gate after Phase 2C reads this to freeze chunk range, right context, temperature/seed and risk thresholds. Contains only aggregated metrics, hashes and identities - never full translation text.",
+  "description": "Versioned baseline artifact produced by Phase 0C. Combines Track A (chunk-size x right-context grid over chapter_046 golden accepted PIDs) and Track B (internal pipeline metrics from a v3.1 production run of chapter_100). The Gate after Phase 2C reads this to freeze chunk range, right context, temperature/seed and risk thresholds. Contains only aggregated metrics, hashes, identities, and Gate-visible annotations (notes, terminal_discrepancy). Never full translation text. Track B terminal/monitor inconsistencies are recorded explicitly in track_b.notes and track_b.terminal_discrepancy; the bare-string form of residual_errors.final_residual_total is not allowed — a typed {status, value_numeric, reason} object is required.",
   "type": "object",
   "required": [
     "schema",
@@ -15,7 +15,11 @@
     "schema": { "const": "pact-v4-phase0c-result-record/v1" },
     "generated_at": { "type": "string" },
     "tool_version": { "type": "string" },
-    "notes": { "type": "array", "items": { "type": "string" } },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Top-level operator annotations about the record as a whole (e.g. cross-track findings, re-issue history). Distinct from track_b.notes, which is Track-B-specific."
+    },
     "track_a": {
       "type": "object",
       "required": [
@@ -86,8 +90,36 @@
     },
     "track_b": {
       "type": "object",
-      "required": ["source", "completion", "metrics"],
+      "required": [
+        "source",
+        "completion",
+        "notes",
+        "terminal_discrepancy",
+        "metrics"
+      ],
       "properties": {
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Track-B-specific operator annotations (e.g. monitor vs artifacts divergence, REUSED cache path, ACTIVE in-progress residual pass). May be empty when no Track-B-specific annotation is needed."
+        },
+        "terminal_discrepancy": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["detected", "monitor_status", "artifacts_say"],
+              "properties": {
+                "detected": { "type": "boolean" },
+                "monitor_status": { "type": "string" },
+                "artifacts_say": { "type": "string" },
+                "reason": { "type": "string" }
+              },
+              "additionalProperties": true
+            },
+            { "type": "null" }
+          ],
+          "description": "Explicit record of a divergence between monitor_state.v31.json and the v3.1 run artifacts (state.json, final HTML, residual lifecycle). null when there is no divergence to flag. Required so the Gate cannot mask an unresolved monitor=FAILED as a clean terminal state."
+        },
         "source": {
           "type": "object",
           "required": [
@@ -132,7 +164,32 @@
           "properties": {
             "pid_coverage": { "$ref": "#/$defs/metric_status" },
             "bad_repair": { "$ref": "#/$defs/metric_status" },
-            "residual_errors": { "$ref": "#/$defs/metric_status" },
+            "residual_errors": {
+              "type": "object",
+              "required": [
+                "status",
+                "primary_total_issues",
+                "primary_resolved_repair",
+                "primary_retry_exhausted",
+                "primary_false_positive",
+                "primary_keep_decisions",
+                "final_residual_total"
+              ],
+              "properties": {
+                "status": {
+                  "enum": ["measured", "pending_live_run", "pending_run_completion",
+                            "pending_definition", "not_measurable", "no_run"]
+                },
+                "primary_total_issues": { "type": "integer", "minimum": 0 },
+                "primary_resolved_repair": { "type": "integer", "minimum": 0 },
+                "primary_retry_exhausted": { "type": "integer", "minimum": 0 },
+                "primary_false_positive": { "type": "integer", "minimum": 0 },
+                "primary_keep_decisions": { "type": "integer", "minimum": 0 },
+                "final_residual_total": { "$ref": "#/$defs/typed_residual_total" },
+                "reason": { "type": "string" }
+              },
+              "additionalProperties": true
+            },
             "deterministic_integrity": { "$ref": "#/$defs/metric_status" },
             "russian_rubric": { "$ref": "#/$defs/metric_status" },
             "ltcr": { "$ref": "#/$defs/metric_status" },
@@ -158,9 +215,31 @@
           ]
         },
         "reason": { "type": "string" },
-        "value": {}
+        "value": {},
+        "value_numeric": {
+          "type": ["number", "null"],
+          "description": "Optional typed numeric value for metrics that carry one. Generic metric_status does not require it; residual_errors.final_residual_total uses the stricter typed_residual_total $ref."
+        }
       },
       "additionalProperties": true
+    },
+    "typed_residual_total": {
+      "type": "object",
+      "required": ["status", "value_numeric", "reason"],
+      "properties": {
+        "status": {
+          "enum": ["measured", "pending_run_completion"]
+        },
+        "value_numeric": {
+          "type": ["integer", "null"],
+          "description": "Final residual-pass retry_exhausted count, or null when the residual pass has not yet produced a lifecycle.json."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Empty when value_numeric is a number; explains why value_numeric is null otherwise."
+        }
+      },
+      "additionalProperties": false
     },
     "grid_cell": {
       "type": "object",

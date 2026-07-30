@@ -76,7 +76,10 @@ def v31_run(root: Path, *, primary: bool = True, residual: bool = False,
             lifecycle_statuses: list[str] | None = None,
             gate_fail_pids: list[str] | None = None,
             introduced_pids: list[str] | None = None,
-            selected_pids: list[str] | None = None) -> Path:
+            selected_pids: list[str] | None = None,
+            monitor_status: str | None = None,
+            monitor_stage: str = "11/11 Restore formatting and finalize HTML",
+            residual_retry_exhausted: int = 0) -> Path:
     """Build a synthetic v31 run_root; returns the root."""
     wj(root / "config.full_pipeline.v31.json", {"artifact_version": "3.1.3"})
     wj(root / "chapter_manifest.v31.json", {"chapter": "0100_x.html"})
@@ -138,7 +141,23 @@ def v31_run(root: Path, *, primary: bool = True, residual: bool = False,
             "changed_pids": selected_pids or [],
         })
     if residual:
-        wj(ch / "v31" / "residual" / "lifecycle.json", [])
+        rl: list[dict[str, Any]] = []
+        for i in range(residual_retry_exhausted):
+            rl.append({
+                "issue_id": f"v31-residual-{i:05d}",
+                "pid": "p00000",
+                "pass": "residual",
+                "round": 1,
+                "status": "resolved_retry_exhausted",
+            })
+        wj(ch / "v31" / "residual" / "lifecycle.json", rl)
+    if monitor_status is not None:
+        wj(root / "monitor_state.v31.json", {
+            "runner_version": "3.1.3",
+            "artifact_version": "3.1.3",
+            "stage": monitor_stage,
+            "status": monitor_status,
+        })
     return root
 
 
@@ -246,7 +265,11 @@ class PartialTrackBTests(unittest.TestCase):
             self.assertEqual("2/2", tb["metrics"]["deterministic_integrity"]["pid_coverage"])
             # residual_errors primary numbers measured but final residual pending
             self.assertEqual(1, tb["metrics"]["residual_errors"]["primary_retry_exhausted"])
-            self.assertEqual(PENDING_RUN_COMPLETION, tb["metrics"]["residual_errors"]["final_residual_total"])
+            # typed final_residual_total: status pending, value_numeric null, reason present
+            frt = tb["metrics"]["residual_errors"]["final_residual_total"]
+            self.assertEqual(PENDING_RUN_COMPLETION, frt["status"])
+            self.assertIsNone(frt["value_numeric"])
+            self.assertTrue(frt["reason"])
             self.assertEqual(NOT_MEASURABLE, tb["metrics"]["russian_rubric"]["status"])
             self.assertEqual(PENDING_DEFINITION, tb["metrics"]["ltcr"]["status"])
             self.assertEqual(MEASURED, tb["metrics"]["time_tokens"]["status"])
@@ -267,6 +290,61 @@ class PartialTrackBTests(unittest.TestCase):
             tb = m.import_track_b(Path(tmp) / "missing")
         self.assertEqual(NO_RUN, tb["completion"]["status"])
 
+    def test_complete_run_typed_residual_value_numeric(self) -> None:
+        """When the residual pass is complete, ``final_residual_total`` must
+        be a typed object with ``value_numeric`` equal to the
+        retry_exhausted count from the residual lifecycle, NOT a bare
+        status string."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = v31_run(Path(tmp), primary=True, residual=True,
+                           selected_pids=["p00000"],
+                           lifecycle_statuses=["resolved_repair"],
+                           residual_retry_exhausted=3)
+            tb = m.import_track_b(root)
+            self.assertEqual(MEASURED, tb["completion"]["status"])
+            frt = tb["metrics"]["residual_errors"]["final_residual_total"]
+            self.assertEqual({"status", "value_numeric", "reason"}, set(frt.keys()))
+            self.assertEqual("measured", frt["status"])
+            self.assertEqual(3, frt["value_numeric"])
+            self.assertEqual("", frt["reason"])
+
+    def test_monitor_failed_with_primary_complete_records_discrepancy(self) -> None:
+        """When monitor=FAILED but primary state.json + lifecycle.json are
+        present, the producer must record an explicit
+        ``terminal_discrepancy`` and a matching note, not mask the
+        failure as a successful terminal state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = v31_run(Path(tmp), primary=True, residual=False,
+                           selected_pids=["p00000"],
+                           lifecycle_statuses=["resolved_repair"],
+                           monitor_status="FAILED")
+            tb = m.import_track_b(root)
+            td = tb["terminal_discrepancy"]
+            self.assertIsNotNone(td)
+            self.assertTrue(td["detected"])
+            self.assertEqual("FAILED", td["monitor_status"])
+            self.assertIn("primary", td["artifacts_say"].lower())
+            self.assertTrue(any("terminal_discrepancy" in n for n in tb["notes"]))
+
+    def test_monitor_active_no_discrepancy(self) -> None:
+        """monitor=ACTIVE alone is not a discrepancy; only a note is added."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = v31_run(Path(tmp), primary=True, residual=False,
+                           selected_pids=["p00000"],
+                           lifecycle_statuses=["resolved_repair"],
+                           monitor_status="ACTIVE",
+                           monitor_stage="residual Gemma semantic audit")
+            tb = m.import_track_b(root)
+            self.assertIsNone(tb["terminal_discrepancy"])
+            self.assertTrue(any("ACTIVE" in n for n in tb["notes"]))
+
+    def test_no_run_has_empty_notes_and_null_discrepancy(self) -> None:
+        """The no-run shape is fixed: notes=[], terminal_discrepancy=None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tb = m.import_track_b(Path(tmp) / "missing")
+        self.assertEqual([], tb["notes"])
+        self.assertIsNone(tb["terminal_discrepancy"])
+
 
 class ResultRecordTests(unittest.TestCase):
     def test_versioning_and_roundtrip(self) -> None:
@@ -278,7 +356,7 @@ class ResultRecordTests(unittest.TestCase):
                            lifecycle_statuses=["resolved_repair"])
             rec = m.build_result_record(golden, root)
             self.assertEqual(SCHEMA_VERSION, rec["schema"])
-            self.assertEqual("pact-0c/0.1", rec["tool_version"])
+            self.assertEqual("pact-0c/0.2", rec["tool_version"])
             self.assertEqual(PENDING_LIVE_RUN, rec["track_a"]["aggregated"]["status"])
             self.assertEqual(PENDING_RUN_COMPLETION, rec["track_b"]["completion"]["status"])
             out = Path(tmp) / "out" / "result.json"
