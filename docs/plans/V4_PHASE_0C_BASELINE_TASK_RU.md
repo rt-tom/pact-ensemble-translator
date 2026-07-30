@@ -105,6 +105,51 @@ bad repair, deterministic integrity, translation time/tokens) are
 
 ## Usage
 
+### Prepare isolated Track A cells
+
+The preparation command snapshots mutable glossary/book-bible inputs into
+four independent cell directories. It refuses a non-empty bench root, never
+starts `llama-server`, and never invokes the translation pipeline:
+
+```powershell
+$ProjectRoot = '<development-worktree>'
+$SourceRoot = '<production-root>'
+$BenchRoot = '<new-gate-bench-run-directory>'
+
+cd "$ProjectRoot\pact_full_pipeline_runner_v1"
+
+py .\v4_phase0c_gate_bench.py `
+    --project-root $ProjectRoot `
+    --source-root $SourceRoot `
+    --bench-root $BenchRoot
+```
+
+The generated `run_track_a.ps1` contains the four sequential explicit
+translation commands. Start the tuned GemmaTranslate profile separately,
+inspect the generated configs, then execute that file as the operator. Do not
+use a production run directory as `--bench-root` and do not add destructive
+resume/redo flags.
+
+### Import Track A results
+
+Completed cells are discovered under
+`<bench-root>/<cell-id>/work/<chapter>/draft_translations.json`; missing cells
+remain `pending_live_run`. Each completed cell must also contain its
+`manifest.json`, from which actual PID-per-chunk counts are reported.
+
+```powershell
+py .\v4_phase0c_baseline.py `
+    --golden '<golden-set-root>\chapter_046\records.json' `
+    --track-a-run-root $BenchRoot `
+    --track-b-run-root '<production-run-root>' `
+    --out "$BenchRoot\phase0c_result.json"
+```
+
+The result record contains only aggregate metrics, hashes, PID identities and
+gap/violation flags; translated text is not copied into it.
+
+### Build a recipe/result record without live Track A outputs
+
 ```powershell
 cd D:\pact\pact_translator_v3\pact_full_pipeline_runner_v1
 
@@ -118,9 +163,8 @@ py .\v4_phase0c_baseline.py `
 py -m unittest self_test_v4_phase0c_baseline
 ```
 
-After the future Track A grid runs execute, fill each cell by importing the
-run output (`attach_grid_metrics`) — the harness already handles the
-measurement/gap logic; only the live runs remain operator-driven.
+Live runs remain operator-driven. The preparation helper deliberately does
+not manage or stop `llama-server` and does not attach to foreign servers.
 
 ## Acceptance
 
