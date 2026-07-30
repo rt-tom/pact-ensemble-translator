@@ -18,3 +18,5 @@
 2026-07-29. Отклонённые raw-ответы final Qwen global smoke сохраняются только в `v31/final/diagnostics/qwen_global_smoke` с `authoritative=false`: это позволяет видеть полный JSON и PID обрыва, но файлы не являются агрегатами и не участвуют в cache/reuse или качестве перевода.
 
 2026-07-29. Final Qwen global smoke больше не возвращает пустой `status: ok` для каждого PID: compact contract требует точное coverage всей главы и перечисляет только проблемные PID в `issues`. Это сохраняет chapter-wide проверку, но устраняет сотни информационно-пустых объектов, из-за которых ответ не помещался в лимит.
+
+2026-07-29. `quarantined` остаётся монотонным внутри run identity, но `failed` фиксирует execution/accounting failure и не блокирует последующий успешный final cycle: после устранения причины final gate может перейти в `complete`.

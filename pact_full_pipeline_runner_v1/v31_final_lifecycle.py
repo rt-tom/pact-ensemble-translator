@@ -101,13 +101,13 @@ def terminal_status(*, ledger_ok: bool, coverage_ok: bool, verification_ok: bool
     """Quality findings quarantine; execution and accounting failures fail.
 
     A terminal quarantine is monotonic: a later stale artifact can never turn it
-    into complete.  The runner is allowed exactly one final repair round.
+    into complete. A prior ``failed`` state records an execution/accounting
+    failure, so a later fully successful final cycle may recover to complete.
+    The runner is allowed exactly one final repair round.
     """
     if not ledger_ok or not coverage_ok or not verification_ok or not smoke_ok:
         return "failed"
     if final_repair_rounds > 1:
-        return "failed"
-    if prior_status == "failed":
         return "failed"
     if prior_status == "quarantined":
         return "quarantined"
