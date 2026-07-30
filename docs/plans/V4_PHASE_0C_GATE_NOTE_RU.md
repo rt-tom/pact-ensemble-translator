@@ -16,6 +16,18 @@ changelog, без нового runtime (Phase 1C chunk planner и Phase 2 risk/g
   (`D:\pact\pact_translator_v3_v31_production\pipeline_runs\chapter_100_to_100_v31`,
   run_identity `91e2d8ab...d1dbb52e09`).
 
+**Tool version 0.1 → 0.2.** Live record сгенерирован `pact-0c/0.2` (внешний
+прогон от 2026-07-30). В репозитории до этого PR константа
+`TOOL_VERSION` в `pact_full_pipeline_runner_v1/v4_phase0c_baseline.py`
+всё ещё была `pact-0c/0.1`. Этот PR поднимает её до `0.2` и обновляет
+assert в `self_test_v4_phase0c_baseline.py`, чтобы репозиторий снова
+мог воспроизвести именно ту baseline-запись, на которую Gate ссылается
+как на источник истины (`generated_at` + `tool_version` — это
+identity record'а, по которому Gate её опознаёт). Без этого бампа
+следующая регенерация record'а дала бы `0.1` и регресс по сравнению с
+Gate-заметкой. Сам bump не меняет поведения producer'а кроме
+строковой метки.
+
 ## Зафиксированные policy-решения
 
 ### 1. Chunking — Phase 1 (Phase 1C структура-aware chunk planner)

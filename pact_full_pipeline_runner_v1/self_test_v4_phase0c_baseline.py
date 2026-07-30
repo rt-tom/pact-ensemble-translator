@@ -278,7 +278,7 @@ class ResultRecordTests(unittest.TestCase):
                            lifecycle_statuses=["resolved_repair"])
             rec = m.build_result_record(golden, root)
             self.assertEqual(SCHEMA_VERSION, rec["schema"])
-            self.assertEqual("pact-0c/0.1", rec["tool_version"])
+            self.assertEqual("pact-0c/0.2", rec["tool_version"])
             self.assertEqual(PENDING_LIVE_RUN, rec["track_a"]["aggregated"]["status"])
             self.assertEqual(PENDING_RUN_COMPLETION, rec["track_b"]["completion"]["status"])
             out = Path(tmp) / "out" / "result.json"

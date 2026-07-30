@@ -40,7 +40,7 @@ from typing import Any
 import v4_measurement_harness as h0a
 
 SCHEMA_VERSION = "pact-v4-phase0c-result-record/v1"
-TOOL_VERSION = "pact-0c/0.1"
+TOOL_VERSION = "pact-0c/0.2"
 UNKNOWN = h0a.UNKNOWN
 
 PENDING_LIVE_RUN = "pending_live_run"
