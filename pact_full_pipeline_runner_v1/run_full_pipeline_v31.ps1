@@ -577,7 +577,7 @@ function Invoke-AggregateModelStage {
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {
         Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
-        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
+        Write-MonitorState -Stage $Label -Status 'REUSED'
         return
     }
     if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }
