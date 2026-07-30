@@ -7,15 +7,25 @@ regression tests. Интеграция в runtime consumers Phase 1C/2A/2B/2C �
 
 ## Опорные записи
 
-- Baseline: `D:\pact\gate_bench_runs\phase0c_track_a_001\phase0c_result.json`
-  (`pact-v4-phase0c-result-record/v1`, `tool_version pact-0c/0.2`,
-  `generated_at 2026-07-30T18:06:57+00:00`).
+- Baseline: live Phase 0C result record on the local machine
+  (`$BASELINE_DIR$/phase0c_track_a_001/phase0c_result.json`).
+  Identity: `pact-v4-phase0c-result-record/v1`, `tool_version pact-0c/0.2`,
+  `generated_at 2026-07-30T18:06:57+00:00`. The exact local path is
+  not committed to the repo and may differ between machines; the
+  record is identified by its schema version + tool version +
+  `generated_at`.
 - Track A: chapter 046 / Phase 0B golden set, 57 accepted PID,
   43 needs_review (исключены из численных метрик), 0 rejected, 0 gaps
   во всех ячейках.
 - Track B: chapter 100 v3.1 production run
-  (`D:\pact\pact_translator_v3_v31_production\pipeline_runs\chapter_100_to_100_v31`,
-  run_identity `91e2d8ab...d1dbb52e09`).
+  (`$V31_PROD_RUN_DIR$/chapter_100_to_100_v31`,
+  run_identity `91e2d8ab...d1dbb52e09`). Authoritative chapter-level
+  terminal artifact: `work/0100_duress-12-1/state.json` →
+  `status="complete"`, `output` HTML present on disk,
+  `completed_at="2026-07-30T18:00:03.639344+00:00"`. Top-level
+  `monitor_state.v31.json` reports `status="FAILED"` at stage
+  `11/11 Restore formatting and finalize HTML` — this is the
+  monitor/artifact discrepancy the Gate records.
 
 **Tool version 0.1 → 0.2.** Live record сгенерирован `pact-0c/0.2`
 (внешний прогон от 2026-07-30). В репозитории до этого PR константа
@@ -125,22 +135,44 @@ FP-candidate-rate преимущества `rc_on` (см. §"Ограничен�
 
 Track B для главы 100 содержит два противоречивых сигнала:
 
-- `state.json` и итоговый HTML помечены как `complete`
-  (primary pass adjudicated, primary artifacts present).
-- `monitor_state.v31.json` содержит исторический `status=FAILED`
-  (стадия `11/11 Restore formatting and finalize HTML`).
+- **Authoritative** chapter-level terminal artifact:
+  `work/0100_duress-12-1/state.json` (см. `v31_final_lifecycle.py`)
+  reports `status="complete"`, with the recorded `output` HTML
+  present on disk and `completed_at="2026-07-30T18:00:03+00:00"`.
+  This is the chapter's terminal state. The per-pass
+  `v31/primary/status.json` is a primary-pass projection and is not
+  a terminal artifact.
+- **Informative** monitor artifact: top-level
+  `monitor_state.v31.json` reports `status="FAILED"` at stage
+  `11/11 Restore formatting and finalize HTML` with
+  `failure_reason="… failed with exit code 1"`.
 
-Gate требует, чтобы эта несогласованность была **явно зафиксирована**
-в result record как `track_b.terminal_discrepancy` (с полями
-`detected: true`, `monitor_status`, `artifacts_say`, `reason`) и
-сопровождалась записью в `track_b.notes[]`. Без этого Track B
-нельзя интерпретировать как `complete` terminal state.
+A divergence between an **authoritative terminal artifact**
+(chapter-level `state.json`) and an **informative** monitor
+(`monitor_state.v31.json`) is a Gate-visible fact, not a quality
+claim: it must not be masked as a successful terminal state.
 
-Schema (`pact-v4-phase0c-result-record/v1`) делает оба поля
-`track_b.notes` и `track_b.terminal_discrepancy` **required**
-(`terminal_discrepancy` — nullable). Producer
-`v4_phase0c_baseline.py:import_track_b` заполняет их автоматически,
-когда `monitor_status=FAILED` + `primary_complete`.
+Gate requires this divergence to be **explicitly recorded** in the
+result record as `track_b.terminal_discrepancy` (with fields
+`detected: true`, `monitor_status`, `artifacts_say`, `reason`) and
+accompanied by an entry in `track_b.notes[]`. The producer
+(`v4_phase0c_baseline.py:import_track_b`) sets
+`terminal_discrepancy` only when:
+
+- `monitor_state.v31.json.status == "FAILED"`, AND
+- chapter-level `state.json.status == "complete"`, AND
+- the recorded `output` HTML path exists on disk.
+
+If `state.json.status` is `failed` / `quarantined` or the file is
+absent, monitor=FAILED is **not** a discrepancy; it is a failed run,
+and the producer records this alignment in `track_b.notes[]` instead
+of setting `terminal_discrepancy`. If `state.json.status="complete"`
+but the `output` HTML is missing on disk, the terminal record is
+treated as corrupt and no discrepancy is raised.
+
+Schema (`pact-v4-phase0c-result-record/v1`) makes both
+`track_b.notes` and `track_b.terminal_discrepancy` **required**
+(the latter nullable).
 
 ### 5. `final_residual_total` — typed form обязателен
 
@@ -187,8 +219,8 @@ Producer `v4_phase0c_baseline.py` теперь:
   `pact_v4/phase2/risk.py`, `pact_v4/phase2/cascade.py` и т. п.).
   Интеграция policy в эти consumers — отдельные тематические PR
   (Phase 1C PR, Phase 2 PR), как требует «один этап — один PR».
-- Не переиздаёт live baseline record в
-  `D:\pact\gate_bench_runs\phase0c_track_a_001\phase0c_result.json`.
+- Не переиздаёт live baseline record
+  (`$BASELINE_DIR$/phase0c_track_a_001/phase0c_result.json`).
   Переиздание — отдельный approved шаг, требующий явного «approved»
   на запись в persistent memory Phase 0C.
 - Не меняет Track A / Track B source данные, golden set или
@@ -215,8 +247,8 @@ Producer `v4_phase0c_baseline.py` теперь:
   `{status, value_numeric: int|null, reason}`; bare-string форма
   schema-rejected.
 - Producer, schema и regression tests зелёные на synthetic fixtures.
-- Live baseline record в `D:\pact\gate_bench_runs\...` остаётся
-  неизменным до отдельного approved re-issue.
+- Live baseline record (`$BASELINE_DIR$/phase0c_track_a_001/…`)
+  остаётся неизменным до отдельного approved re-issue.
 - Нет изменений V3 production code, run artifacts, translated
   chapters или cache.
 - Phase 1C/2 consumers не правятся этим PR.

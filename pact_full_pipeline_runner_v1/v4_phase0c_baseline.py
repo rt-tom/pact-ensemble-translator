@@ -377,6 +377,45 @@ def load_v31_residual_lifecycle(chapter_dir: Path) -> list[dict[str, Any]]:
     return read_v31_json(chapter_dir / "v31" / "residual" / "lifecycle.json", [])
 
 
+def load_terminal_state(chapter_dir: Path) -> dict[str, Any] | None:
+    """Read the authoritative v3.1 chapter-level terminal record.
+
+    ``work/<chapter>/state.json`` is the chapter lifecycle record;
+    its ``status`` is in {complete, quarantined, failed} (see
+    ``v31_final_lifecycle.py``). This is the **authoritative** terminal
+    artifact for the chapter. The per-pass
+    ``v31/primary/status.json`` is a primary-pass projection and is
+    NOT a terminal artifact; the producer must not use its existence
+    as evidence that "the chapter is complete".
+
+    Returns the parsed ``state.json`` dict, or ``None`` if absent or
+    unreadable. Callers must check ``status`` and treat any value
+    outside the terminal set as "no terminal state"."""
+    state = read_v31_json(chapter_dir / "state.json", {})
+    return state if isinstance(state, dict) else None
+
+
+def terminal_artifact_present(chapter_dir: Path) -> tuple[bool, str | None]:
+    """Return (is_terminal_complete, output_path_or_none).
+
+    A chapter is treated as terminal-complete only when
+    ``state.json.status == "complete"`` AND the ``output`` HTML path
+    recorded in ``state.json`` actually exists on disk. The HTML
+    existence check guards against a corrupt terminal record that
+    records a path without the corresponding artefact."""
+    state = load_terminal_state(chapter_dir)
+    if not isinstance(state, dict):
+        return False, None
+    if state.get("status") != "complete":
+        return False, None
+    output = state.get("output")
+    if not isinstance(output, str) or not output:
+        return False, None
+    if not Path(output).exists():
+        return False, output
+    return True, output
+
+
 def load_v31_verification_report(chapter_dir: Path) -> dict[str, Any]:
     return read_v31_json(chapter_dir / "v31" / "primary" / "verification_report.json", {})
 
@@ -472,6 +511,17 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
     # Residual pass is adjudicated once its lifecycle.json appears; absence -> pending.
     residual_complete = (residual_dir / "lifecycle.json").exists()
 
+    # Authoritative terminal state is the chapter-level ``state.json``
+    # (NOT the per-pass ``v31/primary/status.json``). For the Gate's
+    # monitor-vs-artifact discrepancy check, only the chapter-level
+    # terminal artifact counts as evidence that "the chapter is
+    # complete".
+    terminal_state = load_terminal_state(chapter_dir)
+    terminal_status_value: str | None = (
+        terminal_state.get("status") if isinstance(terminal_state, dict) else None
+    )
+    is_terminal_complete, terminal_output = terminal_artifact_present(chapter_dir)
+
     source = {
         "chapter_id": chapter_dir.name.split("_", 1)[0],
         "pipeline": "v31 (run_full_pipeline_v31.ps1)",
@@ -480,6 +530,8 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         "artifact_version": artifact_version,
         "monitor_stage": monitor_stage,
         "monitor_status": monitor_status,
+        "terminal_status": terminal_status_value or UNKNOWN,
+        "terminal_output_path": terminal_output or UNKNOWN,
     }
 
     if primary_complete and residual_complete:
@@ -499,24 +551,35 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
     notes: list[str] = []
     terminal_discrepancy: dict[str, Any] | None = None
     if monitor_status in ("FAILED", "ACTIVE", "REUSED"):
-        # monitor_state is informative, not authoritative for terminal status.
-        # The v3.1 artifacts (state.json / final HTML) are authoritative for
-        # "the chapter is complete and translation is frozen". A divergence
-        # between monitor and artifacts is a Gate-visible fact, never masked.
-        if monitor_status == "FAILED" and primary_complete:
+        # monitor_state is informative, not authoritative. The v3.1
+        # chapter-level state.json (and the final HTML referenced
+        # from it) is the only authoritative terminal artifact.
+        if monitor_status == "FAILED" and is_terminal_complete:
             terminal_discrepancy = {
                 "detected": True,
                 "monitor_status": monitor_status,
-                "artifacts_say": "primary state.json and lifecycle.json present",
+                "artifacts_say": (
+                    f"chapter-level state.json.status='complete' and "
+                    f"output HTML exists at {terminal_output!r}"
+                ),
                 "reason": (
                     "historical monitor_state.v31.json reports FAILED "
-                    "while primary pass artifacts are complete; reconciliation "
-                    "required before this run is treated as a quality success"
+                    "while the authoritative chapter-level terminal "
+                    "artifact is 'complete'; reconciliation required "
+                    "before this run is treated as a quality success"
                 ),
             }
             notes.append(
                 "track_b.terminal_discrepancy detected: monitor=FAILED vs "
-                "primary artifacts complete (state.json + lifecycle.json present)"
+                "chapter-level state.json.status='complete' and final HTML present"
+            )
+        elif monitor_status == "FAILED" and isinstance(terminal_state, dict):
+            # terminal_state present but not 'complete' — this is a
+            # failed run, not a discrepancy. Note it for the record
+            # without raising a discrepancy flag.
+            notes.append(
+                f"track_b monitor=FAILED aligns with chapter-level "
+                f"state.json.status={terminal_status_value!r}; no discrepancy"
             )
         elif monitor_status == "ACTIVE":
             notes.append(
@@ -886,18 +949,26 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
     comp = tb.get("completion", {})
     if comp.get("status") not in (MEASURED, PENDING_RUN_COMPLETION, NO_RUN):
         errors.append("track_b.completion.status invalid")
-    # notes + terminal_discrepancy (Gate-visible annotations)
-    notes_v = tb.get("notes")
-    if not isinstance(notes_v, list) or any(not isinstance(n, str) for n in notes_v):
-        errors.append("track_b.notes must be a list of strings")
-    td_v = tb.get("terminal_discrepancy")
-    if td_v is not None:
-        if not isinstance(td_v, dict):
-            errors.append("track_b.terminal_discrepancy must be an object or null")
-        else:
-            for k in ("detected", "monitor_status", "artifacts_say"):
-                if k not in td_v:
-                    errors.append(f"track_b.terminal_discrepancy missing: {k}")
+    # notes + terminal_discrepancy (Gate-visible annotations). The keys
+    # themselves are required by schema; this validator hard-fails when
+    # they are absent.
+    if "notes" not in tb:
+        errors.append("track_b.notes missing (required by schema)")
+    else:
+        notes_v = tb["notes"]
+        if not isinstance(notes_v, list) or any(not isinstance(n, str) for n in notes_v):
+            errors.append("track_b.notes must be a list of strings")
+    if "terminal_discrepancy" not in tb:
+        errors.append("track_b.terminal_discrepancy missing (required by schema)")
+    else:
+        td_v = tb["terminal_discrepancy"]
+        if td_v is not None:
+            if not isinstance(td_v, dict):
+                errors.append("track_b.terminal_discrepancy must be an object or null")
+            else:
+                for k in ("detected", "monitor_status", "artifacts_say"):
+                    if k not in td_v:
+                        errors.append(f"track_b.terminal_discrepancy missing: {k}")
     mtcs = tb.get("metrics", {})
     for k in ("pid_coverage", "bad_repair", "residual_errors",
               "deterministic_integrity", "russian_rubric", "ltcr", "time_tokens"):
@@ -911,7 +982,7 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
     # typed final_residual_total: must be {status, value_numeric: number|null, reason}
     frt = (mtcs.get("residual_errors") or {}).get("final_residual_total")
     if isinstance(frt, dict):
-        if frt.get("status") not in (MEASURED, PENDING_RUN_COMPLETION):
+        if frt.get("status") not in (MEASURED, PENDING_RUN_COMPLETION, NO_RUN):
             errors.append(
                 "track_b.metrics.residual_errors.final_residual_total.status invalid"
             )
@@ -925,6 +996,11 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
             errors.append(
                 "track_b.metrics.residual_errors.final_residual_total.value_numeric "
                 "must be a number or null"
+            )
+        if "reason" not in frt or not isinstance(frt["reason"], str):
+            errors.append(
+                "track_b.metrics.residual_errors.final_residual_total.reason "
+                "must be a string (empty when value_numeric is a number)"
             )
     elif frt is not None:
         errors.append(

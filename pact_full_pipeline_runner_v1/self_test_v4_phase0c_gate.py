@@ -77,7 +77,9 @@ def make_v31_run(root: Path, *, primary: bool = True, residual: bool = False,
                  primary_lifecycle: list[str] | None = None,
                  residual_lifecycle: list[dict] | None = None,
                  monitor_status: str | None = None,
-                 monitor_stage: str = "11/11 Restore formatting and finalize HTML") -> Path:
+                 monitor_stage: str = "11/11 Restore formatting and finalize HTML",
+                 terminal_status: str = "complete",
+                 create_output_html: bool = True) -> Path:
     wj(root / "config.full_pipeline.v31.json", {"artifact_version": "3.1.3"})
     wj(root / "chapter_manifest.v31.json", {"chapter": "0100_x.html"})
     wj(root / "book_bible.json", {"characters": []})
@@ -133,6 +135,25 @@ def make_v31_run(root: Path, *, primary: bool = True, residual: bool = False,
         })
     if residual:
         wj(ch / "v31" / "residual" / "lifecycle.json", residual_lifecycle or [])
+    # Authoritative chapter-level terminal state.json. Default: complete
+    # with output HTML present on disk. Tests that need a failed run
+    # pass terminal_status="failed" / "quarantined".
+    output_html = root / "output" / "0100_x.html"
+    if create_output_html and terminal_status == "complete":
+        output_html.parent.mkdir(parents=True, exist_ok=True)
+        output_html.write_text("<html>test</html>", encoding="utf-8")
+        wj(ch / "state.json", {
+            "status": terminal_status,
+            "output": str(output_html),
+            "completed_at": "2026-07-30T18:00:03+00:00",
+        })
+    else:
+        wj(ch / "state.json", {
+            "status": terminal_status,
+            "output": str(output_html) if create_output_html else None,
+            "completed_at": ("2026-07-30T18:00:03+00:00"
+                             if terminal_status == "complete" else None),
+        })
     if monitor_status is not None:
         wj(root / "monitor_state.v31.json", {
             "runner_version": "3.1.3", "artifact_version": "3.1.3",
@@ -332,18 +353,74 @@ class ProducerTests(unittest.TestCase):
         self.assertIsNone(frt["value_numeric"])
         self.assertTrue(frt["reason"])
 
-    def test_monitor_failed_with_primary_complete_records_discrepancy(self) -> None:
+    def test_monitor_failed_with_chapter_terminal_complete_records_discrepancy(self) -> None:
+        """When monitor=FAILED but the authoritative chapter-level
+        ``state.json`` reports ``status=complete`` and the recorded
+        output HTML exists on disk, the producer must record an
+        explicit ``terminal_discrepancy`` (not mask monitor=FAILED as a
+        clean terminal state). The previous version of this test used
+        the per-pass ``v31/primary/status.json`` as a proxy for
+        "chapter complete"; that was wrong because the primary-pass
+        projection is not a terminal artifact."""
         root = make_v31_run(self.tmp / "r", primary=True, residual=False,
                             primary_lifecycle=["resolved_repair"],
-                            monitor_status="FAILED")
+                            monitor_status="FAILED",
+                            terminal_status="complete")
         tb = self.m.import_track_b(root)
         td = tb["terminal_discrepancy"]
         self.assertIsNotNone(td)
         self.assertTrue(td["detected"])
         self.assertEqual("FAILED", td["monitor_status"])
-        self.assertIn("primary", td["artifacts_say"].lower())
+        self.assertIn("complete", td["artifacts_say"].lower())
         self.assertTrue(td["reason"])
         self.assertTrue(any("terminal_discrepancy" in n for n in tb["notes"]))
+        self.assertEqual("complete", tb["source"]["terminal_status"])
+
+    def test_monitor_failed_with_state_json_failed_is_not_a_discrepancy(self) -> None:
+        """When state.json.status='failed', monitor=FAILED is consistent
+        and must NOT be reported as a terminal_discrepancy. The Gate
+        only flags divergence; consistent failure is a failed run."""
+        root = make_v31_run(self.tmp / "r", primary=True, residual=False,
+                            primary_lifecycle=["resolved_repair"],
+                            monitor_status="FAILED",
+                            terminal_status="failed",
+                            create_output_html=False)
+        tb = self.m.import_track_b(root)
+        self.assertIsNone(tb["terminal_discrepancy"])
+        self.assertEqual("failed", tb["source"]["terminal_status"])
+        self.assertTrue(any("aligns" in n and "state.json.status='failed'" in n
+                            for n in tb["notes"]))
+
+    def test_monitor_failed_with_state_json_complete_but_output_html_missing(self) -> None:
+        """state.json.status='complete' but the recorded output HTML path
+        does not exist on disk: this is a corrupt terminal record, not
+        a clean complete. The producer must not raise a discrepancy
+        based on a phantom complete; it must treat this as
+        not-terminal-complete."""
+        root = make_v31_run(self.tmp / "r", primary=True, residual=False,
+                            primary_lifecycle=["resolved_repair"],
+                            monitor_status="FAILED",
+                            terminal_status="complete",
+                            create_output_html=False)
+        tb = self.m.import_track_b(root)
+        self.assertIsNone(tb["terminal_discrepancy"])
+        self.assertEqual("complete", tb["source"]["terminal_status"])
+        self.assertEqual("unknown", tb["source"]["terminal_output_path"])
+
+    def test_monitor_failed_with_state_json_missing(self) -> None:
+        """state.json absent entirely (no terminal record yet):
+        monitor=FAILED is a failed run, not a discrepancy."""
+        tmp = Path(self._tmp.name) / "no_state"
+        tmp.mkdir()
+        root = make_v31_run(tmp / "r", primary=True, residual=False,
+                            primary_lifecycle=["resolved_repair"],
+                            monitor_status="FAILED",
+                            terminal_status="complete",
+                            create_output_html=True)
+        (root / "work" / "0100_x" / "state.json").unlink()
+        tb = self.m.import_track_b(root)
+        self.assertIsNone(tb["terminal_discrepancy"])
+        self.assertEqual("unknown", tb["source"]["terminal_status"])
 
     def test_monitor_active_is_a_note_not_a_discrepancy(self) -> None:
         root = make_v31_run(self.tmp / "r", primary=True, residual=False,
@@ -381,7 +458,8 @@ class ProducerTests(unittest.TestCase):
         root = make_v31_run(self.tmp / "r", primary=True, residual=True,
                             primary_lifecycle=["resolved_repair"],
                             residual_lifecycle=rl,
-                            monitor_status="FAILED")
+                            monitor_status="FAILED",
+                            terminal_status="complete")
         rec = self.m.build_result_record(None, root)
         # The producer output must validate against validate_result_record
         # (the in-tree contract check) with no errors.
@@ -393,6 +471,40 @@ class ProducerTests(unittest.TestCase):
         )
         # And terminal_discrepancy must be detected.
         self.assertTrue(rec["track_b"]["terminal_discrepancy"]["detected"])
+
+    def test_validator_rejects_missing_terminal_discrepancy_key(self) -> None:
+        """The validator must hard-fail when the required
+        ``track_b.terminal_discrepancy`` key is missing entirely, not
+        silently accept a missing key as ``None``."""
+        rec = self.m.build_result_record(None, None)
+        rec["track_b"].pop("terminal_discrepancy", None)
+        errors = self.m.validate_result_record(rec)
+        self.assertTrue(
+            any("terminal_discrepancy missing" in e for e in errors),
+            f"expected hard error on missing terminal_discrepancy, got {errors!r}",
+        )
+
+    def test_validator_rejects_missing_final_residual_reason(self) -> None:
+        """The validator must hard-fail when the required
+        ``final_residual_total.reason`` field is missing or not a string."""
+        rec = self.m.build_result_record(None, None)
+        rec["track_b"]["metrics"]["residual_errors"]["final_residual_total"].pop("reason", None)
+        errors = self.m.validate_result_record(rec)
+        self.assertTrue(
+            any("final_residual_total.reason" in e for e in errors),
+            f"expected hard error on missing reason, got {errors!r}",
+        )
+
+    def test_validator_rejects_missing_notes_key(self) -> None:
+        """The validator must hard-fail when ``track_b.notes`` is missing
+        entirely, even if it is an empty list when present."""
+        rec = self.m.build_result_record(None, None)
+        rec["track_b"].pop("notes", None)
+        errors = self.m.validate_result_record(rec)
+        self.assertTrue(
+            any("track_b.notes missing" in e for e in errors),
+            f"expected hard error on missing notes, got {errors!r}",
+        )
 
 
 # --------------------------------------------------------------------- #
@@ -412,8 +524,13 @@ class MergeBaseGuardTests(unittest.TestCase):
       * committing run artifacts, golden set, translated chapters,
         models, logs, secrets or backups.
 
-    Skipped when no upstream is configured (the local-only check below
-    covers a single-commit case) or when git is unavailable."""
+    Skipped when ``origin/main`` is not available locally.
+
+    The test computes the merge base of HEAD and ``origin/main``
+    explicitly. Using ``@{u}`` (the previous implementation) pointed
+    at this branch's own remote-tracking ref (``origin/vk/…-gate-only``),
+    producing an empty diff and silently skipping the guard; that
+    defeated the whole point of the test."""
 
     @staticmethod
     def _git(*args: str, cwd: str | None = None) -> str:
@@ -423,31 +540,33 @@ class MergeBaseGuardTests(unittest.TestCase):
         ).stdout
 
     def _resolve_base(self) -> str | None:
+        # Explicit base reference. The PR's declared base is "main";
+        # using `origin/main` rather than the branch's own @{u} avoids
+        # the silent-empty-diff failure mode of the previous version.
         try:
-            upstream = self._git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+            self._git("rev-parse", "--verify", "origin/main")
         except subprocess.CalledProcessError:
             return None
-        upstream = upstream.strip()
-        if not upstream:
+        merge_base = subprocess.run(
+            ["git", "merge-base", "HEAD", "origin/main"],
+            cwd=str(ROOT), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if not merge_base:
             return None
         try:
-            self._git("rev-parse", "--verify", upstream)
+            self._git("rev-parse", "--verify", merge_base + "^{commit}")
         except subprocess.CalledProcessError:
             return None
-        return upstream
+        return merge_base
 
     def test_diff_against_base_touches_only_allowed_paths(self) -> None:
         base = self._resolve_base()
         if base is None:
-            self.skipTest("no upstream configured for this branch")
-        try:
-            self._git("rev-parse", "--verify", f"{base}^{{commit}}")
-        except subprocess.CalledProcessError:
-            self.skipTest(f"upstream {base!r} has no commit reachable locally")
+            self.skipTest("origin/main not available locally; run with a fetched main")
         diff = self._git("diff", "--name-only", base, "HEAD")
         changed = sorted({p.strip().replace("\\", "/") for p in diff.splitlines() if p.strip()})
         if not changed:
-            self.skipTest(f"no diff vs {base!r} (no commits yet?)")
+            self.skipTest(f"no diff vs merge-base {base[:12]}… (no commits since main?)")
         unexpected = [p for p in changed if p not in ALLOWED_PATHS]
         self.assertEqual(
             unexpected, [],

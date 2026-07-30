@@ -79,7 +79,9 @@ def v31_run(root: Path, *, primary: bool = True, residual: bool = False,
             selected_pids: list[str] | None = None,
             monitor_status: str | None = None,
             monitor_stage: str = "11/11 Restore formatting and finalize HTML",
-            residual_retry_exhausted: int = 0) -> Path:
+            residual_retry_exhausted: int = 0,
+            terminal_status: str = "complete",
+            create_output_html: bool = True) -> Path:
     """Build a synthetic v31 run_root; returns the root."""
     wj(root / "config.full_pipeline.v31.json", {"artifact_version": "3.1.3"})
     wj(root / "chapter_manifest.v31.json", {"chapter": "0100_x.html"})
@@ -100,9 +102,28 @@ def v31_run(root: Path, *, primary: bool = True, residual: bool = False,
         "attempts": [{"attempt": 1, "ok": True,
                        "generation": {"usage": {"prompt_tokens": 100, "completion_tokens": 50,
                                                  "total_tokens": 150},
-                                       "wall_seconds": 12.5,
-                                       "finish_reason": "stop"}}],
+                                        "wall_seconds": 12.5,
+                                        "finish_reason": "stop"}}],
     })
+    # Authoritative chapter-level terminal state.json. Default: complete
+    # with output HTML present on disk. Tests that need a failed run
+    # pass terminal_status="failed" / "quarantined".
+    output_html = root / "output" / "0100_x.html"
+    if create_output_html and terminal_status == "complete":
+        output_html.parent.mkdir(parents=True, exist_ok=True)
+        output_html.write_text("<html>test</html>", encoding="utf-8")
+        wj(ch / "state.json", {
+            "status": terminal_status,
+            "output": str(output_html),
+            "completed_at": "2026-07-30T18:00:03+00:00",
+        })
+    else:
+        wj(ch / "state.json", {
+            "status": terminal_status,
+            "output": str(output_html) if create_output_html else None,
+            "completed_at": ("2026-07-30T18:00:03+00:00"
+                             if terminal_status == "complete" else None),
+        })
     if primary:
         wj(ch / "v31" / "primary" / "status.json",
            {"version": "3.1.3", "pass": "primary", "last_round": 1,
@@ -308,23 +329,47 @@ class PartialTrackBTests(unittest.TestCase):
             self.assertEqual(3, frt["value_numeric"])
             self.assertEqual("", frt["reason"])
 
-    def test_monitor_failed_with_primary_complete_records_discrepancy(self) -> None:
-        """When monitor=FAILED but primary state.json + lifecycle.json are
-        present, the producer must record an explicit
-        ``terminal_discrepancy`` and a matching note, not mask the
-        failure as a successful terminal state."""
+    def test_monitor_failed_with_chapter_terminal_complete_records_discrepancy(self) -> None:
+        """When monitor=FAILED but the authoritative chapter-level
+        ``state.json`` reports ``status=complete`` and the recorded
+        output HTML exists on disk, the producer must record an
+        explicit ``terminal_discrepancy`` (not mask monitor=FAILED as a
+        clean terminal state). The previous version of this test used
+        the per-pass ``v31/primary/status.json`` as a proxy for
+        "chapter complete"; that was wrong because the primary-pass
+        projection is not a terminal artifact."""
         with tempfile.TemporaryDirectory() as tmp:
             root = v31_run(Path(tmp), primary=True, residual=False,
                            selected_pids=["p00000"],
                            lifecycle_statuses=["resolved_repair"],
-                           monitor_status="FAILED")
+                           monitor_status="FAILED",
+                           terminal_status="complete")
             tb = m.import_track_b(root)
             td = tb["terminal_discrepancy"]
             self.assertIsNotNone(td)
             self.assertTrue(td["detected"])
             self.assertEqual("FAILED", td["monitor_status"])
-            self.assertIn("primary", td["artifacts_say"].lower())
+            self.assertIn("complete", td["artifacts_say"].lower())
             self.assertTrue(any("terminal_discrepancy" in n for n in tb["notes"]))
+            self.assertEqual("complete", tb["source"]["terminal_status"])
+
+    def test_monitor_failed_with_terminal_failed_is_not_a_discrepancy(self) -> None:
+        """When monitor=FAILED aligns with chapter-level
+        state.json.status='failed', this is a failed run, not a
+        discrepancy. The producer must not raise terminal_discrepancy;
+        it must add a note documenting the alignment."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = v31_run(Path(tmp), primary=True, residual=False,
+                           selected_pids=["p00000"],
+                           lifecycle_statuses=["resolved_repair"],
+                           monitor_status="FAILED",
+                           terminal_status="failed",
+                           create_output_html=False)
+            tb = m.import_track_b(root)
+            self.assertIsNone(tb["terminal_discrepancy"])
+            self.assertEqual("failed", tb["source"]["terminal_status"])
+            self.assertTrue(any("aligns" in n and "state.json.status='failed'" in n
+                                for n in tb["notes"]))
 
     def test_monitor_active_no_discrepancy(self) -> None:
         """monitor=ACTIVE alone is not a discrepancy; only a note is added."""
