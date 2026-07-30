@@ -102,6 +102,7 @@ def terminal_status(*, ledger_ok: bool, coverage_ok: bool, verification_ok: bool
 
     Blocking findings remain durable and visible, but do not prevent final HTML
     creation. A legacy quarantine is promoted only to the explicit warning
+<<<<<<< HEAD
     status, never silently to a clean completion. A prior ``failed`` state may
     recover after its execution/accounting cause is eliminated. The runner is
     allowed one final repair round.
