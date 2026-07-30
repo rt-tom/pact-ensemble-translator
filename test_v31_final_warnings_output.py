@@ -37,6 +37,10 @@ class FinalWarningsOutputTests(unittest.TestCase):
         runner = (PACKAGE / "run_full_pipeline_v31.ps1").read_text(encoding="utf-8-sig")
         self.assertIn(".status -eq 'quarantined'", runner)
 
+    def test_final_lifecycle_contains_no_unresolved_conflict_marker(self):
+        lifecycle = (PACKAGE / "v31_final_lifecycle.py").read_text(encoding="utf-8")
+        self.assertNotIn("<<<<<<<", lifecycle)
+
 
 if __name__ == "__main__":
     unittest.main()
