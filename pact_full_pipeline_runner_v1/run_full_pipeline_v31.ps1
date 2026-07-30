@@ -577,11 +577,20 @@ function Invoke-AggregateModelStage {
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {
         Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
-        # The aggregate proves coverage, while the producer's per-unit cache
-        # identity proves that it matches the current translations and prompt.
-        # Keep the owned server available if that second check requires a rerun.
-        Start-LlamaServer $Profile
-        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
+        $auditScript = Join-Path $PackageRoot 'v31_audit.py'
+        if ($Arguments -contains $auditScript) {
+            Push-Location $ProjectRoot
+            try { & $Python @Arguments '--cache-check'; $cacheExit = $LASTEXITCODE } finally { Pop-Location }
+            if ($cacheExit -eq 0) {
+                Write-MonitorState -Stage $Label -Status 'REUSED'
+                return
+            }
+            if ($cacheExit -ne 20) { throw "$Label cache-only probe failed with exit code $cacheExit" }
+            Start-LlamaServer $Profile
+            Invoke-PythonStage -Label $Label -Arguments $Arguments
+            return
+        }
+        Write-MonitorState -Stage $Label -Status 'REUSED'
         return
     }
     if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }
