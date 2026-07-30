@@ -197,10 +197,14 @@ def test_run_generate_left_context_uses_fidelity_first_draft_not_selection(tmp_p
     assert result.chunk_count == 2
     calls_by_chunk = {c.chunk_id: c for c in caller.calls}
     chunk_ids = sorted(calls_by_chunk)
-    # There may be 1 or 2 calls per chunk (low vs high risk); find the
-    # first call recorded for chunk 2 (fidelity_first is always first).
-    second_chunk_calls = [c for c in caller.calls if c.chunk_id == chunk_ids[1]]
-    second_bundle = second_chunk_calls[0]
+    # There may be 1 or 2 calls per chunk (low vs high risk); pick the
+    # fidelity_first call explicitly rather than assuming role order.
+    second_chunk_fidelity_calls = [
+        c for c in caller.calls
+        if c.chunk_id == chunk_ids[1] and c.role == "fidelity_first"
+    ]
+    assert second_chunk_fidelity_calls, "expected a fidelity_first call for chunk 2"
+    second_bundle = second_chunk_fidelity_calls[0]
     assert second_bundle.left_context != ()
     left_texts = [text for _, text in second_bundle.left_context]
     # Only fidelity_first ("короткий буквальный") text may appear, since
