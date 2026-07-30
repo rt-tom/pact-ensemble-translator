@@ -374,6 +374,11 @@ class ProducerTests(unittest.TestCase):
         self.assertIn("complete", td["artifacts_say"].lower())
         self.assertTrue(td["reason"])
         self.assertTrue(any("terminal_discrepancy" in n for n in tb["notes"]))
+        # The record must not embed the absolute final HTML path:
+        # the result record is a persistent artefact and a
+        # machine-specific path is forbidden by the Gate note.
+        self.assertNotIn("D:\\", td["artifacts_say"])
+        self.assertNotIn("D:\\", str(tb["source"]))
         self.assertEqual("complete", tb["source"]["terminal_status"])
 
     def test_monitor_failed_with_state_json_failed_is_not_a_discrepancy(self) -> None:
@@ -405,7 +410,10 @@ class ProducerTests(unittest.TestCase):
         tb = self.m.import_track_b(root)
         self.assertIsNone(tb["terminal_discrepancy"])
         self.assertEqual("complete", tb["source"]["terminal_status"])
-        self.assertEqual("unknown", tb["source"]["terminal_output_path"])
+        # terminal_output_present is the boolean placeholder that
+        # replaced the absolute path; False here because the HTML is
+        # not actually on disk.
+        self.assertFalse(tb["source"]["terminal_output_present"])
 
     def test_monitor_failed_with_state_json_missing(self) -> None:
         """state.json absent entirely (no terminal record yet):

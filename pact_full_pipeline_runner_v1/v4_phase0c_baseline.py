@@ -515,12 +515,22 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
     # (NOT the per-pass ``v31/primary/status.json``). For the Gate's
     # monitor-vs-artifact discrepancy check, only the chapter-level
     # terminal artifact counts as evidence that "the chapter is
-    # complete".
+    # complete". We deliberately do NOT record the absolute path to
+    # the final HTML here: that would embed a machine-specific path
+    # in the persistent baseline record. The record only carries
+    # ``terminal_output_present`` (a boolean), which is enough to
+    # tell apart "complete + HTML on disk" from "complete with no
+    # HTML recorded" or "not complete". Downstream consumers that
+    # need the actual path re-read ``state.json`` via the operator's
+    # --track-b-run-root.
     terminal_state = load_terminal_state(chapter_dir)
     terminal_status_value: str | None = (
         terminal_state.get("status") if isinstance(terminal_state, dict) else None
     )
-    is_terminal_complete, terminal_output = terminal_artifact_present(chapter_dir)
+    is_terminal_complete, _terminal_output = terminal_artifact_present(chapter_dir)
+    terminal_output_present: bool = (
+        is_terminal_complete and (terminal_state.get("status") == "complete")
+    )
 
     source = {
         "chapter_id": chapter_dir.name.split("_", 1)[0],
@@ -531,7 +541,7 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         "monitor_stage": monitor_stage,
         "monitor_status": monitor_status,
         "terminal_status": terminal_status_value or UNKNOWN,
-        "terminal_output_path": terminal_output or UNKNOWN,
+        "terminal_output_present": terminal_output_present,
     }
 
     if primary_complete and residual_complete:
@@ -558,9 +568,16 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
             terminal_discrepancy = {
                 "detected": True,
                 "monitor_status": monitor_status,
+                # Boolean, not a path: the result record is a
+                # persistent artefact and must not embed the
+                # machine-specific final HTML path. Downstream
+                # consumers that need the actual path re-read
+                # ``state.json`` via the operator's
+                # ``--track-b-run-root``.
                 "artifacts_say": (
-                    f"chapter-level state.json.status='complete' and "
-                    f"output HTML exists at {terminal_output!r}"
+                    "chapter-level state.json.status='complete' and "
+                    "final HTML is present on disk (boolean; path "
+                    "intentionally not stored in the result record)"
                 ),
                 "reason": (
                     "historical monitor_state.v31.json reports FAILED "
