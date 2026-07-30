@@ -454,6 +454,7 @@ def main() -> int:
                         help="override reviewer context only for qwen_global_smoke")
     parser.add_argument("--pids-file", help="JSON ledger or list restricting TARGET_PIDS; context remains adjacent manifest PIDs")
     parser.add_argument("--pids-map", type=Path, help="Canonical per-chapter final changed-PID ledger scope map")
+    parser.add_argument("--cache-check", action="store_true", help="validate per-unit cache identity without model HTTP calls")
     args = parser.parse_args()
     setup_logging()
     runtime = load_runtime(args.project_root.resolve())
@@ -499,7 +500,7 @@ def main() -> int:
             stage = stage_cfg(cfg, section, DEFAULTS[args.mode])
             units = list(batched(pids, int(stage["batch_pids"])))
 
-        def evaluate_unit(unit_pids: list[str], cache_path: Path, label: str):
+        def unit_payload(unit_pids: list[str]):
             if args.mode == "qwen_global_smoke":
                 local_stage, messages = qwen_global_smoke_messages(runtime, cfg, work, blocks, block_map, translations, unit_pids, args.pass_name)
             elif args.mode == "qwen_semantic":
@@ -517,6 +518,10 @@ def main() -> int:
                 config=local_stage, prompt=messages,
                 profile={"model": args.model or cfg[api_section].get("model"), "api": api_section},
             )
+            return local_stage, messages, identity
+
+        def evaluate_unit(unit_pids: list[str], cache_path: Path, label: str):
+            local_stage, messages, identity = unit_payload(unit_pids)
             if not args.force:
                 saved, reason = cache_reuse(cache_path, identity)
                 if saved is not None:
@@ -571,6 +576,19 @@ def main() -> int:
                 }
             write_json(cache_path, with_cache_identity(record, identity))
             return local_issues, local_covered
+
+        if args.cache_check:
+            if args.force:
+                return 20
+            for index, unit in enumerate(units, 1):
+                _, _, identity = unit_payload(unit)
+                cache = root / f"unit_{index:04d}.json"
+                saved, reason = cache_reuse(cache, identity)
+                if saved is None:
+                    logging.info("Cache check requires model for %s: %s", cache, reason)
+                    return 20
+            logging.info("Cache check reused %s %s", args.mode, source_path.name)
+            continue
 
         for index, unit in enumerate(units, 1):
             cache = root / f"unit_{index:04d}.json"
