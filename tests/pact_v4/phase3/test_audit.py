@@ -318,3 +318,35 @@ def test_findings_from_different_detectors_on_same_pid_all_retained():
 
     region = outcome.region_plan.for_pid("p00000")[0]
     assert set(f.content_hash for f in pid_findings) == set(region.finding_content_hashes)
+
+
+# 10. A missing/empty translation produces a zero-length Region(pid, 0, 0). This is
+#     intentional: it still groups with any other finding on that same empty PID into one
+#     coverage region (resolve_regions treats touching spans, start <= end, as adjacent),
+#     without merging or dropping either finding's own evidence.
+def test_zero_length_region_for_empty_translation_still_groups_by_pid():
+    translation_overrides = {"p00000": ""}
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, chapter = _env(
+        translation_overrides=translation_overrides
+    )
+    qwen = ScriptedEvaluator({
+        chunk1.chunk_id: [_issues_json([{"pid": "p00000", "category": "omission", "note": "qwen finding"}])],
+        chunk2.chunk_id: [_issues_json([])],
+    })
+    outcome = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
+        qwen_evaluator=qwen, gemma_evaluator=_no_issue_evaluator([chunk1.chunk_id, chunk2.chunk_id]),
+    )
+    assert outcome.status == "complete"
+    pid_findings = outcome.store.by_pid("p00000")
+    detectors = {f.detector for f in pid_findings}
+    assert detectors == {"deterministic_integrity", "qwen_chapter_audit"}
+    for f in pid_findings:
+        assert f.region.start == 0
+        assert f.region.end == 0
+
+    # Both zero-length findings on the same PID are grouped into one coverage region,
+    # with both content hashes referenced — neither finding's evidence is lost.
+    regions = outcome.region_plan.for_pid("p00000")
+    assert len(regions) == 1
+    assert set(f.content_hash for f in pid_findings) == set(regions[0].finding_content_hashes)

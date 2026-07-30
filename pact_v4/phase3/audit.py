@@ -28,11 +28,12 @@ Three check tracks:
     register/repetition/dialogue/ты-вы, per chunk.
   * ``_deterministic_chapter_findings`` — model-free: missing translation,
     numeric-value preservation, mixed-script tokens, and glossary/name
-    consistency, over every PID. Reuses the pure helper functions and
-    ``DeterministicGateData`` already built and tested in
-    ``pact_v4.phase2.cascade`` (imported directly, not duplicated) — that
-    module's gate operates per-candidate pre-selection; this one applies the
-    same checks chapter-wide, post-selection.
+    consistency, over every PID. Reuses the pure helper functions in
+    ``pact_v4._integrity_checks`` (a public, versioned utility module shared
+    with ``pact_v4.phase2.cascade``'s ``deterministic_consistency_gate`` —
+    that gate operates per-candidate pre-selection; this one applies the
+    same checks chapter-wide, post-selection) and the ``DeterministicGateData``
+    dataclass already built and tested in ``pact_v4.phase2.cascade``.
 
 Explicitly NOT implemented here: formatting-contract / HTML-structure
 checks. No v4 runtime formatting/HTML artifact exists yet — ``pact_v4.
@@ -67,6 +68,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
+from pact_v4._integrity_checks import (
+    combine_glossary_terms,
+    extract_digits,
+    find_mixed_script,
+    missing_numeric_values,
+    source_term_present,
+    target_form_present,
+)
 from pact_v4.phase1.models import (
     Candidate,
     ChunkPlanArtifact,
@@ -75,14 +84,7 @@ from pact_v4.phase1.models import (
     canonical_json_hash,
     validate_json_complete,
 )
-from pact_v4.phase2.cascade import (
-    DeterministicGateData,
-    _extract_digits,
-    _find_mixed_script,
-    _missing_numeric_values,
-    _source_term_present,
-    _target_form_present,
-)
+from pact_v4.phase2.cascade import DeterministicGateData
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.findings import Finding, FindingStore
 from pact_v4.phase3.region_resolver import RegionPlan, resolve_regions
@@ -176,6 +178,16 @@ class AuditCache:
         self._store[unit_hash] = result
 
 
+def _candidate_id_for(chunk_id: str, candidates: Mapping[str, Candidate]) -> str:
+    candidate = candidates.get(chunk_id)
+    if candidate is None:
+        raise ValueError(
+            f"run_chapter_audit: no winning candidate supplied for chunk {chunk_id!r} "
+            f"(candidates mapping must cover every chunk in chunk_plan)"
+        )
+    return candidate.candidate_id
+
+
 def _unit_hash(*, chapter_hash: str, chunk_id: str, detector: str, policy_version: str) -> str:
     return canonical_json_hash({
         "artifact": "pact-v4-audit-unit/v1",
@@ -247,6 +259,19 @@ def _findings_from_issues(
     candidate_id: str,
     policy_version: str,
 ) -> Tuple[Finding, ...]:
+    """Convert parsed Qwen/Gemma issues into ``Finding``s.
+
+    Known MVP simplification: Qwen/Gemma aren't given character offsets, so
+    every finding's region defaults to the whole PID span, ``Region(pid, 0,
+    len(text))`` — same convention used by the deterministic layer
+    (``_deterministic_finding``). A consequence, intentional per Phase 3A's
+    region-resolver contract: a zero-length span (an empty/missing
+    translation, ``len(text) == 0``) is adjacent to (touches) any other
+    zero-length finding on that same PID, so ``resolve_regions`` groups them
+    into one coverage region — it still keeps every finding's own evidence
+    distinct, it only merges the *coverage span*, exactly like any other
+    same-PID overlap/adjacency.
+    """
     chapter_map = chapter.as_pid_map()
     findings = []
     for issue in issues:
@@ -271,6 +296,30 @@ def _findings_from_issues(
 # ---------------------------------------------------------------------------
 
 
+def _deterministic_finding(
+    *,
+    chapter: AssembledChapter,
+    chunk_id: str,
+    candidate_id: str,
+    pid: str,
+    category: str,
+    problem: str,
+    end: int,
+    policy_version: str,
+) -> Finding:
+    return Finding(
+        detector="deterministic_integrity",
+        category=category,
+        evidence={"problem": problem},
+        region=Region(pid=pid, start=0, end=end),
+        source_id=chapter.source_hash,
+        snapshot_id=chapter.snapshot_hash,
+        chunk_id=chunk_id,
+        candidate_id=candidate_id,
+        policy_version=policy_version,
+    )
+
+
 def _deterministic_chapter_findings(
     *,
     chapter: AssembledChapter,
@@ -282,54 +331,50 @@ def _deterministic_chapter_findings(
 ) -> Tuple[Finding, ...]:
     source_map = dict(source.source)
     chapter_map = dict(chapter.translation)
-
-    all_terms: Dict[str, str] = {}
-    for en_term, ru_term in det_data.glossary_terms:
-        key = en_term.strip()
-        if key and ru_term.strip():
-            all_terms[key] = ru_term.strip()
-    for en_name, ru_name in det_data.names:
-        key = en_name.strip()
-        if key and ru_name.strip():
-            all_terms[key] = ru_name.strip()
+    all_terms = combine_glossary_terms(det_data.glossary_terms, det_data.names)
 
     findings: List[Finding] = []
     for chunk in chunk_plan.chunks:
-        candidate_id = candidates[chunk.chunk_id].candidate_id
+        candidate_id = _candidate_id_for(chunk.chunk_id, candidates)
         for pid in chunk.pids:
             en_text = source_map.get(pid, "")
             target = chapter_map.get(pid, "")
 
-            def _add(category: str, problem: str, end: int) -> None:
-                findings.append(Finding(
-                    detector="deterministic_integrity",
-                    category=category,
-                    evidence={"problem": problem},
-                    region=Region(pid=pid, start=0, end=end),
-                    source_id=chapter.source_hash,
-                    snapshot_id=chapter.snapshot_hash,
-                    chunk_id=chunk.chunk_id,
-                    candidate_id=candidate_id,
-                    policy_version=policy_version,
-                ))
-
             if not target:
-                _add("missing", "Translation is empty or missing.", 0)
+                findings.append(_deterministic_finding(
+                    chapter=chapter, chunk_id=chunk.chunk_id, candidate_id=candidate_id,
+                    pid=pid, category="missing", problem="Translation is empty or missing.",
+                    end=0, policy_version=policy_version,
+                ))
                 continue
 
-            source_digits = _extract_digits(en_text)
+            source_digits = extract_digits(en_text)
             if source_digits:
-                missing = _missing_numeric_values(source_digits, target)
+                missing = missing_numeric_values(source_digits, target)
                 if missing:
-                    _add("number", f"Missing numeric values: {missing}", len(target))
+                    findings.append(_deterministic_finding(
+                        chapter=chapter, chunk_id=chunk.chunk_id, candidate_id=candidate_id,
+                        pid=pid, category="number", problem=f"Missing numeric values: {missing}",
+                        end=len(target), policy_version=policy_version,
+                    ))
 
-            mixed = _find_mixed_script(target, det_data.mixed_script_allow)
+            mixed = find_mixed_script(target, det_data.mixed_script_allow)
             if mixed:
-                _add("mixed_script", f"Latin or mixed-script token(s): {mixed}", len(target))
+                findings.append(_deterministic_finding(
+                    chapter=chapter, chunk_id=chunk.chunk_id, candidate_id=candidate_id,
+                    pid=pid, category="mixed_script",
+                    problem=f"Latin or mixed-script token(s): {mixed}",
+                    end=len(target), policy_version=policy_version,
+                ))
 
             for en_term, ru_term in all_terms.items():
-                if _source_term_present(en_text, en_term) and not _target_form_present(target, ru_term):
-                    _add("glossary_consistency", f"'{en_term}' should use '{ru_term}'", len(target))
+                if source_term_present(en_text, en_term) and not target_form_present(target, ru_term):
+                    findings.append(_deterministic_finding(
+                        chapter=chapter, chunk_id=chunk.chunk_id, candidate_id=candidate_id,
+                        pid=pid, category="glossary_consistency",
+                        problem=f"'{en_term}' should use '{ru_term}'",
+                        end=len(target), policy_version=policy_version,
+                    ))
 
     return tuple(findings)
 
@@ -406,7 +451,7 @@ def run_chapter_audit(
     failed_units: List[Tuple[str, str, str]] = []
 
     for chunk in chunk_plan.chunks:
-        candidate_id = candidates[chunk.chunk_id].candidate_id
+        candidate_id = _candidate_id_for(chunk.chunk_id, candidates)
         owned_pids = frozenset(chunk.pids)
         owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
         owned_translation = {pid: chapter_map.get(pid, "") for pid in chunk.pids}
