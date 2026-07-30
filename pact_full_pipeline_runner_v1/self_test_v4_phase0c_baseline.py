@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import v4_phase0c_baseline as m
+import v4_phase0c_gate_bench as gate_bench
 from v4_phase0c_baseline import (
     MEASURED, NO_RUN, NOT_MEASURABLE, PENDING_DEFINITION,
     PENDING_LIVE_RUN, PENDING_RUN_COMPLETION, SCHEMA_VERSION,
@@ -182,6 +183,102 @@ class GridTests(unittest.TestCase):
             self.assertEqual(MEASURED, m._grid_aggregated_status(grid))
 
 
+class TrackARunImportTests(unittest.TestCase):
+    def _write_cell(self, root: Path, cell_id: str,
+                    translations: dict[str, str]) -> None:
+        chapter = root / cell_id / "work" / "0046_x"
+        wj(chapter / "draft_translations.json", translations)
+        wj(chapter / "manifest.json", {
+            "chunks": [
+                {"chunk_id": "c0001", "pids": ["p00000"]},
+                {"chunk_id": "c0002", "pids": ["p00001", "p00002"]},
+            ]
+        })
+
+    def test_discovers_completed_and_pending_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_cell(root, "8_12__rc_on", {"p00000": "RU", "p00001": "RU"})
+            outputs = m.load_track_a_run_outputs(root)
+            complete = outputs["8_12__rc_on"]
+            self.assertIsNotNone(complete)
+            assert complete is not None
+            self.assertEqual(2, len(complete["translations"]))
+            shape = complete["achieved_pid_per_chunk"]
+            self.assertEqual([1, 2], shape["pid_counts"])
+            self.assertEqual(1.5, shape["mean"])
+            self.assertIsNone(outputs["8_12__rc_off"])
+
+    def test_imported_cells_feed_result_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            golden = Path(tmp) / "records.json"
+            make_golden(golden, accepted=2, needs_review=0)
+            for cell_id in (
+                "8_12__rc_on", "8_12__rc_off",
+                "12_20__rc_on", "12_20__rc_off",
+            ):
+                self._write_cell(root, cell_id, {
+                    "p00000": "RU 100", "p00001": "RU",
+                })
+            rec = m.build_result_record(
+                golden, None,
+                track_a_run_outputs=m.load_track_a_run_outputs(root),
+            )
+            self.assertEqual(MEASURED, rec["track_a"]["aggregated"]["status"])
+            for cell in rec["track_a"]["grid"]["cells"]:
+                self.assertEqual(MEASURED, cell["status"])
+                self.assertEqual(2, cell["achieved_pid_per_chunk"]["translated_pids"])
+
+    def test_rejects_non_mapping_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chapter = root / "8_12__rc_on" / "work" / "0046_x"
+            wj(chapter / "draft_translations.json", ["not", "a", "map"])
+            wj(chapter / "manifest.json", {"chunks": []})
+            with self.assertRaisesRegex(ValueError, "mapping PID to text"):
+                m.load_track_a_run_outputs(root)
+
+
+class GateBenchPreparationTests(unittest.TestCase):
+    def test_prepares_four_isolated_configs_and_operator_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            source = root / "source"
+            bench = root / "bench"
+            project.mkdir()
+            source.mkdir()
+            (project / "pact_translate_v3.py").write_text("# fixture\n", encoding="utf-8")
+            (source / "pact_chapters").mkdir()
+            (source / "glossary").mkdir()
+            wj(source / "glossary" / "locked.json", {})
+            wj(source / "config.v3.json", {"paths": {}, "translation": {"temperature": 0.3}})
+            wj(source / "book_bible.json", {})
+            wj(source / "arc_names.json", {})
+
+            configs = gate_bench.prepare_gate_bench(project, source, bench)
+            self.assertEqual(4, len(configs))
+            self.assertTrue((bench / "run_track_a.ps1").exists())
+            self.assertTrue((bench / "bench_manifest.json").exists())
+            work_dirs: set[str] = set()
+            for config in configs:
+                cfg = json.loads(config.read_text(encoding="utf-8"))
+                work_dirs.add(cfg["paths"]["work_dir"])
+                self.assertEqual(str((source / "pact_chapters").resolve()),
+                                 cfg["paths"]["input_dir"])
+                self.assertTrue((config.parent / "glossary" / "locked.json").exists())
+            self.assertEqual(4, len(work_dirs))
+
+    def test_refuses_to_overwrite_existing_bench(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = Path(tmp) / "bench"
+            bench.mkdir()
+            (bench / "existing.txt").write_text("preserve", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite caches"):
+                gate_bench._assert_new_or_empty(bench)
+
+
 class NeedsReviewExclusionTests(unittest.TestCase):
     def test_only_accepted_feed_numeric_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,7 +375,7 @@ class ResultRecordTests(unittest.TestCase):
                            lifecycle_statuses=["resolved_repair"])
             rec = m.build_result_record(golden, root)
             self.assertEqual(SCHEMA_VERSION, rec["schema"])
-            self.assertEqual("pact-0c/0.1", rec["tool_version"])
+            self.assertEqual("pact-0c/0.2", rec["tool_version"])
             self.assertEqual(PENDING_LIVE_RUN, rec["track_a"]["aggregated"]["status"])
             self.assertEqual(PENDING_RUN_COMPLETION, rec["track_b"]["completion"]["status"])
             out = Path(tmp) / "out" / "result.json"

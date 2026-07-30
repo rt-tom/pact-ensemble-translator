@@ -40,7 +40,7 @@ from typing import Any
 import v4_measurement_harness as h0a
 
 SCHEMA_VERSION = "pact-v4-phase0c-result-record/v1"
-TOOL_VERSION = "pact-0c/0.1"
+TOOL_VERSION = "pact-0c/0.2"
 UNKNOWN = h0a.UNKNOWN
 
 PENDING_LIVE_RUN = "pending_live_run"
@@ -325,16 +325,110 @@ def build_grid(chapter_id: str, config_path: str = "config.v3.json") -> dict[str
     }
 
 
-def attach_grid_metrics(grid: dict[str, Any], golden: list[dict[str, Any]], run_outputs: dict[str, dict[str, str] | None]) -> None:
-    """Attach per-cell metrics.  ``run_outputs`` maps cell_id -> {pid: ru} or None."""
+def _cell_translations_and_shape(
+    artifact: dict[str, Any] | None,
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Accept legacy ``{pid: text}`` maps or a discovered cell artifact."""
+    if artifact is None:
+        return None, None
+    translations = artifact.get("translations")
+    if isinstance(translations, dict):
+        shape = artifact.get("achieved_pid_per_chunk")
+        return translations, shape if isinstance(shape, dict) else None
+    return artifact, None
+
+
+def attach_grid_metrics(
+    grid: dict[str, Any],
+    golden: list[dict[str, Any]],
+    run_outputs: dict[str, dict[str, Any] | None],
+) -> None:
+    """Attach per-cell metrics from PID maps or discovered run artifacts."""
     for cell in grid["cells"]:
-        out = run_outputs.get(cell["cell_id"])
+        out, shape = _cell_translations_and_shape(run_outputs.get(cell["cell_id"]))
         cell["metrics"] = aggregate_track_a_cell(golden, out)
         cell["status"] = cell["metrics"]["status"]
         if out is not None:
-            cell["achieved_pid_per_chunk"] = {"status": MEASURED, "pids_in_output": len(out)}
+            cell["achieved_pid_per_chunk"] = shape or {
+                "status": MEASURED,
+                "translated_pids": len(out),
+            }
         else:
             cell["achieved_pid_per_chunk"] = {"status": PENDING_LIVE_RUN}
+
+
+def _read_required_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        raise ValueError(f"required Track A artifact not found: {path}") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in Track A artifact {path}: {exc}") from exc
+
+
+def _discover_cell_chapter_dir(cell_root: Path) -> Path | None:
+    direct = cell_root / "draft_translations.json"
+    if direct.exists():
+        return cell_root
+    work = cell_root / "work"
+    if not work.exists():
+        return None
+    candidates = sorted(
+        p.parent for p in work.glob("*/draft_translations.json") if p.is_file()
+    )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        names = ", ".join(str(p) for p in candidates)
+        raise ValueError(f"Track A cell {cell_root.name} has multiple chapter outputs: {names}")
+    return candidates[0]
+
+
+def _manifest_chunk_shape(manifest: Any, translated_pids: int) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("chunks"), list):
+        raise ValueError("Track A manifest must contain a chunks array")
+    counts: list[int] = []
+    for index, chunk in enumerate(manifest["chunks"]):
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("pids"), list):
+            raise ValueError(f"Track A manifest chunk {index} must contain a pids array")
+        counts.append(len(chunk["pids"]))
+    return {
+        "status": MEASURED,
+        "chunk_count": len(counts),
+        "pid_counts": counts,
+        "min": min(counts) if counts else 0,
+        "max": max(counts) if counts else 0,
+        "mean": round(sum(counts) / len(counts), 2) if counts else 0.0,
+        "translated_pids": translated_pids,
+    }
+
+
+def load_track_a_run_outputs(run_root: Path) -> dict[str, dict[str, Any] | None]:
+    """Discover the four isolated Gate Bench cells without reading model logs."""
+    if not run_root.is_dir():
+        raise ValueError(f"Track A run root is not a directory: {run_root}")
+    outputs: dict[str, dict[str, Any] | None] = {}
+    expected_ids = [grid_cell_id(chunk, rc) for chunk, rc in GRID_CONFIG]
+    for cell_id in expected_ids:
+        chapter_dir = _discover_cell_chapter_dir(run_root / cell_id)
+        if chapter_dir is None:
+            outputs[cell_id] = None
+            continue
+        translations = _read_required_json(chapter_dir / "draft_translations.json")
+        if not isinstance(translations, dict) or not all(
+            isinstance(pid, str) and isinstance(text, str)
+            for pid, text in translations.items()
+        ):
+            raise ValueError(
+                f"Track A draft must be an object mapping PID to text: "
+                f"{chapter_dir / 'draft_translations.json'}"
+            )
+        manifest = _read_required_json(chapter_dir / "manifest.json")
+        outputs[cell_id] = {
+            "translations": translations,
+            "achieved_pid_per_chunk": _manifest_chunk_shape(manifest, len(translations)),
+        }
+    return outputs
 
 # --------------------------------------------------------------------------- #
 # Track B — v31 run import (read-only)
@@ -705,7 +799,7 @@ def _now_iso() -> str:
 def build_result_record(
     golden_path: Path | None,
     track_b_run_root: Path | None,
-    track_a_run_outputs: dict[str, dict[str, str] | None] | None = None,
+    track_a_run_outputs: dict[str, dict[str, Any] | None] | None = None,
     chapter_id_for_grid: str = "046",
     config_path: str = "config.v3.json",
 ) -> dict[str, Any]:
@@ -849,6 +943,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="v4 Phase 0C baseline (read-only)")
     p.add_argument("--golden", type=Path, help="path to golden set records.json (Track A)")
     p.add_argument("--track-b-run-root", type=Path, help="v31 run root to import (Track B)")
+    p.add_argument(
+        "--track-a-run-root", type=Path,
+        help="Gate Bench root containing the four Track A cell directories",
+    )
     p.add_argument("--out", type=Path, help="write assembled result record here")
     p.add_argument("--chapter", default="046", help="chapter id for grid recipe")
     p.add_argument("--config-path", default="config.v3.json", help="v3 config path for run command recipe")
@@ -857,10 +955,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.track_a_run_root is not None and args.golden is None:
+        raise SystemExit("--track-a-run-root requires --golden")
+    track_a_outputs = (
+        load_track_a_run_outputs(args.track_a_run_root)
+        if args.track_a_run_root is not None else None
+    )
     record = build_result_record(
         golden_path=args.golden,
         track_b_run_root=args.track_b_run_root,
-        track_a_run_outputs=None,
+        track_a_run_outputs=track_a_outputs,
         chapter_id_for_grid=args.chapter,
         config_path=args.config_path,
     )
