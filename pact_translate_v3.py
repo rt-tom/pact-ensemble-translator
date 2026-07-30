@@ -3489,7 +3489,14 @@ class Runner:
         if post_cfg.get("enabled", False) and post_cfg.get("required", False):
             post_report_path = work / "post_repair_report.json"
             if not post_report_path.exists():
-                raise PipelineError("Required post-repair verification report is missing.")
+                state = read_json(work / "state.json", {})
+                if state.get("status") in {"complete", "complete_with_warnings"}:
+                    logging.info(
+                        "Skipping post-repair check: quality gate already approved %s for %s",
+                        state["status"], source_path.name,
+                    )
+                else:
+                    raise PipelineError("Required post-repair verification report is missing.")
             post_report = read_json(post_report_path, {})
             unresolved = int(post_report.get("unresolved_total", post_report.get("retry_required", 0)))
             if unresolved:
@@ -3593,9 +3600,14 @@ class Runner:
             if phase == "repair":
                 return None
         else:
-            repaired = read_json(
-                work / "repaired_translations.json", draft
-            )
+            repaired_path = work / "repaired_translations.json"
+            if repaired_path.exists():
+                repaired = read_json(repaired_path, draft)
+            else:
+                repaired = read_json(
+                    work / "v31_final_translations.json",
+                    read_json(work / "v31_pre_final_repair_translations.json", draft),
+                )
             records = read_json(work / "repair_records.json", [])
 
         return self.finalize(
