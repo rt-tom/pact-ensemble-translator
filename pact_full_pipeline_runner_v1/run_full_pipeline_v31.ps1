@@ -577,7 +577,11 @@ function Invoke-AggregateModelStage {
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
     if ($probeExit -eq 0) {
         Write-Host "`nStage protocol REUSED: $Label" -ForegroundColor DarkGray
-        Write-MonitorState -Stage $Label -Status 'REUSED'
+        # The aggregate proves coverage, while the producer's per-unit cache
+        # identity proves that it matches the current translations and prompt.
+        # Keep the owned server available if that second check requires a rerun.
+        Start-LlamaServer $Profile
+        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
         return
     }
     if ($probeExit -notin @(20, 22)) { throw "$Label stage probe FAILED with exit code $probeExit" }

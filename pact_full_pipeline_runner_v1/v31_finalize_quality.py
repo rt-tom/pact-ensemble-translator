@@ -51,6 +51,20 @@ def deterministic(runtime, cfg, work, blocks_raw, translations):
     return [asdict(x) for x in runtime.deterministic_issues(block_objs, translations, cfg, glossary, bible, book)]
 
 
+def active_final_blockers(
+    verified: list[dict[str, Any]], lifecycle: list[dict[str, Any]], smoke: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep resolved audit history out of final quarantine findings."""
+    resolved_ids = {
+        str(row.get("issue_id")) for row in lifecycle
+        if row.get("status") in RESOLVED_LIFECYCLE_STATUSES and row.get("issue_id")
+    }
+    return [
+        issue for issue in verified
+        if str(issue.get("issue_id")) not in resolved_ids
+    ] + smoke
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser, include_pass=False)
@@ -227,7 +241,11 @@ def main() -> int:
             coverage["final:qwen_global_smoke"] = smoke_cov
             if int(smoke_cov.get("expected", -1)) != len(expected_pids) or int(smoke_cov.get("completed", -1)) != len(expected_pids) or not smoke_cov.get("ok"):
                 unresolved.append({"stage": "global_smoke", "reason": "incomplete coverage", "coverage": smoke_cov})
-            final_blockers = list(read_json(root / "verified_issues.json", [])) + list(smoke.get("issues") or [])
+            final_blockers = active_final_blockers(
+                list(read_json(root / "verified_issues.json", [])),
+                list(read_json(root / "lifecycle.json", [])),
+                list(smoke.get("issues") or []),
+            )
 
         terminal = terminal_status(
             ledger_ok=not any(row.get("stage") == "final_changed_pid_ledger" for row in unresolved),

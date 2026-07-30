@@ -20,3 +20,5 @@
 2026-07-29. Final Qwen global smoke больше не возвращает пустой `status: ok` для каждого PID: compact contract требует точное coverage всей главы и перечисляет только проблемные PID в `issues`. Это сохраняет chapter-wide проверку, но устраняет сотни информационно-пустых объектов, из-за которых ответ не помещался в лимит.
 
 2026-07-29. `quarantined` остаётся монотонным внутри run identity, но `failed` фиксирует execution/accounting failure и не блокирует последующий успешный final cycle: после устранения причины final gate может перейти в `complete`.
+
+2026-07-29. Aggregate coverage/version недостаточны для cache reuse model-stage: runner запускает producer с owned server, чтобы его per-unit content identity могла либо подтвердить reuse без HTTP, либо безопасно пересчитать устаревшие units. Resolved lifecycle history не является новым final blocker; final quarantine учитывает только unresolved findings и текущий global smoke.
