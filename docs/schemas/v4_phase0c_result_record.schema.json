@@ -88,6 +88,22 @@
       "type": "object",
       "required": ["source", "completion", "metrics"],
       "properties": {
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Operator-visible annotations about the run that do not affect numeric metrics (e.g. terminal/monitor_state inconsistency, re-issue required). The Phase 0C Gate requires that any historical monitor_status=FAILED accompanied by an apparently-complete state.json be recorded here as an explicit inconsistency, not masked as a successful terminal state."
+        },
+        "terminal_discrepancy": {
+          "type": "object",
+          "description": "Records an unresolved divergence between v31 run artifacts (state.json, final HTML) and the monitor_state.v31.json terminal status. Required when monitor_status implies a failure that is not reflected in lifecycle/HTML artifacts. Without this object the Gate must not treat Track B as a quality success.",
+          "required": ["detected", "monitor_status", "artifacts_say"],
+          "properties": {
+            "detected": { "type": "boolean" },
+            "monitor_status": { "type": "string" },
+            "artifacts_say": { "type": "string" },
+            "reason": { "type": "string" }
+          }
+        },
         "source": {
           "type": "object",
           "required": [
@@ -158,7 +174,11 @@
           ]
         },
         "reason": { "type": "string" },
-        "value": {}
+        "value": {},
+        "value_numeric": {
+          "type": ["number", "null"],
+          "description": "Typed numeric value for the metric, when applicable. The Phase 0C Gate requires that residual_errors.final_residual_total carry an explicit value_numeric (number|null) rather than a bare status string in the value slot, so a missing or non-numeric residual is visible rather than implied."
+        }
       },
       "additionalProperties": true
     },
