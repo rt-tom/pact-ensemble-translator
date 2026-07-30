@@ -1,0 +1,783 @@
+"""Tests for Phase 2B risk-gated A/B generation (pact_v4.phase2.generation).
+
+All generator calls go through a mock ``ModelCaller`` — no real llama-server,
+no production pipeline, no network access.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from typing import Callable, Dict, Tuple
+
+import pytest
+
+from pact_v4.phase1.models import (
+    ChunkPlan,
+    ChunkPlanArtifact,
+    ConfigArtifact,
+    Snapshot,
+    SourceArtifact,
+    canonical_json_hash,
+)
+from pact_v4.phase2.generation import (
+    GenerationCache,
+    GenerationErrorCode,
+    GenerationParams,
+    generate_for_chunk,
+)
+from pact_v4.phase2.risk import GlossaryEntry, RiskAssessment, RiskBand
+
+
+def _hash(seed: str) -> str:
+    return canonical_json_hash({"seed": seed})
+
+
+def make_source(chapter_id: str = "ch1", pid_count: int = 10) -> SourceArtifact:
+    pairs = tuple((f"p{i}", f"English sentence {i}.") for i in range(pid_count))
+    return SourceArtifact(chapter_id=chapter_id, source=pairs)
+
+
+def make_snapshot(source: SourceArtifact, context: str = "ctx-v1") -> Snapshot:
+    pids = tuple(pid for pid, _ in source.source)
+    return Snapshot(
+        chapter_id=source.chapter_id,
+        pids=pids,
+        context=context,
+        glossary_hash=_hash("glossary"),
+        book_memory_hash=_hash("book_memory"),
+        chapter_memory_hash=_hash("chapter_memory"),
+    )
+
+
+def make_chunk_plan_artifact(
+    snapshot: Snapshot, chunk_id: str = "c1"
+) -> Tuple[ChunkPlanArtifact, ChunkPlan]:
+    chunk = ChunkPlan(
+        chunk_id=chunk_id,
+        snapshot_hash=snapshot.snapshot_hash,
+        pids=snapshot.pids,
+        undersized_exception=len(snapshot.pids) < ChunkPlan.MIN_PIDS,
+    )
+    artifact = ChunkPlanArtifact.create(snapshot, (chunk,))
+    return artifact, chunk
+
+
+def make_config(version: str = "v1", **values: object) -> ConfigArtifact:
+    return ConfigArtifact(version=version, values=values or {"model": "gemma-mock"})
+
+
+def make_env(pid_count: int = 10, chunk_id: str = "c1"):
+    source = make_source(pid_count=pid_count)
+    snapshot = make_snapshot(source)
+    chunk_plan, chunk = make_chunk_plan_artifact(snapshot, chunk_id=chunk_id)
+    config = make_config()
+    return source, snapshot, chunk_plan, chunk, config
+
+
+def make_risk(band: RiskBand) -> RiskAssessment:
+    return RiskAssessment(policy_version="pact-v4-risk-source-en/v1", band=band, score=0, features=())
+
+
+def make_params(**overrides: object) -> GenerationParams:
+    values = {"temperature": 0.2, "seed": 7, "max_tokens": 512}
+    values.update(overrides)
+    return GenerationParams(**values)
+
+
+def valid_output_for(chunk: ChunkPlan) -> str:
+    return json.dumps({pid: f"Перевод {pid}" for pid in chunk.pids}, ensure_ascii=False)
+
+
+class ScriptedGenerator:
+    """Mock ModelCaller: returns a scripted string (or raises) per call, in order."""
+
+    def __init__(self, outputs: list):
+        self._outputs = list(outputs)
+        self.calls = []
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        if not self._outputs:
+            raise AssertionError("ScriptedGenerator called more times than scripted")
+        result = self._outputs.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+
+class ConstantGenerator:
+    """Mock ModelCaller returning the same output for every call."""
+
+    def __init__(self, output_fn: Callable):
+        self._output_fn = output_fn
+        self.calls = []
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        return self._output_fn(bundle)
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+
+# ---------------------------------------------------------------------------
+# Risk gating
+# ---------------------------------------------------------------------------
+
+
+def test_low_risk_calls_generator_exactly_once():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.LOW),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+    )
+
+    assert generator.call_count == 1
+    assert outcome.status == "complete"
+    assert set(outcome.candidates) == {"fidelity_first"}
+
+
+@pytest.mark.parametrize("band", [RiskBand.MEDIUM, RiskBand.HIGH])
+def test_medium_and_high_risk_produce_exactly_a_and_b(band):
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(band),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+    )
+
+    assert generator.call_count == 2
+    assert set(outcome.candidates) == {"fidelity_first", "balanced_literary"}
+    assert outcome.status == "complete"
+
+
+def test_no_role_other_than_fidelity_first_or_balanced_literary_is_ever_produced():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    for band in (RiskBand.LOW, RiskBand.MEDIUM, RiskBand.HIGH):
+        outcome = generate_for_chunk(
+            chunk_id=chunk.chunk_id,
+            risk=make_risk(band),
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            config=config,
+            params=make_params(),
+            model_caller=generator,
+        )
+        assert set(outcome.candidates) <= {"fidelity_first", "balanced_literary"}
+        assert "synthesis" not in outcome.candidates
+        assert len(outcome.candidates) <= 2
+
+
+def test_no_selection_or_winner_function_is_exported():
+    import pact_v4.phase2.generation as generation_module
+
+    forbidden_terms = ("select", "winner", "synthesis", "synthesize")
+    for name in generation_module.__all__:
+        lowered = name.lower()
+        assert not any(term in lowered for term in forbidden_terms), name
+
+
+# ---------------------------------------------------------------------------
+# Prompt versioning
+# ---------------------------------------------------------------------------
+
+
+def test_a_and_b_use_different_versioned_templates():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.HIGH),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    bundles = {call.role: call for call in generator.calls}
+    assert bundles["fidelity_first"].template.role == "fidelity_first"
+    assert bundles["balanced_literary"].template.role == "balanced_literary"
+    assert bundles["fidelity_first"].template.version != bundles["balanced_literary"].template.version
+    assert bundles["fidelity_first"].template.instructions != bundles["balanced_literary"].template.instructions
+    assert bundles["fidelity_first"].bundle_hash != bundles["balanced_literary"].bundle_hash
+
+
+# ---------------------------------------------------------------------------
+# Cache reuse / invalidation
+# ---------------------------------------------------------------------------
+
+
+def test_identical_call_reuses_cache():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+    kwargs = dict(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.LOW),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+        cache=cache,
+    )
+
+    first = generate_for_chunk(**kwargs)
+    second = generate_for_chunk(**kwargs)
+
+    assert generator.call_count == 1
+    assert first.candidates["fidelity_first"].candidate_id == second.candidates["fidelity_first"].candidate_id
+
+
+def _base_kwargs(source, snapshot, chunk_plan, chunk, config, generator, cache):
+    return dict(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.LOW),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+        cache=cache,
+    )
+
+
+def test_changing_prompt_version_or_content_invalidates_cache():
+    """Bundle-level check: version and instructions are both part of the
+    hashed identity, independent of which role they belong to (the
+    end-to-end route through ``generate_for_chunk`` always uses the fixed,
+    frozen ``_TEMPLATES`` mapping, so this is exercised at the
+    ``PromptBundle`` level where template content is a free parameter)."""
+    from pact_v4.phase2.generation import PromptBundle
+    from pact_v4.phase2.prompts import PromptTemplate
+
+    common = dict(
+        role="fidelity_first",
+        risk_band="low",
+        risk_policy_version="pact-v4-risk-source-en/v1",
+        snapshot_hash=_hash("snap"),
+        source_hash=_hash("source"),
+        chunk_id="c1",
+        owned_pids=("p0", "p1"),
+        owned_source=(("p0", "Hello."), ("p1", "World.")),
+        left_context=(),
+        right_context=(),
+        glossary=(),
+        style_constraints=(),
+        config_identity=_hash("config"),
+        params=make_params(),
+    )
+
+    template_v1 = PromptTemplate(role="fidelity_first", version="v1", instructions="Do X.")
+    template_v2 = PromptTemplate(role="fidelity_first", version="v2", instructions="Do X.")
+    template_v1_reworded = PromptTemplate(role="fidelity_first", version="v1", instructions="Do Y.")
+
+    bundle_v1 = PromptBundle(template=template_v1, **common)
+    bundle_v2 = PromptBundle(template=template_v2, **common)
+    bundle_reworded = PromptBundle(template=template_v1_reworded, **common)
+
+    assert bundle_v1.bundle_hash != bundle_v2.bundle_hash
+    assert bundle_v1.bundle_hash != bundle_reworded.bundle_hash
+
+
+def test_changing_prompt_version_invalidates_cache_end_to_end():
+    """End-to-end: swapping which versioned template a role resolves to
+    (simulated by generating the same chunk under two independently
+    constructed environments whose only difference is impossible to reach
+    via the public API without a template bump) is covered at the bundle
+    level above; here we confirm the two roles never collide with each
+    other's cache entry even though the risk band groups them together."""
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.HIGH), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+    assert generator.call_count == 2
+    assert len({call.bundle_hash for call in generator.calls}) == 2
+
+
+def test_changing_role_invalidates_cache():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    generate_for_chunk(**_base_kwargs(source, snapshot, chunk_plan, chunk, config, generator, cache))
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.HIGH),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+        cache=cache,
+    )
+
+    # low (1 call, risk_band="low") + high (2 calls: risk_band is itself part
+    # of the bundle identity, so fidelity_first@high is a fresh cache miss
+    # even though fidelity_first@low was already generated) = 3.
+    assert generator.call_count == 3
+
+
+def test_changing_context_invalidates_cache():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+    kwargs = _base_kwargs(source, snapshot, chunk_plan, chunk, config, generator, cache)
+
+    generate_for_chunk(**kwargs)
+    generate_for_chunk(**{**kwargs, "left_context": (("p_prev", "Уже переведено."),)})
+
+    assert generator.call_count == 2
+
+
+def test_changing_snapshot_invalidates_cache():
+    source, _, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    snapshot_a = make_snapshot(source, context="ctx-a")
+    plan_a, chunk_a = make_chunk_plan_artifact(snapshot_a)
+    generate_for_chunk(
+        chunk_id=chunk_a.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot_a, chunk_plan=plan_a, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+
+    snapshot_b = make_snapshot(source, context="ctx-b")
+    plan_b, chunk_b = make_chunk_plan_artifact(snapshot_b)
+    generate_for_chunk(
+        chunk_id=chunk_b.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot_b, chunk_plan=plan_b, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+
+    assert generator.call_count == 2
+
+
+def test_changing_model_config_identity_invalidates_cache():
+    source, snapshot, chunk_plan, chunk, config_a = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config_a, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+
+    config_b = make_config(model="gemma-mock-v2")
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config_b, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+
+    assert generator.call_count == 2
+
+
+def test_changing_pids_invalidates_cache():
+    generator_holder = {}
+
+    def gen(bundle):
+        return json.dumps({pid: f"Перевод {pid}" for pid in bundle.owned_pids}, ensure_ascii=False)
+
+    generator = ConstantGenerator(gen)
+    cache = GenerationCache()
+
+    source_a, snapshot_a, chunk_plan_a, chunk_a, config = make_env(pid_count=8, chunk_id="cA")
+    generate_for_chunk(
+        chunk_id=chunk_a.chunk_id, risk=make_risk(RiskBand.LOW), source=source_a,
+        snapshot=snapshot_a, chunk_plan=chunk_plan_a, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+
+    source_b, snapshot_b, chunk_plan_b, chunk_b, _ = make_env(pid_count=9, chunk_id="cB")
+    generate_for_chunk(
+        chunk_id=chunk_b.chunk_id, risk=make_risk(RiskBand.LOW), source=source_b,
+        snapshot=snapshot_b, chunk_plan=chunk_plan_b, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+
+    assert generator.call_count == 2
+
+
+def test_changing_generation_params_invalidates_cache():
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(seed=1),
+        model_caller=generator, cache=cache,
+    )
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(seed=2),
+        model_caller=generator, cache=cache,
+    )
+
+    assert generator.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Output validation
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_must_be_zero():
+    with pytest.raises(ValueError):
+        GenerationParams(temperature=0.2, seed=1, max_tokens=100, reasoning=1)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        "extra",
+        "missing",
+        "reordered",
+        "duplicate",
+    ],
+)
+def test_pid_mismatch_variants_are_rejected(corrupt):
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+
+    base = {pid: f"Перевод {pid}" for pid in chunk.pids}
+    if corrupt == "extra":
+        base["p999"] = "Лишний PID"
+        raw = json.dumps(base, ensure_ascii=False)
+    elif corrupt == "missing":
+        base.pop(chunk.pids[0])
+        raw = json.dumps(base, ensure_ascii=False)
+    elif corrupt == "reordered":
+        keys = list(reversed(chunk.pids))
+        raw = json.dumps({k: base[k] for k in keys}, ensure_ascii=False)
+    elif corrupt == "duplicate":
+        # Hand-build the JSON text with a literal repeated key: dict-based
+        # construction can't represent this (the second value would just
+        # overwrite the first), but Phase 2B must still reject a raw wire
+        # payload that repeats a PID key.
+        entries = ", ".join(f'"{pid}": "{base[pid]}"' for pid in chunk.pids)
+        first_pid = chunk.pids[0]
+        raw = "{" + entries + f', "{first_pid}": "Повтор"' + "}"
+
+    generator = ConstantGenerator(lambda bundle: raw)
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+
+    assert outcome.status == "incomplete"
+    assert "fidelity_first" in outcome.errors
+    assert outcome.errors["fidelity_first"].code == GenerationErrorCode.PID_MISMATCH
+    assert outcome.candidates == {}
+
+
+def test_context_pid_leakage_is_rejected():
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    leaked = dict(zip(chunk.pids, (f"Перевод {p}" for p in chunk.pids)))
+    leaked["p_context"] = "Не должно сюда попадать"
+    raw = json.dumps(leaked, ensure_ascii=False)
+
+    generator = ConstantGenerator(lambda bundle: raw)
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+        left_context=(("p_context", "Контекстный PID."),),
+    )
+
+    assert outcome.status == "incomplete"
+    assert outcome.errors["fidelity_first"].code == GenerationErrorCode.CONTEXT_LEAKAGE
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{not valid json",
+        '{"p0": "Перевод"',  # truncated
+        "",
+        "null",
+        "[1, 2, 3]",
+    ],
+)
+def test_truncated_or_invalid_json_never_becomes_a_candidate(raw):
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=3)
+    generator = ConstantGenerator(lambda bundle: raw)
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+
+    assert outcome.status == "incomplete"
+    assert outcome.candidates == {}
+    assert outcome.errors["fidelity_first"].code == GenerationErrorCode.INVALID_JSON
+
+
+def test_one_of_ab_failing_yields_incomplete_never_a_substitute():
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=5)
+
+    def gen(bundle):
+        if bundle.role == "fidelity_first":
+            return valid_output_for(chunk)
+        return "{not valid json"
+
+    generator = ConstantGenerator(gen)
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.HIGH), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+
+    assert outcome.status == "incomplete"
+    assert set(outcome.candidates) == {"fidelity_first"}
+    assert "balanced_literary" not in outcome.candidates
+    assert outcome.errors["balanced_literary"].code == GenerationErrorCode.INVALID_JSON
+    # The successful role's candidate must never be relabelled/duplicated to
+    # stand in for the missing one.
+    assert outcome.candidates["fidelity_first"].role == "fidelity_first"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: owned source text, snapshot glossary/style content,
+# cache-hit defense in depth, and full provenance of the bundle hash.
+# ---------------------------------------------------------------------------
+
+
+def test_owned_source_text_is_actually_sent_to_the_generator():
+    """The model must receive the English text of its owned PIDs, not just
+    the PID labels — otherwise it cannot translate anything."""
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+
+    bundle = generator.calls[0]
+    assert bundle.owned_source == tuple(
+        (pid, text) for pid, text in source.source if pid in set(chunk.pids)
+    )
+    from pact_v4.phase2.prompts import render_prompt
+
+    rendered = render_prompt(bundle)
+    for pid, text in bundle.owned_source:
+        assert pid in rendered
+        assert text in rendered
+
+
+def test_changing_glossary_or_style_constraints_invalidates_cache_and_prompt():
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    glossary_a = (GlossaryEntry(source_term="steward", target_terms=("стюард",)),)
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache, glossary=glossary_a,
+        style_constraints={"narrator_voice": "formal"},
+    )
+
+    glossary_b = (GlossaryEntry(source_term="steward", target_terms=("дворецкий",)),)
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache, glossary=glossary_b,
+        style_constraints={"narrator_voice": "formal"},
+    )
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache, glossary=glossary_b,
+        style_constraints={"narrator_voice": "informal"},
+    )
+
+    assert generator.call_count == 3
+
+    from pact_v4.phase2.prompts import render_prompt
+
+    first_prompt = render_prompt(generator.calls[0])
+    second_prompt = render_prompt(generator.calls[1])
+    assert "стюард" in first_prompt
+    assert "дворецкий" in second_prompt
+    assert "стюард" not in second_prompt
+
+
+def test_style_constraints_dict_order_does_not_cause_spurious_cache_miss():
+    """Two calls with the same style constraints but different dict
+    insertion order must hit the same cache entry — order isn't semantic."""
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+        style_constraints={"a": "1", "b": "2"},
+    )
+    generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+        style_constraints={"b": "2", "a": "1"},
+    )
+
+    assert generator.call_count == 1
+
+
+def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
+    """A cache entry that (by bug or tamper) maps a bundle_hash to a
+    candidate for a different chunk/role must never be handed back
+    silently — Phase 2B must not "trust the hash" alone on read."""
+    from pact_v4.phase2.generation import GenerationCandidateResult
+    from pact_v4.phase1.models import Candidate
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    cache = GenerationCache()
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator, cache=cache,
+    )
+    real_candidate = outcome.candidates["fidelity_first"]
+
+    # Simulate cache poisoning: plant a *different-role* candidate under
+    # some other bundle hash, then generate again with a request whose
+    # bundle hash happens to collide with that planted key (we simulate the
+    # collision directly by writing under the exact hash the next call will
+    # compute, rather than trying to find a real sha256 collision).
+    other_source, other_snapshot, other_chunk_plan, other_chunk, other_config = make_env(
+        pid_count=4, chunk_id="other-chunk"
+    )
+    other_generator = ConstantGenerator(lambda bundle: valid_output_for(other_chunk))
+    other_outcome = generate_for_chunk(
+        chunk_id=other_chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=other_source,
+        snapshot=other_snapshot, chunk_plan=other_chunk_plan, config=other_config,
+        params=make_params(), model_caller=other_generator,
+    )
+    foreign_candidate = other_outcome.candidates["fidelity_first"]
+
+    # Recompute the exact bundle_hash our victim call will use, then poison
+    # the shared cache at that key with the foreign candidate.
+    from pact_v4.phase2.generation import PromptBundle
+    from pact_v4.phase2.prompts import FIDELITY_FIRST_V1
+
+    victim_bundle = PromptBundle(
+        template=FIDELITY_FIRST_V1,
+        role="fidelity_first",
+        risk_band="low",
+        risk_policy_version=make_risk(RiskBand.LOW).policy_version,
+        snapshot_hash=snapshot.snapshot_hash,
+        source_hash=source.source_hash,
+        chunk_id=chunk.chunk_id,
+        owned_pids=chunk.pids,
+        owned_source=tuple((pid, text) for pid, text in source.source if pid in set(chunk.pids)),
+        left_context=(),
+        right_context=(),
+        glossary=(),
+        style_constraints=(),
+        config_identity=config.config_identity,
+        params=make_params(),
+    )
+    cache.put(victim_bundle.bundle_hash, GenerationCandidateResult(candidate=foreign_candidate, error=None))
+
+    with pytest.raises(AssertionError):
+        generate_for_chunk(
+            chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+            snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+            model_caller=generator, cache=cache,
+        )
+
+
+def test_candidate_provenance_carries_the_full_bundle_hash():
+    """16 hex characters in candidate_id is not provenance; the full
+    bundle_hash must be recoverable from the Candidate itself."""
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    candidate = outcome.candidates["fidelity_first"]
+    bundle = generator.calls[0]
+
+    matching = [
+        gate for gate in candidate.decision_trace
+        if gate.gate == "phase2b_prompt_bundle" and gate.detail == bundle.bundle_hash
+    ]
+    assert matching, "full bundle_hash must be recoverable from Candidate.decision_trace"
+    assert candidate.candidate_id.endswith(bundle.bundle_hash[:16])
+
+
+def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
+    """The instructions must not tell the model to look for an 'OWNED_PIDS'
+    section that render_prompt never emits (it emits 'OWNED_SOURCE')."""
+    from pact_v4.phase2.prompts import (
+        BALANCED_LITERARY_V1,
+        FIDELITY_FIRST_V1,
+        render_prompt,
+    )
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.HIGH), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V1):
+        assert "OWNED_PIDS" not in template.instructions
+        assert "OWNED_SOURCE" in template.instructions
+
+    for bundle in generator.calls:
+        rendered = render_prompt(bundle)
+        assert "OWNED_SOURCE" in rendered
+        assert "OWNED_PIDS" not in rendered

@@ -325,16 +325,110 @@ def build_grid(chapter_id: str, config_path: str = "config.v3.json") -> dict[str
     }
 
 
-def attach_grid_metrics(grid: dict[str, Any], golden: list[dict[str, Any]], run_outputs: dict[str, dict[str, str] | None]) -> None:
-    """Attach per-cell metrics.  ``run_outputs`` maps cell_id -> {pid: ru} or None."""
+def _cell_translations_and_shape(
+    artifact: dict[str, Any] | None,
+) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Accept legacy ``{pid: text}`` maps or a discovered cell artifact."""
+    if artifact is None:
+        return None, None
+    translations = artifact.get("translations")
+    if isinstance(translations, dict):
+        shape = artifact.get("achieved_pid_per_chunk")
+        return translations, shape if isinstance(shape, dict) else None
+    return artifact, None
+
+
+def attach_grid_metrics(
+    grid: dict[str, Any],
+    golden: list[dict[str, Any]],
+    run_outputs: dict[str, dict[str, Any] | None],
+) -> None:
+    """Attach per-cell metrics from PID maps or discovered run artifacts."""
     for cell in grid["cells"]:
-        out = run_outputs.get(cell["cell_id"])
+        out, shape = _cell_translations_and_shape(run_outputs.get(cell["cell_id"]))
         cell["metrics"] = aggregate_track_a_cell(golden, out)
         cell["status"] = cell["metrics"]["status"]
         if out is not None:
-            cell["achieved_pid_per_chunk"] = {"status": MEASURED, "pids_in_output": len(out)}
+            cell["achieved_pid_per_chunk"] = shape or {
+                "status": MEASURED,
+                "translated_pids": len(out),
+            }
         else:
             cell["achieved_pid_per_chunk"] = {"status": PENDING_LIVE_RUN}
+
+
+def _read_required_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        raise ValueError(f"required Track A artifact not found: {path}") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in Track A artifact {path}: {exc}") from exc
+
+
+def _discover_cell_chapter_dir(cell_root: Path) -> Path | None:
+    direct = cell_root / "draft_translations.json"
+    if direct.exists():
+        return cell_root
+    work = cell_root / "work"
+    if not work.exists():
+        return None
+    candidates = sorted(
+        p.parent for p in work.glob("*/draft_translations.json") if p.is_file()
+    )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        names = ", ".join(str(p) for p in candidates)
+        raise ValueError(f"Track A cell {cell_root.name} has multiple chapter outputs: {names}")
+    return candidates[0]
+
+
+def _manifest_chunk_shape(manifest: Any, translated_pids: int) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("chunks"), list):
+        raise ValueError("Track A manifest must contain a chunks array")
+    counts: list[int] = []
+    for index, chunk in enumerate(manifest["chunks"]):
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("pids"), list):
+            raise ValueError(f"Track A manifest chunk {index} must contain a pids array")
+        counts.append(len(chunk["pids"]))
+    return {
+        "status": MEASURED,
+        "chunk_count": len(counts),
+        "pid_counts": counts,
+        "min": min(counts) if counts else 0,
+        "max": max(counts) if counts else 0,
+        "mean": round(sum(counts) / len(counts), 2) if counts else 0.0,
+        "translated_pids": translated_pids,
+    }
+
+
+def load_track_a_run_outputs(run_root: Path) -> dict[str, dict[str, Any] | None]:
+    """Discover the four isolated Gate Bench cells without reading model logs."""
+    if not run_root.is_dir():
+        raise ValueError(f"Track A run root is not a directory: {run_root}")
+    outputs: dict[str, dict[str, Any] | None] = {}
+    expected_ids = [grid_cell_id(chunk, rc) for chunk, rc in GRID_CONFIG]
+    for cell_id in expected_ids:
+        chapter_dir = _discover_cell_chapter_dir(run_root / cell_id)
+        if chapter_dir is None:
+            outputs[cell_id] = None
+            continue
+        translations = _read_required_json(chapter_dir / "draft_translations.json")
+        if not isinstance(translations, dict) or not all(
+            isinstance(pid, str) and isinstance(text, str)
+            for pid, text in translations.items()
+        ):
+            raise ValueError(
+                f"Track A draft must be an object mapping PID to text: "
+                f"{chapter_dir / 'draft_translations.json'}"
+            )
+        manifest = _read_required_json(chapter_dir / "manifest.json")
+        outputs[cell_id] = {
+            "translations": translations,
+            "achieved_pid_per_chunk": _manifest_chunk_shape(manifest, len(translations)),
+        }
+    return outputs
 
 # --------------------------------------------------------------------------- #
 # Track B — v31 run import (read-only)
@@ -371,6 +465,32 @@ def v31_run_identity(run_root: Path) -> str:
 
 def load_v31_lifecycle(chapter_dir: Path) -> list[dict[str, Any]]:
     return read_v31_json(chapter_dir / "v31" / "primary" / "lifecycle.json", [])
+
+
+def load_v31_verification_report(chapter_dir: Path) -> dict[str, Any]:
+    return read_v31_json(chapter_dir / "v31" / "primary" / "verification_report.json", {})
+
+
+def load_v31_post_gate_deterministic(chapter_dir: Path) -> list[dict[str, Any]]:
+    primary = chapter_dir / "v31" / "primary"
+    decisions: list[dict[str, Any]] = []
+    if not primary.exists():
+        return decisions
+    for path in sorted(primary.glob("post_gate_deterministic_round_*.json")):
+        data = read_v31_json(path, {})
+        if isinstance(data, dict):
+            decs = data.get("decisions") or []
+            if isinstance(decs, list):
+                for d in decs:
+                    if isinstance(d, dict):
+                        d = dict(d)
+                        d["_round"] = data.get("round")
+                        decisions.append(d)
+    return decisions
+
+
+def load_v31_final_ledger(chapter_dir: Path) -> dict[str, Any]:
+    return read_v31_json(chapter_dir / "v31_final_changed_pid_ledger.json", {})
 
 
 def load_v31_residual_lifecycle(chapter_dir: Path) -> list[dict[str, Any]]:
@@ -414,32 +534,6 @@ def terminal_artifact_present(chapter_dir: Path) -> tuple[bool, str | None]:
     if not Path(output).exists():
         return False, output
     return True, output
-
-
-def load_v31_verification_report(chapter_dir: Path) -> dict[str, Any]:
-    return read_v31_json(chapter_dir / "v31" / "primary" / "verification_report.json", {})
-
-
-def load_v31_post_gate_deterministic(chapter_dir: Path) -> list[dict[str, Any]]:
-    primary = chapter_dir / "v31" / "primary"
-    decisions: list[dict[str, Any]] = []
-    if not primary.exists():
-        return decisions
-    for path in sorted(primary.glob("post_gate_deterministic_round_*.json")):
-        data = read_v31_json(path, {})
-        if isinstance(data, dict):
-            decs = data.get("decisions") or []
-            if isinstance(decs, list):
-                for d in decs:
-                    if isinstance(d, dict):
-                        d = dict(d)
-                        d["_round"] = data.get("round")
-                        decisions.append(d)
-    return decisions
-
-
-def load_v31_final_ledger(chapter_dir: Path) -> dict[str, Any]:
-    return read_v31_json(chapter_dir / "v31_final_changed_pid_ledger.json", {})
 
 
 def load_meta_translations(chapter_dir: Path) -> list[dict[str, Any]]:
@@ -554,6 +648,45 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         completion_status = PENDING_RUN_COMPLETION
         completion_reason = "primary pass not adjudicated yet"
 
+    metrics: dict[str, Any] = {}
+    # ---- PID coverage ----
+    manifest = read_v31_json(chapter_dir / "manifest.json", {})
+    blocks = manifest.get("blocks") if isinstance(manifest, dict) else None
+    total_pids = len(blocks) if isinstance(blocks, list) else 0
+    pt = read_v31_json(chapter_dir / "v31_primary_translations.json", {})
+    covered = len(pt) if isinstance(pt, dict) else 0
+    missing = (
+        sorted(
+            set(str(b.get("pid")) for b in blocks if isinstance(b, dict) and b.get("pid"))
+            - set(str(k) for k in (pt.keys() if isinstance(pt, dict) else []))
+        )
+        if isinstance(blocks, list) and isinstance(pt, dict)
+        else []
+    )
+    metrics["pid_coverage"] = {
+        "status": MEASURED if total_pids else PENDING_RUN_COMPLETION,
+        "covered": covered,
+        "total": total_pids,
+        "missing": missing,
+    }
+
+    # ---- lifecycle-derived residual / repair resolution (primary) ----
+    lifecycle = load_v31_lifecycle(chapter_dir)
+    verification = load_v31_verification_report(chapter_dir)
+    from collections import Counter
+
+    lc_status_dist = Counter(i.get("status") for i in lifecycle if isinstance(i, dict))
+    vrep = verification.get("decisions") if isinstance(verification, dict) else None
+    decision_dist: Counter[str] = Counter()
+    if isinstance(vrep, list):
+        for d in vrep:
+            if isinstance(d, dict):
+                decision_dist[str(d.get("decision"))] += 1
+    residual_primary = int(lc_status_dist.get("resolved_retry_exhausted", 0))
+    fp_primary = int(lc_status_dist.get("resolved_false_positive", 0))
+    repaired_primary = int(lc_status_dist.get("resolved_repair", 0))
+    total_lifecycle = len(lifecycle)
+
     # ---- Track B top-level annotations ----
     # Track B carries visible operator notes (not numerical metrics) so the
     # Gate and downstream consumers can see historical anomalies without
@@ -606,44 +739,6 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         elif monitor_status == "REUSED":
             notes.append("track_b monitor_status=REUSED (cache reuse path)")
 
-    metrics: dict[str, Any] = {}
-    # ---- PID coverage ----
-    manifest = read_v31_json(chapter_dir / "manifest.json", {})
-    blocks = manifest.get("blocks") if isinstance(manifest, dict) else None
-    total_pids = len(blocks) if isinstance(blocks, list) else 0
-    pt = read_v31_json(chapter_dir / "v31_primary_translations.json", {})
-    covered = len(pt) if isinstance(pt, dict) else 0
-    missing = (
-        sorted(
-            set(str(b.get("pid")) for b in blocks if isinstance(b, dict) and b.get("pid"))
-            - set(str(k) for k in (pt.keys() if isinstance(pt, dict) else []))
-        )
-        if isinstance(blocks, list) and isinstance(pt, dict)
-        else []
-    )
-    metrics["pid_coverage"] = {
-        "status": MEASURED if total_pids else PENDING_RUN_COMPLETION,
-        "covered": covered,
-        "total": total_pids,
-        "missing": missing,
-    }
-
-    # ---- lifecycle-derived residual / repair resolution (primary) ----
-    lifecycle = load_v31_lifecycle(chapter_dir)
-    verification = load_v31_verification_report(chapter_dir)
-    from collections import Counter
-
-    lc_status_dist = Counter(i.get("status") for i in lifecycle if isinstance(i, dict))
-    vrep = verification.get("decisions") if isinstance(verification, dict) else None
-    decision_dist: Counter[str] = Counter()
-    if isinstance(vrep, list):
-        for d in vrep:
-            if isinstance(d, dict):
-                decision_dist[str(d.get("decision"))] += 1
-    residual_primary = int(lc_status_dist.get("resolved_retry_exhausted", 0))
-    fp_primary = int(lc_status_dist.get("resolved_false_positive", 0))
-    repaired_primary = int(lc_status_dist.get("resolved_repair", 0))
-    total_lifecycle = len(lifecycle)
     # ---- typed final_residual_total ----
     # The bare-string form (status-in-value-slot) mixed status and value, which
     # the Gate requires be replaced with a typed object. The producer now
@@ -676,6 +771,7 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
             "value_numeric": None,
             "reason": "primary pass not adjudicated yet",
         }
+
     metrics["residual_errors"] = {
         "status": MEASURED if primary_complete else PENDING_RUN_COMPLETION,
         "primary_total_issues": total_lifecycle,
@@ -684,9 +780,7 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
         "primary_false_positive": fp_primary,
         "primary_keep_decisions": int(decision_dist.get("keep", 0)),
         "final_residual_total": final_residual_obj,
-        "reason": (
-            "" if primary_complete else "primary adjudication not finalised"
-        ),
+        "reason": "" if primary_complete else "primary adjudication not finalised",
     }
 
     # ---- bad repair (deterministic gate on applied repair candidates) ----
@@ -792,9 +886,9 @@ def import_track_b(run_root: Path) -> dict[str, Any]:
             "primary_pass_complete": primary_complete,
             "residual_pass_complete": residual_complete,
         },
+        "metrics": metrics,
         "notes": notes,
         "terminal_discrepancy": terminal_discrepancy,
-        "metrics": metrics,
     }
 
 
@@ -824,8 +918,6 @@ def _track_b_no_run(run_identity: str = UNKNOWN) -> dict[str, Any]:
             "reason": "no v31 run root found",
             "primary_pass_complete": False,
         },
-        "notes": [],
-        "terminal_discrepancy": None,
         "metrics": {
             "pid_coverage": dict(pending),
             "bad_repair": dict(pending),
@@ -853,6 +945,8 @@ def _track_b_no_run(run_identity: str = UNKNOWN) -> dict[str, Any]:
             },
             "time_tokens": dict(pending),
         },
+        "notes": [],
+        "terminal_discrepancy": None,
     }
 
 # --------------------------------------------------------------------------- #
@@ -867,7 +961,7 @@ def _now_iso() -> str:
 def build_result_record(
     golden_path: Path | None,
     track_b_run_root: Path | None,
-    track_a_run_outputs: dict[str, dict[str, str] | None] | None = None,
+    track_a_run_outputs: dict[str, dict[str, Any] | None] | None = None,
     chapter_id_for_grid: str = "046",
     config_path: str = "config.v3.json",
 ) -> dict[str, Any]:
@@ -966,6 +1060,16 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
     comp = tb.get("completion", {})
     if comp.get("status") not in (MEASURED, PENDING_RUN_COMPLETION, NO_RUN):
         errors.append("track_b.completion.status invalid")
+    mtcs = tb.get("metrics", {})
+    for k in ("pid_coverage", "bad_repair", "residual_errors",
+              "deterministic_integrity", "russian_rubric", "ltcr", "time_tokens"):
+        if k not in mtcs:
+            errors.append(f"track_b.metrics missing: {k}")
+        else:
+            st = (mtcs[k] or {}).get("status")
+            if st not in (MEASURED, PENDING_LIVE_RUN, PENDING_RUN_COMPLETION,
+                          PENDING_DEFINITION, NOT_MEASURABLE, NO_RUN):
+                errors.append(f"track_b.metrics.{k}.status invalid: {st!r}")
     # notes + terminal_discrepancy (Gate-visible annotations). The keys
     # themselves are required by schema; this validator hard-fails when
     # they are absent.
@@ -986,16 +1090,10 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
                 for k in ("detected", "monitor_status", "artifacts_say"):
                     if k not in td_v:
                         errors.append(f"track_b.terminal_discrepancy missing: {k}")
-    mtcs = tb.get("metrics", {})
-    for k in ("pid_coverage", "bad_repair", "residual_errors",
-              "deterministic_integrity", "russian_rubric", "ltcr", "time_tokens"):
-        if k not in mtcs:
-            errors.append(f"track_b.metrics missing: {k}")
-        else:
-            st = (mtcs[k] or {}).get("status")
-            if st not in (MEASURED, PENDING_LIVE_RUN, PENDING_RUN_COMPLETION,
-                          PENDING_DEFINITION, NOT_MEASURABLE, NO_RUN):
-                errors.append(f"track_b.metrics.{k}.status invalid: {st!r}")
+    # records hash shape when a real golden set is used
+    rh = src.get("records_hash_sha256")
+    if rh not in (None, UNKNOWN) and not _HEX_RE.match(str(rh)):
+        errors.append("track_a.source.records_hash_sha256 not a sha256 hex")
     # typed final_residual_total: must be {status, value_numeric: number|null, reason}
     frt = (mtcs.get("residual_errors") or {}).get("final_residual_total")
     if isinstance(frt, dict):
@@ -1024,10 +1122,6 @@ def validate_result_record(record: dict[str, Any]) -> list[str]:
             "track_b.metrics.residual_errors.final_residual_total must be a typed "
             "object {status, value_numeric, reason}; bare strings are not allowed"
         )
-    # records hash shape when a real golden set is used
-    rh = src.get("records_hash_sha256")
-    if rh not in (None, UNKNOWN) and not _HEX_RE.match(str(rh)):
-        errors.append("track_a.source.records_hash_sha256 not a sha256 hex")
     return errors
 
 
@@ -1059,6 +1153,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="v4 Phase 0C baseline (read-only)")
     p.add_argument("--golden", type=Path, help="path to golden set records.json (Track A)")
     p.add_argument("--track-b-run-root", type=Path, help="v31 run root to import (Track B)")
+    p.add_argument(
+        "--track-a-run-root", type=Path,
+        help="Gate Bench root containing the four Track A cell directories",
+    )
     p.add_argument("--out", type=Path, help="write assembled result record here")
     p.add_argument("--chapter", default="046", help="chapter id for grid recipe")
     p.add_argument("--config-path", default="config.v3.json", help="v3 config path for run command recipe")
@@ -1067,10 +1165,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.track_a_run_root is not None and args.golden is None:
+        raise SystemExit("--track-a-run-root requires --golden")
+    track_a_outputs = (
+        load_track_a_run_outputs(args.track_a_run_root)
+        if args.track_a_run_root is not None else None
+    )
     record = build_result_record(
         golden_path=args.golden,
         track_b_run_root=args.track_b_run_root,
-        track_a_run_outputs=None,
+        track_a_run_outputs=track_a_outputs,
         chapter_id_for_grid=args.chapter,
         config_path=args.config_path,
     )
