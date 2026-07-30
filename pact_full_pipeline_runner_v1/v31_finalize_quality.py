@@ -255,17 +255,17 @@ def main() -> int:
                 f"{len(unresolved)} blocking condition(s)"
             )
 
-        if args.final_lifecycle and terminal == "quarantined":
+        if args.final_lifecycle and terminal in {"quarantined", "complete_with_warnings"}:
             gate = {
                 "version": VERSION, "chapter": source_path.name, "ok": False,
-                "status": "quarantined", "coverage": coverage,
+                "status": terminal, "coverage": coverage,
                 "changed_pids": read_json(work / "v31_final_changed_pid_ledger.json", {}).get("changed_pids", []),
                 "blocking_findings": final_blockers,
                 "prior_terminal_status": prior_status,
             }
-            reason = "blocking final quality findings" if final_blockers else "prior quarantine is monotonic within this run identity"
-            publish_terminal_pair(work, {"status": "quarantined", "reason": reason}, gate)
-            logging.warning("%s quarantined: %s final blocking finding(s)", source_path.name, len(final_blockers))
+            reason = "blocking final quality findings; output permitted with warnings" if final_blockers else "legacy quarantine preserved as explicit output warning"
+            publish_terminal_pair(work, {"status": terminal, "reason": reason}, gate)
+            logging.warning("%s completes with warnings: %s final blocking finding(s)", source_path.name, len(final_blockers))
             continue
 
         compat = [compatible(issue) for issue in verified]

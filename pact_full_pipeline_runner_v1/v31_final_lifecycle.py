@@ -11,7 +11,7 @@ from typing import Any
 from v31_common import add_common_args, load_cfg, load_runtime, read_json, selected_chapters, write_json
 
 
-TERMINAL = {"complete", "quarantined", "failed"}
+TERMINAL = {"complete", "complete_with_warnings", "quarantined", "failed"}
 TRANSACTION_FILE = "v31_terminal_transaction.json"
 
 
@@ -98,10 +98,12 @@ def context_pids(blocks: list[dict[str, Any]], targets: list[str], radius: int =
 def terminal_status(*, ledger_ok: bool, coverage_ok: bool, verification_ok: bool,
                     smoke_ok: bool, blocking_findings: list[dict[str, Any]],
                     final_repair_rounds: int, prior_status: str | None = None) -> str:
-    """Quality findings quarantine; execution and accounting failures fail.
+    """Publish output with warnings for quality findings; fail only execution/accounting.
 
-    A terminal quarantine is monotonic: a later stale artifact can never turn it
-    into complete.  The runner is allowed exactly one final repair round.
+    Blocking findings remain durable and visible, but do not prevent final HTML
+    creation. A legacy quarantine is promoted only to the explicit warning
+    status, never silently to a clean completion. The runner is allowed one
+    final repair round.
     """
     if not ledger_ok or not coverage_ok or not verification_ok or not smoke_ok:
         return "failed"
@@ -109,10 +111,8 @@ def terminal_status(*, ledger_ok: bool, coverage_ok: bool, verification_ok: bool
         return "failed"
     if prior_status == "failed":
         return "failed"
-    if prior_status == "quarantined":
-        return "quarantined"
-    if blocking_findings:
-        return "quarantined"
+    if blocking_findings or prior_status in {"quarantined", "complete_with_warnings"}:
+        return "complete_with_warnings"
     return "complete"
 
 
