@@ -1807,6 +1807,16 @@ def target_form_present(text: str, expected: str) -> bool:
     folded = text.casefold().replace("ё", "е")
     if expected.casefold().replace("ё", "е") in folded:
         return True
+    expected_folded = expected.casefold().replace("ё", "е")
+    if (
+        expected[:1].isupper()
+        and re.fullmatch(r"[а-яе]{2,}й", expected_folded)
+        and re.search(
+            rf"(?<![а-яе]){re.escape(expected_folded[:-1])}(?:й|я|ю|ем|е)(?![а-яе])",
+            folded,
+        )
+    ):
+        return True
     if expected in {"Иной", "Иные"}:
         return bool(re.search(
             r"\bин(?:ой|ого|ому|ым|ом|ая|ую|ые|ых|ыми)\b",
@@ -3801,6 +3811,9 @@ def self_test(cfg: dict[str, Any]) -> int:
         assert source_term_present("The Others arrived", "Others")
         assert target_form_present("рядом с Дунканом Бехаймом", "Дункан Бехайм")
         assert target_form_present("для Завоевателя", "Завоеватель")
+        assert target_form_present("хуже, чем у Тая", "Тай")
+        assert target_form_present("подошёл к Таю", "Тай")
+        assert not target_form_present("таял на солнце", "Тай")
 
     print(f"Self-test passed (version {__version__})")
     return 0
