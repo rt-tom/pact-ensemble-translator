@@ -48,9 +48,10 @@ v4: «Сначала создай хорошие варианты в конте�
 4. **Selection — лексикографический каскад, без scoring-движка:**
    Qwen semantic pass/fail → детерминированный consistency-gate (model-free) →
    Gemma Russian preference.
-5. **Один assembled-chapter аудит** + targeted convergence по изменённым
-   регионам + один финальный smoke-check. Никаких повторных полных тяжёлых
-   аудитов.
+5. **Один assembled-chapter аудит** (Step 6) + targeted convergence по
+   изменённым регионам (Step 7). Step 8 (final integrity check) по умолчанию
+   не является модельным аудитом — см. §2 Step 8 и §11. Никаких повторных
+   полных тяжёлых аудитов обеими моделями по всей главе.
 6. **Reasoning в MVP выключен** (Gemma `reasoning=0`), но архитектура
    reasoning-ready: risk score и per-chunk конфиг уже в плайпе, включение —
    флагом позже, отдельным benchmark'ом.
@@ -95,17 +96,49 @@ v4: «Сначала создай хорошие варианты в конте�
 6. Assembled-chapter audit (один раз, по собранной главе)
    Qwen        : source ↔ translation (пропуски/добавления/референты/сцена)
    Gemma       : Russian-only review (кальки, регистр, повторы, диалог, ты/вы)
+                 — коррелированный сигнал (та же модель, что генерировала
+                 текст в Step 4/5), НЕ независимое доказательство качества;
+                 добавочная ценность против отсутствия проверки должна быть
+                 подтверждена ablation-бенчмарком (см. §10)
    deterministic: PID coverage / numbers / mixed-script / glossary / names /
                   formatting contract / HTML structure
+   formatting контракт (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) применяется ДО Step 8, не после — final smoke
+   должен видеть тот же текст, что попадёт в `complete`
 
 7. Targeted repair
    region-level minimal repair (semantic + Russian findings)
    optional full-sentence rewrite ТОЛЬКО если локальная правка невозможна
    convergence: re-audit только изменённых PID + discourse-окрестностей
+     - Qwen: semantic re-check изменённого региона
+     - Gemma: Russian re-check ОБЯЗАТЕЛЕН для региона, если repair устраняет
+       finding, изначально созданный Gemma Russian review в Step 6 (иначе
+       нет доказательства, что именно этот finding закрыт — deterministic
+       Step 8 закрытие Russian-findings подтвердить не может)
+     - Gemma: Russian re-check ДОПОЛНИТЕЛЬНО, risk-triggered (не blanket),
+       для соседних регионов, если правка затронула
+       диалог/регистр/ты-вы/имена, даже без исходного Gemma finding там
    max 2 rounds → иначе quarantined
 
-8. Final smoke + memory promotion
-   финальная проверка неподвижного результата (Qwen sem / Gemma Rus / determ.)
+8. Final integrity check + memory promotion
+   ОБЯЗАТЕЛЬНО, без модели:
+     - неподвижность финального результата (frozen hash)
+     - PID coverage / numbers / glossary / mixed-script / formatting / HTML —
+       вся глава
+     - подтверждение, что все findings Step 6/7 закрыты (для Gemma
+       Russian-findings подтверждением служит обязательный re-check из
+       Step 7, а не deterministic layer)
+   УСЛОВНО, одна модель (не обе):
+     - narrow Qwen semantic smoke по region'ам, ТОЛЬКО если после Step 7
+       текст изменился ВНЕ scope, уже покрытого Step 7 re-audit — например,
+       model-based formatting fallback (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) исправил span после
+       convergence, либо repair расширил межрегиональный риск за пределы
+       проверенной discourse-окрестности. Сам факт «≥1 repair round» НЕ
+       является достаточным триггером — Step 7 уже даёт свежий Qwen verdict
+       по изменённому региону, повторный проход того же региона избыточен
+     - Gemma smoke по умолчанию отсутствует (уже проверяла тот же текст в
+       Step 5 и Step 6 как коррелированный сигнал; закрытие её findings
+       обеспечено обязательным re-check в Step 7, третий blanket-проход не
+       даёт независимого сигнала)
    memory promotion ТОЛЬКО после complete
 ```
 
@@ -282,7 +315,8 @@ Phase 1  memory foundation: glossary / book_memory / chapter snapshot (shadow mo
 Phase 2  risk pre-screen + scene/chunk generation + A/B + cascaded selection
          → benchmark против single-draft v3
 Phase 3  assembled-chapter audit (Qwen sem / Gemma Rus / determ.) + immutable findings
-Phase 4  region repair + convergence (max 2) + quarantine + final smoke
+Phase 4  region repair + convergence (max 2) + quarantine + final integrity check
+         (deterministic default, conditional narrow Qwen smoke — см. §2 Step 8)
 Phase 5  translation-time formatting contract (exact → occurrence → fuzzy → model fallback)
 Phase 6+ ops: batching по ролям, меньше reloads; опц. risk-gated reasoning; опц. 3-я модель
 Phase 7  A/B release; switch только после доказанного выигрыша
@@ -299,5 +333,31 @@ Phase 7  A/B release; switch только после доказанного вы
 2. Temperature/seed для A/B — калибровать на golden set.
 3. Порог risk score (low/med/high).
 4. Даёт ли risk-gated reasoning выигрыш на high-risk EN→RU — отдельный эксперимент Phase 6+.
+5. Ablation на golden set для Step 6 Gemma Russian review: сравнить recall
+   реальных дефектов / false positives / latency / reload cost для (a) Gemma
+   self-review, (b) Qwen Russian review, (c) третья модель, (d) отсутствие
+   дополнительной model-review. Решает, остаётся ли Gemma review в Step 6
+   обязательной или переходит в high-risk-only escalation (см. §1 п.5, §2
+   Step 6/8).
+6. Partial memory promotion при `quarantined`. Сейчас promotion в §6 —
+   all-or-nothing на уровне главы: если хотя бы один регион ушёл в quarantine,
+   ни один термин/факт из этой главы не попадает в `glossary.json` /
+   `book_memory.json`, даже если остальные PID полностью чисты (0 findings за
+   весь repair-lifecycle). Риск: если реальный quarantine rate на golden set
+   окажется высоким, общая память будет расти намного медленнее, чем ожидалось.
+   Измерить фактический quarantine rate в Phase 0/2 (метрика уже собирается
+   для критерия A/B в §8.4) и по результату решить, нужен ли partial promotion:
+   - promote только термины/факты из PID с нулевыми findings за весь
+     lifecycle **и** вне discourse-окрестности любого quarantined-региона
+     (эти окрестности уже считает Step 7 convergence);
+   - promote только до `observed`/`provisional`, никогда сразу
+     `established`/`locked` — сохраняет консервативность лестницы promotion
+     из §6 даже при ошибке;
+   - результат явно маркируется как promoted из partial (не complete) главы,
+     чтобы отличать от обычного promotion при аудите.
+   Не включать в MVP по умолчанию — это возврат части сложности
+   (region-level granularity terminal state), которую v4 сознательно убрал
+   из v3 (см. §5). Делать только если Phase 0/2 числа покажут, что проблема
+   реальна.
 
 Эти решения принимаются числами из Phase 0, а не заранее.

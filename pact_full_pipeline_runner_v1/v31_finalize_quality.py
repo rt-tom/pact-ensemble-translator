@@ -18,6 +18,9 @@ DEFAULT_FAIL_CATEGORIES = {
     "missing", "mixed_script", "english_residue", "number", "number_word",
     "entity_consistency", "name_consistency", "narrator_gender",
 }
+RESOLVED_LIFECYCLE_STATUSES = {
+    "resolved_repair", "resolved_false_positive", "resolved_retry_exhausted",
+}
 
 
 def compatible(issue: dict[str, Any]) -> dict[str, Any]:
@@ -183,7 +186,7 @@ def main() -> int:
             lifecycle_ids = {str(item.get("issue_id")) for item in pass_lifecycle if item.get("issue_id")}
             unresolved_lifecycle = [
                 row for row in pass_lifecycle
-                if row.get("status") not in {"resolved_repair", "resolved_false_positive"}
+                if row.get("status") not in RESOLVED_LIFECYCLE_STATUSES
             ]
             if not status_path.exists():
                 unresolved.append({"pass": pass_name, "stage": "repair", "reason": "status.json missing"})
@@ -269,12 +272,12 @@ def main() -> int:
         changed_pids = [pid for pid in expected_pids if draft.get(pid) != translations.get(pid)]
         repair_records = []
         for row in lifecycle:
-            if row.get("status") in {"resolved_repair", "resolved_false_positive"}:
+            if row.get("status") in RESOLVED_LIFECYCLE_STATUSES:
                 repair_records.append({
                     "pid": row.get("pid"),
                     "issue_ids": [row.get("issue_id")],
                     "action": "replace" if row.get("status") == "resolved_repair" else "keep",
-                    "accepted": True,
+                    "accepted": row.get("status") != "resolved_retry_exhausted",
                     "outcome": row.get("status"),
                     "round": row.get("round"),
                     "pass": row.get("pass"),
@@ -299,6 +302,9 @@ def main() -> int:
             "unresolved_total": 0,
             "resolved_issue_count": len(lifecycle),
             "unresolved_issue_count": 0,
+            "retry_exhausted_issue_count": sum(
+                1 for row in lifecycle if row.get("status") == "resolved_retry_exhausted"
+            ),
             "coverage": coverage,
             "final_deterministic_issue_count": len(final_det),
             "changed_pids": changed_pids,

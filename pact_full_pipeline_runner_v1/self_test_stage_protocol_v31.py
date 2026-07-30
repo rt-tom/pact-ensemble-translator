@@ -84,7 +84,22 @@ def main() -> int:
         finally:
             protocol.os.replace = original_replace
         assert provenance_path.read_text(encoding="utf-8") == preserved
-        assert_outcome(probe(root, "--translation", "--chapter-stem", "one"), 20, "MODEL_REQUIRED")
+        translation_args = ("--translation", "--chapter-stem", "one")
+        assert_outcome(probe(root, *translation_args), 20, "MODEL_REQUIRED")
+        aggregate(root, "one", "manifest.json", {
+            "chunks": [{"chunk_id": "chunk_0001", "pids": ["p1", "p2"]}],
+        })
+        assert_outcome(probe(root, *translation_args), 20, "MODEL_REQUIRED")
+        aggregate(root, "one", "drafts/chunk_0001.json", {
+            "chunk_id": "chunk_0001", "translations": {"p1": "one", "p2": "two"},
+        })
+        cached_translation = probe(root, *translation_args)
+        assert_outcome(cached_translation, 0, "REUSED")
+        assert response(cached_translation)["reason"] == "all_manifest_chunk_drafts_complete"
+        aggregate(root, "one", "drafts/chunk_0001.json", {
+            "chunk_id": "chunk_0001", "translations": {"p1": "one"},
+        })
+        assert_outcome(probe(root, *translation_args), 20, "MODEL_REQUIRED")
     print("Pact v3.1 stage protocol offline integration tests passed")
     return 0
 

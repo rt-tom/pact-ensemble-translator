@@ -10,6 +10,10 @@ param(
     [switch]$RedoFormatting,
     [switch]$DryRun,
     [switch]$SkipPreflight,
+    # Explicit per-run override for full-chapter Qwen checks; default preserves
+    # the validated 32K profile.
+    [ValidateRange(32768, 65536)]
+    [int]$QwenContextSize = 32768,
     # Temporary, explicit migration switch. Remove once 3.1.2j runs are retired.
     [switch]$AllowLegacyArtifactReuse
 )
@@ -18,7 +22,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # BuildIdentity is for release/milestone reporting only.  ArtifactVersion is
 # the semantic identity shared by the config and every Python stage artifact.
-$BuildIdentity = '3.1.3-03'
+$BuildIdentity = '3.1.3-04'
 $ArtifactVersion = '3.1.3'
 
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
@@ -168,7 +172,7 @@ $translatorApi['model'] = $GemmaModelName
 $translatorApi['context_size'] = 32768
 $reviewerApi['enabled'] = $true
 $reviewerApi['model'] = $QwenModelName
-$reviewerApi['context_size'] = 32768
+$reviewerApi['context_size'] = $QwenContextSize
 $paths['input_dir'] = (Join-Path $ProjectRoot 'pact_chapters')
 $paths['output_dir'] = $OutputDir
 $paths['work_dir'] = $WorkDir
@@ -216,7 +220,7 @@ $ensemble['gemma_russian_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enab
 $ensemble['gemma_discourse_audit'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=2600; attempts=3; window_pids=30; overlap_pids=10 }
 $ensemble['qwen_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1400; length_retry_max_tokens=1600; attempts=3; context_size=2 }
 $ensemble['gemma_cross_verifier'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=800; attempts=3; context_size=2 }
-$ensemble['repair'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1600; attempts=3; context_before=2; context_after=2; alternative_for_multiple_issues=$true; alternative_categories=@('idiom','meaning','register','dialogue','continuity'); max_changed_ratio_span=0.35 }
+$ensemble['repair'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=1600; attempts=3; context_before=2; context_after=2; alternative_for_multiple_issues=$true; alternative_categories=@('idiom','meaning','register','dialogue','continuity'); max_changed_ratio_span=0.55 }
 $ensemble['qwen_semantic_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$false; max_tokens=900; attempts=3; context_size=2 }
 $ensemble['gemma_semantic_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=900; attempts=3; context_size=2 }
 $ensemble['gemma_russian_post_gate'] = @{ temperature=0.0; top_p=1.0; top_k=64; enable_thinking=$true; max_tokens=900; attempts=3; context_size=2 }
@@ -285,7 +289,7 @@ function Get-LlamaServerProfile {
         'GemmaTranslate' { $serverArgs = @('-m',$GemmaModelPath,'--model-draft',$GemmaMtpPath,'--spec-type','draft-mtp','--spec-draft-n-max','4','--device','Vulkan0','--host','127.0.0.1','--port','8080','-ngl','99','-ncmoe','18','--no-mmap','--reasoning-budget','0','-np','1','-c','32768','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaRepair' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
         'GemmaVerify' { $serverArgs = @('-m',$GemmaModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1536','-t','6','-tb','12','--no-mmap','--reasoning-budget','128','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
-        'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c','32768','-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
+        'Qwen' { $serverArgs = @('-m',$QwenModelPath,'--device','Vulkan0','--host','127.0.0.1','--port','8080','-c',[string]$QwenContextSize,'-fit','on','-fitt','1280','-b','2048','-ub','512','-ctk','q8_0','-ctv','q8_0','-t','6','-tb','12','--no-mmap','--reasoning-budget','0','-np','1','-fa','on','--jinja','--cache-ram','0','--ctx-checkpoints','0') }
     }
     return $serverArgs
 }
@@ -586,6 +590,10 @@ function Invoke-TranslationStage {
     foreach ($stem in $SelectedChapterStems) { $probeArgs += @('--chapter-stem', $stem) }
     Push-Location $ProjectRoot
     try { & $Python @probeArgs; $probeExit = $LASTEXITCODE } finally { Pop-Location }
+    if ($probeExit -eq 0) {
+        Invoke-PythonStage -Label $Label -Arguments $Arguments -Outcome 'REUSED'
+        return
+    }
     if ($probeExit -ne 20) { throw "$Label stage probe FAILED with exit code $probeExit" }
     Start-LlamaServer GemmaTranslate
     Invoke-PythonStage -Label $Label -Arguments $Arguments
@@ -691,7 +699,9 @@ function Run-RepairPass {
         Invoke-AggregateModelStage -Label "$PassName Gemma Russian gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_postcheck.py')) + (CommonArgs) + $gateArgs + @('--judge','gemma_russian','--model',$GemmaModelName)) -Profile GemmaVerify -AggregateRelativePath ("v31\{0}\post_gate_gemma_russian_round_{1:D2}.json" -f $PassName,$round) -Force ([bool]$RedoQuality)
 
         Invoke-PythonStage -Label "$PassName deterministic gate round $round" -Arguments (@((Join-Path $PackageRoot 'v31_deterministic_gate.py')) + (CommonArgs) + $gateArgs)
-        Invoke-PythonStage -Label "$PassName adjudication round $round" -Arguments (@((Join-Path $PackageRoot 'v31_adjudicate.py')) + (CommonArgs) + $gateArgs)
+        $adjudicationArgs = @($gateArgs)
+        if ($round -eq $maxRounds) { $adjudicationArgs += '--terminal-round' }
+        Invoke-PythonStage -Label "$PassName adjudication round $round" -Arguments (@((Join-Path $PackageRoot 'v31_adjudicate.py')) + (CommonArgs) + $adjudicationArgs)
 
         $retry = Get-RetryCount $PassName
         if ($retry -eq 0) { return }
@@ -699,7 +709,7 @@ function Run-RepairPass {
         $currentFile = if ($PassName -eq 'primary') { 'v31_primary_translations.json' } else { 'v31_final_translations.json' }
     }
     $remaining = Get-RetryCount $PassName
-    if ($remaining -gt 0 -and $PassName -ne 'final') { throw "$PassName left $remaining unresolved PID(s) after $maxRounds repair rounds." }
+    if ($remaining -gt 0) { throw "$PassName failed to terminalize $remaining PID(s) after $maxRounds repair rounds." }
 }
 
 try {

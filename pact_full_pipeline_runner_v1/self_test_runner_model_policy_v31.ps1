@@ -50,6 +50,7 @@ try {
     Assert-True ($runner -match '\$probeExit -notin @\(20, 22\)') 'Only stable MODEL_REQUIRED exit codes may trigger model startup.'
     Assert-True ($runner -match '\$probeExit -eq 22.*--force') 'Invalid aggregate MODEL_REQUIRED must retry the stage instead of accepting the file.'
     Assert-True ($runner -match 'Invoke-TranslationStage') 'Translation must be routed through the protocol, never a file-exists shortcut.'
+    Assert-True ($runner -match '\$probeExit -eq 0\)\s*\{\s*Invoke-PythonStage -Label \$Label -Arguments \$Arguments -Outcome ''REUSED''') 'A complete translation cache must run model-free without starting GemmaTranslate.'
     Assert-True ($runner -match 'Stop-LlamaServer\s*\r?\n\s*\$unownedEndpoint') 'A profile switch must stop only the tracked owned server before startup.'
     Write-Host 'Pact v3.1 runner model policy self-tests passed'
 } finally {
