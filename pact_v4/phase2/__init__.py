@@ -20,6 +20,7 @@ from .generation import (
     generate_for_chunk,
 )
 from .risk import (
+    REQUIRED_RISK_CATEGORIES,
     RISK_POLICY,
     GlossaryEntry,
     RiskAssessment,
@@ -29,6 +30,7 @@ from .risk import (
 )
 
 __all__ = [
+    "REQUIRED_RISK_CATEGORIES",
     "RISK_POLICY",
     "GlossaryEntry",
     "RiskAssessment",
