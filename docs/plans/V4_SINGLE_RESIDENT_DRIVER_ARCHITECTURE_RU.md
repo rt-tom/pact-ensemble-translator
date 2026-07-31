@@ -34,7 +34,9 @@ gate-bench-only вариантом с `SEQUENTIAL_MODEL_CAVEAT`. Ни один �
   Для chunk `N+1` он строится только из `selected_candidate_id` chunk `N`.
 - При `quarantined`, `needs_synthesis` или incomplete generation у `N`
   нет established RU-текста. Следующий chunk получает `()` — не
-  fidelity-first черновик и не «наименее плохой» fallback.
+  fidelity-first черновик и не «наименее плохой» fallback. Это
+  зафиксированное policy-решение, а не эвристика, см. dated record в
+  `DECISIONS.md`.
 - Кандидат, сгенерированный с иным `left_context`, не может стать
   финальным reuse для текущей цепочки. Его можно хранить только как
   provisional artifact с явной зависимостью.
@@ -52,34 +54,59 @@ snapshot и source-side risk для всей главы. Затем он идё�
 ```text
 preflight (model-free): plan + snapshot + risk
 
-for chunk N:
-  Gemma lease: generate A/B with committed_context[N-1]
-  Qwen lease:  fidelity gate for candidates of N
-  local:       deterministic + required-risk-category gates
-  Gemma lease: optional Russian preference among passed candidates
-  commit:      selected candidate, or explicit non-selection state
-              -> committed_context[N]
+G(N):        Gemma generation with committed_context[N-1]
+Q(N):        Qwen fidelity for candidates of N
+local(N):    deterministic + required-risk-category gates
+Gpref(N):    optional Gemma preference among passed candidates
+commit(N):   durable selected candidate, or explicit non-selection
+             -> committed_context[N]
+G(N+1):      Gemma generation only after commit(N)
 ```
 
-После Gemma preference service уже может оставаться загруженным для
-generation chunk `N+1`; перед его selection всё равно нужен переход к
-Qwen. Поэтому реальная стоимость — не предположение «десятки reloads», а
-измеряемая последовательность lease/reload на конкретном железе.
+Граница lease определена явно. Generation `N` заканчивает Gemma lease до
+`Q(N)`. После `Q(N)` вызов `Gpref(N)` и generation `N+1` **могут** быть
+одним следующим Gemma lease, но это два раздельных вызова, между которыми
+лежит durable `commit(N)`. Следовательно preference никогда не
+«сливается» с generation следующего chunk и не может быть молча заменена
+reload-оптимизацией. Если preference не нужна, `commit(N)` выполняется
+после Qwen/local gates до acquire Gemma для `G(N+1)`. Перед selection
+`N+1` всё равно нужен переход к Qwen. Поэтому реальная стоимость — не
+предположение «десятки reloads», а измеряемая последовательность
+lease/reload на конкретном железе.
 
 Driver обязан писать append-only decision/context journal. Минимальная
 запись на chunk: `chunk_id`, `parent_chunk_id`,
 `parent_context_state_hash`, `left_context_kind` (`selected` или
-`empty_after_nonselection`), `candidate_ids`, gate trace,
+`empty_after_nonselection`), `snapshot_hash`, `chunk_plan_hash`,
+`prompt/config identity`, `candidate_ids`, gate trace,
 `selected_candidate_id | terminal_nonselection_state` и hash фактически
 поданного left-context. Это позволяет resume повторно использовать лишь
 артефакт с тем же родителем, snapshot, plan, prompt/config identity и
-left-context hash.
+left-context hash. Равный parent hash сам по себе не является reuse key:
+смена plan или frozen snapshot (включая glossary/memory patch) инвалидирует
+candidate и все зависимые downstream artifacts.
 
 Model lifecycle — отдельный адаптер driver'а (`acquire(Gemma|Qwen)`,
 `release`). Он управляет только service, запущенными самим run, и не
 подключается к чужому `llama-server` и не останавливает его. Реализация
 не должна считать HTTP-ответ доказательством освобождения VRAM: это
 подтверждает сам lifecycle adapter/наблюдаемый runtime state.
+
+### Ошибки между gate и commit
+
+Порядок выше исключает ситуацию «preference есть, а Qwen gate того же
+chunk ещё не был вызван»: `Gpref(N)` возможен только после успешного
+`Q(N)`. Если Qwen недоступен/даёт неучтённую ошибку для `N`, Gemma
+preference не вызывается, `N` получает явное `gate_failed` non-selection,
+а продолжение возможно только с `empty_after_nonselection` (либо глава
+останавливается согласно operational policy). Черновик никогда не
+попадает в context.
+
+Если Qwen упал на `N+1`, commit `N` уже валиден и не откатывается;
+`N+1` не получает selected translation. Последующий retry, который меняет
+это состояние, инвалидирует `N+1` и весь его context-dependent suffix по
+journal. Так ошибка service не создаёт ни commit без gate, ни скрытый
+least-bad fallback.
 
 Качество: эквивалентно текущему interleaved driver'у при одинаковых
 моделях, prompts и детерминизме, потому что вход Phase 2B каждого chunk
@@ -121,9 +148,14 @@ Gemma может предварительно сгенерировать цеп�
 Здесь критерий правильности не «победившая роль отлична от
 fidelity_first», а равенство PID-map/context hash. Даже выбор роли
 `fidelity_first` не разрешает reuse, если карта текста изменилась из-за
-synthesis или повторной генерации. Финал можно принять лишь после
-сравнения со строгим oracle-run: совпадают selected/non-selected states,
-selected candidate maps, decision traces, translations и context hashes.
+synthesis или повторной генерации. Финал нельзя принять по одному
+совпадению роли. На детерминированном fixture с теми же pinned
+model/prompt/config identities он обязан побайтно совпасть со строгим
+oracle-run по final artifacts. На живой главе с той же identity
+сравниваются selected/non-selected states, decision traces и context
+hashes; любые отличающиеся identity сначала делают сравнение невалидным,
+а не «допустимым дрейфом». Переводы дополнительно проходят integrity
+checks, но не подменяют ими oracle equality.
 
 Это может быть полезно, если расхождения действительно редки, но
 добавляет dependency DAG, invalidation, bounded retry/fixed-point policy
@@ -166,12 +198,13 @@ Frozen glossary и book/chapter memory уже необходимы, но они 
 на running glossary или model-generated summary означает изменить
 translation semantics и prompt policy, а не только оркестрацию.
 
-Такую идею стоит вести как отдельный `REVIEW REQUIRED` эксперимент. Её
-контроль — strict exact-RU context; варианты — пустой контекст и
-детерминированная memory-derived выжимка. Решение возможно только если
-слепая оценка стыков и integrity не хуже control, а не потому, что
-right-context не изменил FP-candidate rate в Track A. Тот benchmark не
-измерял discourse, анафору или left-context вовсе.
+Это не закрытая дверь, а отдельная `REVIEW REQUIRED` карточка после
+strict-driver oracle. Её контроль — strict exact-RU context; варианты —
+пустой контекст и детерминированная memory-derived выжимка. Карточка
+обязана включить заранее выбранные boundary cases и слепую оценку стыков.
+Решение возможно только если они и integrity не хуже control, а не потому,
+что right-context не изменил FP-candidate rate в Track A. Тот benchmark
+не измерял discourse, анафору или left-context вовсе.
 
 ## Что измерить до кода
 
@@ -199,13 +232,21 @@ pipeline и не меняют run artifacts/caches.
    deterministic integrity. Track A FP rate недостаточен.
 4. **Равенство speculative fixed point.** Если вариант 2 остаётся
    кандидатом, прогнать deterministic fixture и реальную главу против
-   строгого oracle. Зафиксировать число волн, invalidations, повторные
-   tokens/reloads и полное равенство final artifacts. Несовпадение —
-   дефект, не допустимое качество/скоростное trade-off.
+   строгого oracle с теми же pinned identities. Fixture требует полного
+   равенства final artifacts. Реальная глава требует равенства
+   selected/non-selection states, decision traces и context hashes на
+   каждом chunk; translations дополнительно проходят integrity checks.
+   Зафиксировать число волн, invalidations и повторные tokens/reloads.
+   Несовпадение при одинаковых identity — дефект, не допустимое
+   качество/скоростное trade-off.
 5. **Экономика второго service.** Сопоставить measured wall-clock и
    надёжность варианта 1 с ценой/доступностью второго GPU или удалённого
-   Qwen. Решение фиксирует явный бюджет, а не декларацию
-   «перезагрузок слишком много».
+   Qwen. Measurement record до implementation обязан задать численные
+   `max_chapter_wall_clock`, `max_reload_count`, `p95_cold_acquire` и
+   сравнимый budget второго service. До записи этих четырёх чисел действует
+   предварительный threshold: implementation запрещена; декларация
+   «перезагрузок слишком много» не считается решением. Числа не
+   предзаполняются догадкой, потому что Phase 0C не измерял reloads.
 
 ## Условия перехода к реализации
 
@@ -219,8 +260,12 @@ criteria strict driver:
   committed cascade result `N` либо явному empty-after-nonselection;
 - resume не переиспользует candidate при несовпадающем parent context,
   snapshot, plan, prompt/config identity;
+- отдельный negative regression доказывает invalidation при равном parent
+  context hash, но ином `chunk_plan_hash`, и при изменённом frozen snapshot
+  (например, glossary/memory patch);
 - regression покрывает winner B, quarantine, needs_synthesis и
-  lifecycle failure между Gemma/Qwen без least-bad fallback;
+  lifecycle failure между Gemma/Qwen: Qwen failure не вызывает preference
+  и не создаёт commit без gate или least-bad fallback;
 - offline tests и отдельный hardware benchmark pass; production pipeline
   не запускается этой задачей.
 
