@@ -40,7 +40,8 @@
     },
     "total_words": {
       "type": "integer",
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 640
     },
     "context": {
       "$ref": "#/$defs/chunk_context"
