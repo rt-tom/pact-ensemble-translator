@@ -8,19 +8,17 @@ Scope: одна локальная машина; в каждый момент з
 
 ## Решение
 
-Для одного GPU базовой финальной архитектурой должен стать **строгий
-in-order single-resident driver**: для chunk `N` он завершает Phase 2B и
-весь Phase 2C, фиксирует результат, и только затем начинает генерацию
-`N+1`. В каждый момент driver владеет не более чем одним локальным model
-service. Это сохраняет буквально контракт
-`left_context = cascade-выбранный перевод предыдущего chunk'а` из
-`V4_MVP_SPEC_RU.md` §3.3.
+Для одного GPU базовой кандидатурой становится **batch-first discourse
+plan + targeted boundary convergence**. Он делает source-side preparation,
+generation, semantic admission и Russian-only selection большими model-role
+батчами, а exact selected RU left-context использует только для небольшого
+числа boundary repairs. Это даёт 3 restart до repair и ещё 2 на фактически
+нужный repair-round вместо 20 strict restart для десяти high-risk chunk'ов.
 
-Это не означает, что данный driver уже следует реализовывать. Сначала
-нужен короткий performance/quality gate из раздела «Что измерить». Если
-переключения не укладываются в согласованный бюджет, не следует ослаблять
-`left_context`: единственный рассматриваемый путь уменьшить число запусков
-— speculative fixed point, доказавший совпадение со строгим driver'ом.
+Строгий in-order driver остаётся quality oracle и benchmark-control: только
+с ним можно доказать, что новая политика не ухудшает дискурс. Его не следует
+делать default production topology, пока Vulkan lifecycle budget не показал,
+что 20 переключений стабильны.
 
 `v4_phase12_draft_runner.py` остаётся эталоном корректности при двух
 доступных service, а `v4_phase12_sequential_runner.py` остаётся
@@ -32,21 +30,50 @@ gate-bench-only вариантом с `SEQUENTIAL_MODEL_CAVEAT`. Ни один �
 - `select_candidate` остаётся локальным к одному chunk: статичный EN
   source + кандидаты данного chunk. Его порядок запуска не является
   источником межчанковой зависимости.
-- Единственная межчанковая зависимость Phase 2B — явный `left_context`.
-  Для chunk `N+1` он строится только из `selected_candidate_id` chunk `N`.
-- При `quarantined`, `needs_synthesis` или incomplete generation у `N`
-  нет established RU-текста. Следующий chunk получает `()` — не
-  fidelity-first черновик и не «наименее плохой» fallback. Это
-  зафиксированное policy-решение, а не эвристика, см. dated record в
-  `DECISIONS.md`.
-- Кандидат, сгенерированный с иным `left_context`, не может стать
-  финальным reuse для текущей цепочки. Его можно хранить только как
-  provisional artifact с явной зависимостью.
-- Phase 1/2 контракты (`Candidate`, `generate_for_chunk`,
-  `select_candidate`) не меняются. Меняются только порядок вызовов,
-  lifecycle service и driver artifacts.
+- Primary generation не получает непроверенный RU draft. Она получает
+  frozen source-side discourse plan: glossary/имена, speaker/addressee,
+  ты/вы, референты, время, voice notes и риск границ.
+- Exact selected RU left-context обязателен для boundary repair. Candidate,
+  созданный с другим committed left-context, не может быть reuse этого
+  repair; journal хранит parent context hash.
+- При отсутствии выбранного кандидата автоматический fallback обязан
+  сохранить полный структурно валидный PID-map и trace. Он становится
+  `accepted_degraded` после исчерпания repair budget, а не тихим `complete`.
+- Базовые identity/validation контракты `Candidate` и PID-map сохраняются,
+  но понадобятся новые artifacts: source-side discourse plan, RU boundary
+  window, fallback debt trace и terminal state `accepted_degraded`.
 
-## Рекомендуемый driver: строгий stop-and-switch
+## Рекомендуемый driver: batch-first discourse plan
+
+```text
+Qwen:  source-side discourse plan + boundary-risk map (один батч)
+Gemma: A/B generation всех chunk'ов по frozen plan (один батч)
+Qwen:  semantic admission кандидатов + deterministic/required-risk gates (один батч)
+Gemma: Russian-only global selection и findings слабых стыков (один батч)
+Gemma: targeted boundary repair с exact selected RU left-context
+Qwen:  re-gate только изменённых region'ов
+Gemma: Russian re-check/commit repaired region'ов
+```
+
+Phase 1–2 — admission, не финальный аудит. Там обязательны только valid
+PID-map/identity, coverage, hard deterministic constraints, Qwen semantic
+admission, required-risk categories и выбор среди уже допустимых RU
+кандидатов. Полная литературная и межчанковая проверка находится в Phase 3.
+
+Phase 3 использует окно, а не три полных chunk по умолчанию: весь central
+chunk плюс budgeted tail предыдущего и head следующего RU chunk, явно
+помеченные как read-only context. Три полных chunk допускаются только при
+risk trigger (диалог, referent, ты/вы, scene transition) и после отдельного
+context-size benchmark. Findings всегда принадлежат central chunk.
+
+Phase 4 выполняет один обязательный targeted boundary repair-round. Второй
+разрешён только если re-gate всё ещё находит blocking finding либо первая
+правка изменила boundary/context соседнего region. После лимита система
+принимает структурно валидный fallback как `accepted_degraded`, не
+продвигая память; `failed` остаётся только для отсутствия какого-либо
+валидного PID-map после автоматических retries.
+
+## Reference oracle: строгий stop-and-switch
 
 До первого model call driver детерминированно создаёт `ChunkPlan`, frozen
 snapshot и source-side risk для всей главы. Затем он идёт только слева
@@ -120,11 +147,21 @@ least-bad fallback.
 
 | Вариант | Качество left_context | Сложность | Стоимость/ограничение | Вердикт |
 |---|---|---|---|---|
-| 1. Строгий stop-and-switch на одном GPU | Точное; идентично interleaved по входам | Средняя | Reload Qwen на каждой границе; Gemma переключается вокруг Qwen | Базовый correct architecture; принять или отвергнуть только по замеру |
-| 2. Спекулятивные волны с откатом | Точное только после fixed-point re-run | Высокая | Дешёво при редких расхождениях, но может каскадно сжечь tokens/reloads | Эксперимент после измерений, не initial production path |
-| 3. Ограниченное окно/батч `K` | Неточное без отката | Низкая без отката, высокая с ним | Уменьшает reloads, но внутри окна повторяет defect sequential-driver'а | Не принимать самостоятельным финальным вариантом |
+| 1. Batch-first discourse plan + boundary convergence | Контекст проверяется и чинится на рискованных границах | Средняя | 3 restart до repair; +2 за round | Предпочтительный кандидат, сравнить со strict oracle |
+| 2. Строгий stop-and-switch на одном GPU | Точное на каждом generation input | Средняя | 20 restart на 10 high-risk chunk'ов | Oracle/control, не default до Vulkan benchmark |
+| 3. Спекулятивные волны с откатом | Точное только после fixed-point re-run | Высокая | 2…20 restart и возможный token waste | Второй performance experiment |
+| 4. Ограниченное окно/батч `K` без discourse plan | Неточное без отката | Низкая без отката, высокая с ним | Повторяет defect sequential-driver'а внутри окна | Не принимать самостоятельно |
 
-### 1. Строгий stop-and-switch
+### 1. Batch-first discourse plan + boundary convergence
+
+Этот вариант сохраняет научно обоснованные части v4: preparation/frozen
+memory, небольшой набор A/B, Qwen semantic admission, Russian-only
+selection и minimal convergence. Он не утверждает, что source-derived plan
+эквивалентен raw selected RU: это проверяется против strict oracle на
+boundary golden set. Его преимущество — роль модели меняется редко, а
+русская связность проверяется после сборки текста там, где она наблюдаема.
+
+### 2. Строгий stop-and-switch
 
 Это единственный однопроцессорный вариант, который не делает
 непроверенный текст частью входа следующей генерации. При low risk
@@ -137,7 +174,7 @@ service можно использовать для генерации следу
 только ради меньшего числа reloads: это меняет выбор кандидата и должно
 быть самостоятельной benchmark-policy, а не свойством lifecycle.
 
-### 2. Спекулятивные волны с откатом
+### 3. Спекулятивные волны с откатом
 
 Gemma может предварительно сгенерировать цепочку, используя provisional
 `fidelity_first` left-context, после чего Qwen/Gemma выбирают результаты.
@@ -164,7 +201,7 @@ checks, но не подменяют ими oracle equality.
 вариант экономией: одно раннее расхождение делает его близким к строгому
 per-chunk переключению и добавляет выброшенные generation calls.
 
-### 3. Батчинг с окном `K`
+### 4. Батчинг с окном `K`
 
 Сгенерировать `K` chunk'ов Gemma, затем выбрать их Qwen — допустимо как
 измерительный или speculative-wave механизм, но не как финальный driver
@@ -329,32 +366,39 @@ pipeline и не меняют run artifacts/caches.
    чисел implementation запрещена; декларация «перезагрузок слишком много»
    не считается решением. Числа не предзаполняются догадкой, потому что
    Phase 0C не измерял reloads.
+6. **Batch-first против strict oracle.** На одном frozen source/snapshot
+   сравнить выбранную русскую цепочку и Phase-3 findings: semantic residual,
+   rubric по анафоре/ты-вы/voice, LTCR, deterministic integrity, quarantine /
+   `accepted_degraded` rate, wall-clock, tokens и restart. Три audit profile:
+   central-only, central + bounded neighbour excerpts, три full chunk только
+   для рискованных границ. Default выбирается по качеству стыков, не по
+   размеру prompt сам по себе.
 
 ## Условия перехода к реализации
 
 Следующая карточка может реализовывать только вариант, для которого есть
 versioned measurement record и выбранный бюджет. Минимальные acceptance
-criteria strict driver:
+criteria batch-first driver:
 
-- ни `generation_bundle.json`, ни финальный provenance не несут
-  `SEQUENTIAL_MODEL_CAVEAT`;
-- на generation `N+1` записанный parent context hash соответствует
-  committed cascade result `N` либо явному empty-after-nonselection;
-- resume не переиспользует candidate при несовпадающем parent context,
-  snapshot, plan, prompt/config identity;
-- отдельный negative regression доказывает invalidation при равном parent
-  context hash, но ином `chunk_plan_hash`, и при изменённом frozen snapshot
-  (например, glossary/memory patch);
-- regression покрывает winner B, quarantine, needs_synthesis и
-  lifecycle failure между Gemma/Qwen: Qwen failure не вызывает preference
-  и не создаёт commit без gate или least-bad fallback;
+- primary generation получает только frozen source-side plan, никогда
+  fidelity-first RU draft;
+- Phase 2 пропускает только structurally valid PID-map и candidate с
+  записанным Qwen/deterministic trace; fallback имеет явный debt trace;
+- Russian-only Phase 3 prompt содержит full central chunk и маркированные
+  bounded neighbour excerpts; finding не может быть привязан к чужому PID;
+- один repair-round обязателен, второй требует recorded trigger; repair с
+  changed boundary получает exact committed RU left-context и re-gate;
+- resume не переиспользует repair candidate при несовпадающих parent context,
+  snapshot, plan или prompt/config identity;
+- regression покрывает winner B, отсутствие допустимого кандидата,
+  `accepted_degraded`, Qwen/Gemma failure и восстановление после каждого
+  durable checkpoint;
 - offline tests и отдельный hardware benchmark pass; production pipeline
   не запускается этой задачей.
 
 ## Открытый вопрос для review
 
-Какой измеренный budget (wall-clock на главу, допустимый number of
-reloads, token waste) позволяет выбрать между фиксированными 20 restart
-строгого driver'а и speculative fixed point с диапазоном 2…20? До этой
-цифры рекомендация определяет инвариант и порядок выбора, но не утверждает
-конкретный operational вариант.
+Покажет ли batch-first policy на boundary golden set не худший semantic /
+Russian discourse результат против strict oracle при существенно меньшем
+числе restart? Если нет, strict остаётся quality control, а batch-first
+не принимается только потому, что он быстрее.

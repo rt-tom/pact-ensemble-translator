@@ -31,8 +31,9 @@ targeted convergence и promotion памяти только после `complete
    single-PID exception; результат — authoritative artifact.
 8. **Memory.** Promotion thresholds, provenance, conflicts, atomic write/lock
    и rollback. Quarantined observations non-authoritative.
-9. **Terminal state.** Write-once transitions `complete/quarantined/failed`,
-   output segregation и explicit resume policy.
+9. **Terminal state.** Write-once transitions
+   `complete/accepted_degraded/failed`; `quarantined` — internal repair state,
+   output debt segregation и explicit resume policy.
 10. **Formatting.** Source span contract создаётся при preparation и проходит
     generation/repair; Phase 5 реализует alignment, не позднюю фиксацию spans.
 11. **Provenance.** Минимум: `source_hash`, `chapter_snapshot_hash`,
@@ -84,8 +85,8 @@ identity and non-monotonic terminal transition. No v3 artifact compatibility.
 ### 1B. JSON memory shadow mode — Codex; review Claude
 
 `glossary.json`, `book_memory.json`, frozen `chapter_memory.json`, observations.
-Atomic snapshot/promotion/conflict/rollback. Complete promotes; quarantined and
-failed do not alter authoritative memory.
+Atomic snapshot/promotion/conflict/rollback. Only complete promotes;
+accepted_degraded, quarantined and failed do not alter authoritative memory.
 
 ### 1C. Structure-aware chunk planner — Codex; review Claude
 
@@ -99,17 +100,21 @@ left RU/right EN contexts. All PIDs exactly once; source spans fixed here.
 Versioned feature extractor and explainable bands. No model calls, no generator
 confidence. Regression includes known low/high-risk cases.
 
-### 2B. A/B generation — Codex; review Claude
+### 2B. Batch A/B generation — Codex; review Claude
 
-Gemma scene/chunk ordered PID-map, frozen context and ownership validation.
+Gemma scene/chunk ordered PID-map, frozen book memory + source-side discourse
+plan and ownership validation; primary generation never gets unverified RU
+draft as left context.
 Low=1; med/high=A/B via versioned fidelity-first/balanced-literary prompts.
 Cache includes prompt bundle hash; no reasoning or random C.
 
-### 2C. Cascaded selection — Codex; review Claude
+### 2C. Admission + cascaded Russian selection — Codex; review Claude
 
-Qwen fidelity → deterministic consistency → Gemma Russian preference. C/synthesis
-only after documented semantic disagreement/no passing candidate. No candidate
-means quarantine route, never least-bad selection.
+Qwen fidelity → deterministic consistency → Gemma Russian-only preference and
+neighbour coherence among passed candidates. Phase 2 is candidate admission,
+not a duplicate final audit. C/synthesis only after documented semantic
+disagreement/no passing candidate; bounded automatic fallback yields explicit
+`accepted_degraded` only with a complete structurally-valid PID-map and trace.
 
 **Gate:** run v3/v4 A/B and chunk benchmark using 0A/0B/0C. Only result record
 freezes chunk range, right context, temperature/seed and risk thresholds.
@@ -121,10 +126,13 @@ freezes chunk range, right context, temperature/seed and risk thresholds.
 Separate detector findings, region resolver, no overlap merge. Evidence and
 multiple findings per region remain intact.
 
-### 3B. One full audit — Codex; review Claude
+### 3B. One windowed assembled-chapter audit — Codex; review Claude
 
-Qwen EN↔RU, Gemma RU-only, deterministic integrity/formatting/HTML. Full PID
-coverage, resumable partial units, audit cannot claim complete on model failure.
+Qwen EN↔RU, Gemma RU-only, deterministic integrity/formatting/HTML. Each
+finding belongs to a full central chunk; model prompts carry only bounded
+read-only neighbour excerpts by default, escalating to three full chunks only
+for predeclared discourse risk. Full PID coverage, resumable partial units,
+audit cannot claim complete on model failure.
 
 ## Phase 4 — repair, convergence, terminal state
 
@@ -141,11 +149,13 @@ Step 6, Gemma re-check of that region is mandatory (not just risk-triggered)
 
 ### 4B. Targeted convergence — Codex; review Claude
 
-Re-audit changed PID plus discourse neighbours; hard maximum two rounds;
-final integrity check (deterministic default, conditional narrow Qwen smoke
-only when post-convergence text changes fall outside Step 7's re-audited
-scope — see `V4_MVP_SPEC_RU.md` §2 Step 8) and monotonic terminal
-transition. Quarantined output segregated.
+One required repair-round re-audits changed PID plus discourse neighbours; a
+second is allowed only for a remaining blocking finding or changed boundary.
+Then final integrity check (deterministic default, conditional narrow Qwen
+smoke only when post-convergence text changes fall outside Step 7's re-audited
+scope — see `V4_MVP_SPEC_RU.md` §2 Step 8) and monotonic terminal transition.
+A complete valid PID map may be `accepted_degraded` with debt trace and no
+memory promotion; only absent valid PID map is `failed`.
 
 ## Phase 5 — formatting alignment
 
@@ -157,8 +167,10 @@ transition. Quarantined output segregated.
 > только вместе с Phase 5.
 
 **Codex; review Claude.** Exact → occurrence-aware → conservative fuzzy → model
-fallback, all with provenance. Any unrecovered required span quarantines output.
-No marker leakage; duplicate occurrence/HTML/PID/number fixtures pass.
+fallback, all with provenance. Any unrecovered required span enters automatic
+repair/fallback; it is `accepted_degraded` only if the chosen output profile
+remains structurally valid, otherwise failed. No marker leakage; duplicate
+occurrence/HTML/PID/number fixtures pass.
 
 ## Phase 6 — operations after quality MVP
 

@@ -76,22 +76,30 @@ v4: «Сначала создай хорошие варианты в конте�
             mixed-script, previous-failure memory
    → risk score на каждый chunk
 
-3. Qwen source analysis — ТОЛЬКО для flagged chunks
+3. Qwen source analysis / discourse plan — ТОЛЬКО для flagged chunks и
+   рискованных границ
    plain meaning, subject/object, negation, modality, referents,
-   idioms, numbers, ты/вы, forbidden additions, local risk features
+   idioms, numbers, ты/вы, forbidden additions, local risk features;
+   frozen handoff constraints: speaker/addressee, register, референты,
+   term/name choices, narrative time/voice
 
-4. Generation (Gemma, reasoning=0)
+4. Batch generation (Gemma, reasoning=0)
    low risk : 1 candidate
    high risk: A / B candidates
    disagreement A≠B по смыслу: optional C (targeted resolution, не случайный sample)
-   вход: scene/chunk + prev context + limited future context (read-only)
+   вход: scene/chunk + frozen book memory + discourse plan (read-only);
+          primary generation НЕ получает непроверенный RU draft
    выход: PID-map { PID → текст }
 
-5. Selection (каскад, без scoring-движка)
+5. Admission и Russian-only selection (каскад, без scoring-движка)
    Qwen        : semantic pass/fail        (обязательно)
    deterministic: consistency gate          (glossary/имена/ты-вы/числа/mixed-script)
-   Gemma       : Russian preference         (без оригинала, выбор из прошедших)
-   если не прошёл никто → targeted synthesis/repair, НЕ «наименее плохой»
+   Gemma       : Russian preference / связность соседних прошедших вариантов
+                 (без оригинала)
+   цель Phase 1–2: admission; не дублировать полный литературный audit
+   если не прошёл никто → targeted synthesis/repair; после bounded budget
+   допускается traceable structurally-valid fallback (`accepted_degraded`),
+   не silent `complete`
 
 6. Assembled-chapter audit (один раз, по собранной главе)
    Qwen        : source ↔ translation (пропуски/добавления/референты/сцена)
@@ -100,6 +108,9 @@ v4: «Сначала создай хорошие варианты в конте�
                  текст в Step 4/5), НЕ независимое доказательство качества;
                  добавочная ценность против отсутствия проверки должна быть
                  подтверждена ablation-бенчмарком (см. §10)
+   model context: full central chunk + ограниченный tail предыдущего и head
+                  следующего chunk (read-only); три full chunk только при
+                  risk-triggered escalation и после context-size benchmark
    deterministic: PID coverage / numbers / mixed-script / glossary / names /
                   formatting contract / HTML structure
    formatting контракт (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) применяется ДО Step 8, не после — final smoke
@@ -117,7 +128,9 @@ v4: «Сначала создай хорошие варианты в конте�
      - Gemma: Russian re-check ДОПОЛНИТЕЛЬНО, risk-triggered (не blanket),
        для соседних регионов, если правка затронула
        диалог/регистр/ты-вы/имена, даже без исходного Gemma finding там
-   max 2 rounds → иначе quarantined
+   один repair-round обязателен; второй только если blocking finding остался
+   либо первая правка затронула соседнюю boundary/context
+   после лимита: `accepted_degraded` при валидном PID-map, иначе `failed`
 
 8. Final integrity check + memory promotion
    ОБЯЗАТЕЛЬНО, без модели:
@@ -139,7 +152,8 @@ v4: «Сначала создай хорошие варианты в конте�
        Step 5 и Step 6 как коррелированный сигнал; закрытие её findings
        обеспечено обязательным re-check в Step 7, третий blanket-проход не
        даёт независимого сигнала)
-   memory promotion ТОЛЬКО после complete
+   memory promotion ТОЛЬКО после complete; `accepted_degraded` memory не
+   promote'ит
 ```
 
 ---
@@ -175,8 +189,9 @@ MVP не использует модельную семантическую се
 ### 3.3. Контекст и владение PID
 
 ```text
-left context  = уже зафиксированный перевод предыдущего chunk'а (read-only)
-right context = ИСХОДНЫЕ несколько PID следующего chunk'а (read-only, не переводятся здесь)
+primary context = frozen book memory + source-side discourse plan (read-only)
+repair left context = уже зафиксированный перевод предыдущего chunk'а (read-only)
+audit context = central chunk полностью + ограниченный RU context соседей (read-only)
 владение      = каждый PID переводится ровно одним chunk'ом (без двойного перевода)
 ```
 
@@ -216,7 +231,7 @@ Reasoning в MVP выключен. Risk-gated reasoning — отдельный �
 ✅ book memory / frozen snapshot per chapter
 ✅ resume safety
 ✅ targeted repair
-✅ final acceptance gate (complete / quarantined / failed)
+✅ final acceptance gate (complete / accepted_degraded / failed)
 ✅ Russian-only audit без оригинала
 ✅ challenge_issue
 ```
@@ -258,11 +273,14 @@ sentence-level TM не использовать** — тащит устарев�
 ## 7. Final states
 
 ```text
-complete   — все blocking-инварианты пройдены; память promote'ится
-quarantined — целостный текст есть, но система не смогла принять автоматически;
-              может запустить extra candidate / larger context / 3-ю модель / усиленный audit;
-              в production book не попадает до авторазрешения
-failed      — целостный результат технически не создан
+complete            — все blocking-инварианты пройдены; память promote'ится
+accepted_degraded   — полный structurally-valid PID-map принят автоматически
+                      после bounded repair/fallback; unresolved debt trace
+                      сохранён, память не promote'ится
+quarantined          — внутреннее состояние automatic repair/fallback, не
+                      user-facing terminal при valid PID-map
+failed               — после автоматических retries нет валидного PID-map;
+                      текст не фабрикуется
 ```
 
 ---
