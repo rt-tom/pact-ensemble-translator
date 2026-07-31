@@ -690,6 +690,25 @@ def test_chunk_plan_matches_its_schema():
     assert schema_validate(payload, _schema("v4_chunkplan.schema.json")) == []
 
 
+def test_chunk_plan_schema_rejects_total_words_above_hard_cap():
+    # Regression: the schema's total_words had no "maximum", so it accepted
+    # a payload the model itself would reject (ChunkPlan.MAX_WORDS=640 is a
+    # hard ceiling with no exception) -- schema-based ingestion outside the
+    # model could silently accept an over-cap plan.
+    snap = _snapshot()
+    plan = _chunk_plan(snap)
+    payload = {
+        "chunk_id": plan.chunk_id,
+        "snapshot_hash": plan.snapshot_hash,
+        "pids": list(plan.pids),
+        "total_words": ChunkPlan.MAX_WORDS + 1,
+        "context": {"left_ru": plan.context.left_ru, "right_en": list(plan.context.right_en)},
+        "undersized_exception": plan.undersized_exception,
+    }
+    errors = schema_validate(payload, _schema("v4_chunkplan.schema.json"))
+    assert errors, "schema must reject total_words above ChunkPlan.MAX_WORDS"
+
+
 def test_authoritative_chunk_plan_artifact_matches_its_schema():
     snap = _snapshot()
     artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))

@@ -42,6 +42,11 @@ import logging
 from pathlib import Path
 from typing import Optional, Sequence
 
+from pact_v4.phase1.chunker import (
+    DEFAULT_MAX_WORDS,
+    DEFAULT_MIN_WORDS,
+    DEFAULT_TARGET_WORDS,
+)
 from pact_v4.pipeline.v4_phase12_sequential_runner import (
     SequentialGenerateConfig,
     SequentialSelectConfig,
@@ -76,8 +81,9 @@ def build_argparser() -> argparse.ArgumentParser:
         "--chapter-id", default=None,
         help="[generate] Stable chapter id; defaults to --chapter-html's stem.",
     )
-    p.add_argument("--min-chunk-size", type=int, default=8)
-    p.add_argument("--max-chunk-size", type=int, default=20)
+    p.add_argument("--min-chunk-words", type=int, default=DEFAULT_MIN_WORDS)
+    p.add_argument("--target-chunk-words", type=int, default=DEFAULT_TARGET_WORDS)
+    p.add_argument("--max-chunk-words", type=int, default=DEFAULT_MAX_WORDS)
     p.add_argument("--right-context-pids", type=int, default=0)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=7)
@@ -111,8 +117,9 @@ def _run_generate(args: argparse.Namespace) -> int:
         chapter_html_path=args.chapter_html,
         memory_dir=args.memory_dir,
         out_dir=args.out_dir,
-        min_chunk_size=args.min_chunk_size,
-        max_chunk_size=args.max_chunk_size,
+        min_chunk_words=args.min_chunk_words,
+        target_chunk_words=args.target_chunk_words,
+        max_chunk_words=args.max_chunk_words,
         right_context_pids=args.right_context_pids,
         temperature=args.temperature,
         seed=args.seed,
