@@ -26,6 +26,7 @@ __all__ = [
     "find_mixed_script",
     "target_form_present",
     "combine_glossary_terms",
+    "RU_DIGIT_EQUIVALENTS",
 ]
 
 _URL_OR_EMAIL_RE = re.compile(
@@ -69,6 +70,12 @@ _RU_DIGIT_EQUIVALENTS: Dict[str, "re.Pattern[str]"] = {
     "19": re.compile(r"\b(?:девятнадцать|девятнадцати|девятнадцат\w*)\b", re.I),
     "20": re.compile(r"\b(?:двадцать|двадцати|двадцат\w*)\b", re.I),
 }
+
+# Public alias: pact_v4.phase2.cascade's required-risk-category resolution
+# gate needs this exact table too (matching a written-out English number
+# word's value against its Russian word form), so it is exposed here rather
+# than duplicated — the whole point of this module per its docstring.
+RU_DIGIT_EQUIVALENTS = _RU_DIGIT_EQUIVALENTS
 
 
 def missing_numeric_values(source_values: List[str], target_text: str) -> List[str]:

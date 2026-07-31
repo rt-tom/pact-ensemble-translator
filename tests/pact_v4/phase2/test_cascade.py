@@ -13,11 +13,14 @@ import pytest
 from pact_v4.phase1.models import Candidate, GateResult, SourceArtifact, canonical_json_hash
 from pact_v4.phase2.cascade import (
     DeterministicGateData,
+    RequiredCategoryGateResult,
     SelectionResult,
     check_semantic_disagreement,
     deterministic_consistency_gate,
+    required_category_gate,
     select_candidate,
 )
+from pact_v4.phase2.risk import REQUIRED_RISK_CATEGORIES, RiskAssessment, RiskBand, RiskFeature
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +90,16 @@ def make_candidate(
         chunk_plan=chunk_plan,
         config=config,
     )
+
+
+def make_risk(band: RiskBand = RiskBand.MEDIUM, features: Tuple[RiskFeature, ...] = ()) -> RiskAssessment:
+    return RiskAssessment(
+        policy_version="pact-v4-risk-source-en/v1", band=band, score=0, features=features
+    )
+
+
+def make_feature(code: str, evidence: Tuple[str, ...] = (), weight: int = 1) -> RiskFeature:
+    return RiskFeature(code=code, weight=weight, explanation=f"test:{code}", evidence=evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -862,4 +875,236 @@ def test_disagreement_only_compares_a_b_not_synthesis():
     # C is very different, but must be ignored by the check.
     disagree, reason = check_semantic_disagreement([a, b, c_diff], dict(source.source))
     assert not disagree
+
+
+# ---------------------------------------------------------------------------
+# Work 2C: required_category_gate — REQUIRED_RISK_CATEGORIES resolution
+#
+# cascade.py imports pact_v4.phase2.risk.REQUIRED_RISK_CATEGORIES rather
+# than redeclaring {"number_word", "tone_profanity"}; the gate takes the
+# chunk's source RiskAssessment plus the candidate's final translation and
+# reports which required categories remain unresolved.
+# ---------------------------------------------------------------------------
+
+
+def test_required_category_gate_number_word_unresolved():
+    source = make_source(texts=(("p0", "She waited twelve long years."),))
+    candidate = make_candidate(
+        "A", "c1",
+        translation=(("p0", "Она ждала много лет."),),  # "twelve"/"двенадцать" dropped
+        source=source,
+    )
+    risk = make_risk(features=(make_feature("number_word", evidence=("twelve",)),))
+    result = required_category_gate(risk=risk, candidate=candidate)
+    assert not result.clean
+    assert result.unresolved_required == ("number_word",)
+
+
+def test_required_category_gate_number_word_resolved_as_digit_or_word():
+    source = make_source(texts=(("p0", "She waited twelve long years."),))
+    digit_candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Она ждала 12 долгих лет."),), source=source,
+    )
+    word_candidate = make_candidate(
+        "B", "c1", translation=(("p0", "Она ждала двенадцать долгих лет."),), source=source,
+    )
+    risk = make_risk(features=(make_feature("number_word", evidence=("twelve",)),))
+    assert required_category_gate(risk=risk, candidate=digit_candidate).clean
+    assert required_category_gate(risk=risk, candidate=word_candidate).clean
+
+
+def test_required_category_gate_tone_profanity_unresolved():
+    source = make_source(texts=(("p0", "This is fucking unbelievable."),))
+    candidate = make_candidate(
+        "A", "c1",
+        translation=(("p0", "Это просто невероятно."),),  # softened, no profanity kept
+        source=source,
+    )
+    risk = make_risk(features=(make_feature("tone_profanity", evidence=("fucking",)),))
+    result = required_category_gate(risk=risk, candidate=candidate)
+    assert not result.clean
+    assert result.unresolved_required == ("tone_profanity",)
+
+
+def test_required_category_gate_tone_profanity_resolved():
+    source = make_source(texts=(("p0", "This is fucking unbelievable."),))
+    candidate = make_candidate(
+        "A", "c1",
+        translation=(("p0", "Это, блять, невероятно."),),
+        source=source,
+    )
+    risk = make_risk(features=(make_feature("tone_profanity", evidence=("fucking",)),))
+    result = required_category_gate(risk=risk, candidate=candidate)
+    assert result.clean
+    assert result.unresolved_required == ()
+
+
+def test_required_category_gate_both_categories_resolved():
+    source = make_source(texts=(("p0", "Twelve fucking years."),))
+    candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Двенадцать, блять, лет."),), source=source,
+    )
+    risk = make_risk(features=(
+        make_feature("number_word", evidence=("Twelve",)),
+        make_feature("tone_profanity", evidence=("fucking",)),
+    ))
+    result = required_category_gate(risk=risk, candidate=candidate)
+    assert result.clean
+    assert result.unresolved_required == ()
+
+
+def test_required_category_gate_baseline_no_required_features_is_clean():
+    """No source profanity, no written-out numbers → nothing to resolve,
+    the gate is clean by construction."""
+    source = make_source(texts=(("p0", "The steward opened the door."),))
+    candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Стюард открыл дверь."),), source=source,
+    )
+    risk = make_risk(features=())
+    result = required_category_gate(risk=risk, candidate=candidate)
+    assert result.clean
+    assert result.unresolved_required == ()
+
+
+def test_required_category_gate_ignores_non_required_features():
+    """A flagged feature outside REQUIRED_RISK_CATEGORIES (e.g. idiom) is
+    not this gate's concern and must never make it unresolved-required."""
+    source = make_source(texts=(("p0", "It was a piece of cake."),))
+    candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Это было проще простого."),), source=source,
+    )
+    risk = make_risk(features=(make_feature("idiom_or_metaphor", evidence=("piece of cake",)),))
+    result = required_category_gate(risk=risk, candidate=candidate)
+    assert result.clean
+    assert result.unresolved_required == ()
+
+
+def test_required_category_gate_result_is_immutable():
+    with pytest.raises(Exception):
+        RequiredCategoryGateResult(clean=True).clean = False  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Work 2C: select_candidate(..., risk=...) — a candidate that leaves a
+# required category unresolved is never selected as final.
+# ---------------------------------------------------------------------------
+
+
+def test_select_candidate_rejects_clean_false_selects_clean_true():
+    source = make_source(texts=(("p0", "She waited twelve long years."),))
+    clean = make_candidate(
+        "A", "c1", role="fidelity_first",
+        translation=(("p0", "Она ждала двенадцать долгих лет."),), source=source,
+    )
+    dirty = make_candidate(
+        "B", "c1", role="balanced_literary",
+        translation=(("p0", "Она долго ждала."),), source=source,  # number dropped
+    )
+    qwen = StubQwen(passed=True)
+    risk = make_risk(features=(make_feature("number_word", evidence=("twelve",)),))
+    result = select_candidate(
+        chunk_id="c1", candidates=[dirty, clean], source=source,
+        qwen_evaluator=qwen, risk=risk,
+    )
+    assert result.selected_candidate_id == "A"
+    assert result.candidates_passed == 1
+    assert result.candidates_failed == 1
+
+
+def test_select_candidate_all_dirty_quarantines_not_least_bad():
+    source = make_source(texts=(("p0", "She waited twelve long years."),))
+    a = make_candidate(
+        "A", "c1", role="fidelity_first",
+        translation=(("p0", "Она долго ждала."),), source=source,
+    )
+    b = make_candidate(
+        "B", "c1", role="balanced_literary",
+        translation=(("p0", "Она очень долго ждала."),), source=source,
+    )
+    qwen = StubQwen(passed=True)
+    risk = make_risk(features=(make_feature("number_word", evidence=("twelve",)),))
+    result = select_candidate(
+        chunk_id="c1", candidates=[a, b], source=source,
+        qwen_evaluator=qwen, risk=risk,
+    )
+    assert result.quarantine
+    assert result.selected_candidate_id is None
+    assert "required_risk_categories" in result.quarantine_reason
+
+
+def test_select_candidate_without_risk_param_skips_the_gate_unchanged():
+    """risk=None (the default) must behave exactly as before Work 2C —
+    backward compatible with every pre-existing select_candidate call."""
+    source = make_source(texts=(("p0", "She waited twelve long years."),))
+    candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Она долго ждала."),), source=source,
+    )
+    qwen = StubQwen(passed=True)
+    result = select_candidate(
+        chunk_id="c1", candidates=[candidate], source=source, qwen_evaluator=qwen,
+    )
+    assert result.selected_candidate_id == "A"
+    gates = [g.gate for g in result.decision_trace]
+    assert "required_risk_categories" not in gates
+
+
+def test_select_candidate_records_required_risk_categories_in_decision_trace():
+    source = make_source(texts=(("p0", "The steward opened the door."),))
+    candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Стюард открыл дверь."),), source=source,
+    )
+    qwen = StubQwen(passed=True)
+    risk = make_risk(features=())
+    result = select_candidate(
+        chunk_id="c1", candidates=[candidate], source=source,
+        qwen_evaluator=qwen, risk=risk,
+    )
+    gates = [g.gate for g in result.decision_trace]
+    assert gates == ["qwen_fidelity", "deterministic_consistency", "required_risk_categories"]
+    assert all(g.passed for g in result.decision_trace)
+
+
+def test_required_risk_categories_change_in_risk_module_is_reflected_by_cascade():
+    """cascade.py must consume risk.REQUIRED_RISK_CATEGORIES via import,
+    not a redeclared literal: patching the risk module's constant changes
+    what required_category_gate filters against, with no code edit in
+    cascade.py itself."""
+    import pact_v4.phase2.cascade as cascade_module
+    import pact_v4.phase2.risk as risk_module
+
+    assert cascade_module.REQUIRED_RISK_CATEGORIES is risk_module.REQUIRED_RISK_CATEGORIES
+
+    source = make_source(texts=(("p0", "It was a piece of cake."),))
+    candidate = make_candidate(
+        "A", "c1", translation=(("p0", "Это было очень легко."),), source=source,
+    )
+
+    original = cascade_module.REQUIRED_RISK_CATEGORIES
+    try:
+        cascade_module.REQUIRED_RISK_CATEGORIES = frozenset({"idiom_or_metaphor"})
+        risk = make_risk(features=(make_feature("idiom_or_metaphor", evidence=("piece of cake",)),))
+        result = required_category_gate(risk=risk, candidate=candidate)
+        # idiom_or_metaphor has no target-side resolution check wired in
+        # cascade.py, so once it becomes "required" it is conservatively
+        # unresolved — proving the filter itself picked it up via the
+        # patched constant, not a hardcoded literal.
+        assert result.unresolved_required == ("idiom_or_metaphor",)
+    finally:
+        cascade_module.REQUIRED_RISK_CATEGORIES = original
+
+
+def test_cascade_module_has_no_hardcoded_required_category_literals():
+    """cascade.py must not redeclare {"number_word", "tone_profanity"} — it
+    may only reference them via the imported REQUIRED_RISK_CATEGORIES."""
+    import inspect
+
+    import pact_v4.phase2.cascade as cascade_module
+
+    source_text = inspect.getsource(cascade_module)
+    assert "REQUIRED_RISK_CATEGORIES" in source_text
+    # The category names appear as string literals only in the two
+    # `if feature.code == ...` dispatch branches of required_category_gate,
+    # not as a redeclared set/frozenset of the whole category list.
+    assert 'frozenset({"number_word", "tone_profanity"})' not in source_text
+    assert "frozenset({'number_word', 'tone_profanity'})" not in source_text
 
