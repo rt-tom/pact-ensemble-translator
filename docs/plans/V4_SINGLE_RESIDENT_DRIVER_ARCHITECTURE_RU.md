@@ -234,6 +234,46 @@ committed prefix не перегенерируется.
 машины остаётся внешним восстановлением и не должен стирать journal или
 cache artifacts.
 
+## Как использовать текущий двухфазный sequential run
+
+Текущий `v4_phase12_sequential_run` полезен как **read-only first-wave
+measurement**, даже несмотря на его явный `SEQUENTIAL_MODEL_CAVEAT`.
+После завершения run следует сохранить без перезаписи
+`generation_bundle.json`, `selection_results.json`, `translations.json`,
+`provenance.json` и замер одного ручного перехода Gemma → Qwen.
+
+По этим artifacts можно посчитать:
+
+- число high-risk chunk'ов и A/B-кандидатов;
+- долю `fidelity_first`, не прошедших Qwen/deterministic/required-risk
+  gates, а также quarantine и `needs_synthesis` rate;
+- первый context-impacting mismatch и длину suffix, который speculative
+  driver должен был бы инвалидировать в первой волне;
+- объём candidate generation, который был бы выброшен при таком первом
+  откате.
+
+Ограничение существенно: при одном запущенном llama select-проход не
+может одновременно вызвать Qwen и Gemma preference. Без
+`--use-gemma-selector` существующий runner при нескольких прошедших
+кандидатах использует deterministic role-order tie-break. Поэтому его
+`selected_role` не является полным cascade winner и обычно занижает
+расхождения с `fidelity_first`; этот run нельзя использовать как прямое
+доказательство качества speculative или strict driver.
+
+Для полного measurement без повторной generation допустим отдельный
+shadow re-selection, не меняющий исходные artifacts: Qwen повторно
+гейтит кандидаты из `generation_bundle.json` с per-candidate записью,
+затем после одной смены Qwen → Gemma preference выбирает только среди
+прошедших. Сравнение этого winner с fidelity draft даёт корректную оценку
+первой speculative-волны. Оно не предсказывает последующие волны: при
+регенерации suffix кандидаты могут измениться из-за правильного
+left-context.
+
+Наконец, время текущего Gemma → Qwen swap — лишь один lifecycle sample.
+Оно не измеряет деградацию Vulkan driver от strict-driver 20 restart;
+для этого нужен отдельный короткий `Gemma → Qwen → Gemma` benchmark без
+production pipeline.
+
 ## Почему не надо сейчас заменять RU left_context памятью/выжимкой
 
 Frozen glossary и book/chapter memory уже необходимы, но они не доказано
