@@ -59,11 +59,19 @@ def _snapshot(pids=("p00001", "p00002", "p00003", "p00004", "p00005", "p00006", 
     )
 
 
+# ChunkPlan.MIN_WORDS/MAX_WORDS (280/640) are fixed hard bounds; 35 words/PID
+# keeps every existing PID-count-based fixture in this file compatible with
+# them (e.g. the default 8-PID snapshot lands exactly on MIN_WORDS=280).
+WORDS_PER_PID = 35
+
+
 def _chunk_plan(snapshot: Snapshot, pids=None, **overrides) -> ChunkPlan:
+    resolved_pids = pids if pids is not None else snapshot.pids
     kwargs = dict(
         chunk_id="c0001",
         snapshot_hash=snapshot.snapshot_hash,
-        pids=pids if pids is not None else snapshot.pids,
+        pids=resolved_pids,
+        total_words=len(resolved_pids) * WORDS_PER_PID,
         context=ChunkContext(left_ru="", right_en=()),
     )
     kwargs.update(overrides)
@@ -418,6 +426,7 @@ def test_chunk_plan_matches_its_schema():
         "chunk_id": plan.chunk_id,
         "snapshot_hash": plan.snapshot_hash,
         "pids": list(plan.pids),
+        "total_words": plan.total_words,
         "context": {"left_ru": plan.context.left_ru, "right_en": list(plan.context.right_en)},
         "undersized_exception": plan.undersized_exception,
     }
