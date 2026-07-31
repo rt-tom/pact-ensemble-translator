@@ -23,14 +23,25 @@ Rules:
 
 Explicitly OUT of scope: actual C/synthesis *generation* (Phase 2B/Phase 4),
 repair execution, and benchmark measurement.
+
+Also implements the required-risk-category resolution gate (Work 2C card):
+consumes ``pact_v4.phase2.risk.REQUIRED_RISK_CATEGORIES`` (imported, never
+redeclared) and a chunk's source ``RiskAssessment`` to verify that every
+required category actually flagged for that chunk (``number_word``,
+``tone_profanity``) was resolved in the final translation, not merely
+instructed at generation time (Phase 2B's ``generation.py``/``prompts.py``).
+A candidate that leaves a required category unresolved is never selected as
+final (``select_candidate(..., risk=...)``).
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Protocol, Sequence, Tuple
 
 from pact_v4.phase1.models import Candidate, GateResult, SourceArtifact
+from pact_v4.phase2.risk import REQUIRED_RISK_CATEGORIES, RiskAssessment
 
 __all__ = [
     "SelectionResult",
@@ -38,6 +49,8 @@ __all__ = [
     "GemmaSelector",
     "DeterministicGateData",
     "deterministic_consistency_gate",
+    "RequiredCategoryGateResult",
+    "required_category_gate",
     "select_candidate",
     "check_semantic_disagreement",
 ]
@@ -282,6 +295,116 @@ def deterministic_consistency_gate(
 
 
 # ---------------------------------------------------------------------------
+# Required-risk-category resolution gate (model-free)
+#
+# Consumes pact_v4.phase2.risk.REQUIRED_RISK_CATEGORIES (imported, never
+# redeclared here) and the chunk's source RiskAssessment to check whether
+# every required category the source pre-screen actually flagged for this
+# chunk was resolved in the final translation — not merely echoed as an
+# instruction to the generator (that is Phase 2B's job; this is the
+# post-hoc, model-free verification).
+# ---------------------------------------------------------------------------
+
+_EN_NUMBER_WORD_VALUES: Mapping[str, str] = MappingProxyType({
+    "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+    "seven": "7", "eight": "8", "nine": "9", "ten": "10", "eleven": "11",
+    "twelve": "12", "thirteen": "13", "fourteen": "14", "fifteen": "15",
+    "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19",
+    "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50",
+    "sixty": "60", "seventy": "70", "eighty": "80", "ninety": "90",
+    "hundred": "100", "thousand": "1000",
+})
+
+
+def _number_word_resolved(evidence: Tuple[str, ...], target_text: str) -> bool:
+    """A written-out source number word is resolved if its numeric value
+    survives in the translation as either a digit or a matching Russian
+    number word. Which rendering the translator chose is not constrained
+    here (that would be a style/fidelity call, not this gate's job) — only
+    that the value itself was not dropped or paraphrased away."""
+    target_digits = set(_extract_digits(target_text))
+    for word in evidence:
+        value = _EN_NUMBER_WORD_VALUES.get(word.strip().casefold())
+        if value is None:
+            # Evidence outside the recognised number-word vocabulary can't
+            # be verified — conservatively treat as unresolved rather than
+            # silently passing.
+            return False
+        if value in target_digits:
+            continue
+        pattern = _RU_DIGIT_EQUIVALENTS.get(value)
+        if pattern is not None and pattern.search(target_text):
+            continue
+        return False
+    return True
+
+
+_RU_PROFANITY_RE = re.compile(
+    r"\b(?:бля(?:ть|дь)?\w*|хрен\w*|дерьм\w*|сук[аи]\w*|мудак\w*|"
+    r"говн\w*|ч[её]рт\w*|стерв\w*|скотин\w*|ублюдк?\w*)\b",
+    re.I,
+)
+
+
+def _tone_profanity_resolved(target_text: str) -> bool:
+    """Strong source profanity is resolved if the translation retains a
+    comparable strong-register marker — a euphemism or a silent omission
+    leaves no match here, and is exactly what this gate exists to catch."""
+    return bool(_RU_PROFANITY_RE.search(target_text))
+
+
+@dataclass(frozen=True)
+class RequiredCategoryGateResult:
+    """Result of the required-risk-category resolution gate for one candidate.
+
+    Deliberately a distinct shape from ``pact_v4.phase1.models.GateResult``
+    (already imported into this module for the other gates): per the Work
+    2C card this result is ``(clean, unresolved_required)``, not
+    ``(gate, passed, detail)``.
+    """
+
+    clean: bool
+    unresolved_required: Tuple[str, ...] = ()
+
+
+def required_category_gate(
+    *,
+    risk: RiskAssessment,
+    candidate: Candidate,
+) -> RequiredCategoryGateResult:
+    """Check whether every REQUIRED_RISK_CATEGORIES concern the source risk
+    pre-screen flagged for this chunk was actually resolved in the
+    candidate's final translation.
+
+    ``risk`` is the chunk's ``RiskAssessment`` from
+    ``pact_v4.phase2.risk.assess_source_risk`` (source-only, computed once
+    before generation). Only the features in ``risk.features`` whose code
+    is in ``REQUIRED_RISK_CATEGORIES`` are checked here; every other risk
+    category is out of scope for this gate (idioms, cultural references,
+    etc. are Qwen/deterministic-consistency concerns, not this one).
+    """
+    target_text = " ".join(text for _, text in candidate.translation if text)
+    unresolved: list[str] = []
+    for feature in risk.features:
+        if feature.code not in REQUIRED_RISK_CATEGORIES:
+            continue
+        if feature.code == "number_word":
+            resolved = _number_word_resolved(feature.evidence, target_text)
+        elif feature.code == "tone_profanity":
+            resolved = _tone_profanity_resolved(target_text)
+        else:
+            # A required category with no target-side resolution check
+            # wired here yet must never be silently treated as passed.
+            resolved = False
+        if not resolved:
+            unresolved.append(feature.code)
+    unresolved_tuple = tuple(sorted(set(unresolved)))
+    return RequiredCategoryGateResult(
+        clean=not unresolved_tuple, unresolved_required=unresolved_tuple
+    )
+
+
+# ---------------------------------------------------------------------------
 # Model caller protocols (injectable; no default HTTP implementation)
 # ---------------------------------------------------------------------------
 
@@ -427,6 +550,7 @@ def select_candidate(
     qwen_evaluator: QwenEvaluator,
     det_data: DeterministicGateData = DeterministicGateData(),
     gemma_selector: Optional[GemmaSelector] = None,
+    risk: Optional[RiskAssessment] = None,
 ) -> SelectionResult:
     """Run the lexicographic cascaded selection on a set of candidates.
 
@@ -435,7 +559,17 @@ def select_candidate(
       1. Qwen fidelity gate — run on EVERY candidate (mandatory).
       2. Deterministic consistency gate — run only on candidates that
          passed Qwen.
-      3. Collect candidates that passed BOTH gates.
+      2b. Required-risk-category resolution gate (``required_category_gate``)
+          — run only on candidates that passed both of the above, and only
+          when ``risk`` is supplied. A candidate whose
+          ``RequiredCategoryGateResult.clean`` is ``False`` (a
+          REQUIRED_RISK_CATEGORIES concern the source pre-screen flagged
+          was not resolved in this candidate's translation) is never
+          selected as final — it is treated exactly like a Qwen or
+          deterministic-consistency failure. ``risk=None`` skips this
+          stage entirely (e.g. a caller that hasn't run the Phase 2A
+          pre-screen for this chunk).
+      3. Collect candidates that passed all gates that ran.
       4. If no candidate passed → quarantine.
       5. If one candidate passed → select it.
       6. If multiple passed:
@@ -490,10 +624,30 @@ def select_candidate(
             data=det_data,
         )
         traces[candidate.candidate_id].append(det_result)
-        if det_result.passed:
-            passed.append(candidate)
-        else:
+        if not det_result.passed:
             failed.append(candidate.candidate_id)
+            continue
+
+        # ---- Stage 2b: required-risk-category resolution (opt-in via `risk`)
+        if risk is not None:
+            required_result = required_category_gate(risk=risk, candidate=candidate)
+            traces[candidate.candidate_id].append(
+                GateResult(
+                    gate="required_risk_categories",
+                    passed=required_result.clean,
+                    detail=(
+                        "All required risk categories resolved."
+                        if required_result.clean
+                        else "Unresolved required categories: "
+                        + ", ".join(required_result.unresolved_required)
+                    ),
+                )
+            )
+            if not required_result.clean:
+                failed.append(candidate.candidate_id)
+                continue
+
+        passed.append(candidate)
 
     # ---- Decision ----------------------------------------------------------
     num_passed = len(passed)
