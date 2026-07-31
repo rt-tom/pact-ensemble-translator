@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 
 import pytest
@@ -224,6 +225,37 @@ def test_forced_break_at_hard_cap(planner):
 
 
 # ---------------------------------------------------------------------------
+# Oversized leaf block: a single block whose own word_count already exceeds
+# max_words cannot be split further, so no legal chunk can contain it.
+# max_words is a hard ceiling with no exception -- the planner must reject
+# this at planning time, not silently emit an over-cap chunk for ChunkPlan
+# to reject later with a less informative error.
+# ---------------------------------------------------------------------------
+
+def test_oversized_single_leaf_block_raises(planner):
+    blocks = _make_blocks(5) + [_make_block("huge", index=5, word_count=MAX_WORDS + 1)]
+    with pytest.raises(ValueError, match="exceeding the hard cap"):
+        _plan(planner, blocks)
+
+
+def test_oversized_leaf_block_mid_chapter_raises(planner):
+    blocks = (
+        _make_blocks(14)
+        + [_make_block("huge", index=14, word_count=MAX_WORDS + 100)]
+        + _make_blocks(14, start=16)
+    )
+    with pytest.raises(ValueError, match="'huge'"):
+        _plan(planner, blocks)
+
+
+def test_leaf_block_exactly_at_max_words_does_not_raise(planner):
+    blocks = [_make_block("p00001", index=0, word_count=MAX_WORDS)]
+    result = _plan(planner, blocks)
+    assert len(result) == 1
+    assert _words(result[0]) == MAX_WORDS
+
+
+# ---------------------------------------------------------------------------
 # right_en context (source EN text of the next chunk's first N PIDs).
 #
 # left_ru is intentionally always empty at planning time: the previous
@@ -316,6 +348,21 @@ def test_invalid_min_max_target_raises():
         ChunkPlanner(target_words=100, min_words=10, max_words=20)
 
 
+def test_planner_bounds_must_stay_within_chunk_plan_contractual_cap():
+    """A planner configured wider/narrower than ChunkPlan's own hard bounds
+    would emit plans that ChunkPlan then unconditionally rejects later,
+    deep in a pipeline run. The constructor must reject this up front.
+    """
+    # Internally consistent (min <= target <= max) but max_words exceeds
+    # ChunkPlan.MAX_WORDS=640: would eventually build over-cap chunks.
+    with pytest.raises(ValueError, match="contractual"):
+        ChunkPlanner(target_words=500, min_words=300, max_words=1000)
+    # Internally consistent but min_words is below ChunkPlan.MIN_WORDS=280:
+    # would under-set undersized_exception and hit the soft-minimum reject.
+    with pytest.raises(ValueError, match="contractual"):
+        ChunkPlanner(target_words=200, min_words=100, max_words=300)
+
+
 # ---------------------------------------------------------------------------
 # ChunkPlan model constraints (hard max never relaxed, soft min needs a flag)
 # ---------------------------------------------------------------------------
@@ -324,20 +371,59 @@ def test_chunk_plan_above_hard_max_rejected_even_with_flag():
     with pytest.raises(ValueError, match="exceeds hard cap"):
         ChunkPlan(
             chunk_id="c1", snapshot_hash=SNAPSHOT_HASH,
-            pids=("p1", "p2"), total_words=ChunkPlan.MAX_WORDS + 1,
+            pids=("p1", "p2"), word_counts=(ChunkPlan.MAX_WORDS + 1, 0),
             undersized_exception=True,
         )
 
 
 def test_chunk_plan_below_soft_min_needs_flag():
     with pytest.raises(ValueError, match="below soft minimum"):
-        ChunkPlan(chunk_id="c1", snapshot_hash=SNAPSHOT_HASH, pids=("p1", "p2"), total_words=1)
+        ChunkPlan(chunk_id="c1", snapshot_hash=SNAPSHOT_HASH, pids=("p1", "p2"), word_counts=(1, 0))
     # With the flag, it's accepted.
     plan = ChunkPlan(
-        chunk_id="c1", snapshot_hash=SNAPSHOT_HASH, pids=("p1", "p2"), total_words=1,
+        chunk_id="c1", snapshot_hash=SNAPSHOT_HASH, pids=("p1", "p2"), word_counts=(1, 0),
         undersized_exception=True,
     )
     assert plan.pids == ("p1", "p2")
+    assert plan.total_words == 1
+
+
+def test_chunk_plan_word_counts_must_match_pids_length():
+    with pytest.raises(ValueError, match="word_counts has"):
+        ChunkPlan(
+            chunk_id="c1", snapshot_hash=SNAPSHOT_HASH,
+            pids=("p1", "p2"), word_counts=(100,),
+        )
+
+
+def test_chunk_plan_total_words_is_derived_not_bypassable():
+    """total_words can't be set to an arbitrary value disconnected from pids.
+
+    Regression: an earlier version accepted a caller-supplied total_words
+    int with no relation to len(pids), so e.g. 100 PIDs with
+    total_words=640 passed validation even though that total is nowhere
+    near what 100 real PIDs would sum to. total_words is now always
+    len(word_counts) entries summed, and word_counts is required to have
+    exactly one entry per PID.
+    """
+    plan = ChunkPlan(
+        chunk_id="c1", snapshot_hash=SNAPSHOT_HASH,
+        pids=tuple(f"p{i:05d}" for i in range(100)),
+        word_counts=tuple([1] * 100),  # honest per-PID counts, sums to 100
+        undersized_exception=True,
+    )
+    assert plan.total_words == 100
+    # total_words is init=False: it cannot be passed to the constructor at all.
+    total_words_field = next(f for f in dataclasses.fields(ChunkPlan) if f.name == "total_words")
+    assert total_words_field.init is False
+
+
+def test_chunk_plan_rejects_negative_word_counts():
+    with pytest.raises(ValueError, match="non-negative"):
+        ChunkPlan(
+            chunk_id="c1", snapshot_hash=SNAPSHOT_HASH,
+            pids=("p1", "p2"), word_counts=(300, -1),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -172,25 +172,34 @@ class ChunkPlan:
     ``8_12``/``12_20`` were never real PID ranges — Track A's small
     profile actually produced 16-32 PIDs/chunk (mean 25.21). The upper
     bound (``MAX_WORDS``) is a hard ceiling, always enforced, with no
-    exception. The lower bound (``MIN_WORDS``) is a *soft* target: it can
-    be legitimately missed (a whole chapter shorter than the minimum, an
-    unavoidable undersized tail after rebalancing, or a single oversized
-    leaf block that cannot be split) — such cases must set
+    exception — including for a single oversized leaf PID whose own word
+    count already exceeds ``MAX_WORDS``: the planner (chunker.py) rejects
+    that at planning time rather than ever constructing such a
+    ``ChunkPlan``, since a leaf block cannot be split further and no
+    ``undersized_exception``-style flag relaxes this bound. The lower
+    bound (``MIN_WORDS``) is a *soft* target: it can be legitimately
+    missed (a whole chapter shorter than the minimum, or an unavoidable
+    undersized tail after rebalancing) — such cases must set
     ``undersized_exception=True`` to document why the soft minimum was not
     met; the flag never relaxes the hard maximum.
 
     ``snapshot_hash`` ties the plan back to the frozen snapshot it was
-    computed from. ``total_words`` is the sum of the source word counts of
-    the chunk's PIDs, supplied by the caller (the chunk planner) since
-    ``ChunkPlan`` itself only stores PIDs, not source text.
+    computed from. ``word_counts`` is the per-PID source word count,
+    positionally aligned with ``pids`` (one entry per PID, same order) —
+    supplied by the caller (the chunk planner) since ``ChunkPlan`` itself
+    only stores PIDs, not source text. ``total_words`` is *derived* from
+    ``word_counts`` (not caller-supplied) so the hard cap below is checked
+    against a value structurally tied to the chunk's actual PID count,
+    not an arbitrary unrelated integer a caller could pass to bypass it.
     """
 
     chunk_id: str
     snapshot_hash: str
     pids: Tuple[str, ...]
-    total_words: int
+    word_counts: Tuple[int, ...]
     context: ChunkContext = field(default_factory=ChunkContext)
     undersized_exception: bool = False
+    total_words: int = field(init=False)
 
     MIN_WORDS = 280
     MAX_WORDS = 640
@@ -199,16 +208,23 @@ class ChunkPlan:
         _require_nonempty_str(self.chunk_id, "chunk_id")
         _require_hash(self.snapshot_hash, "snapshot_hash")
         _require_unique_pids(self.pids, "ChunkPlan")
-        if self.total_words < 0:
-            raise ValueError(f"ChunkPlan {self.chunk_id}: total_words must not be negative")
-        if self.total_words > self.MAX_WORDS:
+        if len(self.word_counts) != len(self.pids):
             raise ValueError(
-                f"ChunkPlan {self.chunk_id}: {self.total_words} words exceeds hard cap "
+                f"ChunkPlan {self.chunk_id}: word_counts has {len(self.word_counts)} "
+                f"entries, expected exactly one per PID ({len(self.pids)})"
+            )
+        if any(not isinstance(w, int) or isinstance(w, bool) or w < 0 for w in self.word_counts):
+            raise ValueError(f"ChunkPlan {self.chunk_id}: word_counts must be non-negative integers")
+        total = sum(self.word_counts)
+        object.__setattr__(self, "total_words", total)
+        if total > self.MAX_WORDS:
+            raise ValueError(
+                f"ChunkPlan {self.chunk_id}: {total} words exceeds hard cap "
                 f"{self.MAX_WORDS} (no exception relaxes the upper bound)"
             )
-        if self.total_words < self.MIN_WORDS and not self.undersized_exception:
+        if total < self.MIN_WORDS and not self.undersized_exception:
             raise ValueError(
-                f"ChunkPlan {self.chunk_id}: {self.total_words} words below soft minimum "
+                f"ChunkPlan {self.chunk_id}: {total} words below soft minimum "
                 f"{self.MIN_WORDS} (set undersized_exception=True if this is a "
                 f"documented, unavoidable case)"
             )

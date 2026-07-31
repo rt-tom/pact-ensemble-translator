@@ -64,8 +64,13 @@ class ChunkPlanner:
       - Strong breaks (heading, change of structural_role) are preferred over
         plain ones, so the planner does not simply always cut at the hard cap.
       - Never split inside a dialogue exchange.
-      - max_words is a hard ceiling, never exceeded, no exception (except
-        an unavoidable single oversized leaf block, which cannot be split).
+      - max_words is a hard ceiling, never exceeded, no exception. A
+        single leaf block whose own word count already exceeds max_words
+        cannot be split further, so no legal chunk can contain it: the
+        planner raises ValueError rather than silently emitting an
+        over-cap chunk (min_words/max_words must also stay within
+        ChunkPlan's own [MIN_WORDS, MAX_WORDS] contractual bounds — the
+        constructor rejects a wider/narrower configuration up front).
       - min_words is a soft target: chunks below it are flagged with
         ``undersized_exception=True`` (whole-chapter-shorter-than-min_words,
         or an unavoidable tail after rebalancing).
@@ -84,6 +89,17 @@ class ChunkPlanner:
         if not 1 <= min_words <= target_words <= max_words:
             raise ValueError(
                 "words must satisfy 1 <= min_words <= target_words <= max_words"
+            )
+        # min_words/max_words must stay within ChunkPlan's own contractual
+        # bounds: a wider max_words would let the planner emit chunks that
+        # ChunkPlan then unconditionally rejects (hard cap, no exception); a
+        # narrower min_words would under-set undersized_exception and hit
+        # the same rejection on the soft-minimum side.
+        if min_words < ChunkPlan.MIN_WORDS or max_words > ChunkPlan.MAX_WORDS:
+            raise ValueError(
+                f"min_words/max_words must stay within ChunkPlan's contractual "
+                f"bounds [{ChunkPlan.MIN_WORDS}, {ChunkPlan.MAX_WORDS}] "
+                f"(got min_words={min_words}, max_words={max_words})"
             )
         self.target_words = target_words
         self.min_words = min_words
@@ -112,7 +128,8 @@ class ChunkPlanner:
         for i, (start, end) in enumerate(ranges):
             chunk_id = f"chunk{i + 1:04d}"
             pids = chunk_pid_lists[i]
-            total_words = cum[end] - cum[start]
+            word_counts = tuple(blocks[j].word_count for j in range(start, end))
+            total_words = sum(word_counts)
 
             right_en: Tuple[str, ...] = ()
             if i < len(ranges) - 1 and following_blocks > 0:
@@ -122,7 +139,7 @@ class ChunkPlanner:
                 chunk_id=chunk_id,
                 snapshot_hash=snapshot_hash,
                 pids=tuple(pids),
-                total_words=total_words,
+                word_counts=word_counts,
                 context=ChunkContext(left_ru="", right_en=right_en),
                 undersized_exception=total_words < self.min_words,
             ))
@@ -142,15 +159,27 @@ class ChunkPlanner:
         return cum
 
     @staticmethod
-    def _max_reach(cum: Sequence[int], start: int, n: int, budget: int) -> int:
+    def _max_reach(
+        blocks: Sequence[SourceBlock], cum: Sequence[int], start: int, n: int, budget: int
+    ) -> int:
         """Largest end in (start, n] with cum[end]-cum[start] <= budget.
 
-        Always advances by at least one block, even if that block alone
-        exceeds ``budget`` (an unavoidable oversized leaf that cannot be
-        split further).
+        ``max_words`` is a hard ceiling with no exception (Phase 0C Gate
+        policy): if the single next leaf block already exceeds ``budget``
+        on its own, there is no legal chunk that can contain it (a leaf
+        block cannot be split further) and this raises rather than
+        silently emitting an over-cap chunk for ``ChunkPlan`` to reject
+        later with a less informative error.
         """
+        span = cum[start + 1] - cum[start]
+        if span > budget:
+            raise ValueError(
+                f"ChunkPlanner: block {blocks[start].pid!r} has {span} words, "
+                f"exceeding the hard cap max_words={budget}; a single leaf "
+                f"block cannot be split, so no legal chunk can contain it"
+            )
         point = bisect.bisect_right(cum, cum[start] + budget, start + 1, n + 1)
-        return max(point - 1, start + 1)
+        return point - 1
 
     @staticmethod
     def _min_reach(cum: Sequence[int], start: int, high: int, budget: int) -> int:
@@ -179,7 +208,7 @@ class ChunkPlanner:
 
         while start < n:
             remaining_words = cum[n] - cum[start]
-            high = self._max_reach(cum, start, n, self.max_words)
+            high = self._max_reach(blocks, cum, start, n, self.max_words)
 
             if remaining_words > self.min_words:
                 end = self._find_break(blocks, cum, start, high)
@@ -301,7 +330,7 @@ class ChunkPlanner:
             self._left_bound_for_right_cap(cum, prev_start, end, self.max_words),
         )
         highest = min(
-            self._max_reach(cum, prev_start, end, self.max_words),
+            self._max_reach(blocks, cum, prev_start, end, self.max_words),
             self._right_bound_for_left_cap(cum, prev_start, end, self.min_words),
         )
         if lowest > highest:
