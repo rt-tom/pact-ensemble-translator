@@ -114,7 +114,8 @@ Qwen fidelity → deterministic consistency → Gemma Russian-only preference an
 neighbour coherence among passed candidates. Phase 2 is candidate admission,
 not a duplicate final audit. C/synthesis only after documented semantic
 disagreement/no passing candidate; bounded automatic fallback yields explicit
-`accepted_degraded` only with a complete structurally-valid PID-map and trace.
+`accepted_degraded` only with a complete structurally-valid PID-map and debt
+trace. This is output availability, not canonical quality acceptance.
 
 **Gate:** run v3/v4 A/B and chunk benchmark using 0A/0B/0C. Only result record
 freezes chunk range, right context, temperature/seed and risk thresholds.
@@ -128,11 +129,13 @@ multiple findings per region remain intact.
 
 ### 3B. One windowed assembled-chapter audit — Codex; review Claude
 
-Qwen EN↔RU, Gemma RU-only, deterministic integrity/formatting/HTML. Each
-finding belongs to a full central chunk; model prompts carry only bounded
-read-only neighbour excerpts by default, escalating to three full chunks only
-for predeclared discourse risk. Full PID coverage, resumable partial units,
-audit cannot claim complete on model failure.
+Qwen EN↔RU, Gemma RU-only, deterministic integrity/formatting/HTML. A series
+of overlapping audit units covers every chunk and boundary: each finding
+belongs to its full central chunk, and model prompts carry only bounded
+read-only neighbour excerpts by default. Global deterministic checks cover the
+assembled chapter; escalation to three full chunks is only for predeclared
+discourse risk. Full PID coverage, resumable partial units, audit cannot claim
+complete on model failure.
 
 ## Phase 4 — repair, convergence, terminal state
 
@@ -154,8 +157,9 @@ second is allowed only for a remaining blocking finding or changed boundary.
 Then final integrity check (deterministic default, conditional narrow Qwen
 smoke only when post-convergence text changes fall outside Step 7's re-audited
 scope — see `V4_MVP_SPEC_RU.md` §2 Step 8) and monotonic terminal transition.
-A complete valid PID map may be `accepted_degraded` with debt trace and no
-memory promotion; only absent valid PID map is `failed`.
+A complete valid PID map may be issued as availability-state
+`accepted_degraded` with debt trace and no memory promotion; it is not
+canonical quality acceptance. Only absent valid PID map is `failed`.
 
 ## Phase 5 — formatting alignment
 

@@ -8,17 +8,19 @@ Scope: одна локальная машина; в каждый момент з
 
 ## Решение
 
-Для одного GPU базовой кандидатурой становится **batch-first discourse
-plan + targeted boundary convergence**. Он делает source-side preparation,
+Для одного GPU предпочтительным **экспериментальным** кандидатом становится
+**batch-first discourse plan + targeted boundary convergence**. Он делает source-side preparation,
 generation, semantic admission и Russian-only selection большими model-role
 батчами, а exact selected RU left-context использует только для небольшого
 числа boundary repairs. Это даёт 3 restart до repair и ещё 2 на фактически
 нужный repair-round вместо 20 strict restart для десяти high-risk chunk'ов.
 
 Строгий in-order driver остаётся quality oracle и benchmark-control: только
-с ним можно доказать, что новая политика не ухудшает дискурс. Его не следует
-делать default production topology, пока Vulkan lifecycle budget не показал,
-что 20 переключений стабильны.
+с ним можно доказать, что новая политика не ухудшает дискурс. Batch-first
+нельзя назначать production default, пока он не покажет не худший результат
+по заранее зафиксированной boundary-rubric, semantic residual и integrity
+против strict control на одном golden set. Его преимущество в restart не
+заменяет это доказательство.
 
 `v4_phase12_draft_runner.py` остаётся эталоном корректности при двух
 доступных service, а `v4_phase12_sequential_runner.py` остаётся
@@ -37,8 +39,10 @@ gate-bench-only вариантом с `SEQUENTIAL_MODEL_CAVEAT`. Ни один �
   созданный с другим committed left-context, не может быть reuse этого
   repair; journal хранит parent context hash.
 - При отсутствии выбранного кандидата автоматический fallback обязан
-  сохранить полный структурно валидный PID-map и trace. Он становится
-  `accepted_degraded` после исчерпания repair budget, а не тихим `complete`.
+  сохранить полный структурно валидный PID-map и trace. Он может быть выдан
+  пользователю как `accepted_degraded` после исчерпания repair budget, но это
+  terminal availability state, не canonical quality acceptance и не тихий
+  `complete`.
 - Базовые identity/validation контракты `Candidate` и PID-map сохраняются,
   но понадобятся новые artifacts: source-side discourse plan, RU boundary
   window, fallback debt trace и terminal state `accepted_degraded`.
@@ -60,18 +64,20 @@ PID-map/identity, coverage, hard deterministic constraints, Qwen semantic
 admission, required-risk categories и выбор среди уже допустимых RU
 кандидатов. Полная литературная и межчанковая проверка находится в Phase 3.
 
-Phase 3 использует окно, а не три полных chunk по умолчанию: весь central
-chunk плюс budgeted tail предыдущего и head следующего RU chunk, явно
-помеченные как read-only context. Три полных chunk допускаются только при
-risk trigger (диалог, referent, ты/вы, scene transition) и после отдельного
-context-size benchmark. Findings всегда принадлежат central chunk.
+Phase 3 покрывает **всю главу** серией перекрывающихся audit units: каждый
+chunk один раз является full central chunk, плюс получает budgeted tail
+предыдущего и head следующего RU chunk, явно помеченные как read-only context.
+Глобальные deterministic checks выполняются по полной собранной главе. Три
+full chunk в одном model prompt допускаются только при risk trigger (диалог,
+referent, ты/вы, scene transition) и после отдельного context-size benchmark.
+Findings всегда принадлежат central chunk.
 
 Phase 4 выполняет один обязательный targeted boundary repair-round. Второй
 разрешён только если re-gate всё ещё находит blocking finding либо первая
-правка изменила boundary/context соседнего region. После лимита система
-принимает структурно валидный fallback как `accepted_degraded`, не
-продвигая память; `failed` остаётся только для отсутствия какого-либо
-валидного PID-map после автоматических retries.
+правка изменила boundary/context соседнего region. После лимита система может
+выдать structurally-valid fallback как `accepted_degraded` с явным debt trace,
+не продвигая память и не объявляя его `complete`; `failed` остаётся для
+отсутствия какого-либо валидного PID-map после automatic retries.
 
 ## Reference oracle: строгий stop-and-switch
 

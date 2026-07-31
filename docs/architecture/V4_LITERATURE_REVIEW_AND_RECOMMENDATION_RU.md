@@ -252,6 +252,26 @@ reloads**. BLEU/COMET — максимум как вспомогательный
 везде»; десятки policy-ручек; сложную калибровку надёжности; полную оптимизацию
 планировщика. Всё это — после доказанного качества (Phase 6+).
 
+### 5.7. Сверка с single-resident архитектурой (2026-07-30)
+
+`batch-first discourse plan + targeted boundary convergence` согласуется с
+выводами выше как **экспериментальная topology**: role batching уменьшает
+reload'ы; source-side preparation и frozen memory не дают непроверенному
+русскому draft стать входом генерации; A/B + Qwen semantic admission +
+Russian-only Gemma selection реализуют каскадный QE/MBR; minimal repair с
+одним обязательным и вторым только triggered round остаётся внутри
+рекомендованного cap 2–3.
+
+Это не доказательство эквивалентности source-side plan выбранному русскому
+left-context. Поэтому strict in-order exact-RU driver остаётся control/oracle,
+а promotion batch-first в default возможен только при non-inferiority на
+frozen boundary golden set. Assembled-chapter audit реализуется не одним
+перегруженным prompt, а перекрывающимися bounded windows: каждый chunk бывает
+central, каждая граница наблюдаема, и global deterministic integrity/LTCR
+считаются по целой главе. `accepted_degraded` разрешает автоматическую выдачу
+structurally-valid результата с debt trace, но не отменяет quality contract:
+это не `complete` и не источник authoritative memory.
+
 ---
 
 ## 6. Ответы на вопросы раздела 14.v4.0 плана

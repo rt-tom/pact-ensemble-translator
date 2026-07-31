@@ -98,7 +98,8 @@ v4: «Сначала создай хорошие варианты в конте�
                  (без оригинала)
    цель Phase 1–2: admission; не дублировать полный литературный audit
    если не прошёл никто → targeted synthesis/repair; после bounded budget
-   допускается traceable structurally-valid fallback (`accepted_degraded`),
+   допускается traceable structurally-valid fallback, выданный как
+   availability-state `accepted_degraded`, не canonical quality acceptance и
    не silent `complete`
 
 6. Assembled-chapter audit (один раз, по собранной главе)
@@ -108,11 +109,13 @@ v4: «Сначала создай хорошие варианты в конте�
                  текст в Step 4/5), НЕ независимое доказательство качества;
                  добавочная ценность против отсутствия проверки должна быть
                  подтверждена ablation-бенчмарком (см. §10)
-   model context: full central chunk + ограниченный tail предыдущего и head
-                  следующего chunk (read-only); три full chunk только при
-                  risk-triggered escalation и после context-size benchmark
+   model coverage: серия перекрывающихся audit units покрывает всю главу:
+                   каждый chunk — full central ровно в одной unit +
+                   ограниченный tail предыдущего и head следующего chunk
+                   (read-only); три full chunk только при risk-triggered
+                   escalation и после context-size benchmark
    deterministic: PID coverage / numbers / mixed-script / glossary / names /
-                  formatting contract / HTML structure
+                  formatting contract / HTML structure — по всей главе
    formatting контракт (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) применяется ДО Step 8, не после — final smoke
    должен видеть тот же текст, что попадёт в `complete`
 
@@ -130,7 +133,8 @@ v4: «Сначала создай хорошие варианты в конте�
        диалог/регистр/ты-вы/имена, даже без исходного Gemma finding там
    один repair-round обязателен; второй только если blocking finding остался
    либо первая правка затронула соседнюю boundary/context
-   после лимита: `accepted_degraded` при валидном PID-map, иначе `failed`
+   после лимита: availability-state `accepted_degraded` при валидном PID-map
+   с debt trace, иначе `failed`
 
 8. Final integrity check + memory promotion
    ОБЯЗАТЕЛЬНО, без модели:
@@ -274,9 +278,10 @@ sentence-level TM не использовать** — тащит устарев�
 
 ```text
 complete            — все blocking-инварианты пройдены; память promote'ится
-accepted_degraded   — полный structurally-valid PID-map принят автоматически
-                      после bounded repair/fallback; unresolved debt trace
-                      сохранён, память не promote'ится
+accepted_degraded   — полный structurally-valid PID-map выдан автоматически
+                      после bounded repair/fallback как availability result,
+                      не как canonical quality acceptance; unresolved debt
+                      trace сохранён, память не promote'ится
 quarantined          — внутреннее состояние automatic repair/fallback, не
                       user-facing terminal при valid PID-map
 failed               — после автоматических retries нет валидного PID-map;
