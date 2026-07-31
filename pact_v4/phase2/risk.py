@@ -21,6 +21,14 @@ class RiskBand(str, Enum):
     HIGH = "high"
 
 
+# Required for every V4 risk policy (Phase 0C Gate policy record, §2,
+# docs/plans/V4_PHASE_0C_GATE_NOTE_RU.md): Track B's deterministic
+# consistency gate treats these two as required categories, so the
+# source-only risk pre-screen must always be able to flag them too.
+# A policy that omits either from its weights fails to construct.
+REQUIRED_RISK_CATEGORIES = frozenset({"number_word", "tone_profanity"})
+
+
 @dataclass(frozen=True)
 class RiskPolicy:
     version: str
@@ -28,6 +36,15 @@ class RiskPolicy:
     medium_threshold: int
     high_threshold: int
     force_high: frozenset[str]
+
+    def __post_init__(self) -> None:
+        missing = REQUIRED_RISK_CATEGORIES - set(self.weights)
+        if missing:
+            raise ValueError(
+                f"RiskPolicy {self.version}: missing required risk categories "
+                f"{sorted(missing)} (Phase 0C Gate policy requires "
+                f"{sorted(REQUIRED_RISK_CATEGORIES)} in every policy's weights)"
+            )
 
 
 # Thresholds are intentionally provisional until the Phase-2 benchmark gate.
@@ -41,6 +58,8 @@ RISK_POLICY = RiskPolicy(
         "ambiguous_referent": 3,
         "negation": 2,
         "numbers": 2,
+        "number_word": 3,
+        "tone_profanity": 4,
         "glossary_conflict": 5,
         "unknown_glossary_context": 3,
         "incomplete_glossary_context": 3,
@@ -110,6 +129,22 @@ _NEGATION_RE = re.compile(
 )
 _NUMBER_RE = re.compile(
     r"(?<!\w)(?:[$£€¥]\s*)?[+-]?(?:\d{1,3}(?:[,.]\d{3})+|\d+)(?:[.,]\d+)?%?(?!\w)"
+)
+# Written-out cardinal number words. "one", "half" and "quarter" are
+# deliberately excluded (frequently pronominal or idiomatic, not a number
+# that needs exact preservation) -- same exclusion v3's deterministic gate
+# applies to its target-side missing_written_number_words check.
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
+    r"thousand)\b",
+    re.IGNORECASE,
+)
+_PROFANITY_RE = re.compile(
+    r"\b(?:fuck(?:ing|ed|er)?|shit(?:ty)?|cunt|bitch|damn(?:ed)?|"
+    r"bastard|asshole)\b",
+    re.IGNORECASE,
 )
 
 
@@ -225,6 +260,22 @@ def assess_source_risk(
     numbers = _snippets(_NUMBER_RE, text)
     if numbers:
         add("numbers", "Numeric value or sign requires exact preservation.", numbers)
+
+    number_words = _snippets(_NUMBER_WORD_RE, text)
+    if number_words:
+        add(
+            "number_word",
+            "Written-out number expression requires an exact, non-omitted equivalent.",
+            number_words,
+        )
+
+    profanity = _snippets(_PROFANITY_RE, text)
+    if profanity:
+        add(
+            "tone_profanity",
+            "Strong source profanity/tone must not be softened or omitted.",
+            profanity,
+        )
 
     if glossary is None:
         add("unknown_glossary_context", "Authoritative glossary state was not supplied.", ("glossary=None",))
