@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pact-v4-phase0c-result-record/v1",
+  "title": "Pact v4 Phase 0C baseline result record",
+  "description": "Versioned baseline artifact produced by Phase 0C. Combines Track A (chunk-size x right-context grid over chapter_046 golden accepted PIDs) and Track B (internal pipeline metrics from a v3.1 production run of chapter_100). The Gate after Phase 2C reads this to freeze chunk range, right context, temperature/seed and risk thresholds. Contains only aggregated metrics, hashes, identities, and Gate-visible annotations (notes, terminal_discrepancy). Never full translation text. Track B terminal/monitor inconsistencies are recorded explicitly in track_b.notes and track_b.terminal_discrepancy; the bare-string form of residual_errors.final_residual_total is not allowed — a typed {status, value_numeric, reason} object is required.",
+  "type": "object",
+  "required": [
+    "schema",
+    "generated_at",
+    "tool_version",
+    "track_a",
+    "track_b"
+  ],
+  "properties": {
+    "schema": { "const": "pact-v4-phase0c-result-record/v1" },
+    "generated_at": { "type": "string" },
+    "tool_version": { "type": "string" },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Top-level operator annotations about the record as a whole (e.g. cross-track findings, re-issue history). Distinct from track_b.notes, which is Track-B-specific."
+    },
+    "track_a": {
+      "type": "object",
+      "required": [
+        "source",
+        "grid",
+        "fp_candidate_metric_definition",
+        "aggregated"
+      ],
+      "properties": {
+        "source": {
+          "type": "object",
+          "required": [
+            "chapter_id",
+            "records_hash_sha256",
+            "records_count",
+            "accepted_count",
+            "needs_review_excluded_count",
+            "rejected_count",
+            "known_violations_populated_count",
+            "semantic_recall",
+            "needs_review_policy"
+          ],
+          "properties": {
+            "chapter_id": { "type": "string", "pattern": "^\\d{3}$" },
+            "records_hash_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "records_count": { "type": "integer", "minimum": 0 },
+            "accepted_count": { "type": "integer", "minimum": 0 },
+            "needs_review_excluded_count": { "type": "integer", "minimum": 0 },
+            "rejected_count": { "type": "integer", "minimum": 0 },
+            "known_violations_populated_count": { "type": "integer", "minimum": 0 },
+            "semantic_recall": { "$ref": "#/$defs/metric_status" },
+            "needs_review_policy": { "type": "string" }
+          }
+        },
+        "grid": {
+          "type": "object",
+          "required": ["axes", "cells"],
+          "properties": {
+            "axes": {
+              "type": "object",
+              "required": ["chunk_size", "right_context"],
+              "properties": {
+                "chunk_size": {
+                  "type": "array",
+                  "items": { "enum": ["8_12", "12_20"] },
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "right_context": {
+                  "type": "array",
+                  "items": { "enum": ["on", "off"] },
+                  "minItems": 2,
+                  "maxItems": 2
+                }
+              }
+            },
+            "cells": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/grid_cell" },
+              "minItems": 4,
+              "maxItems": 4
+            }
+          }
+        },
+        "fp_candidate_metric_definition": { "type": "string" },
+        "aggregated": { "$ref": "#/$defs/metric_status" }
+      }
+    },
+    "track_b": {
+      "type": "object",
+      "required": [
+        "source",
+        "completion",
+        "notes",
+        "terminal_discrepancy",
+        "metrics"
+      ],
+      "properties": {
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Track-B-specific operator annotations (e.g. monitor vs artifacts divergence, REUSED cache path, ACTIVE in-progress residual pass). May be empty when no Track-B-specific annotation is needed."
+        },
+        "terminal_discrepancy": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["detected", "monitor_status", "artifacts_say"],
+              "properties": {
+                "detected": { "type": "boolean" },
+                "monitor_status": { "type": "string" },
+                "artifacts_say": { "type": "string" },
+                "reason": { "type": "string" }
+              },
+              "additionalProperties": true
+            },
+            { "type": "null" }
+          ],
+          "description": "Explicit record of a divergence between monitor_state.v31.json and the v3.1 run artifacts (state.json, final HTML, residual lifecycle). null when there is no divergence to flag. Required so the Gate cannot mask an unresolved monitor=FAILED as a clean terminal state."
+        },
+        "source": {
+          "type": "object",
+          "required": [
+            "chapter_id",
+            "pipeline",
+            "run_root_name",
+            "run_identity",
+            "artifact_version"
+          ],
+          "properties": {
+            "chapter_id": { "type": "string" },
+            "pipeline": { "type": "string" },
+            "run_root_name": { "type": "string" },
+            "run_identity": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "artifact_version": { "type": "string" },
+            "monitor_stage": { "type": "string" },
+            "monitor_status": { "type": "string" }
+          }
+        },
+        "completion": {
+          "type": "object",
+          "required": ["status", "primary_pass_complete"],
+          "properties": {
+            "status": {
+              "enum": ["measured", "pending_run_completion", "no_run"]
+            },
+            "reason": { "type": "string" },
+            "primary_pass_complete": { "type": "boolean" }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "required": [
+            "pid_coverage",
+            "bad_repair",
+            "residual_errors",
+            "deterministic_integrity",
+            "russian_rubric",
+            "ltcr",
+            "time_tokens"
+          ],
+          "properties": {
+            "pid_coverage": { "$ref": "#/$defs/metric_status" },
+            "bad_repair": { "$ref": "#/$defs/metric_status" },
+            "residual_errors": {
+              "type": "object",
+              "required": [
+                "status",
+                "primary_total_issues",
+                "primary_resolved_repair",
+                "primary_retry_exhausted",
+                "primary_false_positive",
+                "primary_keep_decisions",
+                "final_residual_total"
+              ],
+              "properties": {
+                "status": {
+                  "enum": ["measured", "pending_live_run", "pending_run_completion",
+                            "pending_definition", "not_measurable", "no_run"]
+                },
+                "primary_total_issues": { "type": "integer", "minimum": 0 },
+                "primary_resolved_repair": { "type": "integer", "minimum": 0 },
+                "primary_retry_exhausted": { "type": "integer", "minimum": 0 },
+                "primary_false_positive": { "type": "integer", "minimum": 0 },
+                "primary_keep_decisions": { "type": "integer", "minimum": 0 },
+                "final_residual_total": { "$ref": "#/$defs/typed_residual_total" },
+                "reason": { "type": "string" }
+              },
+              "additionalProperties": true
+            },
+            "deterministic_integrity": { "$ref": "#/$defs/metric_status" },
+            "russian_rubric": { "$ref": "#/$defs/metric_status" },
+            "ltcr": { "$ref": "#/$defs/metric_status" },
+            "time_tokens": { "$ref": "#/$defs/metric_status" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "metric_status": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": [
+            "measured",
+            "pending_live_run",
+            "pending_run_completion",
+            "pending_definition",
+            "not_measurable",
+            "no_run"
+          ]
+        },
+        "reason": { "type": "string" },
+        "value": {},
+        "value_numeric": {
+          "type": ["number", "null"],
+          "description": "Optional typed numeric value for metrics that carry one. Generic metric_status does not require it; residual_errors.final_residual_total uses the stricter typed_residual_total $ref."
+        }
+      },
+      "additionalProperties": true
+    },
+    "typed_residual_total": {
+      "type": "object",
+      "required": ["status", "value_numeric", "reason"],
+      "properties": {
+        "status": {
+          "enum": ["measured", "pending_run_completion"]
+        },
+        "value_numeric": {
+          "type": ["integer", "null"],
+          "description": "Final residual-pass retry_exhausted count, or null when the residual pass has not yet produced a lifecycle.json."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Empty when value_numeric is a number; explains why value_numeric is null otherwise."
+        }
+      },
+      "additionalProperties": false
+    },
+    "grid_cell": {
+      "type": "object",
+      "required": [
+        "cell_id",
+        "chunk_size",
+        "right_context",
+        "config_overrides",
+        "run_command",
+        "status"
+      ],
+      "properties": {
+        "cell_id": { "type": "string" },
+        "chunk_size": { "enum": ["8_12", "12_20"] },
+        "right_context": { "enum": ["on", "off"] },
+        "config_overrides": { "type": "object" },
+        "run_command": { "type": "string" },
+        "status": {
+          "enum": ["measured", "pending_live_run"]
+        },
+        "metrics": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  }
+}
