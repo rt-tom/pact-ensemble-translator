@@ -272,6 +272,12 @@ central, каждая граница наблюдаема, и global determinist
 structurally-valid результата с debt trace, но не отменяет quality contract:
 это не `complete` и не источник authoritative memory.
 
+Operational уточнение не меняет этот вывод: role batching означает один lease
+из bounded work units, не один prompt на главу. После repair evidence соседних
+окон revalidate'ится по новому context hash; наблюдения degraded-глав передаются
+только как source-grounded advisory overlay. Смена default требует
+pre-registered non-inferiority protocol, а не post-hoc сравнения скорости.
+
 ---
 
 ## 6. Ответы на вопросы раздела 14.v4.0 плана

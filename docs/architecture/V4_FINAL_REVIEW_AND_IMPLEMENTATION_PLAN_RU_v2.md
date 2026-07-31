@@ -25,12 +25,15 @@ targeted convergence и promotion памяти только после `complete
    подтверждает Qwen candidate evaluation. Только затем разрешены C/synthesis.
 5. **Selection/repair.** Qwen fidelity и deterministic — pass/fail; Gemma
    выбирает русский только среди прошедших. Repair проходит релевантные gates.
-6. **Findings.** Immutable stable IDs с detector/category/evidence/region.
-   Разные findings нельзя объединять по span overlap.
+6. **Findings.** Immutable stable IDs с detector/category/evidence/region и
+   `audit_context_hash`. Разные findings нельзя объединять по span overlap;
+   repair с изменённым excerpt добавляет `context_stale_by_repair`, после чего
+   finding требует revalidation или явного supersession.
 7. **Chunk plan.** Deterministic boundaries, hard cap, ownership, contexts и
    single-PID exception; результат — authoritative artifact.
 8. **Memory.** Promotion thresholds, provenance, conflicts, atomic write/lock
-   и rollback. Quarantined observations non-authoritative.
+   и rollback. Quarantined observations non-authoritative; degraded continuity
+   overlay source-grounded, advisory и требует revalidation.
 9. **Terminal state.** Write-once transitions
    `complete/accepted_degraded/failed`; `quarantined` — internal repair state,
    output debt segregation и explicit resume policy.
@@ -74,19 +77,34 @@ benchmark gate заблокирован до 0B и 0C.
 Метрики: semantic recall/FP, bad-repair, residual, Russian rubric, LTCR,
 deterministic integrity, time/tokens/reloads.
 
+### 0D. Pre-registered non-inferiority policy — Codex; review Claude
+
+До первого batch-first vs strict comparison versioned policy фиксирует frozen
+boundary sample size, blind-rubric protocol, one-sided confidence level и
+margins semantic/boundary defect rate, Russian rubric, LTCR и degraded rate.
+Integrity/PID/formatting имеют margin=0. Недостаточный или неопределённый
+result оставляет batch-first experimental; скорость не компенсирует quality
+regression.
+
 ## Phase 1 — foundation
 
 ### 1A. Contracts/state — Codex; review Claude
 
 Schemas/dataclasses/validators для snapshot, chunk plan, candidates, findings,
-repair, terminal state/provenance. Reject partial JSON, duplicate PID, foreign
-identity and non-monotonic terminal transition. No v3 artifact compatibility.
+repair, terminal state/provenance. Findings include audit-context identity and
+append-only stale/revalidation/supersession events. Reject partial JSON,
+duplicate PID, foreign identity and non-monotonic terminal transition. No v3
+artifact compatibility.
 
 ### 1B. JSON memory shadow mode — Codex; review Claude
 
 `glossary.json`, `book_memory.json`, frozen `chapter_memory.json`, observations.
 Atomic snapshot/promotion/conflict/rollback. Only complete promotes;
 accepted_degraded, quarantined and failed do not alter authoritative memory.
+`degraded_continuity_overlay` is a separate append-only, source-grounded
+advisory input with provenance and `requires_revalidation`; it never promotes
+itself. A versioned consecutive-degraded threshold raises next-chapter
+risk/audit profile without blocking automatic output.
 
 ### 1C. Structure-aware chunk planner — Codex; review Claude
 
@@ -106,7 +124,9 @@ Gemma scene/chunk ordered PID-map, frozen book memory + source-side discourse
 plan and ownership validation; primary generation never gets unverified RU
 draft as left context.
 Low=1; med/high=A/B via versioned fidelity-first/balanced-literary prompts.
-Cache includes prompt bundle hash; no reasoning or random C.
+Cache includes prompt bundle hash; no reasoning or random C. A batch is one
+model lease made of durable bounded `chunk_id` work units, never one giant
+chapter prompt.
 
 ### 2C. Admission + cascaded Russian selection — Codex; review Claude
 
@@ -115,7 +135,11 @@ neighbour coherence among passed candidates. Phase 2 is candidate admission,
 not a duplicate final audit. C/synthesis only after documented semantic
 disagreement/no passing candidate; bounded automatic fallback yields explicit
 `accepted_degraded` only with a complete structurally-valid PID-map and debt
-trace. This is output availability, not canonical quality acceptance.
+trace. This is output availability, not canonical quality acceptance. Gemma
+selection uses bounded central-candidate/boundary work units inside one lease;
+aggregate trace is deterministic. Qwen failure blocks selection and commit for
+that candidate; after Gemma failure fallback may choose only an already
+Qwen/deterministic-admitted candidate.
 
 **Gate:** run v3/v4 A/B and chunk benchmark using 0A/0B/0C. Only result record
 freezes chunk range, right context, temperature/seed and risk thresholds.
@@ -135,7 +159,10 @@ belongs to its full central chunk, and model prompts carry only bounded
 read-only neighbour excerpts by default. Global deterministic checks cover the
 assembled chapter; escalation to three full chunks is only for predeclared
 discourse risk. Full PID coverage, resumable partial units, audit cannot claim
-complete on model failure.
+complete on model failure. A repair changing a central/excerpt hash marks all
+affected findings `context_stale_by_repair`; rerun only affected central and
+boundary units, then append revalidation/supersession rather than mutating
+evidence.
 
 ## Phase 4 — repair, convergence, terminal state
 
@@ -159,7 +186,10 @@ smoke only when post-convergence text changes fall outside Step 7's re-audited
 scope — see `V4_MVP_SPEC_RU.md` §2 Step 8) and monotonic terminal transition.
 A complete valid PID map may be issued as availability-state
 `accepted_degraded` with debt trace and no memory promotion; it is not
-canonical quality acceptance. Only absent valid PID map is `failed`.
+canonical quality acceptance. Qwen re-gate failure never commits a repair;
+Gemma re-check failure leaves its Russian finding open and can only return the
+last admitted text as degraded availability. Only absent valid PID map is
+`failed`.
 
 ## Phase 5 — formatting alignment
 
@@ -180,19 +210,23 @@ occurrence/HTML/PID/number fixtures pass.
 
 **Codex; review Claude.** Role batching, fewer reloads, truthful read-only
 monitor and timing/cost record. Reasoning/third model stay feature-flagged
-experiments. Optimisation must preserve contracts and benchmark result.
+experiments. `v4_phase12_sequential_runner.py` remains test-only measurement
+harness: no runtime-driver import or terminal commit; retain it through
+topology choice, then review archive vs regression-fixture status.
+Optimisation must preserve contracts and benchmark result.
 
 ## Phase 7 — A/B release decision
 
 Codex supplies tooling; Claude and human independently review. Same source and
-frozen snapshot for v3/v4. Switch only if residual semantic errors lower,
-bad-repair not higher, Russian/formatting not worse, cost and quarantine rate
-accepted. Otherwise v4 remains experimental.
+frozen snapshot for v3/v4. Switch only if pre-registered 0D non-inferiority
+passes: zero integrity regression and every one-sided quality/degraded margin
+passes at sufficient sample; cost is evaluated only after that. Otherwise v4
+remains experimental.
 
 ## PR order and compact prompts
 
 `1A → 1B → 1C → 2A → 2B → 2C → benchmark gate → 3A → 3B → 4A → 4B → 5 → 6 → 7`.
-0A/0B start immediately; 0C completes before the benchmark gate.
+0A/0B start immediately; 0C/0D complete before the benchmark gate.
 
 ```text
 Реализуй v4 Phase 1A из V4_FINAL_REVIEW_AND_IMPLEMENTATION_PLAN_RU_v2.md.

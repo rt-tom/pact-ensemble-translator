@@ -69,6 +69,9 @@ v4: «Сначала создай хорошие варианты в конте�
    - characters / style / voice memory
    - previous events / facts
    - term & name memory (НЕ fuzzy sentence-level TM)
+   - read-only `degraded_continuity_overlay` предыдущих глав только как
+     `requires_revalidation`: source-grounded facts/entities с provenance,
+     не authoritative memory и не свободный RU draft
 
 2. Deterministic risk pre-screen — ВСЕ chunks, без модели
    сигналы: числа, отрицания, модальность, имена, glossary conflicts,
@@ -101,6 +104,9 @@ v4: «Сначала создай хорошие варианты в конте�
    допускается traceable structurally-valid fallback, выданный как
    availability-state `accepted_degraded`, не canonical quality acceptance и
    не silent `complete`
+   batch = один lease модели, но bounded work units, не giant prompt на главу;
+           Gemma selection unit содержит central candidates + budgeted
+           boundary-context, а aggregate trace собирается детерминированно
 
 6. Assembled-chapter audit (один раз, по собранной главе)
    Qwen        : source ↔ translation (пропуски/добавления/референты/сцена)
@@ -116,6 +122,9 @@ v4: «Сначала создай хорошие варианты в конте�
                    escalation и после context-size benchmark
    deterministic: PID coverage / numbers / mixed-script / glossary / names /
                   formatting contract / HTML structure — по всей главе
+   если repair меняет chunk: findings audit units с изменившимся central/excerpt
+                  hash получают append-only `context_stale_by_repair` и не
+                  закрываются до revalidation affected central/boundary units
    formatting контракт (`PACT_RESPONSE_TO_CLAUDE_REVISED_ACCEPTED_PLAN_RU.md` §8.14) применяется ДО Step 8, не после — final smoke
    должен видеть тот же текст, что попадёт в `complete`
 
@@ -133,6 +142,9 @@ v4: «Сначала создай хорошие варианты в конте�
        диалог/регистр/ты-вы/имена, даже без исходного Gemma finding там
    один repair-round обязателен; второй только если blocking finding остался
    либо первая правка затронула соседнюю boundary/context
+   Qwen gate failure запрещает selection/commit кандидата; Gemma failure после
+   admission допускает fallback только среди Qwen+deterministic-passed
+   candidates, иначе `failed`; Gemma re-check failure не закрывает finding
    после лимита: availability-state `accepted_degraded` при валидном PID-map
    с debt trace, иначе `failed`
 
@@ -157,7 +169,9 @@ v4: «Сначала создай хорошие варианты в конте�
        обеспечено обязательным re-check в Step 7, третий blanket-проход не
        даёт независимого сигнала)
    memory promotion ТОЛЬКО после complete; `accepted_degraded` memory не
-   promote'ит
+   promote'ит, но создаёт non-authoritative source-grounded continuity overlay;
+   consecutive degraded chain versioned-аудируется и усиливает risk/audit
+   следующей главы без остановки автоматического выпуска
 ```
 
 ---

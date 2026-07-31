@@ -59,6 +59,15 @@ Qwen:  re-gate только изменённых region'ов
 Gemma: Russian re-check/commit repaired region'ов
 ```
 
+«Один батч» здесь означает **один непрерывный lease модели**, а не один
+giant prompt: driver последовательно исполняет versioned bounded work units
+(`chunk_id` / `boundary_id`, prompt/context hashes), не выгружая модель между
+ними. Russian-only «global selection» охватывает все chunk'и главы в одном
+Gemma lease, но каждая selection unit содержит только кандидатов central
+chunk и budgeted соседнюю boundary-окрестность; aggregate decision trace
+собирается детерминированно. Размер unit и context budget — benchmark-config,
+а не неявное свойство длины главы.
+
 Phase 1–2 — admission, не финальный аудит. Там обязательны только valid
 PID-map/identity, coverage, hard deterministic constraints, Qwen semantic
 admission, required-risk categories и выбор среди уже допустимых RU
@@ -72,12 +81,63 @@ full chunk в одном model prompt допускаются только при
 referent, ты/вы, scene transition) и после отдельного context-size benchmark.
 Findings всегда принадлежат central chunk.
 
+Finding store остаётся append-only. Если repair меняет текст chunk `N`, все
+audit units, где `N` входил как central или read-only excerpt, обнаруживаются
+по `audit_context_hash`. Их исходные findings получают событие
+`context_stale_by_repair` (не удаляются и не merge'ятся) и не могут быть
+закрыты/использованы как свежие evidence до revalidation. Driver повторяет
+только затронутые central units и boundaries; подтверждённый finding получает
+новую запись с `revalidated_from`, неподтверждённый — явное supersession
+reason. Это исключает решение по finding, чьё соседнее evidence уже устарело.
+
 Phase 4 выполняет один обязательный targeted boundary repair-round. Второй
 разрешён только если re-gate всё ещё находит blocking finding либо первая
 правка изменила boundary/context соседнего region. После лимита система может
 выдать structurally-valid fallback как `accepted_degraded` с явным debt trace,
 не продвигая память и не объявляя его `complete`; `failed` остаётся для
 отсутствия какого-либо валидного PID-map после automatic retries.
+
+### Ошибки и resume batch-first стадий
+
+Batch не является атомарным: каждый generation/gate/selection/re-check work
+unit сначала durable записывается с model/prompt/context identity, а затем
+меняет lifecycle. При model failure driver повторяет только incomplete unit;
+остальные подтверждённые units reuse'ятся лишь при совпадении всех identity.
+
+- Qwen admission error даёт `gate_failed` только затронутым кандидатам:
+  Gemma selection и commit для них запрещены. Другие chunk'и могут закончить
+  свои work units, но глава не становится `complete`; после retry budget без
+  semantically admitted PID-map это `failed`, не fallback без fidelity gate.
+- Gemma selection error после прошедших Qwen/deterministic gates не меняет
+  admission trace. После retry budget разрешён только записанный
+  deterministic fallback **среди уже admitted candidates**; он несёт debt и
+  может дать `accepted_degraded`, но не выбирает fidelity draft или Qwen-failed
+  candidate.
+- Если Qwen re-gate прошёл, а Gemma re-check упал, repair не закрывает
+  исходный Russian finding. Driver сохраняет repair как candidate, возвращает
+  последний admission-passed selected text либо после retry фиксирует
+  `accepted_degraded` с открытым debt; без такого валидного текста — `failed`.
+
+После любого retry, меняющего text/hash, применяются `context_stale_by_repair`
+и ограниченный re-audit соседей выше; HTTP success сам по себе не является
+checkpoint или commit.
+
+### Межглавная continuity после `accepted_degraded`
+
+`accepted_degraded` не меняет `book_memory.json` или locked glossary, но не
+должен тихо обрывать continuity следующей главы. Driver создаёт отдельный
+append-only `degraded_continuity_overlay`: только source-grounded facts и
+детерминированные entities (имя, число, source term, chapter/PID provenance),
+без свободной русской формулировки и без promotion. Следующая глава читает
+overlay как advisory `requires_revalidation`, а её Qwen source-plan и
+deterministic gates обязаны подтвердить или отвергнуть запись; overlay не
+может сам стать authoritative memory.
+
+Journal ведёт `consecutive_accepted_degraded` и debt chain. Достигнутый
+versioned threshold не останавливает автоматический выпуск, но переводит
+следующую главу в усиленный risk/audit profile и создаёт операционное
+предупреждение. Значение threshold калибруется и pin'ится в benchmark-config;
+неограниченная немаркированная цепочка degraded-глав запрещена.
 
 ## Reference oracle: строгий stop-and-switch
 
@@ -317,6 +377,13 @@ left-context.
 для этого нужен отдельный короткий `Gemma → Qwen → Gemma` benchmark без
 production pipeline.
 
+`v4_phase12_sequential_runner.py` остаётся **test-only measurement harness**:
+ему запрещены production import, terminal commit и участие в runtime driver.
+Он хранится до решения по default topology как воспроизводимый first-wave /
+gate-bench control; после принятия topology отдельная review-card решает
+оставить его regression fixture или архивировать. Его нельзя незаметно
+превратить в fallback production path.
+
 ## Почему не надо сейчас заменять RU left_context памятью/выжимкой
 
 Frozen glossary и book/chapter memory уже необходимы, но они не доказано
@@ -377,8 +444,16 @@ pipeline и не меняют run artifacts/caches.
    rubric по анафоре/ты-вы/voice, LTCR, deterministic integrity, quarantine /
    `accepted_degraded` rate, wall-clock, tokens и restart. Три audit profile:
    central-only, central + bounded neighbour excerpts, три full chunk только
-   для рискованных границ. Default выбирается по качеству стыков, не по
-   размеру prompt сам по себе.
+   для рискованных границ. До запуска создаётся immutable
+   `noninferiority_policy`: `n_boundary_units`, blind-rubric protocol,
+   one-sided confidence level, margins для semantic/boundary defect rate,
+   Russian rubric, LTCR и `accepted_degraded` rate. Integrity и PID/format
+   contracts имеют margin=0; ни одно преимущество по скорости не компенсирует
+   hard regression. Batch-first проходит, только если верхняя граница
+   one-sided interval разницы с strict не превышает каждый соответствующий
+   margin и sample size достигнут. Неопределённый/недостаточный результат
+   оставляет topology experimental; числа margins и threshold не выдумываются
+   post hoc, а pin'ятся в benchmark-config до первого сравнения.
 
 ## Условия перехода к реализации
 
@@ -392,6 +467,15 @@ criteria batch-first driver:
   записанным Qwen/deterministic trace; fallback имеет явный debt trace;
 - Russian-only Phase 3 prompt содержит full central chunk и маркированные
   bounded neighbour excerpts; finding не может быть привязан к чужому PID;
+- repair делает evidence всех audit units с изменённым context stale и
+  повторно валидирует только затронутые central/boundary units;
+- batch — один model lease из bounded work units, не giant prompt; Qwen
+  failure не допускает Gemma selection/commit, а Gemma fallback разрешён
+  только среди Qwen/deterministic-admitted candidates;
+- `accepted_degraded` создаёт только non-authoritative source-grounded
+  continuity overlay и ведёт versioned degraded-chain threshold;
+- `noninferiority_policy` записан до comparison: sufficient sample, zero
+  integrity regression и one-sided margins для quality/degraded metrics;
 - один repair-round обязателен, второй требует recorded trigger; repair с
   changed boundary получает exact committed RU left-context и re-gate;
 - resume не переиспользует repair candidate при несовпадающих parent context,
