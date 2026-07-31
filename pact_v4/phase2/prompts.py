@@ -17,6 +17,10 @@ a bug, not a feature, hence the version is required and immutable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Iterable, Mapping, Tuple
+
+from pact_v4.phase2.risk import REQUIRED_RISK_CATEGORIES
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,47 @@ BALANCED_LITERARY_V1 = PromptTemplate(
 )
 
 
+# Explicit per-category instructions for the risk categories that Phase 2A's
+# REQUIRED_RISK_CATEGORIES (pact_v4.phase2.risk) always screens for. Kept as
+# a separate, version-controlled mapping (not inlined into the templates
+# above) so it is added to the prompt only when the source risk pre-screen
+# actually flagged that category for the chunk being generated, not
+# unconditionally on every request.
+_REQUIRED_CATEGORY_INSTRUCTIONS: Mapping[str, str] = MappingProxyType({
+    "number_word": (
+        "Preserve written-out numbers exactly. Do not paraphrase 'twelve' "
+        "to 'a dozen'."
+    ),
+    "tone_profanity": (
+        "Preserve source profanity/tone exactly. Do not soften or omit."
+    ),
+})
+
+if frozenset(_REQUIRED_CATEGORY_INSTRUCTIONS) != REQUIRED_RISK_CATEGORIES:
+    raise AssertionError(
+        "prompts._REQUIRED_CATEGORY_INSTRUCTIONS has drifted from "
+        "risk.REQUIRED_RISK_CATEGORIES; every required risk category needs "
+        "an explicit propagation instruction here."
+    )
+
+
+def required_category_instructions(risk_feature_codes: Iterable[str]) -> Tuple[str, ...]:
+    """Explicit instructions for whichever required categories are present.
+
+    ``risk_feature_codes`` is the set of ``RiskFeature.code`` values the
+    source risk pre-screen actually flagged for this chunk (see
+    ``pact_v4.phase2.risk.assess_source_risk``). Categories outside
+    ``REQUIRED_RISK_CATEGORIES`` (e.g. plain ``numbers``, a digit match, not
+    the written-out ``number_word`` category) never produce an instruction
+    here — propagation is conditional on the actual pre-screen result, not
+    unconditional.
+    """
+    present = REQUIRED_RISK_CATEGORIES & set(risk_feature_codes)
+    return tuple(
+        _REQUIRED_CATEGORY_INSTRUCTIONS[code] for code in sorted(present)
+    )
+
+
 def render_prompt(bundle: "Any") -> str:
     """Render the concrete request text for one generation call.
 
@@ -111,6 +156,14 @@ def render_prompt(bundle: "Any") -> str:
     style_constraints = (
         ", ".join(f"{key}={value}" for key, value in bundle.style_constraints) or "(none)"
     )
+    instructions = required_category_instructions(bundle.required_risk_feature_codes)
+    required_category_block = (
+        f"REQUIRED_CATEGORY_INSTRUCTIONS:\n"
+        + "\n".join(f"  - {line}" for line in instructions)
+        + "\n"
+        if instructions
+        else ""
+    )
     return (
         f"{bundle.template.instructions}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
@@ -120,4 +173,5 @@ def render_prompt(bundle: "Any") -> str:
         f"right_context (read-only English source): {right_context}\n"
         f"GLOSSARY:\n{glossary}\n"
         f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n"
+        f"{required_category_block}"
     )

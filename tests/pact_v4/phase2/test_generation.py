@@ -25,7 +25,13 @@ from pact_v4.phase2.generation import (
     GenerationParams,
     generate_for_chunk,
 )
-from pact_v4.phase2.risk import GlossaryEntry, RiskAssessment, RiskBand
+from pact_v4.phase2.risk import (
+    REQUIRED_RISK_CATEGORIES,
+    GlossaryEntry,
+    RiskAssessment,
+    RiskBand,
+    RiskFeature,
+)
 
 
 def _hash(seed: str) -> str:
@@ -74,8 +80,14 @@ def make_env(pid_count: int = 10, chunk_id: str = "c1"):
     return source, snapshot, chunk_plan, chunk, config
 
 
-def make_risk(band: RiskBand) -> RiskAssessment:
-    return RiskAssessment(policy_version="pact-v4-risk-source-en/v1", band=band, score=0, features=())
+def make_risk(band: RiskBand, features: Tuple[RiskFeature, ...] = ()) -> RiskAssessment:
+    return RiskAssessment(
+        policy_version="pact-v4-risk-source-en/v1", band=band, score=0, features=features
+    )
+
+
+def make_feature(code: str, weight: int = 1) -> RiskFeature:
+    return RiskFeature(code=code, weight=weight, explanation=f"test:{code}", evidence=())
 
 
 def make_params(**overrides: object) -> GenerationParams:
@@ -283,6 +295,7 @@ def test_changing_prompt_version_or_content_invalidates_cache():
         role="fidelity_first",
         risk_band="low",
         risk_policy_version="pact-v4-risk-source-en/v1",
+        required_risk_feature_codes=(),
         snapshot_hash=_hash("snap"),
         source_hash=_hash("source"),
         chunk_id="c1",
@@ -711,6 +724,7 @@ def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
         role="fidelity_first",
         risk_band="low",
         risk_policy_version=make_risk(RiskBand.LOW).policy_version,
+        required_risk_feature_codes=(),
         snapshot_hash=snapshot.snapshot_hash,
         source_hash=source.source_hash,
         chunk_id=chunk.chunk_id,
@@ -781,3 +795,163 @@ def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
         rendered = render_prompt(bundle)
         assert "OWNED_SOURCE" in rendered
         assert "OWNED_PIDS" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Work 2B: REQUIRED_RISK_CATEGORIES propagation into the prompt
+#
+# generation.py imports pact_v4.phase2.risk.REQUIRED_RISK_CATEGORIES rather
+# than redeclaring {"number_word", "tone_profanity"}; whichever of those
+# categories the source risk pre-screen actually flagged for a chunk is
+# threaded onto PromptBundle.required_risk_feature_codes and rendered as an
+# explicit instruction — conditionally, not unconditionally.
+# ---------------------------------------------------------------------------
+
+
+def test_number_word_feature_propagates_explicit_instruction_into_prompt():
+    from pact_v4.phase2.prompts import render_prompt
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    risk = make_risk(RiskBand.MEDIUM, features=(make_feature("number_word"),))
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=risk, source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    for bundle in generator.calls:
+        assert bundle.required_risk_feature_codes == ("number_word",)
+        assert "Preserve written-out numbers" in render_prompt(bundle)
+
+
+def test_tone_profanity_feature_propagates_explicit_instruction_into_prompt():
+    from pact_v4.phase2.prompts import render_prompt
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    risk = make_risk(RiskBand.MEDIUM, features=(make_feature("tone_profanity"),))
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=risk, source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    for bundle in generator.calls:
+        assert bundle.required_risk_feature_codes == ("tone_profanity",)
+        assert "Preserve source profanity" in render_prompt(bundle)
+
+
+def test_digit_numbers_feature_does_not_trigger_number_word_instruction():
+    """Propagation is conditional on the actual pre-screen result: a plain
+    ``numbers`` feature (digits, e.g. "42") is not the ``number_word``
+    required category (written-out, e.g. "forty-two"), so it must not add
+    the number_word-specific instruction."""
+    from pact_v4.phase2.prompts import render_prompt
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    risk = make_risk(RiskBand.MEDIUM, features=(make_feature("numbers"),))
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=risk, source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    for bundle in generator.calls:
+        assert bundle.required_risk_feature_codes == ()
+        rendered = render_prompt(bundle)
+        assert "Preserve written-out numbers" not in rendered
+        assert "REQUIRED_CATEGORY_INSTRUCTIONS" not in rendered
+
+
+def test_no_required_risk_features_omits_the_instruction_block_entirely():
+    from pact_v4.phase2.prompts import render_prompt
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.LOW), source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    rendered = render_prompt(generator.calls[0])
+    assert "REQUIRED_CATEGORY_INSTRUCTIONS" not in rendered
+
+
+def test_both_required_categories_present_propagate_both_instructions():
+    from pact_v4.phase2.prompts import render_prompt
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    risk = make_risk(
+        RiskBand.HIGH,
+        features=(make_feature("number_word"), make_feature("tone_profanity")),
+    )
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id, risk=risk, source=source,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+        model_caller=generator,
+    )
+    assert outcome.status == "complete"
+
+    for bundle in generator.calls:
+        assert bundle.required_risk_feature_codes == ("number_word", "tone_profanity")
+        rendered = render_prompt(bundle)
+        assert "Preserve written-out numbers" in rendered
+        assert "Preserve source profanity" in rendered
+
+
+def test_required_risk_categories_change_in_risk_module_is_reflected_by_generation():
+    """generation.py must consume risk.REQUIRED_RISK_CATEGORIES via import,
+    not a redeclared literal: patching the risk module's constant changes
+    what generation.py filters against, at runtime, with no code edit in
+    generation.py itself."""
+    import pact_v4.phase2.generation as generation_module
+    import pact_v4.phase2.risk as risk_module
+
+    assert generation_module.REQUIRED_RISK_CATEGORIES is risk_module.REQUIRED_RISK_CATEGORIES
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    original = generation_module.REQUIRED_RISK_CATEGORIES
+    try:
+        generation_module.REQUIRED_RISK_CATEGORIES = frozenset({"idiom_or_metaphor"})
+        risk = make_risk(RiskBand.MEDIUM, features=(make_feature("idiom_or_metaphor"),))
+        outcome = generate_for_chunk(
+            chunk_id=chunk.chunk_id, risk=risk, source=source,
+            snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
+            model_caller=generator,
+        )
+        assert outcome.status == "complete"
+        for bundle in generator.calls:
+            assert bundle.required_risk_feature_codes == ("idiom_or_metaphor",)
+    finally:
+        generation_module.REQUIRED_RISK_CATEGORIES = original
+
+
+def test_generation_module_has_no_hardcoded_required_category_literals():
+    """generation.py must not redeclare {"number_word", "tone_profanity"} —
+    it may only reference them via the imported REQUIRED_RISK_CATEGORIES
+    (or re-export it), never as its own literal set/frozenset."""
+    import inspect
+
+    import pact_v4.phase2.generation as generation_module
+
+    source_text = inspect.getsource(generation_module)
+    assert "REQUIRED_RISK_CATEGORIES" in source_text
+    assert '"number_word"' not in source_text
+    assert '"tone_profanity"' not in source_text
+    assert "'number_word'" not in source_text
+    assert "'tone_profanity'" not in source_text

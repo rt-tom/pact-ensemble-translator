@@ -75,6 +75,7 @@ def _bundle() -> PromptBundle:
         role="fidelity_first",
         risk_band="low",
         risk_policy_version="pact-v4-risk-source-en/v1",
+        required_risk_feature_codes=(),
         snapshot_hash=_hash("snap"),
         source_hash=_hash("source"),
         chunk_id="chunk0001",

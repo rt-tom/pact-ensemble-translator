@@ -28,6 +28,14 @@ generation"):
     A cache *hit* is still re-verified against the requested chunk_id/role
     and against the candidate's own ownership contract before being
     returned — reuse never depends solely on trusting the hash.
+  * Whichever of ``pact_v4.phase2.risk.REQUIRED_RISK_CATEGORIES`` the
+    source risk pre-screen actually flagged for this chunk (``number_word``,
+    ``tone_profanity``) is threaded onto the ``PromptBundle`` as
+    ``required_risk_feature_codes`` and rendered into the request text as an
+    explicit instruction by ``pact_v4.phase2.prompts.render_prompt`` —
+    conditionally, only for the categories actually present, never
+    unconditionally. This module imports ``REQUIRED_RISK_CATEGORIES`` from
+    ``pact_v4.phase2.risk`` rather than redeclaring the category list.
 
 Explicitly OUT of scope for this module (Phase 2C, "Cascaded selection"):
 Qwen fidelity/semantic analysis, the deterministic consistency gate, Gemma
@@ -57,7 +65,12 @@ from pact_v4.phase2.prompts import (
     FIDELITY_FIRST_V1,
     PromptTemplate,
 )
-from pact_v4.phase2.risk import GlossaryEntry, RiskAssessment, RiskBand
+from pact_v4.phase2.risk import (
+    REQUIRED_RISK_CATEGORIES,
+    GlossaryEntry,
+    RiskAssessment,
+    RiskBand,
+)
 
 __all__ = [
     "GenerationParams",
@@ -125,6 +138,7 @@ class PromptBundle:
     role: str
     risk_band: str
     risk_policy_version: str
+    required_risk_feature_codes: Tuple[str, ...]
     snapshot_hash: str
     source_hash: str
     chunk_id: str
@@ -149,16 +163,24 @@ class PromptBundle:
                 "PromptBundle: owned_source PIDs/order must exactly match owned_pids "
                 f"({tuple(pid for pid, _ in self.owned_source)!r} != {self.owned_pids!r})"
             )
+        unknown = set(self.required_risk_feature_codes) - REQUIRED_RISK_CATEGORIES
+        if unknown:
+            raise ValueError(
+                f"PromptBundle: required_risk_feature_codes contains non-required "
+                f"categories {sorted(unknown)}; only {sorted(REQUIRED_RISK_CATEGORIES)} "
+                "may appear here"
+            )
         object.__setattr__(self, "bundle_hash", canonical_json_hash(self._identity_payload()))
 
     def _identity_payload(self) -> dict:
         return {
-            "artifact": "pact-v4-prompt-bundle/v2",
+            "artifact": "pact-v4-prompt-bundle/v3",
             "template_role": self.template.role,
             "template_version": self.template.version,
             "template_instructions_hash": canonical_json_hash(self.template.instructions),
             "risk_band": self.risk_band,
             "risk_policy_version": self.risk_policy_version,
+            "required_risk_feature_codes": sorted(self.required_risk_feature_codes),
             "snapshot_hash": self.snapshot_hash,
             "source_hash": self.source_hash,
             "chunk_id": self.chunk_id,
@@ -402,12 +424,16 @@ def _generate_one(
 ) -> GenerationCandidateResult:
     chunk = chunk_plan.chunk(chunk_id)
     template = _TEMPLATES[role]
+    required_risk_feature_codes = tuple(
+        sorted({feature.code for feature in risk.features} & REQUIRED_RISK_CATEGORIES)
+    )
 
     bundle = PromptBundle(
         template=template,
         role=role,
         risk_band=risk.band.value,
         risk_policy_version=risk.policy_version,
+        required_risk_feature_codes=required_risk_feature_codes,
         snapshot_hash=snapshot.snapshot_hash,
         source_hash=source.source_hash,
         chunk_id=chunk_id,
