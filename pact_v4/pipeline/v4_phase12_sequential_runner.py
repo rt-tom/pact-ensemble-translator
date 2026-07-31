@@ -27,13 +27,17 @@ disk (the same pattern ``pact_translate_v3.py`` already uses for its
 
 * ``run_select`` — needs only Qwen (Gemma optionally, if it happens to
   still be resident). Reads the ``generate`` pass's self-contained
-  ``generation_bundle.json`` (source text, chunk plan, and every
-  candidate ``generate_for_chunk`` produced) and runs
-  ``pact_v4.phase2.cascade.select_candidate`` per chunk. Selection is
-  provably order-independent: ``select_candidate`` takes the static
-  ``source`` (English text) and the chunk's own candidates, never the
-  previous chunk's translation, so chunks can be selected in any order
-  or even in parallel.
+  ``generation_bundle.json`` (source text, chunk plan, per-chunk
+  ``RiskAssessment``, and every candidate ``generate_for_chunk``
+  produced) and runs ``pact_v4.phase2.cascade.select_candidate`` per
+  chunk -- including its ``risk=`` argument, so the required-risk-
+  category resolution gate (``number_word``/``tone_profanity``, see
+  ``pact_v4.phase2.cascade.required_category_gate``) actually runs
+  here too, not just in the interleaved driver. Selection is provably
+  order-independent: ``select_candidate`` takes the static ``source``
+  (English text) and the chunk's own candidates, never the previous
+  chunk's translation, so chunks can be selected in any order or even
+  in parallel.
 
 The output of ``run_select`` (``translations.json`` + ``provenance.json``)
 uses the same schema as ``v4_phase12_draft_runner.run_chapter``'s output,
@@ -68,7 +72,7 @@ from pact_v4.phase2.generation import (
     ModelCaller,
     generate_for_chunk,
 )
-from pact_v4.phase2.risk import RiskAssessment, assess_source_risk
+from pact_v4.phase2.risk import RiskAssessment, RiskBand, RiskFeature, assess_source_risk
 from pact_v4.pipeline.v4_phase12_draft_runner import _glossary_entries
 from pact_v4.runtime.snapshot_factory import (
     ChapterMemory,
@@ -210,6 +214,48 @@ def _deserialize_candidate(payload: Mapping[str, Any]) -> Candidate:
         decision_trace=tuple(
             GateResult(gate=g["gate"], passed=g["passed"], detail=g.get("detail", ""))
             for g in payload.get("decision_trace", [])
+        ),
+    )
+
+
+def _serialize_risk(risk: RiskAssessment) -> Dict[str, Any]:
+    """Render one chunk's ``RiskAssessment`` for the generation bundle.
+
+    Needed so ``run_select`` can pass ``risk=`` into ``select_candidate``
+    and get the required-risk-category resolution gate (Phase 2C, gate
+    ``required_risk_categories`` -- see ``pact_v4.phase2.cascade.
+    required_category_gate``) -- without this, that gate silently no-ops
+    (``select_candidate(risk=None)`` skips stage 2b entirely).
+    """
+    return {
+        "policy_version": risk.policy_version,
+        "band": risk.band.value,
+        "score": risk.score,
+        "features": [
+            {
+                "code": f.code,
+                "weight": f.weight,
+                "explanation": f.explanation,
+                "evidence": list(f.evidence),
+            }
+            for f in risk.features
+        ],
+    }
+
+
+def _deserialize_risk(payload: Mapping[str, Any]) -> RiskAssessment:
+    return RiskAssessment(
+        policy_version=payload["policy_version"],
+        band=RiskBand(payload["band"]),
+        score=payload["score"],
+        features=tuple(
+            RiskFeature(
+                code=f["code"],
+                weight=f["weight"],
+                explanation=f["explanation"],
+                evidence=tuple(f.get("evidence", ())),
+            )
+            for f in payload.get("features", [])
         ),
     )
 
@@ -373,6 +419,7 @@ def run_generate(
         outcome_records.append({
             "chunk_id": outcome.chunk_id,
             "risk_band": outcome.risk_band,
+            "risk": _serialize_risk(risk),
             "expected_roles": list(outcome.expected_roles),
             "status": outcome.status,
             "candidates": {
@@ -593,6 +640,12 @@ def run_select(
             for role, payload in outcome_record["candidates"].items()
         }
         candidates = list(candidates_by_role.values())
+        # Older bundles (written before the required-risk-category gate
+        # existed) won't carry "risk" -- degrade to risk=None, which is
+        # exactly select_candidate's own documented "skip stage 2b"
+        # behaviour, not a fabricated value.
+        risk_payload = outcome_record.get("risk")
+        risk = _deserialize_risk(risk_payload) if risk_payload is not None else None
 
         try:
             result = select_candidate(
@@ -602,6 +655,7 @@ def run_select(
                 qwen_evaluator=qwen_evaluator,
                 det_data=det_data,
                 gemma_selector=gemma_selector,
+                risk=risk,
             )
         except Exception as exc:  # noqa: BLE001 -- see draft_runner's note
             LOG.exception("select_candidate raised for %s", chunk_id)

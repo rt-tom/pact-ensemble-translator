@@ -277,6 +277,74 @@ def test_run_select_works_without_gemma_selector(tmp_path: Path):
     assert len(translations) == 8
 
 
+def test_run_generate_bundle_carries_full_risk_assessment(tmp_path: Path):
+    """The generation bundle must carry each chunk's full RiskAssessment
+    (not just risk_band), so run_select can pass risk= into
+    select_candidate and actually exercise the required-risk-category
+    gate (pact_v4.phase2.cascade.required_category_gate)."""
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>" + "<p>This is fucking unacceptable, she said.</p>" * 8 + "</body></html>",
+        encoding="utf-8",
+    )
+    _write_empty_memory(tmp_path / "memory")
+    gen_cfg = SequentialGenerateConfig(
+        chapter_id="046", chapter_html_path=chapter_html,
+        memory_dir=tmp_path / "memory", out_dir=tmp_path / "out",
+        min_chunk_size=8, max_chunk_size=20,
+    )
+    result = run_generate(gen_cfg, model_caller=StubModelCaller())
+    bundle = json.loads(result.generation_bundle_path.read_text(encoding="utf-8"))
+    outcome = bundle["outcomes"][0]
+    assert "risk" in outcome
+    risk_codes = {f["code"] for f in outcome["risk"]["features"]}
+    assert "tone_profanity" in risk_codes
+
+
+def test_run_select_quarantines_when_required_risk_category_unresolved(tmp_path: Path):
+    """Regression for the risk= wiring gap: source risk pre-screen flags
+    tone_profanity, but StubModelCaller's translation never resolves it
+    (plain 'Перевод номерN' text) -- the chunk must be quarantined by
+    the required-risk-category gate, not silently selected because
+    risk=None was never passed through to select_candidate."""
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>" + "<p>This is fucking unacceptable, she said.</p>" * 8 + "</body></html>",
+        encoding="utf-8",
+    )
+    _write_empty_memory(tmp_path / "memory")
+    gen_cfg = SequentialGenerateConfig(
+        chapter_id="046", chapter_html_path=chapter_html,
+        memory_dir=tmp_path / "memory", out_dir=tmp_path / "out",
+        min_chunk_size=8, max_chunk_size=20,
+    )
+    gen_result = run_generate(gen_cfg, model_caller=StubModelCaller())
+    select_cfg = SequentialSelectConfig(
+        generation_bundle_path=gen_result.generation_bundle_path, out_dir=tmp_path / "out",
+    )
+    result = run_select(select_cfg, qwen_evaluator=StubQwen(), gemma_selector=StubGemma())
+    payload = json.loads(result.selection_path.read_text(encoding="utf-8"))
+    assert all(rec["status"] == "quarantined" for rec in payload["results"])
+    reasons = " ".join(rec.get("quarantine_reason", "") for rec in payload["results"])
+    assert "tone_profanity" in reasons
+
+
+def test_run_select_degrades_gracefully_without_risk_in_bundle(tmp_path: Path):
+    """An older bundle written before the risk= wiring existed (no
+    "risk" key per outcome) must not crash run_select -- it degrades to
+    risk=None, select_candidate's own documented "skip stage 2b"
+    behaviour, not a fabricated risk assessment."""
+    select_cfg, bundle_path = _generate_then_select_cfg(tmp_path)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    for outcome in bundle["outcomes"]:
+        outcome.pop("risk", None)
+    bundle_path.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
+
+    result = run_select(select_cfg, qwen_evaluator=StubQwen(), gemma_selector=StubGemma())
+    translations = json.loads(result.translations_path.read_text(encoding="utf-8"))
+    assert len(translations) == 8
+
+
 def test_run_select_rejects_foreign_bundle_schema(tmp_path: Path):
     bad_bundle_path = tmp_path / "generation_bundle.json"
     bad_bundle_path.write_text(json.dumps({"schema": "not-the-right-schema"}), encoding="utf-8")
