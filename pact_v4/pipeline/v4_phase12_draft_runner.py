@@ -41,7 +41,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase0b.source_html import SourceBlock, load_source
-from pact_v4.phase1.chunker import ChunkPlanner
+from pact_v4.phase1.chunker import (
+    DEFAULT_MAX_WORDS,
+    DEFAULT_MIN_WORDS,
+    DEFAULT_TARGET_WORDS,
+    ChunkPlanner,
+)
 from pact_v4.phase1.models import (
     Candidate,
     ChunkContext,
@@ -96,9 +101,11 @@ class PipelineConfig:
       will replace them.
     * ``right_context_pids`` is the count of next-chunk PIDs rendered
       into the prompt as English source (0 by default — same default as
-      ``ChunkPlanner.plan(context_right_count=0)``).
-    * ``min_chunk_size`` / ``max_chunk_size`` are passed straight into
-      ``ChunkPlanner``. Defaults match the current 8-20 policy.
+      ``ChunkPlanner.plan(following_blocks=0)``).
+    * ``min_chunk_words`` / ``target_chunk_words`` / ``max_chunk_words``
+      are passed straight into ``ChunkPlanner``. Defaults are the Phase
+      0C Gate's initial/default small chunk profile (word-based, not
+      PID-based — see ``pact_v4.phase1.chunker``).
     """
 
     chapter_id: str
@@ -106,8 +113,9 @@ class PipelineConfig:
     memory_dir: Path
     out_dir: Path
     # Chunk planner
-    min_chunk_size: int = 8
-    max_chunk_size: int = 20
+    min_chunk_words: int = DEFAULT_MIN_WORDS
+    target_chunk_words: int = DEFAULT_TARGET_WORDS
+    max_chunk_words: int = DEFAULT_MAX_WORDS
     right_context_pids: int = 0
     # Generation (Phase 2B)
     temperature: float = 0.2
@@ -127,8 +135,9 @@ class PipelineConfig:
             values={
                 "chapter_id": self.chapter_id,
                 "model_profile": model_profile,
-                "chunk_min_size": self.min_chunk_size,
-                "chunk_max_size": self.max_chunk_size,
+                "chunk_min_words": self.min_chunk_words,
+                "chunk_target_words": self.target_chunk_words,
+                "chunk_max_words": self.max_chunk_words,
                 "right_context_pids": self.right_context_pids,
                 "generation": {
                     "temperature": self.temperature,
@@ -327,11 +336,15 @@ def run_chapter(
     # ------------------------------------------------------------------
     # Phase 1C: structure-aware chunk plan.
     # ------------------------------------------------------------------
-    planner = ChunkPlanner(min_size=cfg.min_chunk_size, max_size=cfg.max_chunk_size)
+    planner = ChunkPlanner(
+        target_words=cfg.target_chunk_words,
+        min_words=cfg.min_chunk_words,
+        max_words=cfg.max_chunk_words,
+    )
     plans = planner.plan(
         blocks,
         snapshot_hash=snapshot.snapshot_hash,
-        context_right_count=cfg.right_context_pids,
+        following_blocks=cfg.right_context_pids,
     )
     if not plans:
         raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
@@ -574,8 +587,9 @@ def run_chapter(
             "temperature": cfg.temperature,
             "seed": cfg.seed,
             "max_tokens": cfg.max_tokens,
-            "chunk_min_size": cfg.min_chunk_size,
-            "chunk_max_size": cfg.max_chunk_size,
+            "chunk_min_words": cfg.min_chunk_words,
+            "chunk_target_words": cfg.target_chunk_words,
+            "chunk_max_words": cfg.max_chunk_words,
             "right_context_pids": cfg.right_context_pids,
         },
         "counts": {

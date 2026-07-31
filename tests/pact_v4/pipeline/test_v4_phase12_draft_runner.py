@@ -52,13 +52,21 @@ from pact_v4.runtime.snapshot_factory import ChapterMemory
 
 
 # ---------------------------------------------------------------------------
-# Source HTML fixture: a small chapter that yields exactly two chunks
-# (8 + 8 PIDs at min_size=8, max_size=20).
+# Source HTML fixture.
+#
+# ChunkPlanner sizes chunks in words, with a fixed contractual floor of
+# MIN_WORDS=280 (ChunkPlan.MIN_WORDS) that no planner configuration can go
+# below. 35 words/paragraph puts 8 paragraphs at exactly 280 words -- the
+# same "8 PIDs" boundary the old PID-based fixture used, just expressed in
+# the unit the planner actually sizes on now.
 # ---------------------------------------------------------------------------
 
+WORDS_PER_PARAGRAPH = 35
 
-def _write_chapter_html(path: Path, n_paragraphs: int) -> None:
-    body = "\n".join(f"<p>Plain sentence number {i+1}.</p>" for i in range(n_paragraphs))
+
+def _write_chapter_html(path: Path, n_paragraphs: int, words_per_paragraph: int = WORDS_PER_PARAGRAPH) -> None:
+    paragraph_text = " ".join(f"word{i}" for i in range(words_per_paragraph))
+    body = "\n".join(f"<p>{paragraph_text}</p>" for _ in range(n_paragraphs))
     path.write_text(
         "<html><body>" + body + "</body></html>",
         encoding="utf-8",
@@ -153,8 +161,9 @@ def _make_pipeline(
     tmp_path: Path,
     *,
     n_paragraphs: int = 16,
-    min_chunk_size: int = 8,
-    max_chunk_size: int = 20,
+    min_chunk_words: int | None = None,
+    target_chunk_words: int | None = None,
+    max_chunk_words: int | None = None,
     run_label: str = "unit-test",
 ) -> PipelineConfig:
     chapter_html = tmp_path / "046.html"
@@ -162,14 +171,20 @@ def _make_pipeline(
     out_dir = tmp_path / "out"
     _write_chapter_html(chapter_html, n_paragraphs)
     _write_empty_memory(memory_dir)
+    kwargs: Dict[str, Any] = {}
+    if min_chunk_words is not None:
+        kwargs["min_chunk_words"] = min_chunk_words
+    if target_chunk_words is not None:
+        kwargs["target_chunk_words"] = target_chunk_words
+    if max_chunk_words is not None:
+        kwargs["max_chunk_words"] = max_chunk_words
     return PipelineConfig(
         chapter_id="046",
         chapter_html_path=chapter_html,
         memory_dir=memory_dir,
         out_dir=out_dir,
-        min_chunk_size=min_chunk_size,
-        max_chunk_size=max_chunk_size,
         run_label=run_label,
+        **kwargs,
     )
 
 
@@ -239,13 +254,14 @@ def test_run_chapter_high_risk_chunks_have_a_and_b(tmp_path: Path):
         encoding="utf-8",
     )
     _write_empty_memory(tmp_path / "memory")
+    # Default chunk-word bounds: this short chapter (~96 words) lands in a
+    # single undersized chunk, which is fine here -- the test only cares
+    # that a high-risk chunk produces both A and B candidates.
     cfg = PipelineConfig(
         chapter_id="046",
         chapter_html_path=chapter_html,
         memory_dir=tmp_path / "memory",
         out_dir=tmp_path / "out",
-        min_chunk_size=8,
-        max_chunk_size=20,
     )
     result = run_chapter(
         cfg,
@@ -307,9 +323,11 @@ def test_run_chapter_quarantines_when_gemma_cannot_choose(tmp_path: Path):
                 detail="Cannot choose: both candidates are equally bad.",
             )
 
-    # 24 paragraphs to force a multi-chunk, high-risk layout so Gemma is
-    # actually consulted (with one chunk and a low risk, the cascade
-    # never reaches the selector).
+    # 24 paragraphs, high-risk text, so Gemma is actually consulted (with
+    # low risk, the cascade never reaches the selector). This lands in a
+    # single chunk under the word-based planner (~192 words, well under
+    # MIN_WORDS=280) rather than the old PID-based fixture's multi-chunk
+    # layout, but Gemma consultation only depends on risk, not chunk count.
     chapter_html = tmp_path / "046.html"
     chapter_html.write_text(
         "<html><body>"
@@ -323,8 +341,6 @@ def test_run_chapter_quarantines_when_gemma_cannot_choose(tmp_path: Path):
         chapter_html_path=chapter_html,
         memory_dir=tmp_path / "memory",
         out_dir=tmp_path / "out",
-        min_chunk_size=8,
-        max_chunk_size=20,
     )
     result = run_chapter(
         cfg,
@@ -419,11 +435,12 @@ def test_run_chapter_provisional_params_propagate_to_phase2b(tmp_path: Path):
 
 
 def test_run_chapter_records_left_ru_only_after_selection(tmp_path: Path):
-    # 24 paragraphs split into two chunks of 12 each (max_size=12, so
-    # the planner needs to break). Chunk 1's selection must surface as
-    # chunk 2's left_context.
+    # 24 paragraphs of 35 words each (840 words) split into two chunks of
+    # 12 paragraphs / 420 words (max_chunk_words=12*35, so the planner
+    # needs to break there). Chunk 1's selection must surface as chunk 2's
+    # left_context.
     cfg = _make_pipeline(
-        tmp_path, n_paragraphs=24, min_chunk_size=8, max_chunk_size=12,
+        tmp_path, n_paragraphs=24, min_chunk_words=280, target_chunk_words=420, max_chunk_words=420,
     )
     caller = StubModelCaller()
     result = run_chapter(
@@ -497,11 +514,17 @@ def test_run_chapter_left_context_uses_cascade_winner_not_first_role(tmp_path: P
     together push the risk score well above the medium threshold),
     so Phase 2B produces both A and B and the cascade's multi-pass
     branch is exercised."""
+    # Each sentence is exactly 10 words; 28 repeats/half = 280 words/half
+    # (ChunkPlan.MIN_WORDS exactly). min=target=max=280 forces the planner
+    # to cut precisely at the sentence-type boundary: chunk 1 = the 28
+    # "Thanksgiving" paragraphs (280 words, the largest window that still
+    # fits <=280), chunk 2 = the remaining 280 "Blake" words (<=280 left,
+    # taken as a single chunk without a further break search).
     chapter_html = tmp_path / "046.html"
     chapter_html.write_text(
         "<html><body>"
-        + "<p>You must not open box 7 at Thanksgiving, said Alice.</p>" * 12
-        + "<p>She smiled and looked at Blake.</p>" * 12
+        + "<p>You must not open box 7 at Thanksgiving, said Alice.</p>" * 28
+        + "<p>She smiled and looked at Blake near the old window.</p>" * 28
         + "</body></html>",
         encoding="utf-8",
     )
@@ -511,8 +534,9 @@ def test_run_chapter_left_context_uses_cascade_winner_not_first_role(tmp_path: P
         chapter_html_path=chapter_html,
         memory_dir=tmp_path / "memory",
         out_dir=tmp_path / "out",
-        min_chunk_size=8,
-        max_chunk_size=12,
+        min_chunk_words=280,
+        target_chunk_words=280,
+        max_chunk_words=280,
     )
     caller = _StubModelCallerDistinctAB()
     # Gemma picks the candidate whose candidate_id contains
@@ -575,7 +599,7 @@ def test_run_chapter_left_context_is_empty_when_previous_chunk_quarantined(tmp_p
     its draft to the next chunk is the same silent fallback the
     cascade is built to refuse."""
     cfg = _make_pipeline(
-        tmp_path, n_paragraphs=24, min_chunk_size=8, max_chunk_size=12,
+        tmp_path, n_paragraphs=24, min_chunk_words=280, target_chunk_words=420, max_chunk_words=420,
     )
     result = run_chapter(
         cfg,
@@ -599,8 +623,9 @@ def test_run_chapter_left_context_is_empty_when_previous_chunk_quarantined(tmp_p
             chapter_html_path=cfg.chapter_html_path,
             memory_dir=cfg.memory_dir,
             out_dir=tmp_path / "out2",
-            min_chunk_size=cfg.min_chunk_size,
-            max_chunk_size=cfg.max_chunk_size,
+            min_chunk_words=cfg.min_chunk_words,
+            target_chunk_words=cfg.target_chunk_words,
+            max_chunk_words=cfg.max_chunk_words,
         ),
         model_caller=caller,
         qwen_evaluator=StubQwen(passed=False, reason="meaning drift"),
@@ -629,11 +654,15 @@ def test_run_chapter_left_context_is_empty_when_previous_chunk_needs_synthesis(t
     # tokens at all across the two roles, jaccard is 0.0, and the
     # cascade reliably reports needs_synthesis (rather than a noisy
     # fallback path) for the regression assertion.
+    # Each sentence is exactly 10 words; 28 repeats/half = 280 words/half
+    # (ChunkPlan.MIN_WORDS exactly). min=target=max=280 forces the planner
+    # to cut precisely at the sentence-type boundary (see the analogous
+    # comment in test_run_chapter_left_context_uses_cascade_winner_not_first_role).
     chapter_html = tmp_path / "046.html"
     chapter_html.write_text(
         "<html><body>"
-        + "<p>Alice said it was cold at Thanksgiving.</p>" * 12
-        + "<p>She smiled and looked at Blake.</p>" * 12
+        + "<p>Alice said it was very cold outside at Thanksgiving today.</p>" * 28
+        + "<p>She smiled and looked at Blake near the old window.</p>" * 28
         + "</body></html>",
         encoding="utf-8",
     )
@@ -643,8 +672,9 @@ def test_run_chapter_left_context_is_empty_when_previous_chunk_needs_synthesis(t
         chapter_html_path=chapter_html,
         memory_dir=tmp_path / "memory",
         out_dir=tmp_path / "out",
-        min_chunk_size=8,
-        max_chunk_size=12,
+        min_chunk_words=280,
+        target_chunk_words=280,
+        max_chunk_words=280,
     )
     caller = _StubModelCallerDistinctAB()
     # Both A and B pass Qwen; the A and B texts are token-disjoint
@@ -670,8 +700,9 @@ def test_run_chapter_left_context_is_empty_when_previous_chunk_needs_synthesis(t
             chapter_html_path=cfg.chapter_html_path,
             memory_dir=cfg.memory_dir,
             out_dir=tmp_path / "out2",
-            min_chunk_size=cfg.min_chunk_size,
-            max_chunk_size=cfg.max_chunk_size,
+            min_chunk_words=cfg.min_chunk_words,
+            target_chunk_words=cfg.target_chunk_words,
+            max_chunk_words=cfg.max_chunk_words,
         ),
         model_caller=caller,
         qwen_evaluator=StubQwen(),

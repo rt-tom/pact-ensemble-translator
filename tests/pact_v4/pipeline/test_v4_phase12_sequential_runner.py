@@ -31,8 +31,16 @@ from pact_v4.pipeline.v4_phase12_sequential_runner import (
 # ---------------------------------------------------------------------------
 
 
-def _write_chapter_html(path: Path, n_paragraphs: int) -> None:
-    body = "\n".join(f"<p>Plain sentence number {i+1}.</p>" for i in range(n_paragraphs))
+# ChunkPlanner sizes chunks in words with a fixed floor of MIN_WORDS=280
+# (ChunkPlan.MIN_WORDS) that no configuration can go below. 35 words/
+# paragraph puts 8 paragraphs at exactly 280 words -- the same "8 PIDs"
+# boundary the old PID-based fixture used, just expressed in words.
+WORDS_PER_PARAGRAPH = 35
+
+
+def _write_chapter_html(path: Path, n_paragraphs: int, words_per_paragraph: int = WORDS_PER_PARAGRAPH) -> None:
+    paragraph_text = " ".join(f"word{i}" for i in range(words_per_paragraph))
+    body = "\n".join(f"<p>{paragraph_text}</p>" for _ in range(n_paragraphs))
     path.write_text("<html><body>" + body + "</body></html>", encoding="utf-8")
 
 
@@ -101,21 +109,28 @@ def _make_generate_cfg(
     tmp_path: Path,
     *,
     n_paragraphs: int = 16,
-    min_chunk_size: int = 8,
-    max_chunk_size: int = 20,
+    min_chunk_words: int | None = None,
+    target_chunk_words: int | None = None,
+    max_chunk_words: int | None = None,
 ) -> SequentialGenerateConfig:
     chapter_html = tmp_path / "046.html"
     memory_dir = tmp_path / "memory"
     out_dir = tmp_path / "out"
     _write_chapter_html(chapter_html, n_paragraphs)
     _write_empty_memory(memory_dir)
+    kwargs: Dict[str, int] = {}
+    if min_chunk_words is not None:
+        kwargs["min_chunk_words"] = min_chunk_words
+    if target_chunk_words is not None:
+        kwargs["target_chunk_words"] = target_chunk_words
+    if max_chunk_words is not None:
+        kwargs["max_chunk_words"] = max_chunk_words
     return SequentialGenerateConfig(
         chapter_id="046",
         chapter_html_path=chapter_html,
         memory_dir=memory_dir,
         out_dir=out_dir,
-        min_chunk_size=min_chunk_size,
-        max_chunk_size=max_chunk_size,
+        **kwargs,
     )
 
 
@@ -191,7 +206,10 @@ def test_run_generate_left_context_uses_fidelity_first_draft_not_selection(tmp_p
     """Sequential-model deviation: chunk 1's left_context must be built
     from chunk 0's fidelity_first DRAFT (there is no selection yet on
     this pass), never left empty just because no cascade ran."""
-    cfg = _make_generate_cfg(tmp_path, n_paragraphs=24, min_chunk_size=8, max_chunk_size=12)
+    cfg = _make_generate_cfg(
+        tmp_path, n_paragraphs=24,
+        min_chunk_words=280, target_chunk_words=420, max_chunk_words=420,
+    )
     caller = _StubModelCallerDistinctAB()
     result = run_generate(cfg, model_caller=caller)
     assert result.chunk_count == 2
@@ -291,7 +309,6 @@ def test_run_generate_bundle_carries_full_risk_assessment(tmp_path: Path):
     gen_cfg = SequentialGenerateConfig(
         chapter_id="046", chapter_html_path=chapter_html,
         memory_dir=tmp_path / "memory", out_dir=tmp_path / "out",
-        min_chunk_size=8, max_chunk_size=20,
     )
     result = run_generate(gen_cfg, model_caller=StubModelCaller())
     bundle = json.loads(result.generation_bundle_path.read_text(encoding="utf-8"))
@@ -316,7 +333,6 @@ def test_run_select_quarantines_when_required_risk_category_unresolved(tmp_path:
     gen_cfg = SequentialGenerateConfig(
         chapter_id="046", chapter_html_path=chapter_html,
         memory_dir=tmp_path / "memory", out_dir=tmp_path / "out",
-        min_chunk_size=8, max_chunk_size=20,
     )
     gen_result = run_generate(gen_cfg, model_caller=StubModelCaller())
     select_cfg = SequentialSelectConfig(

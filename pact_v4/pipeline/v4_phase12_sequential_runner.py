@@ -53,7 +53,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase0b.source_html import load_source
-from pact_v4.phase1.chunker import ChunkPlanner
+from pact_v4.phase1.chunker import (
+    DEFAULT_MAX_WORDS,
+    DEFAULT_MIN_WORDS,
+    DEFAULT_TARGET_WORDS,
+    ChunkPlanner,
+)
 from pact_v4.phase1.models import (
     Candidate,
     ChunkPlanArtifact,
@@ -109,8 +114,9 @@ class SequentialGenerateConfig:
     chapter_html_path: Path
     memory_dir: Path
     out_dir: Path
-    min_chunk_size: int = 8
-    max_chunk_size: int = 20
+    min_chunk_words: int = DEFAULT_MIN_WORDS
+    target_chunk_words: int = DEFAULT_TARGET_WORDS
+    max_chunk_words: int = DEFAULT_MAX_WORDS
     right_context_pids: int = 0
     temperature: float = 0.2
     seed: int = 7
@@ -124,8 +130,9 @@ class SequentialGenerateConfig:
             values={
                 "chapter_id": self.chapter_id,
                 "model_profile": model_profile,
-                "chunk_min_size": self.min_chunk_size,
-                "chunk_max_size": self.max_chunk_size,
+                "chunk_min_words": self.min_chunk_words,
+                "chunk_target_words": self.target_chunk_words,
+                "chunk_max_words": self.max_chunk_words,
                 "right_context_pids": self.right_context_pids,
                 "generation": {
                     "temperature": self.temperature,
@@ -336,11 +343,15 @@ def run_generate(
     )
     config = cfg.to_config_artifact(model_profile="gemma-4-26B-A4B-it-UD-Q4_K_XL")
 
-    planner = ChunkPlanner(min_size=cfg.min_chunk_size, max_size=cfg.max_chunk_size)
+    planner = ChunkPlanner(
+        target_words=cfg.target_chunk_words,
+        min_words=cfg.min_chunk_words,
+        max_words=cfg.max_chunk_words,
+    )
     plans = planner.plan(
         blocks,
         snapshot_hash=snapshot.snapshot_hash,
-        context_right_count=cfg.right_context_pids,
+        following_blocks=cfg.right_context_pids,
     )
     if not plans:
         raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
@@ -463,8 +474,9 @@ def run_generate(
             "temperature": cfg.temperature,
             "seed": cfg.seed,
             "max_tokens": cfg.max_tokens,
-            "chunk_min_size": cfg.min_chunk_size,
-            "chunk_max_size": cfg.max_chunk_size,
+            "chunk_min_words": cfg.min_chunk_words,
+            "chunk_target_words": cfg.target_chunk_words,
+            "chunk_max_words": cfg.max_chunk_words,
             "right_context_pids": cfg.right_context_pids,
         },
         "sequential_model_caveat": SEQUENTIAL_MODEL_CAVEAT,

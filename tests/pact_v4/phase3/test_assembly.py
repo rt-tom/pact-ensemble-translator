@@ -39,8 +39,16 @@ def _snapshot(source: SourceArtifact) -> Snapshot:
 
 def _two_chunk_plan(snapshot: Snapshot) -> Tuple[ChunkPlanArtifact, ChunkPlan, ChunkPlan]:
     half = len(snapshot.pids) // 2
-    chunk1 = ChunkPlan(chunk_id="chunk0001", snapshot_hash=snapshot.snapshot_hash, pids=snapshot.pids[:half])
-    chunk2 = ChunkPlan(chunk_id="chunk0002", snapshot_hash=snapshot.snapshot_hash, pids=snapshot.pids[half:])
+    # 50 words/PID keeps each half comfortably inside ChunkPlan's fixed
+    # word-based bounds (MIN_WORDS=280/MAX_WORDS=640).
+    chunk1 = ChunkPlan(
+        chunk_id="chunk0001", snapshot_hash=snapshot.snapshot_hash,
+        pids=snapshot.pids[:half], word_counts=tuple(50 for _ in snapshot.pids[:half]),
+    )
+    chunk2 = ChunkPlan(
+        chunk_id="chunk0002", snapshot_hash=snapshot.snapshot_hash,
+        pids=snapshot.pids[half:], word_counts=tuple(50 for _ in snapshot.pids[half:]),
+    )
     artifact = ChunkPlanArtifact.create(snapshot, (chunk1, chunk2))
     return artifact, chunk1, chunk2
 

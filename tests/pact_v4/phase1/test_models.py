@@ -68,11 +68,19 @@ def _snapshot(pids=("p00001", "p00002", "p00003", "p00004", "p00005", "p00006", 
     )
 
 
+# ChunkPlan.MIN_WORDS/MAX_WORDS (280/640) are fixed hard bounds; 35 words/PID
+# keeps every existing PID-count-based fixture in this file compatible with
+# them (e.g. the default 8-PID snapshot lands exactly on MIN_WORDS=280).
+WORDS_PER_PID = 35
+
+
 def _chunk_plan(snapshot: Snapshot, pids=None, **overrides) -> ChunkPlan:
+    resolved_pids = pids if pids is not None else snapshot.pids
     kwargs = dict(
         chunk_id="c0001",
         snapshot_hash=snapshot.snapshot_hash,
-        pids=pids if pids is not None else snapshot.pids,
+        pids=resolved_pids,
+        word_counts=tuple(WORDS_PER_PID for _ in resolved_pids),
         context=ChunkContext(left_ru="", right_en=()),
     )
     kwargs.update(overrides)
@@ -264,6 +272,28 @@ def test_chunk_plan_duplicate_pids_rejected():
     snap = _snapshot()
     with pytest.raises(ValueError, match="duplicate PIDs"):
         _chunk_plan(snap, pids=("p00001", "p00001", "p00002", "p00003", "p00004", "p00005", "p00006", "p00007"))
+
+
+def test_chunk_plan_total_words_cannot_be_set_disconnected_from_pids():
+    # Regression: total_words used to be a caller-supplied int with no
+    # relation to len(pids), so e.g. 100 PIDs with total_words=640 passed
+    # validation despite being nowhere near what 100 real PIDs would sum
+    # to. total_words is now derived from word_counts (one entry per PID).
+    snap = _snapshot(pids=tuple(f"p{i:05d}" for i in range(1, 101)))  # 100 PIDs
+    with pytest.raises(ValueError, match="word_counts has"):
+        ChunkPlan(
+            chunk_id="c0001", snapshot_hash=snap.snapshot_hash,
+            pids=snap.pids, word_counts=(640,),  # one entry, not one per PID
+        )
+
+
+def test_chunk_plan_word_counts_derives_total_words():
+    snap = _snapshot(pids=("p00001", "p00002"))
+    plan = ChunkPlan(
+        chunk_id="c0001", snapshot_hash=snap.snapshot_hash,
+        pids=snap.pids, word_counts=(150, 150),
+    )
+    assert plan.total_words == 300
 
 
 def test_chunk_plan_rejects_foreign_snapshot_hash():
@@ -653,6 +683,7 @@ def test_chunk_plan_matches_its_schema():
         "chunk_id": plan.chunk_id,
         "snapshot_hash": plan.snapshot_hash,
         "pids": list(plan.pids),
+        "total_words": plan.total_words,
         "context": {"left_ru": plan.context.left_ru, "right_en": list(plan.context.right_en)},
         "undersized_exception": plan.undersized_exception,
     }

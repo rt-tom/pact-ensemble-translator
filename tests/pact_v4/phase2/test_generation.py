@@ -58,11 +58,15 @@ def make_snapshot(source: SourceArtifact, context: str = "ctx-v1") -> Snapshot:
 def make_chunk_plan_artifact(
     snapshot: Snapshot, chunk_id: str = "c1"
 ) -> Tuple[ChunkPlanArtifact, ChunkPlan]:
+    # 50 words/PID keeps this fixture (used with pid_count up to 10) inside
+    # ChunkPlan's fixed word-based hard cap (MAX_WORDS=640).
+    word_counts = tuple(50 for _ in snapshot.pids)
     chunk = ChunkPlan(
         chunk_id=chunk_id,
         snapshot_hash=snapshot.snapshot_hash,
         pids=snapshot.pids,
-        undersized_exception=len(snapshot.pids) < ChunkPlan.MIN_PIDS,
+        word_counts=word_counts,
+        undersized_exception=sum(word_counts) < ChunkPlan.MIN_WORDS,
     )
     artifact = ChunkPlanArtifact.create(snapshot, (chunk,))
     return artifact, chunk

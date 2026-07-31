@@ -71,11 +71,16 @@ def make_candidate(
         chapter_memory_hash=_hash("chapter"),
     )
     pids = tuple(pid for pid, _ in translation)
+    # 100 words/PID keeps a handful of PIDs comfortably inside ChunkPlan's
+    # fixed word-based bounds (MIN_WORDS=280/MAX_WORDS=640) without the
+    # tests needing to care about exact word counts.
+    word_counts = tuple(100 for _ in pids)
     chunk = ChunkPlan(
         chunk_id=chunk_id,
         snapshot_hash=snapshot.snapshot_hash,
         pids=pids,
-        undersized_exception=len(pids) < ChunkPlan.MIN_PIDS,
+        word_counts=word_counts,
+        undersized_exception=sum(word_counts) < ChunkPlan.MIN_WORDS,
     )
     chunk_plan = ChunkPlanArtifact.create(snapshot, (chunk,))
     config = ConfigArtifact(version="v1", values={"model": "mock"})

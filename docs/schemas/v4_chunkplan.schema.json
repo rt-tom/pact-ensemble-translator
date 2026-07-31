@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ChunkPlan",
-  "description": "Structure-aware chunk boundary. 20 PIDs is a hard ceiling (never relaxed); 8 PIDs is a soft target that undersized_exception may document missing.",
+  "description": "Structure-aware chunk boundary, sized in words (Phase 0C Gate policy). total_words <= 640 is a hard ceiling (never relaxed); total_words >= 280 is a soft target that undersized_exception may document missing.",
   "type": "object",
   "additionalProperties": false,
   "$defs": {
@@ -38,6 +38,10 @@
       "uniqueItems": true,
       "minItems": 1
     },
+    "total_words": {
+      "type": "integer",
+      "minimum": 0
+    },
     "context": {
       "$ref": "#/$defs/chunk_context"
     },
@@ -48,6 +52,7 @@
   "required": [
     "chunk_id",
     "snapshot_hash",
-    "pids"
+    "pids",
+    "total_words"
   ]
 }
