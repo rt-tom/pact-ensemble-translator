@@ -66,9 +66,10 @@ BEFORE_RU и CANDIDATE_RU с каждым подтверждённым issue и 
 - не добавлены новые детали;
 - субъект, объект, отрицание, модальность, время, числа и референты не сломаны.
 
-Для action=challenge_issue оцени валидность исходных issues. accept_challenge
-допустим только если ВСЕ issues ложны и BEFORE_RU действительно не требует
-изменения. Иначе reject_challenge.
+Для action=challenge_issue используй только verdict=accept_challenge,
+reject_challenge или uncertain. accept_challenge допустим только если ВСЕ
+issues ложны и BEFORE_RU действительно не требует изменения. Иначе
+reject_challenge.
 
 Верни только JSON:
 {{
@@ -121,8 +122,9 @@ SOURCE NOTES:
 - заявленные русскоязычные issues устранены;
 - repair не ухудшил хороший текст.
 
-Для action=challenge_issue оцени, существует ли русскоязычная проблема.
-accept_challenge допустим только если ВСЕ issues ложны.
+Для action=challenge_issue используй только verdict=accept_challenge,
+reject_challenge или uncertain. Оцени, существует ли русскоязычная проблема.
+accept_challenge допустим только если ВСЕ issues ложны. Иначе reject_challenge.
 
 Верни только JSON:
 {{
@@ -164,6 +166,16 @@ def parse(data: dict[str, Any], judge: str, action: str) -> dict[str, Any]:
         raise ValueError(f"Invalid verdict {verdict}")
     if confidence not in {"high", "medium", "low"}:
         raise ValueError(f"Invalid confidence {confidence}")
+    issue_valid = strict_bool(data.get("issue_valid"), "issue_valid")
+    all_issues_fixed = strict_bool(data.get("all_issues_fixed"), "all_issues_fixed")
+    # Some models emit the ordinary accept/reject labels for a challenge even
+    # when their structured finding unambiguously identifies the challenge
+    # result.  Canonicalize only that equivalent pair before the lifecycle gate.
+    if action == "challenge_issue":
+        if verdict == "accept" and not issue_valid:
+            verdict = "accept_challenge"
+        elif verdict == "reject" and issue_valid:
+            verdict = "reject_challenge"
     if action == "challenge_issue" and verdict not in {"accept_challenge", "reject_challenge", "uncertain"}:
         raise ValueError(f"Invalid challenge verdict {verdict}")
     if action != "challenge_issue" and verdict not in {"accept", "reject", "uncertain"}:
@@ -172,8 +184,8 @@ def parse(data: dict[str, Any], judge: str, action: str) -> dict[str, Any]:
     result = {
         "verdict": verdict,
         "confidence": confidence,
-        "issue_valid": strict_bool(data.get("issue_valid"), "issue_valid"),
-        "all_issues_fixed": strict_bool(data.get("all_issues_fixed"), "all_issues_fixed"),
+        "issue_valid": issue_valid,
+        "all_issues_fixed": all_issues_fixed,
         "reason": norm(data.get("reason"))[:1200],
         "feedback": norm(data.get("feedback"))[:1200],
     }

@@ -3,9 +3,11 @@
   "title": "ChunkPlan",
   "description": "Structure-aware chunk boundary, sized in words (Phase 0C Gate policy). total_words <= 640 is a hard ceiling (never relaxed); total_words >= 280 is a soft target that undersized_exception may document missing.",
   "type": "object",
+  "additionalProperties": false,
   "$defs": {
     "chunk_context": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "left_ru": {
           "type": "string"

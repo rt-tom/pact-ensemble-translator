@@ -11,18 +11,26 @@ from pathlib import Path
 
 import pytest
 
-from pact_v4.phase1.schema_check import load_schema, validate as schema_validate
+from pact_v4.phase1.schema_check import (
+    SchemaError,
+    load_schema,
+    validate as schema_validate,
+)
 from pact_v4.phase1.models import (
     Candidate,
     ChunkContext,
     ChunkPlan,
+    ChunkPlanArtifact,
+    ConfigArtifact,
     Finding,
     GateResult,
     Provenance,
     Region,
     Repair,
     Snapshot,
+    SourceArtifact,
     TerminalState,
+    canonical_json_hash,
     validate_candidate_ownership,
     validate_full_pid_ownership,
     validate_json_complete,
@@ -41,6 +49,7 @@ def _provenance(**overrides) -> Provenance:
         chapter_snapshot_hash=_hash("snapshot"),
         chunk_plan_hash=_hash("chunkplan"),
         prompt_bundle_hash=_hash("prompt"),
+        config_identity=_hash("config"),
         code_version="v4.0-phase1a",
         policy_versions={"risk_policy": "v1"},
     )
@@ -87,10 +96,21 @@ def _candidate(chunk: ChunkPlan, **overrides) -> Candidate:
         source_hash=_hash("source"),
         snapshot_hash=chunk.snapshot_hash,
         chunk_plan_hash=_hash("chunkplan"),
-        config_identity="gemma/temp0/seed1",
+        config_identity=_hash("config"),
     )
     kwargs.update(overrides)
     return Candidate(**kwargs)
+
+
+def _identity_context(snapshot: Snapshot):
+    source = SourceArtifact(
+        chapter_id=snapshot.chapter_id,
+        source=tuple((pid, f"en-{pid}") for pid in snapshot.pids),
+    )
+    chunk = _chunk_plan(snapshot)
+    plan = ChunkPlanArtifact.create(snapshot, (chunk,))
+    config = ConfigArtifact(version="generation-v1", values={"model": "gemma", "seed": 1})
+    return source, plan, config
 
 
 # --- Provenance --------------------------------------------------------
@@ -114,6 +134,68 @@ def test_provenance_is_frozen():
     p = _provenance()
     with pytest.raises(dataclasses.FrozenInstanceError):
         p.code_version = "other"
+
+
+def test_provenance_rejects_well_formed_foreign_identity():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    prompt_bundle = {"version": "prompts-v1", "roles": ["fidelity_first"]}
+    provenance = Provenance(
+        source_hash=_hash("foreign-source"),
+        chapter_snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash,
+        prompt_bundle_hash=canonical_json_hash(prompt_bundle),
+        config_identity=config.config_identity,
+        code_version="v4.0-phase1a",
+        policy_versions={"risk_policy": "v1"},
+        model_config=dict(config.values),
+    )
+    with pytest.raises(ValueError, match="Foreign identity: source_hash"):
+        provenance.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan,
+            prompt_bundle=prompt_bundle, config=config,
+        )
+
+
+def test_provenance_distinguishes_config_versions_with_same_values():
+    snap = _snapshot()
+    source, plan, config_v1 = _identity_context(snap)
+    config_v2 = ConfigArtifact(version="generation-v2", values=dict(config_v1.values))
+    prompt_bundle = {"version": "prompts-v1"}
+    provenance = Provenance(
+        source_hash=source.source_hash,
+        chapter_snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash,
+        prompt_bundle_hash=canonical_json_hash(prompt_bundle),
+        config_identity=config_v1.config_identity,
+        code_version="v4.0-phase1a",
+        policy_versions={"risk_policy": "v1"},
+        model_config=dict(config_v1.values),
+    )
+    with pytest.raises(ValueError, match="Foreign identity: config_identity"):
+        provenance.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan,
+            prompt_bundle=prompt_bundle, config=config_v2,
+        )
+
+
+def test_config_identity_is_stable_after_caller_mutation():
+    values = {"model": "gemma", "sampling": {"seed": 1}}
+    config = ConfigArtifact(version="generation-v1", values=values)
+    identity = config.config_identity
+    values["sampling"]["seed"] = 2
+    assert config.config_identity == identity
+    assert config.values["sampling"]["seed"] == 1
+
+
+def test_content_artifacts_are_hashable_by_identity():
+    source_items = [["p00001", "text"]]
+    source = SourceArtifact(chapter_id="ch044", source=source_items)
+    config = ConfigArtifact(version="v1", values={"model": "gemma"})
+    assert hash(source) == hash(source.source_hash)
+    assert hash(config) == hash(config.config_identity)
+    source_items[0][1] = "mutated"
+    assert source.source == (("p00001", "text"),)
 
 
 # --- Snapshot ------------------------------------------------------------
@@ -252,6 +334,47 @@ def test_full_pid_ownership_detects_foreign_plan():
         validate_full_pid_ownership((plan_from_b,), snap_a)
 
 
+def test_chunk_plan_artifact_hash_is_content_derived():
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    same = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    assert artifact.plan_hash == same.plan_hash
+    assert artifact.snapshot_hash == snap.snapshot_hash
+
+
+def test_chunk_plan_artifact_rejects_duplicate_chunk_id():
+    snap = _snapshot(pids=tuple(f"p{i:05d}" for i in range(1, 17)))
+    first = _chunk_plan(snap, pids=snap.pids[:8])
+    duplicate = _chunk_plan(snap, pids=snap.pids[8:])
+    with pytest.raises(ValueError, match="duplicate chunk IDs"):
+        ChunkPlanArtifact.create(snap, (first, duplicate))
+
+
+def test_chunk_plan_artifact_rejects_foreign_snapshot_inside_chunk():
+    snap = _snapshot()
+    foreign = dataclasses.replace(_chunk_plan(snap), snapshot_hash=_hash("foreign"))
+    with pytest.raises(ValueError, match="references foreign snapshot"):
+        ChunkPlanArtifact.create(snap, (foreign,))
+
+
+def test_chunk_plan_artifact_payload_round_trip_recomputes_hash():
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    loaded = ChunkPlanArtifact.from_payload(artifact.to_payload(), snapshot=snap)
+    assert loaded == artifact
+    tampered = artifact.to_payload()
+    tampered["chunks"][0]["context"]["left_ru"] = "foreign context"
+    with pytest.raises(ValueError, match="Foreign identity: plan_hash"):
+        ChunkPlanArtifact.from_payload(tampered, snapshot=snap)
+
+
+def test_chunk_plan_artifact_replace_cannot_bypass_snapshot_validation():
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    with pytest.raises(TypeError, match="InitVar 'snapshot'"):
+        dataclasses.replace(artifact, chunks=artifact.chunks)
+
+
 # --- Candidate ---------------------------------------------------------
 
 def test_candidate_has_no_score_field():
@@ -260,6 +383,100 @@ def test_candidate_has_no_score_field():
     cand = _candidate(chunk)
     assert not hasattr(cand, "score")
     assert "score" not in {f.name for f in dataclasses.fields(cand)}
+
+
+def test_candidate_factory_binds_all_content_identities():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    chunk = plan.chunk("c0001")
+    cand = Candidate.create(
+        candidate_id="cand-a",
+        chunk_id=chunk.chunk_id,
+        role="fidelity_first",
+        translation=tuple((pid, f"ru-{pid}") for pid in chunk.pids),
+        source=source,
+        snapshot=snap,
+        chunk_plan=plan,
+        config=config,
+    )
+    assert cand.source_hash == source.source_hash
+    assert cand.chunk_plan_hash == plan.plan_hash
+    assert cand.config_identity == config.config_identity
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["source_hash", "snapshot_hash", "chunk_plan_hash", "config_identity"],
+)
+def test_candidate_rejects_well_formed_foreign_identity(field_name):
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    chunk = plan.chunk("c0001")
+    cand = Candidate.create(
+        candidate_id="cand-a", chunk_id=chunk.chunk_id, role="fidelity_first",
+        translation=tuple((pid, f"ru-{pid}") for pid in chunk.pids),
+        source=source, snapshot=snap, chunk_plan=plan, config=config,
+    )
+    foreign = dataclasses.replace(cand, **{field_name: _hash(f"foreign-{field_name}")})
+    with pytest.raises(ValueError, match=f"Foreign identity: {field_name}"):
+        foreign.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan, config=config
+        )
+
+
+def test_candidate_rejects_foreign_chunk_with_valid_hashes():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    cand = Candidate(
+        candidate_id="cand-a", chunk_id="foreign", role="fidelity_first",
+        translation=tuple((pid, "ru") for pid in snap.pids),
+        source_hash=source.source_hash, snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash, config_identity=config.config_identity,
+    )
+    with pytest.raises(ValueError, match="is not in chunk plan"):
+        cand.validate_against(
+            source=source, snapshot=snap, chunk_plan=plan, config=config
+        )
+
+
+def test_candidate_rejects_source_with_foreign_pid_set_same_chapter():
+    snap = _snapshot()
+    _, plan, config = _identity_context(snap)
+    foreign_source = SourceArtifact(
+        chapter_id=snap.chapter_id,
+        source=tuple((f"q{i:05d}", "foreign") for i in range(1, 9)),
+    )
+    chunk = plan.chunk("c0001")
+    cand = Candidate(
+        candidate_id="cand-a", chunk_id=chunk.chunk_id, role="fidelity_first",
+        translation=tuple((pid, "ru") for pid in chunk.pids),
+        source_hash=foreign_source.source_hash, snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash, config_identity=config.config_identity,
+    )
+    with pytest.raises(ValueError, match="source PID order"):
+        cand.validate_against(
+            source=foreign_source, snapshot=snap, chunk_plan=plan, config=config
+        )
+
+
+def test_candidate_rejects_reordered_source_pids_same_chapter():
+    snap = _snapshot()
+    source, plan, config = _identity_context(snap)
+    reordered = SourceArtifact(
+        chapter_id=snap.chapter_id,
+        source=tuple(reversed(source.source)),
+    )
+    chunk = plan.chunk("c0001")
+    cand = Candidate(
+        candidate_id="cand-a", chunk_id=chunk.chunk_id, role="fidelity_first",
+        translation=tuple((pid, "ru") for pid in chunk.pids),
+        source_hash=reordered.source_hash, snapshot_hash=snap.snapshot_hash,
+        chunk_plan_hash=plan.plan_hash, config_identity=config.config_identity,
+    )
+    with pytest.raises(ValueError, match="source PID order"):
+        cand.validate_against(
+            source=reordered, snapshot=snap, chunk_plan=plan, config=config
+        )
 
 
 def test_candidate_ordered_pid_map_matches_chunk():
@@ -427,6 +644,24 @@ def _schema(name: str) -> dict:
     return load_schema(SCHEMA_DIR / name)
 
 
+def test_schema_validator_enforces_min_length():
+    assert schema_validate("", {"type": "string", "minLength": 1}) == [
+        "$: length 0 < minLength 1"
+    ]
+
+
+def test_schema_validator_rejects_unsupported_additional_properties_schema():
+    with pytest.raises(SchemaError, match="Only additionalProperties=false"):
+        schema_validate(
+            {"known": "ok", "extra": "value"},
+            {
+                "type": "object",
+                "properties": {"known": {"type": "string"}},
+                "additionalProperties": {"type": "string"},
+            },
+        )
+
+
 def test_snapshot_matches_its_schema():
     snap = _snapshot()
     payload = {
@@ -455,6 +690,15 @@ def test_chunk_plan_matches_its_schema():
     assert schema_validate(payload, _schema("v4_chunkplan.schema.json")) == []
 
 
+def test_authoritative_chunk_plan_artifact_matches_its_schema():
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    payload = artifact.to_payload()
+    assert schema_validate(
+        payload, _schema("v4_chunk_plan_artifact.schema.json")
+    ) == []
+
+
 def test_candidate_matches_its_schema():
     snap = _snapshot()
     chunk = _chunk_plan(snap)
@@ -474,11 +718,36 @@ def test_candidate_matches_its_schema():
 
 
 def test_candidate_schema_rejects_score_field_style_payload():
-    # A payload shaped like the old (rejected) contract must fail: it is
-    # missing the now-required identity/role fields entirely.
-    legacy_style = {"candidate_id": "c1", "translation": "plain string", "score": 0.9}
-    errs = schema_validate(legacy_style, _schema("v4_candidates.schema.json"))
-    assert errs
+    snap = _snapshot()
+    chunk = _chunk_plan(snap)
+    cand = _candidate(chunk)
+    valid_payload = {
+        "candidate_id": cand.candidate_id, "chunk_id": cand.chunk_id,
+        "role": cand.role, "translation": [list(pair) for pair in cand.translation],
+        "source_hash": cand.source_hash, "snapshot_hash": cand.snapshot_hash,
+        "chunk_plan_hash": cand.chunk_plan_hash,
+        "config_identity": cand.config_identity, "decision_trace": [],
+    }
+    assert schema_validate(valid_payload, _schema("v4_candidates.schema.json")) == []
+    valid_payload["score"] = 0.9
+    assert schema_validate(valid_payload, _schema("v4_candidates.schema.json")) == [
+        "$.score: unexpected property"
+    ]
+
+
+def test_candidate_schema_rejects_extra_gate_result_property():
+    snap = _snapshot()
+    cand = _candidate(_chunk_plan(snap))
+    payload = {
+        "candidate_id": cand.candidate_id, "chunk_id": cand.chunk_id,
+        "role": cand.role, "translation": [list(pair) for pair in cand.translation],
+        "source_hash": cand.source_hash, "snapshot_hash": cand.snapshot_hash,
+        "chunk_plan_hash": cand.chunk_plan_hash, "config_identity": cand.config_identity,
+        "decision_trace": [{"gate": "fidelity", "passed": True, "score": 0.9}],
+    }
+    assert "$.decision_trace[0].score: unexpected property" in schema_validate(
+        payload, _schema("v4_candidates.schema.json")
+    )
 
 
 def test_finding_matches_its_schema():
@@ -527,6 +796,7 @@ def test_terminal_state_matches_its_schema():
             "chapter_snapshot_hash": state.provenance.chapter_snapshot_hash,
             "chunk_plan_hash": state.provenance.chunk_plan_hash,
             "prompt_bundle_hash": state.provenance.prompt_bundle_hash,
+            "config_identity": state.provenance.config_identity,
             "code_version": state.provenance.code_version,
             "policy_versions": state.provenance.policy_versions,
             "model_config": state.provenance.model_config,
@@ -544,6 +814,7 @@ def test_terminal_state_schema_rejects_old_vocabulary_only_completed():
         "provenance": {
             "source_hash": _hash("s"), "chapter_snapshot_hash": _hash("c"),
             "chunk_plan_hash": _hash("p"), "prompt_bundle_hash": _hash("b"),
+            "config_identity": _hash("config"),
             "code_version": "v1", "policy_versions": {"x": "1"},
         },
     }

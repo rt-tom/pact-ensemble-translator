@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ChunkPlanArtifact",
+  "description": "Authoritative chapter-level chunk plan with a content-derived identity.",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "chunk_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "left_ru": { "type": "string" },
+        "right_en": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["left_ru", "right_en"]
+    },
+    "chunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "chunk_id": { "type": "string", "minLength": 1 },
+        "snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "pids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "word_counts": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 1
+        },
+        "context": { "$ref": "#/$defs/chunk_context" },
+        "undersized_exception": { "type": "boolean" }
+      },
+      "required": ["chunk_id", "snapshot_hash", "pids", "word_counts", "context", "undersized_exception"]
+    }
+  },
+  "properties": {
+    "artifact": { "const": "pact-v4-chunk-plan/v1" },
+    "snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "chunks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/chunk" },
+      "minItems": 1
+    },
+    "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  },
+  "required": ["artifact", "snapshot_hash", "chunks", "plan_hash"]
+}

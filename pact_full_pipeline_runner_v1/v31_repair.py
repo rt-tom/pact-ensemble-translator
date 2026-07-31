@@ -23,7 +23,7 @@ DEFAULT_STAGE = {
     "context_before": 2, "context_after": 2,
     "alternative_for_multiple_issues": True,
     "alternative_categories": ["idiom", "meaning", "register", "dialogue", "continuity"],
-    "max_changed_ratio_span": 0.35,
+    "max_changed_ratio_span": 0.55,
 }
 
 # A short PID can legitimately need a local wording correction whose character

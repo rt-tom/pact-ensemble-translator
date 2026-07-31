@@ -54,6 +54,33 @@ def valid_aggregate(path: Path, *, allow_legacy_artifact_version: bool = False) 
     return True
 
 
+def translation_cache_complete(work_dir: Path, chapter_stems: list[str]) -> tuple[bool, list[str]]:
+    """Prove that every manifest chunk has a complete recursive draft cache."""
+    incomplete: list[str] = []
+    for stem in chapter_stems:
+        chapter_dir = work_dir / stem
+        try:
+            manifest = json.loads((chapter_dir / "manifest.json").read_text(encoding="utf-8-sig"))
+            chunks = manifest.get("chunks") if isinstance(manifest, dict) else None
+            if not isinstance(chunks, list) or not chunks:
+                raise ValueError("manifest has no chunks")
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    raise ValueError("invalid chunk")
+                chunk_id = chunk.get("chunk_id")
+                pids = chunk.get("pids")
+                if not isinstance(chunk_id, str) or not chunk_id or not isinstance(pids, list) or not pids:
+                    raise ValueError("invalid chunk identity")
+                draft_path = chapter_dir / "drafts" / f"{chunk_id}.json"
+                draft = json.loads(draft_path.read_text(encoding="utf-8-sig"))
+                translations = draft.get("translations") if isinstance(draft, dict) else None
+                if not isinstance(translations, dict) or not all(pid in translations for pid in pids):
+                    incomplete.append(str(draft_path))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+            incomplete.append(str(chapter_dir))
+    return not incomplete, incomplete
+
+
 def write_json_atomic(path: Path, value: object) -> None:
     """Publish a complete provenance document or leave the prior document intact."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,10 +154,10 @@ def main() -> int:
     if not args.chapter_stem:
         return emit("FAILED", reason="empty_chapter_selection")
     if args.translation:
-        # Translation has no v3.1 aggregate with a completion identity.  Never
-        # infer completion from an output file; a future translation aggregate
-        # may tighten this to REUSED after proving every chunk.
-        return emit("MODEL_REQUIRED", reason="translation_completion_not_proven")
+        complete, incomplete = translation_cache_complete(args.work_dir, args.chapter_stem)
+        if complete:
+            return emit("REUSED", reason="all_manifest_chunk_drafts_complete")
+        return emit("MODEL_REQUIRED", reason="translation_cache_incomplete", incomplete=incomplete)
     if args.force:
         return emit("MODEL_REQUIRED", reason="forced")
     if not args.aggregate_relative_path:

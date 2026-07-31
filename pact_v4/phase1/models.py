@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
-from typing import Any, Dict, Tuple
+from dataclasses import InitVar, dataclass, field
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Tuple
 
 HEX_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 
@@ -77,6 +78,123 @@ def canonical_json_hash(value: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _freeze_json(value: Any) -> Any:
+    """Detach identity inputs from caller mutation and make them read-only."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _plain_json(value: Any) -> Any:
+    """Return ordinary JSON containers from the immutable in-memory view."""
+    if isinstance(value, Mapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def _validate_identity_context(
+    source: "SourceArtifact",
+    snapshot: "Snapshot",
+    chunk_plan: "ChunkPlanArtifact",
+) -> None:
+    """Bind source and plan content to the same authoritative snapshot."""
+    if source.chapter_id != snapshot.chapter_id:
+        raise ValueError(
+            f"Foreign identity: source chapter {source.chapter_id!r}, "
+            f"expected {snapshot.chapter_id!r}"
+        )
+    source_pids = tuple(pid for pid, _ in source.source)
+    if source_pids != snapshot.pids:
+        raise ValueError(
+            f"Foreign identity: source PID order {source_pids}, "
+            f"expected {snapshot.pids}"
+        )
+    chunk_plan.validate_against(snapshot)
+
+
+def _validate_expected_identities(owner: Any, expected: Mapping[str, str]) -> None:
+    """Reject well-formed identities belonging to different content."""
+    for field_name, expected_hash in expected.items():
+        actual = getattr(owner, field_name)
+        if actual != expected_hash:
+            raise ValueError(
+                f"Foreign identity: {field_name}={actual}, expected {expected_hash}"
+            )
+
+
+def _require_exact_keys(
+    payload: Mapping[str, Any], expected: set[str], owner: str
+) -> None:
+    unexpected = set(payload) - expected
+    missing = expected - set(payload)
+    if unexpected or missing:
+        raise ValueError(
+            f"{owner} keys invalid; missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
+
+
+@dataclass(frozen=True)
+class SourceArtifact:
+    """Canonical ordered source PID-map with a content-derived identity."""
+
+    chapter_id: str
+    source: Tuple[Tuple[str, str], ...]
+    source_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.chapter_id, "chapter_id")
+        normalized = []
+        for item in self.source:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("SourceArtifact: source entries must be PID/text pairs")
+            normalized.append((item[0], item[1]))
+        source = tuple(normalized)
+        object.__setattr__(self, "source", source)
+        pids = tuple(pid for pid, _ in source)
+        _require_unique_pids(pids, "SourceArtifact")
+        for pid, text in source:
+            _require_nonempty_str(pid, "source PID")
+            if not isinstance(text, str):
+                raise ValueError(f"SourceArtifact: PID {pid} text must be a string")
+        object.__setattr__(self, "source_hash", canonical_json_hash({
+            "artifact": "pact-v4-source/v1",
+            "chapter_id": self.chapter_id,
+            "source": [list(item) for item in self.source],
+        }))
+
+    def __hash__(self) -> int:
+        return hash(self.source_hash)
+
+
+@dataclass(frozen=True)
+class ConfigArtifact:
+    """Versioned model/runtime configuration with a content-derived identity."""
+
+    version: str
+    values: Mapping[str, Any]
+    config_identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.version, "config version")
+        plain_values = dict(self.values)
+        object.__setattr__(self, "config_identity", canonical_json_hash({
+            "artifact": "pact-v4-config/v1",
+            "version": self.version,
+            "values": plain_values,
+        }))
+        object.__setattr__(self, "values", _freeze_json(plain_values))
+
+    def __hash__(self) -> int:
+        return hash(self.config_identity)
+
+
 def validate_json_complete(json_str: str) -> dict:
     """Parse JSON and reject anything partial/truncated/invalid.
 
@@ -107,6 +225,7 @@ class Provenance:
     chapter_snapshot_hash: str
     chunk_plan_hash: str
     prompt_bundle_hash: str
+    config_identity: str
     code_version: str
     policy_versions: Dict[str, str] = field(default_factory=dict)
     model_config: Dict[str, Any] = field(default_factory=dict)
@@ -116,9 +235,33 @@ class Provenance:
         _require_hash(self.chapter_snapshot_hash, "chapter_snapshot_hash")
         _require_hash(self.chunk_plan_hash, "chunk_plan_hash")
         _require_hash(self.prompt_bundle_hash, "prompt_bundle_hash")
+        _require_hash(self.config_identity, "config_identity")
         _require_nonempty_str(self.code_version, "code_version")
         if not self.policy_versions:
             raise ValueError("policy_versions must record at least one versioned policy")
+
+    def validate_against(
+        self,
+        *,
+        source: SourceArtifact,
+        snapshot: "Snapshot",
+        chunk_plan: "ChunkPlanArtifact",
+        prompt_bundle: Any,
+        config: ConfigArtifact,
+    ) -> None:
+        """Reject well-formed hashes that belong to foreign artifacts."""
+        _validate_identity_context(source, snapshot, chunk_plan)
+        _validate_expected_identities(self, {
+            "source_hash": source.source_hash,
+            "chapter_snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "prompt_bundle_hash": canonical_json_hash(prompt_bundle),
+            "config_identity": config.config_identity,
+        })
+        if canonical_json_hash(self.model_config) != canonical_json_hash(
+            _plain_json(config.values)
+        ):
+            raise ValueError("Foreign identity: model_config does not match config artifact")
 
 
 @dataclass(frozen=True)
@@ -260,6 +403,133 @@ def validate_full_pid_ownership(plans: Tuple[ChunkPlan, ...], snapshot: Snapshot
 
 
 @dataclass(frozen=True)
+class ChunkPlanArtifact:
+    """Authoritative chapter-level plan with a content-derived identity.
+
+    ``create`` and ``from_payload`` are the supported construction paths.
+    Both require the authoritative Snapshot, so ownership cannot be bypassed
+    by calling the dataclass constructor or ``dataclasses.replace``.
+    """
+
+    chunks: Tuple[ChunkPlan, ...]
+    snapshot: InitVar[Snapshot]
+    snapshot_hash: str = field(init=False)
+    plan_hash: str = field(init=False)
+
+    @classmethod
+    def create(cls, snapshot: Snapshot, chunks: Tuple[ChunkPlan, ...]) -> "ChunkPlanArtifact":
+        return cls(chunks=tuple(chunks), snapshot=snapshot)
+
+    def __post_init__(self, snapshot: Snapshot) -> None:
+        if not isinstance(snapshot, Snapshot):
+            raise TypeError("ChunkPlanArtifact requires an authoritative Snapshot")
+        if not self.chunks:
+            raise ValueError("ChunkPlanArtifact: at least one chunk is required")
+        chunk_ids = tuple(chunk.chunk_id for chunk in self.chunks)
+        if len(chunk_ids) != len(set(chunk_ids)):
+            raise ValueError("ChunkPlanArtifact: duplicate chunk IDs are not allowed")
+        for chunk in self.chunks:
+            if chunk.snapshot_hash != snapshot.snapshot_hash:
+                raise ValueError(
+                    f"ChunkPlan {chunk.chunk_id} references foreign snapshot "
+                    f"{chunk.snapshot_hash}, expected {snapshot.snapshot_hash}"
+                )
+        validate_full_pid_ownership(self.chunks, snapshot)
+        object.__setattr__(self, "snapshot_hash", snapshot.snapshot_hash)
+        object.__setattr__(self, "plan_hash", canonical_json_hash(self._identity_payload()))
+
+    def _identity_payload(self) -> Dict[str, Any]:
+        return {
+            "artifact": "pact-v4-chunk-plan/v1",
+            "snapshot_hash": self.snapshot_hash,
+            "chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "snapshot_hash": chunk.snapshot_hash,
+                    "pids": list(chunk.pids),
+                    "word_counts": list(chunk.word_counts),
+                    "context": {
+                        "left_ru": chunk.context.left_ru,
+                        "right_en": list(chunk.context.right_en),
+                    },
+                    "undersized_exception": chunk.undersized_exception,
+                }
+                for chunk in self.chunks
+            ],
+        }
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Single canonical persisted representation, including its digest."""
+        payload = self._identity_payload()
+        payload["plan_hash"] = self.plan_hash
+        return payload
+
+    @classmethod
+    def from_payload(
+        cls, payload: Mapping[str, Any], *, snapshot: Snapshot
+    ) -> "ChunkPlanArtifact":
+        """Load, reconstruct, and re-hash a persisted authoritative plan."""
+        _require_exact_keys(
+            payload,
+            {"artifact", "snapshot_hash", "chunks", "plan_hash"},
+            "ChunkPlanArtifact payload",
+        )
+        if payload["artifact"] != "pact-v4-chunk-plan/v1":
+            raise ValueError(f"Foreign identity: artifact={payload['artifact']!r}")
+        if payload["snapshot_hash"] != snapshot.snapshot_hash:
+            raise ValueError(
+                f"Foreign identity: snapshot_hash={payload['snapshot_hash']}, "
+                f"expected {snapshot.snapshot_hash}"
+            )
+        chunks = []
+        for index, item in enumerate(payload["chunks"]):
+            _require_exact_keys(
+                item,
+                {"chunk_id", "snapshot_hash", "pids", "word_counts", "context", "undersized_exception"},
+                f"ChunkPlanArtifact chunk[{index}]",
+            )
+            _require_exact_keys(
+                item["context"],
+                {"left_ru", "right_en"},
+                f"ChunkPlanArtifact chunk[{index}].context",
+            )
+            chunks.append(ChunkPlan(
+                chunk_id=item["chunk_id"],
+                snapshot_hash=item["snapshot_hash"],
+                pids=tuple(item["pids"]),
+                word_counts=tuple(item["word_counts"]),
+                context=ChunkContext(
+                    left_ru=item["context"]["left_ru"],
+                    right_en=tuple(item["context"]["right_en"]),
+                ),
+                undersized_exception=item["undersized_exception"],
+            ))
+        artifact = cls.create(snapshot, tuple(chunks))
+        _require_hash(payload["plan_hash"], "plan_hash")
+        if payload["plan_hash"] != artifact.plan_hash:
+            raise ValueError(
+                f"Foreign identity: plan_hash={payload['plan_hash']}, "
+                f"expected {artifact.plan_hash}"
+            )
+        return artifact
+
+    def chunk(self, chunk_id: str) -> ChunkPlan:
+        for chunk in self.chunks:
+            if chunk.chunk_id == chunk_id:
+                return chunk
+        raise ValueError(f"Foreign identity: chunk {chunk_id!r} is not in chunk plan")
+
+    def validate_against(self, snapshot: Snapshot) -> None:
+        """Bind a loaded plan to the authoritative snapshot and PID ownership."""
+        if self.snapshot_hash != snapshot.snapshot_hash:
+            raise ValueError(
+                f"Foreign identity: snapshot_hash={self.snapshot_hash}, "
+                f"expected {snapshot.snapshot_hash}"
+            )
+        validate_full_pid_ownership(self.chunks, snapshot)
+
+
+@dataclass(frozen=True)
 class GateResult:
     """One cascade-stage decision, kept as part of a candidate/repair trace."""
 
@@ -299,14 +569,66 @@ class Candidate:
         _require_unique_pids(tuple(pids), f"Candidate {self.candidate_id}")
         for pid, text in self.translation:
             if not isinstance(text, str):
-                raise ValueError(f"Candidate {self.candidate_id}: PID {pid} translation must be a string")
+                raise ValueError(
+                    f"Candidate {self.candidate_id}: PID {pid} "
+                    "translation must be a string"
+                )
         for name, value in (
             ("source_hash", self.source_hash),
             ("snapshot_hash", self.snapshot_hash),
             ("chunk_plan_hash", self.chunk_plan_hash),
         ):
             _require_hash(value, name)
-        _require_nonempty_str(self.config_identity, "config_identity")
+        _require_hash(self.config_identity, "config_identity")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        candidate_id: str,
+        chunk_id: str,
+        role: str,
+        translation: Tuple[Tuple[str, str], ...],
+        source: SourceArtifact,
+        snapshot: Snapshot,
+        chunk_plan: ChunkPlanArtifact,
+        config: ConfigArtifact,
+        decision_trace: Tuple[GateResult, ...] = (),
+    ) -> "Candidate":
+        """Create a candidate whose identities cannot be caller-fabricated."""
+        candidate = cls(
+            candidate_id=candidate_id,
+            chunk_id=chunk_id,
+            role=role,
+            translation=translation,
+            source_hash=source.source_hash,
+            snapshot_hash=snapshot.snapshot_hash,
+            chunk_plan_hash=chunk_plan.plan_hash,
+            config_identity=config.config_identity,
+            decision_trace=decision_trace,
+        )
+        candidate.validate_against(
+            source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config
+        )
+        return candidate
+
+    def validate_against(
+        self,
+        *,
+        source: SourceArtifact,
+        snapshot: Snapshot,
+        chunk_plan: ChunkPlanArtifact,
+        config: ConfigArtifact,
+    ) -> None:
+        """Semantic identity validation required at persistence/cache boundaries."""
+        _validate_identity_context(source, snapshot, chunk_plan)
+        _validate_expected_identities(self, {
+            "source_hash": source.source_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+        })
+        validate_candidate_ownership(self, chunk_plan.chunk(self.chunk_id))
 
     def pid_order(self) -> Tuple[str, ...]:
         return tuple(pid for pid, _ in self.translation)

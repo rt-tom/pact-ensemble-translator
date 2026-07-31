@@ -3,6 +3,7 @@
   "title": "Snapshot",
   "description": "Frozen per-chapter book-context snapshot (V4_MVP_SPEC_RU.md §6). snapshot_hash is derived from content, not caller-supplied.",
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "chapter_id": { "type": "string", "minLength": 1 },
     "pids": {
