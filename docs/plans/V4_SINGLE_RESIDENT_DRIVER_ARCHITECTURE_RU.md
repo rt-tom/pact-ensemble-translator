@@ -455,6 +455,95 @@ pipeline и не меняют run artifacts/caches.
    оставляет topology experimental; числа margins и threshold не выдумываются
    post hoc, а pin'ятся в benchmark-config до первого сравнения.
 
+## Результат измерения 1: расхождение draft ↔ winner (chapter_046, 2026-07-31)
+
+Задача 1 из «Что измерить до кода» выполнена методом shadow re-selection,
+описанным выше («Для полного measurement без повторной generation допустим
+отдельный shadow re-selection…»). Источник: `draft_001` (sequential
+generate+select run, tie-break, `SEQUENTIAL_MODEL_CAVEAT` записан) для
+`chapter_046`, 11 chunk'ов. `draft_001/*` не менялся (verified по sha256 до
+и после).
+
+**Обнаруженное ограничение исходного инструмента.** `v4_phase12_sequential_run.py
+--phase select --use-gemma-selector` не разделяет Qwen fidelity gate и Gemma
+preference на два прохода: `select_candidate` зовёт Gemma **внутри** обработки
+одного chunk, сразу после его Qwen-гейта, до перехода к следующему chunk'у.
+Значит на железе с одной резидентной моделью этот флаг неисполним в одном
+запуске. Вместо правки `pact_v4/` (что нарушило бы read-only-периметр этой
+измерительной задачи) собран отдельный two-pass инструмент вне `pact_v4/`:
+`pact_full_pipeline_runner_v1/v4_shadow_reselect_two_pass.py` — `--stage qwen`
+прогоняет Qwen fidelity + deterministic + required-risk-category гейты по
+всем chunk'ам и копит `pending_gemma` кандидатов в промежуточный
+`qwen_pass_state.json`; `--stage gemma` (после ручной смены модели на
+сервере) вызывает Gemma preference только для реально накопленных
+`pending_gemma` chunk'ов и пишет `selection_results.json` /
+`translations.json` / `provenance.json` в той же схеме, что и оригинальный
+`--phase select`. Оркестрация повторяет ветвление `select_candidate`
+построчно, но сами гейты (`deterministic_consistency_gate`,
+`required_category_gate`, `check_semantic_disagreement`) импортированы из
+`pact_v4.phase2.cascade` без изменений. Regression-проверка (replay
+сохранённых Qwen-вердиктов `draft_001` через новый инструмент) побайтно
+воспроизвела исходные `selected_role_counts`. Сравнение вынесено в
+`pact_full_pipeline_runner_v1/v4_shadow_reselect_compare.py` (read-only,
+берёт `fidelity_first` PID-map из `generation_bundle.json` и selected map из
+`selection_results.json`).
+
+**Результат живого прогона** (`shadow_reselect_001`, реальный Qwen,
+`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, `reasoning-budget=0` подтверждён в логе
+сервера):
+
+- `pending_gemma_chunks = 0` — ни разу не набралось 2+ прошедших кандидата;
+  Gemma preference не вызывалась ни разу. Совпадает с исходным tie-break
+  run'ом побайтно: `selected=2` (`chunk0001`, `chunk0008`, оба —
+  `balanced_literary`), `quarantined=9`, `needs_synthesis=0`.
+- `fidelity_first` совпал с cascade winner **0 раз из 11**: в 9 случаях сам
+  `fidelity_first` не прошёл Qwen (вместе со вторым кандидатом), в 2 —
+  прошёл только `balanced_literary`.
+- Первое context-impacting расхождение — `chunk_index=0` (самый первый
+  chunk главы). Инвалидируемый suffix первой спекулятивной волны —
+  **10 из 11** chunk'ов.
+- Итог по всем 11 chunk'ам: `context_impacting_mismatches=11`,
+  `divergence_rate=1.0`.
+
+Полная запись: `D:\pact\gate_bench_runs\v4_phase12_046_seq\shadow_reselect_001\measurement_record.json`
+(таблица по chunk'ам, hash'и identity, ссылки на оба run-каталога).
+
+**Значение для выбора топологии.** На этой главе у варианта 3 (спекулятивные
+волны) буквально нет окна экономии: расхождение с provisional-контекстом
+наступает на первом же chunk'е, поэтому первая волна инвалидирует
+практически всю главу — restart-экономия speculative варианта против
+strict stop-and-switch (раздел «Подсчёт перезапусков») здесь не реализуется.
+Это согласуется с уже записанным анализом варианта 3, но не заменяет его:
+здесь измерена ровно первая волна на одной главе, не fixed-point equality.
+
+**Ограничения этого измерения, важные для интерпретации:**
+
+1. `quarantine_rate=9/11` объясняется почти целиком отказом на этапе Qwen
+   fidelity, а не сравнением ролей. При этом почти каждый Qwen-вызов
+   доходил до `max_tokens=4096`, не останавливаясь естественно (видно по
+   `n_decoded`/`eval time` в логе `llama-server`), несмотря на промпт,
+   требующий `reason` в одно-два предложения. `response_format=json_object`
+   гарантирует только синтаксическую валидность, а не длину; при обрыве
+   генерации на границе `max_tokens` `json.loads` в `_parse_qwen_verdict`
+   падает и трактуется как провал гейта — неотличимо от содержательного
+   отказа в уже сохранённых артефактах, потому что `quarantine_reason`
+   строит текст только из `traces`, куда провалившийся у Qwen кандидат не
+   попадает (raw `detail` для таких случаев не сохраняется). Поэтому
+   текущие 82% карантина — верхняя граница, не чистая оценка content-level
+   fidelity; часть могла быть парсинг-артефактом. До отдельной доработки
+   (сохранять `gate.detail` и для непройденных кандидатов) это неразличимо
+   retroactively.
+2. `n=1` глава, 11 chunk'ов — недостаточно для решения по топологии.
+   `chapter_046` может быть нерепрезентативна (high-risk band у
+   большинства chunk'ов). Повтор на нескольких главах golden-набора не
+   выполнялся.
+
+Следующие шаги при желании закрыть это измерение полнее: (a) починить
+observability Qwen-гейта для непройденных кандидатов, (b) повторить
+shadow re-selection на 2-3 других главах, прежде чем использовать
+`divergence_rate=1.0` как аргумент против варианта 3/4 за пределами этой
+одной главы.
+
 ## Условия перехода к реализации
 
 Следующая карточка может реализовывать только вариант, для которого есть
