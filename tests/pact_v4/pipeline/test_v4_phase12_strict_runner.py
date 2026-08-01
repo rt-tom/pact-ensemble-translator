@@ -205,6 +205,44 @@ def test_two_low_risk_chunks_restart_count_matches_2n_minus_1(tmp_path: Path):
     assert result.record["lifecycle"]["restart_count"] == 3
 
 
+def test_high_risk_chunk_with_agreeing_candidates_calls_gemma_preference(tmp_path: Path):
+    # "You must not open box 7." repeated trips the risk pre-screen into
+    # a high-risk band (same trigger content as
+    # test_v4_phase12_draft_runner.test_run_chapter_high_risk_chunks_have_a_and_b),
+    # producing 2 candidates. StubQwen passes both, and StubModelCaller
+    # (role-blind) gives both candidates identical text, so there is no
+    # semantic disagreement -- select_candidate's decision tree (case
+    # "d": 2+ passed, no disagreement) calls gemma_selector. This is the
+    # restart-accounting case test_two_low_risk_chunks_... does not cover:
+    # a real switch back to Gemma for preference within the same chunk,
+    # not just the next chunk's generation.
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>" + "<p>You must not open box 7.</p>" * 9 + "</body></html>",
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    _write_empty_memory(memory_dir)
+    cfg = StrictRunConfig(
+        chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
+        out_dir=tmp_path / "out", backend=_make_backend(),
+    )
+    router = _make_router()
+    stub_gemma = StubGemma()
+    model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
+    qwen_evaluator = _LifecycleAwareQwen(router, StubQwen(passed=True))
+    gemma_selector = _LifecycleAwareGemmaSelector(router, stub_gemma)
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+    )
+    assert result.chunk_count == 1
+    assert len(stub_gemma.calls) == 1  # Gemma preference was actually invoked
+    # Ggen(start) -> switch to Q(gate) -> switch back to G(preference): 2 restarts.
+    assert len(router.switches) == 3
+    assert result.record["lifecycle"]["restart_count"] == 2
+
+
 def test_selected_translations_written(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=8)
     result, _router = _run(cfg)
