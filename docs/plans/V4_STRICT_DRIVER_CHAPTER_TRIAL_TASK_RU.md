@@ -295,6 +295,42 @@ batch-first, speculative), поскольку все они используют
    operational policy (не на аварийном обрыве процесса/питания) —
    искусственный kill-and-resume тест остаётся только в unit-тестах
    (`FakeLifecycleAdapter`), не проверен здесь на живом процессе.
-4. Причина высокого Qwen fidelity fail rate не диагностирована (промпт?
-   qwen quantization? confidence threshold?) — вне scope этой карточки,
-   но блокирует прогресс к задаче 6 сильнее, чем cost-вопрос.
+4. ~~Причина высокого Qwen fidelity fail rate не диагностирована~~ —
+   диагностирована постфактум, см. ниже.
+
+## Диагностика Qwen fidelity fail rate (2026-08-01)
+
+Ограничение №4 выше закрыто отдельным диагностическим прогоном
+(`pact_full_pipeline_runner_v1/v4_diag_qwen_truncation_repro.py`,
+только Qwen, без Gemma — ~2 минуты, не полная регенерация): повторный
+Qwen-запрос теми же candidate-переводами, что уже quarantined в
+`run_001` (`chunk0009`, `chunk0010`, оба кандидата каждого).
+
+**Корень найден: не fidelity-отказ, а обрезание JSON-ответа по
+`max_tokens`.** `chunk0009/fidelity_first` — сырое тело ответа
+обрывается на середине строки `"reason"`, но уже содержит
+`faithful_to_source: true, completeness: true, introduced_errors: false,
+confidence: "high"` — то есть Qwen склонялся к **passed**, и его
+оборвало до закрытия JSON. Остальные три (`chunk0009/balanced_literary`,
+`chunk0010/fidelity_first`, `chunk0010/balanced_literary`) — вовсе
+**пустое** тело ответа (бюджет токенов, похоже, исчерпан внутри
+`<think>`-блока до появления видимого контента). `_parse_qwen_verdict`
+трактует любой невалидный JSON как `passed=False` — неотличимо от
+содержательного отказа, ровно то ограничение, что уже отмечало
+Измерение 1 ("это неразличимо retroactively"), только теперь с прямым
+подтверждением, а не подозрением.
+
+`pact_v4/runtime/qwen_evaluator.py`'s `DEFAULT_MAX_TOKENS` был
+фиксирован на `4096` независимо от размера chunk'а (комментарий
+утверждал "below any plausible chunk of 20 PIDs" — chunk0010 дал 44
+PID). Исправлено на `16384` (тот же файл, с обновлённым комментарием,
+ссылающимся на этот прогон). Это меняет поведение Qwen-гейта для
+**всех** топологий и production baseline, не только strict-driver'а —
+не тронуто ничего в `pact_v4/phase2/cascade.py` (сама gate-логика), это
+чисто token budget. `tests/pact_v4/` (368 тестов) зелёный после правки.
+
+**Не перепроверено на GPU в рамках этой сессии** — по решению
+пользователя фикс подготовлен, но повторный запуск оставлен ему.
+Команды для самостоятельной проверки — см. финальное сообщение сессии
+2026-08-01 (или просто перезапустить diag-скрипт и/или resume run_001
+после `--max-consecutive-nonselections` сброса).

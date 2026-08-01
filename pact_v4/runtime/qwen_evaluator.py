@@ -33,11 +33,20 @@ from pact_v4.runtime.prompts_runtime import (
 LOG = logging.getLogger(__name__)
 
 
-# Qwen reviews a translation that is at most one chunk long. 4k tokens is
-# well above the worst-case JSON response (a verdict with a short reason
-# and a confidence label), and below any plausible chunk of 20 PIDs of
-# English + Russian context.
-DEFAULT_MAX_TOKENS = 4096
+# Was 4096 ("well above the worst-case JSON response... below any
+# plausible chunk of 20 PIDs"). That assumption was wrong: a live
+# chapter_046 strict-driver trial (docs/plans/V4_STRICT_DRIVER_CHAPTER_TRIAL_TASK_RU.md,
+# "Результат прогона") found Qwen's response truncated mid-JSON on a
+# 32-PID chunk -- the raw body showed a clean pass
+# (faithful/complete/no-errors/confidence=high) cut off mid-"reason"
+# string -- and empty on a 44-PID chunk (budget likely exhausted inside
+# the model's <think> block before any visible content). Both were
+# scored as a failed gate indistinguishable from a real fidelity
+# objection, inflating quarantine rates. 16k gives headroom for larger
+# chunks' thinking + JSON without materially increasing single-call cost
+# (this is a token *ceiling*, not a target -- most calls finish well
+# under it, as seen on the passing chunks in that same trial).
+DEFAULT_MAX_TOKENS = 16384
 
 
 @dataclass(frozen=True)
