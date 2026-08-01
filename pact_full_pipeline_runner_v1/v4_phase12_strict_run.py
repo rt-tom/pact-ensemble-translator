@@ -9,10 +9,16 @@ Measurement 2 -- ``C:\\llama-sycl-new``, same server flags) via
 touch ``pact_translate_v3.py`` or v3 config, and it is meant for one
 explicit chapter trial run, not routine use.
 
-Usage::
+Usage (``--chapter-id``/``--chapter-html``/``--memory-dir`` are required,
+no default chapter -- this has already been re-run against chapter_046
+more than once; a default would just make that easier to repeat by
+accident)::
 
     python -m pact_full_pipeline_runner_v1.v4_phase12_strict_run \\
-        --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_046/run_001"
+        --chapter-id "046_subordination-6-3" \\
+        --chapter-html "D:/pact/pact_chapters/0046_subordination-6-3.html" \\
+        --memory-dir "D:/pact/pact_chapters" \\
+        --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_046/run_002"
 """
 from __future__ import annotations
 
@@ -78,14 +84,20 @@ QWEN_SERVER_ARGS = [
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--chapter-id", default="046_subordination-6-3")
-    p.add_argument("--chapter-html", type=Path,
-                    default=Path(r"D:\pact\pact_chapters\0046_subordination-6-3.html"),
-                    help="Same chapter/path used by the existing v4 dry runs "
-                         "(gate_bench_runs/v4_phase12_046/dry_run_*) for direct comparability.")
-    p.add_argument("--memory-dir", type=Path, default=Path(r"D:\pact\pact_chapters"),
-                    help="No glossary.json/book_memory.json present there -> empty memory, "
-                         "same as the existing dry runs.")
+    # No defaults for chapter_id/chapter_html/memory_dir: this CLI has
+    # been re-run against the same chapter_046 more than once already
+    # (dry runs, the strict-driver trial, the max_tokens-fix re-check) --
+    # a default here is exactly what silently reproduces that instead of
+    # the chapter the caller actually meant to run. Required, always
+    # explicit.
+    p.add_argument("--chapter-id", required=True)
+    p.add_argument("--chapter-html", type=Path, required=True,
+                    help="e.g. D:/pact/pact_chapters/0046_subordination-6-3.html "
+                         "(the chapter_046 trial used chapter-id 046_subordination-6-3).")
+    p.add_argument("--memory-dir", type=Path, required=True,
+                    help="Directory with glossary.json/book_memory.json (or neither, for "
+                         "empty memory -- the chapter_046 trial used D:/pact/pact_chapters, "
+                         "which has neither file).")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8094)
