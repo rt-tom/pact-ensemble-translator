@@ -356,7 +356,12 @@ def test_select_single_candidate_fails_qwen():
         qwen_evaluator=qwen,
     )
     assert result.quarantine
-    assert "Qwen fidelity fail" in result.quarantine_reason
+    # The evaluator's actual detail text must survive into
+    # quarantine_reason, not just a generic "Qwen fidelity fail" label --
+    # otherwise a real failure reason (or a truncation signal, see
+    # qwen_evaluator.py's _parse_qwen_verdict) is unrecoverable from the
+    # record after the fact.
+    assert "Meaning not preserved" in result.quarantine_reason
     assert result.selected_candidate_id is None
 
 
@@ -513,6 +518,11 @@ def test_select_nobody_passes_quarantines_no_least_bad():
     assert result.candidates_passed == 0
     assert "A:" in result.quarantine_reason
     assert "B:" in result.quarantine_reason
+    # Both candidates' actual Qwen detail text must be recoverable, not
+    # collapsed to the generic "Qwen fidelity fail" placeholder -- a
+    # failing qwen_result must still land in `traces` (see cascade.py's
+    # Stage 1 comment).
+    assert result.quarantine_reason.count("Semantic errors in both") == 2
 
 
 # ---------------------------------------------------------------------------

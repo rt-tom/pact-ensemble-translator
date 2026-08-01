@@ -489,10 +489,16 @@ def select_candidate(
     for candidate in candidates:
         translation = dict(candidate.translation)
         qwen_result = qwen_evaluator(source_map, translation)
-        gate_trace = [qwen_result]
-        if qwen_result.passed:
-            traces[candidate.candidate_id] = gate_trace
-        else:
+        # Always keep the trace, pass or fail. Previously a failing
+        # qwen_result was discarded here -- quarantine_reason (below)
+        # then fell back to the generic literal "Qwen fidelity fail",
+        # losing the evaluator's actual detail text (including, e.g., a
+        # max_tokens-truncation signal -- see qwen_evaluator.py's
+        # _parse_qwen_verdict). This is a bookkeeping fix only: it does
+        # not change which candidates pass or fail, only what gets
+        # recorded about a failure.
+        traces[candidate.candidate_id] = [qwen_result]
+        if not qwen_result.passed:
             failed.append(candidate.candidate_id)
 
     # ---- Stage 2: Deterministic consistency (only Qwen-passed candidates) -
