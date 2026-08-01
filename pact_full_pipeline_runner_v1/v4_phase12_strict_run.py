@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""CLI: run the strict single-resident driver on a real chapter.
+
+Backing task: ``docs/plans/V4_STRICT_DRIVER_CHAPTER_TRIAL_TASK_RU.md``.
+Wires ``pact_v4.pipeline.v4_phase12_strict_runner.run_chapter_strict`` to
+a real, self-started ``llama-server`` (SYCL build validated in
+Measurement 2 -- ``C:\\llama-sycl-new``, same server flags) via
+``build_strict_lifecycle``. Not a production entry point: this does not
+touch ``pact_translate_v3.py`` or v3 config, and it is meant for one
+explicit chapter trial run, not routine use.
+
+Usage::
+
+    python -m pact_full_pipeline_runner_v1.v4_phase12_strict_run \\
+        --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_046/run_001"
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+from typing import Optional, Sequence
+
+from pact_v4.pipeline.v4_phase12_strict_runner import (
+    StrictBackendConfig,
+    StrictRunConfig,
+    build_strict_lifecycle,
+    run_chapter_strict,
+)
+
+LOG = logging.getLogger("v4_phase12_strict_run")
+
+LLAMA_ROOT = Path(r"C:\llama-cpp")
+GEMMA_PATH = LLAMA_ROOT / "models" / "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+GEMMA_DRAFT_PATH = LLAMA_ROOT / "models" / "MTP" / "mtp-gemma-4-26B-A4B-it-Q8_0.gguf"
+QWEN_PATH = LLAMA_ROOT / "models" / "Qwen3.6-35B-A3B" / "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+
+# Same validated SYCL profile as Measurement 2
+# (docs/plans/V4_SINGLE_RESIDENT_DRIVER_ARCHITECTURE_RU.md, "Результат
+# измерения 2") and the user's optimized production command line, so
+# lifecycle numbers from this real chapter trial are comparable to that
+# synthetic benchmark's.
+CONTEXT_SIZE = 32768
+GEMMA_SERVER_ARGS = [
+    "--model-draft", str(GEMMA_DRAFT_PATH),
+    "--spec-type", "draft-mtp",
+    "--spec-draft-n-max", "4",
+    "-ngl", "99",
+    "-ncmoe", "18",
+    "--load-mode", "mmap",
+    "--reasoning-budget", "0",
+    "-np", "1",
+    "-c", str(CONTEXT_SIZE),
+    "-fa", "on",
+    "--jinja",
+    "--cache-ram", "0",
+    "--ctx-checkpoints", "0",
+]
+QWEN_SERVER_ARGS = [
+    "-fit", "on",
+    "-fitt", "1280",
+    "-b", "2048",
+    "-ub", "512",
+    "-ctk", "q8_0",
+    "-ctv", "q8_0",
+    "-t", "6",
+    "-tb", "12",
+    "--load-mode", "mmap",
+    "--reasoning-budget", "0",
+    "-np", "1",
+    "-c", str(CONTEXT_SIZE),
+    "-fa", "on",
+    "--jinja",
+    "--cache-ram", "0",
+    "--ctx-checkpoints", "0",
+]
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--chapter-id", default="046_subordination-6-3")
+    p.add_argument("--chapter-html", type=Path,
+                    default=Path(r"D:\pact\pact_chapters\0046_subordination-6-3.html"),
+                    help="Same chapter/path used by the existing v4 dry runs "
+                         "(gate_bench_runs/v4_phase12_046/dry_run_*) for direct comparability.")
+    p.add_argument("--memory-dir", type=Path, default=Path(r"D:\pact\pact_chapters"),
+                    help="No glossary.json/book_memory.json present there -> empty memory, "
+                         "same as the existing dry runs.")
+    p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8094)
+    p.add_argument("--max-consecutive-nonselections", type=int, default=3)
+    p.add_argument("--startup-timeout", type=float, default=240.0)
+    p.add_argument("--unload-timeout", type=float, default=30.0)
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_argparser().parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                         format="%(asctime)s %(levelname)s %(message)s")
+
+    backend = StrictBackendConfig(
+        exe=Path(r"C:\llama-sycl-new\llama-server.exe"), device="SYCL0", host=args.host,
+        model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
+        model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
+        server_args={"gemma": GEMMA_SERVER_ARGS, "qwen": QWEN_SERVER_ARGS},
+        port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
+    )
+    cfg = StrictRunConfig(
+        chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
+        out_dir=args.out_dir, backend=backend,
+        max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
+        run_label="v4-phase12-strict-chapter-trial",
+    )
+    router, model_caller, qwen_evaluator, gemma_selector = build_strict_lifecycle(
+        backend, log_dir=args.out_dir / "server_logs",
+    )
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+    )
+    LOG.info(
+        "Done: chunks=%d/%d selected=%d quarantined=%d needs_synthesis=%d "
+        "incomplete_generation=%d halted_early=%s restarts=%d wall_clock=%.1fs",
+        result.processed_count, result.chunk_count, result.selected_count,
+        result.quarantined_count, result.needs_synthesis_count,
+        result.incomplete_generation_count, result.halted_early,
+        result.record["lifecycle"]["restart_count"], result.record["wall_clock_seconds"],
+    )
+    return 0 if not result.halted_early else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
