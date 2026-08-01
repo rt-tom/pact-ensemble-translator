@@ -140,6 +140,24 @@ class StrictBackendConfig:
     startup_timeout: float = 240.0
     unload_timeout: float = 30.0
 
+    @property
+    def identity_hash(self) -> str:
+        """Hash of everything that changes what the models actually do.
+
+        The resume identity check (snapshot/plan/config) says nothing
+        about *which backend/model/flags* produced the committed text --
+        a resume against a journal written under different server_args
+        or model files would silently mix content from two different
+        configurations. Timeouts/port are excluded deliberately: they
+        don't affect model output, only how this process talks to it.
+        """
+        return canonical_json_hash({
+            "exe": str(self.exe), "device": self.device,
+            "model_paths": {k: str(v) for k, v in sorted(self.model_paths.items())},
+            "model_names": dict(sorted(self.model_names.items())),
+            "server_args": {k: list(v) for k, v in sorted(self.server_args.items())},
+        })
+
 
 @dataclass(frozen=True)
 class StrictRunConfig:
@@ -229,6 +247,7 @@ class JournalEntry:
     snapshot_hash: str
     chunk_plan_hash: str
     config_identity: str
+    backend_identity_hash: str
     candidate_ids: List[str]
     gate_trace: List[Dict[str, Any]]
     outcome: str  # "selected" | "quarantined" | "needs_synthesis" | "incomplete_generation"
@@ -244,6 +263,20 @@ def _left_context_hash(left_context: Tuple[Tuple[str, str], ...]) -> str:
     if not left_context:
         return canonical_json_hash({"left_context": NO_LEFT_CONTEXT_SENTINEL})
     return canonical_json_hash({"left_context": list(left_context)})
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Write-then-rename so a crash mid-write never leaves a truncated file.
+
+    Used for ``translations.json``, which resume reads back to
+    reconstruct ``selected_text_by_chunk``. Without this, a crash between
+    ``open(..., 'w')`` and the write completing could leave a partial/
+    corrupt file that a later resume would silently misread as having
+    fewer committed PIDs than the journal says are selected.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _load_journal(journal_path: Path) -> List[Dict[str, Any]]:
@@ -386,6 +419,7 @@ def run_chapter_strict(
     # Resume: replay journal, verify identities, reconstruct state.
     # ------------------------------------------------------------------
     journal_path = cfg.out_dir / "journal.ndjson"
+    translations_path = cfg.out_dir / "translations.json"
     prior_entries = _load_journal(journal_path)
     selected_text_by_chunk: Dict[str, Dict[str, str]] = {}
     final_text_by_pid: Dict[str, str] = {}
@@ -400,7 +434,8 @@ def run_chapter_strict(
     for entry in prior_entries:
         if entry.get("snapshot_hash") != snapshot.snapshot_hash or \
                 entry.get("chunk_plan_hash") != chunk_plan.plan_hash or \
-                entry.get("config_identity") != config.config_identity:
+                entry.get("config_identity") != config.config_identity or \
+                entry.get("backend_identity_hash") != cfg.backend.identity_hash:
             raise ValueError(
                 "Foreign identity: journal entry for "
                 f"{entry.get('chunk_id')} was written under a different "
@@ -461,6 +496,12 @@ def run_chapter_strict(
     halted_early = False
     halt_reason: Optional[str] = None
     consecutive_nonselections = 0
+    # Itemized per-chunk reasons for the current non-selection streak, so
+    # halt_reason names what actually went wrong (e.g. specific Qwen/
+    # deterministic failures) instead of only a generic chunk count --
+    # reviewers shouldn't have to open selection_results.json separately
+    # to see why an operational-policy halt fired.
+    recent_nonselection_reasons: List[str] = []
 
     try:
         with open(journal_path, "a", encoding="utf-8") as journal_file:
@@ -500,6 +541,10 @@ def run_chapter_strict(
                 if outcome.status != "complete":
                     incomplete_generation_count += 1
                     consecutive_nonselections += 1
+                    recent_nonselection_reasons.append(
+                        f"{plan_chunk.chunk_id}: incomplete_generation "
+                        f"({', '.join(f'{r}={e.detail}' for r, e in outcome.errors.items())})"
+                    )
                     entry = JournalEntry(
                         chunk_index=index, chunk_id=plan_chunk.chunk_id,
                         parent_chunk_id=parent_chunk_id,
@@ -508,6 +553,7 @@ def run_chapter_strict(
                         left_context_hash=_left_context_hash(left_context),
                         snapshot_hash=snapshot.snapshot_hash, chunk_plan_hash=chunk_plan.plan_hash,
                         config_identity=config.config_identity,
+                        backend_identity_hash=cfg.backend.identity_hash,
                         candidate_ids=list(outcome.candidates.keys()),
                         gate_trace=[], outcome="incomplete_generation",
                         selected_candidate_id=None, selected_role=None,
@@ -528,7 +574,8 @@ def run_chapter_strict(
                             f"{consecutive_nonselections} consecutive non-selected chunks "
                             f"(>= max_consecutive_terminal_nonselections="
                             f"{cfg.max_consecutive_terminal_nonselections}); halting per pinned "
-                            "operational policy instead of cascading empty left_context further."
+                            "operational policy instead of cascading empty left_context further. "
+                            "Reasons: " + " | ".join(recent_nonselection_reasons)
                         )
                         break
                     continue
@@ -544,6 +591,9 @@ def run_chapter_strict(
                     LOG.exception("select_candidate raised for %s", plan_chunk.chunk_id)
                     quarantined_count += 1
                     consecutive_nonselections += 1
+                    recent_nonselection_reasons.append(
+                        f"{plan_chunk.chunk_id}: cascade raised {exc!r}"
+                    )
                     entry = JournalEntry(
                         chunk_index=index, chunk_id=plan_chunk.chunk_id,
                         parent_chunk_id=parent_chunk_id,
@@ -552,6 +602,7 @@ def run_chapter_strict(
                         left_context_hash=_left_context_hash(left_context),
                         snapshot_hash=snapshot.snapshot_hash, chunk_plan_hash=chunk_plan.plan_hash,
                         config_identity=config.config_identity,
+                        backend_identity_hash=cfg.backend.identity_hash,
                         candidate_ids=[c.candidate_id for c in candidates],
                         gate_trace=[], outcome="quarantined",
                         selected_candidate_id=None, selected_role=None,
@@ -569,7 +620,8 @@ def run_chapter_strict(
                         halted_early = True
                         halt_reason = (
                             f"{consecutive_nonselections} consecutive non-selected chunks; halting "
-                            "per pinned operational policy."
+                            "per pinned operational policy. Reasons: "
+                            + " | ".join(recent_nonselection_reasons)
                         )
                         break
                     continue
@@ -588,10 +640,13 @@ def run_chapter_strict(
                 if selected_text is not None:
                     selected_text_by_chunk[plan_chunk.chunk_id] = selected_text
                     consecutive_nonselections = 0
+                    recent_nonselection_reasons.clear()
                     entry_outcome = "selected"
                 else:
                     consecutive_nonselections += 1
                     entry_outcome = "needs_synthesis" if result.needs_synthesis else "quarantined"
+                    reason_text = result.synthesis_reason if result.needs_synthesis else result.quarantine_reason
+                    recent_nonselection_reasons.append(f"{plan_chunk.chunk_id}: {entry_outcome} ({reason_text})")
 
                 entry = JournalEntry(
                     chunk_index=index, chunk_id=plan_chunk.chunk_id,
@@ -601,6 +656,7 @@ def run_chapter_strict(
                     left_context_hash=_left_context_hash(left_context),
                     snapshot_hash=snapshot.snapshot_hash, chunk_plan_hash=chunk_plan.plan_hash,
                     config_identity=config.config_identity,
+                    backend_identity_hash=cfg.backend.identity_hash,
                     candidate_ids=[c.candidate_id for c in candidates],
                     gate_trace=gate_trace, outcome=entry_outcome,
                     selected_candidate_id=result.selected_candidate_id,
@@ -609,13 +665,25 @@ def run_chapter_strict(
                 )
                 journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                 journal_file.flush()
+                if entry_outcome == "selected":
+                    # Written immediately, not just at the end of the run:
+                    # if the process crashes before reaching the final
+                    # write below, a later resume reads this file back to
+                    # reconstruct selected_text_by_chunk. Without this,
+                    # a crash after this journal entry is flushed but
+                    # before the run's final translations.json write
+                    # would leave the journal saying "selected" for a
+                    # chunk whose text resume can no longer find --
+                    # producing a wrongly-empty left_context for the next
+                    # chunk on resume instead of the real committed text.
+                    _atomic_write_json(translations_path, final_text_by_pid)
 
                 if consecutive_nonselections >= cfg.max_consecutive_terminal_nonselections:
                     halted_early = True
                     halt_reason = (
                         f"{consecutive_nonselections} consecutive non-selected chunks; halting "
                         "per pinned operational policy instead of cascading empty left_context "
-                        "further."
+                        "further. Reasons: " + " | ".join(recent_nonselection_reasons)
                     )
                     break
     finally:
@@ -636,10 +704,9 @@ def run_chapter_strict(
         "outcomes": generation_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    translations_path = cfg.out_dir / "translations.json"
-    translations_path.write_text(
-        json.dumps(final_text_by_pid, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+    # Final write is redundant with the incremental one after each
+    # selected chunk (below) but kept for a clean end-state file.
+    _atomic_write_json(translations_path, final_text_by_pid)
     selection_path = cfg.out_dir / "selection_results.json"
     selection_path.write_text(json.dumps({
         "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
