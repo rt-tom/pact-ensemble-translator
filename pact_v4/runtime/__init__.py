@@ -87,6 +87,8 @@ from pact_v4.runtime.runtime_config import (
     LocalRoutingBackend,
     OpenCodeBackendConfig,
     StrictBackendConfig,
+    build_role_adapters,
+    build_role_backend,
     load_runtime_config,
 )
 from pact_v4.runtime.runtime_coordinator import (
@@ -155,6 +157,8 @@ __all__ = [
     "LocalRoutingBackend",
     "OpenCodeBackendConfig",
     "StrictBackendConfig",
+    "build_role_adapters",
+    "build_role_backend",
     "load_runtime_config",
     "EVENT_KIND_LOCAL_SWITCH",
     "EVENT_KIND_REMOTE_CALL",

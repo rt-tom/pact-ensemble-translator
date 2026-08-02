@@ -1,0 +1,32 @@
+# V4 C3 example: fully remote profile over an `opencode serve` endpoint
+# (no secrets).
+#
+# Auth is via environment variables only (plan §12): OPENCODE_SERVER_USERNAME
+# / OPENCODE_SERVER_PASSWORD are the basic-auth pair of the serve endpoint.
+# Pact reads the values from the environment at backend construction time and
+# never persists them. Edit the env-var names if your endpoint uses different
+# ones; never put the values themselves in this file.
+#
+# server_mode:
+#   external -- talk to a pre-started `opencode serve` on base_url;
+#   managed  -- Pact starts its own `opencode serve` (pinned version) and
+#               stops it after the run. Equivalent to `--managed-server`.
+#
+# Running this profile sends the chapter text to the remote provider(s)
+# referenced by the model_bindings (plan §12 acknowledgement).
+kind: opencode_server
+server_mode: external
+base_url: http://127.0.0.1:4096
+server_version_policy: compatible_minor
+pinned_server_version: 1.4.7
+auth:
+  type: basic_env
+  username_env: OPENCODE_SERVER_USERNAME
+  password_env: OPENCODE_SERVER_PASSWORD
+structured_output_mode: prompt_only
+model_bindings:
+  generator: opencode-go/deepseek-v4-flash
+  fidelity_reviewer: opencode-go/qwen3.7-plus
+  russian_selector: opencode-go/qwen3.7-plus
+  qwen_audit: opencode-go/qwen3.7-plus
+  gemma_audit: opencode-go/deepseek-v4-flash

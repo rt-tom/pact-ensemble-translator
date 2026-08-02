@@ -1,0 +1,81 @@
+# V4 C3 example: local llama-server profile (no secrets).
+#
+# Mirrors the historical local strict default of
+# pact_full_pipeline_runner_v1/v4_phase12_strict_run.py (SYCL profile
+# validated in Measurement 2). Running the CLI without --runtime-config
+# already uses exactly this profile; this file is the config-form equivalent.
+#
+# Paths below are the validated values already documented in the CLI -- edit
+# them to match your environment. No credentials appear in this file.
+kind: local_llama
+exe: C:/llama-sycl-new/llama-server.exe
+device: SYCL0
+host: 127.0.0.1
+port: 8094
+startup_timeout: 240.0
+unload_timeout: 30.0
+model_paths:
+  gemma: C:/llama-cpp/models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+  qwen: C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+model_names:
+  gemma: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+  qwen: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+server_args:
+  gemma:
+    - --model-draft
+    - C:/llama-cpp/models/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf
+    - --spec-type
+    - draft-mtp
+    - --spec-draft-n-max
+    - "4"
+    - -ngl
+    - "99"
+    - -ncmoe
+    - "18"
+    - --load-mode
+    - mmap
+    - --reasoning-budget
+    - "0"
+    - -np
+    - "1"
+    - -c
+    - "32768"
+    - -fa
+    - on
+    - --jinja
+    - --cache-ram
+    - "0"
+    - --ctx-checkpoints
+    - "0"
+  qwen:
+    - -fit
+    - on
+    - -fitt
+    - "1280"
+    - -b
+    - "2048"
+    - -ub
+    - "512"
+    - -ctk
+    - q8_0
+    - -ctv
+    - q8_0
+    - -t
+    - "6"
+    - -tb
+    - "12"
+    - --load-mode
+    - mmap
+    - --reasoning-budget
+    - "0"
+    - -np
+    - "1"
+    - -c
+    - "32768"
+    - -fa
+    - on
+    - --jinja
+    - --cache-ram
+    - "0"
+    - --ctx-checkpoints
+    - "0"

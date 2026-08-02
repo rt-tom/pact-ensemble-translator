@@ -1,0 +1,110 @@
+# V4 C3 example: composite profile -- generator + fidelity + Qwen audit on a
+# remote OpenCode provider, Russian preference + Gemma audit locally
+# (no secrets).
+#
+# IMPORTANT ordering constraint (PR 4): the `opencode` sub-backend MUST be
+# listed before `local`. The composite descriptor binds each role to the
+# FIRST sub-backend that declares it; listing `local` first would capture
+# every role (its bindings are the local model names) and the generator/
+# fidelity calls would silently route to the local models. `opencode`
+# declares only the roles it serves; `local` fills in russian_selector and
+# gemma_audit.
+#
+# Auth for the opencode sub-backend is via env vars (plan §12); no secret
+# values are stored here.
+kind: composite
+role_backend_map:
+  generator: opencode
+  fidelity_reviewer: opencode
+  qwen_audit: opencode
+  russian_selector: local
+  gemma_audit: local
+backends:
+  opencode:
+    kind: opencode_server
+    server_mode: external
+    base_url: http://127.0.0.1:4096
+    server_version_policy: compatible_minor
+    pinned_server_version: 1.4.7
+    auth:
+      type: basic_env
+      username_env: OPENCODE_SERVER_USERNAME
+      password_env: OPENCODE_SERVER_PASSWORD
+    structured_output_mode: prompt_only
+    model_bindings:
+      generator: opencode-go/deepseek-v4-flash
+      fidelity_reviewer: opencode-go/qwen3.7-plus
+      qwen_audit: opencode-go/qwen3.7-plus
+  local:
+    kind: local_llama
+    exe: C:/llama-sycl-new/llama-server.exe
+    device: SYCL0
+    host: 127.0.0.1
+    port: 8094
+    startup_timeout: 240.0
+    unload_timeout: 30.0
+    model_paths:
+      gemma: C:/llama-cpp/models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+      qwen: C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+    model_names:
+      gemma: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+      qwen: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+    server_args:
+      gemma:
+        - --model-draft
+        - C:/llama-cpp/models/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf
+        - --spec-type
+        - draft-mtp
+        - --spec-draft-n-max
+        - "4"
+        - -ngl
+        - "99"
+        - -ncmoe
+        - "18"
+        - --load-mode
+        - mmap
+        - --reasoning-budget
+        - "0"
+        - -np
+        - "1"
+        - -c
+        - "32768"
+        - -fa
+        - on
+        - --jinja
+        - --cache-ram
+        - "0"
+        - --ctx-checkpoints
+        - "0"
+      qwen:
+        - -fit
+        - on
+        - -fitt
+        - "1280"
+        - -b
+        - "2048"
+        - -ub
+        - "512"
+        - -ctk
+        - q8_0
+        - -ctv
+        - q8_0
+        - -t
+        - "6"
+        - -tb
+        - "12"
+        - --load-mode
+        - mmap
+        - --reasoning-budget
+        - "0"
+        - -np
+        - "1"
+        - -c
+        - "32768"
+        - -fa
+        - on
+        - --jinja
+        - --cache-ram
+        - "0"
+        - --ctx-checkpoints
+        - "0"

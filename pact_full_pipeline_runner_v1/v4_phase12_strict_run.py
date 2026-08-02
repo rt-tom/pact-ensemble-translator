@@ -19,19 +19,37 @@ accident)::
         --chapter-html "D:/pact/pact_chapters/0046_subordination-6-3.html" \\
         --memory-dir "D:/pact/pact_chapters" \\
         --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_046/run_002"
+
+V4 C3 (PR 4 of ``docs/plans/V4_OPENCODE_REMOTE_MODELS_INTEGRATION_PLAN_RU.md``):
+``--runtime-config`` selects a tagged local/remote/composite backend profile
+instead of the historical local default. Without it the CLI is byte-for-byte
+the old local-only strict command (same model-call order, lifecycle and
+record). ``--managed-server`` forces every OpenCode backend in the profile to
+Pact-managed mode (Pact starts its own ``opencode serve`` and stops it after
+the run). Remote profiles print a §12 acknowledgement that chapter text is
+sent to the configured remote provider(s).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+from dataclasses import replace
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictBackendConfig,
     StrictRunConfig,
     build_strict_lifecycle,
     run_chapter_strict,
+)
+from pact_v4.runtime.runtime_config import (
+    CompositeBackendConfig,
+    LocalLlamaBackendConfig,
+    OpenCodeBackendConfig,
+    build_role_adapters,
+    load_runtime_config,
 )
 
 LOG = logging.getLogger("v4_phase12_strict_run")
@@ -104,38 +122,107 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-consecutive-nonselections", type=int, default=3)
     p.add_argument("--startup-timeout", type=float, default=240.0)
     p.add_argument("--unload-timeout", type=float, default=30.0)
+    p.add_argument("--runtime-config", type=Path, default=None, metavar="FILE",
+                    help="YAML/JSON tagged runtime profile (kind local_llama | "
+                         "opencode_server | composite). When absent the historical "
+                         "local llama-server profile is used unchanged.")
+    p.add_argument("--managed-server", action="store_true",
+                    help="Start Pact's own 'opencode serve' for every OpenCode "
+                         "backend in the runtime config (server_mode=managed) and "
+                         "stop it after the run. Ignored without --runtime-config.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_argparser().parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                         format="%(asctime)s %(levelname)s %(message)s")
+# ---------------------------------------------------------------------------
+# Runtime-config loading / profile helpers (V4 C3, plan §8/§12)
+# ---------------------------------------------------------------------------
 
-    backend = StrictBackendConfig(
-        exe=Path(r"C:\llama-sycl-new\llama-server.exe"), device="SYCL0", host=args.host,
-        model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
-        model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
-        server_args={"gemma": GEMMA_SERVER_ARGS, "qwen": QWEN_SERVER_ARGS},
-        port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
-    )
-    cfg = StrictRunConfig(
-        chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
-        out_dir=args.out_dir, backend=backend,
-        max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
-        run_label="v4-phase12-strict-chapter-trial",
-    )
-    router, model_caller, qwen_evaluator, gemma_selector, \
-        qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
-            backend, log_dir=args.out_dir / "server_logs",
+
+def _load_runtime_config_file(path: Path) -> Any:
+    """Parse a ``--runtime-config`` YAML/JSON file into a tagged config.
+
+    JSON is tried first (no extra dependency); YAML is used as a fallback.
+    Secret values are never read here -- only env-var *names* (plan §12).
+    """
+    raw = path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            import yaml  # type: ignore
+        except ImportError as exc:
+            raise ValueError(
+                f"{path}: looks like YAML but PyYAML is not installed "
+                "(pip install pyyaml) or the file is not valid JSON"
+            ) from exc
+        payload = yaml.safe_load(raw)
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"{path}: runtime config must be a mapping, got {type(payload).__name__}"
         )
-    result = run_chapter_strict(
-        cfg, router=router, model_caller=model_caller,
-        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
-        qwen_audit_evaluator=qwen_audit_evaluator,
-        gemma_audit_evaluator=gemma_audit_evaluator,
+    return load_runtime_config(payload)
+
+
+def force_managed(cfg: Any, *, nested: bool = False) -> Any:
+    """Apply ``--managed-server`` to a loaded runtime config.
+
+    Every ``opencode_server`` profile becomes ``server_mode=managed`` (Pact
+    starts its own ``opencode serve`` and stops only that process). A
+    top-level ``local_llama`` profile has nothing to manage and is an error;
+    a local sub-backend inside a composite is left as-is (Pact already owns
+    the llama-server lifecycle).
+    """
+    if isinstance(cfg, OpenCodeBackendConfig):
+        if cfg.server_mode == "managed":
+            return cfg
+        return replace(cfg, server_mode="managed")
+    if isinstance(cfg, CompositeBackendConfig):
+        return replace(cfg, backends={
+            name: force_managed(sub, nested=True)
+            for name, sub in cfg.backends.items()
+        })
+    if isinstance(cfg, LocalLlamaBackendConfig):
+        if nested:
+            return cfg
+        raise ValueError(
+            "--managed-server given but the runtime config is local_llama; "
+            "there is no opencode server to manage"
+        )
+    raise ValueError(
+        f"--managed-server: unsupported config kind {type(cfg).__name__}"
     )
+
+
+def _remote_endpoints(cfg: Any) -> Sequence[str]:
+    """Public endpoints of the remote providers a profile will talk to."""
+    if isinstance(cfg, OpenCodeBackendConfig):
+        return (cfg.server.base_url,)
+    if isinstance(cfg, CompositeBackendConfig):
+        endpoints: list = []
+        for sub in cfg.backends.values():
+            if isinstance(sub, OpenCodeBackendConfig):
+                endpoints.append(sub.server.base_url)
+        return endpoints
+    return ()
+
+
+def _warn_remote_acknowledgement(cfg: Any) -> None:
+    """§12 acknowledgement: chapter text is sent to the configured provider."""
+    endpoints = _remote_endpoints(cfg)
+    if not endpoints:
+        return
+    LOG.warning(
+        "PROFILE SENDS CHAPTER TEXT TO A REMOTE PROVIDER: this run sends the "
+        "chapter source text to the remote provider(s) configured in the "
+        "runtime profile (endpoints: %s). OpenCode sessions are isolated per "
+        "work unit, tools are disabled, and no credentials are persisted. "
+        "Run only if you accept this.",
+        ", ".join(endpoints),
+    )
+
+
+def _log_result(result: Any) -> None:
     step6_status = result.step6.get("status")
     step6_extra = ""
     if step6_status not in (None, "complete", "skipped"):
@@ -154,7 +241,72 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result.record["lifecycle"]["restart_count"], result.record["wall_clock_seconds"],
         step6_status, step6_extra,
     )
+
+
+def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig:
+    return StrictRunConfig(
+        chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
+        out_dir=args.out_dir, backend=backend,
+        max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
+        run_label="v4-phase12-strict-chapter-trial",
+    )
+
+
+def run_local_default(args: argparse.Namespace) -> int:
+    """The historical local-only path -- unchanged from before C3."""
+    backend = StrictBackendConfig(
+        exe=Path(r"C:\llama-sycl-new\llama-server.exe"), device="SYCL0", host=args.host,
+        model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
+        model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
+        server_args={"gemma": GEMMA_SERVER_ARGS, "qwen": QWEN_SERVER_ARGS},
+        port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
+    )
+    cfg = _build_run_config(args, backend)
+    router, model_caller, qwen_evaluator, gemma_selector, \
+        qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
+            backend, log_dir=args.out_dir / "server_logs",
+        )
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=qwen_audit_evaluator,
+        gemma_audit_evaluator=gemma_audit_evaluator,
+    )
+    _log_result(result)
     return 0 if not result.halted_early else 2
+
+
+def run_with_runtime_config(args: argparse.Namespace) -> int:
+    """Generic backend path: load profile -> runtime -> role adapters."""
+    backend = _load_runtime_config_file(args.runtime_config)
+    if args.managed_server:
+        backend = force_managed(backend)
+    _warn_remote_acknowledgement(backend)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
+    model_caller, qwen_evaluator, gemma_selector, \
+        qwen_audit_evaluator, gemma_audit_evaluator = build_role_adapters(
+            backend, runtime,
+        )
+    cfg = _build_run_config(args, backend)
+    result = run_chapter_strict(
+        cfg, runtime=runtime, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=qwen_audit_evaluator,
+        gemma_audit_evaluator=gemma_audit_evaluator,
+    )
+    _log_result(result)
+    return 0 if not result.halted_early else 2
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_argparser().parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                         format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.runtime_config is not None:
+        return run_with_runtime_config(args)
+    return run_local_default(args)
 
 
 if __name__ == "__main__":

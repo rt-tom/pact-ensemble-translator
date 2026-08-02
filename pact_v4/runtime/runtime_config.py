@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from pact_v4.phase1.models import canonical_json_hash
@@ -555,9 +555,78 @@ class CompositeBackendConfig:
                     f"unsupported runtime {type(runtime).__name__}"
                 )
         descriptor = self.build_descriptor()
+        # The routing backend is attached to the coordinator (PR 4) so the
+        # ``Backend*`` role adapters can serve Phase 1-2/Step 6 calls over
+        # the same sub-backends the coordinator owns.
+        composite_backend = CompositeCompletionBackend(sub_backends, descriptor)
         return CompositeRuntimeCoordinator(
-            local_coord, remote_coord, descriptor,
+            local_coord, remote_coord, descriptor, backend=composite_backend,
         )
+
+
+# ---------------------------------------------------------------------------
+# Role-adapter bridge (PR 4 / C3): build the Phase 1-2 + Step 6 callables
+# over a built runtime's CompletionBackend.
+# ---------------------------------------------------------------------------
+
+
+def build_role_backend(
+    cfg: BackendRuntimeConfig, runtime: RuntimeCoordinator
+) -> CompletionBackend:
+    """The ``CompletionBackend`` the ``Backend*`` role adapters use.
+
+    ``run_chapter_strict`` is backend-agnostic, but its five injected
+    callables are the ``Backend*`` transport adapters over a single
+    ``CompletionBackend``. Each tagged config resolves to the backend the
+    runtime actually serves:
+
+    * ``local_llama`` -> ``LocalRoutingBackend`` over the router (ensures
+      the right model is resident before delegating);
+    * ``opencode_server`` -> the coordinator's remote backend (already
+      carrying the managed server's ephemeral credentials when managed);
+    * ``composite`` -> the ``CompositeCompletionBackend`` attached to the
+      coordinator by ``build_runtime`` (routes by model_ref).
+
+    No new process/HTTP client is created here; it only wires the already
+    built runtime.
+    """
+    if isinstance(cfg, LocalLlamaBackendConfig):
+        return LocalRoutingBackend(runtime.router, cfg)
+    if isinstance(cfg, OpenCodeBackendConfig):
+        return runtime.backend
+    if isinstance(cfg, CompositeBackendConfig):
+        return runtime.backend
+    raise TypeError(
+        f"build_role_backend: unsupported config {type(cfg).__name__}"
+    )
+
+
+def build_role_adapters(
+    cfg: BackendRuntimeConfig, runtime: RuntimeCoordinator
+) -> Tuple[Any, Any, Any, Any, Any]:
+    """The five role adapters ``run_chapter_strict`` needs injected.
+
+    Return order matches ``build_strict_lifecycle``: ``(model_caller,
+    qwen_evaluator, gemma_selector, qwen_audit_evaluator,
+    gemma_audit_evaluator)``. Imported lazily so ``runtime_config`` stays
+    importable without ``backend_role_adapters`` (no import cycle).
+    """
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendGemmaAuditEvaluator,
+        BackendGemmaSelector,
+        BackendModelCaller,
+        BackendQwenAuditEvaluator,
+        BackendQwenEvaluator,
+    )
+
+    backend = build_role_backend(cfg, runtime)
+    return (
+        BackendModelCaller(backend),
+        BackendQwenEvaluator(backend),
+        BackendGemmaSelector(backend),
+        BackendQwenAuditEvaluator(backend),
+        BackendGemmaAuditEvaluator(backend),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -679,4 +748,6 @@ __all__ = [
     "CompositeCompletionBackend",
     "CompositeBackendConfig",
     "load_runtime_config",
+    "build_role_backend",
+    "build_role_adapters",
 ]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test: chapter args in the strict-driver CLI have no default.
+"""Regression tests for the strict-driver CLI (V4 C3).
 
 PR #97: --chapter-id/--chapter-html/--memory-dir used to default to
 chapter_046's own paths, which made it easy to silently re-run that
@@ -7,16 +7,63 @@ chapter again instead of whichever one was actually intended. This test
 locks in that they are now required, without needing a real llama-server
 or chapter file -- argparse fails at parse time, before any of that is
 touched.
+
+V4 C3 (PR 4): --runtime-config loading (JSON/YAML -> tagged config),
+--managed-server forcing, the local default staying the unchanged legacy
+path without the flag, and no credential values leaking into
+public_record().
 """
 from __future__ import annotations
 
 import io
+import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stderr
+from pathlib import Path
 
 import v4_phase12_strict_run as m
 
 REQUIRED_FLAGS = ("--chapter-id", "--chapter-html", "--memory-dir")
+
+BASE_ARGS = [
+    "--chapter-id", "046_subordination-6-3",
+    "--chapter-html", "D:/pact/pact_chapters/0046_subordination-6-3.html",
+    "--memory-dir", "D:/pact/pact_chapters",
+    "--out-dir", "D:/pact/gate_bench_runs/test_run",
+]
+
+
+def _local_payload() -> dict:
+    return {
+        "kind": "local_llama",
+        "exe": "C:/llama/llama-server.exe",
+        "device": "SYCL0",
+        "host": "127.0.0.1",
+        "model_paths": {"gemma": "C:/m/gemma.gguf", "qwen": "C:/m/qwen.gguf"},
+        "model_names": {"gemma": "gemma", "qwen": "qwen"},
+        "server_args": {"gemma": ["-c", "32768"], "qwen": []},
+        "port": 8094,
+    }
+
+
+def _remote_payload() -> dict:
+    return {
+        "kind": "opencode_server",
+        "server_mode": "external",
+        "base_url": "http://127.0.0.1:4096",
+        "auth": {
+            "type": "basic_env",
+            "username_env": "SMOKE_C3_USER_ENV",
+            "password_env": "SMOKE_C3_PASS_ENV",
+        },
+        "model_bindings": {
+            "generator": "opencode-go/deepseek-v4-flash",
+            "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+            "russian_selector": "opencode-go/qwen3.7-plus",
+        },
+    }
 
 
 class RequiredChapterArgsTest(unittest.TestCase):
@@ -27,29 +74,123 @@ class RequiredChapterArgsTest(unittest.TestCase):
         self.assertNotEqual(cm.exception.code, 0)
 
     def test_missing_any_one_required_flag_exits_nonzero(self):
-        base = {
-            "--chapter-id": "046_subordination-6-3",
-            "--chapter-html": "D:/pact/pact_chapters/0046_subordination-6-3.html",
-            "--memory-dir": "D:/pact/pact_chapters",
-            "--out-dir": "D:/pact/gate_bench_runs/test_run",
-        }
         for missing in REQUIRED_FLAGS:
-            argv = [v for k, v in base.items() if k != missing for v in (k, v)]
+            argv = []
+            for k in REQUIRED_FLAGS:
+                if k == missing:
+                    continue
+                argv += [k, BASE_ARGS[BASE_ARGS.index(k) + 1]]
             with redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     m.build_argparser().parse_args(argv)
 
     def test_all_required_flags_present_parses_successfully(self):
-        args = m.build_argparser().parse_args([
-            "--chapter-id", "046_subordination-6-3",
-            "--chapter-html", "D:/pact/pact_chapters/0046_subordination-6-3.html",
-            "--memory-dir", "D:/pact/pact_chapters",
-            "--out-dir", "D:/pact/gate_bench_runs/test_run",
-        ])
+        args = m.build_argparser().parse_args(BASE_ARGS)
         self.assertEqual(args.chapter_id, "046_subordination-6-3")
         self.assertEqual(str(args.chapter_html), "D:\\pact\\pact_chapters\\0046_subordination-6-3.html")
         self.assertEqual(str(args.memory_dir), "D:\\pact\\pact_chapters")
 
 
+class RuntimeConfigCliTest(unittest.TestCase):
+    def test_no_runtime_config_flag_means_legacy_local_default(self):
+        args = m.build_argparser().parse_args(BASE_ARGS)
+        self.assertIsNone(args.runtime_config)
+        self.assertFalse(args.managed_server)
+
+    def test_runtime_config_and_managed_server_parse(self):
+        args = m.build_argparser().parse_args(
+            BASE_ARGS + ["--runtime-config", "configs/runtime_remote.example.yaml",
+                         "--managed-server"]
+        )
+        self.assertEqual(str(args.runtime_config), "configs\\runtime_remote.example.yaml")
+        self.assertTrue(args.managed_server)
+
+    def test_load_json_local_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "local.json"
+            path.write_text(json.dumps(_local_payload()), encoding="utf-8")
+            cfg = m._load_runtime_config_file(path)
+        from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig
+        self.assertIsInstance(cfg, LocalLlamaBackendConfig)
+
+    def test_load_yaml_remote_config_records_env_refs_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remote.yaml"
+            path.write_text(
+                "kind: opencode_server\n"
+                "server_mode: external\n"
+                "base_url: http://127.0.0.1:4096\n"
+                "auth:\n"
+                "  type: basic_env\n"
+                "  username_env: SMOKE_C3_USER_ENV\n"
+                "  password_env: SMOKE_C3_PASS_ENV\n"
+                "model_bindings:\n"
+                "  generator: opencode-go/deepseek-v4-flash\n",
+                encoding="utf-8",
+            )
+            cfg = m._load_runtime_config_file(path)
+        from pact_v4.runtime.runtime_config import OpenCodeBackendConfig
+        self.assertIsInstance(cfg, OpenCodeBackendConfig)
+        self.assertEqual(cfg.server.username_env, "SMOKE_C3_USER_ENV")
+        self.assertEqual(cfg.server.password_env, "SMOKE_C3_PASS_ENV")
+        # Secret *values* never enter the loaded config.
+        self.assertIsNone(cfg.server.username)
+        self.assertIsNone(cfg.server.password)
+
+    def test_force_managed_switches_opencode_to_managed(self):
+        from pact_v4.runtime.runtime_config import OpenCodeBackendConfig, load_runtime_config
+        cfg = load_runtime_config(_remote_payload())
+        managed = m.force_managed(cfg)
+        self.assertIsInstance(managed, OpenCodeBackendConfig)
+        self.assertEqual(managed.server_mode, "managed")
+
+    def test_force_managed_rejects_top_level_local(self):
+        from pact_v4.runtime.runtime_config import load_runtime_config
+        cfg = load_runtime_config(_local_payload())
+        with self.assertRaises(ValueError):
+            m.force_managed(cfg)
+
+    def test_force_managed_composite_manages_opencode_leaves_local(self):
+        from pact_v4.runtime.runtime_config import (
+            CompositeBackendConfig,
+            LocalLlamaBackendConfig,
+            OpenCodeBackendConfig,
+            load_runtime_config,
+        )
+        composite = load_runtime_config({
+            "kind": "composite",
+            "backends": {
+                "opencode": _remote_payload(),
+                "local": _local_payload(),
+            },
+            "role_backend_map": {
+                "generator": "opencode",
+                "fidelity_reviewer": "opencode",
+                "russian_selector": "local",
+            },
+        })
+        managed = m.force_managed(composite)
+        self.assertIsInstance(managed, CompositeBackendConfig)
+        self.assertIsInstance(managed.backends["opencode"], OpenCodeBackendConfig)
+        self.assertEqual(managed.backends["opencode"].server_mode, "managed")
+        self.assertIsInstance(managed.backends["local"], LocalLlamaBackendConfig)
+
+    def test_public_record_contains_no_credential_values(self):
+        from pact_v4.runtime.runtime_config import load_runtime_config
+        # Distinctive values: these could never appear as a substring of a
+        # legitimate identity string like "pact-v4-neutral/v1".
+        os.environ["SMOKE_C3_USER_ENV"] = "distinct-user-abc123"
+        os.environ["SMOKE_C3_PASS_ENV"] = "distinct-pass-xyz789"
+        try:
+            cfg = load_runtime_config(_remote_payload())
+            blob = json.dumps(cfg.public_record())
+            self.assertNotIn("distinct-user-abc123", blob)
+            self.assertNotIn("distinct-pass-xyz789", blob)
+        finally:
+            os.environ.pop("SMOKE_C3_USER_ENV", None)
+            os.environ.pop("SMOKE_C3_PASS_ENV", None)
+
+
 if __name__ == "__main__":
     unittest.main()
+
