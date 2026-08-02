@@ -127,9 +127,13 @@ For `REVIEW REQUIRED`, PR body needs: cause, policy, affected lifecycle, changed
 
 Refresh if needed, run relevant tests, and merge. Do not tag, deploy, or run pipeline.
 
-### Documentation-only PR targeting `main`
+### Documentation-only edits
 
-Run lightweight validation and merge. No production tag/deploy unless explicitly needed by production tooling.
+Documentation-only edits (e.g. `AGENTS.md`, `DECISIONS.md` notes) do not get
+their own branch or PR. Commit them directly on the current working branch;
+if a docs change accompanies code, it rides with the code's PR. A dedicated
+PR is reserved for a docs change that is itself the reviewed deliverable
+(e.g. a plan/architecture update the owner explicitly requested).
 
 ### Production-code PR targeting `main`
 
