@@ -294,7 +294,10 @@ class QwenEvaluator(Protocol):
     """Qwen evaluates fidelity of one candidate against the source.
 
     Receives the source (PID → EN text mapping) and the candidate's
-    translation (PID → RU text mapping). Returns a ``GateResult`` with
+    translation (PID → RU text mapping). The source must be scoped to the
+    candidate's chunk (the same PID set as the translation, in the same
+    order) -- ``select_candidate`` supplies it scoped; the reviewer
+    contract expects matching PID sets. Returns a ``GateResult`` with
     the fidelity verdict.
 
     The evaluator is expected to return JSON with keys:
@@ -481,6 +484,22 @@ def select_candidate(
         )
 
     source_map: Dict[str, str] = dict(source.source)
+
+    # Scope the reviewer's source to this chunk's PIDs. select_candidate
+    # is always invoked with the candidates of exactly one chunk, and
+    # generation (pact_v4.phase2.generation._validate_pid_map) guarantees
+    # every candidate's pid_order equals the chunk's owned PIDs -- so the
+    # union of candidate PIDs is the chunk's source scope. Feeding the
+    # Qwen fidelity reviewer the *whole chapter* source against a
+    # chunk-sized translation violates the reviewer contract ("SOURCE and
+    # TRANSLATION, same PIDs in the same order", QWEN_FIDELITY_V1 in
+    # pact_v4.runtime.prompts_runtime) and forces completeness=False on
+    # every chunk (observed as full quarantine in the chapter_046
+    # strict-driver trial run_003). The deterministic gate below only
+    # looks up each candidate's own PIDs, so this scoping is safe there too.
+    chunk_pids = [pid for candidate in candidates for pid in candidate.pid_order()]
+    source_map = {pid: source_map[pid] for pid in chunk_pids if pid in source_map}
+
     traces: Dict[str, list[GateResult]] = {}
     failed: list[str] = []
     passed: list[Candidate] = []

@@ -381,6 +381,86 @@ def test_select_single_candidate_passes_qwen_fails_deterministic():
 
 
 # ---------------------------------------------------------------------------
+# Regression: the Qwen fidelity reviewer must get the chunk-scoped source,
+# not the whole chapter (chapter_046 strict-driver run_003: full 353-PID
+# source against a ~34-PID chunk translation forced completeness=False and
+# quarantined every chunk).
+# ---------------------------------------------------------------------------
+
+
+def _make_two_chunk_plan(source: SourceArtifact):
+    from pact_v4.phase1.models import (
+        ChunkPlan,
+        ChunkPlanArtifact,
+        ConfigArtifact,
+        Snapshot,
+    )
+
+    pids = tuple(pid for pid, _ in source.source)
+    snapshot = Snapshot(
+        chapter_id=source.chapter_id,
+        pids=pids,
+        context="test-context",
+        glossary_hash=_hash("glossary"),
+        book_memory_hash=_hash("book"),
+        chapter_memory_hash=_hash("chapter"),
+    )
+    chunk_plan = ChunkPlanArtifact.create(
+        snapshot,
+        (
+            ChunkPlan(
+                chunk_id="c1", snapshot_hash=snapshot.snapshot_hash,
+                pids=("p0", "p1", "p2"), word_counts=(100, 100, 100),
+            ),
+            ChunkPlan(
+                chunk_id="c2", snapshot_hash=snapshot.snapshot_hash,
+                pids=("p3", "p4", "p5"), word_counts=(100, 100, 100),
+            ),
+        ),
+    )
+    config = ConfigArtifact(version="v1", values={"model": "mock"})
+    return snapshot, chunk_plan, config
+
+
+def test_select_candidate_scopes_qwen_source_to_chunk_pids():
+    source = make_source(
+        texts=(
+            ("p0", "The steward opened the heavy oak door."),
+            ("p1", "3 figures stood waiting in the cold rain."),
+            ("p2", "She counted 20 silver coins on the table."),
+            ("p3", "The flames rose high in the hearth."),
+            ("p4", "He whispered a quiet warning."),
+            ("p5", "They left before dawn broke."),
+        ),
+    )
+    snapshot, chunk_plan, config = _make_two_chunk_plan(source)
+    candidate = Candidate.create(
+        candidate_id="A", chunk_id="c1", role="fidelity_first",
+        translation=(
+            ("p0", "Стюард открыл тяжёлую дубовую дверь."),
+            ("p1", "Три фигуры стояли в ожидании под холодным дождём."),
+            ("p2", "Она пересчитала двадцать серебряных монет на столе."),
+        ),
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
+    qwen = StubQwen(passed=True)
+    result = select_candidate(
+        chunk_id="c1",
+        candidates=[candidate],
+        source=source,
+        qwen_evaluator=qwen,
+    )
+    assert not result.quarantine
+    assert result.selected_candidate_id == "A"
+    assert len(qwen.calls) == 1
+    seen_source, seen_translation = qwen.calls[0]
+    # Only the chunk's PIDs reach the reviewer, in the chunk's order --
+    # never the full 6-PID chapter source.
+    assert list(seen_source) == ["p0", "p1", "p2"]
+    assert list(seen_translation) == ["p0", "p1", "p2"]
+
+
+# ---------------------------------------------------------------------------
 # Tests: select_candidate — multiple candidates
 # ---------------------------------------------------------------------------
 
