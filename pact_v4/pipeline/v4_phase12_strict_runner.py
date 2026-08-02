@@ -118,6 +118,7 @@ RECORD_SCHEMA = "pact-v4-strict-chapter-trial/v1"
 AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
 AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
 HANDOFF_SCHEMA = "pact-v4-step6-b2-handoff/v1"
+SELECTION_META_SCHEMA = "pact-v4-strict-selection-meta/v1"
 
 NO_LEFT_CONTEXT_SENTINEL = "pact-v4-strict/no-left-context"
 
@@ -498,6 +499,22 @@ def _audit_candidate_map(
         (tagged ``pact_v4.phase3.audit.NO_CANDIDATE_MARKER``), and no model
         unit is attempted for it.
 
+    Handoff-row contract (B2 input, pinned at review of PR #108):
+
+      * ``uncovered_pids`` is **structural** coverage only: the chunk's plan
+        PIDs that have no candidate translation in the assembled chapter
+        (always empty for a chunk with an audited candidate). It says nothing
+        about audit *completeness* — that is carried by ``audit_status``
+        (filled in ``_run_step6_audit`` after the audit runs):
+        ``clean`` / ``findings_present`` / ``unit_failed`` for a chunk with an
+        audited candidate, ``no_candidate`` otherwise. A selected chunk whose
+        Qwen or Gemma unit failed therefore reports ``uncovered_pids=[]`` but
+        ``audit_status="unit_failed"`` — B2 must key off ``audit_status``, not
+        infer it from ``uncovered_pids`` + ``committed``.
+      * ``gate_trace`` reads either ``decision_trace`` (selection records,
+        generation records) or ``gate_trace`` (journal) — both spell the same
+        cascade trace; do not "normalise" one side without the other.
+
     Raises ``_IncompleteSelectionError`` (data-integrity, ``incomplete_translation``)
     when a chunk is selected in the journal but its committed translation no
     longer covers the chunk's plan PIDs.
@@ -544,6 +561,8 @@ def _audit_candidate_map(
             "quarantine_reason": record.get("quarantine_reason") if record else None,
             "gate_trace": gate_trace,
             "uncovered_pids": plan_pids,
+            # Filled in _run_step6_audit once the audit outcome is known.
+            "audit_status": None,
         }
 
         if status == "selected":
@@ -603,6 +622,42 @@ def _audit_candidate_map(
     return candidates, handoff_rows
 
 
+def _fill_audit_status(
+    handoff_rows: List[Dict[str, Any]],
+    *,
+    candidates: Mapping[str, Candidate],
+    outcome: Any,
+) -> None:
+    """Tag every handoff row with its per-chunk ``audit_status``.
+
+    Values (see ``_audit_candidate_map`` docstring):
+
+      * ``no_candidate`` — chunk has no auditable candidate; deterministic
+        ``missing`` coverage only (no model unit existed to fail).
+      * ``unit_failed`` — at least one (chunk, detector) model unit failed;
+        the audit for this chunk is incomplete, so it is NOT ``clean`` even
+        if ``uncovered_pids`` is empty.
+      * ``findings_present`` — both model units succeeded and at least one
+        finding (any detector) was recorded for the chunk.
+      * ``clean`` — both model units succeeded with no findings.
+
+    ``audit_status`` is orthogonal to the row's ``status``: a quarantined
+    chunk whose best-variant audited clean stays ``status="quarantined"``
+    with ``audit_status="clean"`` (diagnostic, not acceptance).
+    """
+    failed_by_chunk = {unit[0] for unit in outcome.failed_units}
+    for row in handoff_rows:
+        chunk_id = row["chunk_id"]
+        if row["audited_candidate_id"] is None or chunk_id not in candidates:
+            row["audit_status"] = "no_candidate"
+        elif chunk_id in failed_by_chunk:
+            row["audit_status"] = "unit_failed"
+        elif any(finding.chunk_id == chunk_id for finding in outcome.store):
+            row["audit_status"] = "findings_present"
+        else:
+            row["audit_status"] = "clean"
+
+
 def _audit_cache_path(out_dir: Path) -> Path:
     return out_dir / "audit_cache.json"
 
@@ -617,6 +672,62 @@ def _b2_handoff_path(out_dir: Path) -> Path:
 
 def _generation_outcomes_path(out_dir: Path) -> Path:
     return out_dir / "generation_outcomes.json"
+
+
+def _selection_meta_path(out_dir: Path) -> Path:
+    return out_dir / "selection_meta.json"
+
+
+def _merge_selection_meta(
+    out_dir: Path,
+    current_records: List[Dict[str, Any]],
+    *,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+) -> List[Dict[str, Any]]:
+    """Merge the persisted ``selection_meta.json`` with this session's records.
+
+    ``selection_meta.json`` is the cumulative per-chunk selection sidecar that
+    survives resume (same lifecycle as ``generation_outcomes.json``). The
+    journal (v1) does not persist ``quarantine_reason``/``synthesis_reason``,
+    so without this sidecar a resumed run's Step 6 handoff would silently
+    record ``quarantine_reason=None`` for quarantined chunks of earlier
+    sessions (review PR #108, issue 2). This merge also fixes the
+    ``selection_results.json`` reconstruction gap recorded in ``DECISIONS.md``
+    2026-08-01: prior sessions' rich records are restored.
+
+    Precedence: the persisted record wins for a chunk that was **resumed**
+    (its current-session journal-derived entry is only a stub), while a chunk
+    actually processed in this session overrides its prior record.
+    """
+    path = _selection_meta_path(out_dir)
+    prior: List[Dict[str, Any]] = []
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != SELECTION_META_SCHEMA:
+            raise ValueError(
+                f"Foreign identity: selection_meta schema={payload.get('schema')!r}"
+            )
+        if (
+            payload.get("snapshot_hash") != snapshot.snapshot_hash
+            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or payload.get("config_identity") != config.config_identity
+        ):
+            raise ValueError(
+                "Foreign identity: selection_meta.json was written under a "
+                "different snapshot/plan/config than this run -- refusing to "
+                "mix selection records across runs."
+            )
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise ValueError("selection_meta.json: records must be an array")
+        prior = records
+    merged = {rec.get("chunk_id"): rec for rec in prior if rec.get("chunk_id")}
+    for rec in current_records:
+        if rec.get("chunk_id") and not rec.get("resumed"):
+            merged[rec["chunk_id"]] = rec
+    return [merged[chunk.chunk_id] for chunk in chunk_plan.chunks if chunk.chunk_id in merged]
 
 
 def _merge_generation_outcomes(
@@ -753,6 +864,12 @@ def _run_step6_audit(
     committed text does not cover the chunk's plan PIDs (tampered/partial
     prior translations).
 
+    Each handoff row additionally gets ``audit_status`` (``clean`` /
+    ``findings_present`` / ``unit_failed`` / ``no_candidate``) once the audit
+    outcome is known — so a selected chunk whose Qwen/Gemma unit failed is
+    distinguishable from a clean one without cross-referencing
+    ``audit_findings.json`` (review PR #108, issue 1).
+
     Findings are persisted as a dedicated run artifact via ``FindingStore``
     (append-only evidence, region resolver included); the journal stays v1.
     The ``AuditCache`` is persisted for resume: a resumed run reloads it and
@@ -819,6 +936,8 @@ def _run_step6_audit(
         "region_plan": outcome.region_plan.to_payload(),
     }
     _atomic_write_json(_audit_findings_path(cfg.out_dir), findings_payload)
+
+    _fill_audit_status(handoff_chunks, candidates=candidates, outcome=outcome)
 
     handoff_payload = {
         "schema": HANDOFF_SCHEMA,
@@ -1229,12 +1348,21 @@ def run_chapter_strict(
         cfg.out_dir, generation_records,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config,
     )
+    # The journal (v1) does not persist quarantine_reason, so merge the
+    # cumulative selection_meta.json sidecar to restore it (and the rest of
+    # the per-chunk selection detail) for chunks journaled in earlier
+    # sessions — without it the handoff would silently lose *why* a resumed
+    # chunk was quarantined (review PR #108, issue 2).
+    merged_selection_records = _merge_selection_meta(
+        cfg.out_dir, selection_records,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
     switches_before_step6 = len(all_switches)
     step6: Dict[str, Any]
     try:
         step6 = _run_step6_audit(
             cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-            config=config, det_data=det_data, selection_records=selection_records,
+            config=config, det_data=det_data, selection_records=merged_selection_records,
             selected_text_by_chunk=selected_text_by_chunk,
             generation_records=merged_generation_records,
             qwen_audit_evaluator=qwen_audit_evaluator,
@@ -1279,8 +1407,20 @@ def run_chapter_strict(
     selection_path.write_text(json.dumps({
         "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
         "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
-        "results": selection_records,
+        # Write the merged list so a resumed run's selection_results.json is
+        # as rich as a fresh run's (quarantine_reason, decision_trace, ...).
+        "results": merged_selection_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Cumulative per-chunk selection sidecar (review PR #108, issue 2): the
+    # journal (v1) does not persist quarantine_reason, so without this a later
+    # resume loses *why* a chunk was quarantined. Written after selection and
+    # Step 6, from the same merged list used above.
+    _atomic_write_json(_selection_meta_path(cfg.out_dir), {
+        "schema": SELECTION_META_SCHEMA,
+        "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+        "records": merged_selection_records,
+    })
 
     finished_at = now_fn().isoformat(timespec="seconds")
     record: Dict[str, Any] = {
@@ -1329,6 +1469,7 @@ def run_chapter_strict(
             "audit_cache": str(_audit_cache_path(cfg.out_dir)),
             "audit_findings": str(_audit_findings_path(cfg.out_dir)),
             "b2_handoff": str(_b2_handoff_path(cfg.out_dir)),
+            "selection_meta": str(_selection_meta_path(cfg.out_dir)),
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"

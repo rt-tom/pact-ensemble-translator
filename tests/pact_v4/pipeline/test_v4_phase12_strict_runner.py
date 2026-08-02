@@ -19,7 +19,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from pact_v4.phase1.models import GateResult
+from pact_v4.phase1.models import ChunkPlanArtifact, GateResult
+from pact_v4.phase1.chunker import ChunkPlanner
 from pact_v4.phase2.generation import PromptBundle
 from pact_v4.pipeline import _shared_runner_helpers
 from pact_v4.pipeline import v4_phase12_sequential_runner
@@ -27,9 +28,16 @@ from pact_v4.pipeline import v4_phase12_strict_runner
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictBackendConfig,
     StrictRunConfig,
+    _audit_candidate_map,
     run_chapter_strict,
 )
+from pact_v4.phase0b.source_html import load_source
 from pact_v4.runtime.model_lifecycle import ModelRouter
+from pact_v4.runtime.snapshot_factory import (
+    ChapterMemory,
+    build_snapshot,
+    build_source_artifact,
+)
 
 WORDS_PER_PARAGRAPH = 35
 
@@ -359,8 +367,10 @@ def test_quarantine_halts_after_max_consecutive_nonselections(tmp_path: Path):
     assert by_id["chunk0001"]["status"] == "quarantined"
     assert by_id["chunk0001"]["committed"] is False
     assert by_id["chunk0001"]["audited_candidate_id"] is not None  # best-variant was audited
+    assert by_id["chunk0001"]["audit_status"] == "clean"  # audited clean, still not accepted
     assert by_id["chunk0002"]["status"] == "incomplete_generation"
     assert by_id["chunk0002"]["uncovered_pids"] == by_id["chunk0002"]["plan_pids"]
+    assert by_id["chunk0002"]["audit_status"] == "no_candidate"
 
 
 def test_resume_skips_already_journaled_chunks_and_completes(tmp_path: Path):
@@ -572,11 +582,13 @@ def test_step6_audits_partial_selection_with_best_variant(tmp_path: Path):
     assert by_id["chunk0001"]["status"] == "quarantined"
     assert by_id["chunk0001"]["committed"] is False
     assert by_id["chunk0001"]["audited_candidate_id"] is not None
+    assert by_id["chunk0001"]["audit_status"] == "clean"
     assert by_id["chunk0001"]["best_variant_rule"] == "max_gates_passed>role(fidelity_first>balanced_literary>synthesis)>candidate_id"
     assert by_id["chunk0001"]["quarantine_reason"] is not None
     assert by_id["chunk0002"]["status"] == "audited"
     assert by_id["chunk0002"]["committed"] is True
     assert by_id["chunk0002"]["audited_candidate_id"] is not None
+    assert by_id["chunk0002"]["audit_status"] == "clean"
     assert by_id["chunk0002"]["uncovered_pids"] == []
 
 
@@ -659,6 +671,96 @@ def test_step6_no_candidate_chunk_is_missing_coverage_without_model_units(tmp_pa
     assert gemma_audit.calls == []
 
 
+def test_step6_quarantined_chunk_without_variants_is_missing_coverage(tmp_path: Path):
+    # Review PR #108, issue 4: a quarantined chunk whose variants are not
+    # recoverable (e.g. a prior session whose generation_outcomes.json was
+    # lost) must fall into the same no-candidate branch as incomplete_generation
+    # — no candidate, missing coverage, no fabricated variant.
+    cfg = _make_cfg(tmp_path, n_paragraphs=8)
+    blocks, _raw_sha = load_source(cfg.chapter_html_path)
+    source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
+    memory = ChapterMemory.from_directory(cfg.memory_dir)
+    snapshot = build_snapshot(
+        chapter_id=cfg.chapter_id, source=source, memory=memory,
+        context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
+    )
+    config = cfg.to_config_artifact(model_profile="gemma-fake")
+    planner = ChunkPlanner(
+        target_words=cfg.target_chunk_words, min_words=cfg.min_chunk_words,
+        max_words=cfg.max_chunk_words,
+    )
+    plans = planner.plan(blocks, snapshot_hash=snapshot.snapshot_hash,
+                          following_blocks=cfg.right_context_pids)
+    chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+    chunk0 = chunk_plan.chunks[0]
+
+    candidates, rows = _audit_candidate_map(
+        selection_records=[
+            {"chunk_id": chunk0.chunk_id, "status": "quarantined",
+             "quarantine_reason": "No candidate passed both gates."}
+        ],
+        selected_text_by_chunk={},
+        generation_records=[],  # no recoverable variants
+        chunk_plan=chunk_plan, source=source, snapshot=snapshot, config=config,
+    )
+    assert candidates == {}
+    row = rows[0]
+    assert row["status"] == "quarantined"
+    assert row["committed"] is False
+    assert row["audited_candidate_id"] is None
+    assert row["best_variant_rule"] is None
+    assert row["available_variants"] == []
+    assert row["uncovered_pids"] == list(chunk0.pids)
+
+
+def test_step6_handoff_audit_status_marks_failed_units(tmp_path: Path):
+    # Review PR #108, issue 1: a chunk whose model unit failed must be
+    # distinguishable from a clean audit in the handoff itself. uncovered_pids
+    # stays structural ([] for a committed chunk); audit_status carries the
+    # audit-completeness signal.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+
+    class _FailChunk2Gemma(StubGemmaAudit):
+        def __call__(self, *, chunk_id, translation):
+            if chunk_id == "chunk0002":
+                raise RuntimeError("gemma timeout")
+            return json.dumps({"issues": []})
+
+    result, _router = _run(cfg, gemma_audit=_FailChunk2Gemma())
+    assert result.step6["status"] == "incomplete"
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    by_id = {row["chunk_id"]: row for row in handoff["chunks"]}
+    assert by_id["chunk0001"]["audit_status"] == "clean"
+    assert by_id["chunk0002"]["audit_status"] == "unit_failed"
+    assert by_id["chunk0002"]["committed"] is True
+    assert by_id["chunk0002"]["uncovered_pids"] == []
+    # step6.status is per-audit-run; the per-chunk truth lives in the handoff.
+    assert by_id["chunk0001"]["status"] == "audited"
+    assert by_id["chunk0002"]["status"] == "audited"
+
+
+def test_step6_handoff_audit_status_marks_findings_present(tmp_path: Path):
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+
+    class _FlaggingQwenAudit(StubQwenAudit):
+        def __call__(self, *, chunk_id, source, translation):
+            if chunk_id == "chunk0001":
+                pid = next(iter(translation))
+                return json.dumps({"issues": [
+                    {"pid": pid, "category": "omission", "note": "dropped clause"}
+                ]})
+            return json.dumps({"issues": []})
+
+    result, _router = _run(cfg, qwen_audit=_FlaggingQwenAudit())
+    assert result.step6["status"] == "complete"
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    by_id = {row["chunk_id"]: row for row in handoff["chunks"]}
+    assert by_id["chunk0001"]["audit_status"] == "findings_present"
+    assert by_id["chunk0002"]["audit_status"] == "clean"
+    assert by_id["chunk0001"]["status"] == "audited"
+    assert by_id["chunk0001"]["committed"] is True
+
+
 def test_step6_resume_reloads_generation_outcomes_for_quarantined_chunks(tmp_path: Path):
     # Run 1: chunk0001 quarantined (halted). Run 2 (resume): chunk0001's
     # journal entry is replayed and chunk0002 is selected. Step 6 must load
@@ -685,6 +787,10 @@ def test_step6_resume_reloads_generation_outcomes_for_quarantined_chunks(tmp_pat
     assert by_id["chunk0001"]["status"] == "quarantined"
     assert by_id["chunk0001"]["committed"] is False
     assert by_id["chunk0001"]["audited_candidate_id"] is not None  # reloaded from prior session
+    # The quarantine reason from run 1 survives the resume via the cumulative
+    # selection_meta.json sidecar (the journal v1 does not persist it).
+    assert by_id["chunk0001"]["quarantine_reason"] is not None
+    assert "meaning drift" in by_id["chunk0001"]["quarantine_reason"]
     assert by_id["chunk0002"]["status"] == "audited"
     assert by_id["chunk0002"]["committed"] is True
 
@@ -694,6 +800,14 @@ def test_step6_resume_reloads_generation_outcomes_for_quarantined_chunks(tmp_pat
         (second_result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
     )
     assert {rec["chunk_id"] for rec in gen["outcomes"]} == {"chunk0001", "chunk0002"}
+    # selection_results.json is cumulative and rich too: chunk0001's record
+    # carries its original quarantine_reason even after the resume.
+    sel = json.loads(
+        (second_result.out_dir / "selection_results.json").read_text(encoding="utf-8")
+    )
+    chunk1_sel = next(r for r in sel["results"] if r["chunk_id"] == "chunk0001")
+    assert chunk1_sel["status"] == "quarantined"
+    assert "meaning drift" in chunk1_sel["quarantine_reason"]
 
 
 def test_step6_audit_rejects_foreign_audit_cache_on_resume(tmp_path: Path):
