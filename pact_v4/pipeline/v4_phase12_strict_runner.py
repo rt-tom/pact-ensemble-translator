@@ -634,7 +634,11 @@ def _merge_selection_meta(
 
     Precedence: the persisted record wins for a chunk that was **resumed**
     (its current-session journal-derived entry is only a stub), while a chunk
-    actually processed in this session overrides its prior record.
+    actually processed in this session overrides its prior record. A resumed
+    stub is kept as a **fallback** when no richer persisted record exists at
+    all — e.g. a pre-sidecar run (no ``selection_meta.json``) resumed in full,
+    where dropping the stubs would empty the map and Step 6 would report
+    ``no_selected_chunks`` instead of auditing the committed text.
     """
     path = _selection_meta_path(out_dir)
     prior: List[Dict[str, Any]] = []
@@ -660,7 +664,11 @@ def _merge_selection_meta(
         prior = records
     merged = {rec.get("chunk_id"): rec for rec in prior if rec.get("chunk_id")}
     for rec in current_records:
-        if rec.get("chunk_id") and not rec.get("resumed"):
+        if not rec.get("chunk_id"):
+            continue
+        if rec.get("resumed"):
+            merged.setdefault(rec["chunk_id"], rec)
+        else:
             merged[rec["chunk_id"]] = rec
     return [merged[chunk.chunk_id] for chunk in chunk_plan.chunks if chunk.chunk_id in merged]
 

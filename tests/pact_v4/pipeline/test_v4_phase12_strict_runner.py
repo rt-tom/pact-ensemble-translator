@@ -29,6 +29,7 @@ from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictBackendConfig,
     StrictRunConfig,
     _audit_candidate_map,
+    _merge_selection_meta,
     run_chapter_strict,
 )
 from pact_v4.phase0b.source_html import load_source
@@ -247,6 +248,39 @@ def _make_cfg(tmp_path: Path, *, n_paragraphs: int = 24, max_consecutive: int = 
         chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
         out_dir=tmp_path / "out", backend=_make_backend(),
         max_consecutive_terminal_nonselections=max_consecutive,
+    )
+
+
+def _build_artifacts(cfg: StrictRunConfig):
+    """Build (source, snapshot, chunk_plan, config) for a fixture cfg."""
+    blocks, _ = load_source(cfg.chapter_html_path)
+    source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
+    memory = ChapterMemory.from_directory(cfg.memory_dir)
+    snapshot = build_snapshot(
+        chapter_id=cfg.chapter_id, source=source, memory=memory,
+        context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
+    )
+    planner = ChunkPlanner()
+    plans = planner.plan(
+        blocks, snapshot_hash=snapshot.snapshot_hash, following_blocks=cfg.right_context_pids
+    )
+    chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+    config = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
+    return source, snapshot, chunk_plan, config
+
+
+def _write_selection_meta(out_dir: Path, *, snapshot, chunk_plan, config, records) -> None:
+    from pact_v4.pipeline.v4_phase12_strict_runner import SELECTION_META_SCHEMA
+    payload = {
+        "schema": SELECTION_META_SCHEMA,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "records": records,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "selection_meta.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
 
@@ -907,3 +941,72 @@ def test_runners_do_not_import_helpers_from_draft_runner():
         "_serialize_generation_outcome",
     ):
         assert hasattr(_shared_runner_helpers, name), name
+
+
+def test_merge_selection_meta_keeps_resumed_stubs_when_no_sidecar(tmp_path: Path):
+    # Pre-sidecar run (no selection_meta.json) resumed in full: the journal-
+    # derived resumed stubs must be kept. Dropping them (the old `not
+    # rec["resumed"]` filter) emptied the map, and Step 6 reported
+    # "no_selected_chunks" instead of auditing the committed text.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    _source, snapshot, chunk_plan, config = _build_artifacts(cfg)
+    resumed_stubs = [
+        {
+            "chunk_id": chunk.chunk_id, "status": "selected",
+            "selected_candidate_id": "candidate", "selected_role": "fidelity_first",
+            "gate_trace": [], "resumed": True,
+        }
+        for chunk in chunk_plan.chunks
+    ]
+    merged = _merge_selection_meta(
+        cfg.out_dir, resumed_stubs, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
+    assert {rec["chunk_id"] for rec in merged} == {c.chunk_id for c in chunk_plan.chunks}
+    assert len(merged) == len(chunk_plan.chunks)
+
+
+def test_merge_selection_meta_prior_wins_and_current_overrides(tmp_path: Path):
+    # A richer persisted record wins over the resumed stub for the same chunk
+    # (quarantine_reason is preserved for B2's handoff), and a chunk actually
+    # processed in this session overrides its prior record.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    _source, snapshot, chunk_plan, config = _build_artifacts(cfg)
+    prior_records = [
+        {
+            "chunk_id": chunk.chunk_id, "status": "quarantined",
+            "quarantine_reason": "No candidate passed both gates.", "gate_trace": [],
+        }
+        for chunk in chunk_plan.chunks
+    ]
+    _write_selection_meta(
+        cfg.out_dir, snapshot=snapshot, chunk_plan=chunk_plan, config=config, records=prior_records,
+    )
+    current_records = [
+        {
+            "chunk_id": chunk.chunk_id, "status": "selected",
+            "selected_candidate_id": "candidate", "selected_role": "fidelity_first",
+            "gate_trace": [], "resumed": True,
+        }
+        for chunk in chunk_plan.chunks
+    ]
+    merged = _merge_selection_meta(
+        cfg.out_dir, current_records, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
+    by_chunk = {rec["chunk_id"]: rec for rec in merged}
+    assert len(merged) == len(chunk_plan.chunks)
+    # Prior record (rich, quarantine_reason) wins over the resumed stub.
+    assert by_chunk[chunk_plan.chunks[0].chunk_id]["status"] == "quarantined"
+    assert by_chunk[chunk_plan.chunks[0].chunk_id]["quarantine_reason"] == (
+        "No candidate passed both gates."
+    )
+
+    # A current-session (non-resumed) record overrides the prior record.
+    overridden = dict(current_records[0])
+    overridden["resumed"] = False
+    overridden["status"] = "selected"
+    current_records[0] = overridden
+    merged2 = _merge_selection_meta(
+        cfg.out_dir, current_records, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
+    by_chunk2 = {rec["chunk_id"]: rec for rec in merged2}
+    assert by_chunk2[chunk_plan.chunks[0].chunk_id]["status"] == "selected"
