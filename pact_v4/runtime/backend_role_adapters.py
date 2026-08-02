@@ -57,9 +57,25 @@ LOG = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 8192
 
 
-def _model_ref_for(backend: CompletionBackend, role: str) -> str:
+def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
+    """Resolve the role → model binding from the backend descriptor.
+
+    Falls back to a ``default`` binding. Raises a role-aware ``ValueError``
+    when no binding exists so a role without an assigned model fails loudly
+    instead of silently using whatever model the transport is serving.
+    """
     bindings = backend.descriptor.model_bindings
-    return bindings.get(role) or bindings.get("default") or ""
+    for role in roles:
+        ref = bindings.get(role)
+        if ref:
+            return ref
+    ref = bindings.get("default")
+    if ref:
+        return ref
+    raise ValueError(
+        f"no model binding for role(s) {list(roles)!r}; "
+        f"backend model_bindings={dict(bindings)!r}"
+    )
 
 
 @dataclass(frozen=True)
@@ -94,7 +110,7 @@ class BackendModelCaller:
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, bundle.role),
+            model_ref=_model_ref_for(self._backend, (bundle.role,)),
             messages=(Message(role="user", content=user_text),),
             max_output_tokens=self._max_tokens,
             temperature=bundle.params.temperature,
@@ -146,8 +162,9 @@ class BackendQwenEvaluator:
             MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
         )
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, "fidelity_reviewer")
-            or _model_ref_for(self._backend, "qwen_fidelity"),
+            model_ref=_model_ref_for(
+                self._backend, ("fidelity_reviewer", "qwen_fidelity")
+            ),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
             temperature=0.0,
@@ -204,8 +221,9 @@ class BackendGemmaSelector:
             template=self._config.template,
         )
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, "russian_selector")
-            or _model_ref_for(self._backend, "gemma_russian_preference"),
+            model_ref=_model_ref_for(
+                self._backend, ("russian_selector", "gemma_russian_preference")
+            ),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=self._max_tokens,
             temperature=0.0,

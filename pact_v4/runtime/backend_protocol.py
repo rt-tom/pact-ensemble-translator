@@ -170,6 +170,8 @@ class CompletionRequest:
     request_options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_ref, str) or not self.model_ref:
+            raise ValueError("CompletionRequest: model_ref must be a non-empty string")
         if not isinstance(self.messages, tuple) or not self.messages:
             raise ValueError("CompletionRequest: messages must be a non-empty tuple")
         if not all(isinstance(m, Message) for m in self.messages):

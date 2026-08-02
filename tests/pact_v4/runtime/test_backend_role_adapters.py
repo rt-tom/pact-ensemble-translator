@@ -44,8 +44,20 @@ def _hash(seed: str) -> str:
 class ScriptedBackend:
     """In-memory ``CompletionBackend`` returning scripted responses."""
 
-    def __init__(self, script: Sequence[CompletionResponse]):
+    _DEFAULT_BINDINGS = {
+        "default": "gemma-4-26B",
+        "generator": "gemma-4-26B",
+        "fidelity_reviewer": "qwen-3",
+        "russian_selector": "gemma-4-26B",
+    }
+
+    def __init__(
+        self,
+        script: Sequence[CompletionResponse],
+        model_bindings: Optional[Mapping[str, str]] = None,
+    ):
         self._script = list(script)
+        self._model_bindings = model_bindings if model_bindings is not None else self._DEFAULT_BINDINGS
         self.requests: list[CompletionRequest] = []
         self._closed = False
 
@@ -56,12 +68,7 @@ class ScriptedBackend:
             transport_version="openai-chat-completions/v1",
             endpoint_family="openai_chat_completions",
             public_endpoint="http://127.0.0.1:8080/v1/chat/completions",
-            model_bindings={
-                "default": "gemma-4-26B",
-                "generator": "gemma-4-26B",
-                "fidelity_reviewer": "qwen-3",
-                "russian_selector": "gemma-4-26B",
-            },
+            model_bindings=self._model_bindings,
             effective_options={"temperature": 0.0},
         )
 
@@ -143,6 +150,16 @@ def test_model_caller_uses_role_model_ref_from_descriptor():
     caller = BackendModelCaller(backend)
     caller(_bundle())
     assert backend.requests[0].model_ref == "gemma-4-26B"
+
+
+def test_model_caller_fails_loudly_on_missing_model_binding():
+    # A role without a model binding must not silently fall back to the
+    # transport's model: the request construction rejects it.
+    backend = ScriptedBackend([_text_response("{}")], model_bindings={})
+    caller = BackendModelCaller(backend)
+    with pytest.raises(ValueError, match="no model binding"):
+        caller(_bundle())
+    assert backend.requests == []
 
 
 # ---------------------------------------------------------------------------

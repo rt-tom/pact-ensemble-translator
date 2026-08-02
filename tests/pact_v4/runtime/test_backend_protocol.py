@@ -213,6 +213,11 @@ def test_request_rejects_empty_label():
         _request(label="")
 
 
+def test_request_rejects_empty_model_ref():
+    with pytest.raises(ValueError, match="model_ref"):
+        _request(model_ref="")
+
+
 # ---------------------------------------------------------------------------
 # CompletionResponse normalization
 # ---------------------------------------------------------------------------

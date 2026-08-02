@@ -137,10 +137,11 @@ class LocalOpenAIBackend:
                 f"{sorted(request.request_options)} for LocalOpenAIBackend"
             )
         actual_model = self._api.config.model
-        if request.model_ref and request.model_ref != actual_model:
+        if request.model_ref != actual_model:
             # The request claims a role→model binding that this backend is
             # not actually serving. Refuse rather than silently call a
-            # different model (plan: no silent fallback).
+            # different model (plan: no silent fallback). ``model_ref`` is
+            # guaranteed non-empty by ``CompletionRequest`` validation.
             raise CompletionError(
                 f"{self._cfg.name}: request model_ref {request.model_ref!r} does not "
                 f"match the backend's actual model {actual_model!r}"
