@@ -256,6 +256,15 @@ Python-код обращается к OpenCode REST/OpenAPI напрямую. Ty
 Node SDK для v4 не нужны: они добавили бы второй runtime только ради нескольких
 HTTP endpoints.
 
+По умолчанию сервер заранее запущен (external mode). С PR 3 добавляется
+managed-режим (маркер для карточки C2, реализация не начата): Pact сам
+стартует `opencode serve` через `pact_v4/runtime/opencode_server_lifecycle.py`
+(health-wait, PID ownership, `assert_port_free_or_owned`), конфиг
+`runtime.server_mode: managed | external`. В managed-режиме Pact генерирует
+эфемерные basic-auth креды, кладёт их в env subprocess'а и использует те же
+креды для HTTP-запросов; сервер стартует с `--pure`. При занятом порту —
+fail-fast (не подключаться к чужому серверу).
+
 Перед первым model call backend выполняет read-only проверки:
 
 1. `GET /global/health` — server доступен, версия поддерживается;
@@ -383,6 +392,13 @@ pipeline:
   seed: 7
   max_consecutive_terminal_nonselections: 3
 ```
+
+`runtime.server_mode` (добавляется в PR 3, маркер для карточки C2):
+`external` — предзапущенный сервер (пример выше), `managed` — Pact сам
+поднимает `opencode serve` через `opencode_server_lifecycle.py` (health-wait,
+PID ownership, `assert_port_free_or_owned`), сервер стартует с `--pure`,
+basic-auth креды — эфемерные (генерируются Pact, кладутся в env subprocess'а
+и используются для HTTP); при занятом порту — fail-fast.
 
 Названия `fidelity_reviewer` и `russian_selector` являются config aliases.
 Внутренние v4 gate names могут остаться `qwen_fidelity` и
@@ -752,7 +768,10 @@ Gate: offline contract suite + один ручной smoke на тестовом
 - runtime coordinators;
 - strict runner journal/record v2;
 - backend identity/resume validation;
-- local/remote/composite config loader.
+- local/remote/composite config loader;
+- managed-режим `opencode serve`: `opencode_server_lifecycle.py`,
+  `runtime.server_mode: managed | external`, эфемерные basic-auth креды,
+  `--pure`, fail-fast при занятом порту.
 
 Gate: old local run config работает; remote fake end-to-end работает.
 

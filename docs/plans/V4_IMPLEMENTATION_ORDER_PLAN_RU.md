@@ -90,6 +90,13 @@ workstream-тема, темы не смешивать.
 - **C2 = PR 3**: tagged backend configs, `RuntimeCoordinator`, journal/record v2,
   resume identity. Желательно до live-прогонов Phase 4, чтобы не перепрогонять
   главу на двух record-схемах.
+  - **В карточку C2 включить (маркер, реализация не начата)**: managed-режим
+    `opencode serve` — новый модуль
+    `pact_v4/runtime/opencode_server_lifecycle.py` (самозапуск, health-wait,
+    PID ownership, `assert_port_free_or_owned`), `runtime.server_mode:
+    managed | external`, эфемерные basic-auth креды в env subprocess'а,
+    `--pure`, fail-fast при занятом порту. Решение: `DECISIONS.md`
+    (2026-08-01).
 - **C3 = PR 4**: CLI `--runtime-config`, live one-chunk smoke → chapter_046
   remote trial → запись решения в `DECISIONS.md`.
 
