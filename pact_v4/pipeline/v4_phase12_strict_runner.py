@@ -377,6 +377,18 @@ def _switch_aggregates(switches: List[SwitchRecord]) -> Dict[str, Any]:
 # the assembled chapter.
 
 
+class _IncompleteSelectionError(ValueError):
+    """A selected chunk's committed translation does not cover its plan PIDs.
+
+    Raised by ``_selected_candidates`` instead of letting ``Candidate.create``
+    fail with a generic ownership ``ValueError``, so the Step 6 audit can
+    report the distinct ``incomplete_translation`` skip reason. Normally
+    unreachable (the strict driver only writes complete per-chunk committed
+    text); it fires when prior translations were tampered or a resume
+    reconstruction came up short of the plan.
+    """
+
+
 def _selected_candidates(
     *,
     selection_records: List[Dict[str, Any]],
@@ -399,9 +411,15 @@ def _selected_candidates(
             continue
         text = selected_text_by_chunk.get(chunk.chunk_id)
         if text is None:
-            raise ValueError(
-                f"Step 6 audit: chunk {chunk.chunk_id} is selected in the journal "
-                "but has no committed translation to audit"
+            raise _IncompleteSelectionError(
+                f"chunk {chunk.chunk_id}: selected in the journal but has no "
+                "committed translation to audit"
+            )
+        if set(text) != set(chunk.pids):
+            raise _IncompleteSelectionError(
+                f"chunk {chunk.chunk_id}: committed translation covers "
+                f"{len(text)}/{len(chunk.pids)} PIDs; refusing to audit a "
+                "partially reconstructed chunk"
             )
         candidates[chunk.chunk_id] = Candidate.create(
             candidate_id=rec["selected_candidate_id"],
@@ -473,8 +491,13 @@ def _run_step6_audit(
     contract (``AssembledChapter`` / ``run_chapter_audit``) requires the full
     chapter plan to be covered by winning candidates, and the strict driver
     only ever commits a selected candidate. A run with non-selected chunks
-    (halted early, quarantines, needs_synthesis) is recorded as skipped —
-    filling those gaps is Phase 4 (repair/convergence, out of B1 scope).
+    (halted early, quarantines, needs_synthesis) is recorded as skipped with
+    ``reason="partial_selection"`` — filling those gaps is Phase 4
+    (repair/convergence, out of B1 scope). ``reason="no_selected_chunks"`` is
+    a defense-in-depth branch for a fully-corrupted prior run (no selected
+    chunk at all), and ``reason="incomplete_translation"`` covers the rarer
+    case where a chunk is selected in the journal but its committed text does
+    not cover the chunk's plan PIDs (tampered/partial prior translations).
 
     Findings are persisted as a dedicated run artifact via ``FindingStore``
     (append-only evidence, region resolver included); the journal stays v1.
@@ -482,11 +505,17 @@ def _run_step6_audit(
     ``run_chapter_audit`` re-attempts only the unfinished ``(chunk_id,
     detector)`` units.
     """
-    candidates = _selected_candidates(
-        selection_records=selection_records,
-        selected_text_by_chunk=selected_text_by_chunk,
-        chunk_plan=chunk_plan, source=source, snapshot=snapshot, config=config,
-    )
+    try:
+        candidates = _selected_candidates(
+            selection_records=selection_records,
+            selected_text_by_chunk=selected_text_by_chunk,
+            chunk_plan=chunk_plan, source=source, snapshot=snapshot, config=config,
+        )
+    except _IncompleteSelectionError as exc:
+        return {
+            "status": "skipped", "reason": "incomplete_translation",
+            "detail": str(exc),
+        }
     if not candidates:
         return {"status": "skipped", "reason": "no_selected_chunks"}
     if len(candidates) < len(chunk_plan.chunks):

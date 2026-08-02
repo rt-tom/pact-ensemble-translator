@@ -556,3 +556,36 @@ def test_step6_audit_rejects_foreign_audit_cache_on_resume(tmp_path: Path):
     result, _router = _run(resumed_cfg)
     assert result.step6["status"] == "failed"
     assert "Foreign identity: audit cache" in result.step6["error"]
+
+
+def test_step6_audit_skipped_on_incomplete_translation(tmp_path: Path):
+    # A chunk is selected in the journal but its committed text no longer
+    # covers the plan's PIDs (e.g. prior translations.json was tampered or a
+    # resume reconstruction came up short). The audit must refuse to assemble
+    # a partial chunk with a distinct skip reason, not misread it as a clean
+    # chapter or crash with a generic ownership error.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    first_result, _router = _run(cfg)
+    assert first_result.step6["status"] == "complete"
+
+    # Drop one PID owned by chunk0001 from the committed translations.
+    plan_payload = json.loads(
+        (cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8")
+    )
+    chunk0001 = next(c for c in plan_payload["chunks"] if c["chunk_id"] == "chunk0001")
+    missing_pid = chunk0001["pids"][0]
+    translations_path = cfg.out_dir / "translations.json"
+    translations = json.loads(translations_path.read_text(encoding="utf-8"))
+    del translations[missing_pid]
+    translations_path.write_text(
+        json.dumps(translations, ensure_ascii=False), encoding="utf-8"
+    )
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+    )
+    result, _router = _run(resumed_cfg)
+    assert result.step6["status"] == "skipped"
+    assert result.step6["reason"] == "incomplete_translation"
+    assert "chunk0001" in result.step6["detail"]

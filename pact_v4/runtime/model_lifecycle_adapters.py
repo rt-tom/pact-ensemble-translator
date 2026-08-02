@@ -141,12 +141,16 @@ class LifecycleQwenAuditEvaluator:
                  config: Optional[BackendQwenAuditEvaluatorConfig] = None):
         self._router = router
         cfg = config or BackendQwenAuditEvaluatorConfig()
+        # temperature=0.0, not 0.2: the audit adapters always send
+        # ``request.temperature == 0.0`` (same as the gate evaluations), so
+        # keeping the ApiClientConfig in sync keeps the backend descriptor's
+        # ``effective_options`` honest about what is actually sent.
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
             timeout_seconds=1800.0,
             context_size=32768,
-            temperature=0.2,
+            temperature=0.0,
         )
         backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
         self._evaluator = BackendQwenAuditEvaluator(
@@ -179,7 +183,7 @@ class LifecycleGemmaAuditEvaluator:
             model=model_name,
             timeout_seconds=1800.0,
             context_size=32768,
-            temperature=0.2,
+            temperature=0.0,
         )
         backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
         self._evaluator = BackendGemmaAuditEvaluator(
