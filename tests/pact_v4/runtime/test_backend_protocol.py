@@ -148,6 +148,32 @@ def test_public_record_contains_public_identity_fields():
     assert record["identity_hash"] == _descriptor().identity_hash
 
 
+def test_identity_keeps_plural_tokens_sampling_fields():
+    # ``max_output_tokens`` / ``input_tokens`` are sampling/usage settings and
+    # must participate in identity; only singular ``token`` keys are secrets.
+    with_tokens = _descriptor(
+        effective_options={
+            "temperature": 0.2,
+            "max_output_tokens": 8192,
+            "input_tokens": 10,
+        }
+    )
+    without_tokens = _descriptor(effective_options={"temperature": 0.2})
+    assert with_tokens.identity_hash != without_tokens.identity_hash
+    assert "max_output_tokens" in repr(with_tokens.public_record())
+    assert "input_tokens" in repr(with_tokens.public_record())
+
+
+def test_singular_token_key_is_treated_as_secret():
+    # ``api_token`` is a credential and must be stripped from identity.
+    with_secret = _descriptor(
+        effective_options={"temperature": 0.2, "api_token": "sk-secret"}
+    )
+    without_secret = _descriptor(effective_options={"temperature": 0.2})
+    assert with_secret.identity_hash == without_secret.identity_hash
+    assert "api_token" not in repr(with_secret.public_record())
+
+
 def test_public_record_strips_endpoint_userinfo_and_secret_query():
     record = _descriptor(
         public_endpoint=(

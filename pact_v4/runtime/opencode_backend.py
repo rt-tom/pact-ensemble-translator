@@ -63,7 +63,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, NoReturn, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import requests
@@ -140,6 +140,10 @@ ERROR_INVALID_MODEL_OUTPUT = "invalid_model_output"
 ERROR_SEMANTIC_GATE_FAILED = "semantic_gate_failed"
 ERROR_SERVER_VERSION_UNSUPPORTED = "server_version_unsupported"
 ERROR_REMOTE_BUDGET_EXHAUSTED = "remote_budget_exhausted"
+# Request-level incompatibility (e.g. unsupported request_options, or
+# json_schema mode without a response_schema). Raised before any network
+# call; the request never reached the provider.
+ERROR_REQUEST_NOT_SUPPORTED = "request_not_supported"
 
 # error classes that are retried (bounded) by this transport.
 _RETRYABLE_ERROR_CLASSES = frozenset({
@@ -254,6 +258,13 @@ class OpenCodeServerBackendConfig:
     # Role -> provider/model bindings (part of backend identity).
     model_bindings: Mapping[str, str] = field(default_factory=dict)
 
+    # Effective sampling settings (plan §5.4). v1.4.7 cannot send these in
+    # the message body, but they belong in backend identity so a change in
+    # requested sampling invalidates cache/resume instead of silently reusing
+    # a candidate generated with different settings.
+    default_temperature: Optional[float] = None
+    default_max_output_tokens: Optional[int] = None
+
     transport_version: str = OPENCODE_SERVER_TRANSPORT_VERSION
     endpoint_family: str = ENDPOINT_FAMILY_OPENCODE_HTTP
 
@@ -286,6 +297,19 @@ class OpenCodeServerBackendConfig:
             raise ValueError("OpenCodeServerBackendConfig: retry_delay_seconds must be >= 0")
         if self.timeout_seconds <= 0:
             raise ValueError("OpenCodeServerBackendConfig: timeout_seconds must be positive")
+        if self.default_temperature is not None and (
+            not isinstance(self.default_temperature, (int, float))
+            or self.default_temperature < 0
+        ):
+            raise ValueError(
+                "OpenCodeServerBackendConfig: default_temperature must be >= 0"
+            )
+        if self.default_max_output_tokens is not None and (
+            int(self.default_max_output_tokens) <= 0
+        ):
+            raise ValueError(
+                "OpenCodeServerBackendConfig: default_max_output_tokens must be positive"
+            )
 
 
 def _parse_model_ref(model_ref: str) -> Tuple[str, str]:
@@ -603,7 +627,13 @@ class OpenCodeServerBackend:
                 f"opencode server /session returned malformed JSON: {exc}",
                 status_code=resp.status_code,
             ) from exc
-        session_id = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise OpenCodeError(
+                ERROR_TRANSPORT_NETWORK,
+                f"opencode server /session response is not an object: {data!r}",
+                status_code=resp.status_code,
+            )
+        session_id = data.get("id")
         if not isinstance(session_id, str) or not session_id:
             raise OpenCodeError(
                 ERROR_TRANSPORT_NETWORK,
@@ -826,6 +856,8 @@ class OpenCodeServerBackend:
                 "schema_version": "pact-json-object/v1",
                 "retry_count": self._cfg.structured_output_retry_count,
             },
+            "temperature": self._cfg.default_temperature,
+            "max_output_tokens": self._cfg.default_max_output_tokens,
             "timeout_seconds": self._cfg.timeout_seconds,
             "http_retries": self._cfg.http_retries,
             "retry_delay_seconds": self._cfg.retry_delay_seconds,
@@ -859,13 +891,33 @@ class OpenCodeServerBackend:
             # v1.4.7 has no per-request sampling fields; silently dropping an
             # option would change behaviour without being honest (plan §5.1).
             raise OpenCodeError(
-                ERROR_TRANSPORT_NETWORK,
+                ERROR_REQUEST_NOT_SUPPORTED,
                 "OpenCodeServerBackend: request_options are not supported by "
                 f"opencode-server-http/v1.4 (got {sorted(request.request_options)})",
+            )
+        if self._cfg.structured_output_mode == "json_schema" and request.response_schema is None:
+            # json_schema mode without a schema would silently ignore a
+            # server-returned ``info.structured``; fail loudly instead.
+            raise OpenCodeError(
+                ERROR_REQUEST_NOT_SUPPORTED,
+                "OpenCodeServerBackend: json_schema mode requires a response_schema",
             )
         self.preflight()
 
         provider_id, model_id = _parse_model_ref(request.model_ref)
+
+        # The request's model must be one of the role->model bindings this
+        # backend was configured with (like LocalOpenAIBackend rejects a
+        # model_ref that is not the model it actually serves). A request
+        # outside the bindings fails loudly instead of being routed
+        # somewhere unexpected.
+        bound_models = set(self._cfg.model_bindings.values())
+        if bound_models and request.model_ref not in bound_models:
+            raise OpenCodeError(
+                ERROR_REQUEST_NOT_SUPPORTED,
+                f"OpenCodeServerBackend: model_ref {request.model_ref!r} is not "
+                f"bound for any role (bindings: {sorted(bound_models)})",
+            )
         self._check_provider_model(provider_id, model_id)
 
         started = time.perf_counter()
@@ -893,7 +945,6 @@ class OpenCodeServerBackend:
                         if not self._cfg.retain_failed_sessions:
                             self._delete_own_session(session_id)
                         self._raise_budget_exhausted(exc, attempt_log, started, request)
-                        raise AssertionError("unreachable")
                     transport_attempts += 1
                     self._reserve_retry()
                     self._backoff(exc)
@@ -901,7 +952,6 @@ class OpenCodeServerBackend:
                 if not self._cfg.retain_failed_sessions:
                     self._delete_own_session(session_id)
                 self._raise_final(exc, attempt_log, started, request)
-                raise AssertionError("unreachable")
 
             message_error = self._map_message_error(info, session_id=session_id)
             if message_error is not None:
@@ -920,20 +970,18 @@ class OpenCodeServerBackend:
                         self._raise_budget_exhausted(
                             message_error, attempt_log, started, request
                         )
-                        raise AssertionError("unreachable")
                     structured_attempts += 1
                     self._reserve_retry()
                     continue
                 if not self._cfg.retain_failed_sessions:
                     self._delete_own_session(session_id)
                 self._raise_final(message_error, attempt_log, started, request)
-                raise AssertionError("unreachable")
 
             # Success path.
             self._owned_sessions[session_id] = "success"
             text = self._extract_text(parts)
             structured = info.get("structured")
-            if self._cfg.structured_output_mode == "json_schema" and request.response_schema is not None:
+            if self._cfg.structured_output_mode == "json_schema":
                 if structured is None:
                     # Server claimed json_schema but returned no structured
                     # object; treat as a structured-output failure (bounded
@@ -954,14 +1002,12 @@ class OpenCodeServerBackend:
                             self._raise_budget_exhausted(
                                 err, attempt_log, started, request
                             )
-                            raise AssertionError("unreachable")
                         structured_attempts += 1
                         self._reserve_retry()
                         continue
                     if not self._cfg.retain_failed_sessions:
                         self._delete_own_session(session_id)
                     self._raise_final(err, attempt_log, started, request)
-                    raise AssertionError("unreachable")
                 text = _canonical_structured_text(structured)
 
             request_id = info.get("id")
@@ -1020,7 +1066,7 @@ class OpenCodeServerBackend:
         attempt_log: list,
         started: float,
         request: CompletionRequest,
-    ) -> None:
+    ) -> NoReturn:
         """Record the failed call and raise the final normalized error."""
         self._record_failure(exc, attempt_log, started, request)
         raise exc
@@ -1031,7 +1077,7 @@ class OpenCodeServerBackend:
         attempt_log: list,
         started: float,
         request: CompletionRequest,
-    ) -> None:
+    ) -> NoReturn:
         """Record and raise an explicit operational budget-exhaustion error."""
         budget = self._cfg.remote_budget
         message = (
@@ -1152,6 +1198,7 @@ __all__ = [
     "ERROR_SEMANTIC_GATE_FAILED",
     "ERROR_SERVER_VERSION_UNSUPPORTED",
     "ERROR_REMOTE_BUDGET_EXHAUSTED",
+    "ERROR_REQUEST_NOT_SUPPORTED",
     "OpenCodeError",
     "RemoteBudget",
     "OpenCodeServerBackendConfig",

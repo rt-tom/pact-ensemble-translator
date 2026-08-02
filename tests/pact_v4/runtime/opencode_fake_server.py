@@ -132,6 +132,9 @@ class FakeOpenCodeServer:
 
         self.message_responses: List[Any] = []
         self.delete_responses: List[Any] = []
+        # Optional override for the POST /session payload (e.g. a non-dict
+        # response to exercise the malformed-session-response path).
+        self.session_create_response: Optional[Any] = None
 
         self.requests_log: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
         self.sessions: Dict[str, Dict[str, Any]] = {}
@@ -175,6 +178,13 @@ class FakeOpenCodeServer:
     # -- internals -----------------------------------------------------------
 
     def _create_session(self, body: Optional[Dict[str, Any]]) -> FakeResponse:
+        if self.session_create_response is not None:
+            item = self.session_create_response
+            if isinstance(item, BaseException):
+                raise item
+            if isinstance(item, FakeResponse):
+                return item
+            return FakeResponse(200, item)
         self._session_seq += 1
         session_id = f"ses_fake_{self._session_seq}"
         title = (body or {}).get("title", "")

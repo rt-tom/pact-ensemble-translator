@@ -25,6 +25,7 @@ from pact_v4.runtime.opencode_backend import (
     ERROR_PROVIDER_AUTH,
     ERROR_PROVIDER_MODEL_UNAVAILABLE,
     ERROR_REMOTE_BUDGET_EXHAUSTED,
+    ERROR_REQUEST_NOT_SUPPORTED,
     ERROR_SERVER_VERSION_UNSUPPORTED,
     ERROR_STRUCTURED_OUTPUT_FAILED,
     ERROR_TRANSPORT_NETWORK,
@@ -188,6 +189,7 @@ def test_preflight_is_cached_across_calls():
     gets = [p for m, p, _ in fake.requests_log if m == "GET"]
     assert gets.count("/global/health") == 1
     assert gets.count("/provider") == 1
+    assert gets.count("/experimental/tool/ids") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +234,16 @@ def test_tools_really_disabled():
     assert all(value is False for value in tools.values())
     assert "bash" in tools and "read" in tools and "edit" in tools
     assert "grep" in tools and "webfetch" in tools and "task" in tools
+
+
+def test_malformed_session_response_raises_transport_network():
+    fake = FakeOpenCodeServer()
+    fake.session_create_response = ["not-an-object"]
+    backend = _backend(fake)
+    with pytest.raises(OpenCodeError) as exc_info:
+        backend.complete(_request())
+    assert exc_info.value.error_class == ERROR_TRANSPORT_NETWORK
+    assert "not an object" in str(exc_info.value)
 
 
 def test_success_session_cleanup_when_retain_success_false():
@@ -703,7 +715,28 @@ def test_request_options_are_rejected_not_silently_dropped():
     backend = _backend(fake)
     with pytest.raises(OpenCodeError) as exc_info:
         backend.complete(_request(request_options={"top_p": 0.9}))
+    assert exc_info.value.error_class == ERROR_REQUEST_NOT_SUPPORTED
     assert "not supported" in str(exc_info.value)
+
+
+def test_json_schema_mode_requires_response_schema():
+    fake = FakeOpenCodeServer()
+    backend = _backend(fake, structured_output_mode="json_schema")
+    with pytest.raises(OpenCodeError) as exc_info:
+        backend.complete(_request(response_schema=None))
+    assert exc_info.value.error_class == ERROR_REQUEST_NOT_SUPPORTED
+    assert "response_schema" in str(exc_info.value)
+    # No network call was made.
+    assert [p for m, p, _ in fake.requests_log if m != "GET"] == []
+
+
+def test_request_model_ref_outside_bindings_fails_loudly():
+    fake = FakeOpenCodeServer()
+    backend = _backend(fake, model_bindings={"generator": "opencode-go/deepseek-v4-flash"})
+    with pytest.raises(OpenCodeError) as exc_info:
+        backend.complete(_request(model_ref="opencode-go/qwen3.7-plus"))
+    assert exc_info.value.error_class == ERROR_REQUEST_NOT_SUPPORTED
+    assert "not bound" in str(exc_info.value)
 
 
 def test_descriptor_identity_excludes_credentials_and_is_deterministic():
@@ -736,6 +769,29 @@ def test_descriptor_identity_changes_with_structured_output_mode():
     a = _backend(fake, structured_output_mode="prompt_only")
     b = _backend(fake, structured_output_mode="json_schema")
     assert a.descriptor.identity_hash != b.descriptor.identity_hash
+
+
+def test_descriptor_identity_changes_with_temperature():
+    # Plan §5.4: sampling fields belong in identity even when the wire
+    # contract cannot send them (B1).
+    fake = FakeOpenCodeServer()
+    a = _backend(fake, default_temperature=0.0)
+    b = _backend(fake, default_temperature=0.2)
+    assert a.descriptor.identity_hash != b.descriptor.identity_hash
+
+
+def test_descriptor_identity_changes_with_max_output_tokens():
+    fake = FakeOpenCodeServer()
+    a = _backend(fake, default_max_output_tokens=512)
+    b = _backend(fake, default_max_output_tokens=8192)
+    assert a.descriptor.identity_hash != b.descriptor.identity_hash
+
+
+def test_descriptor_identity_stable_when_sampling_unset():
+    fake = FakeOpenCodeServer()
+    a = _backend(fake)
+    b = _backend(fake)
+    assert a.descriptor.identity_hash == b.descriptor.identity_hash
 
 
 def test_descriptor_identity_changes_with_agent_and_system():
