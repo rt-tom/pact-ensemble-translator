@@ -53,6 +53,17 @@ Phase 0–7. Задачи вне плана — только по решению
 - Run targeted tests by default. Expand only if root cause is unclear, data may be lost, lifecycle/cache behavior changes, or targeted tests fail.
 - Git and PRs are shared memory. Do not require the user to relay long summaries.
 
+## Shell syntax (PowerShell)
+
+The user's shell is PowerShell on Windows. Any command you give the user
+must use PowerShell syntax, not POSIX:
+
+- Prefer a single-line command when reasonable.
+- For line continuation use a backtick at the end of the line with NO
+  trailing whitespace after it (a trailing space silently breaks it). Do
+  not use POSIX `^` or `\` continuations.
+- Quote paths with double quotes, not single quotes.
+
 ## Short commands
 
 ### `Проверь`
