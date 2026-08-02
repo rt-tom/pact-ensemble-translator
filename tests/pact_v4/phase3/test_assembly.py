@@ -102,16 +102,46 @@ def test_assemble_concatenates_winners_in_pid_order():
     assert chapter.config_identity == config.config_identity
 
 
-# 2. Missing winner for a chunk raises — no partial/best-effort chapter.
-def test_missing_winner_raises():
+# 2. A chunk missing from the candidates map is omitted from the assembled
+#    translation — no partial/best-effort text is fabricated for it, and the
+#    PIDs it owns stay uncovered for the Step 6 audit's ``missing`` layer
+#    (owner decision 2026-08-02: audit ALL chunks, best-variant for quarantine).
+def test_missing_candidate_leaves_chunk_absent():
     source, snapshot, chunk_plan, chunk1, chunk2, config = _env()
     c1 = _candidate(chunk=chunk1, suffix="A", source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config)
 
-    with pytest.raises(ValueError, match="no winning candidate"):
-        AssembledChapter.assemble(
-            source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
-            candidates={chunk1.chunk_id: c1},
-        )
+    chapter = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates={chunk1.chunk_id: c1},
+    )
+
+    # chunk2's PIDs are simply absent — nothing is invented for them.
+    assert tuple(pid for pid, _ in chapter.translation) == tuple(chunk1.pids)
+    assert all(pid not in chapter.as_pid_map() for pid in chunk2.pids)
+
+
+# 2b. A partial assembly is deterministic: the same partial candidate map
+#     always yields the same chapter_hash (resume identity).
+def test_partial_assembly_chapter_hash_deterministic():
+    source, snapshot, chunk_plan, chunk1, chunk2, config = _env()
+    c1 = _candidate(chunk=chunk1, suffix="A", source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config)
+
+    chapter_a = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates={chunk1.chunk_id: c1},
+    )
+    chapter_b = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates={chunk1.chunk_id: c1},
+    )
+    assert chapter_a.chapter_hash == chapter_b.chapter_hash
+    # Adding chunk2's candidate changes the hash — coverage growth is visible.
+    c2 = _candidate(chunk=chunk2, suffix="A", source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config)
+    chapter_full = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates={chunk1.chunk_id: c1, chunk2.chunk_id: c2},
+    )
+    assert chapter_full.chapter_hash != chapter_a.chapter_hash
 
 
 # 3. A candidate belonging to a foreign snapshot/config is rejected, not silently included.

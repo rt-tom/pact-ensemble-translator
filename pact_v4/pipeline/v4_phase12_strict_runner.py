@@ -79,6 +79,7 @@ from pact_v4.phase1.models import (
     Candidate,
     ChunkPlanArtifact,
     ConfigArtifact,
+    GateResult,
     canonical_json_hash,
 )
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
@@ -125,6 +126,8 @@ JOURNAL_SCHEMA = "pact-v4-strict-chapter-trial-journal/v2"
 RECORD_SCHEMA = "pact-v4-strict-chapter-trial/v2"
 AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
 AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
+HANDOFF_SCHEMA = "pact-v4-step6-b2-handoff/v1"
+SELECTION_META_SCHEMA = "pact-v4-strict-selection-meta/v1"
 
 NO_LEFT_CONTEXT_SENTINEL = "pact-v4-strict/no-left-context"
 
@@ -314,7 +317,7 @@ class StrictChapterRunResult:
 class _IncompleteSelectionError(ValueError):
     """A selected chunk's committed translation does not cover its plan PIDs.
 
-    Raised by ``_selected_candidates`` instead of letting ``Candidate.create``
+    Raised by ``_audit_candidate_map`` instead of letting ``Candidate.create``
     fail with a generic ownership ``ValueError``, so the Step 6 audit can
     report the distinct ``incomplete_translation`` skip reason. Normally
     unreachable (the strict driver only writes complete per-chunk committed
@@ -323,46 +326,271 @@ class _IncompleteSelectionError(ValueError):
     """
 
 
-def _selected_candidates(
+# ---------------------------------------------------------------------------
+# Best-variant selection for quarantined chunks (owner decision 2026-08-02)
+# ---------------------------------------------------------------------------
+
+# The deterministic rule recorded in ``b2_handoff.json``: a quarantined
+# chunk's best-variant is the one with the most passed gates on its own
+# ``decision_trace``, ties broken by role priority, then lexicographic
+# ``candidate_id``. The rule is recorded verbatim in the artifact so a
+# reviewer never has to infer it from behaviour.
+BEST_VARIANT_RULE = (
+    "max_gates_passed>role(fidelity_first>balanced_literary>synthesis)>candidate_id"
+)
+
+_ROLE_PRIORITY = {"fidelity_first": 0, "balanced_literary": 1, "synthesis": 2}
+
+
+def _gates_passed(decision_trace: List[Dict[str, Any]]) -> int:
+    return sum(1 for gate in decision_trace if gate.get("passed"))
+
+
+def _pick_best_variant(variants: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Deterministically pick one best-variant among a quarantined chunk's
+    produced variants (serialized generation-outcome records).
+
+    ``None`` when there are no variants. The selection is a total order, so it
+    is reproducible across resume sessions — a resumed run reconstructs the
+    same best-variant candidate, hence the same assembled chapter and audit
+    cache identity.
+    """
+    if not variants:
+        return None
+
+    def _key(variant: Dict[str, Any]) -> Tuple[int, int, str]:
+        return (
+            -_gates_passed(variant.get("decision_trace", [])),
+            _ROLE_PRIORITY.get(variant.get("role"), 99),
+            variant["candidate_id"],
+        )
+
+    return min(variants, key=_key)
+
+
+def _candidate_from_generation_record(
+    variant: Dict[str, Any],
+    *,
+    chunk_id: str,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+) -> Candidate:
+    """Reconstruct one ``Candidate`` from a serialized generation-outcome record.
+
+    ``Candidate.create`` re-validates every identity against
+    source/snapshot/plan/config, so a stale or fabricated variant cannot enter
+    the audit. Translation PID order is rebuilt from the chunk plan (the
+    persisted record stores a PID->text map, not an ordered tuple).
+    """
+    chunk = chunk_plan.chunk(chunk_id)
+    translation_map = variant["translation"]
+    translation = tuple((pid, translation_map[pid]) for pid in chunk.pids)
+    decision_trace = tuple(
+        GateResult(
+            gate=str(gate["gate"]),
+            passed=bool(gate.get("passed", False)),
+            detail=str(gate.get("detail", "")),
+        )
+        for gate in variant.get("decision_trace", [])
+    )
+    return Candidate.create(
+        candidate_id=variant["candidate_id"],
+        chunk_id=chunk_id,
+        role=variant["role"],
+        translation=translation,
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        decision_trace=decision_trace,
+    )
+
+
+def _audit_candidate_map(
     *,
     selection_records: List[Dict[str, Any]],
     selected_text_by_chunk: Dict[str, Dict[str, str]],
+    generation_records: List[Dict[str, Any]],
     chunk_plan: ChunkPlanArtifact,
     source: Any,
     snapshot: Any,
     config: ConfigArtifact,
-) -> Dict[str, Candidate]:
-    """Reconstruct the winning ``Candidate`` per selected chunk."""
+) -> Tuple[Dict[str, Candidate], List[Dict[str, Any]]]:
+    """Build the Step 6 candidate map + the per-chunk ``b2_handoff.json`` rows.
+
+    Rules (owner decision 2026-08-02):
+
+      * selected chunk — the committed winning candidate (identity re-validated
+        through ``Candidate.create``);
+      * quarantined chunk — the deterministic **best-variant** among the
+        variants it actually produced (``_pick_best_variant``), also recreated
+        through ``Candidate.create``. This is a *diagnostic* read, never an
+        acceptance: the chunk stays ``quarantined`` in the handoff even if its
+        best-variant audits clean;
+      * needs_synthesis / incomplete_generation / never-processed chunk — no
+        candidate; the deterministic audit layer covers its PIDs as ``missing``
+        (tagged ``pact_v4.phase3.audit.NO_CANDIDATE_MARKER``), and no model
+        unit is attempted for it.
+
+    Handoff-row contract (B2 input, pinned at review of PR #108):
+
+      * ``uncovered_pids`` is **structural** coverage only: the chunk's plan
+        PIDs that have no candidate translation in the assembled chapter
+        (always empty for a chunk with an audited candidate). It says nothing
+        about audit *completeness* — that is carried by ``audit_status``
+        (filled in ``_run_step6_audit`` after the audit runs):
+        ``clean`` / ``findings_present`` / ``unit_failed`` for a chunk with an
+        audited candidate, ``no_candidate`` otherwise. A selected chunk whose
+        Qwen or Gemma unit failed therefore reports ``uncovered_pids=[]`` but
+        ``audit_status="unit_failed"`` — B2 must key off ``audit_status``, not
+        infer it from ``uncovered_pids`` + ``committed``.
+      * ``gate_trace`` reads either ``decision_trace`` (selection records,
+        generation records) or ``gate_trace`` (journal) — both spell the same
+        cascade trace; do not "normalise" one side without the other.
+
+    Raises ``_IncompleteSelectionError`` (data-integrity, ``incomplete_translation``)
+    when a chunk is selected in the journal but its committed translation no
+    longer covers the chunk's plan PIDs.
+    """
     selected_meta = {
         rec["chunk_id"]: rec
         for rec in selection_records
         if rec.get("status") == "selected" and rec.get("selected_candidate_id")
     }
+    gen_by_chunk = {rec["chunk_id"]: rec for rec in generation_records}
+
     candidates: Dict[str, Candidate] = {}
+    handoff_rows: List[Dict[str, Any]] = []
+
     for chunk in chunk_plan.chunks:
-        rec = selected_meta.get(chunk.chunk_id)
-        if rec is None:
-            continue
-        text = selected_text_by_chunk.get(chunk.chunk_id)
-        if text is None:
-            raise _IncompleteSelectionError(
-                f"chunk {chunk.chunk_id}: selected in the journal but has no "
-                "committed translation to audit"
-            )
-        if set(text) != set(chunk.pids):
-            raise _IncompleteSelectionError(
-                f"chunk {chunk.chunk_id}: committed translation covers "
-                f"{len(text)}/{len(chunk.pids)} PIDs; refusing to audit a "
-                "partially reconstructed chunk"
-            )
-        candidates[chunk.chunk_id] = Candidate.create(
-            candidate_id=rec["selected_candidate_id"],
-            chunk_id=chunk.chunk_id,
-            role=rec["selected_role"],
-            translation=tuple(text.items()),
-            source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        chunk_id = chunk.chunk_id
+        plan_pids = list(chunk.pids)
+        record = next((r for r in selection_records if r["chunk_id"] == chunk_id), None)
+        status = record.get("status") if record else "incomplete_generation"
+        gen = gen_by_chunk.get(chunk_id)
+        variants = list(gen["candidates"].values()) if gen else []
+        gate_trace = (
+            list(record.get("decision_trace") or record.get("gate_trace") or [])
+            if record else []
         )
-    return candidates
+        available_variants = [
+            {
+                "candidate_id": variant["candidate_id"],
+                "role": variant["role"],
+                "gates_passed": _gates_passed(variant.get("decision_trace", [])),
+            }
+            for variant in variants
+        ]
+
+        row: Dict[str, Any] = {
+            "chunk_id": chunk_id,
+            "plan_pids": plan_pids,
+            "status": "audited" if status == "selected" else status,
+            "committed": status == "selected",
+            "audited_candidate_id": None,
+            "audited_role": None,
+            "best_variant_rule": None,
+            "available_variants": available_variants,
+            "quarantine_reason": record.get("quarantine_reason") if record else None,
+            "gate_trace": gate_trace,
+            "uncovered_pids": plan_pids,
+            # Filled in _run_step6_audit once the audit outcome is known.
+            "audit_status": None,
+        }
+
+        if status == "selected":
+            rec = selected_meta.get(chunk_id)
+            text = selected_text_by_chunk.get(chunk_id)
+            if text is None:
+                raise _IncompleteSelectionError(
+                    f"chunk {chunk_id}: selected in the journal but has no "
+                    "committed translation to audit"
+                )
+            if set(text) != set(chunk.pids):
+                raise _IncompleteSelectionError(
+                    f"chunk {chunk_id}: committed translation covers "
+                    f"{len(text)}/{len(chunk.pids)} PIDs; refusing to audit a "
+                    "partially reconstructed chunk"
+                )
+            candidate = Candidate.create(
+                candidate_id=rec["selected_candidate_id"],
+                chunk_id=chunk_id,
+                role=rec["selected_role"],
+                translation=tuple(text.items()),
+                source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+            )
+            candidates[chunk_id] = candidate
+            row["committed"] = True
+            row["audited_candidate_id"] = candidate.candidate_id
+            row["audited_role"] = candidate.role
+            row["uncovered_pids"] = []
+        elif status == "quarantined":
+            best = _pick_best_variant(variants)
+            if best is not None:
+                try:
+                    candidate = _candidate_from_generation_record(
+                        best, chunk_id=chunk_id, source=source, snapshot=snapshot,
+                        chunk_plan=chunk_plan, config=config,
+                    )
+                except ValueError:
+                    # Our own generation records are validated when written, so
+                    # a reconstruction failure means corrupt/foreign data. The
+                    # audit is diagnostic: cover the chunk as missing rather
+                    # than fabricate or crash the whole chapter audit.
+                    LOG.exception(
+                        "Step 6: best-variant for quarantined chunk %s could not "
+                        "be reconstructed; covering it as missing coverage",
+                        chunk_id,
+                    )
+                    candidate = None
+                if candidate is not None:
+                    candidates[chunk_id] = candidate
+                    row["audited_candidate_id"] = candidate.candidate_id
+                    row["audited_role"] = candidate.role
+                    row["best_variant_rule"] = BEST_VARIANT_RULE
+                    row["uncovered_pids"] = []
+
+        handoff_rows.append(row)
+
+    return candidates, handoff_rows
+
+
+def _fill_audit_status(
+    handoff_rows: List[Dict[str, Any]],
+    *,
+    candidates: Mapping[str, Candidate],
+    outcome: Any,
+) -> None:
+    """Tag every handoff row with its per-chunk ``audit_status``.
+
+    Values (see ``_audit_candidate_map`` docstring):
+
+      * ``no_candidate`` — chunk has no auditable candidate; deterministic
+        ``missing`` coverage only (no model unit existed to fail).
+      * ``unit_failed`` — at least one (chunk, detector) model unit failed;
+        the audit for this chunk is incomplete, so it is NOT ``clean`` even
+        if ``uncovered_pids`` is empty.
+      * ``findings_present`` — both model units succeeded and at least one
+        finding (any detector) was recorded for the chunk.
+      * ``clean`` — both model units succeeded with no findings.
+
+    ``audit_status`` is orthogonal to the row's ``status``: a quarantined
+    chunk whose best-variant audited clean stays ``status="quarantined"``
+    with ``audit_status="clean"`` (diagnostic, not acceptance).
+    """
+    failed_by_chunk = {unit[0] for unit in outcome.failed_units}
+    for row in handoff_rows:
+        chunk_id = row["chunk_id"]
+        if row["audited_candidate_id"] is None or chunk_id not in candidates:
+            row["audit_status"] = "no_candidate"
+        elif chunk_id in failed_by_chunk:
+            row["audit_status"] = "unit_failed"
+        elif any(finding.chunk_id == chunk_id for finding in outcome.store):
+            row["audit_status"] = "findings_present"
+        else:
+            row["audit_status"] = "clean"
 
 
 def _audit_cache_path(out_dir: Path) -> Path:
@@ -373,6 +601,114 @@ def _audit_findings_path(out_dir: Path) -> Path:
     return out_dir / "audit_findings.json"
 
 
+def _b2_handoff_path(out_dir: Path) -> Path:
+    return out_dir / "b2_handoff.json"
+
+
+def _generation_outcomes_path(out_dir: Path) -> Path:
+    return out_dir / "generation_outcomes.json"
+
+
+def _selection_meta_path(out_dir: Path) -> Path:
+    return out_dir / "selection_meta.json"
+
+
+def _merge_selection_meta(
+    out_dir: Path,
+    current_records: List[Dict[str, Any]],
+    *,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+) -> List[Dict[str, Any]]:
+    """Merge the persisted ``selection_meta.json`` with this session's records.
+
+    ``selection_meta.json`` is the cumulative per-chunk selection sidecar that
+    survives resume (same lifecycle as ``generation_outcomes.json``). The
+    journal (v1) does not persist ``quarantine_reason``/``synthesis_reason``,
+    so without this sidecar a resumed run's Step 6 handoff would silently
+    record ``quarantine_reason=None`` for quarantined chunks of earlier
+    sessions (review PR #108, issue 2). This merge also fixes the
+    ``selection_results.json`` reconstruction gap recorded in ``DECISIONS.md``
+    2026-08-01: prior sessions' rich records are restored.
+
+    Precedence: the persisted record wins for a chunk that was **resumed**
+    (its current-session journal-derived entry is only a stub), while a chunk
+    actually processed in this session overrides its prior record.
+    """
+    path = _selection_meta_path(out_dir)
+    prior: List[Dict[str, Any]] = []
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != SELECTION_META_SCHEMA:
+            raise ValueError(
+                f"Foreign identity: selection_meta schema={payload.get('schema')!r}"
+            )
+        if (
+            payload.get("snapshot_hash") != snapshot.snapshot_hash
+            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or payload.get("config_identity") != config.config_identity
+        ):
+            raise ValueError(
+                "Foreign identity: selection_meta.json was written under a "
+                "different snapshot/plan/config than this run -- refusing to "
+                "mix selection records across runs."
+            )
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise ValueError("selection_meta.json: records must be an array")
+        prior = records
+    merged = {rec.get("chunk_id"): rec for rec in prior if rec.get("chunk_id")}
+    for rec in current_records:
+        if rec.get("chunk_id") and not rec.get("resumed"):
+            merged[rec["chunk_id"]] = rec
+    return [merged[chunk.chunk_id] for chunk in chunk_plan.chunks if chunk.chunk_id in merged]
+
+
+def _merge_generation_outcomes(
+    out_dir: Path,
+    current_records: List[Dict[str, Any]],
+    *,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+) -> List[Dict[str, Any]]:
+    """Merge the persisted ``generation_outcomes.json`` with this session's
+    records so Step 6 can select best-variants for quarantined chunks of
+    *previous* sessions too.
+
+    Resume only appends records for chunks processed in the current session,
+    so without this the quarantined chunks of earlier sessions would have no
+    recoverable variants and would silently degrade to ``missing`` coverage.
+    The final write below persists the merged list, making the file cumulative
+    across resumes (fixes the ``generation_outcomes.json`` reconstruction gap
+    recorded in ``DECISIONS.md`` 2026-08-01).
+    """
+    path = _generation_outcomes_path(out_dir)
+    prior: List[Dict[str, Any]] = []
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            payload.get("snapshot_hash") != snapshot.snapshot_hash
+            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or payload.get("config_identity") != config.config_identity
+        ):
+            raise ValueError(
+                "Foreign identity: generation_outcomes.json was written under "
+                "a different snapshot/plan/config than this run -- refusing to "
+                "mix generation records across runs."
+            )
+        outcomes = payload.get("outcomes")
+        if not isinstance(outcomes, list):
+            raise ValueError("generation_outcomes.json: outcomes must be an array")
+        prior = outcomes
+    merged = {rec.get("chunk_id"): rec for rec in prior if rec.get("chunk_id")}
+    for rec in current_records:
+        if rec.get("chunk_id"):
+            merged[rec["chunk_id"]] = rec
+    return [merged[chunk.chunk_id] for chunk in chunk_plan.chunks if chunk.chunk_id in merged]
+
+
 def _load_audit_cache(
     path: Path, *, chapter_hash: str, snapshot_hash: str,
     chunk_plan_hash: str, config_identity: str,
@@ -380,11 +716,24 @@ def _load_audit_cache(
 ) -> Optional[AuditCache]:
     """Reload a previously persisted audit cache, refusing foreign identity.
 
-    An audit cache written under a different snapshot/plan/config/backend or
-    a different assembled chapter must never be mixed into this run — the
-    unit-hash reuse would otherwise silently serve another run's findings.
-    ``backend_identity_hashes`` accepts every hash this config considers
-    resumable (e.g. a local config's legacy ``StrictBackendConfig`` hash).
+    Every audit unit is keyed on ``chapter_hash`` + ``chunk_id`` +
+    ``candidate_id`` + detector + policy version, so a cache whose assembled
+    chapter differs cannot serve any unit (every key would miss). Two
+    identities therefore play different roles here:
+
+      * ``backend_identity_hashes`` (every hash this config considers
+        resumable, e.g. a local config's legacy ``StrictBackendConfig`` hash)
+        is the only envelope identity NOT captured by a unit key (the model
+        that produced the findings is not part of the hash) — a cache written
+        under a different backend must be rejected outright, never silently
+        reused.
+      * a ``chapter_hash`` / snapshot / plan / config mismatch means the
+        assembled chapter legitimately changed — e.g. a resumed run commits
+        more chunks than the previous session (auditing a partial chapter
+        before this change produced no cache at all; now a partial audit
+        cache exists and the next resume grows the chapter). Every old unit
+        key misses anyway, so the cache is discarded in favour of a fresh
+        one rather than treated as foreign-data corruption.
     """
     if not path.exists():
         return None
@@ -393,6 +742,13 @@ def _load_audit_cache(
         raise ValueError(
             f"Foreign identity: audit cache schema={payload.get('schema')!r}"
         )
+    if payload.get("backend_identity_hash") not in backend_identity_hashes:
+        raise ValueError(
+            f"Foreign identity: audit cache backend_identity_hash="
+            f"{payload.get('backend_identity_hash')!r}, expected one of "
+            f"{list(backend_identity_hashes)!r} -- refusing to resume against a "
+            "cache written under a different model backend."
+        )
     for field, expected in (
         ("chapter_hash", chapter_hash),
         ("snapshot_hash", snapshot_hash),
@@ -400,17 +756,12 @@ def _load_audit_cache(
         ("config_identity", config_identity),
     ):
         if payload.get(field) != expected:
-            raise ValueError(
-                f"Foreign identity: audit cache {field}={payload.get(field)!r}, "
-                f"expected {expected!r} — refusing to resume against a stale cache."
+            LOG.info(
+                "Audit cache from a different assembled chapter (%s differs); "
+                "all unit keys miss, starting a fresh cache",
+                field,
             )
-    if payload.get("backend_identity_hash") not in backend_identity_hashes:
-        raise ValueError(
-            f"Foreign identity: audit cache backend_identity_hash="
-            f"{payload.get('backend_identity_hash')!r}, expected one of "
-            f"{list(backend_identity_hashes)!r} — refusing to resume against "
-            "a stale cache."
-        )
+            return None
     return AuditCache.from_payload(payload["cache"])
 
 
@@ -424,6 +775,7 @@ def _run_step6_audit(
     det_data: DeterministicGateData,
     selection_records: List[Dict[str, Any]],
     selected_text_by_chunk: Dict[str, Dict[str, str]],
+    generation_records: List[Dict[str, Any]],
     qwen_audit_evaluator: Any,
     gemma_audit_evaluator: Any,
     backend_identity_hash: str,
@@ -431,28 +783,44 @@ def _run_step6_audit(
 ) -> Dict[str, Any]:
     """Run the Step 6 assembled-chapter audit and persist its artifacts.
 
-    Audit runs only when every chunk has a committed selection: the audit
-    contract (``AssembledChapter`` / ``run_chapter_audit``) requires the full
-    chapter plan to be covered by winning candidates, and the strict driver
-    only ever commits a selected candidate. A run with non-selected chunks
-    (halted early, quarantines, needs_synthesis) is recorded as skipped with
-    ``reason="partial_selection"`` — filling those gaps is Phase 4
-    (repair/convergence, out of B1 scope). ``reason="no_selected_chunks"`` is
-    a defense-in-depth branch for a fully-corrupted prior run (no selected
-    chunk at all), and ``reason="incomplete_translation"`` covers the rarer
-    case where a chunk is selected in the journal but its committed text does
-    not cover the chunk's plan PIDs (tampered/partial prior translations).
+    Since the B1 follow-up (owner decision 2026-08-02) the audit runs over
+    **every chunk**: selected chunks use their committed winner, quarantined
+    chunks use the deterministic best-variant among their produced variants
+    (``_audit_candidate_map``), and chunks with no candidate at all
+    (needs_synthesis / incomplete_generation / never-processed) are covered by
+    the deterministic ``missing`` layer without any model unit. The old
+    ``skipped/partial_selection`` branch is gone — a partially selected run is
+    audited exactly like a full one, and ``b2_handoff.json`` (the B2 input
+    contract) records each chunk's true status, including the fact that
+    auditing a quarantined chunk's best-variant is a *diagnosis*, never an
+    acceptance: the chunk stays ``quarantined`` in the handoff even if the
+    variant audited clean.
+
+    ``reason="no_selected_chunks"`` (defense-in-depth) remains for a run with
+    zero candidates at all (no selected chunk and no quarantined chunk with a
+    recoverable variant), and ``reason="incomplete_translation"`` covers the
+    data-integrity case where a chunk is selected in the journal but its
+    committed text does not cover the chunk's plan PIDs (tampered/partial
+    prior translations).
+
+    Each handoff row additionally gets ``audit_status`` (``clean`` /
+    ``findings_present`` / ``unit_failed`` / ``no_candidate``) once the audit
+    outcome is known — so a selected chunk whose Qwen/Gemma unit failed is
+    distinguishable from a clean one without cross-referencing
+    ``audit_findings.json`` (review PR #108, issue 1).
 
     Findings are persisted as a dedicated run artifact via ``FindingStore``
     (append-only evidence, region resolver included); the journal stays v2.
     The ``AuditCache`` is persisted for resume: a resumed run reloads it and
     ``run_chapter_audit`` re-attempts only the unfinished ``(chunk_id,
-    detector)`` units.
+    detector)`` units. ``b2_handoff.json`` is written whenever the audit runs
+    (i.e. whenever at least one candidate exists).
     """
     try:
-        candidates = _selected_candidates(
+        candidates, handoff_chunks = _audit_candidate_map(
             selection_records=selection_records,
             selected_text_by_chunk=selected_text_by_chunk,
+            generation_records=generation_records,
             chunk_plan=chunk_plan, source=source, snapshot=snapshot, config=config,
         )
     except _IncompleteSelectionError as exc:
@@ -462,11 +830,6 @@ def _run_step6_audit(
         }
     if not candidates:
         return {"status": "skipped", "reason": "no_selected_chunks"}
-    if len(candidates) < len(chunk_plan.chunks):
-        return {
-            "status": "skipped", "reason": "partial_selection",
-            "selected_chunks": len(candidates), "total_chunks": len(chunk_plan.chunks),
-        }
 
     chapter = AssembledChapter.assemble(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
@@ -513,14 +876,33 @@ def _run_step6_audit(
     }
     _atomic_write_json(_audit_findings_path(cfg.out_dir), findings_payload)
 
+    _fill_audit_status(handoff_chunks, candidates=candidates, outcome=outcome)
+
+    handoff_payload = {
+        "schema": HANDOFF_SCHEMA,
+        "chapter_id": cfg.chapter_id,
+        "source_hash": source.source_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": backend_identity_hash,
+        "chapter_hash": outcome.chapter_hash,
+        "best_variant_rule": BEST_VARIANT_RULE,
+        "chunks": handoff_chunks,
+    }
+    _atomic_write_json(_b2_handoff_path(cfg.out_dir), handoff_payload)
+
     return {
         "status": outcome.status,
         "chapter_hash": outcome.chapter_hash,
         "finding_count": len(outcome.store),
         "region_count": len(outcome.region_plan),
         "failed_units": [list(unit) for unit in outcome.failed_units],
+        "covered_chunks": len(candidates),
+        "uncovered_chunks": len(chunk_plan.chunks) - len(candidates),
         "audit_cache_path": str(cache_path),
         "audit_findings_path": str(_audit_findings_path(cfg.out_dir)),
+        "b2_handoff_path": str(_b2_handoff_path(cfg.out_dir)),
     }
 
 
@@ -557,10 +939,16 @@ def run_chapter_strict(
     provenance/journal and validated on resume.
 
     After Phase 1-2 completes, Step 6 runs the assembled-chapter audit
-    (``pact_v4.phase3.audit.run_chapter_audit``) over the committed
-    translations; its ``AuditCache``/findings are persisted as dedicated run
-    artifacts and restored on resume (only unfinished ``(chunk_id,
-    detector)`` units are re-attempted).
+    (``pact_v4.phase3.audit.run_chapter_audit``) over **every chunk** (owner
+    decision 2026-08-02): selected chunks use their committed winner,
+    quarantined chunks use the deterministic best-variant among their produced
+    variants (diagnostic only — the chunk stays quarantined), and chunks with
+    no candidate at all are covered by the deterministic ``missing`` layer
+    without any model unit. Its ``AuditCache``/findings and the B2 input
+    contract ``b2_handoff.json`` are persisted as dedicated run artifacts and
+    restored on resume (only unfinished ``(chunk_id, detector)`` units are
+    re-attempted; a chapter that grew across resume sessions simply starts a
+    fresh audit cache, since every old unit key misses).
     """
     if runtime is None:
         if router is None:
@@ -659,6 +1047,11 @@ def run_chapter_strict(
             "chunk_id": entry["chunk_id"], "status": outcome,
             "selected_candidate_id": entry.get("selected_candidate_id"),
             "selected_role": entry.get("selected_role"),
+            # gate_trace is carried from the journal so Step 6's b2_handoff
+            # still shows a resumed chunk's cascade trace; quarantine_reason
+            # is not persisted in the journal (v1), so it stays absent here
+            # and the handoff records it as None for resumed chunks.
+            "gate_trace": list(entry.get("gate_trace") or []),
             "resumed": True,
         })
         if outcome == "selected":
@@ -893,21 +1286,42 @@ def run_chapter_strict(
             LOG.exception("Failed to release runtime at end of Phase 1-2")
 
     # ------------------------------------------------------------------
-    # Step 6: assembled-chapter audit (Phase 3B, DECISIONS 2026-08-01).
-    # Runs after the Phase 1-2 loop, so the audit's lifecycle-aware
-    # evaluators re-acquire models as needed; the detector-outer loop
-    # inside run_chapter_audit batches all Qwen units then all Gemma
-    # units, giving ~1-2 switches for the whole phase. Audit failures
-    # never abort the completed Phase 1-2 run -- they are recorded in the
-    # run record (and, for model/parse failures, as incomplete units).
+    # Step 6: assembled-chapter audit (Phase 3B, DECISIONS 2026-08-01,
+    # owner decision 2026-08-02: audit ALL chunks — best-variant for
+    # quarantine). Runs after the Phase 1-2 loop, so the audit's
+    # lifecycle-aware evaluators re-acquire models as needed; the
+    # detector-outer loop inside run_chapter_audit batches all Qwen units
+    # then all Gemma units, giving ~1-2 switches for the whole phase.
+    # Audit failures never abort the completed Phase 1-2 run -- they are
+    # recorded in the run record (and, for model/parse failures, as
+    # incomplete units).
     # ------------------------------------------------------------------
+    # Step 6 needs the generation records of *every* chunk — including
+    # quarantined chunks from earlier sessions — to pick best-variants, so
+    # merge the persisted generation_outcomes.json with this session's
+    # records. A foreign-identity file raises like the journal check: mixing
+    # generation data across runs would let a stale variant enter the audit.
+    merged_generation_records = _merge_generation_outcomes(
+        cfg.out_dir, generation_records,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
+    # The journal (v1) does not persist quarantine_reason, so merge the
+    # cumulative selection_meta.json sidecar to restore it (and the rest of
+    # the per-chunk selection detail) for chunks journaled in earlier
+    # sessions — without it the handoff would silently lose *why* a resumed
+    # chunk was quarantined (review PR #108, issue 2).
+    merged_selection_records = _merge_selection_meta(
+        cfg.out_dir, selection_records,
+        snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+    )
     events_before_step6 = runtime.event_count()
     step6: Dict[str, Any]
     try:
         step6 = _run_step6_audit(
             cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-            config=config, det_data=det_data, selection_records=selection_records,
+            config=config, det_data=det_data, selection_records=merged_selection_records,
             selected_text_by_chunk=selected_text_by_chunk,
+            generation_records=merged_generation_records,
             qwen_audit_evaluator=qwen_audit_evaluator,
             gemma_audit_evaluator=gemma_audit_evaluator,
             backend_identity_hash=cfg.backend.identity_hash,
@@ -938,11 +1352,13 @@ def run_chapter_strict(
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
 
-    generation_path = cfg.out_dir / "generation_outcomes.json"
+    generation_path = _generation_outcomes_path(cfg.out_dir)
     generation_path.write_text(json.dumps({
         "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
         "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
-        "outcomes": generation_records,
+        # Persist the merged list so a later resume can recover variants for
+        # quarantined chunks of this session too (cumulative across resumes).
+        "outcomes": merged_generation_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # Final write is redundant with the incremental one after each
@@ -952,8 +1368,20 @@ def run_chapter_strict(
     selection_path.write_text(json.dumps({
         "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
         "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
-        "results": selection_records,
+        # Write the merged list so a resumed run's selection_results.json is
+        # as rich as a fresh run's (quarantine_reason, decision_trace, ...).
+        "results": merged_selection_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Cumulative per-chunk selection sidecar (review PR #108, issue 2): the
+    # journal (v1) does not persist quarantine_reason, so without this a later
+    # resume loses *why* a chunk was quarantined. Written after selection and
+    # Step 6, from the same merged list used above.
+    _atomic_write_json(_selection_meta_path(cfg.out_dir), {
+        "schema": SELECTION_META_SCHEMA,
+        "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+        "records": merged_selection_records,
+    })
 
     finished_at = now_fn().isoformat(timespec="seconds")
     runtime_summary = dict(runtime.summary())
@@ -1003,6 +1431,8 @@ def run_chapter_strict(
             "journal": str(journal_path),
             "audit_cache": str(_audit_cache_path(cfg.out_dir)),
             "audit_findings": str(_audit_findings_path(cfg.out_dir)),
+            "b2_handoff": str(_b2_handoff_path(cfg.out_dir)),
+            "selection_meta": str(_selection_meta_path(cfg.out_dir)),
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"

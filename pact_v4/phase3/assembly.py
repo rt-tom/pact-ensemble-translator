@@ -46,6 +46,14 @@ class AssembledChapter:
     owned by exactly one chunk (``validate_full_pid_ownership``). Full PID
     coverage is therefore a structural consequence of successful assembly,
     not a separate check.
+
+    Since the B1 follow-up (owner decision 2026-08-02), assembly accepts a
+    **partial** candidate map: a chunk with no entry in ``candidates`` is
+    simply absent from ``translation`` (its PIDs stay uncovered and the Step 6
+    audit marks them ``missing`` via ``NO_CANDIDATE_MARKER`` in
+    ``pact_v4.phase3.audit``). ``chapter_hash`` stays deterministic — it is
+    recomputed from whatever ``translation`` actually contains, never from the
+    candidate map, so the same partial selection always yields the same hash.
     """
 
     source_hash: str
@@ -87,20 +95,25 @@ class AssembledChapter:
         ``candidates`` maps ``chunk_id -> the winning Candidate for that
         chunk`` (the caller resolves Phase 2C's ``SelectionResult`` to the
         actual candidate object; this module knows nothing about selection).
-        A chunk with no entry in ``candidates`` raises — there is no
-        partial/best-effort assembly. Every candidate is re-validated against
-        the same ``source``/``snapshot``/``chunk_plan``/``config`` (never
-        trusted on identity alone), so a candidate belonging to a foreign
+
+        Since the B1 follow-up (owner decision 2026-08-02) the map may be
+        **partial**: a chunk with no entry is omitted from the assembled
+        ``translation`` (no partial/best-effort text is fabricated for it) and
+        its PIDs are left uncovered for the audit to mark ``missing``. Every
+        candidate that IS supplied is still re-validated against the same
+        ``source``/``snapshot``/``chunk_plan``/``config`` (never trusted on
+        identity alone), so a candidate belonging to a foreign
         snapshot/config cannot silently enter the assembled chapter.
         """
         translation: list = []
         for chunk in chunk_plan.chunks:
             candidate = candidates.get(chunk.chunk_id)
             if candidate is None:
-                raise ValueError(
-                    f"AssembledChapter: no winning candidate supplied for "
-                    f"chunk {chunk.chunk_id!r}"
-                )
+                # Partial map (owner decision 2026-08-02): the chunk has no
+                # auditable candidate. It is omitted from the assembled
+                # translation; the audit covers it via the deterministic
+                # ``missing`` layer instead of fabricating text.
+                continue
             if candidate.chunk_id != chunk.chunk_id:
                 raise ValueError(
                     f"AssembledChapter: candidate {candidate.candidate_id} "
