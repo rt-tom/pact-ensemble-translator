@@ -54,8 +54,10 @@ class ManagedServerError(RuntimeError):
     """Raised for any managed-server lifecycle failure (start/health/stop)."""
 
 
-def _default_http_get(url: str, timeout: float) -> Any:
-    return requests.get(url, timeout=timeout)
+def _default_http_get(
+    url: str, timeout: float, *, auth: Optional[Tuple[str, str]] = None
+) -> Any:
+    return requests.get(url, timeout=timeout, auth=auth)
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,32 @@ class ManagedServerSpec:
     server_version_policy: str = "compatible_minor"
     startup_timeout: float = 120.0
     health_interval: float = 0.5
+
+
+def _build_launch_args(spec: ManagedServerSpec) -> list:
+    """The subprocess args for one managed ``opencode serve``.
+
+    On Windows the ``npx`` shim is ``npx.CMD`` (a batch file): Windows
+    ``CreateProcess`` only resolves ``.exe`` and cannot execute a ``.cmd``
+    directly, so a bare ``Popen(["npx", ...])`` fails with
+    ``[WinError 2]``. The launch is routed through ``cmd.exe /d /s /c``,
+    which performs the ``PATHEXT`` lookup and runs the shim. Non-Windows
+    keeps the direct ``npx`` invocation (a native/scripted binary).
+    """
+    args = [
+        "npx", "-y", f"opencode-ai@{spec.pinned_server_version}",
+        "serve",
+        "--hostname", spec.hostname,
+        "--port", str(spec.port),
+        "--pure",
+    ]
+    if sys.platform == "win32":
+        return [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d", "/s", "/c",
+            *args,
+        ]
+    return args
 
 
 class OpenCodeServerProcess:
@@ -124,10 +152,10 @@ class OpenCodeServerProcess:
     # Health / port ownership (fail-fast, plan §5 / DECISIONS 2026-08-01)
     # ------------------------------------------------------------------
 
-    def _health(self) -> Optional[dict]:
+    def _health(self, *, auth: Optional[Tuple[str, str]] = None) -> Optional[dict]:
         try:
             resp = self._http_get(
-                f"{self.base_url}{_HEALTH_PATH}", timeout=2.0
+                f"{self.base_url}{_HEALTH_PATH}", timeout=2.0, auth=auth
             )
             payload = resp.json()
             return payload if isinstance(payload, dict) else None
@@ -160,13 +188,7 @@ class OpenCodeServerProcess:
         username = DEFAULT_USERNAME
         password = secrets.token_urlsafe(24)
         spec = self._spec
-        args = [
-            "npx", "-y", f"opencode-ai@{spec.pinned_server_version}",
-            "serve",
-            "--hostname", spec.hostname,
-            "--port", str(spec.port),
-            "--pure",
-        ]
+        args = _build_launch_args(spec)
         env = dict(os.environ)
         env["OPENCODE_SERVER_USERNAME"] = username
         env["OPENCODE_SERVER_PASSWORD"] = password
@@ -223,7 +245,7 @@ class OpenCodeServerProcess:
                     f"managed opencode serve exited during startup "
                     f"(code={code}); last probe: {last_error}"
                 )
-            health = self._health()
+            health = self._health(auth=(self._username, self._password))
             if health is not None and health.get("healthy"):
                 version = str(health.get("version") or "")
                 if not version:
@@ -256,10 +278,37 @@ class OpenCodeServerProcess:
             f"{spec.startup_timeout}s; last probe: {last_error}"
         )
 
+    def _kill_tree(self, proc: Any) -> None:
+        """Kill the whole subprocess tree (cmd -> npx -> node) on Windows.
+
+        ``proc`` is the ``cmd.exe`` wrapper Popen; ``terminate()`` on it
+        would kill only cmd, orphaning the ``opencode`` node process which
+        keeps the port bound. ``taskkill /T /F`` kills the entire tree.
+        Non-Windows (and non-``Popen`` fakes in tests) fall back to plain
+        ``terminate`` by the caller.
+        """
+        if (
+            sys.platform == "win32"
+            and isinstance(proc, subprocess.Popen)
+            and proc.poll() is None
+        ):
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except Exception:  # noqa: BLE001 -- best-effort; caller retries below
+                LOG.warning(
+                    "OpenCodeServerProcess: taskkill /T failed for pid %s", proc.pid
+                )
+
     def _force_kill(self) -> None:
         proc, self._proc = self._proc, None
         if proc is None:
             return
+        self._kill_tree(proc)
         if proc.poll() is None:
             proc.terminate()
             try:
@@ -278,6 +327,9 @@ class OpenCodeServerProcess:
         if self._proc is None:
             return
         proc, self._proc = self._proc, None
+        if proc.poll() is not None:
+            return
+        self._kill_tree(proc)
         if proc.poll() is not None:
             return
         proc.terminate()
