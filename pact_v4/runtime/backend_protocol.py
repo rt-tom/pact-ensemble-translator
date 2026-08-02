@@ -81,9 +81,17 @@ class CompletionError(RuntimeError):
 
 
 def _is_secret_name(name: Any) -> bool:
-    """True if a key/query-param name looks like it carries credentials."""
+    """True if a key/query-param name looks like it carries credentials.
+
+    ``token`` is matched only as a *singular whole word* (``api_token``,
+    ``auth_token``): plural ``tokens`` fields such as
+    ``max_output_tokens`` / ``input_tokens`` are sampling/usage settings and
+    must participate in identity, never be stripped as credentials.
+    """
     folded = str(name).casefold().replace("-", "_")
-    return any(token in folded for token in _SECRET_KEY_TOKENS)
+    if "token" in folded.split("_"):
+        return True
+    return any(token in folded for token in _SECRET_KEY_TOKENS if token != "token")
 
 
 def _sanitize_secrets(value: Any) -> Any:
