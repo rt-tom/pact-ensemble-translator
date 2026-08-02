@@ -273,6 +273,22 @@ def test_run_writes_all_artefacts(tmp_path: Path):
         assert path.exists(), f"missing artefact: {path}"
 
 
+def test_local_record_v2_shape(tmp_path: Path):
+    # The v2 record keeps the legacy ``lifecycle`` block for old readers and
+    # adds the generic ``backend`` + ``runtime`` blocks (plan §9.3).
+    cfg = _make_cfg(tmp_path, n_paragraphs=8)
+    result, router = _run(cfg)
+    record = result.record
+    assert record["schema"] == "pact-v4-strict-chapter-trial/v2"
+    assert record["backend"]["kind"] == "local_llama"
+    assert record["backend"]["identity_hash"] == cfg.backend.identity_hash
+    assert record["runtime"]["remote_calls"] is None
+    assert record["runtime"]["local_lifecycle"]["startup_count"] == len(router.switches)
+    # Legacy block equals the runtime block's local_lifecycle.
+    assert record["lifecycle"] == record["runtime"]["local_lifecycle"]
+    assert record["lifecycle"]["restart_count"] == max(0, len(router.switches) - 1)
+
+
 def test_two_low_risk_chunks_restart_count_matches_2n_minus_1(tmp_path: Path):
     # 24 paragraphs -> 2 chunks (same fixture as the draft_runner tests),
     # neither high-risk -> single candidate each, no Gemma preference
