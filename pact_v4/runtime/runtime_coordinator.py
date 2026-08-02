@@ -430,6 +430,14 @@ class CompositeRuntimeCoordinator:
     per-run ordering, deterministic for provenance; the plan's §9.1
     requires the two index families, not a strict wall-clock merge).
     ``summary()`` reports both blocks; ``close()`` closes both.
+
+    ``backend`` (optional, PR 4) is the role-routing ``CompletionBackend``
+    the composite profile owns — the same ``CompositeCompletionBackend``
+    built by ``CompositeBackendConfig.build_runtime`` so the ``Backend*``
+    role adapters can route Phase 1-2/Step 6 calls to the right sub-backend.
+    It is exposed read-only via the ``backend`` property (raises when no
+    backend was attached, so the coordinator can still be constructed as a
+    pure event/telemetry holder as before).
     """
 
     def __init__(
@@ -437,6 +445,7 @@ class CompositeRuntimeCoordinator:
         local: Optional[LocalLifecycleCoordinator],
         remote: Optional[RemoteRuntimeCoordinator],
         descriptor: BackendDescriptor,
+        backend: Optional[CompletionBackend] = None,
     ) -> None:
         if local is None and remote is None:
             raise ValueError(
@@ -445,6 +454,7 @@ class CompositeRuntimeCoordinator:
         self._local = local
         self._remote = remote
         self._descriptor = descriptor
+        self._backend = backend
         self._closed = False
 
     @property
@@ -454,6 +464,15 @@ class CompositeRuntimeCoordinator:
     @property
     def remote(self) -> Optional[RemoteRuntimeCoordinator]:
         return self._remote
+
+    @property
+    def backend(self) -> CompletionBackend:
+        if self._backend is None:
+            raise ValueError(
+                "CompositeRuntimeCoordinator: no composite CompletionBackend "
+                "was attached"
+            )
+        return self._backend
 
     @property
     def backend_descriptor(self) -> BackendDescriptor:

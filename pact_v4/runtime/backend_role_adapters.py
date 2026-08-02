@@ -113,8 +113,20 @@ class BackendModelCaller:
 
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
+        # Generation bundle roles are the template roles ("fidelity_first" /
+        # "balanced_literary"), while tagged configs bind the model under the
+        # plan §8 alias "generator". Resolve either, then fall back to a
+        # "default" binding (PR 4 / C3: makes the plan's config shape work
+        # without forcing every config to duplicate the bundle role names).
+        # The alias is generation-only by design: the other four role
+        # adapters resolve via the v4 gate names ("fidelity_reviewer",
+        # "russian_selector", "qwen_audit", "gemma_audit") which configs bind
+        # verbatim, so they need no alias namespace. If a config ever binds
+        # "fidelity_first"/"balanced_literary" to a different model than
+        # "generator", this lookup honours the bundle role first and the
+        # alias only as a fallback.
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, (bundle.role,)),
+            model_ref=_model_ref_for(self._backend, (bundle.role, "generator")),
             messages=(Message(role="user", content=user_text),),
             max_output_tokens=self._max_tokens,
             temperature=bundle.params.temperature,
