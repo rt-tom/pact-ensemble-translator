@@ -323,6 +323,56 @@ def _parse_model_ref(model_ref: str) -> Tuple[str, str]:
     return parts[0], parts[1]
 
 
+def build_opencode_descriptor(
+    cfg: "OpenCodeServerBackendConfig",
+) -> BackendDescriptor:
+    """Build the backend identity descriptor for an OpenCode config.
+
+    Module-level (not a backend method) so config loaders can compute
+    ``identity_hash`` without constructing a backend / HTTP session.
+    Includes everything that can change the model answer (bindings,
+    adapter/server contract version, endpoint family, agent/system
+    identity, structured-output mode + schema version, effective options,
+    retry policy) and excludes credentials (plan §5.4, §12).
+    """
+    bindings = dict(cfg.model_bindings) or {"default": ""}
+    effective_options = {
+        "server_version_policy": cfg.server_version_policy,
+        "pinned_server_version": cfg.pinned_server_version,
+        "agent": cfg.agent or "server-default",
+        "system_prompt_version": cfg.system_prompt_version,
+        "session_policy": {
+            "scope": cfg.session_scope,
+            "retain_success": cfg.retain_success_sessions,
+            "retain_failed": cfg.retain_failed_sessions,
+        },
+        "tools_disabled": cfg.tools_disabled,
+        "structured_output": {
+            "mode": cfg.structured_output_mode,
+            "schema_version": "pact-json-object/v1",
+            "retry_count": cfg.structured_output_retry_count,
+        },
+        "temperature": cfg.default_temperature,
+        "max_output_tokens": cfg.default_max_output_tokens,
+        "timeout_seconds": cfg.timeout_seconds,
+        "http_retries": cfg.http_retries,
+        "retry_delay_seconds": cfg.retry_delay_seconds,
+        "remote_budget": {
+            "max_requests_per_chapter": cfg.remote_budget.max_requests_per_chapter,
+            "max_retry_requests_per_chapter": cfg.remote_budget.max_retry_requests_per_chapter,
+            "max_wait_seconds_on_rate_limit": cfg.remote_budget.max_wait_seconds_on_rate_limit,
+        },
+    }
+    return BackendDescriptor(
+        kind=KIND_OPENCODE_SERVER,
+        transport_version=cfg.transport_version,
+        endpoint_family=cfg.endpoint_family,
+        public_endpoint=cfg.base_url,
+        model_bindings=bindings,
+        effective_options=effective_options,
+    )
+
+
 def _major_minor(version: str) -> Tuple[int, int]:
     pieces = version.split(".")
     try:
@@ -839,48 +889,7 @@ class OpenCodeServerBackend:
         return self._descriptor
 
     def _build_descriptor(self) -> BackendDescriptor:
-        bindings = dict(self._cfg.model_bindings) or {"default": ""}
-        effective_options = {
-            "server_version_policy": self._cfg.server_version_policy,
-            "pinned_server_version": self._cfg.pinned_server_version,
-            "agent": self._cfg.agent or "server-default",
-            "system_prompt_version": self._cfg.system_prompt_version,
-            "session_policy": {
-                "scope": self._cfg.session_scope,
-                "retain_success": self._cfg.retain_success_sessions,
-                "retain_failed": self._cfg.retain_failed_sessions,
-            },
-            "tools_disabled": self._cfg.tools_disabled,
-            "structured_output": {
-                "mode": self._cfg.structured_output_mode,
-                "schema_version": "pact-json-object/v1",
-                "retry_count": self._cfg.structured_output_retry_count,
-            },
-            "temperature": self._cfg.default_temperature,
-            "max_output_tokens": self._cfg.default_max_output_tokens,
-            "timeout_seconds": self._cfg.timeout_seconds,
-            "http_retries": self._cfg.http_retries,
-            "retry_delay_seconds": self._cfg.retry_delay_seconds,
-            "remote_budget": {
-                "max_requests_per_chapter": (
-                    self._cfg.remote_budget.max_requests_per_chapter
-                ),
-                "max_retry_requests_per_chapter": (
-                    self._cfg.remote_budget.max_retry_requests_per_chapter
-                ),
-                "max_wait_seconds_on_rate_limit": (
-                    self._cfg.remote_budget.max_wait_seconds_on_rate_limit
-                ),
-            },
-        }
-        return BackendDescriptor(
-            kind=KIND_OPENCODE_SERVER,
-            transport_version=self._cfg.transport_version,
-            endpoint_family=self._cfg.endpoint_family,
-            public_endpoint=self._cfg.base_url,
-            model_bindings=bindings,
-            effective_options=effective_options,
-        )
+        return build_opencode_descriptor(self._cfg)
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         if self._closed:
@@ -1187,6 +1196,7 @@ __all__ = [
     "OPENCODE_SYSTEM_PROMPT_VERSION",
     "DEFAULT_SYSTEM_PROMPT",
     "DEFAULT_DISABLED_TOOLS",
+    "build_opencode_descriptor",
     "ERROR_TRANSPORT_TIMEOUT",
     "ERROR_TRANSPORT_NETWORK",
     "ERROR_PROVIDER_429",

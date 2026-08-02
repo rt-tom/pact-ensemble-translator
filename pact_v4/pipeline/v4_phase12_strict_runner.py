@@ -62,12 +62,11 @@ from __future__ import annotations
 
 import json
 import logging
-import statistics
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pact_v4.phase0b.source_html import load_source
 from pact_v4.phase1.chunker import (
@@ -94,7 +93,7 @@ from pact_v4.pipeline._shared_runner_helpers import (
     _risk_for_chunk,
     _serialize_generation_outcome,
 )
-from pact_v4.runtime.model_lifecycle import LifecycleAdapter, ModelRouter, SwitchRecord
+from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
     QWEN_MODEL_KEY,
@@ -103,6 +102,16 @@ from pact_v4.runtime.model_lifecycle_adapters import (
     LifecycleModelCaller,
     LifecycleQwenAuditEvaluator,
     LifecycleQwenEvaluator,
+)
+from pact_v4.runtime.runtime_config import (
+    BackendRuntimeConfig,
+    LocalLlamaBackendConfig,
+    StrictBackendConfig,
+)
+from pact_v4.runtime.runtime_coordinator import (
+    EVENT_KIND_LOCAL_SWITCH,
+    LocalLifecycleCoordinator,
+    RuntimeCoordinator,
 )
 from pact_v4.runtime.snapshot_factory import (
     ChapterMemory,
@@ -113,8 +122,8 @@ from pact_v4.runtime.snapshot_factory import (
 
 LOG = logging.getLogger(__name__)
 
-JOURNAL_SCHEMA = "pact-v4-strict-chapter-trial-journal/v1"
-RECORD_SCHEMA = "pact-v4-strict-chapter-trial/v1"
+JOURNAL_SCHEMA = "pact-v4-strict-chapter-trial-journal/v2"
+RECORD_SCHEMA = "pact-v4-strict-chapter-trial/v2"
 AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
 AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
 HANDOFF_SCHEMA = "pact-v4-step6-b2-handoff/v1"
@@ -127,44 +136,11 @@ NO_LEFT_CONTEXT_SENTINEL = "pact-v4-strict/no-left-context"
 # Config
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class StrictBackendConfig:
-    """Fixed identity for the llama-server backend + per-model server args.
-
-    Deliberately mirrors the SYCL profile validated in Measurement 2
-    (``V4_SINGLE_RESIDENT_DRIVER_ARCHITECTURE_RU.md``, "Результат
-    измерения 2") -- same backend/build, same flags -- so lifecycle
-    numbers from this real chapter trial are comparable to that synthetic
-    benchmark's.
-    """
-
-    exe: Path
-    device: str
-    host: str
-    model_paths: Mapping[str, Path]
-    model_names: Mapping[str, str]
-    server_args: Mapping[str, List[str]]
-    port: int = 8093
-    startup_timeout: float = 240.0
-    unload_timeout: float = 30.0
-
-    @property
-    def identity_hash(self) -> str:
-        """Hash of everything that changes what the models actually do.
-
-        The resume identity check (snapshot/plan/config) says nothing
-        about *which backend/model/flags* produced the committed text --
-        a resume against a journal written under different server_args
-        or model files would silently mix content from two different
-        configurations. Timeouts/port are excluded deliberately: they
-        don't affect model output, only how this process talks to it.
-        """
-        return canonical_json_hash({
-            "exe": str(self.exe), "device": self.device,
-            "model_paths": {k: str(v) for k, v in sorted(self.model_paths.items())},
-            "model_names": dict(sorted(self.model_names.items())),
-            "server_args": {k: list(v) for k, v in sorted(self.server_args.items())},
-        })
+# The historical local-only backend config is now a tagged runtime config
+# (``pact_v4.runtime.runtime_config.LocalLlamaBackendConfig``, plan §9.2).
+# The name ``StrictBackendConfig`` is preserved as an alias so existing
+# imports/tests and old local run configs keep working unchanged.
+StrictBackendConfig = LocalLlamaBackendConfig
 
 
 @dataclass(frozen=True)
@@ -173,7 +149,7 @@ class StrictRunConfig:
     chapter_html_path: Path
     memory_dir: Path
     out_dir: Path
-    backend: StrictBackendConfig
+    backend: BackendRuntimeConfig
     min_chunk_words: int = DEFAULT_MIN_WORDS
     target_chunk_words: int = DEFAULT_TARGET_WORDS
     max_chunk_words: int = DEFAULT_MAX_WORDS
@@ -223,18 +199,12 @@ def build_strict_lifecycle(
     ``run_chapter_strict`` itself so tests can inject fakes instead
     (``tests/pact_v4/pipeline/test_v4_phase12_strict_runner.py``) without
     ever constructing a real ``LifecycleAdapter`` / spawning
-    ``llama-server``.
+    ``llama-server``. The router is built once here and handed to the
+    coordinator; the runner adapters are the lifecycle-aware wrappers over
+    that same router.
     """
-    adapter = LifecycleAdapter(
-        backend.exe, backend.device, backend.host, backend.port,
-        log_dir, backend.model_paths,
-        startup_timeout=backend.startup_timeout, unload_timeout=backend.unload_timeout,
-    )
-    router = ModelRouter(
-        adapter,
-        role_profile_names={GEMMA_MODEL_KEY: "Gemma", QWEN_MODEL_KEY: "Qwen"},
-        role_args=dict(backend.server_args),
-    )
+    runtime = backend.build_runtime(log_dir=log_dir)
+    router = runtime.router
     model_caller = LifecycleModelCaller(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
     qwen_evaluator = LifecycleQwenEvaluator(router, model_name=backend.model_names[QWEN_MODEL_KEY])
     gemma_selector = LifecycleGemmaSelector(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
@@ -268,7 +238,8 @@ class JournalEntry:
     outcome: str  # "selected" | "quarantined" | "needs_synthesis" | "incomplete_generation"
     selected_candidate_id: Optional[str]
     selected_role: Optional[str]
-    switch_indices: List[int]  # indices into the run's flat switches list
+    switch_indices: List[int]  # indices into the run's flat local-switch list
+    backend_event_indices: List[int] = field(default_factory=list)  # indices into the run's flat backend-event list
 
     def to_json(self) -> Dict[str, Any]:
         return {"schema": JOURNAL_SCHEMA, **self.__dict__}
@@ -324,48 +295,12 @@ class StrictChapterRunResult:
     halted_early: bool
     halt_reason: Optional[str]
     resumed_from_index: int
-    switches: List[SwitchRecord]
+    switches: List[Any]
     translations_path: Path
     journal_path: Path
     record_path: Path
     record: Dict[str, Any]
     step6: Dict[str, Any] = field(default_factory=dict)
-
-
-def _percentile(values: List[float], pct: float) -> Optional[float]:
-    if not values:
-        return None
-    s = sorted(values)
-    k = (len(s) - 1) * pct
-    lo = int(k)
-    hi = min(lo + 1, len(s) - 1)
-    if lo == hi:
-        return s[lo]
-    return s[lo] + (s[hi] - s[lo]) * (k - lo)
-
-
-def _switch_aggregates(switches: List[SwitchRecord]) -> Dict[str, Any]:
-    by_model: Dict[str, Dict[str, List[float]]] = {}
-    for sw in switches:
-        bucket = by_model.setdefault(sw.to_model, {
-            "cold_acquire_seconds": [], "unload_seconds": [], "peak_vram_mb": [],
-        })
-        bucket["cold_acquire_seconds"].append(sw.cold_acquire_seconds)
-        if sw.unload_seconds is not None:
-            bucket["unload_seconds"].append(sw.unload_seconds)
-        if sw.peak_vram_mb is not None:
-            bucket["peak_vram_mb"].append(sw.peak_vram_mb)
-    out: Dict[str, Any] = {}
-    for model_key, fields in by_model.items():
-        out[model_key] = {
-            name: {
-                "n": len(values),
-                "median": statistics.median(values) if values else None,
-                "p95": _percentile(values, 0.95),
-            }
-            for name, values in fields.items()
-        }
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -776,7 +711,8 @@ def _merge_generation_outcomes(
 
 def _load_audit_cache(
     path: Path, *, chapter_hash: str, snapshot_hash: str,
-    chunk_plan_hash: str, config_identity: str, backend_identity_hash: str,
+    chunk_plan_hash: str, config_identity: str,
+    backend_identity_hashes: Sequence[str],
 ) -> Optional[AuditCache]:
     """Reload a previously persisted audit cache, refusing foreign identity.
 
@@ -785,10 +721,12 @@ def _load_audit_cache(
     chapter differs cannot serve any unit (every key would miss). Two
     identities therefore play different roles here:
 
-      * ``backend_identity_hash`` is the only envelope identity NOT captured
-        by a unit key (the model that produced the findings is not part of
-        the hash) — a cache written under a different backend must be
-        rejected outright, never silently reused.
+      * ``backend_identity_hashes`` (every hash this config considers
+        resumable, e.g. a local config's legacy ``StrictBackendConfig`` hash)
+        is the only envelope identity NOT captured by a unit key (the model
+        that produced the findings is not part of the hash) — a cache written
+        under a different backend must be rejected outright, never silently
+        reused.
       * a ``chapter_hash`` / snapshot / plan / config mismatch means the
         assembled chapter legitimately changed — e.g. a resumed run commits
         more chunks than the previous session (auditing a partial chapter
@@ -804,12 +742,12 @@ def _load_audit_cache(
         raise ValueError(
             f"Foreign identity: audit cache schema={payload.get('schema')!r}"
         )
-    if payload.get("backend_identity_hash") != backend_identity_hash:
+    if payload.get("backend_identity_hash") not in backend_identity_hashes:
         raise ValueError(
             f"Foreign identity: audit cache backend_identity_hash="
-            f"{payload.get('backend_identity_hash')!r}, expected "
-            f"{backend_identity_hash!r} -- refusing to resume against a cache "
-            "written under a different model backend."
+            f"{payload.get('backend_identity_hash')!r}, expected one of "
+            f"{list(backend_identity_hashes)!r} -- refusing to resume against a "
+            "cache written under a different model backend."
         )
     for field, expected in (
         ("chapter_hash", chapter_hash),
@@ -841,6 +779,7 @@ def _run_step6_audit(
     qwen_audit_evaluator: Any,
     gemma_audit_evaluator: Any,
     backend_identity_hash: str,
+    backend_identity_hashes: Sequence[str],
 ) -> Dict[str, Any]:
     """Run the Step 6 assembled-chapter audit and persist its artifacts.
 
@@ -871,7 +810,7 @@ def _run_step6_audit(
     ``audit_findings.json`` (review PR #108, issue 1).
 
     Findings are persisted as a dedicated run artifact via ``FindingStore``
-    (append-only evidence, region resolver included); the journal stays v1.
+    (append-only evidence, region resolver included); the journal stays v2.
     The ``AuditCache`` is persisted for resume: a resumed run reloads it and
     ``run_chapter_audit`` re-attempts only the unfinished ``(chunk_id,
     detector)`` units. ``b2_handoff.json`` is written whenever the audit runs
@@ -903,7 +842,7 @@ def _run_step6_audit(
         snapshot_hash=snapshot.snapshot_hash,
         chunk_plan_hash=chunk_plan.plan_hash,
         config_identity=config.config_identity,
-        backend_identity_hash=backend_identity_hash,
+        backend_identity_hashes=backend_identity_hashes,
     ) or AuditCache()
 
     outcome = run_chapter_audit(
@@ -974,7 +913,8 @@ def _run_step6_audit(
 def run_chapter_strict(
     cfg: StrictRunConfig,
     *,
-    router: ModelRouter,
+    router: Optional[ModelRouter] = None,
+    runtime: Optional[RuntimeCoordinator] = None,
     model_caller: Any,
     qwen_evaluator: Any,
     gemma_selector: Any,
@@ -984,14 +924,19 @@ def run_chapter_strict(
 ) -> StrictChapterRunResult:
     """Run the strict single-resident driver for one chapter.
 
-    ``router``/``model_caller``/``qwen_evaluator``/``gemma_selector``/
+    ``model_caller``/``qwen_evaluator``/``gemma_selector``/
     ``qwen_audit_evaluator``/``gemma_audit_evaluator`` are injected, exactly
-    like ``run_chapter``'s ``model_caller`` / ``qwen_evaluator`` /
-    ``gemma_selector`` -- this function has no opinion about whether they
+    like ``run_chapter``'s -- this function has no opinion about whether they
     are the real ``Lifecycle*`` wrappers over a live ``llama-server`` (see
-    ``build_strict_lifecycle``) or test stubs over a fake in-memory router.
-    ``cfg.backend`` is still required (it is the identity recorded in
-    provenance/journal), but it is not used to construct anything here.
+    ``build_strict_lifecycle``) or backend-role adapters over an OpenCode
+    server, or test stubs over a fake in-memory router.
+
+    Backend lifecycle is observed through a ``RuntimeCoordinator`` (plan
+    §9.1). ``runtime`` may be supplied directly (remote/composite runs); if
+    omitted, a ``router`` is required and wrapped in a
+    ``LocalLifecycleCoordinator`` (the historical local-only call shape).
+    ``cfg.backend`` is required in both cases: it is the identity recorded in
+    provenance/journal and validated on resume.
 
     After Phase 1-2 completes, Step 6 runs the assembled-chapter audit
     (``pact_v4.phase3.audit.run_chapter_audit``) over **every chunk** (owner
@@ -1005,6 +950,14 @@ def run_chapter_strict(
     re-attempted; a chapter that grew across resume sessions simply starts a
     fresh audit cache, since every old unit key misses).
     """
+    if runtime is None:
+        if router is None:
+            raise ValueError(
+                "run_chapter_strict: either router or runtime must be provided"
+            )
+        runtime = LocalLifecycleCoordinator(
+            router, descriptor=cfg.backend.build_descriptor()
+        )
     now_fn = now or (lambda: datetime.now(timezone.utc))
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     started_at = now_fn().isoformat(timespec="seconds")
@@ -1022,7 +975,7 @@ def run_chapter_strict(
         chapter_id=cfg.chapter_id, source=source, memory=memory,
         context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
     )
-    config = cfg.to_config_artifact(model_profile=cfg.backend.model_names[GEMMA_MODEL_KEY])
+    config = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
     planner = ChunkPlanner(
         target_words=cfg.target_chunk_words, min_words=cfg.min_chunk_words,
         max_words=cfg.max_chunk_words,
@@ -1058,13 +1011,13 @@ def run_chapter_strict(
     incomplete_generation_count = 0
     generation_records: List[Dict[str, Any]] = []
     selection_records: List[Dict[str, Any]] = []
-    all_switches: List[SwitchRecord] = []
 
+    acceptable_backend_hashes = list(cfg.backend.acceptable_identity_hashes())
     for entry in prior_entries:
         if entry.get("snapshot_hash") != snapshot.snapshot_hash or \
                 entry.get("chunk_plan_hash") != chunk_plan.plan_hash or \
                 entry.get("config_identity") != config.config_identity or \
-                entry.get("backend_identity_hash") != cfg.backend.identity_hash:
+                entry.get("backend_identity_hash") not in acceptable_backend_hashes:
             raise ValueError(
                 "Foreign identity: journal entry for "
                 f"{entry.get('chunk_id')} was written under a different "
@@ -1162,7 +1115,7 @@ def run_chapter_strict(
                 parent_chunk_id = chunk_plan.chunks[index - 1].chunk_id if index > 0 else None
                 parent_context_state_hash = _left_context_hash(left_context)
 
-                switches_before = len(router.switches)
+                events_before = runtime.event_count()
 
                 outcome = generate_for_chunk(
                     chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
@@ -1191,7 +1144,8 @@ def run_chapter_strict(
                         candidate_ids=list(outcome.candidates.keys()),
                         gate_trace=[], outcome="incomplete_generation",
                         selected_candidate_id=None, selected_role=None,
-                        switch_indices=list(range(switches_before, len(router.switches))),
+                        switch_indices=runtime.local_switch_event_indices(events_before),
+                        backend_event_indices=list(range(events_before, runtime.event_count())),
                     )
                     journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                     journal_file.flush()
@@ -1240,7 +1194,8 @@ def run_chapter_strict(
                         candidate_ids=[c.candidate_id for c in candidates],
                         gate_trace=[], outcome="quarantined",
                         selected_candidate_id=None, selected_role=None,
-                        switch_indices=list(range(switches_before, len(router.switches))),
+                        switch_indices=runtime.local_switch_event_indices(events_before),
+                        backend_event_indices=list(range(events_before, runtime.event_count())),
                     )
                     journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                     journal_file.flush()
@@ -1295,7 +1250,8 @@ def run_chapter_strict(
                     gate_trace=gate_trace, outcome=entry_outcome,
                     selected_candidate_id=result.selected_candidate_id,
                     selected_role=result.selected_role if entry_outcome == "selected" else None,
-                    switch_indices=list(range(switches_before, len(router.switches))),
+                    switch_indices=runtime.local_switch_event_indices(events_before),
+                    backend_event_indices=list(range(events_before, runtime.event_count())),
                 )
                 journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                 journal_file.flush()
@@ -1321,12 +1277,13 @@ def run_chapter_strict(
                     )
                     break
     finally:
-        if router.current_model is not None:
-            try:
-                router.release()
-            except Exception:  # noqa: BLE001
-                LOG.exception("Failed to release resident model at end of run")
-        all_switches = list(router.switches)
+        # Non-terminal release: frees the resident model for a local
+        # single-resident run (re-acquirable by Step 6) and is a no-op for
+        # a remote backend, which must stay open until the very end.
+        try:
+            runtime.release()
+        except Exception:  # noqa: BLE001
+            LOG.exception("Failed to release runtime at end of Phase 1-2")
 
     # ------------------------------------------------------------------
     # Step 6: assembled-chapter audit (Phase 3B, DECISIONS 2026-08-01,
@@ -1357,7 +1314,7 @@ def run_chapter_strict(
         cfg.out_dir, selection_records,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config,
     )
-    switches_before_step6 = len(all_switches)
+    events_before_step6 = runtime.event_count()
     step6: Dict[str, Any]
     try:
         step6 = _run_step6_audit(
@@ -1368,25 +1325,29 @@ def run_chapter_strict(
             qwen_audit_evaluator=qwen_audit_evaluator,
             gemma_audit_evaluator=gemma_audit_evaluator,
             backend_identity_hash=cfg.backend.identity_hash,
+            backend_identity_hashes=acceptable_backend_hashes,
         )
     except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
         LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
         step6 = {"status": "failed", "error": str(exc)}
     finally:
-        if router.current_model is not None:
-            try:
-                router.release()
-            except Exception:  # noqa: BLE001
-                LOG.exception("Failed to release resident model after Step 6 audit")
-        all_switches = list(router.switches)
+        try:
+            runtime.release()
+        except Exception:  # noqa: BLE001
+            LOG.exception("Failed to release runtime after Step 6 audit")
 
     # The audit phase's own lifecycle cost, recorded for run_003-style
     # validation: batching by detector should keep this at ~1-2 switches
     # (one Qwen acquire + one Qwen->Gemma switch) regardless of chunk count.
-    step6_switches = all_switches[switches_before_step6:]
+    # For remote/composite runs the Step 6 "switches" are the local switch
+    # events only (remote call events are aggregated in the runtime block).
+    step6_events = [
+        event for event in runtime.events_since(events_before_step6)
+        if event.kind == EVENT_KIND_LOCAL_SWITCH
+    ]
     step6 = dict(step6)
-    step6["switch_count"] = len(step6_switches)
-    step6["switches"] = [sw.__dict__ for sw in step6_switches]
+    step6["switch_count"] = len(step6_events)
+    step6["switches"] = [event.to_payload() for event in step6_events]
 
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
@@ -1423,6 +1384,11 @@ def run_chapter_strict(
     })
 
     finished_at = now_fn().isoformat(timespec="seconds")
+    runtime_summary = dict(runtime.summary())
+    local_lifecycle = runtime_summary.get("local_lifecycle")
+    remote_calls = runtime_summary.get("remote_calls")
+    backend_block = dict(runtime.backend_descriptor.public_record())
+    backend_block["config_identity_hash"] = cfg.backend.identity_hash
     record: Dict[str, Any] = {
         "schema": RECORD_SCHEMA,
         "run_label": cfg.run_label,
@@ -1434,11 +1400,10 @@ def run_chapter_strict(
             "source_hash": source.source_hash, "snapshot_hash": snapshot.snapshot_hash,
             "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
         },
-        "backend": {
-            "exe": str(cfg.backend.exe), "device": cfg.backend.device,
-            "model_names": dict(cfg.backend.model_names),
-            "model_paths": {k: str(v) for k, v in cfg.backend.model_paths.items()},
-            "server_args": dict(cfg.backend.server_args),
+        "backend": backend_block,
+        "runtime": {
+            "local_lifecycle": local_lifecycle,
+            "remote_calls": remote_calls,
         },
         "operational_policy": {
             "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
@@ -1456,11 +1421,9 @@ def run_chapter_strict(
             "selected_role_counts": dict(selected_role_counts),
         },
         "step6": step6,
-        "lifecycle": {
-            "startup_count": len(all_switches),
-            "restart_count": max(0, len(all_switches) - 1) if all_switches else 0,
-            "switches": [sw.__dict__ for sw in all_switches],
-            "aggregates_by_model": _switch_aggregates(all_switches),
+        "lifecycle": local_lifecycle or {
+            "startup_count": 0, "restart_count": 0,
+            "switches": [], "aggregates_by_model": {},
         },
         "artefacts": {
             "chunk_plan": str(chunk_plan_path), "generation_outcomes": str(generation_path),
@@ -1475,13 +1438,21 @@ def run_chapter_strict(
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # Terminal teardown only at the very end: closes the remote backend /
+    # stops a managed server the runtime started, releases the local router.
+    try:
+        runtime.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close runtime at end of run")
+
     return StrictChapterRunResult(
         chapter_id=cfg.chapter_id, out_dir=cfg.out_dir, chunk_count=len(chunk_plan.chunks),
         processed_count=processed_count, selected_count=sum(selected_role_counts.values()),
         quarantined_count=quarantined_count, needs_synthesis_count=needs_synthesis_count,
         incomplete_generation_count=incomplete_generation_count,
         selected_role_counts=dict(selected_role_counts), halted_early=halted_early,
-        halt_reason=halt_reason, resumed_from_index=resumed_from_index, switches=all_switches,
+        halt_reason=halt_reason, resumed_from_index=resumed_from_index,
+        switches=((local_lifecycle or {}).get("switches") or []),
         translations_path=translations_path, journal_path=journal_path, record_path=record_path,
         record=record, step6=step6,
     )
