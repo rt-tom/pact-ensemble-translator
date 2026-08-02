@@ -13,12 +13,17 @@ instead of a real HTTP client.
 """
 from __future__ import annotations
 
+import inspect
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import PromptBundle
+from pact_v4.pipeline import _shared_runner_helpers
+from pact_v4.pipeline import v4_phase12_sequential_runner
+from pact_v4.pipeline import v4_phase12_strict_runner
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictBackendConfig,
     StrictRunConfig,
@@ -589,3 +594,32 @@ def test_step6_audit_skipped_on_incomplete_translation(tmp_path: Path):
     assert result.step6["status"] == "skipped"
     assert result.step6["reason"] == "incomplete_translation"
     assert "chunk0001" in result.step6["detail"]
+
+
+def test_runners_do_not_import_helpers_from_draft_runner():
+    """A2 decoupling guard: strict/sequential must not depend on the draft runner.
+
+    ``v4_phase12_draft_runner`` is being demoted to a reference/fixture
+    (strict is the production v4 architecture, ``DECISIONS.md``
+    2026-08-01). The shared helpers now live in
+    ``pact_v4.pipeline._shared_runner_helpers``; if any runner imports them
+    from ``v4_phase12_draft_runner`` again, archiving that fixture would
+    silently break the production driver.
+    """
+    _IMPORT_FROM_DRAFT = re.compile(
+        r"^\s*from\s+pact_v4\.pipeline\.v4_phase12_draft_runner\s+import",
+        re.MULTILINE,
+    )
+    for module in (v4_phase12_sequential_runner, v4_phase12_strict_runner):
+        source = inspect.getsource(module)
+        assert _IMPORT_FROM_DRAFT.search(source) is None, (
+            f"{module.__name__} still imports helpers from v4_phase12_draft_runner"
+        )
+    for name in (
+        "_glossary_entries",
+        "_left_ru_for_chunk",
+        "_record_selection",
+        "_risk_for_chunk",
+        "_serialize_generation_outcome",
+    ):
+        assert hasattr(_shared_runner_helpers, name), name
