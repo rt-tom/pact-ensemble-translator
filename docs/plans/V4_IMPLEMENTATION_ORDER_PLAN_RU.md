@@ -48,18 +48,28 @@ OpenCode-интеграция — отдельная transport-workstream: он�
    `docs/plans/V4_WEAK_SPOT_STRENGTHENING_RU.md`.
 5. **1B**: `degraded_continuity_overlay` + atomic memory promotion/conflict/
    rollback — доработка по мере встраивания batch-first.
+6. **Runner decoupling**: strict- и sequential-runner импортируют приватные
+   хелперы из `draft_runner` (`_left_ru_for_chunk`, `_glossary_entries` и
+   др.); при принятии strict (DECISIONS 2026-08-01) выносим их в общий
+   модуль, `draft_runner` → reference/fixture. Карточка:
+   `docs/plans/V4_RUNNER_SHARED_HELPERS_TASK_RU.md` (A2).
 
 ## 4. Порядок реализации
 
 Три независимых потока. Порядок внутри каждого — по зависимостям; один PR = одна
 workstream-тема, темы не смешивать.
 
-### Поток A — provider boundary (фундамент для Phase 3B/4)
+### Поток A — provider boundary и runner decoupling (фундамент для Phase 3B/4)
 
 - **A1 = PR 1 интеграционного плана**: `CompletionBackend` contracts,
   `LocalOpenAIBackend` поверх текущего `ApiClient`, backend-neutral адаптеры
   (`BackendModelCaller`/`BackendQwenEvaluator`/`BackendGemmaSelector`), нынешние
   `Http*` — compatibility wrappers.
+- **A2 = `docs/plans/V4_RUNNER_SHARED_HELPERS_TASK_RU.md`** (отдельная
+  карточка, не PR интеграционного плана): вынос приватных хелперов из
+  `draft_runner` в общий модуль + фиксация статуса `draft_runner`
+  (reference/fixture) и `sequential_runner` (archive vs regression fixture) —
+  требование решения о strict (DECISIONS 2026-08-01).
 - Gate: local strict tests + chapter fixture неизменны по смыслу.
 
 ### Поток B — достройка quality engine (ядро v4)
@@ -97,6 +107,9 @@ workstream-тема, темы не смешивать.
 - B и C идут параллельно с приоритетом B (ядро качества важнее transport).
 - strict-архитектура — производственная архитектура v4 (решение владельца,
   `DECISIONS.md`); batch-first/sequential остаются экспериментальными.
+- `draft_runner` → reference/fixture, `sequential_runner` → archive vs
+  regression fixture; решение и вынос хелперов — A2 (до архивации любых
+  runner-модулей).
 - Identity/resume, secrets, no silent fallback, transport failure ≠ semantic gate
   failure — по интеграционному плану (§5.4/§10/§12).
 - Phase 6/7 — только после замыкания quality engine и наличия 0D-политики.
