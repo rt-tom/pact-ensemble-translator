@@ -35,10 +35,14 @@ from pact_v4.runtime.backend_protocol import (
 )
 from pact_v4.runtime.gemma_selector import _parse_gemma_preference
 from pact_v4.runtime.prompts_runtime import (
+    GEMMA_AUDIT_V1,
     GEMMA_RUSSIAN_PREFERENCE_V1,
+    QWEN_AUDIT_V1,
     QWEN_FIDELITY_V1,
     ReviewerPrompt,
+    render_gemma_audit_prompt,
     render_gemma_preference_prompt,
+    render_qwen_audit_prompt,
     render_qwen_review_prompt,
 )
 from pact_v4.runtime.qwen_evaluator import (
@@ -242,6 +246,135 @@ class BackendGemmaSelector:
         return _parse_gemma_preference(response.text, valid_candidate_ids=valid_ids)
 
 
+@dataclass(frozen=True)
+class BackendQwenAuditEvaluatorConfig:
+    """Step 6 Qwen audit call settings.
+
+    ``max_tokens`` is the *floor* (the Qwen ``max_tokens`` fix, PR #96):
+    the audit output for a large chunk can be long, and truncation mid-JSON
+    would otherwise surface as a spurious fidelity objection. Per-PID
+    headroom is added on top exactly like the fidelity gate
+    (``TOKENS_PER_PID``), capped at ``MAX_TOKENS_CEILING``.
+    """
+
+    max_tokens: int = 16384
+    template: ReviewerPrompt = QWEN_AUDIT_V1
+    label: str = "phase3/qwen_chapter_audit"
+
+
+class BackendQwenAuditEvaluator:
+    """``pact_v4.phase3.audit.QwenAuditEvaluator`` over a ``CompletionBackend``.
+
+    Transport-only role adapter (V4 A1 pattern): renders the Qwen audit
+    prompt, sends it through ``backend.complete(request)``, and returns the
+    raw assistant text. Issue parsing/validation and per-unit resumability
+    live in ``pact_v4.phase3.audit``, unchanged. A transport failure raises
+    ``CompletionError`` — ``run_chapter_audit`` converts any exception into a
+    failed (resumable) unit, so the audit can never claim ``complete`` on a
+    model failure.
+    """
+
+    def __init__(
+        self,
+        backend: CompletionBackend,
+        *,
+        config: Optional[BackendQwenAuditEvaluatorConfig] = None,
+    ) -> None:
+        self._backend = backend
+        self._config = config or BackendQwenAuditEvaluatorConfig()
+        self._max_tokens = int(self._config.max_tokens)
+
+    @property
+    def backend(self) -> CompletionBackend:
+        return self._backend
+
+    def __call__(
+        self, *, chunk_id: str, source: Mapping[str, str], translation: Mapping[str, str]
+    ) -> str:
+        prompt = render_qwen_audit_prompt(
+            chunk_id=chunk_id,
+            source=dict(source),
+            translation=dict(translation),
+            template=self._config.template,
+        )
+        # Floor (config.max_tokens) + per-PID headroom, capped at
+        # MAX_TOKENS_CEILING — same Qwen max_tokens fix as the fidelity
+        # gate (see qwen_evaluator.py for the rationale).
+        dynamic_max_tokens = min(
+            MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(
+                self._backend, ("qwen_audit", "fidelity_reviewer", "qwen_fidelity")
+            ),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=dynamic_max_tokens,
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+        try:
+            response = self._backend.complete(request)
+        except CompletionError as exc:
+            LOG.error("BackendQwenAuditEvaluator: backend failure: %s", exc)
+            raise
+        return response.text
+
+
+@dataclass(frozen=True)
+class BackendGemmaAuditEvaluatorConfig:
+    max_tokens: int = 4096
+    template: ReviewerPrompt = GEMMA_AUDIT_V1
+    label: str = "phase3/gemma_russian_review"
+
+
+class BackendGemmaAuditEvaluator:
+    """``pact_v4.phase3.audit.GemmaAuditEvaluator`` over a ``CompletionBackend``.
+
+    Russian-only review: never given the English source (spec
+    "Russian-only review без оригинала"), matching the protocol signature
+    exactly. Transport failures raise ``CompletionError`` for
+    ``run_chapter_audit`` to record as a failed unit.
+    """
+
+    def __init__(
+        self,
+        backend: CompletionBackend,
+        *,
+        config: Optional[BackendGemmaAuditEvaluatorConfig] = None,
+    ) -> None:
+        self._backend = backend
+        self._config = config or BackendGemmaAuditEvaluatorConfig()
+        self._max_tokens = int(self._config.max_tokens)
+
+    @property
+    def backend(self) -> CompletionBackend:
+        return self._backend
+
+    def __call__(self, *, chunk_id: str, translation: Mapping[str, str]) -> str:
+        prompt = render_gemma_audit_prompt(
+            chunk_id=chunk_id,
+            translation=dict(translation),
+            template=self._config.template,
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(
+                self._backend, ("gemma_audit", "russian_selector", "gemma_russian_preference")
+            ),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=self._max_tokens,
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+        try:
+            response = self._backend.complete(request)
+        except CompletionError as exc:
+            LOG.error("BackendGemmaAuditEvaluator: backend failure: %s", exc)
+            raise
+        return response.text
+
+
 __all__ = [
     "DEFAULT_MAX_TOKENS",
     "BackendModelCallerConfig",
@@ -250,4 +383,8 @@ __all__ = [
     "BackendQwenEvaluator",
     "BackendGemmaSelectorConfig",
     "BackendGemmaSelector",
+    "BackendQwenAuditEvaluatorConfig",
+    "BackendQwenAuditEvaluator",
+    "BackendGemmaAuditEvaluatorConfig",
+    "BackendGemmaAuditEvaluator",
 ]

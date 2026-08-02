@@ -126,20 +126,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
         run_label="v4-phase12-strict-chapter-trial",
     )
-    router, model_caller, qwen_evaluator, gemma_selector = build_strict_lifecycle(
-        backend, log_dir=args.out_dir / "server_logs",
-    )
+    router, model_caller, qwen_evaluator, gemma_selector, \
+        qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
+            backend, log_dir=args.out_dir / "server_logs",
+        )
     result = run_chapter_strict(
         cfg, router=router, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=qwen_audit_evaluator,
+        gemma_audit_evaluator=gemma_audit_evaluator,
     )
+    step6_status = result.step6.get("status")
+    step6_extra = ""
+    if step6_status not in (None, "complete", "skipped"):
+        failed_units = result.step6.get("failed_units") or []
+        step6_extra = (
+            f" (failed_units={len(failed_units)}, "
+            f"error={result.step6.get('error')!r})"
+        )
     LOG.info(
         "Done: chunks=%d/%d selected=%d quarantined=%d needs_synthesis=%d "
-        "incomplete_generation=%d halted_early=%s restarts=%d wall_clock=%.1fs",
+        "incomplete_generation=%d halted_early=%s restarts=%d wall_clock=%.1fs "
+        "step6=%s%s",
         result.processed_count, result.chunk_count, result.selected_count,
         result.quarantined_count, result.needs_synthesis_count,
         result.incomplete_generation_count, result.halted_early,
         result.record["lifecycle"]["restart_count"], result.record["wall_clock_seconds"],
+        step6_status, step6_extra,
     )
     return 0 if not result.halted_early else 2
 

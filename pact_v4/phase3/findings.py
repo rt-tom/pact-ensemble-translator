@@ -25,7 +25,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Tuple
 
-from pact_v4.phase1.models import Region, canonical_json_hash
+from pact_v4.phase1.models import Region, canonical_json_hash, _require_exact_keys
 
 __all__ = [
     "Finding",
@@ -141,6 +141,47 @@ class Finding:
             "policy_version": self.policy_version,
         }
 
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "Finding":
+        """Reconstruct a ``Finding`` from ``to_payload`` output.
+
+        ``content_hash`` is deliberately not read from the payload: it is
+        recomputed deterministically from content in ``__post_init__``, so a
+        tampered or stale hash in the payload cannot be smuggled in as the
+        finding's identity. ``finding_id`` is preserved when present (it is
+        only auto-derived when empty), keeping the persisted id stable across
+        a resume round-trip.
+        """
+        _require_exact_keys(
+            payload,
+            {
+                "finding_id", "content_hash", "detector", "category", "evidence",
+                "region", "source_id", "snapshot_id", "chunk_id", "candidate_id",
+                "policy_version",
+            },
+            "Finding payload",
+        )
+        region = payload["region"]
+        if not isinstance(region, Mapping):
+            raise ValueError("Finding payload: region must be a JSON object")
+        _require_exact_keys(region, {"pid", "start", "end"}, "Finding payload region")
+        return cls(
+            detector=payload["detector"],
+            category=payload["category"],
+            evidence=payload["evidence"],
+            region=Region(
+                pid=region["pid"],
+                start=region["start"],
+                end=region["end"],
+            ),
+            source_id=payload["source_id"],
+            snapshot_id=payload["snapshot_id"],
+            chunk_id=payload["chunk_id"],
+            candidate_id=payload["candidate_id"],
+            policy_version=payload["policy_version"],
+            finding_id=payload["finding_id"],
+        )
+
 
 @dataclass(frozen=True)
 class FindingStore:
@@ -199,3 +240,30 @@ class FindingStore:
 
     def __iter__(self):
         return iter(self.findings)
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialisable round-trip form (used by the strict driver's Step 6
+        artifact: findings are persisted per run and reloaded on resume)."""
+        return {
+            "expected_snapshot_id": self.expected_snapshot_id,
+            "findings": [finding.to_payload() for finding in self.findings],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "FindingStore":
+        """Rebuild a store from ``to_payload`` output.
+
+        Every finding is re-validated against ``expected_snapshot_id`` on
+        reconstruction (``create``), so a foreign-snapshot finding cannot
+        silently re-enter the store through a stale artifact.
+        """
+        _require_exact_keys(
+            payload, {"expected_snapshot_id", "findings"}, "FindingStore payload"
+        )
+        findings = payload["findings"]
+        if not isinstance(findings, list):
+            raise ValueError("FindingStore payload: findings must be an array")
+        return cls.create(
+            expected_snapshot_id=payload["expected_snapshot_id"],
+            findings=[Finding.from_payload(item) for item in findings],
+        )

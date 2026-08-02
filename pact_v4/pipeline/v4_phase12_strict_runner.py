@@ -85,6 +85,8 @@ from pact_v4.phase1.models import (
 )
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
 from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
+from pact_v4.phase3.assembly import AssembledChapter
+from pact_v4.phase3.audit import AuditCache, run_chapter_audit
 from pact_v4.pipeline.v4_phase12_draft_runner import (
     _glossary_entries,
     _left_ru_for_chunk,
@@ -96,8 +98,10 @@ from pact_v4.runtime.model_lifecycle import LifecycleAdapter, ModelRouter, Switc
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
     QWEN_MODEL_KEY,
+    LifecycleGemmaAuditEvaluator,
     LifecycleGemmaSelector,
     LifecycleModelCaller,
+    LifecycleQwenAuditEvaluator,
     LifecycleQwenEvaluator,
 )
 from pact_v4.runtime.snapshot_factory import (
@@ -111,6 +115,8 @@ LOG = logging.getLogger(__name__)
 
 JOURNAL_SCHEMA = "pact-v4-strict-chapter-trial-journal/v1"
 RECORD_SCHEMA = "pact-v4-strict-chapter-trial/v1"
+AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
+AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
 
 NO_LEFT_CONTEXT_SENTINEL = "pact-v4-strict/no-left-context"
 
@@ -206,12 +212,13 @@ class StrictRunConfig:
 
 def build_strict_lifecycle(
     backend: StrictBackendConfig, *, log_dir: Path,
-) -> Tuple[ModelRouter, Any, Any, Any]:
+) -> Tuple[ModelRouter, Any, Any, Any, Any, Any]:
     """Wire up the real ``llama-server``-backed lifecycle for a live run.
 
-    Returns ``(router, model_caller, qwen_evaluator, gemma_selector)``,
-    the four objects ``run_chapter_strict`` needs injected. Kept separate
-    from ``run_chapter_strict`` itself so tests can inject fakes instead
+    Returns ``(router, model_caller, qwen_evaluator, gemma_selector,
+    qwen_audit_evaluator, gemma_audit_evaluator)``, the six objects
+    ``run_chapter_strict`` needs injected. Kept separate from
+    ``run_chapter_strict`` itself so tests can inject fakes instead
     (``tests/pact_v4/pipeline/test_v4_phase12_strict_runner.py``) without
     ever constructing a real ``LifecycleAdapter`` / spawning
     ``llama-server``.
@@ -229,7 +236,13 @@ def build_strict_lifecycle(
     model_caller = LifecycleModelCaller(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
     qwen_evaluator = LifecycleQwenEvaluator(router, model_name=backend.model_names[QWEN_MODEL_KEY])
     gemma_selector = LifecycleGemmaSelector(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
-    return router, model_caller, qwen_evaluator, gemma_selector
+    qwen_audit_evaluator = LifecycleQwenAuditEvaluator(
+        router, model_name=backend.model_names[QWEN_MODEL_KEY],
+    )
+    gemma_audit_evaluator = LifecycleGemmaAuditEvaluator(
+        router, model_name=backend.model_names[GEMMA_MODEL_KEY],
+    )
+    return router, model_caller, qwen_evaluator, gemma_selector, qwen_audit_evaluator, gemma_audit_evaluator
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +327,7 @@ class StrictChapterRunResult:
     journal_path: Path
     record_path: Path
     record: Dict[str, Any]
+    step6: Dict[str, Any] = field(default_factory=dict)
 
 
 def _percentile(values: List[float], pct: float) -> Optional[float]:
@@ -353,6 +367,220 @@ def _switch_aggregates(switches: List[SwitchRecord]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3B Step 6 audit (assembled-chapter audit), per DECISIONS 2026-08-01
+# ---------------------------------------------------------------------------
+
+# The Step 6 audit reconstructs the winning ``Candidate`` objects from what
+# was actually committed (journal-driven selection records + committed
+# translations). ``Candidate.create`` re-validates every candidate against
+# source/snapshot/plan/config, so a stale or fabricated identity cannot enter
+# the assembled chapter.
+
+
+class _IncompleteSelectionError(ValueError):
+    """A selected chunk's committed translation does not cover its plan PIDs.
+
+    Raised by ``_selected_candidates`` instead of letting ``Candidate.create``
+    fail with a generic ownership ``ValueError``, so the Step 6 audit can
+    report the distinct ``incomplete_translation`` skip reason. Normally
+    unreachable (the strict driver only writes complete per-chunk committed
+    text); it fires when prior translations were tampered or a resume
+    reconstruction came up short of the plan.
+    """
+
+
+def _selected_candidates(
+    *,
+    selection_records: List[Dict[str, Any]],
+    selected_text_by_chunk: Dict[str, Dict[str, str]],
+    chunk_plan: ChunkPlanArtifact,
+    source: Any,
+    snapshot: Any,
+    config: ConfigArtifact,
+) -> Dict[str, Candidate]:
+    """Reconstruct the winning ``Candidate`` per selected chunk."""
+    selected_meta = {
+        rec["chunk_id"]: rec
+        for rec in selection_records
+        if rec.get("status") == "selected" and rec.get("selected_candidate_id")
+    }
+    candidates: Dict[str, Candidate] = {}
+    for chunk in chunk_plan.chunks:
+        rec = selected_meta.get(chunk.chunk_id)
+        if rec is None:
+            continue
+        text = selected_text_by_chunk.get(chunk.chunk_id)
+        if text is None:
+            raise _IncompleteSelectionError(
+                f"chunk {chunk.chunk_id}: selected in the journal but has no "
+                "committed translation to audit"
+            )
+        if set(text) != set(chunk.pids):
+            raise _IncompleteSelectionError(
+                f"chunk {chunk.chunk_id}: committed translation covers "
+                f"{len(text)}/{len(chunk.pids)} PIDs; refusing to audit a "
+                "partially reconstructed chunk"
+            )
+        candidates[chunk.chunk_id] = Candidate.create(
+            candidate_id=rec["selected_candidate_id"],
+            chunk_id=chunk.chunk_id,
+            role=rec["selected_role"],
+            translation=tuple(text.items()),
+            source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        )
+    return candidates
+
+
+def _audit_cache_path(out_dir: Path) -> Path:
+    return out_dir / "audit_cache.json"
+
+
+def _audit_findings_path(out_dir: Path) -> Path:
+    return out_dir / "audit_findings.json"
+
+
+def _load_audit_cache(
+    path: Path, *, chapter_hash: str, snapshot_hash: str,
+    chunk_plan_hash: str, config_identity: str, backend_identity_hash: str,
+) -> Optional[AuditCache]:
+    """Reload a previously persisted audit cache, refusing foreign identity.
+
+    An audit cache written under a different snapshot/plan/config/backend or
+    a different assembled chapter must never be mixed into this run — the
+    unit-hash reuse would otherwise silently serve another run's findings.
+    """
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != AUDIT_CACHE_SCHEMA:
+        raise ValueError(
+            f"Foreign identity: audit cache schema={payload.get('schema')!r}"
+        )
+    for field, expected in (
+        ("chapter_hash", chapter_hash),
+        ("snapshot_hash", snapshot_hash),
+        ("chunk_plan_hash", chunk_plan_hash),
+        ("config_identity", config_identity),
+        ("backend_identity_hash", backend_identity_hash),
+    ):
+        if payload.get(field) != expected:
+            raise ValueError(
+                f"Foreign identity: audit cache {field}={payload.get(field)!r}, "
+                f"expected {expected!r} — refusing to resume against a stale cache."
+            )
+    return AuditCache.from_payload(payload["cache"])
+
+
+def _run_step6_audit(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    det_data: DeterministicGateData,
+    selection_records: List[Dict[str, Any]],
+    selected_text_by_chunk: Dict[str, Dict[str, str]],
+    qwen_audit_evaluator: Any,
+    gemma_audit_evaluator: Any,
+    backend_identity_hash: str,
+) -> Dict[str, Any]:
+    """Run the Step 6 assembled-chapter audit and persist its artifacts.
+
+    Audit runs only when every chunk has a committed selection: the audit
+    contract (``AssembledChapter`` / ``run_chapter_audit``) requires the full
+    chapter plan to be covered by winning candidates, and the strict driver
+    only ever commits a selected candidate. A run with non-selected chunks
+    (halted early, quarantines, needs_synthesis) is recorded as skipped with
+    ``reason="partial_selection"`` — filling those gaps is Phase 4
+    (repair/convergence, out of B1 scope). ``reason="no_selected_chunks"`` is
+    a defense-in-depth branch for a fully-corrupted prior run (no selected
+    chunk at all), and ``reason="incomplete_translation"`` covers the rarer
+    case where a chunk is selected in the journal but its committed text does
+    not cover the chunk's plan PIDs (tampered/partial prior translations).
+
+    Findings are persisted as a dedicated run artifact via ``FindingStore``
+    (append-only evidence, region resolver included); the journal stays v1.
+    The ``AuditCache`` is persisted for resume: a resumed run reloads it and
+    ``run_chapter_audit`` re-attempts only the unfinished ``(chunk_id,
+    detector)`` units.
+    """
+    try:
+        candidates = _selected_candidates(
+            selection_records=selection_records,
+            selected_text_by_chunk=selected_text_by_chunk,
+            chunk_plan=chunk_plan, source=source, snapshot=snapshot, config=config,
+        )
+    except _IncompleteSelectionError as exc:
+        return {
+            "status": "skipped", "reason": "incomplete_translation",
+            "detail": str(exc),
+        }
+    if not candidates:
+        return {"status": "skipped", "reason": "no_selected_chunks"}
+    if len(candidates) < len(chunk_plan.chunks):
+        return {
+            "status": "skipped", "reason": "partial_selection",
+            "selected_chunks": len(candidates), "total_chunks": len(chunk_plan.chunks),
+        }
+
+    chapter = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates=candidates,
+    )
+    cache_path = _audit_cache_path(cfg.out_dir)
+    cache = _load_audit_cache(
+        cache_path,
+        chapter_hash=chapter.chapter_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        chunk_plan_hash=chunk_plan.plan_hash,
+        config_identity=config.config_identity,
+        backend_identity_hash=backend_identity_hash,
+    ) or AuditCache()
+
+    outcome = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
+        qwen_evaluator=qwen_audit_evaluator, gemma_evaluator=gemma_audit_evaluator,
+        det_data=det_data, cache=cache,
+    )
+
+    _atomic_write_json(cache_path, {
+        "schema": AUDIT_CACHE_SCHEMA,
+        "chapter_hash": chapter.chapter_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": backend_identity_hash,
+        "cache": cache.to_payload(),
+    })
+    findings_payload = {
+        "schema": AUDIT_FINDINGS_SCHEMA,
+        "chapter_id": cfg.chapter_id,
+        "source_hash": source.source_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": backend_identity_hash,
+        "chapter_hash": outcome.chapter_hash,
+        "status": outcome.status,
+        "failed_units": [list(unit) for unit in outcome.failed_units],
+        "store": outcome.store.to_payload(),
+        "region_plan": outcome.region_plan.to_payload(),
+    }
+    _atomic_write_json(_audit_findings_path(cfg.out_dir), findings_payload)
+
+    return {
+        "status": outcome.status,
+        "chapter_hash": outcome.chapter_hash,
+        "finding_count": len(outcome.store),
+        "region_count": len(outcome.region_plan),
+        "failed_units": [list(unit) for unit in outcome.failed_units],
+        "audit_cache_path": str(cache_path),
+        "audit_findings_path": str(_audit_findings_path(cfg.out_dir)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main run
 # ---------------------------------------------------------------------------
 
@@ -363,18 +591,26 @@ def run_chapter_strict(
     model_caller: Any,
     qwen_evaluator: Any,
     gemma_selector: Any,
+    qwen_audit_evaluator: Any,
+    gemma_audit_evaluator: Any,
     now: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Run the strict single-resident driver for one chapter.
 
-    ``router``/``model_caller``/``qwen_evaluator``/``gemma_selector`` are
-    injected, exactly like ``run_chapter``'s ``model_caller`` /
-    ``qwen_evaluator`` / ``gemma_selector`` -- this function has no
-    opinion about whether they are the real ``Lifecycle*`` wrappers over
-    a live ``llama-server`` (see ``build_strict_lifecycle``) or test
-    stubs over a fake in-memory router. ``cfg.backend`` is still required
-    (it is the identity recorded in provenance/journal), but it is not
-    used to construct anything here.
+    ``router``/``model_caller``/``qwen_evaluator``/``gemma_selector``/
+    ``qwen_audit_evaluator``/``gemma_audit_evaluator`` are injected, exactly
+    like ``run_chapter``'s ``model_caller`` / ``qwen_evaluator`` /
+    ``gemma_selector`` -- this function has no opinion about whether they
+    are the real ``Lifecycle*`` wrappers over a live ``llama-server`` (see
+    ``build_strict_lifecycle``) or test stubs over a fake in-memory router.
+    ``cfg.backend`` is still required (it is the identity recorded in
+    provenance/journal), but it is not used to construct anything here.
+
+    After Phase 1-2 completes, Step 6 runs the assembled-chapter audit
+    (``pact_v4.phase3.audit.run_chapter_audit``) over the committed
+    translations; its ``AuditCache``/findings are persisted as dedicated run
+    artifacts and restored on resume (only unfinished ``(chunk_id,
+    detector)`` units are re-attempted).
     """
     now_fn = now or (lambda: datetime.now(timezone.utc))
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
@@ -694,6 +930,45 @@ def run_chapter_strict(
                 LOG.exception("Failed to release resident model at end of run")
         all_switches = list(router.switches)
 
+    # ------------------------------------------------------------------
+    # Step 6: assembled-chapter audit (Phase 3B, DECISIONS 2026-08-01).
+    # Runs after the Phase 1-2 loop, so the audit's lifecycle-aware
+    # evaluators re-acquire models as needed; the detector-outer loop
+    # inside run_chapter_audit batches all Qwen units then all Gemma
+    # units, giving ~1-2 switches for the whole phase. Audit failures
+    # never abort the completed Phase 1-2 run -- they are recorded in the
+    # run record (and, for model/parse failures, as incomplete units).
+    # ------------------------------------------------------------------
+    switches_before_step6 = len(all_switches)
+    step6: Dict[str, Any]
+    try:
+        step6 = _run_step6_audit(
+            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config, det_data=det_data, selection_records=selection_records,
+            selected_text_by_chunk=selected_text_by_chunk,
+            qwen_audit_evaluator=qwen_audit_evaluator,
+            gemma_audit_evaluator=gemma_audit_evaluator,
+            backend_identity_hash=cfg.backend.identity_hash,
+        )
+    except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
+        LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
+        step6 = {"status": "failed", "error": str(exc)}
+    finally:
+        if router.current_model is not None:
+            try:
+                router.release()
+            except Exception:  # noqa: BLE001
+                LOG.exception("Failed to release resident model after Step 6 audit")
+        all_switches = list(router.switches)
+
+    # The audit phase's own lifecycle cost, recorded for run_003-style
+    # validation: batching by detector should keep this at ~1-2 switches
+    # (one Qwen acquire + one Qwen->Gemma switch) regardless of chunk count.
+    step6_switches = all_switches[switches_before_step6:]
+    step6 = dict(step6)
+    step6["switch_count"] = len(step6_switches)
+    step6["switches"] = [sw.__dict__ for sw in step6_switches]
+
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
 
@@ -747,6 +1022,7 @@ def run_chapter_strict(
             "incomplete_generation": incomplete_generation_count,
             "selected_role_counts": dict(selected_role_counts),
         },
+        "step6": step6,
         "lifecycle": {
             "startup_count": len(all_switches),
             "restart_count": max(0, len(all_switches) - 1) if all_switches else 0,
@@ -757,6 +1033,8 @@ def run_chapter_strict(
             "chunk_plan": str(chunk_plan_path), "generation_outcomes": str(generation_path),
             "selection_results": str(selection_path), "translations": str(translations_path),
             "journal": str(journal_path),
+            "audit_cache": str(_audit_cache_path(cfg.out_dir)),
+            "audit_findings": str(_audit_findings_path(cfg.out_dir)),
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"
@@ -770,7 +1048,7 @@ def run_chapter_strict(
         selected_role_counts=dict(selected_role_counts), halted_early=halted_early,
         halt_reason=halt_reason, resumed_from_index=resumed_from_index, switches=all_switches,
         translations_path=translations_path, journal_path=journal_path, record_path=record_path,
-        record=record,
+        record=record, step6=step6,
     )
 
 

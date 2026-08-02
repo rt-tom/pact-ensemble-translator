@@ -29,7 +29,14 @@ from typing import Mapping, Optional, Sequence, Tuple
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import PromptBundle
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
+from pact_v4.runtime.backend_role_adapters import (
+    BackendGemmaAuditEvaluator,
+    BackendGemmaAuditEvaluatorConfig,
+    BackendQwenAuditEvaluator,
+    BackendQwenAuditEvaluatorConfig,
+)
 from pact_v4.runtime.gemma_selector import HttpGemmaSelector, HttpGemmaSelectorConfig
+from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 from pact_v4.runtime.model_caller import HttpModelCaller, HttpModelCallerConfig
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.qwen_evaluator import HttpQwenEvaluator, HttpQwenEvaluatorConfig
@@ -115,3 +122,77 @@ class LifecycleGemmaSelector:
     ) -> GateResult:
         self._router.ensure_resident(GEMMA_MODEL_KEY)
         return self._selector(candidates)
+
+
+class LifecycleQwenAuditEvaluator:
+    """``QwenAuditEvaluator`` (Phase 3B Step 6) over the router's Qwen.
+
+    Same single-resident contract as the other ``Lifecycle*`` wrappers: the
+    audit adapters from ``backend_role_adapters`` are transport-neutral, so
+    this wrapper supplies the local ``llama-server`` transport
+    (``LocalOpenAIBackend`` over an ``ApiClient`` pointed at the router's
+    base URL) and ensures Qwen is resident before every call. The strict
+    driver's audit phase pays the batching benefit of
+    ``run_chapter_audit``'s detector-outer loop: one acquire for all Qwen
+    units, then one switch to Gemma for all Gemma units.
+    """
+
+    def __init__(self, router: ModelRouter, *, model_name: str,
+                 config: Optional[BackendQwenAuditEvaluatorConfig] = None):
+        self._router = router
+        cfg = config or BackendQwenAuditEvaluatorConfig()
+        # temperature=0.0, not 0.2: the audit adapters always send
+        # ``request.temperature == 0.0`` (same as the gate evaluations), so
+        # keeping the ApiClientConfig in sync keeps the backend descriptor's
+        # ``effective_options`` honest about what is actually sent.
+        api_config = ApiClientConfig(
+            chat_url=f"{router.base_url}/v1/chat/completions",
+            model=model_name,
+            timeout_seconds=1800.0,
+            context_size=32768,
+            temperature=0.0,
+        )
+        backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
+        self._evaluator = BackendQwenAuditEvaluator(
+            backend,
+            config=BackendQwenAuditEvaluatorConfig(
+                max_tokens=cfg.max_tokens, template=cfg.template, label=cfg.label,
+            ),
+        )
+
+    def __call__(
+        self, *, chunk_id: str, source: Mapping[str, str], translation: Mapping[str, str]
+    ) -> str:
+        self._router.ensure_resident(QWEN_MODEL_KEY)
+        return self._evaluator(chunk_id=chunk_id, source=source, translation=translation)
+
+
+class LifecycleGemmaAuditEvaluator:
+    """``GemmaAuditEvaluator`` (Phase 3B Step 6) over the router's Gemma.
+
+    Russian-only review: the wrapped ``BackendGemmaAuditEvaluator`` is never
+    given the English source.
+    """
+
+    def __init__(self, router: ModelRouter, *, model_name: str,
+                 config: Optional[BackendGemmaAuditEvaluatorConfig] = None):
+        self._router = router
+        cfg = config or BackendGemmaAuditEvaluatorConfig()
+        api_config = ApiClientConfig(
+            chat_url=f"{router.base_url}/v1/chat/completions",
+            model=model_name,
+            timeout_seconds=1800.0,
+            context_size=32768,
+            temperature=0.0,
+        )
+        backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
+        self._evaluator = BackendGemmaAuditEvaluator(
+            backend,
+            config=BackendGemmaAuditEvaluatorConfig(
+                max_tokens=cfg.max_tokens, template=cfg.template, label=cfg.label,
+            ),
+        )
+
+    def __call__(self, *, chunk_id: str, translation: Mapping[str, str]) -> str:
+        self._router.ensure_resident(GEMMA_MODEL_KEY)
+        return self._evaluator(chunk_id=chunk_id, translation=translation)

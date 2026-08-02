@@ -410,3 +410,69 @@ def test_zero_length_region_for_empty_translation_still_groups_by_pid():
     regions = outcome.region_plan.for_pid("p00000")
     assert len(regions) == 1
     assert set(f.content_hash for f in pid_findings) == set(regions[0].finding_content_hashes)
+
+
+# 11. Detector-outer loop order (DECISIONS 2026-08-01): all Qwen units across
+#     the chapter run before any Gemma unit, so a single-resident driver pays
+#     ~1-2 switches for the whole phase instead of ~2N.
+def test_loop_order_batches_by_detector_not_chunk():
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, chapter = _env()
+    order: list = []
+
+    class Qwen:
+        def __call__(self, *, chunk_id, source, translation):
+            order.append(("qwen_chapter_audit", chunk_id))
+            return _issues_json([])
+
+    class Gemma:
+        def __call__(self, *, chunk_id, translation):
+            order.append(("gemma_russian_review", chunk_id))
+            return _issues_json([])
+
+    run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
+        qwen_evaluator=Qwen(), gemma_evaluator=Gemma(),
+    )
+
+    assert order == [
+        ("qwen_chapter_audit", chunk1.chunk_id),
+        ("qwen_chapter_audit", chunk2.chunk_id),
+        ("gemma_russian_review", chunk1.chunk_id),
+        ("gemma_russian_review", chunk2.chunk_id),
+    ]
+
+
+# 12. AuditCache to_payload/from_payload round-trip: a reloaded cache behaves
+#     identically to the original — cached successes are reused, only failed
+#     units are re-attempted (the strict driver persists exactly this payload
+#     and feeds it back in on resume).
+def test_audit_cache_payload_round_trip():
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, chapter = _env()
+    cache = AuditCache()
+    qwen = ScriptedEvaluator({
+        chunk1.chunk_id: [RuntimeError("llama-server timeout")],
+        chunk2.chunk_id: [_issues_json([])],
+    })
+    gemma = _no_issue_evaluator([chunk1.chunk_id, chunk2.chunk_id])
+
+    first = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
+        qwen_evaluator=qwen, gemma_evaluator=gemma, cache=cache,
+    )
+    assert first.status == "incomplete"
+
+    restored = AuditCache.from_payload(cache.to_payload())
+    qwen2 = ScriptedEvaluator({chunk1.chunk_id: [_issues_json([])]})
+    second = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
+        qwen_evaluator=qwen2, gemma_evaluator=gemma, cache=restored,
+    )
+    assert second.status == "complete"
+    assert qwen2.call_count(chunk1.chunk_id) == 1  # only the failed unit re-called
+    assert qwen2.call_count(chunk2.chunk_id) == 0  # success reused from restored cache
+
+
+def test_audit_cache_from_payload_rejects_foreign_schema():
+    import pytest
+    with pytest.raises(ValueError, match="Foreign identity"):
+        AuditCache.from_payload({"schema": "pact-v4-audit-cache/v999", "units": []})
