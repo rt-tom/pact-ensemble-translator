@@ -37,6 +37,7 @@ from pact_v4.phase1.models import canonical_json_hash
 # Backend kinds recognised by the v4 runtime layer.
 KIND_LOCAL_LLAMA = "local_llama"
 KIND_OPENCODE_SERVER = "opencode_server"
+KIND_COMPOSITE = "composite"
 
 # Endpoint families that change how a request/response is interpreted
 # (and therefore belong in backend identity).
@@ -372,6 +373,7 @@ class CompletionBackend(Protocol):
 __all__ = [
     "KIND_LOCAL_LLAMA",
     "KIND_OPENCODE_SERVER",
+    "KIND_COMPOSITE",
     "ENDPOINT_FAMILY_OPENAI_CHAT_COMPLETIONS",
     "JSON_OBJECT_SCHEMA",
     "ALLOWED_REQUEST_OPTIONS",

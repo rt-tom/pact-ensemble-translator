@@ -1,0 +1,300 @@
+"""Managed ``opencode serve`` process lifecycle (V4 C2 / PR 3).
+
+Per the owner's decision (``DECISIONS.md`` 2026-08-01) PACT raises its
+**own** ``opencode serve`` via ``npx -y opencode-ai@<pin> serve`` on a
+separate port, independent of any pin embedded in other tools. This module
+owns exactly that subprocess:
+
+* ``start()`` first runs ``assert_port_free_or_owned`` -- if the configured
+  port is already served, it **fails fast** rather than attaching to or
+  stopping a foreign server;
+* launches ``opencode serve --hostname 127.0.0.1 --port <port> --pure`` with
+  ephemeral basic-auth credentials generated here and injected into the
+  subprocess environment (``OPENCODE_SERVER_USERNAME`` / ``OPENCODE_SERVER_PASSWORD``);
+* health-waits on ``GET /global/health`` (with the adapter's version policy)
+  and returns once the server is ready;
+* ``close()`` stops **only** the process this instance started (never a
+  foreign one).
+
+The credentials are ephemeral per process and are never persisted: the same
+values are returned to the caller so an ``OpenCodeServerBackendConfig`` can
+use them for the HTTP calls (the backend already supports direct
+``username``/``password`` and never serializes them).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
+import requests
+
+from pact_v4.runtime.opencode_backend import (
+    OPENCODE_PINNED_SERVER_VERSION,
+    _version_compatible,
+)
+
+LOG = logging.getLogger(__name__)
+
+DEFAULT_HOSTNAME = "127.0.0.1"
+DEFAULT_USERNAME = "pact"
+
+# Health endpoint payload keys the adapter contract is pinned to (C1,
+# opencode 1.4.7): ``GET /global/health`` -> ``{"healthy": true, "version": "..."}``.
+_HEALTH_PATH = "/global/health"
+
+
+class ManagedServerError(RuntimeError):
+    """Raised for any managed-server lifecycle failure (start/health/stop)."""
+
+
+def _default_http_get(url: str, timeout: float) -> Any:
+    return requests.get(url, timeout=timeout)
+
+
+@dataclass(frozen=True)
+class ManagedServerSpec:
+    """Identity-relevant settings for a managed ``opencode serve``."""
+
+    hostname: str = DEFAULT_HOSTNAME
+    port: int = 4096
+    pinned_server_version: str = OPENCODE_PINNED_SERVER_VERSION
+    server_version_policy: str = "compatible_minor"
+    startup_timeout: float = 120.0
+    health_interval: float = 0.5
+
+
+class OpenCodeServerProcess:
+    """Owns one managed ``opencode serve`` subprocess; never touches others.
+
+    ``popen`` and ``http_get`` are injectable so tests run fully offline
+    (fake process / fake HTTP response) exactly like the backend's
+    injected ``session``.
+    """
+
+    def __init__(
+        self,
+        spec: Optional[ManagedServerSpec] = None,
+        *,
+        log_dir: Optional[Path] = None,
+        popen: Callable[..., Any] = subprocess.Popen,
+        http_get: Optional[Callable[[str, float], Any]] = None,
+    ) -> None:
+        self._spec = spec or ManagedServerSpec()
+        self._log_dir = log_dir
+        self._popen = popen
+        self._http_get = http_get or _default_http_get
+        self._proc: Optional[Any] = None
+        self._username: Optional[str] = None
+        self._password: Optional[str] = None
+        self._closed = False
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self._spec.hostname}:{self._spec.port}"
+
+    @property
+    def credentials(self) -> Tuple[str, str]:
+        """The ephemeral basic-auth pair, valid only for this owned server."""
+        if self._username is None or self._password is None:
+            raise ManagedServerError(
+                "OpenCodeServerProcess: server not started; no credentials yet"
+            )
+        return self._username, self._password
+
+    @property
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._proc.pid if self._proc is not None else None
+
+    # ------------------------------------------------------------------
+    # Health / port ownership (fail-fast, plan §5 / DECISIONS 2026-08-01)
+    # ------------------------------------------------------------------
+
+    def _health(self) -> Optional[dict]:
+        try:
+            resp = self._http_get(
+                f"{self.base_url}{_HEALTH_PATH}", timeout=2.0
+            )
+            payload = resp.json()
+            return payload if isinstance(payload, dict) else None
+        except Exception:  # noqa: BLE001 -- any probe failure == no server yet
+            return None
+
+    def assert_port_free_or_owned(self) -> None:
+        """Fail fast if the configured port is already served by someone else.
+
+        Never attaches to or stops a foreign server: an unowned healthy
+        endpoint on our port is a hard error, not something to adopt.
+        """
+        health = self._health()
+        if health is not None:
+            raise ManagedServerError(
+                f"Port {self._spec.port} is already served by an unowned "
+                f"endpoint (health={health!r}); refusing to attach to or "
+                "stop it."
+            )
+
+    # ------------------------------------------------------------------
+    # Start / stop
+    # ------------------------------------------------------------------
+
+    def start(self) -> "OpenCodeServerProcess":
+        if self._proc is not None:
+            return self
+        self.assert_port_free_or_owned()
+
+        username = DEFAULT_USERNAME
+        password = secrets.token_urlsafe(24)
+        spec = self._spec
+        args = [
+            "npx", "-y", f"opencode-ai@{spec.pinned_server_version}",
+            "serve",
+            "--hostname", spec.hostname,
+            "--port", str(spec.port),
+            "--pure",
+        ]
+        env = dict(os.environ)
+        env["OPENCODE_SERVER_USERNAME"] = username
+        env["OPENCODE_SERVER_PASSWORD"] = password
+
+        stdout_path: Optional[Path] = None
+        stderr_path: Optional[Path] = None
+        if self._log_dir is not None:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            stdout_path = self._log_dir / f"opencode_serve_{stamp}_stdout.log"
+            stderr_path = self._log_dir / f"opencode_serve_{stamp}_stderr.log"
+
+        LOG.info(
+            "Starting managed opencode serve: %s (log dir: %s)",
+            " ".join(args), self._log_dir,
+        )
+        try:
+            self._proc = self._popen(
+                args,
+                env=env,
+                cwd=str(self._log_dir) if self._log_dir is not None else None,
+                stdout=(
+                    open(stdout_path, "w", encoding="utf-8")
+                    if stdout_path is not None else subprocess.DEVNULL
+                ),
+                stderr=(
+                    open(stderr_path, "w", encoding="utf-8")
+                    if stderr_path is not None else subprocess.DEVNULL
+                ),
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                ),
+            )
+        except OSError as exc:
+            self._proc = None
+            raise ManagedServerError(
+                f"failed to start managed opencode serve: {exc}"
+            ) from exc
+        self._username = username
+        self._password = password
+
+        self._wait_healthy()
+        return self
+
+    def _wait_healthy(self) -> None:
+        spec = self._spec
+        t0 = time.monotonic()
+        last_error: Optional[str] = None
+        while time.monotonic() - t0 < spec.startup_timeout:
+            if self._proc is None or self._proc.poll() is not None:
+                code = self._proc.returncode if self._proc is not None else None
+                self._proc = None
+                raise ManagedServerError(
+                    f"managed opencode serve exited during startup "
+                    f"(code={code}); last probe: {last_error}"
+                )
+            health = self._health()
+            if health is not None and health.get("healthy"):
+                version = str(health.get("version") or "")
+                if not version:
+                    last_error = "health reported no version"
+                elif _version_compatible(
+                    version,
+                    policy=spec.server_version_policy,
+                    pinned=spec.pinned_server_version,
+                ):
+                    LOG.info(
+                        "Managed opencode serve ready on %s (version %s, pid %s)",
+                        self.base_url, version, self.pid,
+                    )
+                    return
+                else:
+                    # Fail fast: a healthy server of the wrong version will not
+                    # become compatible by waiting.
+                    self._force_kill()
+                    raise ManagedServerError(
+                        f"managed opencode serve version {version!r} is not "
+                        f"compatible with policy {spec.server_version_policy!r} "
+                        f"pinned to {spec.pinned_server_version!r}"
+                    )
+            else:
+                last_error = "not healthy yet"
+            time.sleep(spec.health_interval)
+        self._force_kill()
+        raise ManagedServerError(
+            f"managed opencode serve did not become ready within "
+            f"{spec.startup_timeout}s; last probe: {last_error}"
+        )
+
+    def _force_kill(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def close(self) -> None:
+        """Stop only the server this instance started (idempotent)."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._proc is None:
+            return
+        proc, self._proc = self._proc, None
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except Exception:  # noqa: BLE001 -- best-effort teardown
+            try:
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception:  # noqa: BLE001
+                LOG.warning("OpenCodeServerProcess: failed to stop pid %s", proc.pid)
+
+
+__all__ = [
+    "DEFAULT_HOSTNAME",
+    "DEFAULT_USERNAME",
+    "ManagedServerError",
+    "ManagedServerSpec",
+    "OpenCodeServerProcess",
+]
