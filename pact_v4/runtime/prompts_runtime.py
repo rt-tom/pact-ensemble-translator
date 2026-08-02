@@ -85,6 +85,79 @@ GEMMA_RUSSIAN_PREFERENCE_V1 = ReviewerPrompt(
 )
 
 
+# Phase 3B Step 6 audit prompts. The output schema (a JSON object with an
+# ``issues`` array of ``{pid, category, note, excerpt?}``) and the category
+# sets are the contract enforced by ``pact_v4.phase3.audit``'s
+# ``_parse_issues`` — Qwen's allowed categories are
+# ``QWEN_AUDIT_CATEGORIES``, Gemma's ``GEMMA_AUDIT_CATEGORIES``. Wording
+# changes here must bump the version so provenance propagates (the
+# ``policy_version`` tags on the produced findings are separate frozen
+# strings in ``pact_v4.phase3.audit``).
+
+# Qwen EN<->RU fidelity (source + translation both visible). The prompt
+# instructs Qwen to consider idioms/numbers/names/ты-вы while judging
+# fidelity, but issues are still reported under the four allowed
+# categories (omission/addition/referent/scene) — the parser rejects any
+# other category.
+QWEN_AUDIT_V1 = ReviewerPrompt(
+    role="qwen_chapter_audit",
+    version="pact-v4-reviewer-qwen-audit/v1",
+    instructions=(
+        "You are a strict fidelity auditor for a Russian translation of an "
+        "English fiction chapter. You are given one chunk as two ordered PID "
+        "maps: SOURCE (PID -> English text) and TRANSLATION (PID -> Russian "
+        "text, same PIDs in the same order). Judge whether the translation "
+        "preserves the source: meaning, register, negation scope, named "
+        "entities, referents, numeric values, idioms, and ты/вы usage. For "
+        "every problem you find, report one issue. Return STRICT JSON, no "
+        "markdown fences, no commentary, with exactly this schema:\n"
+        "  issues: array of objects, each with:\n"
+        "    pid: string (the PID the issue is in)\n"
+        "    category: exactly one of\n"
+        "      'omission' — a source element (word, clause, name, number, "
+        "idiom) is missing from the translation\n"
+        "      'addition' — content not present in the source was introduced\n"
+        "      'referent' — a pronoun/referent/named entity is wrong or "
+        "ambiguous\n"
+        "      'scene' — scene, narrative voice, register or continuity "
+        "drift versus the source\n"
+        "    note: short string describing the problem\n"
+        "    excerpt: optional short quoted fragment from the translation\n"
+        "Do not include any other keys. If the chunk is faithful, return "
+        '{"issues": []}.'
+    ),
+)
+
+
+# Gemma Russian-only review (spec: "Russian-only review без оригинала").
+# Never given the source — same contract as ``GemmaAuditEvaluator``.
+GEMMA_AUDIT_V1 = ReviewerPrompt(
+    role="gemma_russian_review",
+    version="pact-v4-reviewer-gemma-audit/v1",
+    instructions=(
+        "You are a Russian-language editor reviewing one chunk of a Russian "
+        "translation. You are given one ordered PID map: TRANSLATION (PID -> "
+        "Russian text). No source text is provided: judge ONLY the Russian on "
+        "naturalness, fluency, register, repetition, dialogue, and ты/вы "
+        "consistency. For every problem you find, report one issue. Return "
+        "STRICT JSON, no markdown fences, no commentary, with exactly this "
+        "schema:\n"
+        "  issues: array of objects, each with:\n"
+        "    pid: string (the PID the issue is in)\n"
+        "    category: exactly one of\n"
+        "      'calque' — unnatural word-for-word English calque\n"
+        "      'register' — inconsistent or wrong register\n"
+        "      'repetition' — unnecessary repeated words or phrases\n"
+        "      'dialogue' — unnatural or inconsistent dialogue phrasing\n"
+        "      'ty_vy' — inconsistent ты/вы address within the chunk\n"
+        "    note: short string describing the problem\n"
+        "    excerpt: optional short quoted fragment\n"
+        "Do not include any other keys. If the chunk is clean, return "
+        '{"issues": []}.'
+    ),
+)
+
+
 # --- Render helpers --------------------------------------------------------
 
 
@@ -118,3 +191,36 @@ def render_gemma_preference_prompt(
         )
     joined = "\n".join(parts) if parts else "(no candidates provided)"
     return f"{template.instructions}\n\n{joined}"
+
+
+def render_qwen_audit_prompt(
+    *,
+    chunk_id: str,
+    source: dict[str, str],
+    translation: dict[str, str],
+    template: ReviewerPrompt = QWEN_AUDIT_V1,
+) -> str:
+    """Render the Qwen Step 6 fidelity-audit request as one user message."""
+    src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
+    tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    return (
+        f"{template.instructions}\n\n"
+        f"CHUNK: {chunk_id}\n\n"
+        f"SOURCE (PID -> English text):\n{src_lines}\n\n"
+        f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
+    )
+
+
+def render_gemma_audit_prompt(
+    *,
+    chunk_id: str,
+    translation: dict[str, str],
+    template: ReviewerPrompt = GEMMA_AUDIT_V1,
+) -> str:
+    """Render the Gemma Russian-only Step 6 review as one user message."""
+    tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    return (
+        f"{template.instructions}\n\n"
+        f"CHUNK: {chunk_id}\n\n"
+        f"TRANSLATION (PID -> Russian text):\n{tr_lines}\n"
+    )

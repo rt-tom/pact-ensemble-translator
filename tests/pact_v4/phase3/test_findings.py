@@ -147,3 +147,47 @@ def test_conflicting_findings_same_region_both_retained():
     # Neither overwrote the other's evidence.
     for f in kept:
         assert f.evidence["verdict"] in ("fidelity issue", "style issue")
+
+
+# 9. Finding.from_payload round-trip: content_hash is recomputed, finding_id
+#    is preserved, and a stale/tampered content_hash is ignored.
+def test_finding_from_payload_round_trip():
+    f = _finding()
+    restored = Finding.from_payload(f.to_payload())
+    assert restored == f
+    assert restored.content_hash == f.content_hash
+    assert restored.finding_id == f.finding_id
+
+
+def test_finding_from_payload_recomputes_content_hash():
+    f = _finding()
+    payload = f.to_payload()
+    payload["content_hash"] = "0" * 64  # tampered; must not be trusted
+    restored = Finding.from_payload(payload)
+    assert restored.content_hash == f.content_hash
+    assert restored.content_hash != payload["content_hash"]
+
+
+def test_finding_from_payload_rejects_bad_shape():
+    with pytest.raises(ValueError):
+        Finding.from_payload({"detector": "x"})
+
+
+def test_finding_store_to_from_payload_round_trip():
+    store = FindingStore.create(SNAPSHOT, [
+        _finding(evidence={"note": "a"}, category="omission"),
+        _finding(evidence={"note": "b"}, category="addition"),
+    ])
+    restored = FindingStore.from_payload(store.to_payload())
+    assert restored.expected_snapshot_id == SNAPSHOT
+    assert len(restored) == len(store)
+    assert {f.content_hash for f in restored} == {f.content_hash for f in store}
+    assert {f.category for f in restored} == {"omission", "addition"}
+
+
+def test_finding_store_from_payload_rejects_foreign_snapshot():
+    store = FindingStore.create(SNAPSHOT, [_finding()])
+    payload = store.to_payload()
+    payload["expected_snapshot_id"] = "some-other-snapshot"
+    with pytest.raises(ForeignIdentityError):
+        FindingStore.from_payload(payload)

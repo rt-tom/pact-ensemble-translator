@@ -25,12 +25,16 @@ from pact_v4.runtime.backend_protocol import (
     Message,
 )
 from pact_v4.runtime.backend_role_adapters import (
+    BackendGemmaAuditEvaluator,
     BackendGemmaSelector,
     BackendModelCaller,
+    BackendQwenAuditEvaluator,
     BackendQwenEvaluator,
 )
 from pact_v4.runtime.prompts_runtime import (
+    render_gemma_audit_prompt,
     render_gemma_preference_prompt,
+    render_qwen_audit_prompt,
     render_qwen_review_prompt,
 )
 
@@ -49,6 +53,8 @@ class ScriptedBackend:
         "generator": "gemma-4-26B",
         "fidelity_reviewer": "qwen-3",
         "russian_selector": "gemma-4-26B",
+        "qwen_audit": "qwen-3",
+        "gemma_audit": "gemma-4-26B",
     }
 
     def __init__(
@@ -248,3 +254,115 @@ def test_gemma_selector_returns_failed_gate_on_completion_error():
     result = selector([("A", {"p1": "Привет."})])
     assert result.passed is False
     assert "API failure" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# BackendQwenAuditEvaluator (Phase 3B Step 6)
+# ---------------------------------------------------------------------------
+
+
+def _audit_source() -> dict:
+    return {"p00001": "The steward opened the door.", "p00002": "Do not forget."}
+
+
+def _audit_translation() -> dict:
+    return {"p00001": "Стюард открыл дверь.", "p00002": "Не забудь."}
+
+
+def test_qwen_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(canned)])
+    evaluator = BackendQwenAuditEvaluator(backend)
+    out = evaluator(
+        chunk_id="chunk0001", source=_audit_source(), translation=_audit_translation()
+    )
+    assert out == canned
+    assert len(backend.requests) == 1
+    request = backend.requests[0]
+    assert len(request.messages) == 1
+    assert request.messages[0].content == render_qwen_audit_prompt(
+        chunk_id="chunk0001", source=_audit_source(), translation=_audit_translation()
+    )
+    assert request.model_ref == "qwen-3"
+    assert request.temperature == 0.0
+    assert request.label == "phase3/qwen_chapter_audit"
+    assert request.response_schema is not None
+
+
+def test_qwen_audit_evaluator_uses_max_tokens_floor_with_per_pid_headroom():
+    # The Qwen max_tokens fix (PR #96) applies to the audit too: the floor
+    # is 16384 and max_tokens scales with chunk size on top of it, capped at
+    # MAX_TOKENS_CEILING -- a large chunk's audit response must not truncate.
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(canned)])
+    evaluator = BackendQwenAuditEvaluator(backend)
+    evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+    request = backend.requests[0]
+    assert request.max_output_tokens >= 16384
+    # 2 PIDs * 128 headroom added to the 16384 floor.
+    assert request.max_output_tokens == 16384 + 128 * 2
+
+
+def test_qwen_audit_evaluator_returns_raw_truncated_json_untouched():
+    # Parsing/validation belongs to run_chapter_audit; the adapter only
+    # transports. A truncated JSON body comes back verbatim so the audit
+    # layer records it as a failed unit (never as "no issues").
+    truncated = '{"issues": [{"pid": "p00001", "category": "omission", "note": "x'
+    backend = ScriptedBackend([_text_response(truncated)])
+    evaluator = BackendQwenAuditEvaluator(backend)
+    assert evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation()) == truncated
+
+
+def test_qwen_audit_evaluator_propagates_completion_error():
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            raise CompletionError("connection refused")
+
+    evaluator = BackendQwenAuditEvaluator(_FailingBackend([]))
+    with pytest.raises(CompletionError, match="connection refused"):
+        evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+
+
+# ---------------------------------------------------------------------------
+# BackendGemmaAuditEvaluator (Phase 3B Step 6)
+# ---------------------------------------------------------------------------
+
+
+def test_gemma_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(canned)])
+    evaluator = BackendGemmaAuditEvaluator(backend)
+    out = evaluator(chunk_id="chunk0001", translation=_audit_translation())
+    assert out == canned
+    request = backend.requests[0]
+    assert request.messages[0].content == render_gemma_audit_prompt(
+        chunk_id="chunk0001", translation=_audit_translation()
+    )
+    assert request.model_ref == "gemma-4-26B"
+    assert request.temperature == 0.0
+    assert request.label == "phase3/gemma_russian_review"
+
+
+def test_gemma_audit_evaluator_never_receives_source():
+    # Spec: "Russian-only review без оригинала". The request prompt must not
+    # carry the source PID map, and the adapter takes no source argument.
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(canned)])
+    evaluator = BackendGemmaAuditEvaluator(backend)
+    evaluator(chunk_id="c", translation=_audit_translation())
+    content = backend.requests[0].messages[0].content
+    assert "SOURCE (PID -> English text)" not in content
+    for pid in _audit_source():
+        # The translation PID map only carries p00001/p00002 anyway, but the
+        # source section is what must be absent.
+        assert f"{pid}: {_audit_source()[pid]}" not in content
+
+
+def test_gemma_audit_evaluator_propagates_completion_error():
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            raise CompletionError("connection refused")
+
+    evaluator = BackendGemmaAuditEvaluator(_FailingBackend([]))
+    with pytest.raises(CompletionError, match="connection refused"):
+        evaluator(chunk_id="c", translation=_audit_translation())

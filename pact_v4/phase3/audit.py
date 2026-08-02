@@ -89,6 +89,7 @@ from pact_v4.phase1.models import (
     SourceArtifact,
     canonical_json_hash,
     validate_json_complete,
+    _require_exact_keys,
 )
 from pact_v4.phase2.cascade import DeterministicGateData
 from pact_v4.phase3.assembly import AssembledChapter
@@ -191,6 +192,61 @@ class AuditCache:
 
     def put(self, unit_hash: str, result: AuditUnitResult) -> None:
         self._store[unit_hash] = result
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialisable round-trip form for the pipeline's on-disk cache.
+
+        Persisting/reloading across process restarts is the pipeline's job
+        (see the module docstring); this gives the strict driver exactly
+        what it needs to do that: an ordered list of ``{unit_hash, ok,
+        error, findings}`` records.
+        """
+        return {
+            "schema": "pact-v4-audit-cache/v1",
+            "units": [
+                {
+                    "unit_hash": unit_hash,
+                    "ok": result.ok,
+                    "error": result.error,
+                    "findings": [finding.to_payload() for finding in result.findings],
+                }
+                for unit_hash, result in sorted(self._store.items())
+            ],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "AuditCache":
+        """Rebuild a cache from ``to_payload`` output.
+
+        The strict driver verifies the enclosing artifact's run identities
+        (chapter/snapshot/plan/config/backend) before feeding this back in,
+        so a cache written under a different run cannot be mixed into this
+        one.
+        """
+        if payload.get("schema") != "pact-v4-audit-cache/v1":
+            raise ValueError(
+                f"Foreign identity: audit-cache schema={payload.get('schema')!r}"
+            )
+        units = payload.get("units")
+        if not isinstance(units, list):
+            raise ValueError("AuditCache payload: units must be an array")
+        cache = cls()
+        for item in units:
+            if not isinstance(item, Mapping):
+                raise ValueError("AuditCache payload: unit entries must be JSON objects")
+            _require_exact_keys(item, {"unit_hash", "ok", "error", "findings"}, "AuditCache unit")
+            findings = item["findings"]
+            if not isinstance(findings, list):
+                raise ValueError("AuditCache payload: unit findings must be an array")
+            cache.put(
+                item["unit_hash"],
+                AuditUnitResult(
+                    ok=bool(item["ok"]),
+                    findings=tuple(Finding.from_payload(f) for f in findings),
+                    error=str(item["error"]),
+                ),
+            )
+        return cache
 
 
 def _candidate_id_for(chunk_id: str, candidates: Mapping[str, Candidate]) -> str:
@@ -479,17 +535,25 @@ def run_chapter_audit(
     all_findings: List[Finding] = list(deterministic_findings)
     failed_units: List[Tuple[str, str, str]] = []
 
-    for chunk in chunk_plan.chunks:
-        candidate_id = _candidate_id_for(chunk.chunk_id, candidates)
-        owned_pids = frozenset(chunk.pids)
-        owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
-        owned_translation = {pid: chapter_map.get(pid, "") for pid in chunk.pids}
+    # Detector-outer, chunk-inner iteration (DECISIONS.md, 2026-08-01): the
+    # audit of one chunk does not depend on the audit of any other chunk
+    # (the whole chapter is already assembled), so batching per detector —
+    # all Qwen units across the chapter, then all Gemma units — is correct
+    # and lets a single-resident driver pay ~1-2 model switches for the
+    # whole phase instead of ~2N. Unit identity is unchanged (per
+    # (chunk_id, detector) unit_hash), so the iteration order is purely a
+    # scheduling decision; cache/resume semantics are identical either way.
+    units: Tuple[Tuple[str, str], ...] = (
+        ("qwen_chapter_audit", qwen_policy_version),
+        ("gemma_russian_review", gemma_policy_version),
+    )
+    for detector, policy_version in units:
+        for chunk in chunk_plan.chunks:
+            candidate_id = _candidate_id_for(chunk.chunk_id, candidates)
+            owned_pids = frozenset(chunk.pids)
+            owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
+            owned_translation = {pid: chapter_map.get(pid, "") for pid in chunk.pids}
 
-        units: Tuple[Tuple[str, str], ...] = (
-            ("qwen_chapter_audit", qwen_policy_version),
-            ("gemma_russian_review", gemma_policy_version),
-        )
-        for detector, policy_version in units:
             unit_hash = _unit_hash(
                 chapter_hash=chapter.chapter_hash,
                 chunk_id=chunk.chunk_id,
