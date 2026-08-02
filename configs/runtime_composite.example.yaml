@@ -23,7 +23,9 @@ backends:
   opencode:
     kind: opencode_server
     server_mode: external
-    base_url: http://127.0.0.1:4096
+    # In managed mode this port must be free (4096 is commonly taken by
+    # other tools' opencode servers, so the example uses 4097).
+    base_url: http://127.0.0.1:4097
     server_version_policy: compatible_minor
     pinned_server_version: 1.4.7
     auth:
