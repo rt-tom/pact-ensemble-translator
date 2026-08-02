@@ -18,19 +18,15 @@ implementation that:
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Mapping, Optional
 
 from pact_v4.phase1.models import GateResult
-from pact_v4.runtime.api_client import ApiClient, ApiClientConfig, ApiClientError
+from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
 from pact_v4.runtime.prompts_runtime import (
     QWEN_FIDELITY_V1,
     ReviewerPrompt,
-    render_qwen_review_prompt,
 )
-
-LOG = logging.getLogger(__name__)
 
 
 # Was 4096 ("well above the worst-case JSON response... below any
@@ -163,7 +159,14 @@ def _parse_qwen_verdict(raw: str) -> GateResult:
 
 
 class HttpQwenEvaluator:
-    """Real ``QwenEvaluator`` backed by ``ApiClient``."""
+    """Compatibility wrapper: real ``QwenEvaluator`` backed by ``ApiClient``.
+
+    Public constructor/property/behaviour are unchanged. Internally it
+    delegates to the backend-neutral ``BackendQwenEvaluator`` over a
+    ``LocalOpenAIBackend`` (the V4 provider boundary). The import is lazy
+    to avoid a module-level cycle (``backend_role_adapters`` imports the
+    parsers from this module).
+    """
 
     def __init__(
         self,
@@ -179,40 +182,29 @@ class HttpQwenEvaluator:
         self._api = api
         self._config = config or HttpQwenEvaluatorConfig(api=api.config, label=api.name)
         self._max_tokens = int(self._config.max_tokens)
+        from pact_v4.runtime.backend_role_adapters import (
+            BackendQwenEvaluator,
+            BackendQwenEvaluatorConfig,
+        )
+        from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
+
+        self._impl = BackendQwenEvaluator(
+            LocalOpenAIBackend(api=api),
+            config=BackendQwenEvaluatorConfig(
+                max_tokens=self._max_tokens,
+                template=self._config.template,
+            ),
+        )
 
     @property
     def api(self) -> ApiClient:
         return self._api
 
+    @property
+    def impl(self) -> "BackendQwenEvaluator":
+        return self._impl
+
     def __call__(
         self, source: Mapping[str, str], translation: Mapping[str, str]
     ) -> GateResult:
-        prompt = render_qwen_review_prompt(
-            source=dict(source),
-            translation=dict(translation),
-            template=self._config.template,
-        )
-        messages = [{"role": "user", "content": prompt}]
-        # Floor (self._max_tokens, from config) + per-PID headroom, capped
-        # at MAX_TOKENS_CEILING. See DEFAULT_MAX_TOKENS/TOKENS_PER_PID's
-        # comments above for why a single static value doesn't fit every
-        # chunk this evaluator gets called with.
-        dynamic_max_tokens = min(
-            MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
-        )
-        try:
-            raw = self._api.complete(
-                messages,
-                max_tokens=dynamic_max_tokens,
-                temperature=0.0,
-                response_format_json=True,
-                label="phase2c/qwen_fidelity",
-            )
-        except ApiClientError as exc:
-            LOG.error("HttpQwenEvaluator: %s API failure: %s", self._api.name, exc)
-            return GateResult(
-                gate="qwen_fidelity",
-                passed=False,
-                detail=f"qwen_fidelity: API failure: {exc}",
-            )
-        return _parse_qwen_verdict(raw)
+        return self._impl(source, translation)
