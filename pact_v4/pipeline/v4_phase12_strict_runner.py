@@ -17,10 +17,9 @@ How this reuses existing code rather than re-implementing it:
 * ``left_context`` assembly (``_left_ru_for_chunk``), glossary parsing
   (``_glossary_entries``), risk pre-screen (``_risk_for_chunk``), and the
   generation/selection serialization helpers are imported from
-  ``pact_v4.pipeline.v4_phase12_draft_runner`` (its "private" leading-
-  underscore names) rather than duplicated. The same tolerance is already
-  established by ``v4_shadow_reselect_two_pass.py``, whose docstring notes
-  it duplicates only *orchestration*, never gate logic.
+  ``pact_v4.pipeline._shared_runner_helpers`` rather than duplicated. The
+  same tolerance is already established by ``v4_shadow_reselect_two_pass.py``,
+  whose docstring notes it duplicates only *orchestration*, never gate logic.
 * Model swapping is delegated to ``pact_v4.runtime.model_lifecycle``
   (``LifecycleAdapter``/``ModelRouter``, the same validated mechanics as
   Measurement 2's bench script) via the ``Lifecycle*`` wrapper adapters in
@@ -87,7 +86,7 @@ from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, selec
 from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
-from pact_v4.pipeline.v4_phase12_draft_runner import (
+from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
     _left_ru_for_chunk,
     _record_selection,

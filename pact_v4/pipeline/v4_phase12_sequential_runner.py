@@ -78,7 +78,7 @@ from pact_v4.phase2.generation import (
     generate_for_chunk,
 )
 from pact_v4.phase2.risk import RiskAssessment, RiskBand, RiskFeature, assess_source_risk
-from pact_v4.pipeline.v4_phase12_draft_runner import _glossary_entries
+from pact_v4.pipeline._shared_runner_helpers import _glossary_entries
 from pact_v4.runtime.snapshot_factory import (
     ChapterMemory,
     build_config_artifact,
@@ -176,7 +176,7 @@ class SequentialSelectConfig:
 def _serialize_candidate(candidate: Candidate) -> Dict[str, Any]:
     """Render one ``Candidate`` with every field its constructor needs.
 
-    Unlike ``v4_phase12_draft_runner._serialize_generation_outcome`` (which
+    Unlike ``_shared_runner_helpers._serialize_generation_outcome`` (which
     only needs enough to describe *what happened* for a human/comparison
     tool reading ``generation_outcomes.json``), this must carry enough to
     reconstruct a real ``Candidate`` object on the ``select`` pass, which
@@ -530,7 +530,7 @@ def _record_selection(
 ) -> Tuple[int, int]:
     """Mutate run-level state for one chunk's ``SelectionResult``.
 
-    Mirrors ``v4_phase12_draft_runner._record_selection`` but takes the
+    Mirrors ``_shared_runner_helpers._record_selection`` but takes the
     candidate-by-role map directly (there is no live ``GenerationOutcome``
     on this pass -- candidates were reconstructed from the bundle).
     Returns ``(quarantined_delta, needs_synthesis_delta)``.
