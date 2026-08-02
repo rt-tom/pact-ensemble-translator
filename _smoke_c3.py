@@ -7,8 +7,11 @@ checks usage/provenance/secrets and prints request/session IDs. This is a
 to the remote provider configured in the profile (plan §12). Confirm the
 acknowledgement below before any model call is made.
 
-This is NOT a quality benchmark (plan §14.5) and not the chapter_046 trial;
-it is the mechanical transport/provenance check that unlocks that trial.
+This is NOT a quality benchmark and NOT a quality gate (plan §14.5): it
+confirms the wire (transport + model calls), the §12 acknowledgement, the
+secrets story, and request/session provenance — not translation quality.
+It is also not the chapter_046 trial; it is the mechanical check that
+unlocks that trial.
 
 Usage (PowerShell, from the repo root):
 

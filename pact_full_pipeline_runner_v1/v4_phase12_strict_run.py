@@ -142,26 +142,35 @@ def build_argparser() -> argparse.ArgumentParser:
 def _load_runtime_config_file(path: Path) -> Any:
     """Parse a ``--runtime-config`` YAML/JSON file into a tagged config.
 
-    JSON is tried first (no extra dependency); YAML is used as a fallback.
-    Secret values are never read here -- only env-var *names* (plan §12).
+    Dispatch by extension so a multi-megabyte YAML profile is not scanned as
+    JSON first: ``.yaml``/``.yml`` go straight to PyYAML, everything else
+    tries JSON and falls back to YAML. Secret values are never read here --
+    only env-var *names* (plan §12).
     """
     raw = path.read_text(encoding="utf-8")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
+    if path.suffix.lower() in (".yaml", ".yml"):
+        payload = _load_yaml(raw, path)
+    else:
         try:
-            import yaml  # type: ignore
-        except ImportError as exc:
-            raise ValueError(
-                f"{path}: looks like YAML but PyYAML is not installed "
-                "(pip install pyyaml) or the file is not valid JSON"
-            ) from exc
-        payload = yaml.safe_load(raw)
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = _load_yaml(raw, path)
     if not isinstance(payload, Mapping):
         raise ValueError(
             f"{path}: runtime config must be a mapping, got {type(payload).__name__}"
         )
     return load_runtime_config(payload)
+
+
+def _load_yaml(raw: str, path: Path) -> Any:
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise ValueError(
+            f"{path}: looks like YAML but PyYAML is not installed "
+            "(pip install pyyaml) or the file is not valid JSON"
+        ) from exc
+    return yaml.safe_load(raw)
 
 
 def force_managed(cfg: Any, *, nested: bool = False) -> Any:
