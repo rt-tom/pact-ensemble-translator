@@ -30,6 +30,7 @@ import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pact_v4.phase1.models import canonical_json_hash
 
@@ -79,20 +80,57 @@ class CompletionError(RuntimeError):
     """
 
 
+def _is_secret_name(name: Any) -> bool:
+    """True if a key/query-param name looks like it carries credentials."""
+    folded = str(name).casefold().replace("-", "_")
+    return any(token in folded for token in _SECRET_KEY_TOKENS)
+
+
 def _sanitize_secrets(value: Any) -> Any:
     """Recursively drop secret-bearing keys from a JSON-like value."""
     if isinstance(value, Mapping):
         return {
             key: _sanitize_secrets(item)
             for key, item in value.items()
-            if not any(
-                token in str(key).casefold().replace("-", "_")
-                for token in _SECRET_KEY_TOKENS
-            )
+            if not _is_secret_name(key)
         }
     if isinstance(value, (list, tuple)):
         return [_sanitize_secrets(item) for item in value]
     return value
+
+
+def _canonical_endpoint(endpoint: str, *, drop_port: bool) -> str:
+    """Canonical form of an endpoint for identity/public records.
+
+    Always strips URL userinfo, secret-looking query parameters and the
+    fragment (plan §12: credentials never serialized). ``drop_port`` is
+    used only for ``local_llama``, whose TCP port does not change the
+    served model. Hostname and path are preserved so a different backend
+    still produces a different identity.
+    """
+    if not endpoint:
+        return ""
+    raw = endpoint if "://" in endpoint else f"http://{endpoint}"
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return endpoint
+    host = parts.hostname or ""
+    if not host:
+        return endpoint
+    if drop_port:
+        netloc = host
+    else:
+        netloc = f"{host}:{parts.port}" if parts.port is not None else host
+    kept = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not _is_secret_name(key)
+    ]
+    query = "&".join(f"{key}={value}" for key, value in kept)
+    return urlunsplit(
+        (parts.scheme or "http", netloc, parts.path or "", query, "")
+    )
 
 
 @dataclass(frozen=True)
@@ -230,10 +268,12 @@ class BackendDescriptor:
 
     ``identity_hash`` is a deterministic sha256 over every field that can
     change the model answer; it is recomputed from content in
-    ``__post_init__`` and never caller-supplied. Credentials and fields
-    that do not affect model behaviour (local TCP port, log paths, display
-    labels) are excluded — API key rotation therefore does not change
-    cache/resume identity.
+    ``__post_init__`` and never caller-supplied. Credentials (and fields
+    that do not affect model behaviour, such as the local TCP port of
+    ``local_llama``) are excluded — API key rotation therefore does not
+    change cache/resume identity. Hostname and path of the endpoint are
+    preserved (canonicalized), so a different backend still gets a
+    different identity.
     """
 
     kind: str
@@ -275,12 +315,16 @@ class BackendDescriptor:
         # Secrets are stripped defensively before hashing: even if a future
         # backend accidentally places an api key / password in
         # effective_options, credential rotation must not change identity
-        # (plan §5.4, §11).
+        # (plan §5.4, §11). The endpoint is canonicalized; the local TCP
+        # port is dropped only for ``local_llama``.
         return {
             "artifact": "pact-v4-backend-descriptor/v1",
             "kind": self.kind,
             "transport_version": self.transport_version,
             "endpoint_family": self.endpoint_family,
+            "endpoint": _canonical_endpoint(
+                self.public_endpoint, drop_port=(self.kind == KIND_LOCAL_LLAMA)
+            ),
             "model_bindings": dict(sorted(self.model_bindings.items())),
             "effective_options": _sanitize_secrets(dict(self.effective_options)),
         }
@@ -291,7 +335,7 @@ class BackendDescriptor:
             "kind": self.kind,
             "transport_version": self.transport_version,
             "endpoint_family": self.endpoint_family,
-            "public_endpoint": self.public_endpoint,
+            "public_endpoint": _canonical_endpoint(self.public_endpoint, drop_port=False),
             "model_bindings": dict(sorted(self.model_bindings.items())),
             "effective_options": _sanitize_secrets(dict(self.effective_options)),
             "identity_hash": self.identity_hash,

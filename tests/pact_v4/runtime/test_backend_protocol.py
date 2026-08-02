@@ -62,10 +62,44 @@ def test_descriptor_identity_changes_with_endpoint_family_and_kind():
     assert a.identity_hash != b.identity_hash
 
 
-def test_descriptor_identity_excludes_local_tcp_port_and_public_endpoint():
+def test_local_llama_identity_excludes_only_tcp_port():
+    # For local_llama the TCP port does not change the served model, so a
+    # port-only change must not change identity.
     a = _descriptor(public_endpoint="http://127.0.0.1:8080/v1/chat/completions")
     b = _descriptor(public_endpoint="http://127.0.0.1:18080/v1/chat/completions")
     assert a.identity_hash == b.identity_hash
+
+
+def test_identity_changes_when_hostname_changes():
+    a = _descriptor(public_endpoint="http://127.0.0.1:8080/v1/chat/completions")
+    b = _descriptor(public_endpoint="http://192.168.1.10:8080/v1/chat/completions")
+    assert a.identity_hash != b.identity_hash
+
+
+def test_identity_changes_when_path_changes():
+    a = _descriptor(public_endpoint="http://127.0.0.1:8080/v1/chat/completions")
+    b = _descriptor(public_endpoint="http://127.0.0.1:8080/v1/chat/completions/extra")
+    assert a.identity_hash != b.identity_hash
+
+
+def test_non_local_identity_includes_port():
+    # A remote endpoint's port is part of its identity (different server).
+    a = _descriptor(kind="opencode_server", public_endpoint="http://10.0.0.5:4096")
+    b = _descriptor(kind="opencode_server", public_endpoint="http://10.0.0.5:4097")
+    assert a.identity_hash != b.identity_hash
+
+
+def test_identity_excludes_secret_query_params_in_endpoint():
+    with_secret = _descriptor(
+        public_endpoint="http://127.0.0.1:8080/v1/chat/completions?api_key=sk-x&session=abc"
+    )
+    same_without_secret = _descriptor(
+        public_endpoint="http://127.0.0.1:8080/v1/chat/completions?session=abc"
+    )
+    # Credential rotation / presence must not change identity; the
+    # non-secret query param still participates.
+    assert with_secret.identity_hash == same_without_secret.identity_hash
+    assert with_secret.identity_hash != _descriptor().identity_hash
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +146,22 @@ def test_public_record_contains_public_identity_fields():
     assert record["transport_version"] == "openai-chat-completions/v1"
     assert record["model_bindings"] == {"default": "gemma-4-26B"}
     assert record["identity_hash"] == _descriptor().identity_hash
+
+
+def test_public_record_strips_endpoint_userinfo_and_secret_query():
+    record = _descriptor(
+        public_endpoint=(
+            "http://user:pass@127.0.0.1:8080/v1/chat/completions"
+            "?api_key=sk-x&tenant=42"
+        )
+    ).public_record()
+    endpoint = record["public_endpoint"]
+    assert "user" not in endpoint and "pass" not in endpoint
+    assert "sk-x" not in endpoint
+    assert "api_key" not in endpoint
+    # Non-secret query params are preserved (they can be part of identity).
+    assert "tenant=42" in endpoint
+    assert "127.0.0.1" in endpoint
 
 
 # ---------------------------------------------------------------------------

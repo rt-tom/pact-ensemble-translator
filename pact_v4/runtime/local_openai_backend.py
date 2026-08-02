@@ -136,6 +136,15 @@ class LocalOpenAIBackend:
                 f"{self._cfg.name}: unsupported request option(s) "
                 f"{sorted(request.request_options)} for LocalOpenAIBackend"
             )
+        actual_model = self._api.config.model
+        if request.model_ref and request.model_ref != actual_model:
+            # The request claims a role→model binding that this backend is
+            # not actually serving. Refuse rather than silently call a
+            # different model (plan: no silent fallback).
+            raise CompletionError(
+                f"{self._cfg.name}: request model_ref {request.model_ref!r} does not "
+                f"match the backend's actual model {actual_model!r}"
+            )
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         started = time.perf_counter()
         try:
@@ -158,22 +167,25 @@ class LocalOpenAIBackend:
         # may not expose ``call_records``, so fall back to defaults.
         calls = getattr(self._api, "call_records", None) or []
         record = calls[-1] if calls else None
+        attempts = getattr(record, "attempt_count", None) if record else None
+        retry_count = max(0, int(attempts) - 1) if attempts else 0
         response = CompletionResponse(
             text=text,
             structured=None,
             provider="local_llama",
-            model=self._api.config.model,
+            model=actual_model,
             finish_reason=record.finish_reason if record else None,
             usage=dict(record.usage) if record else {},
             wall_seconds=round(wall, 3),
             request_id=None,
             session_id=None,
-            retry_count=0,
+            retry_count=retry_count,
             raw_metadata={
                 "http_status": record.http_status if record else None,
                 "response_format_attempted": (
                     record.response_format_attempted if record else None
                 ),
+                "attempt_count": attempts,
                 "request_options": dict(request.request_options),
             },
         )
@@ -183,7 +195,7 @@ class LocalOpenAIBackend:
                 model_ref=request.model_ref,
                 request_id=None,
                 session_id=None,
-                retry_count=0,
+                retry_count=retry_count,
                 finish_reason=response.finish_reason,
                 usage=response.usage,
                 wall_seconds=response.wall_seconds,

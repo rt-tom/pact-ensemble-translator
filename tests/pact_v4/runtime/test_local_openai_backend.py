@@ -78,7 +78,7 @@ def _client(cfg: Optional[ApiClientConfig] = None, script: Optional[List[Any]] =
 
 def _request(**overrides) -> CompletionRequest:
     values = {
-        "model_ref": "gemma-4-26B",
+        "model_ref": ApiClientConfig().model,
         "messages": (Message(role="user", content="ping"),),
         "max_output_tokens": 256,
         "temperature": 0.0,
@@ -139,7 +139,58 @@ def test_complete_records_call_records():
     records = backend.call_records()
     assert len(records) == 2
     assert [r.label for r in records] == ["one", "two"]
-    assert records[0].model_ref == "gemma-4-26B"
+    assert records[0].model_ref == ApiClientConfig().model
+
+
+def test_payload_model_matches_backend_config():
+    client = _client(script=[_ok("ok")])
+    backend = LocalOpenAIBackend(api=client)
+    backend.complete(_request())
+    assert client._session.posts[0]["json"]["model"] == ApiClientConfig().model
+
+
+def test_complete_rejects_model_ref_mismatch():
+    # The backend is serving ApiClientConfig().model; claiming another model
+    # for a role must be refused, never silently re-routed.
+    backend = LocalOpenAIBackend(api=_client(script=[_ok("ok")]))
+    with pytest.raises(CompletionError, match="does not match"):
+        backend.complete(_request(model_ref="opencode-go/deepseek-v4-flash"))
+
+
+# ---------------------------------------------------------------------------
+# retry_count provenance
+# ---------------------------------------------------------------------------
+
+
+def test_retry_count_zero_on_single_call():
+    backend = LocalOpenAIBackend(api=_client(script=[_ok("ok")]))
+    response = backend.complete(_request())
+    assert response.retry_count == 0
+    assert backend.call_records()[0].retry_count == 0
+
+
+def test_retry_count_reflects_transient_retries():
+    client = _client(
+        ApiClientConfig(http_retries=3, retry_delay_seconds=0.0),
+        script=[_FakeResponse(status_code=503, text="unavailable"), _ok("ok")],
+    )
+    backend = LocalOpenAIBackend(api=client)
+    response = backend.complete(_request())
+    assert len(client._session.posts) == 2
+    assert response.retry_count == 1
+    assert backend.call_records()[0].retry_count == 1
+
+
+def test_retry_count_reflects_grammar_reject_fallback():
+    reject = "error: response does not match the expected peg-gemma4 format"
+    client = _client(
+        ApiClientConfig(http_retries=3, retry_delay_seconds=0.0),
+        script=[_FakeResponse(status_code=400, text=reject), _ok("{}")],
+    )
+    backend = LocalOpenAIBackend(api=client)
+    response = backend.complete(_request())
+    assert len(client._session.posts) == 2
+    assert response.retry_count == 1
 
 
 # ---------------------------------------------------------------------------
