@@ -37,6 +37,15 @@ This is a home project. Prefer the smallest reliable workflow; do not add enterp
 
 Do not trust a marker or success message without checking active code.
 
+## V4 roadmap
+
+V4 development follows `docs/plans/V4_IMPLEMENTATION_ORDER_PLAN_RU.md` (потоки
+A/B/C/D: A — provider boundary, PR1 интеграционного плана; B — достройка quality
+engine (Phase 3B → драйвер, Phase 4A/4A2/4B, Phase 5); C — OpenCode (PR2/PR3/PR4);
+D — Phase 6/0D/7). OpenCode-интеграция не заменяет согласованный фазовый план
+Phase 0–7. Задачи вне плана — только по решению владельца. strict-архитектура —
+производственная архитектура v4 (решение владельца, `DECISIONS.md`).
+
 ## Token-efficient behavior
 
 - Start with the reported artifact/traceback, implicated code, immediate consumers, and relevant tests.
