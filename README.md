@@ -1,6 +1,26 @@
-# Pact Translator v3.0
+# Pact Translator v4
 
-v3 replaces the full segment self-review with a cheaper and safer pipeline:
+`main` now carries the v4 development tree. v3 is archived
+(`archive/v3-main-20260802`, tags `v3.1.3*`) and no longer used.
+
+v4 architecture and plans:
+
+- `docs/architecture/V4_MVP_SPEC_RU.md`
+- `docs/architecture/V4_FINAL_REVIEW_AND_IMPLEMENTATION_PLAN_RU_v2.md`
+- `docs/plans/V4_IMPLEMENTATION_ORDER_PLAN_RU.md`
+- `docs/plans/V4_OPENCODE_REMOTE_MODELS_INTEGRATION_PLAN_RU.md`
+
+v4 pipeline entry points live in `pact_v4/pipeline/`
+(`v4_phase12_strict_runner.py` is the production driver). Runtime configs:
+`configs/runtime_local.example.yaml`, `configs/runtime_remote.example.yaml`,
+`configs/runtime_composite.example.yaml`.
+
+---
+
+## v3 reference (archived)
+
+The archived v3.0 pipeline replaced the full segment self-review with a cheaper
+and safer pipeline:
 
 ```text
 chapter bible
