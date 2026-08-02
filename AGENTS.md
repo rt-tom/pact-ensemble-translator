@@ -20,8 +20,8 @@ This is a home project. Prefer the smallest reliable workflow; do not add enterp
 - Do not change tuned Qwen/Gemma settings without explicit reason and benchmark evidence.
 - Do not attach to or stop a foreign `llama-server`.
 - Do not run production pipeline during development/testing.
-- Treat a mismatch between production `HEAD` and `deployment_provenance.v31.json` as release drift: stop deployment work, preserve the active tree/runs, and reconcile through a reviewed release path. Never repair drift with reset, force, destructive checkout, or manual replacement of tracked files.
-- Keep V3 production releases and unfinished V4 development in separate worktrees. Do not use a `main` tag for V3 deployment when it contains unapproved V4 runtime/schema changes.
+- Treat a mismatch between production `HEAD` and `deployment_provenance.v31.json` as release drift: stop deployment work, preserve the active tree/runs, and reconcile through a reviewed release path. Never repair drift with reset, force, destructive checkout, or manual replacement of tracked files. `deployment_provenance.v31.json` records the last archived v3 deployment; v4 runs use the v4 run/provenance artifacts in `pact_v4/`.
+- V3 releases are archived (tags `archive/v3-*`, `v3.1.3*`) and no longer used. v4 development happens on `main` or short-lived branches/worktrees from `main`; a v4 run/schema change must not be back-ported into archived v3 release tags.
 
 ## Source of truth
 
