@@ -170,6 +170,44 @@ def test_complete_subsequent_calls_skip_response_format_after_rejection():
     assert "response_format" not in session.posts[2]["json"]
 
 
+def test_complete_records_attempt_count_for_grammar_fallback():
+    reject_text = (
+        "error: response does not match the expected peg-gemma4 format"
+    )
+    session = _FakeSession([
+        _FakeResponse(status_code=400, text=reject_text),
+        _ok_text_response("{}"),
+    ])
+    client = ApiClient(
+        ApiClientConfig(http_retries=3, retry_delay_seconds=0.0),
+        session=session,
+    )
+    client.complete([{"role": "user", "content": "x"}], max_tokens=10)
+    assert len(session.posts) == 2
+    assert client.calls[0].attempt_count == 2
+
+
+def test_complete_records_attempt_count_for_transient_retry():
+    session = _FakeSession([
+        _FakeResponse(status_code=503, text="unavailable"),
+        _ok_text_response("ok"),
+    ])
+    client = ApiClient(
+        ApiClientConfig(http_retries=3, retry_delay_seconds=0.0),
+        session=session,
+    )
+    client.complete([{"role": "user", "content": "x"}], max_tokens=10)
+    assert len(session.posts) == 2
+    assert client.calls[0].attempt_count == 2
+
+
+def test_complete_records_attempt_count_one_for_single_call():
+    session = _FakeSession([_ok_text_response("ok")])
+    client = ApiClient(ApiClientConfig(), session=session)
+    client.complete([{"role": "user", "content": "x"}], max_tokens=10)
+    assert client.calls[0].attempt_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Error propagation
 # ---------------------------------------------------------------------------

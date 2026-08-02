@@ -22,3 +22,47 @@ These adapters are kept thin and explicit:
 """
 
 from __future__ import annotations
+
+from pact_v4.runtime.backend_protocol import (
+    ALLOWED_REQUEST_OPTIONS,
+    ENDPOINT_FAMILY_OPENAI_CHAT_COMPLETIONS,
+    JSON_OBJECT_SCHEMA,
+    KIND_LOCAL_LLAMA,
+    KIND_OPENCODE_SERVER,
+    BackendCallRecord,
+    BackendDescriptor,
+    CompletionBackend,
+    CompletionError,
+    CompletionRequest,
+    CompletionResponse,
+    Message,
+)
+from pact_v4.runtime.backend_role_adapters import (
+    BackendGemmaSelector,
+    BackendModelCaller,
+    BackendQwenEvaluator,
+)
+from pact_v4.runtime.local_openai_backend import (
+    LocalOpenAIBackend,
+    LocalOpenAIBackendConfig,
+)
+
+__all__ = [
+    "ALLOWED_REQUEST_OPTIONS",
+    "ENDPOINT_FAMILY_OPENAI_CHAT_COMPLETIONS",
+    "JSON_OBJECT_SCHEMA",
+    "KIND_LOCAL_LLAMA",
+    "KIND_OPENCODE_SERVER",
+    "BackendCallRecord",
+    "BackendDescriptor",
+    "BackendGemmaSelector",
+    "BackendModelCaller",
+    "BackendQwenEvaluator",
+    "CompletionBackend",
+    "CompletionError",
+    "CompletionRequest",
+    "CompletionResponse",
+    "LocalOpenAIBackend",
+    "LocalOpenAIBackendConfig",
+    "Message",
+]

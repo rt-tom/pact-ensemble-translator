@@ -23,19 +23,15 @@ the validation here too is defence in depth, not duplication).
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase1.models import GateResult
-from pact_v4.runtime.api_client import ApiClient, ApiClientConfig, ApiClientError
+from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
 from pact_v4.runtime.prompts_runtime import (
     GEMMA_RUSSIAN_PREFERENCE_V1,
     ReviewerPrompt,
-    render_gemma_preference_prompt,
 )
-
-LOG = logging.getLogger(__name__)
 
 
 # Gemma sees N translations and emits a short JSON verdict. 1k tokens is
@@ -113,7 +109,14 @@ def _parse_gemma_preference(
 
 
 class HttpGemmaSelector:
-    """Real ``GemmaSelector`` backed by ``ApiClient``."""
+    """Compatibility wrapper: real ``GemmaSelector`` backed by ``ApiClient``.
+
+    Public constructor/property/behaviour are unchanged. Internally it
+    delegates to the backend-neutral ``BackendGemmaSelector`` over a
+    ``LocalOpenAIBackend`` (the V4 provider boundary). The import is lazy
+    to avoid a module-level cycle (``backend_role_adapters`` imports the
+    parsers from this module).
+    """
 
     def __init__(
         self,
@@ -129,39 +132,29 @@ class HttpGemmaSelector:
         self._api = api
         self._config = config or HttpGemmaSelectorConfig(api=api.config, label=api.name)
         self._max_tokens = int(self._config.max_tokens)
+        from pact_v4.runtime.backend_role_adapters import (
+            BackendGemmaSelector,
+            BackendGemmaSelectorConfig,
+        )
+        from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
+
+        self._impl = BackendGemmaSelector(
+            LocalOpenAIBackend(api=api),
+            config=BackendGemmaSelectorConfig(
+                max_tokens=self._max_tokens,
+                template=self._config.template,
+            ),
+        )
 
     @property
     def api(self) -> ApiClient:
         return self._api
 
+    @property
+    def impl(self) -> "BackendGemmaSelector":
+        return self._impl
+
     def __call__(
         self, candidates: Sequence[Tuple[str, Mapping[str, str]]]
     ) -> GateResult:
-        valid_ids = [cid for cid, _ in candidates]
-        if not valid_ids:
-            return GateResult(
-                gate="gemma_russian_preference",
-                passed=False,
-                detail="gemma_russian_preference: empty candidate set",
-            )
-        prompt = render_gemma_preference_prompt(
-            candidates=[(cid, dict(mapping)) for cid, mapping in candidates],
-            template=self._config.template,
-        )
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            raw = self._api.complete(
-                messages,
-                max_tokens=self._max_tokens,
-                temperature=0.0,
-                response_format_json=True,
-                label="phase2c/gemma_russian_preference",
-            )
-        except ApiClientError as exc:
-            LOG.error("HttpGemmaSelector: %s API failure: %s", self._api.name, exc)
-            return GateResult(
-                gate="gemma_russian_preference",
-                passed=False,
-                detail=f"gemma_russian_preference: API failure: {exc}",
-            )
-        return _parse_gemma_preference(raw, valid_candidate_ids=valid_ids)
+        return self._impl(candidates)

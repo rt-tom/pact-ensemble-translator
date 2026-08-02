@@ -68,6 +68,10 @@ class CallRecord:
     finish_reason: str
     usage: Dict[str, Any]
     wall_seconds: float
+    # Number of HTTP POSTs actually sent for this logical call (the
+    # grammar-reject fallback and transient retries each count). Used to
+    # derive an honest ``retry_count`` in backend provenance.
+    attempt_count: int = 1
 
 
 class ApiClient:
@@ -160,7 +164,7 @@ class ApiClient:
         )
         started = time.perf_counter()
         try:
-            data, http_status, fmt_attempted = self._post_with_retry(payload)
+            data, http_status, fmt_attempted, attempts = self._post_with_retry(payload)
         finally:
             wall = time.perf_counter() - started
 
@@ -175,6 +179,7 @@ class ApiClient:
             finish_reason=finish_reason or "",
             usage=usage or {},
             wall_seconds=round(wall, 3),
+            attempt_count=attempts,
         ))
         return text
 
@@ -184,7 +189,7 @@ class ApiClient:
 
     def _post_with_retry(
         self, payload: Mapping[str, Any]
-    ) -> tuple[Dict[str, Any], int, bool]:
+    ) -> tuple[Dict[str, Any], int, bool, int]:
         """POST with bounded transient-error retries, plus a single
         free fallback for the well-known Gemma grammar-reject message.
 
@@ -198,9 +203,15 @@ class ApiClient:
         ``http_retries=1`` still gets the fallback.
 
         All other 4xx errors propagate as ``ApiClientError``.
+
+        Returns ``(data, http_status, response_format_attempted, attempts)``
+        where ``attempts`` is the number of HTTP POSTs actually sent for
+        this call (for provenance).
         """
         last_error: Optional[Exception] = None
+        attempts = 0
         for attempt in range(1, int(self._cfg.http_retries) + 1):
+            attempts += 1
             try:
                 response = self._session.post(
                     self._cfg.chat_url,
@@ -219,7 +230,7 @@ class ApiClient:
             status = response.status_code
             if 200 <= status < 300:
                 try:
-                    return response.json(), status, "response_format" in payload
+                    return response.json(), status, "response_format" in payload, attempts
                 except ValueError as exc:
                     raise ApiClientError(
                         f"{self._name}: non-JSON response body: "
@@ -261,6 +272,7 @@ class ApiClient:
                     for key, value in payload.items()
                     if key != "response_format"
                 }
+                attempts += 1
                 try:
                     retry_response = self._session.post(
                         self._cfg.chat_url,
@@ -284,6 +296,7 @@ class ApiClient:
                         retry_response.json(),
                         retry_response.status_code,
                         False,
+                        attempts,
                     )
                 except ValueError as exc:
                     raise ApiClientError(

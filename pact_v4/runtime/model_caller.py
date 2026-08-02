@@ -13,15 +13,14 @@ not duplicate the library's contract here.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from pact_v4.phase2.generation import ModelCaller, PromptBundle
-from pact_v4.phase2.prompts import render_prompt
+from pact_v4.phase2.generation import PromptBundle
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig, ApiClientError
-
-LOG = logging.getLogger(__name__)
+from pact_v4.runtime.backend_protocol import CompletionError
+from pact_v4.runtime.backend_role_adapters import BackendModelCaller, BackendModelCallerConfig
+from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 
 
 # Phase 2B calls are JSON-object output with chunk-sized max_tokens. The
@@ -39,11 +38,16 @@ class HttpModelCallerConfig:
 
 
 class HttpModelCaller:
-    """Real ``ModelCaller`` backed by ``ApiClient``.
+    """Compatibility wrapper: real ``ModelCaller`` backed by ``ApiClient``.
+
+    Public constructor/property/behaviour are unchanged. Internally it now
+    delegates to the backend-neutral ``BackendModelCaller`` over a
+    ``LocalOpenAIBackend`` (the V4 provider boundary), so the role no
+    longer depends on the HTTP protocol directly.
 
     Implements the ``ModelCaller`` protocol by rendering the bundle into a
-    single user message, sending it to llama-server, and returning the
-    raw assistant text. JSON validation, PID-set enforcement, and cache
+    single user message, sending it to the backend, and returning the raw
+    assistant text. JSON validation, PID-set enforcement, and cache
     identity all live in ``pact_v4.phase2.generation`` — this class does
     not duplicate any of that.
     """
@@ -62,22 +66,28 @@ class HttpModelCaller:
         self._api = api
         self._config = config or HttpModelCallerConfig(api=api.config, label=api.name)
         self._max_tokens = int(self._config.max_tokens)
+        self._backend = LocalOpenAIBackend(api=api)
+        self._impl = BackendModelCaller(
+            self._backend,
+            config=BackendModelCallerConfig(max_tokens=self._max_tokens),
+        )
 
     @property
     def api(self) -> ApiClient:
         return self._api
 
+    @property
+    def backend(self) -> LocalOpenAIBackend:
+        return self._backend
+
     def __call__(self, bundle: PromptBundle) -> str:
-        user_text = render_prompt(bundle)
-        messages = [{"role": "user", "content": user_text}]
         try:
-            return self._api.complete(
-                messages,
-                max_tokens=self._max_tokens,
-                temperature=bundle.params.temperature,
-                response_format_json=True,
-                label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
-            )
-        except ApiClientError as exc:
-            LOG.error("HttpModelCaller: %s API failure: %s", self._api.name, exc)
-            raise
+            return self._impl(bundle)
+        except CompletionError as exc:
+            # Compatibility contract: the public wrapper keeps raising
+            # ApiClientError (its pre-boundary behaviour). The backend
+            # boundary raises CompletionError; restore the legacy type.
+            cause = exc.__cause__
+            if isinstance(cause, ApiClientError):
+                raise cause
+            raise ApiClientError(str(exc)) from exc
