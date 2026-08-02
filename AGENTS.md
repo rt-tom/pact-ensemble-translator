@@ -10,7 +10,7 @@ This is a home project. Prefer the smallest reliable workflow; do not add enterp
 
 ## Repository and safety
 
-- Production: `D:\pact\pact_translator_v3`
+- Production: `D:\pact\pact_translator_v4` (checked out on `main`)
 - Development worktrees: `D:\pact\pact_translator_worktrees\` or `%LOCALAPPDATA%\Temp\vibe-kanban\worktrees\` (Vibe Kanban-managed)
 - Stable branch: `main`
 - Develop only in a separate branch/worktree. Never edit tracked production files directly.
