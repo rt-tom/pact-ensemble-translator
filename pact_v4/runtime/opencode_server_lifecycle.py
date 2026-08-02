@@ -165,16 +165,26 @@ class OpenCodeServerProcess:
     def assert_port_free_or_owned(self) -> None:
         """Fail fast if the configured port is already served by someone else.
 
-        Never attaches to or stops a foreign server: an unowned healthy
-        endpoint on our port is a hard error, not something to adopt.
+        Never attaches to or stops a foreign server: an unowned endpoint on
+        our port is a hard error, not something to adopt. Any HTTP response
+        on the health path counts as occupancy -- including a 401 from an
+        auth-protected foreign server (an HTTP server is listening even if
+        it does not answer the anonymous probe). Without this, a foreign
+        auth-protected server would be silently treated as "free", our own
+        server would fail to bind, and start() would only surface a cryptic
+        "exited during startup (code=1)".
         """
-        health = self._health()
-        if health is not None:
-            raise ManagedServerError(
-                f"Port {self._spec.port} is already served by an unowned "
-                f"endpoint (health={health!r}); refusing to attach to or "
-                "stop it."
+        try:
+            resp = self._http_get(
+                f"{self.base_url}{_HEALTH_PATH}", timeout=2.0
             )
+        except Exception:  # noqa: BLE001 -- no HTTP answer on the port -> free
+            return
+        status = getattr(resp, "status_code", "n/a")
+        raise ManagedServerError(
+            f"Port {self._spec.port} is already served by an unowned endpoint "
+            f"(HTTP status {status}); refusing to attach to or stop it."
+        )
 
     # ------------------------------------------------------------------
     # Start / stop

@@ -166,6 +166,37 @@ def test_start_fails_fast_on_occupied_port():
     assert launched == []
 
 
+def test_start_fails_fast_on_auth_protected_foreign_server():
+    # A foreign server that requires basic auth answers the anonymous health
+    # probe with 401 -- that is still an occupied port and must fail fast,
+    # not let our server try to bind and die with a cryptic exit code.
+    launched: List[Any] = []
+
+    class _AuthRequiredResponse:
+        status_code = 401
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    def popen(args, **kwargs) -> Any:
+        launched.append(args)
+        return _FakeProcess()
+
+    proc = OpenCodeServerProcess(
+        ManagedServerSpec(hostname="127.0.0.1", port=4096),
+        popen=popen,
+        http_get=lambda url, timeout, auth=None: _AuthRequiredResponse(),
+    )
+    try:
+        proc.start()
+    except ManagedServerError as exc:
+        assert "already served" in str(exc)
+        assert "401" in str(exc)
+    else:
+        raise AssertionError("expected ManagedServerError on auth-protected port")
+    assert launched == []
+
+
 def test_start_fails_when_process_exits_during_startup():
     proc = _make_process(
         healthy_after_start=False,  # never healthy
