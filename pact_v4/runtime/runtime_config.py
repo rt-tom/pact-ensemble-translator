@@ -389,6 +389,9 @@ class LocalRoutingBackend:
         return backend.complete(request)
 
     def close(self) -> None:
+        # Close the per-model HTTP adapters first; the router's resident
+        # model is released afterwards by the coordinator's close(). Order
+        # matters: never release the router before its adapters are done.
         for backend in list(self._backends.values()):
             backend.close()
 
@@ -524,6 +527,15 @@ class CompositeBackendConfig:
     def build_runtime(
         self, *, log_dir: Optional[Path] = None
     ) -> RuntimeCoordinator:
+        # Composite shape limitation (PR #107 review): only the FIRST
+        # LocalLifecycleCoordinator and FIRST RemoteRuntimeCoordinator are
+        # kept for event accounting/summary; any additional sub-backend of
+        # the same kind is still closed on close() but its switch/call
+        # events never reach runtime.events_since()/summary(). Today the
+        # only config kinds are local_llama and opencode_server, so a
+        # realistic composite is 1-local + 1-remote; if a future profile
+        # needs 2-local or 2-remote sub-backends, the coordinator must
+        # merge multiple event sources instead of discarding the extras.
         sub_backends: Dict[str, CompletionBackend] = {}
         local_coord: Optional[LocalLifecycleCoordinator] = None
         remote_coord: Optional[RemoteRuntimeCoordinator] = None

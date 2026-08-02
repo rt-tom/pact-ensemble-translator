@@ -113,6 +113,13 @@ class RuntimeCoordinator(Protocol):
 
     Implementations: ``LocalLifecycleCoordinator``,
     ``RemoteRuntimeCoordinator``, ``CompositeRuntimeCoordinator``.
+
+    ``release()`` is the non-terminal cleanup that runs between phases
+    (e.g. Phase 1-2 -> Step 6): it frees a local resident model so a
+    single-resident run can re-acquire it, and is a no-op for backends
+    without a resident model. ``close()`` is terminal (closes the remote
+    HTTP session / deletes owned OpenCode sessions / stops a managed
+    server) and is called once at the very end of the run.
     """
 
     @property
