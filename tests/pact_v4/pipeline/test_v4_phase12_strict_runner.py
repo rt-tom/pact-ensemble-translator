@@ -347,9 +347,20 @@ def test_quarantine_halts_after_max_consecutive_nonselections(tmp_path: Path):
     assert result.halt_reason is not None
     assert result.quarantined_count == 1
     assert result.processed_count == 1  # halted after the first chunk, not both
-    # No committed translation -> nothing for the assembled-chapter audit.
-    assert result.step6["status"] == "skipped"
-    assert result.step6["reason"] == "no_selected_chunks"
+    # The quarantined chunk still produced a candidate, so Step 6 audits it
+    # (best-variant for quarantine, owner decision 2026-08-02) instead of
+    # skipping the whole chapter; the unprocessed second chunk is left to the
+    # deterministic missing layer.
+    assert result.step6["status"] == "complete"
+    assert result.step6["covered_chunks"] == 1
+    assert result.step6["uncovered_chunks"] == 1
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    by_id = {row["chunk_id"]: row for row in handoff["chunks"]}
+    assert by_id["chunk0001"]["status"] == "quarantined"
+    assert by_id["chunk0001"]["committed"] is False
+    assert by_id["chunk0001"]["audited_candidate_id"] is not None  # best-variant was audited
+    assert by_id["chunk0002"]["status"] == "incomplete_generation"
+    assert by_id["chunk0002"]["uncovered_pids"] == by_id["chunk0002"]["plan_pids"]
 
 
 def test_resume_skips_already_journaled_chunks_and_completes(tmp_path: Path):
@@ -416,6 +427,13 @@ def test_step6_audit_runs_on_full_chapter_and_persists_findings(tmp_path: Path):
     assert payload["store"]["findings"] == []
     assert payload["chapter_hash"] == result.step6["chapter_hash"]
     assert "region_plan" in payload
+    # A full chapter still produces the B2 handoff; every chunk is audited.
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    assert handoff["schema"] == "pact-v4-step6-b2-handoff/v1"
+    assert {row["status"] for row in handoff["chunks"]} == {"audited"}
+    assert all(row["committed"] is True for row in handoff["chunks"])
+    assert result.step6["covered_chunks"] == 2
+    assert result.step6["uncovered_chunks"] == 0
 
 
 def test_step6_audit_covers_every_chunk_and_batches_by_detector(tmp_path: Path):
@@ -513,11 +531,11 @@ def test_step6_audit_resume_only_reruns_failed_units(tmp_path: Path):
     assert [cid for cid, _s, _t in resumed_qwen_audit.calls] == ["chunk0001"]
 
 
-def test_step6_audit_skipped_on_partial_selection(tmp_path: Path):
-    # First chunk quarantined (not enough to halt), second selected: the
-    # assembled chapter would be partial, which the audit contract does not
-    # accept (full chapter-plan candidate coverage). Filling the gap is
-    # Phase 4 (repair/convergence), out of B1 scope.
+def test_step6_audits_partial_selection_with_best_variant(tmp_path: Path):
+    # First chunk quarantined (not enough to halt), second selected: Step 6
+    # must audit BOTH chunks (owner decision 2026-08-02) — the quarantined
+    # one through its deterministic best-variant, the selected one through
+    # its committed winner — and hand off the real per-chunk status.
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
 
     class _FailOnceQwen(StubQwen):
@@ -533,13 +551,149 @@ def test_step6_audit_skipped_on_partial_selection(tmp_path: Path):
                 detail="first chunk rejected, then OK",
             )
 
-    result, _router = _run(cfg, qwen=_FailOnceQwen())
+    qwen_audit = StubQwenAudit()
+    gemma_audit = StubGemmaAudit()
+    result, _router = _run(
+        cfg, qwen=_FailOnceQwen(), qwen_audit=qwen_audit, gemma_audit=gemma_audit,
+    )
     assert result.selected_count == 1
     assert result.quarantined_count == 1
+    # No more skip on partial selection: the whole plan is audited.
+    assert result.step6["status"] == "complete"
+    assert result.step6["covered_chunks"] == 2
+    assert result.step6["uncovered_chunks"] == 0
+    # Both chunks were actually audited by both detectors.
+    assert {cid for cid, _src, _tr in qwen_audit.calls} == {"chunk0001", "chunk0002"}
+    assert {cid for cid, _tr in gemma_audit.calls} == {"chunk0001", "chunk0002"}
+
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    assert handoff["schema"] == "pact-v4-step6-b2-handoff/v1"
+    by_id = {row["chunk_id"]: row for row in handoff["chunks"]}
+    assert by_id["chunk0001"]["status"] == "quarantined"
+    assert by_id["chunk0001"]["committed"] is False
+    assert by_id["chunk0001"]["audited_candidate_id"] is not None
+    assert by_id["chunk0001"]["best_variant_rule"] == "max_gates_passed>role(fidelity_first>balanced_literary>synthesis)>candidate_id"
+    assert by_id["chunk0001"]["quarantine_reason"] is not None
+    assert by_id["chunk0002"]["status"] == "audited"
+    assert by_id["chunk0002"]["committed"] is True
+    assert by_id["chunk0002"]["audited_candidate_id"] is not None
+    assert by_id["chunk0002"]["uncovered_pids"] == []
+
+
+def test_step6_best_variant_picks_fidelity_first_among_two_gemma_variants(tmp_path: Path):
+    # A high-risk chunk produces two Gemma candidates (fidelity_first A +
+    # balanced_literary B); both fail the Qwen gate so the chunk is
+    # quarantined. Step 6's best-variant rule (owner decision 2026-08-02)
+    # must deterministically pick A: equal gates passed on each candidate's
+    # own decision_trace, then role priority fidelity_first > balanced_literary.
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>" + "<p>You must not open box 7.</p>" * 9 + "</body></html>",
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    _write_empty_memory(memory_dir)
+    cfg = StrictRunConfig(
+        chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
+        out_dir=tmp_path / "out", backend=_make_backend(),
+    )
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
+    qwen_evaluator = _LifecycleAwareQwen(router, StubQwen(passed=False, reason="meaning drift"))
+    gemma_selector = _LifecycleAwareGemmaSelector(router, StubGemma())
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    assert result.chunk_count == 1
+    assert result.quarantined_count == 1
+    assert result.step6["status"] == "complete"
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    row = handoff["chunks"][0]
+    assert row["status"] == "quarantined"
+    # Both A and B are listed as available variants; the audited best-variant
+    # is the fidelity_first one (role priority), deterministically.
+    roles = {v["role"] for v in row["available_variants"]}
+    assert roles == {"fidelity_first", "balanced_literary"}
+    assert row["audited_role"] == "fidelity_first"
+    assert ":fidelity_first:" in row["audited_candidate_id"]
+    best = next(v for v in row["available_variants"] if v["role"] == "fidelity_first")
+    assert row["audited_candidate_id"] == best["candidate_id"]
+    # A quarantined chunk stays quarantined even though its best-variant
+    # audited clean — the handoff carries the chunk's status, not step6.status.
+    assert row["committed"] is False
+
+
+def test_step6_no_candidate_chunk_is_missing_coverage_without_model_units(tmp_path: Path):
+    # A needs_synthesis / incomplete_generation / never-processed chunk has no
+    # auditable candidate: Step 6 must cover its PIDs via the deterministic
+    # missing layer and must NOT call any model unit for it.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+
+    class _FailGenerationModelCaller(StubModelCaller):
+        def __call__(self, bundle: PromptBundle) -> str:
+            # Truncated JSON -> generation validation failure for every chunk.
+            return '{"p00000": "перевод'
+
+    qwen_audit = StubQwenAudit()
+    gemma_audit = StubGemmaAudit()
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, _FailGenerationModelCaller())
+    qwen_evaluator = _LifecycleAwareQwen(router, StubQwen())
+    gemma_selector = _LifecycleAwareGemmaSelector(router, StubGemma())
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, qwen_audit),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, gemma_audit),
+    )
+    assert result.incomplete_generation_count == 1
+    assert result.halted_early is True
+    # Zero candidates (no selected chunk, no quarantined chunk with variants):
+    # the audit is skipped, so no model audit unit was ever attempted.
     assert result.step6["status"] == "skipped"
-    assert result.step6["reason"] == "partial_selection"
-    assert result.step6["selected_chunks"] == 1
-    assert result.step6["total_chunks"] == 2
+    assert result.step6["reason"] == "no_selected_chunks"
+    assert qwen_audit.calls == []
+    assert gemma_audit.calls == []
+
+
+def test_step6_resume_reloads_generation_outcomes_for_quarantined_chunks(tmp_path: Path):
+    # Run 1: chunk0001 quarantined (halted). Run 2 (resume): chunk0001's
+    # journal entry is replayed and chunk0002 is selected. Step 6 must load
+    # the persisted generation_outcomes.json so chunk0001's best-variant is
+    # recoverable from the *previous* session, and must hand off both chunks.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+    first_result, _router1 = _run(cfg, qwen=StubQwen(passed=False, reason="meaning drift"))
+    assert first_result.quarantined_count == 1
+    assert first_result.processed_count == 1
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        max_consecutive_terminal_nonselections=3,
+    )
+    second_result, _router2 = _run(resumed_cfg, qwen=StubQwen(passed=True))
+    assert second_result.resumed_from_index == 1
+    assert second_result.selected_count == 1
+    assert second_result.step6["status"] == "complete"
+    assert second_result.step6["covered_chunks"] == 2
+
+    handoff = json.loads((second_result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    by_id = {row["chunk_id"]: row for row in handoff["chunks"]}
+    assert by_id["chunk0001"]["status"] == "quarantined"
+    assert by_id["chunk0001"]["committed"] is False
+    assert by_id["chunk0001"]["audited_candidate_id"] is not None  # reloaded from prior session
+    assert by_id["chunk0002"]["status"] == "audited"
+    assert by_id["chunk0002"]["committed"] is True
+
+    # The persisted generation_outcomes.json is now cumulative: both chunks'
+    # records are present for a future resume.
+    gen = json.loads(
+        (second_result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    assert {rec["chunk_id"] for rec in gen["outcomes"]} == {"chunk0001", "chunk0002"}
 
 
 def test_step6_audit_rejects_foreign_audit_cache_on_resume(tmp_path: Path):

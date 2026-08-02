@@ -17,7 +17,11 @@ from pact_v4.phase1.models import (
 )
 from pact_v4.phase2.cascade import DeterministicGateData
 from pact_v4.phase3.assembly import AssembledChapter
-from pact_v4.phase3.audit import AuditCache, run_chapter_audit
+from pact_v4.phase3.audit import (
+    NO_CANDIDATE_MARKER,
+    AuditCache,
+    run_chapter_audit,
+)
 
 
 def _hash(seed: str) -> str:
@@ -476,3 +480,89 @@ def test_audit_cache_from_payload_rejects_foreign_schema():
     import pytest
     with pytest.raises(ValueError, match="Foreign identity"):
         AuditCache.from_payload({"schema": "pact-v4-audit-cache/v999", "units": []})
+
+
+# 13. Partial candidate map (owner decision 2026-08-02): a chunk without a
+#     candidate is skipped by BOTH model tracks — no Qwen/Gemma unit is
+#     created or attempted — and every PID of that chunk is honestly marked
+#     ``missing`` with the NO_CANDIDATE_MARKER, never a fabricated
+#     candidate_id. The audit still claims ``complete`` when every *attempted*
+#     unit succeeded.
+def test_partial_map_skips_model_units_and_marks_missing():
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, _chapter = _env()
+    partial = {chunk1.chunk_id: candidates[chunk1.chunk_id]}  # chunk2 has no candidate
+    chapter = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates=partial,
+    )
+
+    qwen = _no_issue_evaluator([chunk1.chunk_id])
+    gemma = _no_issue_evaluator([chunk1.chunk_id])
+    outcome = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=partial,
+        qwen_evaluator=qwen, gemma_evaluator=gemma,
+    )
+
+    assert outcome.status == "complete"
+    # chunk2 was never touched by a model unit.
+    assert qwen.call_count(chunk2.chunk_id) == 0
+    assert gemma.call_count(chunk2.chunk_id) == 0
+    # chunk2's PIDs are covered by deterministic ``missing`` findings tagged
+    # with the no-candidate marker.
+    chunk2_pids = set(chunk2.pids)
+    missing = [
+        f for f in outcome.store
+        if f.category == "missing"
+        and f.region.pid in chunk2_pids
+        and f.detector == "deterministic_integrity"
+    ]
+    assert len(missing) == len(chunk2_pids)
+    for finding in missing:
+        assert finding.candidate_id == NO_CANDIDATE_MARKER
+        assert finding.chunk_id == chunk2.chunk_id
+
+
+# 14. A no-candidate chunk is never cached and never appears in failed_units:
+#     skipping is not a failure (a chunk with no candidate simply has no units).
+def test_partial_map_no_candidate_never_in_failed_units():
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, _chapter = _env()
+    partial = {chunk1.chunk_id: candidates[chunk1.chunk_id]}
+    chapter = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates=partial,
+    )
+    cache = AuditCache()
+    outcome = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=partial,
+        qwen_evaluator=_no_issue_evaluator([chunk1.chunk_id]),
+        gemma_evaluator=_no_issue_evaluator([chunk1.chunk_id]),
+        cache=cache,
+    )
+    assert outcome.status == "complete"
+    assert all(unit[0] != chunk2.chunk_id for unit in outcome.failed_units)
+    # The cache payload contains only chunk1 units — chunk2 was never created.
+    for unit in cache.to_payload()["units"]:
+        assert chunk2.chunk_id not in unit["unit_hash"]
+
+
+# 15. A chunk with a candidate is audited normally under a partial map, and
+#     its findings carry its own candidate_id (not the no-candidate marker).
+def test_partial_map_audits_present_chunk_with_own_candidate_id():
+    source, snapshot, chunk_plan, chunk1, chunk2, config, candidates, _chapter = _env()
+    partial = {chunk1.chunk_id: candidates[chunk1.chunk_id]}
+    chapter = AssembledChapter.assemble(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        candidates=partial,
+    )
+    qwen = ScriptedEvaluator({
+        chunk1.chunk_id: [_issues_json([{"pid": "p00000", "category": "omission", "note": "x"}])],
+    })
+    outcome = run_chapter_audit(
+        chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=partial,
+        qwen_evaluator=qwen,
+        gemma_evaluator=_no_issue_evaluator([chunk1.chunk_id]),
+    )
+    qwen_findings = [f for f in outcome.store if f.detector == "qwen_chapter_audit"]
+    assert len(qwen_findings) == 1
+    assert qwen_findings[0].candidate_id == candidates[chunk1.chunk_id].candidate_id
+    assert qwen_findings[0].candidate_id != NO_CANDIDATE_MARKER

@@ -102,6 +102,7 @@ __all__ = [
     "AuditUnitResult",
     "AuditCache",
     "AuditOutcome",
+    "NO_CANDIDATE_MARKER",
     "QWEN_AUDIT_CATEGORIES",
     "GEMMA_AUDIT_CATEGORIES",
     "run_chapter_audit",
@@ -109,6 +110,13 @@ __all__ = [
 
 QWEN_AUDIT_CATEGORIES = frozenset({"omission", "addition", "referent", "scene"})
 GEMMA_AUDIT_CATEGORIES = frozenset({"calque", "register", "repetition", "dialogue", "ty_vy"})
+
+# Tagged onto deterministic ``missing`` findings for a chunk that has no
+# auditable candidate at all (quarantined without a recoverable variant,
+# needs_synthesis, incomplete_generation, or simply never processed). It is
+# the honest marker of a coverage gap — no fabricated ``candidate_id`` is
+# ever attached to a finding for text that was never produced.
+NO_CANDIDATE_MARKER = "<no-candidate>"
 
 _ISSUE_REQUIRED_KEYS = {"pid", "category", "note"}
 _ISSUE_ALLOWED_KEYS = _ISSUE_REQUIRED_KEYS | {"excerpt"}
@@ -250,12 +258,20 @@ class AuditCache:
 
 
 def _candidate_id_for(chunk_id: str, candidates: Mapping[str, Candidate]) -> str:
+    """Resolve the ``candidate_id`` tagged onto findings for one chunk.
+
+    A chunk missing from the map (no auditable candidate — e.g. a
+    quarantined chunk without a recoverable variant, or a chunk that was
+    never processed) is tagged with ``NO_CANDIDATE_MARKER`` instead of
+    raising: the deterministic layer must still honestly mark its PIDs as
+    uncovered, and a fabricated ``candidate_id`` would misrepresent
+    provenance. Model units are skipped for such chunks (see
+    ``run_chapter_audit``), so this marker only ever appears on
+    deterministic findings.
+    """
     candidate = candidates.get(chunk_id)
     if candidate is None:
-        raise ValueError(
-            f"run_chapter_audit: no winning candidate supplied for chunk {chunk_id!r} "
-            f"(candidates mapping must cover every chunk in chunk_plan)"
-        )
+        return NO_CANDIDATE_MARKER
     return candidate.candidate_id
 
 
@@ -508,14 +524,24 @@ def run_chapter_audit(
     assemble``) — it supplies the ``candidate_id`` identity tagged onto every
     finding raised against that chunk.
 
-    Every chunk is audited by both Qwen and Gemma as one resumable unit each
-    (four units total across two detectors would be wrong; it's one Qwen
-    unit + one Gemma unit per chunk). A unit whose cached result has
-    ``ok=True`` is reused without calling the evaluator again; any other
-    unit (uncached, or a previous failure) is attempted, and the attempt's
-    outcome — success or failure — is written back to the cache before
-    moving on, so a subsequent call with the same cache only re-attempts
-    what's still outstanding.
+    Since the B1 follow-up (owner decision 2026-08-02, "audit all chunks,
+    best-variant for quarantine"), ``candidates`` is allowed to be **partial**:
+    a chunk missing from the map is not a contract error. Such a chunk is
+    skipped by both model tracks (no Qwen/Gemma unit is created or attempted)
+    while the deterministic layer still covers it — every PID of the chunk
+    gets a ``missing`` finding tagged with ``NO_CANDIDATE_MARKER``, so the
+    audit honestly fixes the gap instead of silently narrowing its scope.
+    The model track's status semantics are unchanged: ``"complete"`` if and
+    only if every *attempted* unit succeeded.
+
+    Every chunk that *has* a candidate is audited by both Qwen and Gemma as
+    one resumable unit each (four units total across two detectors would be
+    wrong; it's one Qwen unit + one Gemma unit per chunk). A unit whose
+    cached result has ``ok=True`` is reused without calling the evaluator
+    again; any other unit (uncached, or a previous failure) is attempted, and
+    the attempt's outcome — success or failure — is written back to the cache
+    before moving on, so a subsequent call with the same cache only
+    re-attempts what's still outstanding.
     """
     if cache is None:
         cache = AuditCache()
@@ -549,7 +575,16 @@ def run_chapter_audit(
     )
     for detector, policy_version in units:
         for chunk in chunk_plan.chunks:
-            candidate_id = _candidate_id_for(chunk.chunk_id, candidates)
+            candidate = candidates.get(chunk.chunk_id)
+            if candidate is None:
+                # No auditable candidate for this chunk (owner decision
+                # 2026-08-02): no model unit is created or attempted. The
+                # deterministic layer already marked every PID of the chunk
+                # ``missing`` with the ``NO_CANDIDATE_MARKER``, so the gap
+                # stays visible in the findings store without a fabricated
+                # candidate identity.
+                continue
+            candidate_id = candidate.candidate_id
             owned_pids = frozenset(chunk.pids)
             owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
             owned_translation = {pid: chapter_map.get(pid, "") for pid in chunk.pids}
