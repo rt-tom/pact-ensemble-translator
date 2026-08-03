@@ -594,7 +594,7 @@ def test_repair_carries_gate_decision_trace():
 
 # --- TerminalState -------------------------------------------------------
 
-@pytest.mark.parametrize("target", ["complete", "quarantined", "failed"])
+@pytest.mark.parametrize("target", ["complete", "accepted_degraded", "failed"])
 def test_terminal_state_reaches_all_three_terminal_states(target):
     state = TerminalState(state_id="s1", status="pending", provenance=_provenance())
     state.transition_to(target)
@@ -602,7 +602,7 @@ def test_terminal_state_reaches_all_three_terminal_states(target):
     assert state.is_terminal
 
 
-@pytest.mark.parametrize("terminal", ["complete", "quarantined", "failed"])
+@pytest.mark.parametrize("terminal", ["complete", "accepted_degraded", "failed"])
 def test_terminal_state_is_write_once(terminal):
     state = TerminalState(state_id="s1", status="pending", provenance=_provenance())
     state.transition_to(terminal)
@@ -620,6 +620,17 @@ def test_terminal_state_pending_can_go_via_in_progress():
     state.transition_to("in_progress")
     state.transition_to("quarantined")
     assert state.status == "quarantined"
+    assert not state.is_terminal  # quarantined is an internal repair state
+
+
+def test_terminal_state_quarantined_can_resolve_to_terminal():
+    # V4_MVP_SPEC_RU.md §7: quarantined is internal, so a resolved quarantine
+    # may advance to a terminal state; it is never itself a terminal state.
+    state = TerminalState(state_id="s1", status="pending", provenance=_provenance())
+    state.transition_to("quarantined")
+    state.transition_to("accepted_degraded")
+    assert state.status == "accepted_degraded"
+    assert state.is_terminal
 
 
 # --- JSON ingestion --------------------------------------------------------

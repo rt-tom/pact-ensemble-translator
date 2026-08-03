@@ -80,12 +80,18 @@ from pact_v4.phase1.models import (
     ChunkPlanArtifact,
     ConfigArtifact,
     GateResult,
+    Provenance,
     canonical_json_hash,
 )
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
 from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
+from pact_v4.phase4.repair import (
+    REPAIR_REPORT_SCHEMA,
+    RepairCache,
+    run_repair_phase,
+)
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
     _left_ru_for_chunk,
@@ -128,6 +134,8 @@ AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
 AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
 HANDOFF_SCHEMA = "pact-v4-step6-b2-handoff/v1"
 SELECTION_META_SCHEMA = "pact-v4-strict-selection-meta/v1"
+REPAIR_CACHE_SCHEMA = "pact-v4-phase4-repair-cache/v1"
+REPAIR_REPORT_SCHEMA = "pact-v4-phase4-repair-report/v1"
 
 NO_LEFT_CONTEXT_SENTINEL = "pact-v4-strict/no-left-context"
 
@@ -301,6 +309,8 @@ class StrictChapterRunResult:
     record_path: Path
     record: Dict[str, Any]
     step6: Dict[str, Any] = field(default_factory=dict)
+    step7: Dict[str, Any] = field(default_factory=dict)
+    step8: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +833,12 @@ def _run_step6_audit(
     ``run_chapter_audit`` re-attempts only the unfinished ``(chunk_id,
     detector)`` units. ``b2_handoff.json`` is written whenever the audit runs
     (i.e. whenever at least one candidate exists).
+
+    Returns ``(report, phase4_inputs)``: ``report`` is the JSON-serializable
+    Step 6 summary recorded in the run record; ``phase4_inputs`` carries the
+    Phase 4 (B2) objects derived from the audit (candidate map, handoff rows,
+    findings store, region plan, assembled chapter) or ``None`` when the
+    audit was skipped.
     """
     try:
         candidates, handoff_chunks = _audit_candidate_map(
@@ -835,9 +851,9 @@ def _run_step6_audit(
         return {
             "status": "skipped", "reason": "incomplete_translation",
             "detail": str(exc),
-        }
+        }, None
     if not candidates:
-        return {"status": "skipped", "reason": "no_selected_chunks"}
+        return {"status": "skipped", "reason": "no_selected_chunks"}, None
 
     chapter = AssembledChapter.assemble(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
@@ -911,6 +927,215 @@ def _run_step6_audit(
         "audit_cache_path": str(cache_path),
         "audit_findings_path": str(_audit_findings_path(cfg.out_dir)),
         "b2_handoff_path": str(_b2_handoff_path(cfg.out_dir)),
+    }, {
+        # Phase 4 (B2) inputs derived from the Step 6 audit: the assembled
+        # chapter, the per-chunk candidate map, the handoff rows and the
+        # findings/region plan. Consumed by ``_run_step7_repair`` when repair
+        # adapters are configured; ``None`` when the audit was skipped.
+        "candidates": candidates,
+        "handoff_chunks": handoff_chunks,
+        "findings_store": outcome.store,
+        "region_plan": outcome.region_plan,
+        "chapter": chapter,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Step 7/8: repair + convergence + terminal (B2)
+# ---------------------------------------------------------------------------
+
+
+def _repair_cache_path(out_dir: Path) -> Path:
+    return out_dir / "repair_cache.json"
+
+
+def _repair_report_path(out_dir: Path) -> Path:
+    return out_dir / "repair_report.json"
+
+
+def _load_repair_cache(
+    path: Path,
+    *,
+    chapter_hash: str,
+    snapshot_hash: str,
+    chunk_plan_hash: str,
+    config_identity: str,
+    backend_identity_hashes: Sequence[str],
+) -> Optional[RepairCache]:
+    """Reload a previously persisted repair cache, refusing foreign identity.
+
+    Mirrors ``_load_audit_cache``: the cache is only reusable when the
+    enclosing run's identities (chapter/snapshot/plan/config/backend) match,
+    so a resumed run deterministically reuses already-committed repairs
+    (same findings/re-gates) instead of re-paying model calls or silently
+    reusing a cache written under a different backend.
+    """
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != REPAIR_CACHE_SCHEMA:
+        raise ValueError(
+            f"Foreign identity: repair cache schema={payload.get('schema')!r}"
+        )
+    if payload.get("backend_identity_hash") not in backend_identity_hashes:
+        raise ValueError(
+            f"Foreign identity: repair cache backend_identity_hash="
+            f"{payload.get('backend_identity_hash')!r}, expected one of "
+            f"{list(backend_identity_hashes)!r} -- refusing to resume against a "
+            "repair cache written under a different model backend."
+        )
+    for field, expected in (
+        ("chapter_hash", chapter_hash),
+        ("snapshot_hash", snapshot_hash),
+        ("chunk_plan_hash", chunk_plan_hash),
+        ("config_identity", config_identity),
+    ):
+        if payload.get(field) != expected:
+            LOG.info(
+                "Repair cache from a different chapter/run (%s differs); "
+                "starting a fresh repair cache",
+                field,
+            )
+            return None
+    return RepairCache.from_payload(payload["cache"])
+
+
+def _build_phase4_provenance(
+    *,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    chapter_hash: str,
+) -> Provenance:
+    """Build the Phase 4 provenance binding the terminal decision to this run.
+
+    ``prompt_bundle_hash`` is derived from the run identities + chapter hash
+    (the strict driver has no single prompt bundle; the value is a
+    deterministic content identity, not a caller-supplied string).
+    """
+    return Provenance(
+        source_hash=source.source_hash,
+        chapter_snapshot_hash=snapshot.snapshot_hash,
+        chunk_plan_hash=chunk_plan.plan_hash,
+        prompt_bundle_hash=canonical_json_hash({
+            "artifact": "pact-v4-phase4/v1",
+            "chapter_hash": chapter_hash,
+            "config_identity": config.config_identity,
+        }),
+        config_identity=config.config_identity,
+        code_version="pact-v4-b2/1",
+        policy_versions={
+            "repair": "pact-v4-repair-policy/v1",
+            "terminal": "pact-v4-terminal/v1",
+        },
+    )
+
+
+def _run_step7_repair(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    det_data: DeterministicGateData,
+    phase4_inputs: Dict[str, Any],
+    repair_adapters: Sequence[Any],
+    backend_identity_hash: str,
+    backend_identity_hashes: Sequence[str],
+    now: Any,
+) -> Dict[str, Any]:
+    """Run Phase 4 (Step 7 repair + Step 8 terminal) and persist its artifacts.
+
+    ``repair_adapters`` is the ``(repair_caller, qwen_evaluator,
+    qwen_audit_evaluator, gemma_audit_evaluator)`` tuple built by
+    ``build_repair_adapters`` (Backend adapters over the coordinator
+    ``CompletionBackend``). ``phase4_inputs`` is the second element returned
+    by ``_run_step6_audit`` (candidates, handoff rows, findings store, region
+    plan, assembled chapter).
+
+    The repair cache is loaded with identity checks on resume so a resumed
+    run reuses committed repairs deterministically. The ``repair_report.json``
+    (with backend identity) records rounds, gate history, debt trace and the
+    monotonic terminal state.
+
+    Returns the Step 7/8 summary recorded in the run record.
+    """
+    repair_caller, qwen_evaluator, qwen_audit_evaluator, gemma_audit_evaluator = repair_adapters
+
+    candidates = phase4_inputs["candidates"]
+    handoff_chunks = phase4_inputs["handoff_chunks"]
+    findings_store = phase4_inputs["findings_store"]
+    region_plan = phase4_inputs["region_plan"]
+    chapter = phase4_inputs["chapter"]
+    current_translation = chapter.as_pid_map()
+
+    cache_path = _repair_cache_path(cfg.out_dir)
+    cache = _load_repair_cache(
+        cache_path,
+        chapter_hash=chapter.chapter_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        chunk_plan_hash=chunk_plan.plan_hash,
+        config_identity=config.config_identity,
+        backend_identity_hashes=backend_identity_hashes,
+    ) or RepairCache()
+
+    provenance = _build_phase4_provenance(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+        config=config, chapter_hash=chapter.chapter_hash,
+    )
+
+    result = run_repair_phase(
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        provenance=provenance,
+        det_data=det_data,
+        handoff_chunks=handoff_chunks,
+        findings_store=findings_store,
+        candidates=candidates,
+        current_translation=current_translation,
+        repair_caller=repair_caller,
+        qwen_evaluator=qwen_evaluator,
+        qwen_audit_evaluator=qwen_audit_evaluator,
+        gemma_audit_evaluator=gemma_audit_evaluator,
+        backend_identity_hash=backend_identity_hash,
+        cache=cache,
+        max_rounds=2,
+        chapter_hash=chapter.chapter_hash,
+    )
+
+    _atomic_write_json(cache_path, {
+        "schema": REPAIR_CACHE_SCHEMA,
+        "chapter_hash": chapter.chapter_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": backend_identity_hash,
+        "cache": cache.to_payload(),
+    })
+    report = result.to_payload()
+    report["chapter_id"] = cfg.chapter_id
+    report["finished_at"] = now().isoformat(timespec="seconds")
+    _atomic_write_json(_repair_report_path(cfg.out_dir), report)
+
+    return {
+        "status": result.status,
+        "rounds": len(result.rounds),
+        "repair_count": sum(
+            len(round.records) for round in result.rounds
+        ),
+        "committed_count": sum(
+            sum(1 for rec in round.records if rec.committed)
+            for round in result.rounds
+        ),
+        "debt_count": len(result.debt_trace),
+        "integrity": result.integrity,
+        "terminal": result.terminal.status,
+        "report_path": str(_repair_report_path(cfg.out_dir)),
+        "cache_path": str(cache_path),
     }
 
 
@@ -928,6 +1153,7 @@ def run_chapter_strict(
     gemma_selector: Any,
     qwen_audit_evaluator: Any,
     gemma_audit_evaluator: Any,
+    repair_adapters: Optional[Sequence[Any]] = None,
     now: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Run the strict single-resident driver for one chapter.
@@ -957,6 +1183,15 @@ def run_chapter_strict(
     restored on resume (only unfinished ``(chunk_id, detector)`` units are
     re-attempted; a chapter that grew across resume sessions simply starts a
     fresh audit cache, since every old unit key misses).
+
+    Step 7/8 (Phase 4, B2) run after Step 6 only when ``repair_adapters``
+    (``(repair_caller, qwen_evaluator, qwen_audit_evaluator,
+    gemma_audit_evaluator)``, built by
+    ``pact_v4.runtime.runtime_config.build_repair_adapters`` over the
+    coordinator ``CompletionBackend``) is provided — local/remote/composite
+    runs wire the same Backend adapters. Without it the repair phase is
+    recorded as ``skipped`` (e.g. test stubs that only cover Phase 1-2 + Step
+    6).
     """
     if runtime is None:
         if router is None:
@@ -1324,8 +1559,9 @@ def run_chapter_strict(
     )
     events_before_step6 = runtime.event_count()
     step6: Dict[str, Any]
+    phase4_inputs: Optional[Dict[str, Any]] = None
     try:
-        step6 = _run_step6_audit(
+        step6, phase4_inputs = _run_step6_audit(
             cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
             config=config, det_data=det_data, selection_records=merged_selection_records,
             selected_text_by_chunk=selected_text_by_chunk,
@@ -1338,11 +1574,60 @@ def run_chapter_strict(
     except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
         LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
         step6 = {"status": "failed", "error": str(exc)}
+        phase4_inputs = None
     finally:
         try:
             runtime.release()
         except Exception:  # noqa: BLE001
             LOG.exception("Failed to release runtime after Step 6 audit")
+
+    # ------------------------------------------------------------------
+    # Step 7/8: Phase 4 repair + convergence + terminal (B2). Runs only
+    # when repair adapters are configured (the CLI always wires them via
+    # ``build_repair_adapters``; test stubs may omit them). Repair model
+    # calls go through the same Backend boundary as Step 6 (never local
+    # lifecycle adapters). A transport failure at a repair call is recorded
+    # as debt/incomplete, never a semantic terminal status.
+    # ------------------------------------------------------------------
+    events_before_step7 = runtime.event_count()
+    step7: Dict[str, Any]
+    step8: Dict[str, Any]
+    if repair_adapters is not None and phase4_inputs is not None:
+        try:
+            step7 = _run_step7_repair(
+                cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+                config=config, det_data=det_data, phase4_inputs=phase4_inputs,
+                repair_adapters=repair_adapters,
+                backend_identity_hash=cfg.backend.identity_hash,
+                backend_identity_hashes=acceptable_backend_hashes,
+                now=now_fn,
+            )
+            step8 = {
+                "status": step7["terminal"],
+                "integrity": step7["integrity"],
+                "debt_trace": None,  # recorded in repair_report.json
+            }
+        except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
+            LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
+            step7 = {"status": "failed", "error": str(exc)}
+            step8 = {"status": "failed", "error": str(exc)}
+        finally:
+            try:
+                runtime.release()
+            except Exception:  # noqa: BLE001
+                LOG.exception("Failed to release runtime after Step 7 repair")
+    else:
+        reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
+        step7 = {"status": "skipped", "reason": reason}
+        step8 = {"status": "skipped", "reason": reason}
+
+    step7_events = [
+        event for event in runtime.events_since(events_before_step7)
+        if event.kind == EVENT_KIND_LOCAL_SWITCH
+    ]
+    step7 = dict(step7)
+    step7["switch_count"] = len(step7_events)
+    step7["switches"] = [event.to_payload() for event in step7_events]
 
     # The audit phase's own lifecycle cost, recorded for run_003-style
     # validation: batching by detector should keep this at ~1-2 switches
@@ -1429,6 +1714,8 @@ def run_chapter_strict(
             "selected_role_counts": dict(selected_role_counts),
         },
         "step6": step6,
+        "step7": step7,
+        "step8": step8,
         "lifecycle": local_lifecycle or {
             "startup_count": 0, "restart_count": 0,
             "switches": [], "aggregates_by_model": {},
@@ -1441,6 +1728,8 @@ def run_chapter_strict(
             "audit_findings": str(_audit_findings_path(cfg.out_dir)),
             "b2_handoff": str(_b2_handoff_path(cfg.out_dir)),
             "selection_meta": str(_selection_meta_path(cfg.out_dir)),
+            "repair_cache": str(_repair_cache_path(cfg.out_dir)),
+            "repair_report": str(_repair_report_path(cfg.out_dir)),
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"
@@ -1462,7 +1751,7 @@ def run_chapter_strict(
         halt_reason=halt_reason, resumed_from_index=resumed_from_index,
         switches=((local_lifecycle or {}).get("switches") or []),
         translations_path=translations_path, journal_path=journal_path, record_path=record_path,
-        record=record, step6=step6,
+        record=record, step6=step6, step7=step7, step8=step8,
     )
 
 

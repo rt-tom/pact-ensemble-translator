@@ -366,3 +366,53 @@ def test_selection_parity_fake_vs_local_backend():
     ref_final = ref_outcome.candidates[ref_selection.selected_role].translation
     back_final = back_outcome.candidates[back_selection.selected_role].translation
     assert back_final == ref_final
+
+
+# ---------------------------------------------------------------------------
+# Phase 4A repair-caller parity (B2): transport-neutral repair prompt/output
+# ---------------------------------------------------------------------------
+
+
+def test_repair_caller_parity_rendered_prompt_is_backend_agnostic():
+    """The same repair request renders the same prompt regardless of backend.
+
+    The repair caller is transport-only: prompt rendering lives in
+    ``prompts_runtime``, parsing in ``pact_v4.phase4.repair``. This pins the
+    rendered-prompt identity so a transport change cannot silently alter what
+    the model sees.
+    """
+    from pact_v4.phase1.models import Region
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendRepairCaller,
+        BackendRepairCallerConfig,
+    )
+    from pact_v4.runtime.prompts_runtime import render_repair_prompt
+
+    region = Region(pid="p1", start=0, end=6)
+    findings = [{"category": "omission", "note": "dropped clause", "excerpt": ""}]
+    source = {"p1": "Hello.", "p2": "World."}
+    translation = {"p1": "Привет.", "p2": "Мир."}
+
+    # Reference: the pure render function.
+    ref_prompt = render_repair_prompt(
+        chunk_id="c1", source=source, translation=translation,
+        region=region, findings=findings,
+    )
+
+    # Backend path: the caller must send exactly the rendered prompt.
+    stub = StubApiClient([
+        json.dumps({"repaired": {"p1": "Здравствуйте."}, "reason": "parity"}, ensure_ascii=False)
+    ])
+    caller = BackendRepairCaller(
+        LocalOpenAIBackend(api=stub),  # type: ignore[arg-type]
+        config=BackendRepairCallerConfig(max_tokens=512),
+    )
+    raw = caller(
+        chunk_id="c1", source=source, translation=translation,
+        region=region, findings=findings,
+    )
+    assert "Здравствуйте" in raw
+    sent = stub.calls[0]["messages"][0]["content"]
+    assert sent == ref_prompt
+    # The repair role resolves the generator binding.
+    assert stub.calls[0]["label"].startswith("phase4/")

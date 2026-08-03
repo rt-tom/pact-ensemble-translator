@@ -19,6 +19,9 @@ role_backend_map:
   qwen_audit: opencode
   russian_selector: local
   gemma_audit: local
+  # Phase 4A region repair (B2). Falls back to the `generator` backend when
+  # this key is absent.
+  repair: opencode
 backends:
   opencode:
     kind: opencode_server
@@ -37,6 +40,7 @@ backends:
       generator: opencode-go/deepseek-v4-flash
       fidelity_reviewer: opencode-go/qwen3.7-plus
       qwen_audit: opencode-go/qwen3.7-plus
+      repair: opencode-go/deepseek-v4-flash
   local:
     kind: local_llama
     exe: C:/llama-sycl-new/llama-server.exe

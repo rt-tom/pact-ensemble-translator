@@ -9,8 +9,12 @@ Design rules enforced here, not just documented:
   * No scoring engine anywhere (V4_MVP_SPEC_RU.md #4: selection is a
     lexicographic cascade, not a scored ranking). ``Candidate`` therefore
     has no numeric score field.
-  * Terminal states are exactly ``complete`` / ``quarantined`` / ``failed``
-    (V4_MVP_SPEC_RU.md §7); all three are write-once (monotonic).
+  * Terminal states are exactly ``complete`` / ``accepted_degraded`` /
+    ``failed`` (V4_MVP_SPEC_RU.md §7); all three are write-once (monotonic).
+    ``quarantined`` is an *internal* repair state (V4_MVP_SPEC_RU.md §7:
+    "quarantined — внутреннее состояние automatic repair/fallback, не
+    user-facing terminal при valid PID-map"), so it is deliberately not a
+    terminal state here.
   * Identity fields (hashes) are validated as hex-encoded content hashes,
     not merely "non-empty" — a malformed/foreign-looking identity is
     rejected at construction time.
@@ -29,18 +33,19 @@ HEX_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 
 CANDIDATE_ROLES = frozenset({"fidelity_first", "balanced_literary", "synthesis"})
 REPAIR_ACTIONS = frozenset({"region_edit", "full_sentence_rewrite"})
-TERMINAL_STATES = frozenset({"complete", "quarantined", "failed"})
-NON_TERMINAL_STATES = frozenset({"pending", "in_progress"})
+TERMINAL_STATES = frozenset({"complete", "accepted_degraded", "failed"})
+NON_TERMINAL_STATES = frozenset({"pending", "in_progress", "quarantined"})
 ALL_STATES = TERMINAL_STATES | NON_TERMINAL_STATES
 
-# Non-terminal states may advance to any terminal state or to the other
-# non-terminal state; terminal states have no outgoing transitions
-# (write-once / monotonic).
+# Non-terminal states (including the internal ``quarantined`` repair state)
+# may advance to any terminal state or to another non-terminal state;
+# terminal states have no outgoing transitions (write-once / monotonic).
 _ALLOWED_TRANSITIONS: Dict[str, Tuple[str, ...]] = {
-    "pending": ("in_progress", "complete", "quarantined", "failed"),
-    "in_progress": ("complete", "quarantined", "failed"),
+    "pending": ("in_progress", "quarantined", "complete", "accepted_degraded", "failed"),
+    "in_progress": ("quarantined", "complete", "accepted_degraded", "failed"),
+    "quarantined": ("in_progress", "complete", "accepted_degraded", "failed"),
     "complete": (),
-    "quarantined": (),
+    "accepted_degraded": (),
     "failed": (),
 }
 
@@ -737,10 +742,14 @@ class Repair:
 class TerminalState:
     """Write-once terminal state machine (contract item 9, V4_MVP_SPEC_RU.md §7).
 
-    Terminal states are exactly ``complete`` / ``quarantined`` / ``failed``.
-    Once in a terminal state there are no outgoing transitions — this is
-    enforced by ``_ALLOWED_TRANSITIONS`` mapping terminal states to an
-    empty tuple, not by special-casing in ``transition_to``.
+    Terminal states are exactly ``complete`` / ``accepted_degraded`` /
+    ``failed``. ``quarantined`` is an *internal* repair state (V4_MVP_SPEC_RU.md
+    §7: "внутреннее состояние automatic repair/fallback, не user-facing
+    terminal при valid PID-map"), so it is a non-terminal state that may still
+    advance to a terminal state once repair resolves it. Once in a terminal
+    state there are no outgoing transitions — this is enforced by
+    ``_ALLOWED_TRANSITIONS`` mapping terminal states to an empty tuple, not by
+    special-casing in ``transition_to``.
     """
 
     state_id: str

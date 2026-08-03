@@ -629,6 +629,35 @@ def build_role_adapters(
     )
 
 
+def build_repair_adapters(
+    cfg: BackendRuntimeConfig, runtime: RuntimeCoordinator
+) -> Tuple[Any, Any, Any, Any]:
+    """The Phase 4 repair callables ``run_chapter_strict`` needs injected.
+
+    Return order: ``(repair_caller, qwen_evaluator, qwen_audit_evaluator,
+    gemma_audit_evaluator)``. All are ``Backend*`` adapters over the
+    coordinator ``CompletionBackend`` (``build_role_backend``), never local
+    lifecycle adapters — Phase 4 repair must run through the same
+    backend-neutral boundary in local, remote and composite profiles
+    (dual-mode rule; no retrofit needed). Imported lazily to avoid an import
+    cycle with ``backend_role_adapters``.
+    """
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendGemmaAuditEvaluator,
+        BackendQwenAuditEvaluator,
+        BackendQwenEvaluator,
+        BackendRepairCaller,
+    )
+
+    backend = build_role_backend(cfg, runtime)
+    return (
+        BackendRepairCaller(backend),
+        BackendQwenEvaluator(backend),
+        BackendQwenAuditEvaluator(backend),
+        BackendGemmaAuditEvaluator(backend),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Loader (dict -> tagged config). Values of secrets are never read here:
 # only env-var *names* are recorded (plan §12).
@@ -750,4 +779,5 @@ __all__ = [
     "load_runtime_config",
     "build_role_backend",
     "build_role_adapters",
+    "build_repair_adapters",
 ]
