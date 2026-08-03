@@ -103,6 +103,7 @@ from pact_v4.pipeline._shared_runner_helpers import (
     _risk_for_chunk,
     _serialize_generation_outcome,
 )
+from pact_v4.pipeline.phase_progress import PhaseProgressWriter
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
@@ -815,6 +816,7 @@ def _run_step6_audit(
     gemma_audit_evaluator: Any,
     backend_identity_hash: str,
     backend_identity_hashes: Sequence[str],
+    progress: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run the Step 6 assembled-chapter audit and persist its artifacts.
 
@@ -889,7 +891,7 @@ def _run_step6_audit(
     outcome = run_chapter_audit(
         chapter=chapter, source=source, chunk_plan=chunk_plan, candidates=candidates,
         qwen_evaluator=qwen_audit_evaluator, gemma_evaluator=gemma_audit_evaluator,
-        det_data=det_data, cache=cache,
+        det_data=det_data, cache=cache, progress=progress,
     )
 
     _atomic_write_json(cache_path, {
@@ -1067,6 +1069,7 @@ def _run_step7_repair(
     backend_identity_hashes: Sequence[str],
     now: Any,
     formatting: Optional[Any] = None,
+    progress: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run Phase 4 (Step 7 repair + Step 8 terminal) and persist its artifacts.
 
@@ -1135,6 +1138,7 @@ def _run_step7_repair(
         max_rounds=2,
         chapter_hash=chapter.chapter_hash,
         formatting=formatting,
+        progress=progress,
     )
 
     _atomic_write_json(cache_path, {
@@ -1209,6 +1213,7 @@ def run_chapter_strict(
     repair_adapters: Optional[Sequence[Any]] = None,
     formatting_adapters: Optional[Sequence[Any]] = None,
     now: Optional[Any] = None,
+    progress: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Run the strict single-resident driver for one chapter.
 
@@ -1267,6 +1272,7 @@ def run_chapter_strict(
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     started_at = now_fn().isoformat(timespec="seconds")
     wall_t0 = time.monotonic()
+    progress_writer = progress or PhaseProgressWriter(cfg.out_dir, now=now_fn)
 
     # ------------------------------------------------------------------
     # Rebuild source/snapshot/plan -- identical to run_chapter/run_generate.
@@ -1333,6 +1339,14 @@ def run_chapter_strict(
     if prior_entries:
         LOG.info("Resuming %s from chunk index %d (%d chunks already journaled)",
                   cfg.chapter_id, resumed_from_index, resumed_from_index)
+
+    progress_writer.run_started(
+        chapter_id=cfg.chapter_id,
+        out_dir=cfg.out_dir,
+        started_at=started_at,
+        backend_identity_hash=cfg.backend.identity_hash,
+        resumed_from_index=resumed_from_index,
+    )
 
     # A resumed run's committed translations live in the *previous* run's
     # translations.json (this run overwrites that path only at the very
@@ -1422,6 +1436,8 @@ def run_chapter_strict(
 
                 events_before = runtime.event_count()
 
+                progress_writer.chunk_started(chunk_id=plan_chunk.chunk_id)
+
                 outcome = generate_for_chunk(
                     chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
                     chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
@@ -1454,6 +1470,9 @@ def run_chapter_strict(
                     )
                     journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                     journal_file.flush()
+                    progress_writer.chunk_done(
+                        chunk_id=plan_chunk.chunk_id, outcome="incomplete_generation"
+                    )
                     selection_records.append({
                         "chunk_id": plan_chunk.chunk_id, "status": "incomplete_generation",
                         "risk_band": outcome.risk_band, "expected_roles": list(outcome.expected_roles),
@@ -1504,6 +1523,9 @@ def run_chapter_strict(
                     )
                     journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                     journal_file.flush()
+                    progress_writer.chunk_done(
+                        chunk_id=plan_chunk.chunk_id, outcome="quarantined"
+                    )
                     selection_records.append({
                         "chunk_id": plan_chunk.chunk_id, "status": "quarantined",
                         "quarantine_reason": f"cascade raised: {exc!r}",
@@ -1560,6 +1582,7 @@ def run_chapter_strict(
                 )
                 journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
                 journal_file.flush()
+                progress_writer.chunk_done(chunk_id=plan_chunk.chunk_id, outcome=entry_outcome)
                 if entry_outcome == "selected":
                     # Written immediately, not just at the end of the run:
                     # if the process crashes before reaching the final
@@ -1632,6 +1655,7 @@ def run_chapter_strict(
             gemma_audit_evaluator=gemma_audit_evaluator,
             backend_identity_hash=cfg.backend.identity_hash,
             backend_identity_hashes=acceptable_backend_hashes,
+            progress=progress_writer,
         )
     except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
         LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
@@ -1690,6 +1714,7 @@ def run_chapter_strict(
                 backend_identity_hashes=acceptable_backend_hashes,
                 now=now_fn,
                 formatting=formatting_step,
+                progress=progress_writer,
             )
             step8 = {
                 "status": step7["terminal"],
@@ -1832,6 +1857,7 @@ def run_chapter_strict(
         runtime.close()
     except Exception:  # noqa: BLE001
         LOG.exception("Failed to close runtime at end of run")
+    progress_writer.close()
 
     return StrictChapterRunResult(
         chapter_id=cfg.chapter_id, out_dir=cfg.out_dir, chunk_count=len(chunk_plan.chunks),

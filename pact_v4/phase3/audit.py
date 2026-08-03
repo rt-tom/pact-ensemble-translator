@@ -516,6 +516,7 @@ def run_chapter_audit(
     gemma_policy_version: str = "gemma_russian_review/v1",
     deterministic_policy_version: str = "deterministic_integrity/v1",
     cache: Optional[AuditCache] = None,
+    progress: Optional[Any] = None,
 ) -> AuditOutcome:
     """Run the Step 6 assembled-chapter audit (Qwen + Gemma + deterministic).
 
@@ -613,6 +614,8 @@ def run_chapter_audit(
                 all_findings.extend(cached.findings)
                 continue
 
+            if progress is not None:
+                progress.audit_unit_started(chunk_id=chunk.chunk_id, detector=detector)
             try:
                 if detector == "qwen_chapter_audit":
                     raw = qwen_evaluator(
@@ -635,6 +638,11 @@ def run_chapter_audit(
                 result = AuditUnitResult(ok=True, findings=unit_findings)
             except Exception as exc:  # model call failure or output validation failure
                 result = AuditUnitResult(ok=False, error=str(exc))
+            if progress is not None:
+                progress.audit_unit_done(
+                    chunk_id=chunk.chunk_id, detector=detector,
+                    status="ok" if result.ok else "failed",
+                )
 
             cache.put(unit_hash, result)
             if result.ok:
@@ -645,6 +653,9 @@ def run_chapter_audit(
     store = FindingStore.create(chapter.snapshot_hash, all_findings)
     region_plan = resolve_regions(store)
     status = "complete" if not failed_units else "incomplete"
+
+    if progress is not None:
+        progress.audit_done(status=status)
 
     return AuditOutcome(
         chapter_hash=chapter.chapter_hash,

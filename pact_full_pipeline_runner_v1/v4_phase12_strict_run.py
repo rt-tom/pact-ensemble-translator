@@ -44,6 +44,7 @@ from pact_v4.pipeline.v4_phase12_strict_runner import (
     build_strict_lifecycle,
     run_chapter_strict,
 )
+from pact_v4.pipeline.phase_progress import PhaseProgressWriter
 from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
     LocalLlamaBackendConfig,
@@ -289,6 +290,7 @@ def run_local_default(args: argparse.Namespace) -> int:
     runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
     repair_adapters = build_repair_adapters(backend, runtime)
     formatting_adapters = build_formatting_adapters(backend, runtime)
+    progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
@@ -296,7 +298,9 @@ def run_local_default(args: argparse.Namespace) -> int:
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
         formatting_adapters=formatting_adapters,
+        progress=progress,
     )
+    progress.close()
     _log_result(result)
     return 0 if not result.halted_early else 2
 
@@ -316,6 +320,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     repair_adapters = build_repair_adapters(backend, runtime)
     formatting_adapters = build_formatting_adapters(backend, runtime)
     cfg = _build_run_config(args, backend)
+    progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
@@ -323,7 +328,9 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
         formatting_adapters=formatting_adapters,
+        progress=progress,
     )
+    progress.close()
     _log_result(result)
     return 0 if not result.halted_early else 2
 
