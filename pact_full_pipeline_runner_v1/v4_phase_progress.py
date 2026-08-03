@@ -141,8 +141,16 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
             parsed = datetime.fromisoformat(started_at)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
+            finished_ts = None
             if record is not None and record.get("finished_at"):
-                finished = datetime.fromisoformat(str(record["finished_at"]))
+                finished_ts = str(record["finished_at"])
+            elif terminal is not None and terminal.get("ts"):
+                # No record yet (fine mode terminal event): pin elapsed to the
+                # terminal event's own timestamp so --watch archival re-views
+                # do not report a growing value for a finished run.
+                finished_ts = str(terminal["ts"])
+            if finished_ts:
+                finished = datetime.fromisoformat(finished_ts)
                 if finished.tzinfo is None:
                     finished = finished.replace(tzinfo=timezone.utc)
                 elapsed = (finished - parsed).total_seconds()
@@ -176,6 +184,9 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "started_at": started_at,
         "elapsed_seconds": elapsed,
         "resumed_from_index": resumed,
+        # The runner sets both identity_hash and config_identity_hash from
+        # cfg.backend.identity_hash; the event carries only the former, so
+        # the record fallback is belt-and-suspenders, not a divergence probe.
         "backend_identity_hash": (started or {}).get("backend_identity_hash") or (record or {}).get("backend", {}).get("identity_hash"),
         "chapter_id": (started or {}).get("chapter_id") or (record or {}).get("chapter_id"),
         "out_dir": str(out_dir),

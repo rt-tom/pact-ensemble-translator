@@ -217,3 +217,16 @@ def test_tracker_resume_identity_from_events(tmp_path: Path):
     identity = tracker._identity(out, tracker._load_events(out))
     assert identity["resumed_from_index"] == 1
     assert identity["backend_identity_hash"] == "h1"
+
+
+def test_elapsed_pinned_to_terminal_event_when_no_record(tmp_path: Path):
+    # N2 review note: with only a terminal event (no trial record), elapsed
+    # must be the started_at..terminal_ts delta, not a wall-clock value that
+    # keeps growing on every --watch tick.
+    out = _make_run_dir(tmp_path)
+    events = _fine_events()
+    assert events[-1]["event"] == "terminal"
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, events)
+    identity = tracker._identity(out, tracker._load_events(out))
+    assert identity["elapsed_seconds"] == 16.0  # 10:00:16 - 10:00:00
+    assert identity["alive"] is False

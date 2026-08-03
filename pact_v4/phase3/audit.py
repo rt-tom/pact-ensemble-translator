@@ -516,6 +516,10 @@ def run_chapter_audit(
     gemma_policy_version: str = "gemma_russian_review/v1",
     deterministic_policy_version: str = "deterministic_integrity/v1",
     cache: Optional[AuditCache] = None,
+    # Duck-typed: any object exposing the event helpers used below
+    # (audit_unit_started/audit_unit_done/audit_done); the reference impl is
+    # ``pact_v4.pipeline.phase_progress.PhaseProgressWriter``. ``Optional[Any]``
+    # (rather than the concrete type) avoids a pipeline->phase3 import cycle.
     progress: Optional[Any] = None,
 ) -> AuditOutcome:
     """Run the Step 6 assembled-chapter audit (Qwen + Gemma + deterministic).

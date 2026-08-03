@@ -1196,6 +1196,9 @@ def _reaudit_chunks(
                 issues = _parse_issues(
                     raw, owned_pids=frozenset(chunk.pids), allowed_categories=allowed
                 )
+                # unit_status drives both the progress emission below and the
+                # original "continue on failure" gate (see the guard after the
+                # reaudit_unit_done call).
                 unit_status = "ok"
             except Exception as exc:
                 LOG.warning(
