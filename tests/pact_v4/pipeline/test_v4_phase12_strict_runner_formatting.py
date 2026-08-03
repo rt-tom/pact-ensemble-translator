@@ -259,6 +259,24 @@ def test_formatting_skipped_without_formatting_adapters(tmp_path: Path):
     assert all("<em>" not in text for _pid, text in report["final_translation"])
 
 
+def test_formatting_skipped_when_formatting_not_required(tmp_path: Path):
+    # ``formatting_required=False`` is the runtime master switch (§6.1
+    # ``formatting.required=true``): even with formatting adapters wired, the
+    # step is skipped entirely — adapters alone never trigger it.
+    cfg = _make_cfg(tmp_path, n_paragraphs=8)
+    cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        formatting_required=False,
+    )
+    result = _run_local(cfg, formatting_caller=CannedFormattingCaller())
+    assert result.step7["formatting"] is None
+    assert result.step8["formatting"] is None
+    assert not (cfg.out_dir / "formatting_report.json").exists()
+    report = _load_report(cfg.out_dir, "repair_report.json")
+    assert all("<em>" not in text for _pid, text in report["final_translation"])
+
+
 def test_formatting_skipped_when_repair_skipped(tmp_path: Path):
     # Without repair adapters, Step 7/8 (and therefore formatting) are
     # recorded as skipped — formatting has no Step 8 to run before.

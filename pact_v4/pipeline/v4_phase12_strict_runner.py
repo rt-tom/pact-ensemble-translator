@@ -1660,8 +1660,13 @@ def run_chapter_strict(
         # through the backend boundary in local/remote/composite profiles
         # alike — never a local lifecycle adapter. Applied between Step 7
         # convergence and Step 8 inside run_repair_phase.
+        #
+        # ``cfg.formatting_required`` is the runtime master switch (§6.1
+        # ``formatting.required=true``): even when formatting adapters are
+        # configured, the step is skipped entirely when the policy says
+        # formatting is not required — adapters alone never trigger it.
         formatting_step = None
-        if formatting_adapters is not None:
+        if formatting_adapters is not None and cfg.formatting_required:
             formatting_caller = formatting_adapters[0]
 
             def _formatting_step(*, translation):
