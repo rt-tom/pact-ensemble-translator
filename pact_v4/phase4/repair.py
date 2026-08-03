@@ -123,7 +123,7 @@ __all__ = [
 REPAIR_UNIT_SCHEMA = "pact-v4-phase4-repair-cache/v1"
 REPAIR_REPORT_SCHEMA = "pact-v4-phase4-repair-report/v1"
 REPAIR_POLICY_VERSION = "pact-v4-repair-policy/v1"
-QWEN_REAUDIT_POLICY_VERSION = "qwen_convergence_reaaduit/v1"
+QWEN_REAUDIT_POLICY_VERSION = "qwen_convergence_reaudit/v1"
 GEMMA_RECHECK_POLICY_VERSION = "gemma_russian_recheck/v1"
 DETERMINISTIC_INTEGRITY_POLICY_VERSION = "deterministic_integrity/v1"
 
@@ -851,7 +851,7 @@ def _reaudit_chunks(
     for chunk_id in chunk_ids:
         chunk = chunk_plan.chunk(chunk_id)
         translation = translation_by_chunk.get(chunk_id, {})
-        candidate_id = f"{chunk_id}:repair:reaaduit"
+        candidate_id = f"{chunk_id}:repair:reaudit"
         for pid in chunk.pids:
             en_text = source_map.get(pid, "")
             target = translation.get(pid, "")
