@@ -48,6 +48,7 @@ from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
     LocalLlamaBackendConfig,
     OpenCodeBackendConfig,
+    build_formatting_adapters,
     build_repair_adapters,
     build_role_adapters,
     load_runtime_config,
@@ -287,12 +288,14 @@ def run_local_default(args: argparse.Namespace) -> int:
         )
     runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
     repair_adapters = build_repair_adapters(backend, runtime)
+    formatting_adapters = build_formatting_adapters(backend, runtime)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
+        formatting_adapters=formatting_adapters,
     )
     _log_result(result)
     return 0 if not result.halted_early else 2
@@ -311,6 +314,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
             backend, runtime,
         )
     repair_adapters = build_repair_adapters(backend, runtime)
+    formatting_adapters = build_formatting_adapters(backend, runtime)
     cfg = _build_run_config(args, backend)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
@@ -318,6 +322,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
+        formatting_adapters=formatting_adapters,
     )
     _log_result(result)
     return 0 if not result.halted_early else 2

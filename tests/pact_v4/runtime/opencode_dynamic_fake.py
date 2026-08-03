@@ -29,6 +29,10 @@ _OWNED_SOURCE_BLOCK = re.compile(
 _PID_LINE = re.compile(r"^  (\S+): (.*)$", re.MULTILINE)
 _CANDIDATE_ID = re.compile(r"candidate_id=([^\s\)]+)")
 
+_FORMAT_PID = re.compile(r"FORMAT_PID: (\S+)")
+_FORMAT_TRANSLATION = re.compile(r"^TRANSLATION: (.*)$", re.MULTILINE)
+_FORMAT_SPANS = re.compile(r"^SOURCE_SPANS: (.*)$", re.MULTILINE)
+
 _QWEN_PASS_VERDICT = json.dumps({
     "faithful_to_source": True,
     "completeness": True,
@@ -58,10 +62,34 @@ def _generation_response(text: str) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+def _formatting_response(text: str) -> str:
+    """Mirror the phase-5 test ``CannedFormattingCaller``.
+
+    Maps each unresolved source span to the corresponding word of the
+    translation (span i -> word i), so a local fake and this remote fake
+    produce byte-identical mappings for the same prompt. Used by the
+    dual-mode parity test (§14.3).
+    """
+    pid = _FORMAT_PID.search(text).group(1)
+    translation = _FORMAT_TRANSLATION.search(text).group(1)
+    spans = json.loads(_FORMAT_SPANS.search(text).group(1))
+    words = translation.split()
+    mappings: list[Dict[str, Any]] = []
+    for index, span in enumerate(spans):
+        target = words[index] if index < len(words) else ""
+        mappings.append({
+            "pid": pid, "span_id": span["span_id"],
+            "target_text": target, "occurrence": 1,
+        })
+    return json.dumps({"mappings": mappings}, ensure_ascii=False)
+
+
 def _respond_to_prompt(text: str) -> str:
     """Return the canned assistant text for a Pact prompt."""
     if "OWNED_SOURCE" in text:
         return _generation_response(text)
+    if "SOURCE_SPANS:" in text:
+        return _formatting_response(text)  # Phase 5 formatting fallback
     if "candidate_id=" in text:
         # Gemma Russian preference: prefer the first candidate id.
         match = _CANDIDATE_ID.search(text)

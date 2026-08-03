@@ -43,6 +43,7 @@ from pact_v4.runtime.runtime_config import (
     LocalLlamaBackendConfig,
     LocalRoutingBackend,
     OpenCodeBackendConfig,
+    build_formatting_adapters,
     build_repair_adapters,
     build_role_adapters,
     build_role_backend,
@@ -194,6 +195,20 @@ def test_build_repair_adapters_returns_backend_repair_caller_over_remote():
     assert isinstance(gemma_audit, BackendGemmaAuditEvaluator)
     for adapter in (repair_caller, qwen, qwen_audit, gemma_audit):
         assert adapter.backend is runtime.backend
+    runtime.close()
+
+
+def test_build_formatting_adapters_returns_backend_caller_over_remote():
+    # Phase 5 formatting adapters (B3) are Backend adapters over the same
+    # coordinator backend — the model-fallback tier never uses a local
+    # lifecycle adapter (dual-mode rule).
+    from pact_v4.runtime.backend_role_adapters import BackendFormattingCaller
+
+    cfg = _remote_cfg()
+    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
+    (formatting_caller,) = build_formatting_adapters(cfg, runtime)
+    assert isinstance(formatting_caller, BackendFormattingCaller)
+    assert formatting_caller.backend is runtime.backend
     runtime.close()
 
 

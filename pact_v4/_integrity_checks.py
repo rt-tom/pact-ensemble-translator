@@ -26,6 +26,7 @@ __all__ = [
     "find_mixed_script",
     "target_form_present",
     "combine_glossary_terms",
+    "strip_inline_markup",
     "RU_DIGIT_EQUIVALENTS",
 ]
 
@@ -37,9 +38,21 @@ _URL_OR_EMAIL_RE = re.compile(
 _SCRIPT_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё'’\-]*")
 _SOURCE_BOUNDARY = r"A-Za-z0-9_"
 
+# Inline tags the Phase 0B source parser can mark (``em``/``strong``/``i``/
+# ``b``/``a``). Phase 5 formatting restores exactly these around translated
+# fragments, so the Step 8 content checks must look at the visible text, not
+# at the injected markup — ``strip_inline_markup`` removes them (with their
+# attributes) for every shared check.
+_INLINE_TAG_RE = re.compile(r"</?(?:em|strong|i|b|a)(?:\s[^>]*)?>", re.I)
+
 
 def _norm(value) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def strip_inline_markup(text: str) -> str:
+    """Remove inline formatting tags (and their attributes) from a text."""
+    return _INLINE_TAG_RE.sub("", text)
 
 
 def extract_digits(text: str) -> List[str]:

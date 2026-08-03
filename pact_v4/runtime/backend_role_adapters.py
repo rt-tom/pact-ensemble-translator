@@ -35,12 +35,14 @@ from pact_v4.runtime.backend_protocol import (
 )
 from pact_v4.runtime.gemma_selector import _parse_gemma_preference
 from pact_v4.runtime.prompts_runtime import (
+    FORMAT_SPANS_V1,
     GEMMA_AUDIT_V1,
     GEMMA_RUSSIAN_PREFERENCE_V1,
     QWEN_AUDIT_V1,
     QWEN_FIDELITY_V1,
     REPAIR_REGION_V1,
     ReviewerPrompt,
+    render_formatting_prompt,
     render_gemma_audit_prompt,
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
@@ -469,6 +471,85 @@ class BackendRepairCaller:
         return response.text
 
 
+@dataclass(frozen=True)
+class BackendFormattingCallerConfig:
+    """Phase 5 span-mapping call settings.
+
+    The formatting output is a ``{"mappings": [{"pid", "span_id",
+    "target_text", "occurrence"}]}`` JSON object for one PID's unresolved
+    spans. ``max_tokens`` is a floor with per-PID headroom (same Qwen fix as
+    the fidelity gate) so a long PID with several spans is not truncated
+    mid-JSON — a truncation would otherwise surface as a spurious incident
+    instead of a transport/format problem.
+    """
+
+    max_tokens: int = 8192
+    template: ReviewerPrompt = FORMAT_SPANS_V1
+    label: str = "phase5/formatting_align"
+
+
+class BackendFormattingCaller:
+    """Phase 5 §8.14 span-mapping model fallback over a ``CompletionBackend``.
+
+    Transport-only role adapter (V4 A1 pattern): renders the formatting
+    prompt (source text + unresolved source spans + Russian translation),
+    sends it through ``backend.complete(request)``, and returns the raw
+    assistant text. Output parsing/validation (strict JSON, PID/span-set
+    enforcement, substring verification) lives in
+    ``pact_v4.phase5.formatting`` — this class never invents a mapping on its
+    own. A transport failure raises ``CompletionError``; the formatting
+    module converts it into a blocking incident recorded as debt, never a
+    semantic terminal status (rule "transport failure != semantic gate
+    failure"; no silent fallback).
+    """
+
+    def __init__(
+        self,
+        backend: CompletionBackend,
+        *,
+        config: Optional[BackendFormattingCallerConfig] = None,
+    ) -> None:
+        self._backend = backend
+        self._config = config or BackendFormattingCallerConfig()
+        self._max_tokens = int(self._config.max_tokens)
+
+    @property
+    def backend(self) -> CompletionBackend:
+        return self._backend
+
+    def __call__(
+        self,
+        *,
+        pid: str,
+        source_text: str,
+        translation: str,
+        spans: Sequence[Mapping[str, Any]],
+    ) -> str:
+        prompt = render_formatting_prompt(
+            pid=pid,
+            source_text=source_text,
+            translation=translation,
+            spans=[dict(item) for item in spans],
+            template=self._config.template,
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(
+                self._backend, ("formatting", "repair", "generator")
+            ),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=self._max_tokens,
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+        try:
+            response = self._backend.complete(request)
+        except CompletionError as exc:
+            LOG.error("BackendFormattingCaller: backend failure: %s", exc)
+            raise
+        return response.text
+
+
 __all__ = [
     "DEFAULT_MAX_TOKENS",
     "BackendModelCallerConfig",
@@ -483,4 +564,6 @@ __all__ = [
     "BackendGemmaAuditEvaluator",
     "BackendRepairCallerConfig",
     "BackendRepairCaller",
+    "BackendFormattingCallerConfig",
+    "BackendFormattingCaller",
 ]
