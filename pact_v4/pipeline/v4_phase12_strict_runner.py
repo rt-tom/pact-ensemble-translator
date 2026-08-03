@@ -1070,10 +1070,11 @@ def _run_step7_repair(
 ) -> Dict[str, Any]:
     """Run Phase 4 (Step 7 repair + Step 8 terminal) and persist its artifacts.
 
-    ``repair_adapters`` is the ``(repair_caller, qwen_evaluator,
+    ``repair_adapters`` is the ``(repair_caller, region_fidelity_gate,
     qwen_audit_evaluator, gemma_audit_evaluator)`` tuple built by
     ``build_repair_adapters`` (Backend adapters over the coordinator
-    ``CompletionBackend``). ``phase4_inputs`` is the second element returned
+    ``CompletionBackend``; ``region_fidelity_gate`` is the L2b narrow
+    per-region Qwen re-gate). ``phase4_inputs`` is the second element returned
     by ``_run_step6_audit`` (candidates, handoff rows, findings store, region
     plan, assembled chapter).
 
@@ -1090,7 +1091,7 @@ def _run_step7_repair(
 
     Returns the Step 7/8 summary recorded in the run record.
     """
-    repair_caller, qwen_evaluator, qwen_audit_evaluator, gemma_audit_evaluator = repair_adapters
+    repair_caller, region_fidelity_gate, qwen_audit_evaluator, gemma_audit_evaluator = repair_adapters
 
     candidates = phase4_inputs["candidates"]
     handoff_chunks = phase4_inputs["handoff_chunks"]
@@ -1126,7 +1127,7 @@ def _run_step7_repair(
         candidates=candidates,
         current_translation=current_translation,
         repair_caller=repair_caller,
-        qwen_evaluator=qwen_evaluator,
+        region_fidelity_gate=region_fidelity_gate,
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         backend_identity_hash=backend_identity_hash,
@@ -1238,7 +1239,7 @@ def run_chapter_strict(
     fresh audit cache, since every old unit key misses).
 
     Step 7/8 (Phase 4, B2) run after Step 6 only when ``repair_adapters``
-    (``(repair_caller, qwen_evaluator, qwen_audit_evaluator,
+    (``(repair_caller, region_fidelity_gate, qwen_audit_evaluator,
     gemma_audit_evaluator)``, built by
     ``pact_v4.runtime.runtime_config.build_repair_adapters`` over the
     coordinator ``CompletionBackend``) is provided — local/remote/composite

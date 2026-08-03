@@ -40,6 +40,7 @@ from pact_v4.runtime.prompts_runtime import (
     GEMMA_RUSSIAN_PREFERENCE_V1,
     QWEN_AUDIT_V1,
     QWEN_FIDELITY_V1,
+    REGION_FIDELITY_GATE_V1,
     REPAIR_REGION_V1,
     ReviewerPrompt,
     render_formatting_prompt,
@@ -47,6 +48,7 @@ from pact_v4.runtime.prompts_runtime import (
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
     render_qwen_review_prompt,
+    render_region_fidelity_gate_prompt,
     render_repair_prompt,
 )
 from pact_v4.runtime.qwen_evaluator import (
@@ -472,6 +474,81 @@ class BackendRepairCaller:
 
 
 @dataclass(frozen=True)
+class BackendRegionFidelityGateConfig:
+    """L2b narrow Qwen re-gate call settings (``region_fidelity_gate``).
+
+    The verdict output is the same short JSON object the full-chunk fidelity
+    reviewer returns (parsed via ``_parse_qwen_verdict``), so narrow verdicts
+    are directly comparable to full-chunk ones on a fixture. The input is a
+    single PID + region, so the output budget is small; ``max_tokens`` stays
+    a floor with a generous ceiling so a verbose ``reason`` is never
+    truncated mid-JSON.
+    """
+
+    max_tokens: int = 4096
+    template: ReviewerPrompt = REGION_FIDELITY_GATE_V1
+    label: str = "phase4/region_fidelity_gate"
+
+
+class BackendRegionFidelityGate:
+    """``pact_v4.phase4.repair.RegionFidelityEvaluator`` over a
+    ``CompletionBackend``.
+
+    L2b (DECISIONS 2026-08-03): narrow per-region re-gate that renders only
+    the edited PID's source + repaired text + region (``render_region_fidelity_gate_prompt``)
+    and parses the verdict via ``_parse_qwen_verdict`` — the same parser the
+    full-chunk fidelity gate uses. The model binding is the Qwen fidelity
+    role (re-gate stays on Qwen; the editor stays on Gemma). A transport
+    failure returns a failing ``GateResult`` (debt, never a semantic
+    verdict); there is no silent fallback.
+    """
+
+    def __init__(
+        self,
+        backend: CompletionBackend,
+        *,
+        config: Optional[BackendRegionFidelityGateConfig] = None,
+    ) -> None:
+        self._backend = backend
+        self._config = config or BackendRegionFidelityGateConfig()
+        self._max_tokens = int(self._config.max_tokens)
+
+    @property
+    def backend(self) -> CompletionBackend:
+        return self._backend
+
+    def __call__(
+        self, *, source_text: str, repaired_text: str, region: Any
+    ) -> GateResult:
+        prompt = render_region_fidelity_gate_prompt(
+            source_text=source_text,
+            repaired_text=repaired_text,
+            region=region,
+            template=self._config.template,
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(
+                self._backend, ("fidelity_reviewer", "qwen_fidelity")
+            ),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=self._max_tokens,
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+        try:
+            response = self._backend.complete(request)
+        except CompletionError as exc:
+            LOG.error("BackendRegionFidelityGate: backend failure: %s", exc)
+            return GateResult(
+                gate="qwen_fidelity",
+                passed=False,
+                detail=f"qwen_fidelity: API failure: {exc}",
+            )
+        return _parse_qwen_verdict(response.text)
+
+
+@dataclass(frozen=True)
 class BackendFormattingCallerConfig:
     """Phase 5 span-mapping call settings.
 
@@ -564,6 +641,8 @@ __all__ = [
     "BackendGemmaAuditEvaluator",
     "BackendRepairCallerConfig",
     "BackendRepairCaller",
+    "BackendRegionFidelityGateConfig",
+    "BackendRegionFidelityGate",
     "BackendFormattingCallerConfig",
     "BackendFormattingCaller",
 ]

@@ -416,3 +416,54 @@ def test_repair_caller_parity_rendered_prompt_is_backend_agnostic():
     assert sent == ref_prompt
     # The repair role resolves the generator binding.
     assert stub.calls[0]["label"].startswith("phase4/")
+
+
+# ---------------------------------------------------------------------------
+# L2b narrow region re-gate parity: rendered prompt is backend-agnostic
+# ---------------------------------------------------------------------------
+
+
+def test_region_fidelity_gate_parity_rendered_prompt_is_backend_agnostic():
+    """The narrow L2b re-gate renders exactly ``render_region_fidelity_gate_prompt``
+    and parses the verdict with the same ``_parse_qwen_verdict`` the full-chunk
+    fidelity gate uses, so narrow verdicts are directly comparable to full ones.
+    """
+    from pact_v4.phase1.models import GateResult, Region
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendRegionFidelityGate,
+        BackendRegionFidelityGateConfig,
+    )
+    from pact_v4.runtime.prompts_runtime import render_region_fidelity_gate_prompt
+
+    region = Region(pid="p1", start=0, end=6)
+    source_text = "Hello, world."
+    repaired_text = "Здравствуй, мир."
+
+    ref_prompt = render_region_fidelity_gate_prompt(
+        source_text=source_text, repaired_text=repaired_text, region=region,
+    )
+
+    stub = StubApiClient([
+        json.dumps({
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "parity",
+            "passed": True,
+        }, ensure_ascii=False)
+    ])
+    gate = BackendRegionFidelityGate(
+        LocalOpenAIBackend(api=stub),  # type: ignore[arg-type]
+        config=BackendRegionFidelityGateConfig(max_tokens=512),
+    )
+    result = gate(
+        source_text=source_text, repaired_text=repaired_text, region=region,
+    )
+    assert isinstance(result, GateResult)
+    assert result.passed is True
+    sent = stub.calls[0]["messages"][0]["content"]
+    assert sent == ref_prompt
+    # The narrow re-gate stays on the Qwen fidelity role (label carries the
+    # phase4/region_fidelity_gate role).
+    assert stub.calls[0]["label"].startswith("phase4/region_fidelity_gate")
