@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from pact_v4.runtime.backend_protocol import KIND_COMPOSITE, KIND_LOCAL_LLAMA
 from pact_v4.runtime.opencode_backend import OpenCodeServerBackendConfig
 from pact_v4.runtime.runtime_config import (
@@ -296,3 +298,55 @@ def test_load_unknown_kind_raises():
         assert "unknown kind" in str(exc)
     else:
         raise AssertionError("expected unknown kind ValueError")
+
+
+# ---------------------------------------------------------------------------
+# Example runtime profiles (V4 C3)
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> Path:
+    return Path(__file__).parents[3]
+
+
+def test_example_local_config_loads_with_string_server_args():
+    """Regression: ``configs/runtime_local.example.yaml`` crashed at model start.
+
+    The unquoted YAML 1.1 bool words ``-fa on`` / ``-fit on`` parsed as
+    booleans and flowed into ``subprocess.Popen`` -> ``list2cmdline`` ->
+    ``TypeError: expected str, bytes or os.PathLike object, not bool``. The
+    example now quotes them; the loader must produce string-only server_args.
+    """
+    yaml = pytest.importorskip("yaml")
+    path = _repo_root() / "configs" / "runtime_local.example.yaml"
+    cfg = load_runtime_config(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert isinstance(cfg, LocalLlamaBackendConfig)
+    for args in cfg.server_args.values():
+        assert all(isinstance(a, str) for a in args), args
+
+
+def test_example_composite_config_loads_with_string_server_args():
+    """Same regression for the composite profile's local sub-backends."""
+    yaml = pytest.importorskip("yaml")
+    path = _repo_root() / "configs" / "runtime_composite.example.yaml"
+    cfg = load_runtime_config(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert isinstance(cfg, CompositeBackendConfig)
+    for sub in cfg.backends.values():
+        if isinstance(sub, LocalLlamaBackendConfig):
+            for args in sub.server_args.values():
+                assert all(isinstance(a, str) for a in args), args
+
+
+def test_local_config_rejects_non_string_server_args():
+    """Non-string server_args fail loudly at construction, not inside Popen."""
+    try:
+        LocalLlamaBackendConfig(
+            exe=Path("C:/fake/llama-server.exe"), device="FAKE0", host="127.0.0.1",
+            model_paths={"gemma": Path("C:/fake/gemma.gguf")},
+            model_names={"gemma": "gemma"},
+            server_args={"gemma": ["-fa", True]},
+        )
+    except ValueError as exc:
+        assert "server_args must contain only strings" in str(exc)
+    else:
+        raise AssertionError("expected non-string server_args ValueError")
