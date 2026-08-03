@@ -22,7 +22,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pact_v4.phase1.models import GateResult
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictBackendConfig,
     StrictRunConfig,
@@ -125,9 +124,6 @@ def _run_with_repair(
     qwen_passed: bool = True,
 ):
     """Run the strict driver with Phase 4 repair adapters injected."""
-    from pact_v4.pipeline.v4_phase12_strict_runner import (
-        _b2_handoff_path,
-    )
     router = _make_router()
     model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
     qwen_evaluator = _LifecycleAwareQwen(router, StubQwen())
@@ -302,16 +298,7 @@ def test_step7_dual_mode_parity_local_vs_remote(tmp_path: Path):
     runtime = RemoteRuntimeCoordinator(backend)
     remote_cfg = make(OpenCodeBackendConfig(server=backend_cfg), tmp_path / "remote_out")
 
-    class _RemoteQwen(StubQwen):
-        def __call__(self, source, translation):
-            return GateResult(gate="qwen_fidelity", passed=True, detail="remote regate")
-
-    model_caller = BackendRepairCaller(backend)  # repair role over the boundary
-    # Reuse the Step 6/audit role adapters over the same remote backend.
-    qwen_evaluator = BackendQwenEvaluator(backend)
     from pact_v4.runtime.backend_role_adapters import BackendGemmaSelector, BackendModelCaller
-    from pact_v4.runtime.backend_protocol import CompletionRequest, Message, JSON_OBJECT_SCHEMA
-    import pact_v4.phase2.generation as _gen
 
     # The remote strict run must go through the Backend role adapters; we
     # reuse the DynamicFakeOpenCodeServer canned behaviour, so the Phase 1-2
