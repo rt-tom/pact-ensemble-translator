@@ -158,6 +158,31 @@ GEMMA_AUDIT_V1 = ReviewerPrompt(
 )
 
 
+# Phase 4A region/PID repair (V4_MVP_SPEC_RU.md §2 Step 7). The model is
+# given a chunk's source + current translation, a located region, and the
+# findings it must fix, and is asked to make a *minimal targeted edit*:
+# change only what the finding requires, keep everything else verbatim.
+REPAIR_REGION_V1 = ReviewerPrompt(
+    role="region_repair",
+    version="pact-v4-repair-region/v1",
+    instructions=(
+        "You are a Russian-language editor fixing specific problems in a "
+        "Russian translation of English fiction. You are given one chunk as "
+        "two ordered PID maps: SOURCE (PID -> English text) and TRANSLATION "
+        "(PID -> Russian text, same PIDs in the same order). A REGION and the "
+        "FINDINGS describe what to fix. Make a minimal targeted edit: change "
+        "only the text needed to resolve the findings, and keep every other "
+        "PID and the rest of the affected PID verbatim. Do not re-translate "
+        "the whole chunk. Return STRICT JSON, no markdown fences, no "
+        "commentary, with exactly this schema:\n"
+        "  repaired: object mapping each target PID (only the ones you were "
+        "asked to fix) to its corrected Russian text\n"
+        "  reason: short string explaining the edit\n"
+        "Do not include any other keys. Do not add or remove PIDs."
+    ),
+)
+
+
 # --- Render helpers --------------------------------------------------------
 
 
@@ -223,4 +248,41 @@ def render_gemma_audit_prompt(
         f"{template.instructions}\n\n"
         f"CHUNK: {chunk_id}\n\n"
         f"TRANSLATION (PID -> Russian text):\n{tr_lines}\n"
+    )
+
+
+def render_repair_prompt(
+    *,
+    chunk_id: str,
+    source: dict[str, str],
+    translation: dict[str, str],
+    region: Any,
+    findings: list[dict[str, str]],
+    template: ReviewerPrompt = REPAIR_REGION_V1,
+) -> str:
+    """Render the Phase 4A region-repair request as one user message.
+
+    ``region`` is a ``pact_v4.phase1.models.Region`` (pid/start/end);
+    ``findings`` is a list of serialized finding evidence dicts with
+    ``category``/``note``/``excerpt`` keys. Everything the model needs to
+    make a minimal targeted edit is rendered here; nothing is hidden in
+    caller state.
+    """
+    src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
+    tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    region_line = (
+        f"pid={region.pid} span=[{region.start}, {region.end})"
+    )
+    finding_lines = "\n".join(
+        f"  - category={f.get('category')} note={f.get('note')}"
+        f" excerpt={f.get('excerpt') or '(none)'}"
+        for f in findings
+    ) or "  (none)"
+    return (
+        f"{template.instructions}\n\n"
+        f"CHUNK: {chunk_id}\n\n"
+        f"SOURCE (PID -> English text):\n{src_lines}\n\n"
+        f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n\n"
+        f"REGION (the located problem span):\n  {region_line}\n\n"
+        f"FINDINGS (what to fix):\n{finding_lines}\n"
     )

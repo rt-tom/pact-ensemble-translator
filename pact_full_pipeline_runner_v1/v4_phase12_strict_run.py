@@ -48,9 +48,11 @@ from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
     LocalLlamaBackendConfig,
     OpenCodeBackendConfig,
+    build_repair_adapters,
     build_role_adapters,
     load_runtime_config,
 )
+from pact_v4.runtime.runtime_coordinator import LocalLifecycleCoordinator
 
 LOG = logging.getLogger("v4_phase12_strict_run")
 
@@ -243,12 +245,14 @@ def _log_result(result: Any) -> None:
     LOG.info(
         "Done: chunks=%d/%d selected=%d quarantined=%d needs_synthesis=%d "
         "incomplete_generation=%d halted_early=%s restarts=%d wall_clock=%.1fs "
-        "step6=%s%s",
+        "step6=%s%s step7=%s terminal=%s",
         result.processed_count, result.chunk_count, result.selected_count,
         result.quarantined_count, result.needs_synthesis_count,
         result.incomplete_generation_count, result.halted_early,
         result.record["lifecycle"]["restart_count"], result.record["wall_clock_seconds"],
         step6_status, step6_extra,
+        result.step7.get("status"),
+        result.step8.get("status"),
     )
 
 
@@ -262,7 +266,13 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
 
 
 def run_local_default(args: argparse.Namespace) -> int:
-    """The historical local-only path -- unchanged from before C3."""
+    """The historical local-only path -- unchanged from before C3.
+
+    Since B2 the Phase 4 repair adapters are also wired here: the same
+    ``llama-server`` router now serves the repair/re-gate/re-check/re-audit
+    calls through the backend boundary (``build_repair_adapters``), so local
+    and remote profiles run the identical Phase 4 algorithm.
+    """
     backend = StrictBackendConfig(
         exe=Path(r"C:\llama-sycl-new\llama-server.exe"), device="SYCL0", host=args.host,
         model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
@@ -275,11 +285,14 @@ def run_local_default(args: argparse.Namespace) -> int:
         qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
             backend, log_dir=args.out_dir / "server_logs",
         )
+    runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
+    repair_adapters = build_repair_adapters(backend, runtime)
     result = run_chapter_strict(
-        cfg, router=router, model_caller=model_caller,
+        cfg, runtime=runtime, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
+        repair_adapters=repair_adapters,
     )
     _log_result(result)
     return 0 if not result.halted_early else 2
@@ -297,12 +310,14 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
         qwen_audit_evaluator, gemma_audit_evaluator = build_role_adapters(
             backend, runtime,
         )
+    repair_adapters = build_repair_adapters(backend, runtime)
     cfg = _build_run_config(args, backend)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
+        repair_adapters=repair_adapters,
     )
     _log_result(result)
     return 0 if not result.halted_early else 2

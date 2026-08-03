@@ -39,11 +39,13 @@ from pact_v4.runtime.prompts_runtime import (
     GEMMA_RUSSIAN_PREFERENCE_V1,
     QWEN_AUDIT_V1,
     QWEN_FIDELITY_V1,
+    REPAIR_REGION_V1,
     ReviewerPrompt,
     render_gemma_audit_prompt,
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
     render_qwen_review_prompt,
+    render_repair_prompt,
 )
 from pact_v4.runtime.qwen_evaluator import (
     MAX_TOKENS_CEILING,
@@ -387,6 +389,86 @@ class BackendGemmaAuditEvaluator:
         return response.text
 
 
+@dataclass(frozen=True)
+class BackendRepairCallerConfig:
+    """Phase 4A region-repair call settings.
+
+    The repair output is a ``{"repaired": {pid: text}, "reason": ...}`` JSON
+    object for the targeted PIDs. ``max_tokens`` is a floor with per-PID
+    headroom (same Qwen fix as the fidelity gate) so a long repaired PID is
+    not truncated mid-JSON — a truncation would otherwise surface as a
+    spurious repair failure instead of a transport/format problem.
+    """
+
+    max_tokens: int = 16384
+    template: ReviewerPrompt = REPAIR_REGION_V1
+    label: str = "phase4/region_repair"
+
+
+class BackendRepairCaller:
+    """Phase 4A region/PID repair over a ``CompletionBackend``.
+
+    Transport-only role adapter (V4 A1 pattern): renders the repair prompt
+    (source + current translation + region + findings), sends it through
+    ``backend.complete(request)``, and returns the raw assistant text.
+    Output parsing/validation (strict JSON, PID-set enforcement) lives in
+    ``pact_v4.phase4.repair`` — this class never invents a repair on its
+    own. A transport failure raises ``CompletionError``; the repair layer
+    converts it into a non-committed/debt outcome, never a semantic
+    terminal status (rule "transport failure != semantic gate failure";
+    no silent fallback).
+    """
+
+    def __init__(
+        self,
+        backend: CompletionBackend,
+        *,
+        config: Optional[BackendRepairCallerConfig] = None,
+    ) -> None:
+        self._backend = backend
+        self._config = config or BackendRepairCallerConfig()
+        self._max_tokens = int(self._config.max_tokens)
+
+    @property
+    def backend(self) -> CompletionBackend:
+        return self._backend
+
+    def __call__(
+        self,
+        *,
+        chunk_id: str,
+        source: Mapping[str, str],
+        translation: Mapping[str, str],
+        region: Any,
+        findings: Sequence[Mapping[str, str]],
+    ) -> str:
+        prompt = render_repair_prompt(
+            chunk_id=chunk_id,
+            source=dict(source),
+            translation=dict(translation),
+            region=region,
+            findings=[dict(item) for item in findings],
+            template=self._config.template,
+        )
+        dynamic_max_tokens = min(
+            MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(self._backend, ("repair", "generator")),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=dynamic_max_tokens,
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+        try:
+            response = self._backend.complete(request)
+        except CompletionError as exc:
+            LOG.error("BackendRepairCaller: backend failure: %s", exc)
+            raise
+        return response.text
+
+
 __all__ = [
     "DEFAULT_MAX_TOKENS",
     "BackendModelCallerConfig",
@@ -399,4 +481,6 @@ __all__ = [
     "BackendQwenAuditEvaluator",
     "BackendGemmaAuditEvaluatorConfig",
     "BackendGemmaAuditEvaluator",
+    "BackendRepairCallerConfig",
+    "BackendRepairCaller",
 ]

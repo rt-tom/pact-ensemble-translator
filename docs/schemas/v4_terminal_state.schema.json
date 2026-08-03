@@ -1,13 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "TerminalState",
-  "description": "Write-once terminal state machine. Terminal states are exactly complete/quarantined/failed (V4_MVP_SPEC_RU.md §7).",
+  "description": "Write-once terminal state machine. Terminal states are exactly complete/accepted_degraded/failed (V4_MVP_SPEC_RU.md §7); quarantined is an internal repair state.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "state_id": { "type": "string", "minLength": 1 },
     "status": {
-      "enum": ["pending", "in_progress", "complete", "quarantined", "failed"]
+      "enum": ["pending", "in_progress", "quarantined", "complete", "accepted_degraded", "failed"]
     },
     "provenance": {
       "type": "object",

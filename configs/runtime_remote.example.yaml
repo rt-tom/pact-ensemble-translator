@@ -34,3 +34,5 @@ model_bindings:
   russian_selector: opencode-go/qwen3.7-plus
   qwen_audit: opencode-go/qwen3.7-plus
   gemma_audit: opencode-go/deepseek-v4-flash
+  # Phase 4A region repair (B2). Falls back to `generator` when unset.
+  repair: opencode-go/deepseek-v4-flash

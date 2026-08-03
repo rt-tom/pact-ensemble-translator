@@ -43,6 +43,7 @@ from pact_v4.runtime.runtime_config import (
     LocalLlamaBackendConfig,
     LocalRoutingBackend,
     OpenCodeBackendConfig,
+    build_repair_adapters,
     build_role_adapters,
     build_role_backend,
 )
@@ -170,6 +171,28 @@ def test_build_role_adapters_returns_five_backend_adapters_over_remote():
     assert isinstance(qwen_audit, BackendQwenAuditEvaluator)
     assert isinstance(gemma_audit, BackendGemmaAuditEvaluator)
     for adapter in (caller, qwen, gemma, qwen_audit, gemma_audit):
+        assert adapter.backend is runtime.backend
+    runtime.close()
+
+
+def test_build_repair_adapters_returns_backend_repair_caller_over_remote():
+    # Phase 4 repair adapters (B2) are Backend adapters over the same
+    # coordinator backend — never local lifecycle adapters.
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendGemmaAuditEvaluator,
+        BackendQwenAuditEvaluator,
+        BackendQwenEvaluator,
+        BackendRepairCaller,
+    )
+
+    cfg = _remote_cfg()
+    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
+    repair_caller, qwen, qwen_audit, gemma_audit = build_repair_adapters(cfg, runtime)
+    assert isinstance(repair_caller, BackendRepairCaller)
+    assert isinstance(qwen, BackendQwenEvaluator)
+    assert isinstance(qwen_audit, BackendQwenAuditEvaluator)
+    assert isinstance(gemma_audit, BackendGemmaAuditEvaluator)
+    for adapter in (repair_caller, qwen, qwen_audit, gemma_audit):
         assert adapter.backend is runtime.backend
     runtime.close()
 
