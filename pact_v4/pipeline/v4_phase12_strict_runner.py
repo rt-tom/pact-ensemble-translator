@@ -68,7 +68,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from pact_v4.phase0b.source_html import load_source
+from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
     DEFAULT_MAX_WORDS,
     DEFAULT_MIN_WORDS,
@@ -91,6 +91,10 @@ from pact_v4.phase4.repair import (
     REPAIR_REPORT_SCHEMA,
     RepairCache,
     run_repair_phase,
+)
+from pact_v4.phase5.formatting import (
+    FORMATTING_REPORT_SCHEMA,
+    run_formatting_align,
 )
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
@@ -175,6 +179,14 @@ class StrictRunConfig:
     # selected translation halt the chapter rather than cascading empty
     # left_context to the end.
     max_consecutive_terminal_nonselections: int = 3
+    # Phase 5 formatting policy (§8.14, B3): blocking-integrity limit on
+    # unresolved required spans and the policy identity. Production default
+    # ``max_formatting_incidents=0`` — any unresolved required inline span
+    # prevents ``complete`` (the chapter degrades to ``accepted_degraded``
+    # when the PID map stays structurally valid).
+    max_formatting_incidents: int = 0
+    formatting_required: bool = True
+    formatting_policy_version: str = "pact-v4-formatting/v1"
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -191,6 +203,11 @@ class StrictRunConfig:
                     "seed": self.seed,
                     "max_tokens": self.max_tokens,
                     "reasoning": 0,
+                },
+                "formatting": {
+                    "required": self.formatting_required,
+                    "max_incidents": self.max_formatting_incidents,
+                    "policy_version": self.formatting_policy_version,
                 },
             },
         )
@@ -953,6 +970,10 @@ def _repair_report_path(out_dir: Path) -> Path:
     return out_dir / "repair_report.json"
 
 
+def _formatting_report_path(out_dir: Path) -> Path:
+    return out_dir / "formatting_report.json"
+
+
 def _load_repair_cache(
     path: Path,
     *,
@@ -1045,6 +1066,7 @@ def _run_step7_repair(
     backend_identity_hash: str,
     backend_identity_hashes: Sequence[str],
     now: Any,
+    formatting: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run Phase 4 (Step 7 repair + Step 8 terminal) and persist its artifacts.
 
@@ -1054,6 +1076,12 @@ def _run_step7_repair(
     ``CompletionBackend``). ``phase4_inputs`` is the second element returned
     by ``_run_step6_audit`` (candidates, handoff rows, findings store, region
     plan, assembled chapter).
+
+    ``formatting`` (B3) is the Phase 5 formatting step (a closure over
+    ``pact_v4.phase5.formatting.run_formatting_align`` built by
+    ``run_chapter_strict``) applied between convergence and Step 8. When
+    present, its outcome is persisted as a dedicated ``formatting_report.json``
+    (with backend identity) and summarized in the returned Step 7/8 block.
 
     The repair cache is loaded with identity checks on resume so a resumed
     run reuses committed repairs deterministically. The ``repair_report.json``
@@ -1105,6 +1133,7 @@ def _run_step7_repair(
         cache=cache,
         max_rounds=2,
         chapter_hash=chapter.chapter_hash,
+        formatting=formatting,
     )
 
     _atomic_write_json(cache_path, {
@@ -1121,6 +1150,28 @@ def _run_step7_repair(
     report["finished_at"] = now().isoformat(timespec="seconds")
     _atomic_write_json(_repair_report_path(cfg.out_dir), report)
 
+    formatting_block: Optional[Dict[str, Any]] = None
+    if result.formatting is not None:
+        formatting_payload = result.formatting.to_payload()
+        _atomic_write_json(_formatting_report_path(cfg.out_dir), {
+            "schema": FORMATTING_REPORT_SCHEMA,
+            "chapter_id": cfg.chapter_id,
+            "source_hash": source.source_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+            "backend_identity_hash": backend_identity_hash,
+            "outcome": formatting_payload,
+        })
+        formatting_block = {
+            "status": "blocking" if formatting_payload["blocking"] else "ok",
+            "resolved_count": formatting_payload["resolved_count"],
+            "incident_count": formatting_payload["incident_count"],
+            "model_fallback_count": formatting_payload["model_fallback_count"],
+            "max_formatting_incidents": formatting_payload["max_formatting_incidents"],
+            "report_path": str(_formatting_report_path(cfg.out_dir)),
+        }
+
     return {
         "status": result.status,
         "rounds": len(result.rounds),
@@ -1134,6 +1185,7 @@ def _run_step7_repair(
         "debt_count": len(result.debt_trace),
         "integrity": result.integrity,
         "terminal": result.terminal.status,
+        "formatting": formatting_block,
         "report_path": str(_repair_report_path(cfg.out_dir)),
         "cache_path": str(cache_path),
     }
@@ -1154,6 +1206,7 @@ def run_chapter_strict(
     qwen_audit_evaluator: Any,
     gemma_audit_evaluator: Any,
     repair_adapters: Optional[Sequence[Any]] = None,
+    formatting_adapters: Optional[Sequence[Any]] = None,
     now: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Run the strict single-resident driver for one chapter.
@@ -1192,6 +1245,14 @@ def run_chapter_strict(
     runs wire the same Backend adapters. Without it the repair phase is
     recorded as ``skipped`` (e.g. test stubs that only cover Phase 1-2 + Step
     6).
+
+    Phase 5 formatting (B3) runs between Step 7 convergence and Step 8 when
+    ``formatting_adapters`` (``(formatting_caller,)``, built by
+    ``pact_v4.runtime.runtime_config.build_formatting_adapters``) is also
+    provided. Its model-fallback tier goes through ``BackendFormattingCaller``
+    over the coordinator ``CompletionBackend`` — never a local lifecycle
+    adapter. The formatted text is what the Step 8 integrity check and the
+    terminal transition see.
     """
     if runtime is None:
         if router is None:
@@ -1593,6 +1654,27 @@ def run_chapter_strict(
     step7: Dict[str, Any]
     step8: Dict[str, Any]
     if repair_adapters is not None and phase4_inputs is not None:
+        # Phase 5 formatting (B3): build the formatting step over the source
+        # blocks + the injected formatting caller (a Backend adapter over the
+        # coordinator CompletionBackend), so the model-fallback tier runs
+        # through the backend boundary in local/remote/composite profiles
+        # alike — never a local lifecycle adapter. Applied between Step 7
+        # convergence and Step 8 inside run_repair_phase.
+        formatting_step = None
+        if formatting_adapters is not None:
+            formatting_caller = formatting_adapters[0]
+
+            def _formatting_step(*, translation):
+                return run_formatting_align(
+                    blocks=blocks,
+                    translation=translation,
+                    formatting_caller=formatting_caller,
+                    backend_identity_hash=cfg.backend.identity_hash,
+                    policy_version=cfg.formatting_policy_version,
+                    max_formatting_incidents=cfg.max_formatting_incidents,
+                )
+
+            formatting_step = _formatting_step
         try:
             step7 = _run_step7_repair(
                 cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
@@ -1601,11 +1683,13 @@ def run_chapter_strict(
                 backend_identity_hash=cfg.backend.identity_hash,
                 backend_identity_hashes=acceptable_backend_hashes,
                 now=now_fn,
+                formatting=formatting_step,
             )
             step8 = {
                 "status": step7["terminal"],
                 "integrity": step7["integrity"],
                 "debt_trace": None,  # recorded in repair_report.json
+                "formatting": step7.get("formatting"),
             }
         except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
             LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
@@ -1730,6 +1814,7 @@ def run_chapter_strict(
             "selection_meta": str(_selection_meta_path(cfg.out_dir)),
             "repair_cache": str(_repair_cache_path(cfg.out_dir)),
             "repair_report": str(_repair_report_path(cfg.out_dir)),
+            "formatting_report": str(_formatting_report_path(cfg.out_dir)),
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"

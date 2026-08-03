@@ -66,6 +66,7 @@ from pact_v4._integrity_checks import (
     find_mixed_script,
     missing_numeric_values,
     source_term_present,
+    strip_inline_markup,
     target_form_present,
 )
 from pact_v4.phase1.models import (
@@ -158,6 +159,25 @@ class RepairCaller(Protocol):
         region: Any,
         findings: Sequence[Mapping[str, str]],
     ) -> str: ...
+
+
+class FormattingStep(Protocol):
+    """Phase 5 formatting applied between convergence (Step 7) and the final
+    integrity check (Step 8).
+
+    Receives the repaired chapter PID map and returns a
+    ``pact_v4.phase5.formatting.FormattingOutcome``-shaped object
+    (``formatted_text``, ``incidents``, ``to_payload()``). The strict driver
+    injects a closure built over ``pact_v4.phase5.formatting.
+    run_formatting_align`` whose model-fallback tier goes through
+    ``BackendFormattingCaller`` over the coordinator ``CompletionBackend`` —
+    never a local lifecycle adapter. The result must preserve the PID map
+    (formatting is wrap-only by contract).
+    """
+
+    def __call__(
+        self, *, translation: Mapping[str, str]
+    ) -> Any: ...
 
 
 # ---------------------------------------------------------------------------
@@ -972,11 +992,19 @@ def _needs_qwen_smoke(
     Step 7 re-audited scope. Repair only changes regions that Step 7
     re-audits, so by default this is ``False`` (deterministic integrity only);
     the driver may still record the conditional trigger for diagnostics.
+
+    Since Phase 5 formatting is applied **before** this check, the final
+    translation may carry inline HTML markup. Formatting is wrap-only (it
+    never rewrites the visible content), so the comparison is done on the
+    markup-stripped text: a formatting-only change can never trip the smoke.
     """
     for pid, text in final_translation.items():
         if pid in reaudited_pids:
             continue
-        if original_translation.get(pid) != text:
+        if (
+            strip_inline_markup(original_translation.get(pid, ""))
+            != strip_inline_markup(text)
+        ):
             return True
     return False
 
@@ -997,6 +1025,12 @@ def run_integrity_check(
     Verifies full PID coverage and deterministic invariants (numbers,
     mixed-script, glossary, missing) over the whole chapter. ``qwen_smoke``
     is ``False`` unless text changed outside the re-audited scope.
+
+    The check runs over the **final** chapter text, which since Phase 5 may
+    carry inline formatting markup. Content checks therefore operate on the
+    markup-stripped text (``strip_inline_markup``) — the visible text — while
+    ``frozen_hash`` still covers the exact final (formatted) text, i.e. the
+    text that goes into ``complete``.
     """
     source_map = dict(source.source)
     missing_pids = [pid for pid in snapshot.pids if not final_translation.get(pid)]
@@ -1005,7 +1039,7 @@ def run_integrity_check(
     glossary: list[str] = []
     for pid in snapshot.pids:
         en_text = source_map.get(pid, "")
-        target = final_translation.get(pid, "")
+        target = strip_inline_markup(final_translation.get(pid, ""))
         if not target:
             continue
         source_digits = extract_digits(en_text)
@@ -1101,7 +1135,10 @@ class RepairPhaseResult:
     ``accepted_degraded`` / ``failed``). ``rounds`` carries per-round repair
     records + convergence re-audit findings. ``debt_trace`` lists the
     unresolved reasons. ``final_translation`` is the chapter PID map after
-    repair (last admitted text for uncommitted repairs).
+    repair **and** Phase 5 formatting (the text the Step 8 integrity check
+    and the terminal transition see — for PIDs with a restored inline span
+    contract the values carry inline HTML markup). ``formatting`` holds the
+    Phase 5 outcome when a formatting step was configured, else ``None``.
     """
 
     status: str
@@ -1111,6 +1148,7 @@ class RepairPhaseResult:
     integrity: Dict[str, Any]
     terminal: TerminalState
     report_payload: Dict[str, Any]
+    formatting: Any = None
 
     def to_payload(self) -> Dict[str, Any]:
         return self.report_payload
@@ -1136,6 +1174,7 @@ def run_repair_phase(
     cache: Optional[RepairCache] = None,
     max_rounds: int = 2,
     chapter_hash: str = "",
+    formatting: Optional[FormattingStep] = None,
 ) -> RepairPhaseResult:
     """Run Phase 4A/4A2/4B for one chapter.
 
@@ -1149,6 +1188,15 @@ def run_repair_phase(
     across resume. When omitted, it is recomputed deterministically from
     ``current_translation`` (callers that already hold the authoritative hash
     should pass it).
+
+    ``formatting`` is the Phase 5 formatting step (B3), applied **after**
+    convergence and **before** the final integrity check and the monotonic
+    terminal transition, so Step 8 sees the same text that goes into
+    ``complete``. Formatting incidents join the debt trace: any unresolved
+    required span is blocking, so with the production default
+    ``max_formatting_incidents=0`` a single incident prevents ``complete``
+    and yields ``accepted_degraded`` (when the PID map stays structurally
+    valid) — never ``failed`` from a formatting transport failure alone.
 
     One repair round is mandatory and re-audits changed PIDs + discourse
     neighbours. A second round is allowed only for a remaining blocking
@@ -1350,6 +1398,37 @@ def run_repair_phase(
     final_map: Dict[str, str] = {}
     for chunk in chunk_plan.chunks:
         final_map.update(translation_by_chunk[chunk.chunk_id])
+
+    # ---- Phase 5 formatting (span contract) before Step 8 --------------
+    # Applied AFTER convergence and BEFORE the final integrity check and the
+    # terminal transition, so Step 8 sees the same text that goes into
+    # `complete`. Formatting is wrap-only by contract: it locates the source
+    # inline spans' fragments and wraps them in the source tags, never
+    # rewriting the visible text, so the re-audit scope and the conditional
+    # Qwen smoke are unaffected. Every unresolved required span is a blocking
+    # incident that joins the debt trace.
+    formatting_outcome = None
+    if formatting is not None:
+        formatting_outcome = formatting(translation=dict(final_map))
+        formatted_map = dict(formatting_outcome.formatted_text)
+        if set(formatted_map) != set(final_map):
+            raise ValueError(
+                "Formatting must preserve the PID map; got "
+                f"{len(formatted_map)} PIDs, expected {len(final_map)}"
+            )
+        for pid, text in final_map.items():
+            if text and not formatted_map.get(pid):
+                raise ValueError(
+                    f"Formatting dropped the text of PID {pid}"
+                )
+        final_map = formatted_map
+        for incident in formatting_outcome.incidents:
+            debt_reasons.append(
+                f"formatting:{incident.pid}:{incident.span_id}: "
+                f"unresolved required span ({incident.reason}, "
+                f"tier={incident.tier})"
+            )
+
     final_translation = tuple(
         (pid, final_map.get(pid, "")) for pid in snapshot.pids
     )
@@ -1409,6 +1488,11 @@ def run_repair_phase(
             "state_id": terminal.state_id,
             "status": terminal.status,
         },
+        "formatting": (
+            formatting_outcome.to_payload()
+            if formatting_outcome is not None
+            else None
+        ),
     }
 
     return RepairPhaseResult(
@@ -1419,4 +1503,5 @@ def run_repair_phase(
         integrity=integrity,
         terminal=terminal,
         report_payload=report,
+        formatting=formatting_outcome,
     )
