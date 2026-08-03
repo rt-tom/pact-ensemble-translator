@@ -114,6 +114,23 @@ class StubQwen:
         return GateResult(gate="qwen_fidelity", passed=self.passed, detail=self.reason)
 
 
+class StubRegionGate:
+    """Fake L2b narrow ``RegionFidelityEvaluator`` (``region_fidelity_gate``)."""
+
+    def __init__(self, passed: bool = True, reason: str = "OK") -> None:
+        self.passed = passed
+        self.reason = reason
+        self.calls: List[Dict[str, str]] = []
+
+    def __call__(self, *, source_text: str, repaired_text: str, region: Any) -> GateResult:
+        self.calls.append({
+            "source_text": source_text,
+            "repaired_text": repaired_text,
+            "pid": region.pid,
+        })
+        return GateResult(gate="qwen_fidelity", passed=self.passed, detail=self.reason)
+
+
 class StubGemma:
     def __init__(self, preferred_id: Optional[str] = None) -> None:
         self.preferred_id = preferred_id

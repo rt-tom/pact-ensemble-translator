@@ -36,6 +36,7 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendModelCaller,
     BackendQwenAuditEvaluator,
     BackendQwenEvaluator,
+    BackendRegionFidelityGate,
     BackendRepairCaller,
 )
 from pact_v4.runtime.opencode_backend import (
@@ -50,6 +51,7 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     StubModelCaller,
     StubQwen,
     StubQwenAudit,
+    StubRegionGate,
     _LifecycleAwareGemmaAudit,
     _LifecycleAwareGemmaSelector,
     _LifecycleAwareModelCaller,
@@ -136,7 +138,7 @@ class CannedFormattingCaller:
 
 def _clean_repair_adapters() -> tuple:
     repair_caller = StubRepairCaller()
-    repair_qwen = StubQwen(passed=True, reason="regate")
+    repair_qwen = StubRegionGate(passed=True, reason="regate")
 
     class _StubRepairGemmaAudit(StubGemmaAudit):
         def __call__(self, *, chunk_id, translation):
@@ -358,7 +360,7 @@ def test_formatting_dual_mode_parity_local_vs_remote(tmp_path: Path):
         gemma_audit_evaluator=BackendGemmaAuditEvaluator(backend),
         repair_adapters=(
             BackendRepairCaller(backend),
-            BackendQwenEvaluator(backend),
+            BackendRegionFidelityGate(backend),
             BackendQwenAuditEvaluator(backend),
             BackendGemmaAuditEvaluator(backend),
         ),

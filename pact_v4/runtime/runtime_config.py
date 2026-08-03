@@ -654,25 +654,28 @@ def build_repair_adapters(
 ) -> Tuple[Any, Any, Any, Any]:
     """The Phase 4 repair callables ``run_chapter_strict`` needs injected.
 
-    Return order: ``(repair_caller, qwen_evaluator, qwen_audit_evaluator,
-    gemma_audit_evaluator)``. All are ``Backend*`` adapters over the
-    coordinator ``CompletionBackend`` (``build_role_backend``), never local
-    lifecycle adapters — Phase 4 repair must run through the same
-    backend-neutral boundary in local, remote and composite profiles
-    (dual-mode rule; no retrofit needed). Imported lazily to avoid an import
-    cycle with ``backend_role_adapters``.
+    Return order: ``(repair_caller, region_fidelity_gate, qwen_audit_evaluator,
+    gemma_audit_evaluator)``. ``region_fidelity_gate`` is the L2b narrow
+    per-region re-gate (``BackendRegionFidelityGate``); the full-chunk Qwen
+    re-gate is no longer used by repair — unedited PIDs are covered by the
+    convergence re-audit. All are ``Backend*`` adapters over the coordinator
+    ``CompletionBackend`` (``build_role_backend``), never local lifecycle
+    adapters — Phase 4 repair must run through the same backend-neutral
+    boundary in local, remote and composite profiles (dual-mode rule; no
+    retrofit needed). Imported lazily to avoid an import cycle with
+    ``backend_role_adapters``.
     """
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
         BackendQwenAuditEvaluator,
-        BackendQwenEvaluator,
+        BackendRegionFidelityGate,
         BackendRepairCaller,
     )
 
     backend = build_role_backend(cfg, runtime)
     return (
         BackendRepairCaller(backend),
-        BackendQwenEvaluator(backend),
+        BackendRegionFidelityGate(backend),
         BackendQwenAuditEvaluator(backend),
         BackendGemmaAuditEvaluator(backend),
     )

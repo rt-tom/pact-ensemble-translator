@@ -178,22 +178,24 @@ def test_build_role_adapters_returns_five_backend_adapters_over_remote():
 
 def test_build_repair_adapters_returns_backend_repair_caller_over_remote():
     # Phase 4 repair adapters (B2) are Backend adapters over the same
-    # coordinator backend — never local lifecycle adapters.
+    # coordinator backend — never local lifecycle adapters. The second
+    # element is the L2b narrow per-region re-gate (``region_fidelity_gate``),
+    # not the full-chunk fidelity evaluator.
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
         BackendQwenAuditEvaluator,
-        BackendQwenEvaluator,
+        BackendRegionFidelityGate,
         BackendRepairCaller,
     )
 
     cfg = _remote_cfg()
     runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
-    repair_caller, qwen, qwen_audit, gemma_audit = build_repair_adapters(cfg, runtime)
+    repair_caller, region_gate, qwen_audit, gemma_audit = build_repair_adapters(cfg, runtime)
     assert isinstance(repair_caller, BackendRepairCaller)
-    assert isinstance(qwen, BackendQwenEvaluator)
+    assert isinstance(region_gate, BackendRegionFidelityGate)
     assert isinstance(qwen_audit, BackendQwenAuditEvaluator)
     assert isinstance(gemma_audit, BackendGemmaAuditEvaluator)
-    for adapter in (repair_caller, qwen, qwen_audit, gemma_audit):
+    for adapter in (repair_caller, region_gate, qwen_audit, gemma_audit):
         assert adapter.backend is runtime.backend
     runtime.close()
 

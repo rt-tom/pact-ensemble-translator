@@ -185,6 +185,35 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 )
 
 
+# Phase 4A narrow re-gate (L2b, DECISIONS 2026-08-03). Unlike the full-chunk
+# ``QWEN_FIDELITY_V1`` re-gate, the model is given ONLY the edited PID's
+# source text, its repaired Russian text and the located region — a short
+# JSON verdict per region. Unedited PIDs are covered by the convergence
+# re-audit. The verdict schema matches ``QWEN_FIDELITY_V1`` (parsed via the
+# same ``_parse_qwen_verdict``), so narrow verdicts are directly comparable
+# to full-chunk verdicts on a fixture.
+REGION_FIDELITY_GATE_V1 = ReviewerPrompt(
+    role="region_fidelity_gate",
+    version="pact-v4-reviewer-qwen-region-fidelity/v1",
+    instructions=(
+        "You are a strict fidelity reviewer for a single repaired region of "
+        "a Russian translation of English fiction. You are given the SOURCE "
+        "text of one PID and the REPAIRED translation of that same PID, "
+        "located at a REGION span. Judge whether the repaired text preserves "
+        "the meaning, register, negation scope, named entities, and numeric "
+        "values of the source within this region. Return STRICT JSON, no "
+        "markdown fences, no commentary, matching exactly this schema:\n"
+        "  faithful_to_source: bool\n"
+        "  completeness: bool\n"
+        "  introduced_errors: bool\n"
+        "  confidence: 'high' | 'medium' | 'low'\n"
+        "  reason: short string (one or two sentences)\n"
+        "  passed: bool (true iff the repaired region is acceptable)\n"
+        "Do not include any other keys."
+    ),
+)
+
+
 # Phase 5 formatting alignment (§8.14 span contract). The model is asked to
 # map a PID's unresolved source inline spans to exact substrings of the
 # Russian translation, with a 1-based occurrence index. Output parsing /
@@ -318,6 +347,28 @@ def render_repair_prompt(
         f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n\n"
         f"REGION (the located problem span):\n  {region_line}\n\n"
         f"FINDINGS (what to fix):\n{finding_lines}\n"
+    )
+
+
+def render_region_fidelity_gate_prompt(
+    *,
+    source_text: str,
+    repaired_text: str,
+    region: Any,
+    template: ReviewerPrompt = REGION_FIDELITY_GATE_V1,
+) -> str:
+    """Render the L2b narrow Qwen re-gate request as one user message.
+
+    Only the edited PID's source text, its repaired Russian text and the
+    located ``region`` (``pid``/``start``/``end``) are rendered — unedited
+    PIDs are covered by the convergence re-audit, never shown here.
+    """
+    region_line = f"pid={region.pid} span=[{region.start}, {region.end})"
+    return (
+        f"{template.instructions}\n\n"
+        f"SOURCE (PID -> English text):\n  {region.pid}: {source_text}\n\n"
+        f"REPAIRED TRANSLATION (same PID):\n  {region.pid}: {repaired_text}\n\n"
+        f"REGION (the located repaired span):\n  {region_line}\n"
     )
 
 

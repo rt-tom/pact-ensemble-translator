@@ -31,6 +31,7 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendGemmaAuditEvaluator,
     BackendQwenAuditEvaluator,
     BackendQwenEvaluator,
+    BackendRegionFidelityGate,
     BackendRepairCaller,
 )
 from pact_v4.runtime.opencode_backend import (
@@ -45,6 +46,7 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     StubModelCaller,
     StubQwen,
     StubQwenAudit,
+    StubRegionGate,
     _LifecycleAwareGemmaAudit,
     _LifecycleAwareGemmaSelector,
     _LifecycleAwareModelCaller,
@@ -132,9 +134,9 @@ def _run_with_repair(
     gemma_audit_evaluator = _LifecycleAwareGemmaAudit(router, StubGemmaAudit())
 
     # Phase 4 repair adapters: the same protocol-shape fakes the runner's
-    # Step 7 consumes (repair_caller, qwen re-gate, qwen audit, gemma audit).
+    # Step 7 consumes (repair_caller, narrow re-gate, qwen audit, gemma audit).
     repair_caller = StubRepairCaller(text=repair_text)
-    repair_qwen = StubQwen(passed=qwen_passed, reason="regate")
+    repair_qwen = StubRegionGate(passed=qwen_passed, reason="regate")
 
     class _StubRepairGemmaAudit(StubGemmaAudit):
         def __call__(self, *, chunk_id, translation):
@@ -305,7 +307,7 @@ def test_step7_dual_mode_parity_local_vs_remote(tmp_path: Path):
     # model calls are scripted by the fake (same as the remote parity tests).
     repair_adapters = (
         BackendRepairCaller(backend),
-        BackendQwenEvaluator(backend),
+        BackendRegionFidelityGate(backend),
         BackendQwenAuditEvaluator(backend),
         BackendGemmaAuditEvaluator(backend),
     )

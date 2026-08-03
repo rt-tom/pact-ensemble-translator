@@ -32,11 +32,24 @@ Key rules implemented here (from DECISIONS 2026-08-01/02 and the plan):
     ``plan_repair`` additionally requires ``challenge_evidence`` for a
     challenged finding).
   * After a repair, the relevant gates pass: deterministic consistency +
-    Qwen re-gate. **Qwen re-gate failure never commits the repair.**
+    Qwen re-gate. **Qwen re-gate failure never commits the repair.** The
+    re-gate is *narrow* (``region_fidelity_gate``: the edited PID + region
+    only, not the whole chunk); unedited PIDs are covered by the
+    convergence re-audit (L2b, DECISIONS 2026-08-03).
   * If the repair closes a finding raised by Gemma Russian review
     (Step 6), a Gemma re-check of the region is **mandatory**; a failed
     re-check leaves the Russian finding open and returns the last admitted
     text as degraded availability.
+  * Each round runs as four role passes (L2b): all Gemma edits, then all
+    narrow Qwen re-gates, then all mandatory Gemma re-checks, then the
+    deferred commit. ``repair_id`` and cache unit identity are unchanged.
+  * The convergence re-audit batches by detector (L1): deterministic layer
+    per chunk, model tracks detector-outer / chunk-inner, findings set
+    order-independent (canonicalised by ``content_hash``).
+  * Weak-evidence soft Gemma findings (``calque``/``register`` with a short
+    excerpt and/or an uncertain note) are skipped from repair planning and
+    are not blocking in round 2 (L3); they stay in the store and are
+    recorded in the debt trace.
   * One repair round is mandatory; a second is allowed only for a remaining
     blocking finding or a changed chunk boundary. Then the final integrity
     check (deterministic by default; narrow Qwen smoke only when text
@@ -111,11 +124,14 @@ __all__ = [
     "GEMMA_RECHECK_POLICY_VERSION",
     "DETERMINISTIC_INTEGRITY_POLICY_VERSION",
     "RepairCaller",
+    "RegionFidelityEvaluator",
     "RepairPlan",
     "RepairCache",
     "RepairRecord",
     "RepairRoundResult",
     "RepairPhaseResult",
+    "SoftFindingsPolicy",
+    "filter_soft_findings",
     "plan_repairs_for_chunk",
     "repair_region",
     "run_repair_phase",
@@ -132,6 +148,19 @@ DETERMINISTIC_INTEGRITY_POLICY_VERSION = "deterministic_integrity/v1"
 # claims the finding is a false positive. Such a repair must carry explicit
 # evidence (a documented reason), never be auto-accepted.
 CHALLENGE_CATEGORIES = frozenset({"false_positive", "challenge"})
+
+# L3 severity filter (owner decision + DECISIONS 2026-08-03): soft-category
+# Gemma Russian-review findings with *weak evidence* are skipped from repair
+# planning (the findings stay in the append-only store — only planning is
+# filtered). Weak evidence = a short excerpt and/or an uncertain note
+# formulation. These thresholds are policy parameters consumed by
+# ``SoftFindingsPolicy``, never magic numbers inline in repair logic.
+L3_SOFT_CATEGORIES = frozenset({"calque", "register"})
+L3_WEAK_EXCERPT_MAX_LEN = 60
+L3_WEAK_NOTE_MARKERS = (
+    "sounds like", "might be", "likely", "possibly", "perhaps", "maybe",
+    "похоже", "возможно", "вероятно", "кажется", "скорее всего", "наверное",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +188,28 @@ class RepairCaller(Protocol):
         region: Any,
         findings: Sequence[Mapping[str, str]],
     ) -> str: ...
+
+
+class RegionFidelityEvaluator(Protocol):
+    """Narrow Qwen re-gate of one repaired region (PID-level fidelity).
+
+    L2b: the Step 7 re-gate is scoped to the *edited region* instead of the
+    whole chunk — only the edited PID's source text, its repaired Russian
+    text, and the located region are shown, and a short JSON verdict is
+    returned (rendered from the ``region_fidelity_gate`` prompt variant,
+    parsed via ``_parse_qwen_verdict`` in the Backend adapter). Unedited
+    PIDs are covered by the convergence re-audit. The verdict contract is
+    the same ``GateResult`` the full-chunk fidelity reviewer returns, so a
+    narrow verdict is directly comparable to a full one on a fixture.
+
+    This protocol knows nothing about HTTP — production wiring lives in the
+    pipeline (``BackendRegionFidelityGate`` over the coordinator
+    ``CompletionBackend``), never a local lifecycle adapter.
+    """
+
+    def __call__(
+        self, *, source_text: str, repaired_text: str, region: Any
+    ) -> GateResult: ...
 
 
 class FormattingStep(Protocol):
@@ -362,6 +413,91 @@ def plan_repair_challenge(
         instructions=challenge_evidence,
     )
     return RepairPlan(repair=repair, region=region, findings=tuple(findings))
+
+
+# ---------------------------------------------------------------------------
+# L3 severity filter (soft Gemma findings with weak evidence)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SoftFindingsPolicy:
+    """L3 severity filter for soft Gemma findings (DECISIONS 2026-08-03).
+
+    Weak-evidence findings in ``soft_categories`` (``calque``/``register``,
+    see ``L3_SOFT_CATEGORIES``) raised by the Gemma Russian review are
+    skipped from repair planning. The findings **remain in the append-only
+    store** (``audit_findings.json`` is untouched); only the planning of
+    repairs is filtered, and the skipped findings are recorded in the debt
+    trace. Soft findings are also excluded from the round-2 *blocking*
+    definition, so a convergence re-audit cannot re-introduce them as a
+    round-2 trigger (otherwise the L3 economy disappears).
+
+    Weak evidence = a short excerpt (``0 < len(excerpt) <
+    weak_excerpt_max_len``) and/or an uncertain note formulation
+    (``weak_note_markers``). Confident findings (long excerpt and no
+    hesitation marker) stay in repair. These thresholds are policy
+    parameters, not magic numbers; tune them here, never by editing repair
+    logic.
+    """
+
+    enabled: bool = True
+    soft_categories: Tuple[str, ...] = tuple(sorted(L3_SOFT_CATEGORIES))
+    weak_excerpt_max_len: int = L3_WEAK_EXCERPT_MAX_LEN
+    weak_note_markers: Tuple[str, ...] = L3_WEAK_NOTE_MARKERS
+
+
+def _is_weak_soft_finding(
+    finding: Finding,
+    *,
+    soft_categories: Sequence[str],
+    weak_excerpt_max_len: int,
+    weak_note_markers: Sequence[str],
+) -> bool:
+    """Whether a finding is a *weak-evidence soft* Gemma finding.
+
+    Only Gemma Russian-review findings in a soft category qualify. Weak
+    evidence is a short non-empty excerpt and/or an uncertain note
+    formulation. An absent (empty) excerpt is not by itself weak — a
+    confident note without an excerpt is still a strong signal.
+    """
+    if finding.detector != "gemma_russian_review" or finding.category not in soft_categories:
+        return False
+    evidence = finding.evidence if isinstance(finding.evidence, Mapping) else {}
+    note = str(evidence.get("note", ""))
+    excerpt = str(evidence.get("excerpt", ""))
+    uncertain_note = any(
+        marker.casefold() in note.casefold() for marker in weak_note_markers
+    )
+    short_excerpt = bool(excerpt.strip()) and len(excerpt) < weak_excerpt_max_len
+    return short_excerpt or uncertain_note
+
+
+def filter_soft_findings(
+    findings: Sequence[Finding],
+    policy: SoftFindingsPolicy,
+) -> Tuple[Tuple[Finding, ...], Tuple[Finding, ...]]:
+    """Split findings into ``(repairable, weak_soft_skipped)``.
+
+    Findings are never mutated or removed from the store; only repair
+    planning is filtered (L3 policy, DECISIONS 2026-08-03). When
+    ``policy.enabled`` is ``False`` every finding is repairable.
+    """
+    if not policy.enabled:
+        return tuple(findings), ()
+    repairable: list[Finding] = []
+    skipped: list[Finding] = []
+    for finding in findings:
+        if _is_weak_soft_finding(
+            finding,
+            soft_categories=policy.soft_categories,
+            weak_excerpt_max_len=policy.weak_excerpt_max_len,
+            weak_note_markers=policy.weak_note_markers,
+        ):
+            skipped.append(finding)
+        else:
+            repairable.append(finding)
+    return tuple(repairable), tuple(skipped)
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +736,147 @@ def _run_gemma_recheck(
     return "passed", ()
 
 
+def _apply_region_edit(
+    *,
+    plan: RepairPlan,
+    chunk: ChunkPlan,
+    current_translation: Mapping[str, str],
+    source: SourceArtifact,
+    repair_caller: RepairCaller,
+) -> Tuple[Optional[Dict[str, str]], str]:
+    """Call the Gemma repair model for one region and build the tentative
+    chunk translation (target PID replaced, everything else verbatim).
+
+    Returns ``(tentative_chunk_map, "")`` on success or
+    ``(None, reason)`` on a transport / invalid-structured-output failure —
+    that is debt, never a semantic terminal status (no silent fallback).
+    Shared by the legacy single-region flow and the L2b pass flow so the
+    edit contract stays identical.
+    """
+    chunk_translation = {
+        pid: current_translation.get(pid, "") for pid in chunk.pids
+    }
+    source_map = {pid: dict(source.source).get(pid, "") for pid in chunk.pids}
+    findings_payload = [
+        {
+            "category": finding.category,
+            "note": (
+                str(finding.evidence.get("note", ""))
+                if isinstance(finding.evidence, Mapping)
+                else str(finding.evidence)
+            ),
+            "excerpt": (
+                str(finding.evidence.get("excerpt", ""))
+                if isinstance(finding.evidence, Mapping)
+                else ""
+            ),
+        }
+        for finding in plan.findings
+    ]
+    try:
+        raw = repair_caller(
+            chunk_id=plan.chunk_id,
+            source=source_map,
+            translation=chunk_translation,
+            region=Region(
+                pid=plan.region.pid, start=plan.region.start, end=plan.region.end
+            ),
+            findings=findings_payload,
+        )
+        repaired_texts, _reason = _parse_repair_output(
+            raw, target_pids=plan.repair.target_pids, chunk_id=plan.chunk_id
+        )
+    except Exception as exc:
+        LOG.warning(
+            "Repair transport/validation failure for %s (%s): %s",
+            plan.chunk_id, plan.repair.action, exc,
+        )
+        return None, (
+            "Repair call failed (transport or invalid structured output): "
+            f"{exc!r} — recorded as debt, not a semantic terminal status"
+        )
+    tentative = {
+        pid: repaired_texts.get(pid, chunk_translation.get(pid, ""))
+        for pid in chunk.pids
+    }
+    return tentative, ""
+
+
+def _re_gate_region(
+    *,
+    plan: RepairPlan,
+    chunk: ChunkPlan,
+    audited_role: str,
+    source: SourceArtifact,
+    snapshot: Snapshot,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    det_data: DeterministicGateData,
+    tentative_translation: Mapping[str, str],
+    region_fidelity_gate: RegionFidelityEvaluator,
+) -> Tuple[Tuple[GateResult, ...], bool, Optional[Candidate], str]:
+    """Run the relevant re-gates on one tentative repaired translation.
+
+    Deterministic consistency (whole chunk, model-free) plus the **narrow**
+    Qwen re-gate of the edited PID (``region_fidelity_gate``: only the
+    edited PID's source + repaired text + region — unedited PIDs are
+    covered by the convergence re-audit). Returns ``(gate_trace, passed,
+    candidate, failure_reason)``; a candidate identity-validation failure
+    returns ``passed=False`` with ``failure_reason`` describing it.
+    """
+    source_map = {pid: dict(source.source).get(pid, "") for pid in chunk.pids}
+    try:
+        repaired_candidate = Candidate.create(
+            candidate_id=f"{plan.chunk_id}:repair:{plan.repair.repair_id[:16]}",
+            chunk_id=plan.chunk_id,
+            role=audited_role,
+            translation=tuple(
+                (pid, tentative_translation.get(pid, "")) for pid in chunk.pids
+            ),
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            config=config,
+        )
+    except ValueError as exc:
+        # The repaired PID map failed the ownership/identity contract (should
+        # not happen: target PIDs are the region's own PIDs of this chunk).
+        return (), False, None, f"Repaired candidate failed identity validation: {exc!r}"
+    gate_trace: list[GateResult] = []
+    det_result = deterministic_consistency_gate(
+        candidate=repaired_candidate, source=source_map, data=det_data,
+    )
+    gate_trace.append(det_result)
+    source_text = dict(source.source).get(plan.region.pid, "")
+    repaired_text = tentative_translation.get(plan.region.pid, "")
+    qwen_result = region_fidelity_gate(
+        source_text=source_text,
+        repaired_text=repaired_text,
+        region=plan.region,
+    )
+    gate_trace.append(qwen_result)
+    return tuple(gate_trace), det_result.passed and qwen_result.passed, repaired_candidate, ""
+
+
+def _commit_reason(gate_trace: Sequence[GateResult], gemma_status: str) -> str:
+    """Build the non-commit ``reason`` from the gate trace + re-check status."""
+    reason_parts: list[str] = []
+    for gate in gate_trace:
+        if gate.passed:
+            continue
+        if gate.gate == "deterministic_consistency":
+            reason_parts.append(f"deterministic_consistency: {gate.detail[:200]}")
+        else:
+            reason_parts.append(f"qwen_fidelity re-gate: {gate.detail[:200]}")
+    if gemma_status == "failed":
+        reason_parts.append("Gemma re-check failed: the Russian finding remains open")
+    if gemma_status == "transport_error":
+        reason_parts.append(
+            "Gemma re-check transport failure (debt, not a semantic verdict)"
+        )
+    return "Repair not committed: " + "; ".join(reason_parts)
+
+
 # ---------------------------------------------------------------------------
 # 4A execution: one region repair + deterministic/Qwen re-gates
 # ---------------------------------------------------------------------------
@@ -652,42 +929,14 @@ def repair_region(
     chunk_translation = {
         pid: current_translation.get(pid, "") for pid in chunk.pids
     }
-    source_map = {pid: dict(source.source).get(pid, "") for pid in chunk.pids}
-    findings_payload = [
-        {
-            "category": finding.category,
-            "note": (
-                str(finding.evidence.get("note", ""))
-                if isinstance(finding.evidence, Mapping)
-                else str(finding.evidence)
-            ),
-            "excerpt": (
-                str(finding.evidence.get("excerpt", ""))
-                if isinstance(finding.evidence, Mapping)
-                else ""
-            ),
-        }
-        for finding in plan.findings
-    ]
-
-    try:
-        raw = repair_caller(
-            chunk_id=plan.chunk_id,
-            source=source_map,
-            translation=chunk_translation,
-            region=Region(
-                pid=plan.region.pid, start=plan.region.start, end=plan.region.end
-            ),
-            findings=findings_payload,
-        )
-        repaired_texts, _reason = _parse_repair_output(
-            raw, target_pids=plan.repair.target_pids, chunk_id=plan.chunk_id
-        )
-    except Exception as exc:
-        LOG.warning(
-            "Repair transport/validation failure for %s (%s): %s",
-            plan.chunk_id, plan.repair.action, exc,
-        )
+    tentative, edit_reason = _apply_region_edit(
+        plan=plan,
+        chunk=chunk,
+        current_translation=current_translation,
+        source=source,
+        repair_caller=repair_caller,
+    )
+    if tentative is None:
         record = RepairRecord(
             repair_id=plan.repair.repair_id,
             chunk_id=plan.chunk_id,
@@ -698,25 +947,19 @@ def repair_region(
             gate_trace=(),
             gemma_recheck="not_required",
             committed=False,
-            reason=(
-                "Repair call failed (transport or invalid structured output): "
-                f"{exc!r} — recorded as debt, not a semantic terminal status"
-            ),
+            reason=edit_reason,
         )
         cache.put(unit_hash, record)
         return record
 
-    new_translation = {
-        pid: repaired_texts.get(pid, chunk_translation.get(pid, ""))
-        for pid in chunk.pids
-    }
+    source_map = {pid: dict(source.source).get(pid, "") for pid in chunk.pids}
     try:
         repaired_candidate = Candidate.create(
             candidate_id=f"{plan.chunk_id}:repair:{plan.repair.repair_id[:16]}",
             chunk_id=plan.chunk_id,
             role=audited_role,
             translation=tuple(
-                (pid, new_translation[pid]) for pid in chunk.pids
+                (pid, tentative[pid]) for pid in chunk.pids
             ),
             source=source,
             snapshot=snapshot,
@@ -747,7 +990,7 @@ def repair_region(
         candidate=repaired_candidate, source=source_map, data=det_data,
     )
     gate_trace.append(det_result)
-    qwen_result = qwen_evaluator(source_map, dict(new_translation))
+    qwen_result = qwen_evaluator(source_map, dict(tentative))
     gate_trace.append(qwen_result)
     gates_passed = det_result.passed and qwen_result.passed
 
@@ -756,7 +999,7 @@ def repair_region(
     if gates_passed and _gemma_recheck_required(plan):
         gemma_status, gemma_findings = _run_gemma_recheck(
             chunk_id=plan.chunk_id,
-            translation=new_translation,
+            translation=tentative,
             target_pids=plan.repair.target_pids,
             gemma_audit_evaluator=gemma_audit_evaluator,
             source_id=source.source_hash,
@@ -770,25 +1013,12 @@ def repair_region(
         # Keep the last admitted text (degraded availability); the finding
         # stays open. Qwen re-gate failure never commits a repair; a failed
         # Gemma re-check leaves the Russian finding open.
-        reason_parts = []
-        if not det_result.passed:
-            reason_parts.append(f"deterministic_consistency: {det_result.detail[:200]}")
-        if not qwen_result.passed:
-            reason_parts.append(f"qwen_fidelity re-gate: {qwen_result.detail[:200]}")
-        if gemma_status == "failed":
-            reason_parts.append(
-                "Gemma re-check failed: the Russian finding remains open"
-            )
-        if gemma_status == "transport_error":
-            reason_parts.append(
-                "Gemma re-check transport failure (debt, not a semantic verdict)"
-            )
-        reason = "Repair not committed: " + "; ".join(reason_parts)
+        reason = _commit_reason(tuple(gate_trace), gemma_status)
         adopted_translation = tuple((pid, chunk_translation[pid]) for pid in chunk.pids)
     else:
         reason = "Repair committed: all relevant gates passed"
         adopted_translation = tuple(
-            (pid, new_translation[pid]) for pid in chunk.pids
+            (pid, tentative[pid]) for pid in chunk.pids
         )
 
     record = RepairRecord(
@@ -862,12 +1092,22 @@ def _reaudit_chunks(
     """Re-audit a targeted set of chunks (changed PIDs + discourse neighbours).
 
     Returns the fresh findings for exactly those chunks. Deterministic layer
-    (numbers/glossary/mixed-script/missing) is re-run per chunk alongside the
-    model tracks so the re-audit is self-contained and needs no cached Step 6
-    results.
+    (numbers/glossary/mixed-script/missing) is re-run per chunk (model-free)
+    alongside the model tracks so the re-audit is self-contained and needs no
+    cached Step 6 results.
+
+    L1 (DECISIONS 2026-08-01/03): the model tracks iterate **detector-outer,
+    chunk-inner** (``for detector: for chunk_id:``) so a single-resident
+    driver pays ~1-2 model switches for the whole re-audit instead of ~2N.
+    Re-audit units are independent (the whole chapter is already assembled),
+    so iteration order is purely a scheduling decision. The returned finding
+    set is order-independent: it is canonicalised by ``content_hash``, so the
+    exact same set is produced regardless of loop order.
     """
     source_map = dict(source.source)
     all_findings: list[Finding] = []
+
+    # Deterministic layer (model-free), per chunk.
     for chunk_id in chunk_ids:
         chunk = chunk_plan.chunk(chunk_id)
         translation = translation_by_chunk.get(chunk_id, {})
@@ -932,12 +1172,17 @@ def _reaudit_chunks(
                         policy_version=DETERMINISTIC_INTEGRITY_POLICY_VERSION,
                     ))
 
-        owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
-        owned_translation = {pid: translation.get(pid, "") for pid in chunk.pids}
-        for detector, evaluator, allowed in (
-            ("qwen_chapter_audit", qwen_audit_evaluator, QWEN_AUDIT_CATEGORIES),
-            ("gemma_russian_review", gemma_audit_evaluator, GEMMA_AUDIT_CATEGORIES),
-        ):
+    # Model tracks: detector-outer, chunk-inner (L1 batching by model).
+    scope = [(chunk_id, chunk_plan.chunk(chunk_id)) for chunk_id in chunk_ids]
+    for detector, evaluator, allowed in (
+        ("qwen_chapter_audit", qwen_audit_evaluator, QWEN_AUDIT_CATEGORIES),
+        ("gemma_russian_review", gemma_audit_evaluator, GEMMA_AUDIT_CATEGORIES),
+    ):
+        for chunk_id, chunk in scope:
+            translation = translation_by_chunk.get(chunk_id, {})
+            candidate_id = f"{chunk_id}:repair:reaudit"
+            owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
+            owned_translation = {pid: translation.get(pid, "") for pid in chunk.pids}
             try:
                 if detector == "qwen_chapter_audit":
                     raw = evaluator(
@@ -974,7 +1219,7 @@ def _reaudit_chunks(
                     else GEMMA_RECHECK_POLICY_VERSION
                 ),
             ))
-    return tuple(all_findings)
+    return tuple(sorted(all_findings, key=lambda finding: finding.content_hash))
 
 
 # ---------------------------------------------------------------------------
@@ -1154,6 +1399,177 @@ class RepairPhaseResult:
         return self.report_payload
 
 
+def _run_repair_round(
+    *,
+    chapter_hash: str,
+    chunk_plan: ChunkPlanArtifact,
+    plans_by_chunk: Mapping[str, Sequence[RepairPlan]],
+    candidates: Mapping[str, Candidate],
+    source: SourceArtifact,
+    snapshot: Snapshot,
+    config: ConfigArtifact,
+    det_data: DeterministicGateData,
+    translation_by_chunk: Dict[str, Dict[str, str]],
+    repair_caller: RepairCaller,
+    region_fidelity_gate: RegionFidelityEvaluator,
+    gemma_audit_evaluator: GemmaAuditEvaluator,
+    backend_identity_hash: str,
+    cache: RepairCache,
+) -> Tuple[Tuple[RepairRecord, ...], Tuple[str, ...]]:
+    """Execute one convergence round as four role passes (L2b).
+
+    1. **Gemma edit pass** (one lease): every planned ``region_edit`` is
+       prepared on the round's chunk snapshot (one text slice per chunk;
+       regions on distinct PIDs) and kept as tentative.
+    2. **Qwen re-gate pass** (one lease): the narrow ``region_fidelity_gate``
+       (edited PID only) + the deterministic consistency gate per tentative.
+    3. **Gemma recheck pass** (one lease): the mandatory Russian re-check for
+       tentatives that passed their re-gate and close a Gemma finding.
+    4. **Commit**: tentatives that passed re-gate (+ recheck where required)
+       are applied to ``translation_by_chunk``; the rest are debt and their
+       findings stay open.
+
+    Cached units are reused verbatim on exact identity (never re-called),
+    committed or not, with the same debt semantics as the interleaved flow.
+    Returns ``(records, changed_chunk_ids)``.
+    """
+    fresh: Dict[str, Tuple[RepairPlan, Dict[str, str], Dict[str, str], str]] = {}
+    failed_edits: Dict[str, Tuple[RepairPlan, Dict[str, str], str, str]] = {}
+    cached: Dict[str, Tuple[RepairRecord, str]] = {}
+    for chunk_id, plans in plans_by_chunk.items():
+        if chunk_id not in candidates:
+            continue
+        base = translation_by_chunk[chunk_id]
+        for plan in plans:
+            unit_hash = _repair_unit_hash(
+                chapter_hash=chapter_hash,
+                plan=plan,
+                backend_identity_hash=backend_identity_hash,
+                policy_version=REPAIR_POLICY_VERSION,
+            )
+            record = cache.get(unit_hash)
+            if record is not None:
+                cached[plan.repair.repair_id] = (record, chunk_id)
+                continue
+            tentative, edit_reason = _apply_region_edit(
+                plan=plan,
+                chunk=chunk_plan.chunk(chunk_id),
+                current_translation=base,
+                source=source,
+                repair_caller=repair_caller,
+            )
+            if tentative is None:
+                failed_edits[plan.repair.repair_id] = (plan, base, unit_hash, edit_reason)
+            else:
+                fresh[plan.repair.repair_id] = (plan, tentative, base, unit_hash)
+
+    records: list[RepairRecord] = []
+    changed: list[str] = []
+
+    # ---- Qwen re-gate pass (one lease) ----------------------------------
+    gate_results: Dict[
+        str, Tuple[Tuple[GateResult, ...], bool, Optional[Candidate], str]
+    ] = {}
+    for repair_id, (plan, tentative, _base, _unit_hash) in fresh.items():
+        gate_results[repair_id] = _re_gate_region(
+            plan=plan,
+            chunk=chunk_plan.chunk(plan.chunk_id),
+            audited_role=candidates[plan.chunk_id].role,
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            config=config,
+            det_data=det_data,
+            tentative_translation=tentative,
+            region_fidelity_gate=region_fidelity_gate,
+        )
+
+    # ---- Gemma recheck pass (one lease) ---------------------------------
+    recheck: Dict[str, str] = {}
+    for repair_id, (plan, tentative, _base, _unit_hash) in fresh.items():
+        gate_trace, passed, candidate, _candidate_reason = gate_results[repair_id]
+        if passed and candidate is not None and _gemma_recheck_required(plan):
+            status, _gemma_findings = _run_gemma_recheck(
+                chunk_id=plan.chunk_id,
+                translation=tentative,
+                target_pids=plan.repair.target_pids,
+                gemma_audit_evaluator=gemma_audit_evaluator,
+                source_id=source.source_hash,
+                snapshot_id=snapshot.snapshot_hash,
+                candidate_id=candidate.candidate_id,
+            )
+            recheck[repair_id] = status
+        else:
+            recheck[repair_id] = "not_required"
+
+    # ---- commit ---------------------------------------------------------
+    for repair_id, (plan, tentative, base, unit_hash) in fresh.items():
+        gate_trace, passed, _candidate, candidate_reason = gate_results[repair_id]
+        gemma_status = recheck[repair_id]
+        gemma_ok = gemma_status in ("passed", "not_required")
+        committed = passed and gemma_ok
+        chunk_pids = chunk_plan.chunk(plan.chunk_id).pids
+        if committed:
+            reason = "Repair committed: all relevant gates passed"
+            adopted = tuple((pid, tentative[pid]) for pid in chunk_pids)
+        elif candidate_reason:
+            reason = candidate_reason
+            adopted = tuple((pid, base[pid]) for pid in chunk_pids)
+        else:
+            reason = _commit_reason(gate_trace, gemma_status)
+            adopted = tuple((pid, base[pid]) for pid in chunk_pids)
+        record = RepairRecord(
+            repair_id=plan.repair.repair_id,
+            chunk_id=plan.chunk_id,
+            finding_ids=plan.repair.finding_ids,
+            target_pids=plan.repair.target_pids,
+            action=plan.repair.action,
+            new_translation=adopted,
+            gate_trace=gate_trace,
+            gemma_recheck=gemma_status,
+            committed=committed,
+            reason=reason,
+        )
+        records.append(record)
+        cache.put(unit_hash, record)
+        if committed:
+            # Apply only the plan's target PIDs: every tentative is prepared
+            # on the round's snapshot (one text slice), so writing the whole
+            # chunk here would clobber sibling repairs of the same chunk.
+            for pid in plan.repair.target_pids:
+                translation_by_chunk[plan.chunk_id][pid] = tentative[pid]
+            if plan.chunk_id not in changed:
+                changed.append(plan.chunk_id)
+
+    for _repair_id, (plan, base, unit_hash, edit_reason) in failed_edits.items():
+        chunk_pids = chunk_plan.chunk(plan.chunk_id).pids
+        record = RepairRecord(
+            repair_id=plan.repair.repair_id,
+            chunk_id=plan.chunk_id,
+            finding_ids=plan.repair.finding_ids,
+            target_pids=plan.repair.target_pids,
+            action=plan.repair.action,
+            new_translation=tuple((pid, base[pid]) for pid in chunk_pids),
+            gate_trace=(),
+            gemma_recheck="not_required",
+            committed=False,
+            reason=edit_reason,
+        )
+        records.append(record)
+        cache.put(unit_hash, record)
+
+    for _repair_id, (record, chunk_id) in cached.items():
+        records.append(record)
+        if record.committed:
+            for pid in record.target_pids:
+                text = dict(record.new_translation).get(pid, "")
+                translation_by_chunk[chunk_id][pid] = text
+            if chunk_id not in changed:
+                changed.append(chunk_id)
+
+    return tuple(records), tuple(changed)
+
+
 def run_repair_phase(
     *,
     source: SourceArtifact,
@@ -1167,7 +1583,7 @@ def run_repair_phase(
     candidates: Mapping[str, Candidate],
     current_translation: Mapping[str, str],
     repair_caller: RepairCaller,
-    qwen_evaluator: QwenEvaluator,
+    region_fidelity_gate: RegionFidelityEvaluator,
     qwen_audit_evaluator: QwenAuditEvaluator,
     gemma_audit_evaluator: GemmaAuditEvaluator,
     backend_identity_hash: str,
@@ -1175,6 +1591,7 @@ def run_repair_phase(
     max_rounds: int = 2,
     chapter_hash: str = "",
     formatting: Optional[FormattingStep] = None,
+    soft_findings_policy: Optional[SoftFindingsPolicy] = None,
 ) -> RepairPhaseResult:
     """Run Phase 4A/4A2/4B for one chapter.
 
@@ -1189,6 +1606,24 @@ def run_repair_phase(
     ``current_translation`` (callers that already hold the authoritative hash
     should pass it).
 
+    Each round runs as four role passes (L2b, DECISIONS 2026-08-03):
+    all Gemma edits, then all narrow Qwen re-gates
+    (``region_fidelity_gate`` — edited PID only, unedited PIDs are covered
+    by the convergence re-audit), then all mandatory Gemma re-checks, then
+    the deferred commit. Commit criteria are unchanged (deterministic +
+    Qwen fidelity passed; Gemma re-check passed where required); only the
+    re-gate scope and commit timing change. ``repair_id`` and the repair
+    cache unit hash are unchanged, so resume/cache semantics are preserved.
+    Edits inside a chunk are prepared on one text snapshot (regions on
+    distinct PIDs); cross-region issues are caught by the re-audit — an
+    accepted trade-off (DECISIONS 2026-08-03).
+
+    ``soft_findings_policy`` enables the L3 severity filter (default on):
+    weak-evidence soft Gemma findings (``calque``/``register`` with a short
+    excerpt and/or an uncertain note) are skipped from repair planning,
+    excluded from the round-2 blocking definition, and recorded in the debt
+    trace. The findings stay in the store.
+
     ``formatting`` is the Phase 5 formatting step (B3), applied **after**
     convergence and **before** the final integrity check and the monotonic
     terminal transition, so Step 8 sees the same text that goes into
@@ -1199,14 +1634,15 @@ def run_repair_phase(
     valid) — never ``failed`` from a formatting transport failure alone.
 
     One repair round is mandatory and re-audits changed PIDs + discourse
-    neighbours. A second round is allowed only for a remaining blocking
-    finding or a changed chunk boundary. Then the final integrity check
-    (deterministic by default) and the monotonic terminal transition.
+    neighbours (batched by detector, L1). A second round is allowed only
+    for a remaining blocking finding or a changed chunk boundary. Then the
+    final integrity check (deterministic by default) and the monotonic
+    terminal transition.
     """
     if cache is None:
         cache = RepairCache()
+    policy = soft_findings_policy or SoftFindingsPolicy()
 
-    source_map = dict(source.source)
     if not chapter_hash:
         chapter_hash = canonical_json_hash({
             "artifact": "pact-v4-assembled-chapter/v1",
@@ -1218,16 +1654,17 @@ def run_repair_phase(
         })
 
     # ---- round 1 (mandatory) -------------------------------------------
-    round_one_records: list[RepairRecord] = []
     translation_by_chunk: Dict[str, Dict[str, str]] = {
         chunk.chunk_id: {
             pid: current_translation.get(pid, "") for pid in chunk.pids
         }
         for chunk in chunk_plan.chunks
     }
-    changed_chunk_ids: list[str] = []
     debt_reasons: list[str] = []
 
+    # Plan repairs per chunk, applying the L3 severity pre-filter before the
+    # region resolver (findings stay in the store; only planning is filtered).
+    round_one_plans: Dict[str, list[RepairPlan]] = {}
     for chunk in chunk_plan.chunks:
         # A chunk with no auditable candidate has no text to repair; its
         # PIDs are structural gaps (debt, and terminal `failed` if the whole
@@ -1238,9 +1675,24 @@ def run_repair_phase(
         chunk_findings = tuple(f for f in findings_store if f.chunk_id == chunk.chunk_id)
         if not chunk_findings:
             continue
+        repairable, skipped = filter_soft_findings(chunk_findings, policy)
+        for finding in skipped:
+            note = (
+                str(finding.evidence.get("note", ""))
+                if isinstance(finding.evidence, Mapping)
+                else str(finding.evidence)
+            )
+            debt_reasons.append(
+                f"{chunk.chunk_id}: {finding.region.pid}: soft Gemma finding "
+                f"({finding.category}) skipped by L3 policy (weak evidence): {note}"
+            )
+        if not repairable:
+            # Every finding of this chunk was a weak-soft L3 skip (already
+            # recorded in the debt trace); nothing remains to plan.
+            continue
         plans = plan_repairs_for_chunk(
             chunk=chunk,
-            findings=chunk_findings,
+            findings=repairable,
             current_text=translation_by_chunk[chunk.chunk_id],
             backend_identity_hash=backend_identity_hash,
         )
@@ -1249,38 +1701,33 @@ def run_repair_phase(
                 f"{chunk.chunk_id}: findings present but no region repair could be planned"
             )
             continue
-        for plan in plans:
-            audited_role = candidates[chunk.chunk_id].role
-            record = repair_region(
-                plan=plan,
-                chapter_hash=chapter_hash,
-                chunk=chunk,
-                audited_role=audited_role,
-                source=source,
-                snapshot=snapshot,
-                chunk_plan=chunk_plan,
-                config=config,
-                det_data=det_data,
-                current_translation=translation_by_chunk[chunk.chunk_id],
-                repair_caller=repair_caller,
-                qwen_evaluator=qwen_evaluator,
-                gemma_audit_evaluator=gemma_audit_evaluator,
-                backend_identity_hash=backend_identity_hash,
-                cache=cache,
-            )
-            round_one_records.append(record)
-            if record.committed:
-                for pid, text in record.new_translation:
-                    translation_by_chunk[record.chunk_id][pid] = text
-                if record.chunk_id not in changed_chunk_ids:
-                    changed_chunk_ids.append(record.chunk_id)
-            else:
-                debt_reasons.append(
-                    f"{record.chunk_id}: repair {record.repair_id[:12]} not committed "
-                    f"({record.reason})"
-                )
+        round_one_plans[chunk.chunk_id] = list(plans)
 
-    # ---- convergence re-audit (round 1) --------------------------------
+    round_one_records, changed_chunk_ids = _run_repair_round(
+        chapter_hash=chapter_hash,
+        chunk_plan=chunk_plan,
+        plans_by_chunk=round_one_plans,
+        candidates=candidates,
+        source=source,
+        snapshot=snapshot,
+        config=config,
+        det_data=det_data,
+        translation_by_chunk=translation_by_chunk,
+        repair_caller=repair_caller,
+        region_fidelity_gate=region_fidelity_gate,
+        gemma_audit_evaluator=gemma_audit_evaluator,
+        backend_identity_hash=backend_identity_hash,
+        cache=cache,
+    )
+    changed_chunk_ids = list(changed_chunk_ids)
+    for record in round_one_records:
+        if not record.committed:
+            debt_reasons.append(
+                f"{record.chunk_id}: repair {record.repair_id[:12]} not committed "
+                f"({record.reason})"
+            )
+
+    # ---- convergence re-audit (round 1; L1-batched by detector) ---------
     reaudit_scope = list(changed_chunk_ids)
     for chunk_id in changed_chunk_ids:
         reaudit_scope.extend(_neighbour_chunk_ids(chunk_plan, chunk_id))
@@ -1307,12 +1754,34 @@ def run_repair_phase(
     )
 
     # ---- round 2 (only for a remaining blocking finding or changed boundary)
+    # L3: weak-evidence soft findings are not blocking in round 2 — the
+    # convergence re-audit would otherwise re-raise them and the L3 economy
+    # would disappear. They are recorded as debt below.
+    def _is_blocking(finding: Finding) -> bool:
+        if not policy.enabled:
+            return True
+        return not _is_weak_soft_finding(
+            finding,
+            soft_categories=policy.soft_categories,
+            weak_excerpt_max_len=policy.weak_excerpt_max_len,
+            weak_note_markers=policy.weak_note_markers,
+        )
+
     round_two_records: list[RepairRecord] = []
     round_two_findings: Tuple[Finding, ...] = ()
     round_two_changed: list[str] = []
     blocking_findings = tuple(
-        f for f in reaudit_findings if f.chunk_id in reaudit_scope
+        f for f in reaudit_findings
+        if f.chunk_id in reaudit_scope and _is_blocking(f)
     )
+    # Record weak-soft re-audit findings as L3 debt regardless of whether
+    # round 2 runs (they are intentionally left open).
+    for finding in reaudit_findings:
+        if finding.chunk_id in reaudit_scope and not _is_blocking(finding):
+            debt_reasons.append(
+                f"{finding.chunk_id}: {finding.region.pid}: soft Gemma finding "
+                f"({finding.category}) left open by L3 policy (weak evidence)"
+            )
     boundary_changed = any(
         cid in _neighbour_chunk_ids(chunk_plan, chunk_id)
         for chunk_id in changed_chunk_ids
@@ -1320,6 +1789,7 @@ def run_repair_phase(
         if cid != chunk_id
     )
     if max_rounds >= 2 and (blocking_findings or boundary_changed):
+        round_two_plans: Dict[str, list[RepairPlan]] = {}
         for chunk in chunk_plan.chunks:
             if chunk.chunk_id not in candidates:
                 continue
@@ -1340,36 +1810,31 @@ def run_repair_phase(
                     f"{chunk.chunk_id}: blocking finding remains but no repair could be planned"
                 )
                 continue
-            for plan in plans:
-                audited_role = candidates[chunk.chunk_id].role
-                record = repair_region(
-                    plan=plan,
-                    chapter_hash=chapter_hash,
-                    chunk=chunk,
-                    audited_role=audited_role,
-                    source=source,
-                    snapshot=snapshot,
-                    chunk_plan=chunk_plan,
-                    config=config,
-                    det_data=det_data,
-                    current_translation=translation_by_chunk[chunk.chunk_id],
-                    repair_caller=repair_caller,
-                    qwen_evaluator=qwen_evaluator,
-                    gemma_audit_evaluator=gemma_audit_evaluator,
-                    backend_identity_hash=backend_identity_hash,
-                    cache=cache,
+            round_two_plans[chunk.chunk_id] = list(plans)
+        if round_two_plans:
+            round_two_records, round_two_changed = _run_repair_round(
+                chapter_hash=chapter_hash,
+                chunk_plan=chunk_plan,
+                plans_by_chunk=round_two_plans,
+                candidates=candidates,
+                source=source,
+                snapshot=snapshot,
+                config=config,
+                det_data=det_data,
+                translation_by_chunk=translation_by_chunk,
+                repair_caller=repair_caller,
+                region_fidelity_gate=region_fidelity_gate,
+                gemma_audit_evaluator=gemma_audit_evaluator,
+                backend_identity_hash=backend_identity_hash,
+                cache=cache,
+            )
+            round_two_changed = list(round_two_changed)
+        for record in round_two_records:
+            if not record.committed:
+                debt_reasons.append(
+                    f"{record.chunk_id}: round 2 repair not committed "
+                    f"({record.reason})"
                 )
-                round_two_records.append(record)
-                if record.committed:
-                    for pid, text in record.new_translation:
-                        translation_by_chunk[record.chunk_id][pid] = text
-                    if record.chunk_id not in round_two_changed:
-                        round_two_changed.append(record.chunk_id)
-                else:
-                    debt_reasons.append(
-                        f"{record.chunk_id}: round 2 repair not committed "
-                        f"({record.reason})"
-                    )
         if round_two_changed:
             scope2 = list(round_two_changed)
             for chunk_id in round_two_changed:
