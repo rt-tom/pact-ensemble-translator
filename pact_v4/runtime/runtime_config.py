@@ -146,7 +146,23 @@ class LocalLlamaBackendConfig:
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_paths", dict(self.model_paths))
         object.__setattr__(self, "model_names", dict(self.model_names))
-        object.__setattr__(self, "server_args", {k: list(v) for k, v in self.server_args.items()})
+        server_args = {k: list(v) for k, v in self.server_args.items()}
+        # server_args are handed verbatim to ``subprocess.Popen``, so a
+        # non-string value would fail deep inside ``list2cmdline`` with an
+        # unreadable ``TypeError``. The most common way in is YAML 1.1 bool
+        # words (`on`/`off`/`yes`/`no`/`true`/`false` parsed bare) -- refuse
+        # here with a message that says so, instead of after the model server
+        # was about to start.
+        bad = {k: [a for a in v if not isinstance(a, str)] for k, v in server_args.items()}
+        bad = {k: v for k, v in bad.items() if v}
+        if bad:
+            raise ValueError(
+                "server_args must contain only strings, got "
+                + "; ".join(f"{k}: {v!r}" for k, v in sorted(bad.items()))
+                + " (quote YAML 1.1 bool words like `on`/`off`/`yes`/`no` in the "
+                "runtime config)"
+            )
+        object.__setattr__(self, "server_args", server_args)
 
     def _role_bindings(self) -> Dict[str, str]:
         names = self.model_names

@@ -76,7 +76,7 @@ backends:
         - -c
         - "32768"
         - -fa
-        - on
+        - "on"
         - --jinja
         - --cache-ram
         - "0"
@@ -84,7 +84,7 @@ backends:
         - "0"
       qwen:
         - -fit
-        - on
+        - "on"
         - -fitt
         - "1280"
         - -b
@@ -108,7 +108,7 @@ backends:
         - -c
         - "32768"
         - -fa
-        - on
+        - "on"
         - --jinja
         - --cache-ram
         - "0"

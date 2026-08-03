@@ -41,7 +41,7 @@ server_args:
     - -c
     - "32768"
     - -fa
-    - on
+    - "on"
     - --jinja
     - --cache-ram
     - "0"
@@ -49,7 +49,7 @@ server_args:
     - "0"
   qwen:
     - -fit
-    - on
+    - "on"
     - -fitt
     - "1280"
     - -b
@@ -73,7 +73,7 @@ server_args:
     - -c
     - "32768"
     - -fa
-    - on
+    - "on"
     - --jinja
     - --cache-ram
     - "0"
