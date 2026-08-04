@@ -200,6 +200,35 @@ def test_build_repair_adapters_returns_backend_repair_caller_over_remote():
     runtime.close()
 
 
+def test_build_role_adapters_json_retry_policy_override():
+    # B4 §5: the JSON-resilience retry policy is overridable through the
+    # runtime-config build hook (default max_retries=2).
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    cfg = _remote_cfg()
+    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
+    policy = JsonRetryPolicy(max_retries=5, base_delay_seconds=0.5)
+    _caller, _qwen, _gemma, qwen_audit, _gemma_audit = build_role_adapters(
+        cfg, runtime, json_retry_policy=policy,
+    )
+    assert qwen_audit._config.retry == policy
+    runtime.close()
+
+
+def test_build_repair_adapters_json_retry_policy_override():
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    cfg = _remote_cfg()
+    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
+    policy = JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
+    repair_caller, _region_gate, qwen_audit, _gemma_audit = build_repair_adapters(
+        cfg, runtime, json_retry_policy=policy,
+    )
+    assert repair_caller._config.retry == policy
+    assert qwen_audit._config.retry == policy
+    runtime.close()
+
+
 def test_build_formatting_adapters_returns_backend_caller_over_remote():
     # Phase 5 formatting adapters (B3) are Backend adapters over the same
     # coordinator backend — the model-fallback tier never uses a local

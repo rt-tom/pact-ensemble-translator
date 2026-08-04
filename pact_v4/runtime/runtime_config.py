@@ -49,6 +49,7 @@ from pact_v4.runtime.backend_protocol import (
     CompletionResponse,
     ENDPOINT_FAMILY_OPENAI_CHAT_COMPLETIONS,
 )
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.opencode_backend import (
@@ -622,7 +623,10 @@ def build_role_backend(
 
 
 def build_role_adapters(
-    cfg: BackendRuntimeConfig, runtime: RuntimeCoordinator
+    cfg: BackendRuntimeConfig,
+    runtime: RuntimeCoordinator,
+    *,
+    json_retry_policy: Optional[JsonRetryPolicy] = None,
 ) -> Tuple[Any, Any, Any, Any, Any]:
     """The five role adapters ``run_chapter_strict`` needs injected.
 
@@ -630,27 +634,40 @@ def build_role_adapters(
     qwen_evaluator, gemma_selector, qwen_audit_evaluator,
     gemma_audit_evaluator)``. Imported lazily so ``runtime_config`` stays
     importable without ``backend_role_adapters`` (no import cycle).
+
+    ``json_retry_policy`` (B4, optional) overrides the JSON-resilience retry
+    policy of the Qwen audit adapter (default ``JsonRetryPolicy()``,
+    ``max_retries=2``). A runtime-config override is wired by the caller (the
+    CLI); the policy is a resilience parameter and does not change backend
+    identity.
     """
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
         BackendGemmaSelector,
         BackendModelCaller,
         BackendQwenAuditEvaluator,
+        BackendQwenAuditEvaluatorConfig,
         BackendQwenEvaluator,
     )
 
+    retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
     return (
         BackendModelCaller(backend),
         BackendQwenEvaluator(backend),
         BackendGemmaSelector(backend),
-        BackendQwenAuditEvaluator(backend),
+        BackendQwenAuditEvaluator(
+            backend, config=BackendQwenAuditEvaluatorConfig(retry=retry),
+        ),
         BackendGemmaAuditEvaluator(backend),
     )
 
 
 def build_repair_adapters(
-    cfg: BackendRuntimeConfig, runtime: RuntimeCoordinator
+    cfg: BackendRuntimeConfig,
+    runtime: RuntimeCoordinator,
+    *,
+    json_retry_policy: Optional[JsonRetryPolicy] = None,
 ) -> Tuple[Any, Any, Any, Any]:
     """The Phase 4 repair callables ``run_chapter_strict`` needs injected.
 
@@ -664,19 +681,30 @@ def build_repair_adapters(
     boundary in local, remote and composite profiles (dual-mode rule; no
     retrofit needed). Imported lazily to avoid an import cycle with
     ``backend_role_adapters``.
+
+    ``json_retry_policy`` (B4, optional) overrides the JSON-resilience retry
+    policy of the repair caller and the Step 6 Qwen audit re-used during
+    convergence (default ``JsonRetryPolicy()``, ``max_retries=2``). A
+    runtime-config override is wired by the caller (the CLI); the policy is a
+    resilience parameter and does not change backend identity.
     """
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
         BackendQwenAuditEvaluator,
+        BackendQwenAuditEvaluatorConfig,
         BackendRegionFidelityGate,
         BackendRepairCaller,
+        BackendRepairCallerConfig,
     )
 
+    retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
     return (
-        BackendRepairCaller(backend),
+        BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry)),
         BackendRegionFidelityGate(backend),
-        BackendQwenAuditEvaluator(backend),
+        BackendQwenAuditEvaluator(
+            backend, config=BackendQwenAuditEvaluatorConfig(retry=retry),
+        ),
         BackendGemmaAuditEvaluator(backend),
     )
 
@@ -823,4 +851,5 @@ __all__ = [
     "build_role_adapters",
     "build_repair_adapters",
     "build_formatting_adapters",
+    "JsonRetryPolicy",
 ]

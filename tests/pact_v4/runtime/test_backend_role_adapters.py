@@ -29,7 +29,15 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendGemmaSelector,
     BackendModelCaller,
     BackendQwenAuditEvaluator,
+    BackendQwenAuditEvaluatorConfig,
     BackendQwenEvaluator,
+    BackendRepairCaller,
+    BackendRepairCallerConfig,
+)
+from pact_v4.runtime.json_resilience import (
+    EmptyResponseError,
+    JsonRetryPolicy,
+    TruncatedJSONError,
 )
 from pact_v4.runtime.prompts_runtime import (
     render_gemma_audit_prompt,
@@ -303,14 +311,94 @@ def test_qwen_audit_evaluator_uses_max_tokens_floor_with_per_pid_headroom():
     assert request.max_output_tokens == 16384 + 128 * 2
 
 
-def test_qwen_audit_evaluator_returns_raw_truncated_json_untouched():
-    # Parsing/validation belongs to run_chapter_audit; the adapter only
-    # transports. A truncated JSON body comes back verbatim so the audit
-    # layer records it as a failed unit (never as "no issues").
+def test_qwen_audit_evaluator_retries_truncated_json_then_succeeds():
+    # B4 (JSON resilience): a truncated JSON body is *not* returned raw for
+    # the audit layer to fail on — the adapter retries (bounded, no backoff
+    # here) by re-issuing the identical request and returns the valid body
+    # from the second attempt.
+    truncated = '{"issues": [{"pid": "p00001", "category": "omission", "note": "x'
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(truncated), _text_response(canned)])
+    evaluator = BackendQwenAuditEvaluator(
+        backend,
+        config=BackendQwenAuditEvaluatorConfig(
+            retry=JsonRetryPolicy(max_retries=1, base_delay_seconds=0.0)
+        ),
+    )
+    out = evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+    assert out == canned
+    # Retry re-issued the exact same request (identity unchanged).
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_qwen_audit_evaluator_raises_after_truncated_retries_exhausted():
+    # B4: when the bounded retry budget is exhausted the adapter re-raises
+    # TruncatedJSONError — run_chapter_audit records that unit as failed
+    # (resumable), never as "no issues" and never as a semantic verdict.
     truncated = '{"issues": [{"pid": "p00001", "category": "omission", "note": "x'
     backend = ScriptedBackend([_text_response(truncated)])
-    evaluator = BackendQwenAuditEvaluator(backend)
-    assert evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation()) == truncated
+    evaluator = BackendQwenAuditEvaluator(
+        backend,
+        config=BackendQwenAuditEvaluatorConfig(
+            retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
+        ),
+    )
+    with pytest.raises(TruncatedJSONError):
+        evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+    assert len(backend.requests) == 1
+
+
+def test_qwen_audit_evaluator_retries_empty_response_then_succeeds():
+    # B4: an empty response (the run_001 qwen-audit failure mode) is retried
+    # with the identical request; the second attempt's body is returned.
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(""), _text_response(canned)])
+    evaluator = BackendQwenAuditEvaluator(
+        backend,
+        config=BackendQwenAuditEvaluatorConfig(
+            retry=JsonRetryPolicy(max_retries=1, base_delay_seconds=0.0)
+        ),
+    )
+    out = evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+    assert out == canned
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_qwen_audit_evaluator_raises_after_empty_retries_exhausted():
+    backend = ScriptedBackend([_text_response("")])
+    evaluator = BackendQwenAuditEvaluator(
+        backend,
+        config=BackendQwenAuditEvaluatorConfig(
+            retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
+        ),
+    )
+    with pytest.raises(EmptyResponseError):
+        evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+    assert len(backend.requests) == 1
+
+
+def test_qwen_audit_evaluator_does_not_retry_transport_failure_as_json_error():
+    # B4 §3: a transport failure (CompletionError / C1 OpenCodeError) is a
+    # separate error class and must NOT be retried by the JSON retry — it is
+    # the transport's own bounded-retry domain.
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    evaluator = BackendQwenAuditEvaluator(
+        _FailingBackend([]),
+        config=BackendQwenAuditEvaluatorConfig(
+            retry=JsonRetryPolicy(max_retries=3, base_delay_seconds=0.0)
+        ),
+    )
+    with pytest.raises(CompletionError, match="connection refused"):
+        evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
+    assert len(attempts) == 1
 
 
 def test_qwen_audit_evaluator_propagates_completion_error():
@@ -366,3 +454,81 @@ def test_gemma_audit_evaluator_propagates_completion_error():
     evaluator = BackendGemmaAuditEvaluator(_FailingBackend([]))
     with pytest.raises(CompletionError, match="connection refused"):
         evaluator(chunk_id="c", translation=_audit_translation())
+
+
+# ---------------------------------------------------------------------------
+# BackendRepairCaller (Phase 4A region repair; B4 JSON retry)
+# ---------------------------------------------------------------------------
+
+
+def _repair_kwargs():
+    from pact_v4.phase1.models import Region
+
+    return dict(
+        chunk_id="chunk0001",
+        source=_audit_source(),
+        translation=_audit_translation(),
+        region=Region(pid="p00001", start=0, end=10),
+        findings=[{"category": "omission", "note": "dropped clause"}],
+    )
+
+
+def _repair_ok() -> str:
+    return json.dumps(
+        {"repaired": {"p00001": "Исправленный перевод."}, "reason": "scripted"},
+        ensure_ascii=False,
+    )
+
+
+def test_repair_caller_retries_truncated_json_then_succeeds():
+    # B4: a truncated repair JSON body is retried (bounded) with the identical
+    # request and the second attempt's body is returned — the repair layer
+    # then commits normally instead of recording a spurious debt.
+    truncated = '{"repaired": {"p00001": "Исправленный пере'
+    backend = ScriptedBackend([_text_response(truncated), _text_response(_repair_ok())])
+    caller = BackendRepairCaller(
+        backend,
+        config=BackendRepairCallerConfig(
+            retry=JsonRetryPolicy(max_retries=1, base_delay_seconds=0.0)
+        ),
+    )
+    out = caller(**_repair_kwargs())
+    assert out == _repair_ok()
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_repair_caller_raises_after_truncated_retries_exhausted():
+    # B4: exhausted budget re-raises TruncatedJSONError — repair_region /
+    # _apply_region_edit converts it into a non-committed (debt) outcome,
+    # never a semantic terminal status.
+    truncated = '{"repaired": {"p00001": "Исправленный пере'
+    backend = ScriptedBackend([_text_response(truncated)])
+    caller = BackendRepairCaller(
+        backend,
+        config=BackendRepairCallerConfig(
+            retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
+        ),
+    )
+    with pytest.raises(TruncatedJSONError):
+        caller(**_repair_kwargs())
+    assert len(backend.requests) == 1
+
+
+def test_repair_caller_does_not_retry_transport_failure_as_json_error():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    caller = BackendRepairCaller(
+        _FailingBackend([]),
+        config=BackendRepairCallerConfig(
+            retry=JsonRetryPolicy(max_retries=3, base_delay_seconds=0.0)
+        ),
+    )
+    with pytest.raises(CompletionError, match="connection refused"):
+        caller(**_repair_kwargs())
+    assert len(attempts) == 1

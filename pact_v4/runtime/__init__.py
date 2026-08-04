@@ -43,6 +43,13 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendModelCaller,
     BackendQwenEvaluator,
 )
+from pact_v4.runtime.json_resilience import (
+    EmptyResponseError,
+    JsonRetryPolicy,
+    TruncatedJSONError,
+    classify_response_text,
+    retry_json_call,
+)
 from pact_v4.runtime.local_openai_backend import (
     LocalOpenAIBackend,
     LocalOpenAIBackendConfig,
@@ -122,6 +129,11 @@ __all__ = [
     "LocalOpenAIBackend",
     "LocalOpenAIBackendConfig",
     "Message",
+    "EmptyResponseError",
+    "JsonRetryPolicy",
+    "TruncatedJSONError",
+    "classify_response_text",
+    "retry_json_call",
     "DEFAULT_DISABLED_TOOLS",
     "DEFAULT_SYSTEM_PROMPT",
     "ENDPOINT_FAMILY_OPENCODE_HTTP",
