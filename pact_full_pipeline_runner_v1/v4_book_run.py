@@ -5,16 +5,35 @@ after each chapter based on its terminal status. The wrapper calls
 ``v4_phase12_strict_run`` for each chapter and ``MemoryManager.promote``
 between chapters.
 
+B9-I2 (owner-approved 2026-08-04, ``docs/plans/V4_B9_GLOSSARY_OBSERVATIONS_TASK_RU.md``)
+adds the glossary-candidate loop between the chapter run and ``promote``:
+after each chapter the deterministic generator + consensus alignment
+(``pact_v4.phase1.glossary_candidates``) produces candidate records from the
+chapter source and ``out_dir/translations.json``, appends them to the
+append-only ledger (``glossary_candidates.json``), and auto-promotes the
+candidates that meet the v3 thresholds (proper_name >=
+``--proper-name-min-occurrences``; term >= ``--term-min-chapters`` chapters
+AND >= ``--term-min-occurrences`` total occurrences) with a single aligned
+target. Promotion goes through the existing ``MemoryManager.add_observation``
+-> ``promote`` path (B7), so the quarantined-chunk filter keeps working;
+after ``promote`` the newly-promoted glossary entries are restored to the
+flat ``{source: target}`` on-disk contract (``_glossary_entries`` skips dict
+values). Zero model calls; identity/cache/journal untouched.
+
 CLI::
 
     python -m pact_full_pipeline_runner_v1.v4_book_run \\
         --memory-dir <dir> --chapters 0001 0002 0003 \\
         --chapter-html-pattern 'chapters/{chapter_id}.html' \\
-        --out-base <dir>
+        --out-base <dir> [--candidates-ledger <path>]
+        [--term-min-occurrences 3 --term-min-chapters 2]
+        [--proper-name-min-occurrences 2 --consensus-ratio 0.8]
 
 Artefacts: ``book_run.json`` in ``--out-base`` records the per-chapter
 history (chapter_id, terminal status, promotion events, book_memory_hash
-before/after).
+before/after, per-chapter ``candidates`` block ``{generated, promoted,
+conflicts}``); ``glossary_candidates.json`` (default ``<out-base>``) is the
+append-only candidate ledger.
 """
 from __future__ import annotations
 
@@ -24,14 +43,24 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from pact_v4.phase0b.source_html import parse_source_html
+from pact_v4.phase1.glossary_candidates import (
+    GlossaryCandidateLedger,
+    align_candidates,
+    candidate_key,
+    generate_candidates,
+)
 from pact_v4.phase1.memory import MemoryManager
 from pact_v4.runtime.bible_renderer import render_bible_section
 
 LOG = logging.getLogger(__name__)
 
 BOOK_RUN_SCHEMA = "pact-v4-book-run/v1"
+
+# Terminal statuses after which ``MemoryManager.promote`` runs (B7).
+_PROMOTING_STATUSES = ("complete", "accepted_degraded")
 
 
 @dataclass
@@ -43,6 +72,7 @@ class BookRunRecord:
     promoted: bool
     promote_detail: str
     out_dir: str
+    candidates: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
 
     def to_payload(self) -> Dict[str, Any]:
@@ -54,6 +84,9 @@ class BookRunRecord:
             "promoted": self.promoted,
             "promote_detail": self.promote_detail,
             "out_dir": self.out_dir,
+            "candidates": self.candidates or {
+                "generated": 0, "promoted": 0, "conflicts": 0,
+            },
             "error": self.error,
         }
 
@@ -133,6 +166,214 @@ def _quarantined_chunks_from_record(out_dir: Path) -> set:
     return quarantined
 
 
+# ---------------------------------------------------------------------------
+# B9-I2: glossary-candidate generation / alignment / ledger / auto-promotion
+# ---------------------------------------------------------------------------
+
+
+def _load_json(path: Path, default: Any = None) -> Any:
+    """Tolerant JSON loader (missing/corrupt file -> ``default``)."""
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def _source_by_pid(chapter_html: Path) -> Dict[str, str]:
+    """``{pid: text}`` for a chapter HTML file via the Phase 0B parser."""
+    blocks = parse_source_html(chapter_html.read_text(encoding="utf-8-sig"))
+    return {block.pid: block.text for block in blocks}
+
+
+def _pid_to_chunk(out_dir: Path) -> Dict[str, str]:
+    """``{pid: chunk_id}`` from the strict driver's ``chunk_plan.json``.
+
+    Missing/corrupt plan -> empty mapping (candidates then carry no
+    ``chunk_ids`` and are not filtered by quarantine).
+    """
+    plan = _load_json(out_dir / "chunk_plan.json", {})
+    mapping: Dict[str, str] = {}
+    if not isinstance(plan, dict):
+        return mapping
+    for chunk in plan.get("chunks", []) or []:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_id = chunk.get("chunk_id")
+        if chunk_id is None:
+            continue
+        for pid in chunk.get("pids", []) or []:
+            mapping[str(pid)] = str(chunk_id)
+    return mapping
+
+
+def _generate_and_align_chapter(
+    chapter_html: Path,
+    out_dir: Path,
+    memory_dir: Path,
+    *,
+    proper_name_min_occurrences: int,
+    term_min_occurrences: int,
+    consensus_ratio: float,
+) -> List[Dict[str, Any]]:
+    """B9-I2: generate candidates + consensus-align targets for one chapter.
+
+    Source is ``chapter_html`` (parsed to pid blocks), translation is
+    ``out_dir/translations.json`` (``{pid: text}``), exclusions come from the
+    live ``glossary.json``/``book_memory.json`` in ``memory_dir`` (the B5
+    mixed-script allowlist is a per-run strict-driver concern and is not
+    threaded here — glossary/book-memory exclusions carry the same weight for
+    candidate suppression). ``pid_to_chunk`` comes from the driver's
+    ``chunk_plan.json`` so candidates carry ``chunk_ids`` for the B7
+    quarantined-chunk filter.
+
+    Degrades to ``[]`` on missing artifacts (e.g. a chapter that failed
+    before persisting translations) so the book run never crashes on the
+    candidate loop. No model calls, no HTTP.
+    """
+    try:
+        if not chapter_html.exists():
+            return []
+        source_by_pid = _source_by_pid(chapter_html)
+        translations = _load_json(out_dir / "translations.json", {})
+        if not translations:
+            return []
+        glossary = _load_json(memory_dir / "glossary.json", {})
+        book_memory = _load_json(memory_dir / "book_memory.json", {})
+        candidates = generate_candidates(
+            source_by_pid,
+            glossary=glossary,
+            book_memory=book_memory,
+            pid_to_chunk=_pid_to_chunk(out_dir),
+            min_name_occurrences=proper_name_min_occurrences,
+            min_term_occurrences=term_min_occurrences,
+        )
+        if not candidates:
+            return []
+        return align_candidates(
+            candidates, source_by_pid, translations,
+            consensus_ratio=consensus_ratio,
+        )
+    except Exception as exc:  # defensive: the candidate loop must not break a run
+        LOG.warning("B9-I2: candidate generation skipped for %s: %s",
+                    out_dir.name, exc)
+        return []
+
+
+def _flat_target(value: Any) -> Optional[str]:
+    """Flat glossary target for an on-disk entry (str or ``{target: ...}``)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("target"), str):
+        return value["target"]
+    return None
+
+
+def _auto_promote_glossary(
+    manager: MemoryManager,
+    chapter_aligned: Sequence[Mapping[str, Any]],
+    merged_ledger: Mapping[str, Mapping[str, Any]],
+    glossary: Mapping[str, Any],
+    *,
+    term_min_chapters: int,
+    term_min_occurrences: int,
+    proper_name_min_occurrences: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """B9-I2: v3-threshold auto-promotion via ``MemoryManager.add_observation``.
+
+    For every candidate aligned in THIS chapter, look up its cumulative
+    ledger record (``merged_ledger``) and check the kind-specific thresholds
+    (B9-I2 card, v3 mechanics):
+
+      * ``proper_name``: ``total_occurrences >= proper_name_min_occurrences``
+        and a single aligned target;
+      * ``term``: ``len(chapters) >= term_min_chapters`` AND
+        ``total_occurrences >= term_min_occurrences`` and a single aligned
+        target.
+
+    A candidate that passes is recorded as a glossary observation
+    ``{target, type, chunk_id}`` (``chunk_id`` = first sorted chunk of the
+    current chapter, so the existing B7 quarantined-chunk filter applies).
+    Conflicts — competing alignment variants (no single target) or an
+    established glossary entry with a different target — are returned and
+    NOT observed. Zero model calls; ``MemoryManager`` is untouched.
+
+    Returns ``(promoted, conflicts)`` — the aligned records that were
+    observed for promotion and the aligned records that hit a conflict.
+    """
+    promoted: List[Dict[str, Any]] = []
+    conflicts: List[Dict[str, Any]] = []
+    for aligned in chapter_aligned:
+        source = str(aligned.get("source") or "")
+        kind = str(aligned.get("kind") or "term")
+        if not source:
+            continue
+        if aligned.get("conflicts"):
+            # Several notable variants — no single target (alignment conflict).
+            conflicts.append(dict(aligned))
+            continue
+        target = aligned.get("target")
+        if not target:
+            continue
+        record = merged_ledger.get(candidate_key(source, kind))
+        if not record:
+            continue
+        total = int(record.get("total_occurrences") or 0)
+        if kind == "proper_name":
+            meets = total >= proper_name_min_occurrences
+        else:
+            chapters = [
+                entry for entry in (record.get("chapters") or [])
+                if isinstance(entry, dict) and entry.get("chapter_id")
+            ]
+            meets = (len(chapters) >= term_min_chapters
+                     and total >= term_min_occurrences)
+        if not meets:
+            continue
+        existing_target = _flat_target(glossary.get(source))
+        if existing_target is not None and existing_target != target:
+            conflicts.append({**dict(aligned), "established_target": existing_target})
+            continue
+        if existing_target == target:
+            continue  # already established with the same target — no-op
+        chunk_ids = sorted({str(c) for c in (aligned.get("chunk_ids") or [])})
+        manager.add_observation("glossary", source, {
+            "target": str(target),
+            "type": kind,
+            "chunk_id": chunk_ids[0] if chunk_ids else "",
+        })
+        promoted.append(dict(aligned))
+    return promoted, conflicts
+
+
+def _flatten_promoted_glossary(memory_dir: Path) -> None:
+    """Restore the flat ``{source: target}`` glossary contract after promote.
+
+    ``MemoryManager.promote`` stores observation values verbatim, so B9
+    observations (``{target, type, chunk_id}``) land in ``glossary.json`` as
+    dict values. The on-disk contract is flat (the existing 119 entries;
+    ``_glossary_entries`` skips dict values), so any dict-valued entry
+    carrying a string ``target`` is flattened back. ``book_memory.json`` is
+    untouched (its entries are dicts by design).
+    """
+    path = memory_dir / "glossary.json"
+    if not path.exists():
+        return
+    data = _load_json(path, None)
+    if not isinstance(data, dict):
+        return
+    changed = False
+    for source, value in data.items():
+        if isinstance(value, dict) and isinstance(value.get("target"), str):
+            data[source] = value["target"]
+            changed = True
+    if changed:
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+
+
 def run_book(
     *,
     memory_dir: Path,
@@ -140,10 +381,18 @@ def run_book(
     chapter_html_pattern: str,
     out_base: Path,
     extra_args: Sequence[str] = (),
+    candidates_ledger: Optional[Path] = None,
+    term_min_occurrences: int = 3,
+    term_min_chapters: int = 2,
+    proper_name_min_occurrences: int = 2,
+    consensus_ratio: float = 0.8,
 ) -> Dict[str, Any]:
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
     manager = MemoryManager(str(memory_dir))
+    ledger = GlossaryCandidateLedger(
+        str(candidates_ledger or (out_base / "glossary_candidates.json"))
+    )
 
     records: List[BookRunRecord] = []
     for chapter_id in chapter_ids:
@@ -171,6 +420,41 @@ def run_book(
             error_msg = result.get("error")
 
         quarantined = _quarantined_chunks_from_record(out_dir)
+
+        # B9-I2: candidate generation + consensus alignment -> ledger, then
+        # v3-threshold auto-promotion via MemoryManager.add_observation.
+        # Strictly after the chapter and before MemoryManager.promote (GATE);
+        # the actual glossary write still happens through the existing
+        # promote(status, quarantined_chunks) below.
+        aligned = _generate_and_align_chapter(
+            chapter_html,
+            out_dir,
+            memory_dir,
+            proper_name_min_occurrences=proper_name_min_occurrences,
+            term_min_occurrences=term_min_occurrences,
+            consensus_ratio=consensus_ratio,
+        )
+        if aligned:
+            ledger.append_chapter(chapter_id, aligned)
+        candidates_block = {
+            "generated": len(aligned),
+            "promoted": 0,
+            "conflicts": 0,
+        }
+        if terminal_status in _PROMOTING_STATUSES:
+            glossary_now = _load_json(memory_dir / "glossary.json", {})
+            promoted_recs, conflict_recs = _auto_promote_glossary(
+                manager,
+                aligned,
+                ledger.load(),
+                glossary_now,
+                term_min_chapters=term_min_chapters,
+                term_min_occurrences=term_min_occurrences,
+                proper_name_min_occurrences=proper_name_min_occurrences,
+            )
+            candidates_block["promoted"] = len(promoted_recs)
+            candidates_block["conflicts"] = len(conflict_recs)
+
         promoted = False
         promote_detail = ""
         if terminal_status == "complete":
@@ -196,6 +480,10 @@ def run_book(
                 f"(excluded {len(quarantined)} quarantined chunks)"
             )
 
+        # B9-I2: promote stores observation values verbatim — restore the
+        # flat {source: target} glossary contract for the promoted entries.
+        _flatten_promoted_glossary(memory_dir)
+
         hash_after = _book_memory_hash(memory_dir)
         records.append(BookRunRecord(
             chapter_id=chapter_id,
@@ -205,6 +493,7 @@ def run_book(
             promoted=promoted,
             promote_detail=promote_detail,
             out_dir=str(out_dir),
+            candidates=candidates_block,
             error=error_msg,
         ))
 
@@ -212,19 +501,39 @@ def run_book(
     payload = {
         "schema": BOOK_RUN_SCHEMA,
         "memory_dir": str(memory_dir),
+        "candidates_ledger": str(ledger.path),
         "chapters": [rec.to_payload() for rec in records],
     }
     book_run_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="V4 book-run wrapper (B7)")
+def build_argparser() -> argparse.ArgumentParser:
+    """Build the book-run CLI parser (extracted for dry-run validation)."""
+    parser = argparse.ArgumentParser(description="V4 book-run wrapper (B7/B9)")
     parser.add_argument("--memory-dir", required=True, type=Path)
     parser.add_argument("--chapters", nargs="+", required=True)
     parser.add_argument("--chapter-html-pattern", required=True,
                         help="Pattern with {chapter_id}, e.g. 'chapters/{chapter_id}.html'")
     parser.add_argument("--out-base", required=True, type=Path)
+    parser.add_argument(
+        "--candidates-ledger", type=Path, default=None,
+        help="B9 glossary-candidate ledger path "
+             "(default: <out-base>/glossary_candidates.json)",
+    )
+    parser.add_argument("--term-min-occurrences", type=int, default=3,
+                        help="term: min total occurrences across chapters (v3)")
+    parser.add_argument("--term-min-chapters", type=int, default=2,
+                        help="term: min distinct chapters before promotion")
+    parser.add_argument("--proper-name-min-occurrences", type=int, default=2,
+                        help="proper_name: min occurrences before promotion")
+    parser.add_argument("--consensus-ratio", type=float, default=0.8,
+                        help="dominant-variant share required for a target (0-1)")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_argparser()
     args, extra = parser.parse_known_args(argv)
     result = run_book(
         memory_dir=args.memory_dir,
@@ -232,6 +541,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chapter_html_pattern=args.chapter_html_pattern,
         out_base=args.out_base,
         extra_args=extra,
+        candidates_ledger=args.candidates_ledger,
+        term_min_occurrences=args.term_min_occurrences,
+        term_min_chapters=args.term_min_chapters,
+        proper_name_min_occurrences=args.proper_name_min_occurrences,
+        consensus_ratio=args.consensus_ratio,
     )
     failed = 0
     for rec in result["chapters"]:
