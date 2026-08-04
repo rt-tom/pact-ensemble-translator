@@ -66,7 +66,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
@@ -87,9 +87,28 @@ from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, selec
 from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
+from pact_v4.phase3.findings import Finding
+from pact_v4.phase4.quarantined_retry import (
+    QUARANTINED_RETRY_POLICY_VERSION,
+    QUARANTINED_RETRY_SCHEMA,
+    QuarantinedRetryAttempt,
+    debt_mentions_chunk,
+    debt_mentions_pid,
+    merge_retry_generation_records,
+    quarantined_chunks_with_debt,
+    run_quarantined_retry,
+)
 from pact_v4.phase4.repair import (
     REPAIR_REPORT_SCHEMA,
     RepairCache,
+    RepairPhaseResult,
+    SoftFindingsPolicy,
+    _reaudit_chunks,
+    _run_repair_round,
+    decide_terminal_state,
+    filter_soft_findings,
+    plan_repairs_for_chunk,
+    run_integrity_check,
     run_repair_phase,
 )
 from pact_v4.phase5.formatting import (
@@ -1101,9 +1120,14 @@ def _run_step7_repair(
     The repair cache is loaded with identity checks on resume so a resumed
     run reuses committed repairs deterministically. The ``repair_report.json``
     (with backend identity) records rounds, gate history, debt trace and the
-    monotonic terminal state.
+    monotonic terminal state. B6: the report also carries the
+    ``quarantined_final`` / ``retry_attempts`` defaults, updated by the
+    separate quarantined-retry cycle (``_run_quarantined_retry_cycle``) when
+    one runs.
 
-    Returns the Step 7/8 summary recorded in the run record.
+    Returns ``(summary, phase_result)`` — the Step 7/8 summary recorded in the
+    run record plus the full ``RepairPhaseResult`` the B6 retry cycle needs to
+    inspect the repair debt and the final translation.
     """
     repair_caller, region_fidelity_gate, qwen_audit_evaluator, gemma_audit_evaluator = repair_adapters
 
@@ -1164,6 +1188,10 @@ def _run_step7_repair(
     report = result.to_payload()
     report["chapter_id"] = cfg.chapter_id
     report["finished_at"] = now().isoformat(timespec="seconds")
+    # B6 defaults: the separate quarantined-retry cycle (if any) updates these
+    # to the retry's real outcome before the report is read by consumers.
+    report["quarantined_final"] = False
+    report["retry_attempts"] = 0
     _atomic_write_json(_repair_report_path(cfg.out_dir), report)
 
     formatting_block: Optional[Dict[str, Any]] = None
@@ -1188,7 +1216,7 @@ def _run_step7_repair(
             "report_path": str(_formatting_report_path(cfg.out_dir)),
         }
 
-    return {
+    summary = {
         "status": result.status,
         "rounds": len(result.rounds),
         "repair_count": sum(
@@ -1205,6 +1233,459 @@ def _run_step7_repair(
         "report_path": str(_repair_report_path(cfg.out_dir)),
         "cache_path": str(cache_path),
     }
+    return summary, result
+
+
+# ---------------------------------------------------------------------------
+# B6: separate quarantined-retry cycle (V4_B6_QUARANTINED_RETRY_TASK_RU.md)
+# ---------------------------------------------------------------------------
+
+
+def _quarantined_retry_path(out_dir: Path) -> Path:
+    return out_dir / "quarantined_retry.json"
+
+
+def _load_prior_quarantined_retries(
+    out_dir: Path,
+    *,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    acceptable_backend_hashes: Sequence[str],
+) -> Dict[str, QuarantinedRetryAttempt]:
+    """Reload a prior session's retry history, refusing foreign identity.
+
+    Mirrors ``_merge_generation_outcomes`` / ``_load_repair_cache``: the
+    retry history is only reusable when the enclosing run's identities
+    (snapshot/plan/config/backend) match, so a resumed run deterministically
+    reuses already-recorded attempts instead of re-paying the bounded
+    regeneration or silently mixing retry state across runs.
+    """
+    path = _quarantined_retry_path(out_dir)
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != QUARANTINED_RETRY_SCHEMA:
+        raise ValueError(
+            f"Foreign identity: quarantined_retry schema={payload.get('schema')!r}"
+        )
+    if (
+        payload.get("snapshot_hash") != snapshot.snapshot_hash
+        or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+        or payload.get("config_identity") != config.config_identity
+    ):
+        raise ValueError(
+            "Foreign identity: quarantined_retry.json was written under a "
+            "different snapshot/plan/config than this run -- refusing to mix "
+            "quarantined retry state across runs."
+        )
+    if payload.get("backend_identity_hash") not in acceptable_backend_hashes:
+        raise ValueError(
+            f"Foreign identity: quarantined_retry.json backend_identity_hash="
+            f"{payload.get('backend_identity_hash')!r}, expected one of "
+            f"{list(acceptable_backend_hashes)!r} -- refusing to resume against "
+            "retry history written under a different model backend."
+        )
+    attempts = payload.get("attempts") or []
+    if not isinstance(attempts, list):
+        raise ValueError("quarantined_retry.json: attempts must be an array")
+    return {
+        item["chunk_id"]: QuarantinedRetryAttempt.from_payload(item)
+        for item in attempts
+        if item.get("chunk_id")
+    }
+
+
+def _run_quarantined_retry_cycle(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    det_data_base: DeterministicGateData,
+    det_data_full: DeterministicGateData,
+    risk_by_chunk: Mapping[str, Any],
+    glossary: Sequence[Any],
+    generation_params: GenerationParams,
+    model_caller: Any,
+    gen_cache: Any,
+    qwen_evaluator: Any,
+    gemma_selector: Any,
+    selected_text_by_chunk: Dict[str, Dict[str, str]],
+    phase4_inputs: Dict[str, Any],
+    repair_phase_result: RepairPhaseResult,
+    repair_adapters: Sequence[Any],
+    formatting_step: Optional[Any],
+    backend_identity_hash: str,
+    acceptable_backend_hashes: Sequence[str],
+    now: Any,
+    progress: Optional[Any],
+    existing_generation_records: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Run the separate quarantined-retry cycle (V4 B6).
+
+    Triggered after Step 7/8 when at least one quarantined chunk still has
+    repair debt. The cycle (Variant A of the card, bounded 1 retry):
+
+      1. regenerate the quarantined chunks with look-ahead right_context (the
+         next chunk's English source) and re-run the cascade;
+      2. a cascade winner **replaces the best-variant**: its text is written
+         into the final translation and the chunk is re-audited
+         (``_reaudit_chunks``) and re-repaired (one ``_run_repair_round``),
+         so stale debt on the old best-variant is dropped, never carried;
+      3. a chunk that still fails the cascade is accepted as final with its
+         best-variant (``quarantined_final``) and its debt stays.
+
+    Persists ``quarantined_retry.json`` (history, resume-validated),
+    re-writes ``repair_report.json`` / ``repair_cache.json`` /
+    ``formatting_report.json`` with the retry outcome, and returns the
+    retry summary (including the merged generation records so the caller's
+    ``generation_outcomes.json`` write carries the new candidates).
+
+    Returns ``None`` when there is nothing to retry. A transport/gate failure
+    inside the cycle is the caller's concern (the driver records it as
+    ``step7.quarantined_retry.status="failed"``, never a semantic terminal
+    status).
+    """
+    handoff_chunks = phase4_inputs["handoff_chunks"]
+    prior_attempts = _load_prior_quarantined_retries(
+        cfg.out_dir,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        acceptable_backend_hashes=acceptable_backend_hashes,
+    )
+    # Trigger = quarantined chunks that carry current repair debt OR have a
+    # prior retry attempt. The prior-history branch matters on resume: the
+    # prior session's retry candidate may already be the best-variant (so
+    # Step 6 audits it clean and there is no *fresh* repair debt), but the
+    # retry markers/terminal must still be recomputed consistently and the
+    # prior attempt reused instead of re-paying the regeneration.
+    debt_chunks = set(quarantined_chunks_with_debt(handoff_chunks, repair_phase_result))
+    quarantined_chunks = {
+        row["chunk_id"]
+        for row in handoff_chunks
+        if row.get("status") == "quarantined"
+    }
+    chunk_ids = sorted(debt_chunks | (set(prior_attempts) & quarantined_chunks))
+    if not chunk_ids:
+        return None
+
+    result = run_quarantined_retry(
+        chunk_ids=chunk_ids,
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        det_data_base=det_data_base,
+        risk_by_chunk=risk_by_chunk,
+        glossary=tuple(glossary),
+        selected_text_by_chunk=selected_text_by_chunk,
+        generation_params=generation_params,
+        model_caller=model_caller,
+        gen_cache=gen_cache,
+        qwen_evaluator=qwen_evaluator,
+        gemma_selector=gemma_selector,
+        prior_attempts=prior_attempts,
+    )
+
+    _atomic_write_json(_quarantined_retry_path(cfg.out_dir), {
+        "schema": QUARANTINED_RETRY_SCHEMA,
+        "policy_version": QUARANTINED_RETRY_POLICY_VERSION,
+        "chapter_id": cfg.chapter_id,
+        "source_hash": source.source_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": backend_identity_hash,
+        "attempts": [attempt.to_payload() for attempt in result.attempts],
+    })
+
+    selected_chunks = list(result.selected_chunk_ids)
+    # A cascade winner replaces the best-variant text; the candidate map is
+    # updated so the re-audit / repair round keys off the new winner's role.
+    final_map = dict(repair_phase_result.final_translation)
+    candidates = dict(phase4_inputs["candidates"])
+    for chunk_id, candidate in result.candidates:
+        final_map.update(candidate.as_pid_map())
+        candidates[chunk_id] = candidate
+
+    retry_debt: List[str] = []
+    retry_round_payload: Optional[Dict[str, Any]] = None
+    if selected_chunks:
+        chunk_translation = {
+            chunk_id: {
+                pid: final_map.get(pid, "")
+                for pid in chunk_plan.chunk(chunk_id).pids
+            }
+            for chunk_id in selected_chunks
+        }
+        reaudit_findings = _reaudit_chunks(
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            config=config,
+            det_data=det_data_full,
+            translation_by_chunk=chunk_translation,
+            chunk_ids=selected_chunks,
+            qwen_audit_evaluator=repair_adapters[2],
+            gemma_audit_evaluator=repair_adapters[3],
+            progress=progress,
+        )
+
+        plans_by_chunk: Dict[str, list] = {}
+        policy = SoftFindingsPolicy()
+        for chunk_id in selected_chunks:
+            chunk_findings = tuple(
+                finding for finding in reaudit_findings
+                if finding.chunk_id == chunk_id
+            )
+            if not chunk_findings:
+                continue
+            repairable, skipped = filter_soft_findings(chunk_findings, policy)
+            for finding in skipped:
+                note = (
+                    str(finding.evidence.get("note", ""))
+                    if isinstance(finding.evidence, Mapping)
+                    else str(finding.evidence)
+                )
+                retry_debt.append(
+                    f"{chunk_id}: {finding.region.pid}: soft Gemma finding "
+                    f"({finding.category}) skipped by L3 policy after "
+                    f"quarantined retry: {note}"
+                )
+            if not repairable:
+                continue
+            plans = plan_repairs_for_chunk(
+                chunk=chunk_plan.chunk(chunk_id),
+                findings=repairable,
+                current_text={
+                    pid: final_map.get(pid, "")
+                    for pid in chunk_plan.chunk(chunk_id).pids
+                },
+                backend_identity_hash=backend_identity_hash,
+            )
+            if plans:
+                plans_by_chunk[chunk_id] = list(plans)
+            else:
+                for finding in repairable:
+                    retry_debt.append(
+                        f"{chunk_id}: {finding.region.pid}: finding "
+                        f"({finding.category}) unresolved after quarantined "
+                        "retry (no region repair could be planned)"
+                    )
+
+        if plans_by_chunk:
+            repair_cache = _load_repair_cache(
+                _repair_cache_path(cfg.out_dir),
+                chapter_hash=phase4_inputs["chapter"].chapter_hash,
+                snapshot_hash=snapshot.snapshot_hash,
+                chunk_plan_hash=chunk_plan.plan_hash,
+                config_identity=config.config_identity,
+                backend_identity_hashes=acceptable_backend_hashes,
+            ) or RepairCache()
+            if progress is not None:
+                progress.repair_round_started(round_number=3)
+            round_records, _changed = _run_repair_round(
+                chapter_hash=phase4_inputs["chapter"].chapter_hash,
+                chunk_plan=chunk_plan,
+                plans_by_chunk=plans_by_chunk,
+                candidates=candidates,
+                source=source,
+                snapshot=snapshot,
+                config=config,
+                det_data=det_data_full,
+                translation_by_chunk={
+                    chunk_id: {
+                        pid: final_map.get(pid, "")
+                        for pid in chunk_plan.chunk(chunk_id).pids
+                    }
+                    for chunk_id in plans_by_chunk
+                },
+                repair_caller=repair_adapters[0],
+                region_fidelity_gate=repair_adapters[1],
+                gemma_audit_evaluator=repair_adapters[3],
+                backend_identity_hash=backend_identity_hash,
+                cache=repair_cache,
+                progress=progress,
+            )
+            for record in round_records:
+                if record.committed:
+                    for pid in record.target_pids:
+                        final_map[pid] = dict(record.new_translation).get(pid, "")
+                else:
+                    retry_debt.append(
+                        f"{record.chunk_id}: quarantined-retry repair "
+                        f"{record.repair_id[:12]} not committed ({record.reason})"
+                    )
+            retry_round_payload = {
+                "round_number": 3,
+                "records": [record.to_payload() for record in round_records],
+                "reaudit_findings": [
+                    finding.to_payload() for finding in reaudit_findings
+                ],
+                "changed_chunk_ids": selected_chunks,
+            }
+            _atomic_write_json(_repair_cache_path(cfg.out_dir), {
+                "schema": REPAIR_CACHE_SCHEMA,
+                "chapter_hash": phase4_inputs["chapter"].chapter_hash,
+                "snapshot_hash": snapshot.snapshot_hash,
+                "chunk_plan_hash": chunk_plan.plan_hash,
+                "config_identity": config.config_identity,
+                "backend_identity_hash": backend_identity_hash,
+                "cache": repair_cache.to_payload(),
+            })
+
+    # Phase 5 formatting re-run over the updated text (B3 span contract), so
+    # Step 8 / the terminal transition see exactly the text that goes into
+    # `complete` — the same invariant the main repair phase maintains.
+    formatting_outcome = None
+    if formatting_step is not None:
+        formatting_outcome = formatting_step(translation=dict(final_map))
+        formatted_map = dict(formatting_outcome.formatted_text)
+        if set(formatted_map) != set(final_map):
+            raise ValueError(
+                "Quarantined-retry formatting must preserve the PID map; got "
+                f"{len(formatted_map)} PIDs, expected {len(final_map)}"
+            )
+        for pid, text in final_map.items():
+            if text and not formatted_map.get(pid):
+                raise ValueError(
+                    f"Quarantined-retry formatting dropped the text of PID {pid}"
+                )
+        final_map = formatted_map
+        for incident in formatting_outcome.incidents:
+            retry_debt.append(
+                f"formatting:{incident.pid}:{incident.span_id}: "
+                f"unresolved required span ({incident.reason}, "
+                f"tier={incident.tier})"
+            )
+        if progress is not None:
+            progress.formatting_done(
+                incidents=formatting_outcome.incident_count,
+                blocking=formatting_outcome.blocking,
+            )
+
+    # Debt carry-forward: a retried chunk that got selected replaced its text,
+    # so its old debt (on the old best-variant) and its old formatting
+    # incidents are dropped; everything else stays. Chunks still quarantined
+    # keep their debt and are marked quarantined_final.
+    selected_pids = frozenset(
+        pid for chunk_id in selected_chunks for pid in chunk_plan.chunk(chunk_id).pids
+    )
+    carried_debt = [
+        debt
+        for debt in repair_phase_result.debt_trace
+        if not any(debt_mentions_chunk(debt, chunk_id) for chunk_id in selected_chunks)
+        and not any(debt_mentions_pid(debt, pid) for pid in selected_pids)
+    ]
+    debt = tuple(dict.fromkeys([*carried_debt, *retry_debt]))
+
+    provenance = _build_phase4_provenance(
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        chapter_hash=phase4_inputs["chapter"].chapter_hash,
+    )
+    reaudited_pids = (
+        frozenset(
+            pid
+            for chunk_id in selected_chunks
+            for pid in chunk_plan.chunk(chunk_id).pids
+        )
+        if selected_chunks
+        else frozenset()
+    )
+    integrity = run_integrity_check(
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        det_data=det_data_full,
+        final_translation=dict(final_map),
+        original_translation=dict(repair_phase_result.final_translation),
+        reaudited_pids=reaudited_pids,
+    )
+    terminal = decide_terminal_state(
+        chunk_plan=chunk_plan,
+        final_translation=dict(final_map),
+        debt_reasons=debt,
+        provenance=provenance,
+    )
+    if progress is not None:
+        progress.terminal(status=terminal.status)
+
+    # Re-write the repair report with the retry outcome (schema additions:
+    # quarantined_final / retry_attempts / quarantined_retry block).
+    report = dict(repair_phase_result.to_payload())
+    report["status"] = terminal.status
+    report["rounds"] = report.get("rounds", []) + (
+        [retry_round_payload] if retry_round_payload is not None else []
+    )
+    report["debt_trace"] = list(debt)
+    report["final_translation"] = [
+        [pid, final_map.get(pid, "")] for pid in snapshot.pids
+    ]
+    report["integrity"] = integrity
+    report["terminal"] = {"state_id": terminal.state_id, "status": terminal.status}
+    report["quarantined_final"] = result.quarantined_final
+    report["retry_attempts"] = result.retry_attempts
+    report["quarantined_retry"] = {
+        "ran": True,
+        "policy_version": QUARANTINED_RETRY_POLICY_VERSION,
+        "retried_chunk_ids": list(result.retried_chunk_ids),
+        "selected_chunk_ids": list(result.selected_chunk_ids),
+        "quarantined_final_chunk_ids": list(result.quarantined_final_chunk_ids),
+        "attempts": [attempt.to_payload() for attempt in result.attempts],
+    }
+    report["chapter_id"] = cfg.chapter_id
+    report["finished_at"] = now().isoformat(timespec="seconds")
+    _atomic_write_json(_repair_report_path(cfg.out_dir), report)
+
+    if formatting_outcome is not None:
+        _atomic_write_json(_formatting_report_path(cfg.out_dir), {
+            "schema": FORMATTING_REPORT_SCHEMA,
+            "chapter_id": cfg.chapter_id,
+            "source_hash": source.source_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+            "backend_identity_hash": backend_identity_hash,
+            "outcome": formatting_outcome.to_payload(),
+        })
+
+    merged_generation_records = merge_retry_generation_records(
+        existing_generation_records,
+        result.generation_records,
+    )
+
+    summary: Dict[str, Any] = {
+        "status": "ran",
+        "policy_version": QUARANTINED_RETRY_POLICY_VERSION,
+        "retried_chunk_ids": list(result.retried_chunk_ids),
+        "attempts": [attempt.to_payload() for attempt in result.attempts],
+        "retry_attempts": result.retry_attempts,
+        "quarantined_final": result.quarantined_final,
+        "selected_chunk_ids": list(result.selected_chunk_ids),
+        "quarantined_final_chunk_ids": list(result.quarantined_final_chunk_ids),
+        "terminal": terminal.status,
+        "integrity": integrity["status"],
+        "report_path": str(_repair_report_path(cfg.out_dir)),
+        "quarantined_retry_path": str(_quarantined_retry_path(cfg.out_dir)),
+        "generation_records": merged_generation_records,
+    }
+    if formatting_outcome is not None:
+        summary["formatting"] = {
+            "status": "blocking" if formatting_outcome.blocking else "ok",
+            "resolved_count": formatting_outcome.resolved_count,
+            "incident_count": formatting_outcome.incident_count,
+            "model_fallback_count": formatting_outcome.model_fallback_count,
+            "max_formatting_incidents": formatting_outcome.max_formatting_incidents,
+            "report_path": str(_formatting_report_path(cfg.out_dir)),
+        }
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1777,7 +2258,7 @@ def run_chapter_strict(
 
             formatting_step = _formatting_step
         try:
-            step7 = _run_step7_repair(
+            step7, repair_phase_result = _run_step7_repair(
                 cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
                 config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
                 repair_adapters=repair_adapters,
@@ -1793,6 +2274,61 @@ def run_chapter_strict(
                 "debt_trace": None,  # recorded in repair_report.json
                 "formatting": step7.get("formatting"),
             }
+            # B6: separate bounded quarantined-retry cycle. A quarantined
+            # chunk with repair debt is regenerated with look-ahead context and
+            # re-cascaded; a winner replaces its best-variant, a still-failed
+            # chunk is accepted as final (quarantined_final). A failure here is
+            # recorded in step7, never a crash of the completed run.
+            try:
+                retry_summary = _run_quarantined_retry_cycle(
+                    cfg=cfg,
+                    source=source,
+                    snapshot=snapshot,
+                    chunk_plan=chunk_plan,
+                    config=config,
+                    det_data_base=det_data_base,
+                    det_data_full=det_data_full,
+                    risk_by_chunk=risk_by_chunk,
+                    glossary=glossary,
+                    generation_params=generation_params,
+                    model_caller=model_caller,
+                    gen_cache=gen_cache,
+                    qwen_evaluator=qwen_evaluator,
+                    gemma_selector=gemma_selector,
+                    selected_text_by_chunk=selected_text_by_chunk,
+                    phase4_inputs=phase4_inputs,
+                    repair_phase_result=repair_phase_result,
+                    repair_adapters=repair_adapters,
+                    formatting_step=formatting_step,
+                    backend_identity_hash=cfg.backend.identity_hash,
+                    acceptable_backend_hashes=acceptable_backend_hashes,
+                    now=now_fn,
+                    progress=progress_writer,
+                    existing_generation_records=merged_generation_records,
+                )
+            except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
+                LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
+                step7 = dict(step7)
+                step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
+            else:
+                if retry_summary is not None:
+                    merged_generation_records = retry_summary["generation_records"]
+                    retry_block = {
+                        key: value
+                        for key, value in retry_summary.items()
+                        if key != "generation_records"
+                    }
+                    step7 = {**step7, "quarantined_retry": retry_block}
+                    step8 = {
+                        "status": retry_summary["terminal"],
+                        "integrity": retry_summary["integrity"],
+                        "debt_trace": None,  # recorded in repair_report.json
+                        "formatting": (
+                            retry_summary.get("formatting")
+                            if "formatting" in retry_summary
+                            else step7.get("formatting")
+                        ),
+                    }
         except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
             LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
             step7 = {"status": "failed", "error": str(exc)}
@@ -1921,6 +2457,9 @@ def run_chapter_strict(
         "step6": step6,
         "step7": step7,
         "step8": step8,
+        # B6: mirror of step7.quarantined_retry for top-level readers (absent
+        # when the cycle did not run or repair was skipped).
+        "quarantined_retry": step7.get("quarantined_retry"),
         "lifecycle": local_lifecycle or {
             "startup_count": 0, "restart_count": 0,
             "switches": [], "aggregates_by_model": {},
@@ -1936,6 +2475,7 @@ def run_chapter_strict(
             "repair_cache": str(_repair_cache_path(cfg.out_dir)),
             "repair_report": str(_repair_report_path(cfg.out_dir)),
             "formatting_report": str(_formatting_report_path(cfg.out_dir)),
+            "quarantined_retry": str(_quarantined_retry_path(cfg.out_dir)),
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"
