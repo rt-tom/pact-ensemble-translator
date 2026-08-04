@@ -75,6 +75,7 @@ class HttpQwenEvaluatorConfig:
     max_tokens: int = DEFAULT_MAX_TOKENS
     label: str = "phase2c-qwen-fidelity"
     template: ReviewerPrompt = QWEN_FIDELITY_V1
+    bible_text: str = ""
 
 
 _ALLOWED_CONFIDENCE = frozenset({"high", "medium", "low"})
@@ -193,6 +194,7 @@ class HttpQwenEvaluator:
             config=BackendQwenEvaluatorConfig(
                 max_tokens=self._max_tokens,
                 template=self._config.template,
+                bible_text=self._config.bible_text,
             ),
         )
 

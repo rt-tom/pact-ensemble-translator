@@ -309,6 +309,7 @@ def test_changing_prompt_version_or_content_invalidates_cache():
         right_context=(),
         glossary=(),
         style_constraints=(),
+        bible_text="",
         config_identity=_hash("config"),
         params=make_params(),
     )
@@ -738,6 +739,7 @@ def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
         right_context=(),
         glossary=(),
         style_constraints=(),
+        bible_text="",
         config_identity=config.config_identity,
         params=make_params(),
     )

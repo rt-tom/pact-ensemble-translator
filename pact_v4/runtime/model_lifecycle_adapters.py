@@ -88,6 +88,7 @@ class LifecycleQwenEvaluator:
             max_tokens=(config.max_tokens if config else HttpQwenEvaluatorConfig().max_tokens),
             label=(config.label if config else HttpQwenEvaluatorConfig().label),
             template=(config.template if config else HttpQwenEvaluatorConfig().template),
+            bible_text=(config.bible_text if config else HttpQwenEvaluatorConfig().bible_text),
         )
         self._evaluator = HttpQwenEvaluator(config=inner_config)
 
@@ -157,6 +158,7 @@ class LifecycleQwenAuditEvaluator:
             backend,
             config=BackendQwenAuditEvaluatorConfig(
                 max_tokens=cfg.max_tokens, template=cfg.template, label=cfg.label,
+                bible_text=cfg.bible_text,
             ),
         )
 
@@ -190,6 +192,7 @@ class LifecycleGemmaAuditEvaluator:
             backend,
             config=BackendGemmaAuditEvaluatorConfig(
                 max_tokens=cfg.max_tokens, template=cfg.template, label=cfg.label,
+                bible_text=cfg.bible_text,
             ),
         )
 

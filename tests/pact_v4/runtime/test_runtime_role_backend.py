@@ -348,6 +348,7 @@ def _bundle() -> PromptBundle:
         right_context=(),
         glossary=(),
         style_constraints=(),
+        bible_text="",
         config_identity=_hash("config"),
         params=GenerationParams(temperature=0.2, seed=7, max_tokens=512),
     )

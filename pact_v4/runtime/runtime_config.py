@@ -627,6 +627,7 @@ def build_role_adapters(
     runtime: RuntimeCoordinator,
     *,
     json_retry_policy: Optional[JsonRetryPolicy] = None,
+    bible_text: str = "",
 ) -> Tuple[Any, Any, Any, Any, Any]:
     """The five role adapters ``run_chapter_strict`` needs injected.
 
@@ -640,26 +641,41 @@ def build_role_adapters(
     ``max_retries=2``). A runtime-config override is wired by the caller (the
     CLI); the policy is a resilience parameter and does not change backend
     identity.
+
+    ``bible_text`` (B7) is the rendered book-memory section appended to every
+    Phase 2C/3B prompt (Qwen fidelity, Step 6 Qwen/Gemma audit) so the model
+    sees narrator gender/characters/facts when judging fidelity or reviewing
+    Russian. The Phase 2B generation prompt reads ``bible_text`` from
+    ``PromptBundle`` directly; this parameter is only used by the fidelity
+    and audit adapters.
     """
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
+        BackendGemmaAuditEvaluatorConfig,
         BackendGemmaSelector,
         BackendModelCaller,
         BackendQwenAuditEvaluator,
         BackendQwenAuditEvaluatorConfig,
         BackendQwenEvaluator,
+        BackendQwenEvaluatorConfig,
     )
 
     retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
     return (
         BackendModelCaller(backend),
-        BackendQwenEvaluator(backend),
+        BackendQwenEvaluator(
+            backend, config=BackendQwenEvaluatorConfig(bible_text=bible_text),
+        ),
         BackendGemmaSelector(backend),
         BackendQwenAuditEvaluator(
-            backend, config=BackendQwenAuditEvaluatorConfig(retry=retry),
+            backend,
+            config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text),
         ),
-        BackendGemmaAuditEvaluator(backend),
+        BackendGemmaAuditEvaluator(
+            backend,
+            config=BackendGemmaAuditEvaluatorConfig(bible_text=bible_text),
+        ),
     )
 
 
@@ -668,6 +684,7 @@ def build_repair_adapters(
     runtime: RuntimeCoordinator,
     *,
     json_retry_policy: Optional[JsonRetryPolicy] = None,
+    bible_text: str = "",
 ) -> Tuple[Any, Any, Any, Any]:
     """The Phase 4 repair callables ``run_chapter_strict`` needs injected.
 
@@ -690,6 +707,7 @@ def build_repair_adapters(
     """
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
+        BackendGemmaAuditEvaluatorConfig,
         BackendQwenAuditEvaluator,
         BackendQwenAuditEvaluatorConfig,
         BackendRegionFidelityGate,
@@ -703,9 +721,13 @@ def build_repair_adapters(
         BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry)),
         BackendRegionFidelityGate(backend),
         BackendQwenAuditEvaluator(
-            backend, config=BackendQwenAuditEvaluatorConfig(retry=retry),
+            backend, config=BackendQwenAuditEvaluatorConfig(
+                retry=retry, bible_text=bible_text,
+            ),
         ),
-        BackendGemmaAuditEvaluator(backend),
+        BackendGemmaAuditEvaluator(
+            backend, config=BackendGemmaAuditEvaluatorConfig(bible_text=bible_text),
+        ),
     )
 
 

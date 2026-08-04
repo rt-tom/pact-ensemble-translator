@@ -155,6 +155,7 @@ class BackendModelCaller:
 class BackendQwenEvaluatorConfig:
     max_tokens: int = 16384
     template: ReviewerPrompt = QWEN_FIDELITY_V1
+    bible_text: str = ""
 
 
 class BackendQwenEvaluator:
@@ -181,6 +182,7 @@ class BackendQwenEvaluator:
             source=dict(source),
             translation=dict(translation),
             template=self._config.template,
+            bible_text=self._config.bible_text,
         )
         # Floor (config.max_tokens) + per-PID headroom, capped at
         # MAX_TOKENS_CEILING — see qwen_evaluator.py for the rationale.
@@ -281,12 +283,17 @@ class BackendQwenAuditEvaluatorConfig:
     ``retry`` is the B4 JSON-resilience policy: an empty/truncated JSON body
     is retried (bounded, exponential backoff) by re-issuing the identical
     request — transport failures are never retried here (B4 §1/§3).
+
+    ``bible_text`` is the B7 rendered book-memory section appended to the
+    audit prompt so the model sees narrator gender, characters, facts, and
+    address register when judging fidelity.
     """
 
     max_tokens: int = 16384
     template: ReviewerPrompt = QWEN_AUDIT_V1
     label: str = "phase3/qwen_chapter_audit"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    bible_text: str = ""
 
 
 class BackendQwenAuditEvaluator:
@@ -331,6 +338,7 @@ class BackendQwenAuditEvaluator:
             source=dict(source),
             translation=dict(translation),
             template=self._config.template,
+            bible_text=self._config.bible_text,
         )
         # Floor (config.max_tokens) + per-PID headroom, capped at
         # MAX_TOKENS_CEILING — same Qwen max_tokens fix as the fidelity
@@ -369,6 +377,7 @@ class BackendGemmaAuditEvaluatorConfig:
     max_tokens: int = 4096
     template: ReviewerPrompt = GEMMA_AUDIT_V1
     label: str = "phase3/gemma_russian_review"
+    bible_text: str = ""
 
 
 class BackendGemmaAuditEvaluator:
@@ -399,6 +408,7 @@ class BackendGemmaAuditEvaluator:
             chunk_id=chunk_id,
             translation=dict(translation),
             template=self._config.template,
+            bible_text=self._config.bible_text,
         )
         request = CompletionRequest(
             model_ref=_model_ref_for(

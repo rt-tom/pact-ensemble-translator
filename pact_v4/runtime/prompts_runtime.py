@@ -253,14 +253,17 @@ def render_qwen_review_prompt(
     source: dict[str, str],
     translation: dict[str, str],
     template: ReviewerPrompt = QWEN_FIDELITY_V1,
+    bible_text: str = "",
 ) -> str:
     """Render the Qwen fidelity review request as a single user message."""
     src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
     tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    bible_block = bible_text if bible_text else ""
     return (
         f"{template.instructions}\n\n"
         f"SOURCE (PID -> English text, source order):\n{src_lines}\n\n"
         f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
+        f"{bible_block}"
     )
 
 
@@ -286,15 +289,18 @@ def render_qwen_audit_prompt(
     source: dict[str, str],
     translation: dict[str, str],
     template: ReviewerPrompt = QWEN_AUDIT_V1,
+    bible_text: str = "",
 ) -> str:
     """Render the Qwen Step 6 fidelity-audit request as one user message."""
     src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
     tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    bible_block = bible_text if bible_text else ""
     return (
         f"{template.instructions}\n\n"
         f"CHUNK: {chunk_id}\n\n"
         f"SOURCE (PID -> English text):\n{src_lines}\n\n"
         f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
+        f"{bible_block}"
     )
 
 
@@ -303,13 +309,16 @@ def render_gemma_audit_prompt(
     chunk_id: str,
     translation: dict[str, str],
     template: ReviewerPrompt = GEMMA_AUDIT_V1,
+    bible_text: str = "",
 ) -> str:
     """Render the Gemma Russian-only Step 6 review as one user message."""
     tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    bible_block = bible_text if bible_text else ""
     return (
         f"{template.instructions}\n\n"
         f"CHUNK: {chunk_id}\n\n"
         f"TRANSLATION (PID -> Russian text):\n{tr_lines}\n"
+        f"{bible_block}"
     )
 
 

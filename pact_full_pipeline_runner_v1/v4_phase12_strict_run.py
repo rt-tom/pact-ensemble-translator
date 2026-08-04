@@ -269,10 +269,28 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
     return StrictRunConfig(
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
         out_dir=args.out_dir, backend=backend,
-        max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
+        max_consecutive_terminal_nonselections=args.max_consecutive_terminal_nonselections,
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
         run_label="v4-phase12-strict-chapter-trial",
     )
+
+
+def _load_bible_text(memory_dir: Path) -> str:
+    """Render the bible for adapter injection (B7).
+
+    The strict driver renders the bible from ``book_memory.json`` for the
+    generation prompt itself (see ``run_chapter_strict``), but the audit,
+    fidelity and repair adapters are constructed *before* the driver
+    reloads memory. Loading the bible here and threading it into every
+    adapter at construction time is the only point where the v4 model
+    actually sees narrator gender/characters/facts — everywhere
+    ``run_chapter_strict`` would not re-render the bible.
+    """
+    from pact_v4.runtime.bible_renderer import render_bible_section
+    from pact_v4.runtime.snapshot_factory import ChapterMemory
+
+    memory = ChapterMemory.from_directory(memory_dir)
+    return render_bible_section(memory.book_memory)
 
 
 def run_local_default(args: argparse.Namespace) -> int:
@@ -291,12 +309,14 @@ def run_local_default(args: argparse.Namespace) -> int:
         port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
     )
     cfg = _build_run_config(args, backend)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    bible_text = _load_bible_text(args.memory_dir)
     router, model_caller, qwen_evaluator, gemma_selector, \
         qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
-            backend, log_dir=args.out_dir / "server_logs",
+            backend, log_dir=args.out_dir / "server_logs", bible_text=bible_text,
         )
     runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
-    repair_adapters = build_repair_adapters(backend, runtime)
+    repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
     formatting_adapters = build_formatting_adapters(backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
@@ -320,12 +340,13 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
         backend = force_managed(backend)
     _warn_remote_acknowledgement(backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    bible_text = _load_bible_text(args.memory_dir)
     runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
     model_caller, qwen_evaluator, gemma_selector, \
         qwen_audit_evaluator, gemma_audit_evaluator = build_role_adapters(
-            backend, runtime,
+            backend, runtime, bible_text=bible_text,
         )
-    repair_adapters = build_repair_adapters(backend, runtime)
+    repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
     formatting_adapters = build_formatting_adapters(backend, runtime)
     cfg = _build_run_config(args, backend)
     progress = PhaseProgressWriter(cfg.out_dir)
