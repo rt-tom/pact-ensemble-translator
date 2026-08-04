@@ -1088,6 +1088,7 @@ def _reaudit_chunks(
     chunk_ids: Sequence[str],
     qwen_audit_evaluator: QwenAuditEvaluator,
     gemma_audit_evaluator: GemmaAuditEvaluator,
+    progress: Optional[Any] = None,
 ) -> Tuple[Finding, ...]:
     """Re-audit a targeted set of chunks (changed PIDs + discourse neighbours).
 
@@ -1179,6 +1180,8 @@ def _reaudit_chunks(
         ("gemma_russian_review", gemma_audit_evaluator, GEMMA_AUDIT_CATEGORIES),
     ):
         for chunk_id, chunk in scope:
+            if progress is not None:
+                progress.reaudit_unit_started(chunk_id=chunk_id, detector=detector)
             translation = translation_by_chunk.get(chunk_id, {})
             candidate_id = f"{chunk_id}:repair:reaudit"
             owned_source = {pid: source_map.get(pid, "") for pid in chunk.pids}
@@ -1193,11 +1196,19 @@ def _reaudit_chunks(
                 issues = _parse_issues(
                     raw, owned_pids=frozenset(chunk.pids), allowed_categories=allowed
                 )
+                # unit_status drives both the progress emission below and the
+                # original "continue on failure" gate (see the guard after the
+                # reaudit_unit_done call).
+                unit_status = "ok"
             except Exception as exc:
                 LOG.warning(
                     "Convergence re-audit %s failed for %s: %s (recorded as debt)",
                     detector, chunk_id, exc,
                 )
+                unit_status = "failed"
+            if progress is not None:
+                progress.reaudit_unit_done(chunk_id=chunk_id, detector=detector, status=unit_status)
+            if unit_status != "ok":
                 continue
             all_findings.extend(_findings_from_issues(
                 issues,
@@ -1415,6 +1426,7 @@ def _run_repair_round(
     gemma_audit_evaluator: GemmaAuditEvaluator,
     backend_identity_hash: str,
     cache: RepairCache,
+    progress: Optional[Any] = None,
 ) -> Tuple[Tuple[RepairRecord, ...], Tuple[str, ...]]:
     """Execute one convergence round as four role passes (L2b).
 
@@ -1448,6 +1460,13 @@ def _run_repair_round(
                 policy_version=REPAIR_POLICY_VERSION,
             )
             record = cache.get(unit_hash)
+            if progress is not None:
+                progress.region_started(
+                    chunk_id=plan.chunk_id,
+                    repair_id=plan.repair.repair_id,
+                    target_pids=list(plan.repair.target_pids),
+                    action=plan.repair.action,
+                )
             if record is not None:
                 cached[plan.repair.repair_id] = (record, chunk_id)
                 continue
@@ -1532,6 +1551,15 @@ def _run_repair_round(
         )
         records.append(record)
         cache.put(unit_hash, record)
+        if progress is not None:
+            progress.region_done(
+                chunk_id=plan.chunk_id,
+                repair_id=plan.repair.repair_id,
+                target_pids=list(plan.repair.target_pids),
+                action=plan.repair.action,
+                committed=committed,
+                reason=reason,
+            )
         if committed:
             # Apply only the plan's target PIDs: every tentative is prepared
             # on the round's snapshot (one text slice), so writing the whole
@@ -1557,9 +1585,27 @@ def _run_repair_round(
         )
         records.append(record)
         cache.put(unit_hash, record)
+        if progress is not None:
+            progress.region_done(
+                chunk_id=plan.chunk_id,
+                repair_id=plan.repair.repair_id,
+                target_pids=list(plan.repair.target_pids),
+                action=plan.repair.action,
+                committed=False,
+                reason=edit_reason,
+            )
 
     for _repair_id, (record, chunk_id) in cached.items():
         records.append(record)
+        if progress is not None:
+            progress.region_done(
+                chunk_id=record.chunk_id,
+                repair_id=record.repair_id,
+                target_pids=list(record.target_pids),
+                action=record.action,
+                committed=record.committed,
+                reason=record.reason,
+            )
         if record.committed:
             for pid in record.target_pids:
                 text = dict(record.new_translation).get(pid, "")
@@ -1592,6 +1638,7 @@ def run_repair_phase(
     chapter_hash: str = "",
     formatting: Optional[FormattingStep] = None,
     soft_findings_policy: Optional[SoftFindingsPolicy] = None,
+    progress: Optional[Any] = None,
 ) -> RepairPhaseResult:
     """Run Phase 4A/4A2/4B for one chapter.
 
@@ -1703,6 +1750,8 @@ def run_repair_phase(
             continue
         round_one_plans[chunk.chunk_id] = list(plans)
 
+    if progress is not None:
+        progress.repair_round_started(round_number=1)
     round_one_records, changed_chunk_ids = _run_repair_round(
         chapter_hash=chapter_hash,
         chunk_plan=chunk_plan,
@@ -1718,6 +1767,7 @@ def run_repair_phase(
         gemma_audit_evaluator=gemma_audit_evaluator,
         backend_identity_hash=backend_identity_hash,
         cache=cache,
+        progress=progress,
     )
     changed_chunk_ids = list(changed_chunk_ids)
     for record in round_one_records:
@@ -1744,6 +1794,7 @@ def run_repair_phase(
             chunk_ids=reaudit_scope,
             qwen_audit_evaluator=qwen_audit_evaluator,
             gemma_audit_evaluator=gemma_audit_evaluator,
+            progress=progress,
         )
 
     round_one = RepairRoundResult(
@@ -1770,6 +1821,7 @@ def run_repair_phase(
     round_two_records: list[RepairRecord] = []
     round_two_findings: Tuple[Finding, ...] = ()
     round_two_changed: list[str] = []
+    round_two_ran = False
     blocking_findings = tuple(
         f for f in reaudit_findings
         if f.chunk_id in reaudit_scope and _is_blocking(f)
@@ -1812,6 +1864,9 @@ def run_repair_phase(
                 continue
             round_two_plans[chunk.chunk_id] = list(plans)
         if round_two_plans:
+            round_two_ran = True
+            if progress is not None:
+                progress.repair_round_started(round_number=2)
             round_two_records, round_two_changed = _run_repair_round(
                 chapter_hash=chapter_hash,
                 chunk_plan=chunk_plan,
@@ -1827,6 +1882,7 @@ def run_repair_phase(
                 gemma_audit_evaluator=gemma_audit_evaluator,
                 backend_identity_hash=backend_identity_hash,
                 cache=cache,
+                progress=progress,
             )
             round_two_changed = list(round_two_changed)
         for record in round_two_records:
@@ -1850,6 +1906,7 @@ def run_repair_phase(
                 chunk_ids=scope2,
                 qwen_audit_evaluator=qwen_audit_evaluator,
                 gemma_audit_evaluator=gemma_audit_evaluator,
+                progress=progress,
             )
 
     round_two = RepairRoundResult(
@@ -1858,6 +1915,9 @@ def run_repair_phase(
         reaudit_findings=round_two_findings,
         changed_chunk_ids=tuple(round_two_changed),
     )
+
+    if progress is not None:
+        progress.repair_done(rounds=2 if round_two_ran else 1)
 
     # ---- assemble final chapter translation ----------------------------
     final_map: Dict[str, str] = {}
@@ -1892,6 +1952,11 @@ def run_repair_phase(
                 f"formatting:{incident.pid}:{incident.span_id}: "
                 f"unresolved required span ({incident.reason}, "
                 f"tier={incident.tier})"
+            )
+        if progress is not None:
+            progress.formatting_done(
+                incidents=formatting_outcome.incident_count,
+                blocking=formatting_outcome.blocking,
             )
 
     final_translation = tuple(
@@ -1934,6 +1999,8 @@ def run_repair_phase(
         debt_reasons=debt,
         provenance=provenance,
     )
+    if progress is not None:
+        progress.terminal(status=terminal.status)
 
     report = {
         "schema": REPAIR_REPORT_SCHEMA,
