@@ -121,6 +121,13 @@ def build_argparser() -> argparse.ArgumentParser:
                          "empty memory -- the chapter_046 trial used D:/pact/pact_chapters, "
                          "which has neither file).")
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--run-label", default="v4-phase12-strict-chapter-trial",
+                    help="Run label written to the strict chapter trial record "
+                         "(B8: a re-validation run needs its own label, e.g. "
+                         "v4-phase12-strict-0001-run002, so artifacts are not "
+                         "confused with the historical trial run's). Does NOT "
+                         "participate in config/snapshot identity -- use a "
+                         "distinct --out-dir for cache/resume isolation.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8094)
     p.add_argument("--max-consecutive-nonselections", type=int, default=3)
@@ -269,9 +276,9 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
     return StrictRunConfig(
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
         out_dir=args.out_dir, backend=backend,
-        max_consecutive_terminal_nonselections=args.max_consecutive_terminal_nonselections,
+        max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
-        run_label="v4-phase12-strict-chapter-trial",
+        run_label=args.run_label,
     )
 
 
