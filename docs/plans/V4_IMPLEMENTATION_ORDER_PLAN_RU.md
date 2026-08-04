@@ -105,6 +105,8 @@ workstream-тема, темы не смешивать.
   Ожидается: консистентность рода/персонажей, разблокировка chunk0001,
   ~190→~6 переключений, ~620k→~166k Qwen-токенов.
   `docs/plans/V4_B8_CHAPTER_0001_REVALIDATION_TASK_RU.md`.
+  Статус: карточка создана, CLI-фиксы влиты в main (PR #127, --run-label);
+  прогон главы 0001 не запускался — ожидает команды владельца «Запускай».
 - **B9**: генератор кандидатов глоссария + сбор наблюдений в проде — перенос
   v3-механики `glossary_candidates` (`pact_translate_v3.py`) в v4: вызов
   `add_observation` (`MemoryManager`, `pact_v4/phase1/memory.py`) в book-run
