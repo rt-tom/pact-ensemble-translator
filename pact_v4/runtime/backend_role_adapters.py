@@ -94,8 +94,18 @@ def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
 
 @dataclass(frozen=True)
 class BackendModelCallerConfig:
+    """Phase 2B generation call settings.
+
+    ``retry`` is the B4 JSON-resilience policy (B10: extended to the
+    generation adapter): an empty/truncated JSON body is retried (bounded,
+    exponential backoff) by re-issuing the identical request — transport
+    failures are never retried here (B4 §1/§3). ``max_tokens`` is the
+    generation output budget (chunk-sized, see ``DEFAULT_MAX_TOKENS``).
+    """
+
     max_tokens: int = DEFAULT_MAX_TOKENS
     label: str = "phase2b-generation"
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendModelCaller:
@@ -105,6 +115,15 @@ class BackendModelCaller:
     backend, and returns the raw assistant text. JSON validation, PID-set
     enforcement, and cache identity all live in ``pact_v4.phase2.generation``
     — this class does not duplicate any of that.
+
+    B4 (JSON resilience, B10): an empty or truncated-JSON generation body
+    (the run_002 ``incomplete_generation`` failure mode) is retried
+    (``config.retry``, bounded + exponential backoff) by re-issuing the
+    identical request — identity is unchanged by a retry. Transport failures
+    are never retried here. When the budget is exhausted the last
+    ``EmptyResponseError``/``TruncatedJSONError`` is re-raised — the
+    generation layer records it as a failed candidate, never a semantic
+    verdict.
     """
 
     def __init__(
@@ -143,23 +162,50 @@ class BackendModelCaller:
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
         )
-        try:
-            response = self._backend.complete(request)
-        except CompletionError as exc:
-            LOG.error("BackendModelCaller: backend failure: %s", exc)
-            raise
-        return response.text
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity and never enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendModelCaller: backend failure: %s", exc)
+                raise
+
+        return retry_json_call(
+            _complete, self._config.retry, label=request.label,
+        )
 
 
 @dataclass(frozen=True)
 class BackendQwenEvaluatorConfig:
+    """Phase 2C Qwen fidelity-gate call settings.
+
+    ``retry`` is the B4 JSON-resilience policy (B10: extended to the
+    fidelity gate): an empty/truncated JSON verdict body is retried
+    (bounded, exponential backoff) by re-issuing the identical request —
+    transport failures are never retried here (B4 §1/§3) and still surface
+    as a failing ``GateResult``.
+    """
+
     max_tokens: int = 16384
     template: ReviewerPrompt = QWEN_FIDELITY_V1
     bible_text: str = ""
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendQwenEvaluator:
-    """``QwenEvaluator`` protocol implementation over a ``CompletionBackend``."""
+    """``QwenEvaluator`` protocol implementation over a ``CompletionBackend``.
+
+    B4 (JSON resilience, B10): an empty or truncated-JSON verdict body is
+    retried (``config.retry``, bounded + exponential backoff) by re-issuing
+    the identical request — identity is unchanged by a retry. Transport
+    failures are never retried here and keep returning a failing
+    ``GateResult`` (the cascade's failed-gate contract). When the retry
+    budget is exhausted the last ``EmptyResponseError``/``TruncatedJSONError``
+    is re-raised — never a semantic verdict.
+    """
 
     def __init__(
         self,
@@ -199,26 +245,57 @@ class BackendQwenEvaluator:
             response_schema=JSON_OBJECT_SCHEMA,
             label="phase2c/qwen_fidelity",
         )
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity and never enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendQwenEvaluator: backend failure: %s", exc)
+                raise
+
         try:
-            response = self._backend.complete(request)
+            raw = retry_json_call(
+                _complete, self._config.retry, label="phase2c/qwen_fidelity",
+            )
         except CompletionError as exc:
-            LOG.error("BackendQwenEvaluator: backend failure: %s", exc)
             return GateResult(
                 gate="qwen_fidelity",
                 passed=False,
                 detail=f"qwen_fidelity: API failure: {exc}",
             )
-        return _parse_qwen_verdict(response.text)
+        return _parse_qwen_verdict(raw)
 
 
 @dataclass(frozen=True)
 class BackendGemmaSelectorConfig:
+    """Phase 2C Gemma Russian-preference call settings.
+
+    ``retry`` is the B4 JSON-resilience policy (B10: extended to the
+    selector): an empty/truncated JSON verdict body is retried (bounded,
+    exponential backoff) by re-issuing the identical request — transport
+    failures are never retried here (B4 §1/§3) and still surface as a
+    failing ``GateResult``.
+    """
+
     max_tokens: int = 1024
     template: ReviewerPrompt = GEMMA_RUSSIAN_PREFERENCE_V1
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendGemmaSelector:
-    """``GemmaSelector`` protocol implementation over a ``CompletionBackend``."""
+    """``GemmaSelector`` protocol implementation over a ``CompletionBackend``.
+
+    B4 (JSON resilience, B10): an empty or truncated-JSON verdict body is
+    retried (``config.retry``, bounded + exponential backoff) by re-issuing
+    the identical request — identity is unchanged by a retry. Transport
+    failures are never retried here and keep returning a failing
+    ``GateResult`` (the cascade's failed-gate contract). When the retry
+    budget is exhausted the last ``EmptyResponseError``/``TruncatedJSONError``
+    is re-raised — never a semantic verdict.
+    """
 
     def __init__(
         self,
@@ -258,16 +335,29 @@ class BackendGemmaSelector:
             response_schema=JSON_OBJECT_SCHEMA,
             label="phase2c/gemma_russian_preference",
         )
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity and never enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendGemmaSelector: backend failure: %s", exc)
+                raise
+
         try:
-            response = self._backend.complete(request)
+            raw = retry_json_call(
+                _complete, self._config.retry,
+                label="phase2c/gemma_russian_preference",
+            )
         except CompletionError as exc:
-            LOG.error("BackendGemmaSelector: backend failure: %s", exc)
             return GateResult(
                 gate="gemma_russian_preference",
                 passed=False,
                 detail=f"gemma_russian_preference: API failure: {exc}",
             )
-        return _parse_gemma_preference(response.text, valid_candidate_ids=valid_ids)
+        return _parse_gemma_preference(raw, valid_candidate_ids=valid_ids)
 
 
 @dataclass(frozen=True)
@@ -374,10 +464,20 @@ class BackendQwenAuditEvaluator:
 
 @dataclass(frozen=True)
 class BackendGemmaAuditEvaluatorConfig:
+    """Step 6 Gemma audit call settings.
+
+    ``retry`` is the B4 JSON-resilience policy (B10: extended to the Gemma
+    audit adapter): an empty/truncated JSON body is retried (bounded,
+    exponential backoff) by re-issuing the identical request — transport
+    failures are never retried here (B4 §1/§3) and still raise
+    ``CompletionError`` for ``run_chapter_audit`` to record as a failed unit.
+    """
+
     max_tokens: int = 4096
     template: ReviewerPrompt = GEMMA_AUDIT_V1
     label: str = "phase3/gemma_russian_review"
     bible_text: str = ""
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendGemmaAuditEvaluator:
@@ -387,6 +487,14 @@ class BackendGemmaAuditEvaluator:
     "Russian-only review без оригинала"), matching the protocol signature
     exactly. Transport failures raise ``CompletionError`` for
     ``run_chapter_audit`` to record as a failed unit.
+
+    B4 (JSON resilience, B10): an empty or truncated-JSON body is retried
+    (``config.retry``, bounded + exponential backoff) by re-issuing the
+    identical request — identity is unchanged by a retry. Transport failures
+    are never retried here. When the budget is exhausted the last
+    ``EmptyResponseError``/``TruncatedJSONError`` is re-raised, which
+    ``run_chapter_audit`` records as a failed unit — never a semantic
+    verdict.
     """
 
     def __init__(
@@ -420,12 +528,20 @@ class BackendGemmaAuditEvaluator:
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
-        try:
-            response = self._backend.complete(request)
-        except CompletionError as exc:
-            LOG.error("BackendGemmaAuditEvaluator: backend failure: %s", exc)
-            raise
-        return response.text
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity and never enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendGemmaAuditEvaluator: backend failure: %s", exc)
+                raise
+
+        return retry_json_call(
+            _complete, self._config.retry, label=self._config.label,
+        )
 
 
 @dataclass(frozen=True)
@@ -545,6 +661,7 @@ class BackendRegionFidelityGateConfig:
     max_tokens: int = 4096
     template: ReviewerPrompt = REGION_FIDELITY_GATE_V1
     label: str = "phase4/region_fidelity_gate"
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendRegionFidelityGate:
@@ -558,6 +675,14 @@ class BackendRegionFidelityGate:
     role (re-gate stays on Qwen; the editor stays on Gemma). A transport
     failure returns a failing ``GateResult`` (debt, never a semantic
     verdict); there is no silent fallback.
+
+    B4 (JSON resilience, B10): an empty or truncated-JSON verdict body is
+    retried (``config.retry``, bounded + exponential backoff) by re-issuing
+    the identical request — identity is unchanged by a retry. Transport
+    failures are never retried here and keep returning a failing
+    ``GateResult``. When the retry budget is exhausted the last
+    ``EmptyResponseError``/``TruncatedJSONError`` is re-raised — never a
+    semantic verdict.
     """
 
     def __init__(
@@ -593,16 +718,28 @@ class BackendRegionFidelityGate:
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity and never enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendRegionFidelityGate: backend failure: %s", exc)
+                raise
+
         try:
-            response = self._backend.complete(request)
+            raw = retry_json_call(
+                _complete, self._config.retry, label=self._config.label,
+            )
         except CompletionError as exc:
-            LOG.error("BackendRegionFidelityGate: backend failure: %s", exc)
             return GateResult(
                 gate="qwen_fidelity",
                 passed=False,
                 detail=f"qwen_fidelity: API failure: {exc}",
             )
-        return _parse_qwen_verdict(response.text)
+        return _parse_qwen_verdict(raw)
 
 
 @dataclass(frozen=True)

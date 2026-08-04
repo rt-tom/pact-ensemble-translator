@@ -176,14 +176,23 @@ def test_evaluator_returns_failed_gate_on_api_error():
     assert "API failure" in result.detail
 
 
-def test_evaluator_returns_failed_gate_on_malformed_reply():
-    stub = _StubApiClient(script=["not a json object"])
+def test_evaluator_raises_after_malformed_reply_retries_exhausted():
+    # B10: a non-JSON (unparseable) reply is now a JSON-resilience retry
+    # trigger (TruncatedJSONError) instead of an immediate failed gate.
+    # With the default JsonRetryPolicy(max_retries=2) the adapter re-issues
+    # the identical request up to 3 times; when the budget is exhausted the
+    # last error is re-raised (never a semantic verdict).
+    stub = _StubApiClient(script=["not a json object"] * 3)
     evaluator = HttpQwenEvaluator(api=stub)  # type: ignore[arg-type]
-    result = evaluator(
-        source={"p1": "Hi."}, translation={"p1": "Привет."},
-    )
-    assert result.passed is False
-    assert "non-JSON" in result.detail
+    from pact_v4.runtime.json_resilience import TruncatedJSONError
+
+    with pytest.raises(TruncatedJSONError):
+        evaluator(
+            source={"p1": "Hi."}, translation={"p1": "Привет."},
+        )
+    assert len(stub.calls) == 3
+    # The retried requests are identical (identity unchanged by a retry).
+    assert stub.calls[0]["messages"] == stub.calls[1]["messages"] == stub.calls[2]["messages"]
 
 
 def test_evaluator_default_constructor_creates_real_api_client():
