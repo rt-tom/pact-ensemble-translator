@@ -191,6 +191,39 @@ class RuntimeConfigCliTest(unittest.TestCase):
             os.environ.pop("SMOKE_C3_PASS_ENV", None)
 
 
+class RunLabelCliTest(unittest.TestCase):
+    """B8: the historical trial run_label must stay the default, and a
+    caller must be able to give a re-validation run its own label without
+    changing the (identity-bearing) config hash."""
+
+    DEFAULT_LABEL = "v4-phase12-strict-chapter-trial"
+
+    def test_default_run_label_is_historical_trial_label(self):
+        args = m.build_argparser().parse_args(BASE_ARGS)
+        self.assertEqual(args.run_label, self.DEFAULT_LABEL)
+
+    def test_custom_run_label_propagates_to_run_config(self):
+        argv = BASE_ARGS + ["--run-label", "v4-phase12-strict-0001-run002"]
+        args = m.build_argparser().parse_args(argv)
+        self.assertEqual(args.run_label, "v4-phase12-strict-0001-run002")
+        cfg = m._build_run_config(args, backend=None)
+        self.assertEqual(cfg.run_label, "v4-phase12-strict-0001-run002")
+
+    def test_run_label_does_not_participate_in_config_identity(self):
+        # The label is a record/cosmetic field only: two configs differing
+        # only in run_label must produce the same config_identity.
+        args_default = m.build_argparser().parse_args(BASE_ARGS)
+        args_custom = m.build_argparser().parse_args(
+            BASE_ARGS + ["--run-label", "v4-phase12-strict-0001-run002"]
+        )
+        cfg_default = m._build_run_config(args_default, backend=None)
+        cfg_custom = m._build_run_config(args_custom, backend=None)
+        self.assertEqual(
+            cfg_default.to_config_artifact(model_profile="local-llama/v1").config_identity,
+            cfg_custom.to_config_artifact(model_profile="local-llama/v1").config_identity,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 
