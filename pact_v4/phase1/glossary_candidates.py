@@ -18,9 +18,12 @@ calls in the book run). This module is the model-free core:
      the ``target``, otherwise the candidate gets ``conflicts`` and no target.
   3. ``GlossaryCandidateLedger`` — append-only, line-based (one JSON object
      per line) accumulation into ``glossary_candidates.json``, v3-style merged
-     records ``{source, kind, total_occurrences, chapters, variants,
-     conflicts, first_context}``; a torn/partial trailing line (crash during
-     append) is skipped on load instead of breaking it.
+     records ``{source, kind, total_occurrences, chapters, variants, target,
+     targets_seen, conflicts, first_context}``; the merged ``target`` is the
+     single distinct non-None chapter target and is irreversible — once two
+     chapters disagree it stays ``None`` forever and every distinct chapter
+     target is emitted in ``conflicts``. A torn/partial trailing line (crash
+     during append) is skipped on load instead of breaking it.
 
 Constraints honoured (B9-I1 task card): no model calls, no HTTP, no side
 effects on import; Phase 1/2, cascade, risk, journal schema, identity/cache
@@ -568,11 +571,16 @@ def align_candidates(
 
         if candidate.get("kind") == "proper_name":
             # Common-noun filter: a capitalized word whose stem also occurs
-            # in lowercase in these translations is capitalized only by
-            # sentence position, not a proper name.
+            # in lowercase anywhere in the chapter's translations is
+            # capitalized only by sentence position, not a proper name.
+            # The lowercase evidence is chapter-wide (every translated pid,
+            # matching or not): a sentence-initial "Дом" in the
+            # candidate-matching pids must not become a proper-name target
+            # when "дом" occurs lowercase in a different pid of the same
+            # chapter (P2 review finding).
             lowercase_stems: set = set()
-            for pid in examined:
-                lowercase_stems |= _lowercase_ru_stems(translations[pid])
+            for pid, text in translations.items():
+                lowercase_stems |= _lowercase_ru_stems(text)
             stem_forms: Dict[str, Dict[str, int]] = {}
             stem_order: List[str] = []
             stem_pids: Dict[str, List[str]] = {}
@@ -681,7 +689,15 @@ class GlossaryCandidateLedger:
 
       ``{source, kind, total_occurrences,
         chapters: [{chapter_id, chunk_ids, count}],
-        variants: {variant: count}, target, conflicts, first_context}``
+        variants: {variant: count}, target, targets_seen, conflicts,
+        first_context}``
+
+    ``target`` is the single distinct non-None per-chapter target and is
+    irreversible: once two chapters disagree it stays ``None`` forever (a
+    later chapter matching the first target does not resurrect it) and the
+    disagreeing chapter targets are emitted in ``conflicts``.
+    ``targets_seen`` is the running list of distinct non-None chapter
+    targets (first-seen order) that backs that decision.
 
     Crash-safety: a torn partial *trailing* line (interrupted append) is
     skipped on load; a corrupt line in the middle raises ``ValueError``.
@@ -743,8 +759,11 @@ class GlossaryCandidateLedger:
         candidate the surviving observations are then accumulated:
         ``total_occurrences`` sums, ``chapters`` entries are appended,
         ``variants`` counts sum, ``first_context`` keeps the earliest, and the
-        merged ``target`` is the single distinct non-None per-chapter target
-        (``None`` when chapters disagree or none reached consensus).
+        merged ``target`` is the single distinct non-None per-chapter target.
+        The decision is irreversible: once two chapters disagree, ``target``
+        stays ``None`` forever (a later chapter matching the first target
+        does not resurrect it) and every distinct chapter target is emitted
+        in ``conflicts`` alongside the per-chapter conflicts.
         """
         collapsed: Dict[Tuple[str, str], Dict[str, Any]] = {}
         if isinstance(right, Mapping):
@@ -822,19 +841,46 @@ class GlossaryCandidateLedger:
 
         record["conflicts"] = sorted(set(record.get("conflicts") or []) | set(conflicts))
         record["first_context"] = record.get("first_context") or context
+        distinct_targets = record.get("targets_seen")
+        if not isinstance(distinct_targets, list):
+            # Foreign/legacy record without the tracking field — seed it
+            # from the existing target so the consensus stays irreversible
+            # from this point on.
+            distinct_targets = []
+            if record.get("target") is not None:
+                distinct_targets.append(str(record["target"]))
+            record["targets_seen"] = distinct_targets
         record["target"] = GlossaryCandidateLedger._merge_target(
-            record.get("target"), target
+            distinct_targets, target
         )
+        if len(distinct_targets) > 1:
+            # Cross-chapter disagreement: every distinct chapter target is a
+            # competing variant — emit them all in conflicts without dropping
+            # the per-chapter conflicts already recorded.
+            record["conflicts"] = sorted(
+                set(record["conflicts"]) | set(distinct_targets)
+            )
         return record
 
     @staticmethod
-    def _merge_target(current, incoming) -> Optional[str]:
-        """Single distinct non-None target across observations, else None."""
-        if incoming is None:
-            return current
-        if current is None:
-            return str(incoming)
-        return current if str(current) == str(incoming) else None
+    def _merge_target(targets_seen, incoming) -> Optional[str]:
+        """Merged target for a record, irreversible once chapters disagree.
+
+        ``targets_seen`` is the record's running list of distinct non-None
+        per-chapter targets (first-seen order). It is updated in place with
+        ``incoming``; the merged target is the single distinct value, or
+        ``None`` forever once two different chapter targets have been seen.
+        A later chapter matching the first target must NOT resurrect it —
+        the disagreement is already recorded in ``conflicts`` (P1 review
+        finding: targets Альфа, Бета, Альфа must stay without a target).
+        """
+        if incoming is not None:
+            incoming_s = str(incoming)
+            if incoming_s not in targets_seen:
+                targets_seen.append(incoming_s)
+        if len(targets_seen) == 1:
+            return targets_seen[0]
+        return None
 
     # -- writing -----------------------------------------------------------
 

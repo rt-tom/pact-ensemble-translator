@@ -201,6 +201,33 @@ def test_alignment_proper_name_consensus():
     assert record["variants"]["Блэйк"] == 4
 
 
+def test_alignment_proper_name_chapter_wide_common_noun_filter():
+    # P2: "Дом" is capitalized only by sentence position in the
+    # candidate-matching pids, but "дом" occurs lowercase in a NON-matching
+    # pid of the same chapter. Chapter-wide evidence must stop it from
+    # becoming a proper-name target (with matching-only evidence it would
+    # reach share 1.0 and wrongly become the target).
+    source_by_pid = {
+        "p00001": "Blake walked to the house.",
+        "p00002": "Blake paused at the gate.",
+        "p00003": "The house loomed over Blake.",
+        "p00004": "Blake stayed outside.",
+        "p00005": "The gate was heavy.",
+    }
+    translations = {
+        "p00001": "Дом стоял у дороги.",
+        "p00002": "Дом ждал его у ворот.",
+        "p00003": "Дом нависал над ним.",
+        "p00004": "Дом стоял в глубине.",
+        "p00005": "Тяжёлый дом стоял у ворот.",
+    }
+    aligned = align_candidates([_BLAKE_CANDIDATE], source_by_pid, translations)
+    record = aligned[0]
+    assert record["target"] is None
+    assert record["variants"] == {}
+    assert record["consensus_share"] == 0.0
+
+
 def test_alignment_proper_name_conflict_no_target():
     translations = {
         "p00001": "Блэйк подошёл к дому.",
@@ -353,9 +380,43 @@ def test_ledger_target_conflict_across_chapters(tmp_path):
     assert "Блейком" in record["conflicts"]
 
 
+def _targeted_obs(target, conflicts=()):
+    """An aligned-candidate-shaped observation with an explicit target."""
+    return [{
+        "source": "Blake", "kind": "proper_name", "occurrences": 2,
+        "chunk_ids": [], "context": "Blake walked.",
+        "variants": {target: 2} if target else {},
+        "target": target,
+        "conflicts": list(conflicts),
+    }]
+
+
+def test_ledger_cross_chapter_target_disagreement_is_irreversible(tmp_path):
+    # P1: chapter targets Альфа, Бета, Альфа — the third chapter must NOT
+    # resurrect "Альфа": the earlier disagreement is irreversible, and both
+    # distinct chapter targets (plus any per-chapter conflicts) land in
+    # conflicts.
+    ledger = GlossaryCandidateLedger(str(tmp_path / "glossary_candidates.json"))
+    ledger.append_chapter("ch0001", _targeted_obs("Альфа"))
+    ledger.append_chapter("ch0002", _targeted_obs("Бета", conflicts=("Вариант2",)))
+    ledger.append_chapter("ch0003", _targeted_obs("Альфа"))
+    record = ledger.load()[candidate_key("Blake", "proper_name")]
+    assert record["target"] is None
+    assert set(record["conflicts"]) == {"Альфа", "Бета", "Вариант2"}
+    # Idempotent repeat of a chapter (re-run) must not change the state.
+    stats = ledger.append_chapter("ch0003", _targeted_obs("Альфа"))
+    assert stats == {"appended": 0, "new_candidates": 0, "updated": 1}
+    record = ledger.load()[candidate_key("Blake", "proper_name")]
+    assert record["target"] is None
+    assert set(record["conflicts"]) == {"Альфа", "Бета", "Вариант2"}
+    assert len(record["chapters"]) == 3
+    assert record["total_occurrences"] == 6  # not 8
+
+
 def test_ledger_differing_targets_across_chapters_gives_no_target(tmp_path):
     # Chapter 2 reaches a different consensus (Блейк instead of Блэйк) →
-    # the merged record has no single distinct target.
+    # the merged record has no single distinct target, and both disagreeing
+    # chapter targets are recorded in conflicts.
     other = {pid: text.replace("Блэйк", "Блейк")
              for pid, text in _CONSENSUS_TRANSLATIONS.items()}
     ledger = GlossaryCandidateLedger(str(tmp_path / "glossary_candidates.json"))
@@ -363,6 +424,7 @@ def test_ledger_differing_targets_across_chapters_gives_no_target(tmp_path):
     ledger.append_chapter("ch0002", _aligned(other))
     record = ledger.load()[candidate_key("Blake", "proper_name")]
     assert record["target"] is None
+    assert set(record["conflicts"]) == {"Блэйк", "Блейк"}
 
 
 def test_ledger_append_only_no_duplicate_on_rerun(tmp_path):
