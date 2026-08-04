@@ -88,6 +88,8 @@ from pact_v4.phase2.generation import GenerationCache, GenerationParams, generat
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
 from pact_v4.phase4.quarantined_retry import (
+    OUTCOME_QUARANTINED_FINAL,
+    OUTCOME_SELECTED,
     QUARANTINED_RETRY_POLICY_VERSION,
     QUARANTINED_RETRY_SCHEMA,
     QuarantinedRetryAttempt,
@@ -1371,6 +1373,25 @@ def _run_quarantined_retry_cycle(
     if not chunk_ids:
         return None
 
+    # Resume gate (V4 B6 owner decision 2026-08-04): on a clean resume — every
+    # triggered chunk already has a prior attempt AND there is no fresh
+    # repair debt — skip the model-leases (Qwen re-audit + Gemma + optional
+    # repair round + formatting re-run) and just restore the prior attempt's
+    # candidate + markers from ``quarantined_retry.json``. The re-audit result
+    # is provably identical (no text changed), so the ~2 model leases/resume
+    # are pure waste. The terminal / repair_report / formatting_report are
+    # still re-written from the prior attempt so consumers see the same shape
+    # as a non-resume run; only the lease cost is elided.
+    fresh_debt = chunk_ids and bool(debt_chunks)
+    pure_resume = (
+        not fresh_debt
+        and all(chunk_id in prior_attempts for chunk_id in chunk_ids)
+        and all(
+            prior_attempts[chunk_id].outcome in (OUTCOME_SELECTED, OUTCOME_QUARANTINED_FINAL)
+            for chunk_id in chunk_ids
+        )
+    )
+
     result = run_quarantined_retry(
         chunk_ids=chunk_ids,
         source=source,
@@ -1412,7 +1433,7 @@ def _run_quarantined_retry_cycle(
 
     retry_debt: List[str] = []
     retry_round_payload: Optional[Dict[str, Any]] = None
-    if selected_chunks:
+    if selected_chunks and not pure_resume:
         chunk_translation = {
             chunk_id: {
                 pid: final_map.get(pid, "")
@@ -1538,9 +1559,12 @@ def _run_quarantined_retry_cycle(
 
     # Phase 5 formatting re-run over the updated text (B3 span contract), so
     # Step 8 / the terminal transition see exactly the text that goes into
-    # `complete` — the same invariant the main repair phase maintains.
+    # `complete` — the same invariant the main repair phase maintains. Skipped
+    # on a pure resume (no text changed since the prior session's formatting
+    # run wrote formatting_report.json — re-running it would be the same model
+    # call as the elided re-audit).
     formatting_outcome = None
-    if formatting_step is not None:
+    if formatting_step is not None and not pure_resume:
         formatting_outcome = formatting_step(translation=dict(final_map))
         formatted_map = dict(formatting_outcome.formatted_text)
         if set(formatted_map) != set(final_map):

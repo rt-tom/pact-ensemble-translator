@@ -340,22 +340,39 @@ def test_quarantined_retry_resume_reuses_prior_attempt(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
     first_result, _r1, _c1, _audit1 = _run_with_retry(cfg)
     assert first_result.step8["status"] == "complete"
+    # The first run's Step 6 audit evaluator saw the quarantined chunk; record
+    # that call count so the resume's zero-call assertion below is meaningful
+    # (not trivially zero because the stub never logged).
+    first_step6_audit_calls = len(_audit1.calls)
 
     resumed_cfg = StrictRunConfig(
         chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
     )
-    second_result, _r2, caller2, _audit2 = _run_with_retry(resumed_cfg)
+    second_result, _r2, caller2, qwen_audit2 = _run_with_retry(resumed_cfg)
     assert second_result.resumed_from_index == 2
     # The retry reuses the prior session's selected attempt: the generation
     # caller is never invoked during the resumed run (Phase 1-2 skipped all
     # journaled chunks, Step 6/7 reuse their caches, the retry reuses history).
     assert caller2.calls == []
+    # Resume gate (V4 B6 owner decision 2026-08-04): with prior attempts
+    # recorded and no fresh debt, the re-audit is provably identical (no text
+    # changed), so the cycle must NOT call the Qwen audit evaluator again.
+    # Any calls beyond the first session's count would be the elided re-audit
+    # path (one per retried chunk — chunk0001 only here).
+    assert len(qwen_audit2.calls) == first_step6_audit_calls
     retry_block = second_result.step7["quarantined_retry"]
     assert retry_block["status"] == "ran"
     assert retry_block["selected_chunk_ids"] == ["chunk0001"]
     assert retry_block["attempts"][0]["reused"] is True
+    # Markers restored from prior attempts: terminal and report must agree
+    # with the first run's outcome, not the pre-retry defaults.
     assert second_result.step8["status"] == "complete"
+    second_report = _load_report(resumed_cfg)
+    assert second_report["status"] == "complete"
+    assert second_report["quarantined_final"] is False
+    assert second_report["retry_attempts"] == 1
+    assert second_report["quarantined_retry"]["selected_chunk_ids"] == ["chunk0001"]
 
     history = _load_retry_history(resumed_cfg)
     assert history["attempts"][0]["reused"] is True
