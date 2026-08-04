@@ -16,6 +16,12 @@ calls in the book run). This module is the model-free core:
      word counts over the translations of the pids whose source contains the
      candidate; a dominant variant whose share >= ``consensus_ratio`` becomes
      the ``target``, otherwise the candidate gets ``conflicts`` and no target.
+     Term targets are additionally required to be unambiguous *across* the
+     chapter (B9-F2 review PR #128): when two term candidates dominate on the
+     same Russian variant, that variant is co-occurrence evidence for at most
+     one of them — with no word-level alignment we cannot tell which, so both
+     candidates lose the target (conservative, prevents unrelated co-occurring
+     source terms from being promoted as the same unrelated target).
   3. ``GlossaryCandidateLedger`` — append-only, line-based (one JSON object
      per line) accumulation into ``glossary_candidates.json``, v3-style merged
      records ``{source, kind, total_occurrences, chapters, variants, target,
@@ -545,7 +551,18 @@ def align_candidates(
 
     If the dominant variant's share of the examined pids is >=
     ``consensus_ratio`` it becomes ``target``; otherwise ``conflicts`` lists
-    all competing variants and there is no target. Returns a list of aligned
+    all competing variants and there is no target.
+
+    A term target is only kept when it is unambiguous *within the chapter*
+    (B9-F2 review PR #128): if two ``term`` candidates both dominate on the
+    same Russian variant, that variant is co-occurrence evidence for at most
+    one of them and the frequency-contrast heuristic cannot tell which, so
+    BOTH candidates lose the target and the shared variant lands in their
+    ``conflicts``. Without this rule an unrelated co-occurring source term
+    (e.g. ``bound`` next to ``pact`` in the same sentences) could be
+    auto-promoted as the same unrelated target (e.g. ``пакт``).
+
+    Returns a list of aligned
     records (input candidate fields plus ``matching_pid_count``,
     ``variants``, ``target``, ``consensus_share``, ``conflicts``).
     Deterministic; no model calls.
@@ -668,6 +685,28 @@ def align_candidates(
             "consensus_share": round(share, 6),
             "conflicts": conflicts,
         })
+
+    # B9-F2 (review PR #128): term targets must be unambiguous across the
+    # chapter. The frequency-contrast heuristic cannot distinguish "the
+    # candidate's translation" from "a word that merely co-occurs with the
+    # candidate in the same pids" — when two term candidates of this chapter
+    # both dominate on the SAME Russian variant, that variant is credible
+    # evidence for at most one of them, and without word-level alignment we
+    # cannot tell which. Conservative: neither candidate keeps it as a target
+    # (both become conflicts), so unrelated co-occurring source terms can
+    # never be promoted as the same unrelated target.
+    claims: Dict[str, int] = {}
+    for record in aligned:
+        if record.get("kind") == "term" and record.get("target") is not None:
+            target_s = str(record["target"])
+            claims[target_s] = claims.get(target_s, 0) + 1
+    for record in aligned:
+        if record.get("kind") != "term" or record.get("target") is None:
+            continue
+        if claims.get(str(record["target"]), 0) > 1:
+            record["target"] = None
+            record["consensus_share"] = 0.0
+            record["conflicts"] = list(record["variants"].keys())
     return aligned
 
 

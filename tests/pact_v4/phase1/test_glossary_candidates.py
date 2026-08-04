@@ -297,6 +297,41 @@ def test_alignment_term_contrast_rejects_common_word():
     assert record["target"] == "пакт"
 
 
+def test_alignment_co_occurring_terms_cannot_share_unrelated_target():
+    # B9-F2 (review PR #128): the frequency-contrast heuristic cannot tell
+    # "the candidate's translation" from "a word that merely co-occurs with
+    # the candidate in the same pids" — when the term-pids are identical for
+    # several candidates and there is no contrasting out-group, every
+    # co-occurring Russian word qualifies (contrast is vacuous) and the
+    # first-seen tie-break hands ALL of pact/bound/together the target
+    # "пакт". That would auto-promote unrelated source terms as the same
+    # unrelated target and corrupt the glossary. The conservative rule must
+    # strip the shared target from every competing candidate.
+    source_by_pid = {
+        **{f"p{i:05d}": "The pact bound them all together." for i in range(1, 4)},
+        **{f"p{i:05d}": "The others watched from afar." for i in range(4, 9)},
+    }
+    translations = {
+        **{f"p{i:05d}": "Пакт связывал их всех вместе." for i in range(1, 4)},
+        **{f"p{i:05d}": "Остальные наблюдали издалека." for i in range(4, 9)},
+    }
+    cands = [
+        {"source": source, "kind": "term", "occurrences": 3,
+         "chunk_ids": [], "context": "The pact bound them."}
+        for source in ("pact", "bound", "together")
+    ]
+    aligned = align_candidates(cands, source_by_pid, translations)
+    by_source = {a["source"]: a for a in aligned}
+    # "пакт" is co-occurrence evidence for all three and unambiguous for
+    # none: no candidate keeps it as a target, and it stays visible in the
+    # conflicts for the human reviewer.
+    for name in ("pact", "bound", "together"):
+        record = by_source[name]
+        assert record["target"] is None
+        assert record["consensus_share"] == 0.0
+        assert "пакт" in record["conflicts"]
+
+
 def test_alignment_consensus_ratio_parameter():
     translations = {
         "p00001": "Блэйк подошёл к дому.",
