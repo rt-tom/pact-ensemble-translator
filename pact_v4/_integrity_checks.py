@@ -33,6 +33,7 @@ __all__ = [
     "bible_script_tokens",
     "glossary_script_tokens",
     "source_derived_allowlist",
+    "check_narrator_gender",
 ]
 
 _URL_OR_EMAIL_RE = re.compile(
@@ -385,3 +386,75 @@ def combine_glossary_terms(
         if key and ru_name.strip():
             combined[key] = ru_name.strip()
     return combined
+
+
+# Past-tense verbs are what the narrator_gender check scans for. Present
+# tense («вижу», «смотрю»), adverbs («хорошо») and other inflections that
+# do not inflect for gender are deliberately excluded — the check is
+# model-free, narrow, and only fires on the «я + past-tense verb» surface
+# form that switched gender in run_001 (chunk0015 «увидел» → chunk0016
+# «увидела»). The patterns below are case-insensitive; re.VERBOSE keeps
+# them readable.
+_NARRATOR_MALE_RE = re.compile(
+    r"\bя\s+"
+    r"(?:"
+    r"был|стал|пошёл|пошел|увидел|услышал|сказал|подумал|"
+    r"знал|хотел|мог|должен|решил|встал|сел|вышел|вошёл|вошел|"
+    r"нашёл|нашел|оглянулся|улыбнулся|спросил|ответил|крикнул|"
+    r"взял|дал|получил|написал|прочитал|открыл|закрыл"
+    r")\b",
+    re.I | re.VERBOSE,
+)
+
+_NARRATOR_FEMALE_RE = re.compile(
+    r"\bя\s+"
+    r"(?:"
+    r"была|стала|пошла|увидела|услышала|сказала|подумала|"
+    r"знала|хотела|могла|должна|решила|встала|села|вышла|вошла|"
+    r"нашла|оглянулась|улыбнулась|спросила|ответила|крикнула|"
+    r"взяла|дала|получила|написала|прочитала|открыла|закрыла"
+    r")\b",
+    re.I | re.VERBOSE,
+)
+
+
+def check_narrator_gender(
+    text: str, expected_gender: str
+) -> List[Dict[str, str]]:
+    """Scan Russian text for narrator self-references with wrong gender.
+
+    Looks for the past-tense surface form ``я + past-tense verb`` (e.g.
+    «я увидел», «я вошла») and checks whether the verb's gender agrees
+    with ``expected_gender`` (``"male"`` or ``"female"``). The check is
+    narrow on purpose — only the past-tense self-reference form that
+    switched gender in run_001 (chunk0015 «увидел» → chunk0016
+    «увидела»), no present-tense, no adverbs, no indirect pronouns
+    («мне», «меня»). Other formulations are covered by the Qwen fidelity
+    gate and the Gemma Russian-only review; this deterministic layer
+    catches the specific narrator flip pattern the model missed.
+
+    Returns a list of ``{"form": ..., "expected": ...}`` dicts — one per
+    mismatch found. An empty list means no mismatch. Pure, stateless: no
+    model calls, no disk I/O.
+    """
+    if not text or not expected_gender:
+        return []
+    folded = expected_gender.casefold()
+    if folded not in ("male", "female"):
+        return []
+    cleaned = strip_inline_markup(text)
+    mismatches: List[Dict[str, str]] = []
+    seen: set = set()
+    if folded == "male":
+        for match in _NARRATOR_FEMALE_RE.finditer(cleaned):
+            form = match.group(0).strip()
+            if form not in seen:
+                seen.add(form)
+                mismatches.append({"form": form, "expected": "male"})
+    else:
+        for match in _NARRATOR_MALE_RE.finditer(cleaned):
+            form = match.group(0).strip()
+            if form not in seen:
+                seen.add(form)
+                mismatches.append({"form": form, "expected": "female"})
+    return mismatches

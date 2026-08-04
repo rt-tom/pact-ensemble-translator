@@ -1,7 +1,7 @@
 import json
 import os
 import tempfile
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 def atomic_write(filepath: str, data: Any):
     dir_name = os.path.dirname(filepath)
@@ -46,26 +46,55 @@ class MemoryManager:
         obs[category][key] = value
         atomic_write(self.observations_path, obs)
 
-    def promote(self, status: str):
-        """Promotes observations to main memory if status is 'complete'."""
-        if status != 'complete':
-            # Do nothing if quarantined or failed
+    def promote(self, status: str, *, quarantined_chunks: Optional[set] = None):
+        """Promote observations to main memory based on terminal status.
+
+        ``complete``: promote all observations (existing behaviour).
+        ``accepted_degraded``: promote observations only from non-quarantined
+        chunks (owner decision 2026-08-04, B7). ``quarantined_chunks`` is the
+        set of chunk_ids that were quarantined; observations keyed by those
+        chunk_ids are excluded.
+        ``failed`` / ``quarantined``: do nothing (existing behaviour).
+        """
+        if status not in ('complete', 'accepted_degraded'):
             return
 
         obs = load_json(self.observations_path, {'glossary': {}, 'book_memory': {}})
-        
-        # Promote glossary
+
+        if status == 'accepted_degraded' and quarantined_chunks:
+            obs = self._filter_quarantined_obs(obs, quarantined_chunks)
+
         glossary = load_json(self.glossary_path, {})
         self._merge_with_conflict_resolution(glossary, obs.get('glossary', {}))
         atomic_write(self.glossary_path, glossary)
 
-        # Promote book_memory
         book_memory = load_json(self.book_memory_path, {})
         self._merge_with_conflict_resolution(book_memory, obs.get('book_memory', {}))
         atomic_write(self.book_memory_path, book_memory)
-        
-        # Clear observations after successful promotion
+
         atomic_write(self.observations_path, {'glossary': {}, 'book_memory': {}})
+
+    def _filter_quarantined_obs(
+        self, obs: Dict, quarantined_chunks: set
+    ) -> Dict:
+        """Remove observations attributed to quarantined chunks.
+
+        Observations may carry a ``chunk_id`` field; those matching a
+        quarantined chunk are dropped. Observations without a ``chunk_id``
+        are kept (they are chapter-level, not chunk-specific).
+        """
+        filtered: Dict[str, Any] = {}
+        for category in ('glossary', 'book_memory'):
+            entries = obs.get(category, {})
+            if not isinstance(entries, dict):
+                continue
+            kept: Dict[str, Any] = {}
+            for key, value in entries.items():
+                if isinstance(value, dict) and value.get('chunk_id') in quarantined_chunks:
+                    continue
+                kept[key] = value
+            filtered[category] = kept
+        return filtered
 
     def _merge_with_conflict_resolution(self, main_mem: Dict, new_obs: Dict):
         for key, value in new_obs.items():

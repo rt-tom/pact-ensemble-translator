@@ -164,6 +164,7 @@ def render_prompt(bundle: "Any") -> str:
         if instructions
         else ""
     )
+    bible_block = bundle.bible_text if bundle.bible_text else ""
     return (
         f"{bundle.template.instructions}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
@@ -172,6 +173,7 @@ def render_prompt(bundle: "Any") -> str:
         f"left_context (read-only, already-committed Russian): {left_context}\n"
         f"right_context (read-only English source): {right_context}\n"
         f"GLOSSARY:\n{glossary}\n"
+        f"{bible_block}"
         f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n"
         f"{required_category_block}"
     )

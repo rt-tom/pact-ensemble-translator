@@ -148,6 +148,7 @@ class PromptBundle:
     right_context: Tuple[Tuple[str, str], ...]
     glossary: Tuple[Tuple[str, Tuple[str, ...]], ...]
     style_constraints: Tuple[Tuple[str, str], ...]
+    bible_text: str
     config_identity: str
     params: GenerationParams
     bundle_hash: str = field(init=False)
@@ -196,6 +197,7 @@ class PromptBundle:
             "right_context": [list(item) for item in self.right_context],
             "glossary": [[term, list(targets)] for term, targets in self.glossary],
             "style_constraints": [list(item) for item in self.style_constraints],
+            "bible_text": self.bible_text,
             "config_identity": self.config_identity,
             "params": {
                 "temperature": self.params.temperature,
@@ -417,6 +419,7 @@ def _generate_one(
     right_context: Tuple[Tuple[str, str], ...],
     glossary: Tuple[GlossaryEntry, ...],
     style_constraints: Tuple[Tuple[str, str], ...],
+    bible_text: str,
     config: ConfigArtifact,
     params: GenerationParams,
     model_caller: ModelCaller,
@@ -443,6 +446,7 @@ def _generate_one(
         right_context=right_context,
         glossary=_glossary_identity(glossary),
         style_constraints=style_constraints,
+        bible_text=bible_text,
         config_identity=config.config_identity,
         params=params,
     )
@@ -524,6 +528,7 @@ def generate_for_chunk(
     right_context: Tuple[Tuple[str, str], ...] = (),
     glossary: Tuple[GlossaryEntry, ...] = (),
     style_constraints: Mapping[str, str] = MappingProxyType({}),
+    bible_text: str = "",
     config: ConfigArtifact,
     params: GenerationParams,
     model_caller: ModelCaller,
@@ -565,6 +570,7 @@ def generate_for_chunk(
             right_context=right_context,
             glossary=glossary,
             style_constraints=style_pairs,
+            bible_text=bible_text,
             config=config,
             params=params,
             model_caller=model_caller,

@@ -152,11 +152,13 @@ from pact_v4.runtime.snapshot_factory import (
 )
 from pact_v4._integrity_checks import (
     bible_script_tokens,
+    check_narrator_gender,
     combine_script_tokens,
     extract_script_tokens,
     glossary_script_tokens,
     source_derived_allowlist,
 )
+from pact_v4.runtime.bible_renderer import render_bible_section, extract_narrator_gender
 
 LOG = logging.getLogger(__name__)
 
@@ -246,7 +248,7 @@ class StrictRunConfig:
 
 
 def build_strict_lifecycle(
-    backend: StrictBackendConfig, *, log_dir: Path,
+    backend: StrictBackendConfig, *, log_dir: Path, bible_text: str = "",
 ) -> Tuple[ModelRouter, Any, Any, Any, Any, Any]:
     """Wire up the real ``llama-server``-backed lifecycle for a live run.
 
@@ -260,16 +262,26 @@ def build_strict_lifecycle(
     coordinator; the runner adapters are the lifecycle-aware wrappers over
     that same router.
     """
+    from pact_v4.runtime.qwen_evaluator import HttpQwenEvaluatorConfig
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendQwenAuditEvaluatorConfig,
+        BackendGemmaAuditEvaluatorConfig,
+    )
     runtime = backend.build_runtime(log_dir=log_dir)
     router = runtime.router
     model_caller = LifecycleModelCaller(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
-    qwen_evaluator = LifecycleQwenEvaluator(router, model_name=backend.model_names[QWEN_MODEL_KEY])
+    qwen_evaluator = LifecycleQwenEvaluator(
+        router, model_name=backend.model_names[QWEN_MODEL_KEY],
+        config=HttpQwenEvaluatorConfig(bible_text=bible_text),
+    )
     gemma_selector = LifecycleGemmaSelector(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
     qwen_audit_evaluator = LifecycleQwenAuditEvaluator(
         router, model_name=backend.model_names[QWEN_MODEL_KEY],
+        config=BackendQwenAuditEvaluatorConfig(bible_text=bible_text),
     )
     gemma_audit_evaluator = LifecycleGemmaAuditEvaluator(
         router, model_name=backend.model_names[GEMMA_MODEL_KEY],
+        config=BackendGemmaAuditEvaluatorConfig(bible_text=bible_text),
     )
     return router, model_caller, qwen_evaluator, gemma_selector, qwen_audit_evaluator, gemma_audit_evaluator
 
@@ -1323,6 +1335,7 @@ def _run_quarantined_retry_cycle(
     now: Any,
     progress: Optional[Any],
     existing_generation_records: Sequence[Mapping[str, Any]],
+    bible_text: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Run the separate quarantined-retry cycle (V4 B6).
 
@@ -1408,6 +1421,7 @@ def _run_quarantined_retry_cycle(
         qwen_evaluator=qwen_evaluator,
         gemma_selector=gemma_selector,
         prior_attempts=prior_attempts,
+        bible_text=bible_text,
     )
 
     _atomic_write_json(_quarantined_retry_path(cfg.out_dir), {
@@ -1824,6 +1838,8 @@ def run_chapter_strict(
     )
 
     glossary = _glossary_entries(memory)
+    bible_text = render_bible_section(memory.book_memory)
+    narrator_gender = extract_narrator_gender(memory.book_memory)
     source_map = dict(source.source)
     risk_by_chunk = {
         pc.chunk_id: _risk_for_chunk(chunk=pc, source_map=source_map, glossary=glossary)
@@ -1979,7 +1995,8 @@ def run_chapter_strict(
                 outcome = generate_for_chunk(
                     chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
                     chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
-                    glossary=glossary, style_constraints={}, config=config, params=generation_params,
+                    glossary=glossary, style_constraints={}, bible_text=bible_text,
+                    config=config, params=generation_params,
                     model_caller=model_caller, cache=gen_cache,
                 )
                 generation_records.append(_serialize_generation_outcome(outcome))
@@ -2335,6 +2352,7 @@ def run_chapter_strict(
                     now=now_fn,
                     progress=progress_writer,
                     existing_generation_records=merged_generation_records,
+                    bible_text=bible_text,
                 )
             except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
                 LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
@@ -2393,6 +2411,38 @@ def run_chapter_strict(
     step6 = dict(step6)
     step6["switch_count"] = len(step6_events)
     step6["switches"] = [event.to_payload() for event in step6_events]
+
+    narrator_gender_findings: list = []
+    if narrator_gender and final_text_by_pid:
+        full_text = " ".join(final_text_by_pid.values())
+        narrator_gender_findings = check_narrator_gender(full_text, narrator_gender)
+    if narrator_gender_findings:
+        # B7 invariant: ``integrity.status`` describes the detailed
+        # check-level state (narrator_gender, formatting, mixed_script,
+        # ...); ``step8.status`` is the chapter terminal state
+        # (complete / accepted_degraded / failed / skipped). They are
+        # NOT the same shape. narrator_gender failure is non-fatal at
+        # chapter level (PID map is structurally valid), so step8 stays
+        # in accepted_degraded; ``integrity.status == "failed"`` records
+        # the specific finding for debugging/dashboards. A failed/skipped
+        # step8 (from a prior failure) is never upgraded by a successful
+        # narrator_gender check here — the check only downgrades an
+        # existing complete to accepted_degraded.
+        step8 = dict(step8)
+        integrity = dict(step8.get("integrity") or {})
+        integrity["narrator_gender"] = {
+            "expected": narrator_gender,
+            "mismatches": narrator_gender_findings,
+        }
+        if integrity.get("status") != "failed":
+            integrity["status"] = "failed"
+            integrity["reason"] = (
+                f"narrator_gender mismatch: expected {narrator_gender}, "
+                f"found {len(narrator_gender_findings)} mismatch(es)"
+            )
+        step8["integrity"] = integrity
+        if step8.get("status") == "complete":
+            step8["status"] = "accepted_degraded"
 
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))

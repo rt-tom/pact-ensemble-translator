@@ -396,6 +396,7 @@ def _retry_one_chunk(
     qwen_evaluator: Any,
     gemma_selector: Any,
     prior_attempt: Optional[QuarantinedRetryAttempt],
+    bible_text: str = "",
 ) -> Tuple[QuarantinedRetryAttempt, Optional[Dict[str, Any]]]:
     """Regenerate one chunk with look-ahead and re-run the cascade.
 
@@ -421,6 +422,7 @@ def _retry_one_chunk(
         right_context=right_context,
         glossary=glossary,
         style_constraints={},
+        bible_text=bible_text,
         config=config,
         params=generation_params,
         model_caller=model_caller,
@@ -519,6 +521,7 @@ def run_quarantined_retry(
     qwen_evaluator: Any,
     gemma_selector: Any,
     prior_attempts: Optional[Mapping[str, QuarantinedRetryAttempt]] = None,
+    bible_text: str = "",
 ) -> QuarantinedRetryResult:
     """Run the separate bounded retry cycle for the quarantined chunk set.
 
@@ -601,6 +604,7 @@ def run_quarantined_retry(
             qwen_evaluator=qwen_evaluator,
             gemma_selector=gemma_selector,
             prior_attempt=prior_attempt,
+            bible_text=bible_text,
         )
         attempts.append(attempt)
         if serialized is not None:
