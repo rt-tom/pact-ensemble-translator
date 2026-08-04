@@ -87,7 +87,6 @@ from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, selec
 from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
-from pact_v4.phase3.findings import Finding
 from pact_v4.phase4.quarantined_retry import (
     QUARANTINED_RETRY_POLICY_VERSION,
     QUARANTINED_RETRY_SCHEMA,
@@ -1630,6 +1629,11 @@ def _run_quarantined_retry_cycle(
     ]
     report["integrity"] = integrity
     report["terminal"] = {"state_id": terminal.state_id, "status": terminal.status}
+    # The retry may re-run Phase 5 formatting over the updated text, so the
+    # report's formatting block must reflect the re-run outcome, not the
+    # pre-retry one (the formatting_report.json is re-written below too).
+    if formatting_outcome is not None:
+        report["formatting"] = formatting_outcome.to_payload()
     report["quarantined_final"] = result.quarantined_final
     report["retry_attempts"] = result.retry_attempts
     report["quarantined_retry"] = {
@@ -1671,7 +1675,9 @@ def _run_quarantined_retry_cycle(
         "selected_chunk_ids": list(result.selected_chunk_ids),
         "quarantined_final_chunk_ids": list(result.quarantined_final_chunk_ids),
         "terminal": terminal.status,
-        "integrity": integrity["status"],
+        # The full integrity dict, matching step7["integrity"]'s shape (the
+        # driver copies it into step8 verbatim).
+        "integrity": integrity,
         "report_path": str(_repair_report_path(cfg.out_dir)),
         "quarantined_retry_path": str(_quarantined_retry_path(cfg.out_dir)),
         "generation_records": merged_generation_records,

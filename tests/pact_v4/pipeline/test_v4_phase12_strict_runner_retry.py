@@ -167,7 +167,50 @@ class StubRepairCaller:
         )
 
 
-def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None):
+class CannedFormattingCaller:
+    """Fake Phase 5 ``FormattingCaller``: map each unresolved span to a word.
+
+    Mirrors ``test_v4_phase12_strict_runner_formatting``'s canned caller so a
+    formatting-aware retry run exercises the Phase 5 re-run path (the retry
+    re-runs formatting over the updated text and re-writes the artifacts).
+    """
+
+    def __init__(self, *, empty: bool = False) -> None:
+        self.empty = empty
+        self.calls: list = []
+
+    def __call__(self, *, pid, source_text, translation, spans) -> str:
+        self.calls.append((pid, translation))
+        words = translation.split()
+        mappings = []
+        for index, span in enumerate(spans):
+            target = "" if self.empty else (words[index] if index < len(words) else "")
+            mappings.append({
+                "pid": pid, "span_id": span["span_id"],
+                "target_text": target, "occurrence": 1,
+            })
+        return json.dumps({"mappings": mappings}, ensure_ascii=False)
+
+
+def _make_cfg_with_spans(tmp_path: Path, *, n_paragraphs: int = 24) -> StrictRunConfig:
+    """Chapter whose paragraphs carry an inline ``<em>`` span (span contract)."""
+    chapter_html = tmp_path / "046.html"
+    memory_dir = tmp_path / "memory"
+    _write_empty_memory(memory_dir)
+    words = [f"word{i}" for i in range(WORDS_PER_PARAGRAPH)]
+    words[5] = "<em>emphasized</em>"
+    paragraph_text = " ".join(words)
+    body = "\n".join(f"<p>{paragraph_text}</p>" for _ in range(n_paragraphs))
+    chapter_html.write_text("<html><body>" + body + "</body></html>", encoding="utf-8")
+    return StrictRunConfig(
+        chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
+        out_dir=tmp_path / "out", backend=_make_backend(),
+        max_consecutive_terminal_nonselections=3,
+    )
+
+
+def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None,
+                    formatting_adapters: Any = None):
     """Run the strict driver with Phase 4 repair adapters + the B6 stubs.
 
     The repair re-gate is forced to fail (``StubRegionGate(passed=False)``),
@@ -191,6 +234,7 @@ def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None):
             _LifecycleAwareQwenAudit(router, StubQwenAudit()),
             _LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
         ),
+        formatting_adapters=formatting_adapters,
     )
     return result, router, inner, qwen_audit
 
@@ -343,3 +387,40 @@ def test_quarantined_retry_not_fired_without_quarantined_debt(tmp_path: Path):
     report = _load_report(cfg)
     assert report["quarantined_final"] is False
     assert report["retry_attempts"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Formatting re-run: the retry re-applies Phase 5 over the updated text
+# ---------------------------------------------------------------------------
+
+
+def test_quarantined_retry_reruns_formatting_over_updated_text(tmp_path: Path):
+    # Phase 5 formatting (B3) is configured, so after the retry replaces the
+    # best-variant the formatting step re-runs over the updated chapter text;
+    # the repair report's formatting block and formatting_report.json must
+    # carry the re-run outcome (not the pre-retry one).
+    cfg = _make_cfg_with_spans(tmp_path, n_paragraphs=24)
+    formatting_caller = CannedFormattingCaller()
+    result, _router, _caller, _audit = _run_with_retry(
+        cfg, formatting_adapters=(formatting_caller,),
+    )
+    # The retry succeeded (chunk0001 unlocked) and formatting re-ran.
+    assert result.step7["quarantined_retry"]["status"] == "ran"
+    assert result.step7["quarantined_retry"]["selected_chunk_ids"] == ["chunk0001"]
+    assert formatting_caller.calls  # the formatting caller was actually invoked
+
+    report = _load_report(cfg)
+    assert report["status"] == result.step8["status"]
+    assert report["formatting"]["schema"] == "pact-v4-formatting-outcome/v1"
+    assert report["formatting"]["resolved_count"] > 0
+    # The final translation is the formatted text (restored <em> markup).
+    final_texts = [text for _pid, text in report["final_translation"]]
+    assert any("<em>" in text for text in final_texts)
+
+    fmt_report = json.loads(
+        (cfg.out_dir / "formatting_report.json").read_text(encoding="utf-8")
+    )
+    assert fmt_report["outcome"]["resolved_count"] == report["formatting"]["resolved_count"]
+    assert fmt_report["backend_identity_hash"] == cfg.backend.identity_hash
+    # step8's formatting block mirrors the re-run outcome, not the pre-retry one.
+    assert result.step8["formatting"]["incident_count"] == report["formatting"]["incident_count"]
