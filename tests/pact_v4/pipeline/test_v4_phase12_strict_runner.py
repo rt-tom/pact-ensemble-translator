@@ -1027,3 +1027,157 @@ def test_merge_selection_meta_prior_wins_and_current_overrides(tmp_path: Path):
     )
     by_chunk2 = {rec["chunk_id"]: rec for rec in merged2}
     assert by_chunk2[chunk_plan.chunks[0].chunk_id]["status"] == "selected"
+
+
+
+# ---------------------------------------------------------------------------
+# V4 B5 mixed_script-политика: combined allowlist (bible/glossary/source-
+# derived/manual config) unblocks legitimate Latin initials like "R.D.T."
+# ---------------------------------------------------------------------------
+
+
+def _write_chapter_html_with_marker(
+    path: Path, n_paragraphs: int, marker: str, words_per_paragraph: int = WORDS_PER_PARAGRAPH
+) -> None:
+    paragraphs = []
+    for i in range(n_paragraphs):
+        base = " ".join(f"w{i}_{j}" for j in range(words_per_paragraph))
+        if i == 0:
+            base = f"{marker} " + base
+        paragraphs.append(f"<p>{base}</p>")
+    path.write_text("<html><body>" + "\n".join(paragraphs) + "</body></html>", encoding="utf-8")
+
+
+class MarkerModelCaller:
+    """Translate paragraphs containing ``marker`` to a text that keeps the
+    marker; everything else becomes filler (no Latin residue)."""
+
+    def __init__(self, marker: str):
+        self.marker = marker
+        self.calls: list = []
+
+    def __call__(self, bundle: PromptBundle) -> str:
+        self.calls.append(bundle)
+        out: Dict[str, str] = {}
+        for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+            if self.marker in text:
+                out[pid] = f"{self.marker} стоит у окна."
+            else:
+                out[pid] = f"Перевод номер{index}"
+        return json.dumps(out, ensure_ascii=False)
+
+
+class AlteringModelCaller:
+    """Translate the marker paragraph to a *different* Latin token (one not
+    present in the source), so the mixed_script gate must flag it."""
+
+    def __init__(self, marker: str, substitute: str):
+        self.marker = marker
+        self.substitute = substitute
+        self.calls: list = []
+
+    def __call__(self, bundle: PromptBundle) -> str:
+        self.calls.append(bundle)
+        out: Dict[str, str] = {}
+        for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+            if self.marker in text:
+                out[pid] = f"{self.substitute} стоит у окна."
+            else:
+                out[pid] = f"Перевод номер{index}"
+        return json.dumps(out, ensure_ascii=False)
+
+
+def _run_with_caller(cfg: StrictRunConfig, caller: Any) -> Any:
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, caller)
+    qwen_evaluator = _LifecycleAwareQwen(router, StubQwen())
+    gemma_selector = _LifecycleAwareGemmaSelector(router, StubGemma())
+    qwen_audit_evaluator = _LifecycleAwareQwenAudit(router, StubQwenAudit())
+    gemma_audit_evaluator = _LifecycleAwareGemmaAudit(router, StubGemmaAudit())
+    return run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=qwen_audit_evaluator,
+        gemma_audit_evaluator=gemma_audit_evaluator,
+    )
+
+
+def _marker_cfg(tmp_path: Path) -> StrictRunConfig:
+    """One-chunk chapter whose first paragraph contains the legit source
+    initials ``R.D.T.``; empty memory (no bible) by default."""
+    chapter_html = tmp_path / "0001.html"
+    memory_dir = tmp_path / "memory"
+    _write_chapter_html_with_marker(chapter_html, n_paragraphs=8, marker="R.D.T.")
+    _write_empty_memory(memory_dir)
+    return StrictRunConfig(
+        chapter_id="0001", chapter_html_path=chapter_html, memory_dir=memory_dir,
+        out_dir=tmp_path / "out", backend=_make_backend(),
+        max_consecutive_terminal_nonselections=3,
+    )
+
+
+def test_b5_mixed_script_unblocked_by_book_bible(tmp_path: Path):
+    # The bible is the primary allowlist source: its character entry "R.D.T."
+    # must let the translation keep the source initials.
+    cfg = _marker_cfg(tmp_path)
+    (cfg.memory_dir / "book_bible.json").write_text(json.dumps({
+        "version": 1,
+        "characters": {"R.D.T.": {"target": "Р.Д.Т.", "gender": "male"}},
+        "entities": {}, "address_register": [], "facts": [], "chapters": [],
+    }), encoding="utf-8")
+    result = _run_with_caller(cfg, MarkerModelCaller(marker="R.D.T."))
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+    assert result.step6["finding_count"] == 0
+
+
+def test_b5_mixed_script_unblocked_by_source_derived(tmp_path: Path):
+    # No bible: the source-derived rule alone ("token in source AND in
+    # translation") unblocks the initials.
+    cfg = _marker_cfg(tmp_path)
+    result = _run_with_caller(cfg, MarkerModelCaller(marker="R.D.T."))
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+    assert result.step6["finding_count"] == 0
+
+
+def test_b5_mixed_script_unblocked_by_manual_config(tmp_path: Path):
+    # Manual config override: even without a bible and regardless of the
+    # source-derived intersection, an explicit allowlist entry works.
+    cfg = _marker_cfg(tmp_path)
+    cfg = StrictRunConfig(**{
+        **cfg.__dict__,
+        "deterministic_mixed_script_allow": ("R.D.T.",),
+    })
+    result = _run_with_caller(cfg, MarkerModelCaller(marker="R.D.T."))
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+
+
+def test_b5_mixed_script_still_flags_unjustified_latin(tmp_path: Path):
+    # Source has "R.D.T.", translation substitutes "A.B.V." (Latin initials
+    # NOT in the source and NOT in any allowlist) -> the deterministic gate
+    # must still quarantine the chunk for mixed_script.
+    cfg = _marker_cfg(tmp_path)
+    result = _run_with_caller(cfg, AlteringModelCaller(marker="R.D.T.", substitute="A.B.V."))
+    assert result.quarantined_count == 1
+    assert result.selected_count == 0
+    journal = [
+        json.loads(line) for line in result.journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert journal and journal[0]["outcome"] == "quarantined"
+
+
+def test_b5_mixed_script_manual_entry_dotted_form(tmp_path: Path):
+    # A manual config entry written as the dotted form "R.D.T." is tokenized
+    # into R/D/T (same as a bible entry), so it must unblock the initials.
+    cfg = _marker_cfg(tmp_path)
+    cfg = StrictRunConfig(**{
+        **cfg.__dict__,
+        "deterministic_mixed_script_allow": ("R.D.T.",),
+    })
+    result = _run_with_caller(cfg, MarkerModelCaller(marker="R.D.T."))
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+    # The run record carries the allowlist provenance.
+    assert result.record["mixed_script_policy"]["sources"]["manual"] == ["R.D.T."]
