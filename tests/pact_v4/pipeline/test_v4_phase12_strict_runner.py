@@ -1031,8 +1031,9 @@ def test_merge_selection_meta_prior_wins_and_current_overrides(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# V4 B5 mixed_script-политика: combined allowlist (bible/glossary/source-
-# derived/manual config) unblocks legitimate Latin initials like "R.D.T."
+# V4 B5 mixed_script-политика: combined allowlist (book_memory/glossary/
+# source-derived/manual config) unblocks legitimate Latin initials like
+# "R.D.T."
 # ---------------------------------------------------------------------------
 
 
@@ -1116,14 +1117,16 @@ def _marker_cfg(tmp_path: Path) -> StrictRunConfig:
     )
 
 
-def test_b5_mixed_script_unblocked_by_book_bible(tmp_path: Path):
-    # The bible is the primary allowlist source: its character entry "R.D.T."
-    # must let the translation keep the source initials.
+def test_b5_mixed_script_unblocked_by_book_memory(tmp_path: Path):
+    # book_memory.json is the primary bible source (V4_MVP_SPEC_RU.md §6:
+    # персонажи/факты/address register/voice notes): its character entry
+    # "R.D.T." must let the translation keep the source initials. Changing
+    # book_memory content changes book_memory_hash, so cache/resume is
+    # invalidated by the existing snapshot identity (no new hash needed).
     cfg = _marker_cfg(tmp_path)
-    (cfg.memory_dir / "book_bible.json").write_text(json.dumps({
-        "version": 1,
-        "characters": {"R.D.T.": {"target": "Р.Д.Т.", "gender": "male"}},
-        "entities": {}, "address_register": [], "facts": [], "chapters": [],
+    (cfg.memory_dir / "book_memory.json").write_text(json.dumps({
+        "R.D.T.": {"target": "Р.Д.Т.", "gender": "male"},
+        "Blake": {"target": "Блэйк", "gender": "male"},
     }), encoding="utf-8")
     result = _run_with_caller(cfg, MarkerModelCaller(marker="R.D.T."))
     assert result.selected_count == 1

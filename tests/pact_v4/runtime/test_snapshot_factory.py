@@ -110,43 +110,15 @@ def test_chapter_memory_from_directory_handles_missing_files(tmp_path):
     assert memory.source_dir == tmp_path
 
 
-def test_build_snapshot_changes_identity_when_book_bible_changes():
+
+def test_chapter_memory_from_directory_handles_null_book_memory(tmp_path):
+    # A book_memory.json containing JSON null loads as None (pre-existing
+    # _load_json tolerance); build_snapshot and the B5 allowlist builders
+    # must both handle it (None == empty memory).
+    (tmp_path / "book_memory.json").write_text("null", encoding="utf-8")
+    memory = ChapterMemory.from_directory(tmp_path)
+    assert memory.book_memory is None
     blocks = [_block("p00001", "Only.", index=0)]
     source = build_source_artifact(chapter_id="ch046", blocks=blocks)
-    no_bible = build_snapshot(
-        chapter_id="ch046", source=source,
-        memory=ChapterMemory(glossary={}, book_memory={}),
-    )
-    with_bible = build_snapshot(
-        chapter_id="ch046", source=source,
-        memory=ChapterMemory(
-            glossary={}, book_memory={},
-            book_bible={"characters": {"R.D.T.": {"target": "Р.Д.Т."}}},
-        ),
-    )
-    # Changing the book bible changes the snapshot identity -> cache/resume
-    # invalidation for the mixed_script allowlist (V4 B5, task card §7).
-    assert no_bible.snapshot_hash != with_bible.snapshot_hash
-    # Runs without a bible keep the historical book_memory_hash shape.
-    assert no_bible.book_memory_hash == canonical_json_hash({})
-    # Once a bible is present, its content is part of book_memory_hash.
-    assert with_bible.book_memory_hash == canonical_json_hash({
-        "book_memory": {},
-        "book_bible": {"characters": {"R.D.T.": {"target": "Р.Д.Т."}}},
-    })
-
-
-def test_chapter_memory_from_directory_loads_book_bible(tmp_path):
-    (tmp_path / "book_bible.json").write_text(
-        json.dumps({"characters": {"R.D.T.": {"target": "Р.Д.Т."}}}),
-        encoding="utf-8",
-    )
-    memory = ChapterMemory.from_directory(tmp_path)
-    assert memory.book_bible == {
-        "characters": {"R.D.T.": {"target": "Р.Д.Т."}},
-    }
-
-
-def test_chapter_memory_from_directory_missing_book_bible_is_empty(tmp_path):
-    memory = ChapterMemory.from_directory(tmp_path)
-    assert memory.book_bible == {}
+    snapshot = build_snapshot(chapter_id="ch046", source=source, memory=memory)
+    assert snapshot.book_memory_hash == canonical_json_hash({})

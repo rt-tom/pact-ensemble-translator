@@ -147,14 +147,15 @@ def find_mixed_script(text: str, allow: Iterable[str] = ()) -> List[str]:
 #
 # ``find_mixed_script`` compares casefolded *tokens* against the allowlist.
 # The B5 allowlist is the union of tokens derived from four sources: the book
-# bible (``book_bible.json``), the glossary (``glossary.json``), the source
-# text itself (source-derived: a Latin token present in both the source and
-# the translation is legitimate), and the manual ``deterministic_mixed_script_allow``
-# config override. The builders below produce exactly the token shape
-# ``find_mixed_script`` matches against, so a bible/glossary entry like
-# "R.D.T." contributes the tokens ``R``/``D``/``T`` and unblocks legitimate
-# Latin initials in the translation. Pure and stateless: no model calls, no
-# disk I/O (the runner loads the JSON files).
+# memory (``book_memory.json`` — the bible facts, per V4_MVP_SPEC_RU.md §6),
+# the glossary (``glossary.json``), the source text itself (source-derived: a
+# Latin token present in both the source and the translation is legitimate),
+# and the manual ``deterministic_mixed_script_allow`` config override. The
+# builders below produce exactly the token shape ``find_mixed_script`` matches
+# against, so a bible/glossary entry like "R.D.T." contributes the tokens
+# ``R``/``D``/``T`` and unblocks legitimate Latin initials in the translation.
+# Pure and stateless: no model calls, no disk I/O (the runner loads the JSON
+# files).
 
 
 def extract_script_tokens(text: str) -> Tuple[str, ...]:
@@ -204,50 +205,68 @@ def combine_script_tokens(*groups: Iterable[str]) -> Tuple[str, ...]:
     return tuple(result)
 
 
-def _bible_term_strings(bible: Any) -> List[str]:
-    """Collect the source-term strings carried by a book-bible structure.
+_BIBLE_SECTIONS = ("characters", "entities", "terms", "address_register", "facts", "chapters")
 
-    Tolerant of both the v3 ``book_bible.json`` shape — ``characters`` /
-    ``entities`` / ``terms`` as ``{source_term: entry}`` dicts, plus
-    ``address_register`` / ``facts`` / ``chapters`` as lists of dicts or
-    strings — and a list-of-dicts variant.
+
+def _bible_term_strings(bible: Any) -> List[str]:
+    """Collect the source-term strings carried by a bible/memory structure.
+
+    Tolerant of both shapes in use:
+
+    * v4 ``book_memory.json`` (V4_MVP_SPEC_RU.md §6 — персонажи, факты,
+      отношения, address register, voice notes): a flat ``{term: ...}``
+      dict keyed by entity/character name — the dict keys are the terms;
+    * the v3 ``book_bible.json`` / chapter-bible sectioned shape —
+      ``characters``/``entities``/``terms`` as ``{source_term: entry}``
+      dicts (or lists of dicts), plus ``address_register``/``facts``/
+      ``chapters`` as lists of dicts or strings.
+
+    A flat dict is only treated as a term map when no sectioned key is
+    present (a sectioned bible is parsed section-by-section so meta keys
+    like ``version`` are not mistaken for terms).
     """
     terms: List[str] = []
     if not isinstance(bible, dict):
         return terms
-    for section in ("characters", "entities", "terms"):
-        entries = bible.get(section)
-        if isinstance(entries, dict):
-            terms.extend(str(key) for key in entries.keys())
-        elif isinstance(entries, list):
+    if any(section in bible for section in _BIBLE_SECTIONS):
+        for section in ("characters", "entities", "terms"):
+            entries = bible.get(section)
+            if isinstance(entries, dict):
+                terms.extend(str(key) for key in entries.keys())
+            elif isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        for key in ("source", "english", "name", "term"):
+                            value = entry.get(key)
+                            if isinstance(value, str):
+                                terms.append(value)
+        for section in ("address_register", "facts", "chapters"):
+            entries = bible.get(section)
+            if not isinstance(entries, list):
+                continue
             for entry in entries:
                 if isinstance(entry, dict):
                     for key in ("source", "english", "name", "term"):
                         value = entry.get(key)
                         if isinstance(value, str):
                             terms.append(value)
-    for section in ("address_register", "facts", "chapters"):
-        entries = bible.get(section)
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if isinstance(entry, dict):
-                for key in ("source", "english", "name", "term"):
-                    value = entry.get(key)
-                    if isinstance(value, str):
-                        terms.append(value)
-            elif isinstance(entry, str):
-                terms.append(entry)
+                elif isinstance(entry, str):
+                    terms.append(entry)
+    else:
+        terms.extend(str(key) for key in bible.keys())
     return terms
 
 
 def bible_script_tokens(bible: Any) -> Tuple[str, ...]:
-    """Latin script tokens from a book bible (``book_bible.json``).
+    """Latin script tokens from the book-memory / book-bible content.
 
-    A term is added to the allowlist only when it contains Latin characters
-    (e.g. ``"R.D.T."``, ``"Dr."``, ``"Mr."``); it is then tokenized into the
-    exact tokens ``find_mixed_script`` matches. Pure Cyrillic terms
-    contribute nothing (they cannot trip the mixed-script check).
+    The runner feeds this the frozen ``book_memory`` (v4 memory, per
+    V4_MVP_SPEC_RU.md §6); it also accepts the v3 ``book_bible.json``
+    sectioned shape. A term is added to the allowlist only when it contains
+    Latin characters (e.g. ``"R.D.T."``, ``"Dr."``, ``"Mr."``); it is then
+    tokenized into the exact tokens ``find_mixed_script`` matches. Pure
+    Cyrillic terms contribute nothing (they cannot trip the mixed-script
+    check).
     """
     tokens: List[str] = []
     for term in _bible_term_strings(bible):

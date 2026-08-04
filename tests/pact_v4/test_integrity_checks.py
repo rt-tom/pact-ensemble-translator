@@ -40,8 +40,24 @@ def test_extract_script_tokens_strips_urls_and_emails():
     assert "user" not in tokens
 
 
-def test_bible_script_tokens_characters_and_entities():
+def test_bible_script_tokens_flat_book_memory_shape():
+    # V4 book_memory.json is a flat {term: observations} map (V4_MVP_SPEC_RU.md
+    # §6 — персонажи/факты/address register/voice notes); the dict keys are
+    # the terms.
+    book_memory = {
+        "R.D.T.": {"target": "Р.Д.Т.", "gender": "male"},
+        "Dr.": {"target": "доктор"},
+        "GPS": {"target": "GPS"},
+    }
+    tokens = set(bible_script_tokens(book_memory))
+    assert {"R", "D", "T", "Dr", "GPS"} <= tokens
+
+
+def test_bible_script_tokens_sectioned_v3_shape():
+    # The v3 book_bible.json / chapter-bible sectioned shape is also accepted
+    # (so the same parser works for the B7 import later).
     bible = {
+        "version": 1,
         "characters": {
             "R.D.T.": {"target": "Р.Д.Т.", "gender": "male"},
             "Dr.": {"target": "доктор"},
@@ -53,13 +69,15 @@ def test_bible_script_tokens_characters_and_entities():
     }
     tokens = set(bible_script_tokens(bible))
     assert {"R", "D", "T", "Dr", "GPS", "Mr", "Thorburn", "Fray"} <= tokens
+    # Sectioned meta keys are not mistaken for terms.
+    assert "version" not in {t.casefold() for t in bible_script_tokens(bible)}
 
 
 def test_bible_script_tokens_ignores_cyrillic_only_terms():
-    assert bible_script_tokens({"characters": {"Мэри": {}}, "entities": {}}) == ()
+    assert bible_script_tokens({"Мэри": {}}) == ()
 
 
-def test_bible_script_tokens_tolerates_missing_sections():
+def test_bible_script_tokens_tolerates_missing_sections_and_none():
     assert bible_script_tokens({}) == ()
     assert bible_script_tokens({"characters": {}, "entities": {}}) == ()
     assert bible_script_tokens(None) == ()

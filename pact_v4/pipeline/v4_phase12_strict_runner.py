@@ -1405,15 +1405,18 @@ def run_chapter_strict(
     )
     gen_cache = GenerationCache()
     # B5 mixed_script-политика (V4_B5_MIXED_SCRIPT_POLICY_TASK_RU.md):
-    # combined allowlist = bible + glossary + source-derived + manual config.
-    # The static part (bible/glossary/manual) is derived once; the
-    # source-derived part is per-text (tokens present in BOTH the source and
-    # the translation under check), so per-chunk and per-phase det_data are
-    # built from this base below. Manual config entries are tokenized the same
-    # way as bible/glossary entries, so an entry like "R.D.T." unblocks the
-    # tokens R/D/T that ``find_mixed_script`` actually sees.
+    # combined allowlist = book_memory + glossary + source-derived + manual
+    # config. The static part (book_memory/glossary/manual) is derived once;
+    # the source-derived part is per-text (tokens present in BOTH the source
+    # and the translation under check), so per-chunk and per-phase det_data
+    # are built from this base below. The bible source is the v4
+    # ``book_memory`` (per V4_MVP_SPEC_RU.md §6 characters/facts/address
+    # register/voice notes; the task card's "book_bible.json" was a naming
+    # error — a real v4 book_bible is a B7 concern). Manual config entries are
+    # tokenized the same way as book_memory/glossary entries, so an entry like
+    # "R.D.T." unblocks the tokens R/D/T that ``find_mixed_script`` sees.
     static_allow = combine_script_tokens(
-        bible_script_tokens(memory.book_bible or {}),
+        bible_script_tokens(memory.book_memory),
         glossary_script_tokens(memory.glossary),
         extract_script_tokens(" ".join(cfg.deterministic_mixed_script_allow)),
     )
@@ -1886,7 +1889,7 @@ def run_chapter_strict(
         },
         "mixed_script_policy": {
             "sources": {
-                "bible": list(bible_script_tokens(memory.book_bible or {})),
+                "book_memory": list(bible_script_tokens(memory.book_memory)),
                 "glossary": list(glossary_script_tokens(memory.glossary)),
                 "manual": list(cfg.deterministic_mixed_script_allow),
                 "source_derived_chapter": list(

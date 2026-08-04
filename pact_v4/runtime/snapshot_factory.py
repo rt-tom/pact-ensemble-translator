@@ -59,24 +59,18 @@ def _load_json(path: Path | str, default: Any = None) -> Any:
 
 @dataclass(frozen=True)
 class ChapterMemory:
-    """Glossary + book-memory + book-bible state the driver hands into
-    ``build_snapshot``.
+    """Glossary + book-memory state the driver hands into ``build_snapshot``.
 
     ``glossary`` and ``book_memory`` are stored as raw JSON-compatible
     structures (the same data the v3 production pipeline reads from
-    ``glossary/established.json`` + ``book_memory.json``). ``book_bible`` is
-    the v3 ``book_bible.json`` (characters/entities/terms + facts): it is a
-    memory input (V4 B5 reads its Latin terms into the mixed_script
-    allowlist), so it must be part of the snapshot identity — changing it
-    invalidates cache/resume exactly like a glossary/source change. The
-    hashes the library cares about are computed from these contents at
-    snapshot time, not from the file paths, so the memory identities move
-    with the data even if the file location changes.
+    ``glossary/established.json`` + ``book_memory.json``). The hashes the
+    library cares about are computed from these contents at snapshot time,
+    not from the file paths, so the memory identities move with the data
+    even if the file location changes.
     """
 
     glossary: Any
     book_memory: Any
-    book_bible: Any = None
     chapter_memory: Any = None
     # Optional provenance: where the memory was loaded from. Recorded into
     # the returned ``Snapshot.context`` for human-readable provenance but
@@ -90,17 +84,15 @@ class ChapterMemory:
         *,
         chapter_memory: Optional[Any] = None,
     ) -> "ChapterMemory":
-        """Load glossary/book_memory/book_bible from ``<base_dir>/glossary.json``,
-        ``<base_dir>/book_memory.json`` and ``<base_dir>/book_bible.json``
-        (the same on-disk format the v3 production pipeline uses). All three
-        are optional: a missing file loads as ``{}`` (empty memory).
+        """Load glossary/book_memory from ``<base_dir>/glossary.json`` and
+        ``<base_dir>/book_memory.json`` (the same on-disk format the v3
+        production pipeline uses, via ``MemoryManager``'s file paths).
         """
         base = Path(base_dir)
         manager = MemoryManager(str(base))
         return cls(
             glossary=_load_json(manager.glossary_path, {}),
             book_memory=_load_json(manager.book_memory_path, {}),
-            book_bible=_load_json(base / "book_bible.json", {}),
             chapter_memory=chapter_memory,
             source_dir=base,
         )
@@ -141,19 +133,7 @@ def build_snapshot(
     """
     pids = tuple(pid for pid, _ in source.source)
     glossary_hash = _hash_canonical_json(memory.glossary)
-    # The book bible is a memory input (V4 B5 reads its Latin terms into the
-    # mixed_script allowlist), so its content is part of the snapshot
-    # identity. Runs without a bible keep the historical book_memory_hash
-    # (empty memory stays byte-identical to pre-B5 runs); once a bible is
-    # present its content is hashed together with book_memory.
-    book_bible = memory.book_bible or {}
-    if book_bible:
-        book_memory_hash = _hash_canonical_json({
-            "book_memory": memory.book_memory,
-            "book_bible": book_bible,
-        })
-    else:
-        book_memory_hash = _hash_canonical_json(memory.book_memory)
+    book_memory_hash = _hash_canonical_json(memory.book_memory)
     chapter_memory_hash = _hash_canonical_json(
         memory.chapter_memory if memory.chapter_memory is not None else {}
     )
