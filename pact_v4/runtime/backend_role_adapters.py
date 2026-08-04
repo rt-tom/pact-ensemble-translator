@@ -34,6 +34,10 @@ from pact_v4.runtime.backend_protocol import (
     Message,
 )
 from pact_v4.runtime.gemma_selector import _parse_gemma_preference
+from pact_v4.runtime.json_resilience import (
+    JsonRetryPolicy,
+    retry_json_call,
+)
 from pact_v4.runtime.prompts_runtime import (
     FORMAT_SPANS_V1,
     GEMMA_AUDIT_V1,
@@ -273,11 +277,16 @@ class BackendQwenAuditEvaluatorConfig:
     would otherwise surface as a spurious fidelity objection. Per-PID
     headroom is added on top exactly like the fidelity gate
     (``TOKENS_PER_PID``), capped at ``MAX_TOKENS_CEILING``.
+
+    ``retry`` is the B4 JSON-resilience policy: an empty/truncated JSON body
+    is retried (bounded, exponential backoff) by re-issuing the identical
+    request — transport failures are never retried here (B4 §1/§3).
     """
 
     max_tokens: int = 16384
     template: ReviewerPrompt = QWEN_AUDIT_V1
     label: str = "phase3/qwen_chapter_audit"
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendQwenAuditEvaluator:
@@ -290,6 +299,14 @@ class BackendQwenAuditEvaluator:
     ``CompletionError`` — ``run_chapter_audit`` converts any exception into a
     failed (resumable) unit, so the audit can never claim ``complete`` on a
     model failure.
+
+    B4 (JSON resilience): an empty or truncated-JSON body is retried
+    (``config.retry``, bounded + exponential backoff) by re-issuing the
+    identical request — identity is unchanged by a retry. Transport failures
+    are never retried here. When the budget is exhausted the last
+    ``EmptyResponseError``/``TruncatedJSONError`` is re-raised, which
+    ``run_chapter_audit`` records as a failed unit — never a semantic
+    verdict.
     """
 
     def __init__(
@@ -331,12 +348,20 @@ class BackendQwenAuditEvaluator:
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
-        try:
-            response = self._backend.complete(request)
-        except CompletionError as exc:
-            LOG.error("BackendQwenAuditEvaluator: backend failure: %s", exc)
-            raise
-        return response.text
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity and never enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendQwenAuditEvaluator: backend failure: %s", exc)
+                raise
+
+        return retry_json_call(
+            _complete, self._config.retry, label=self._config.label,
+        )
 
 
 @dataclass(frozen=True)
@@ -402,11 +427,16 @@ class BackendRepairCallerConfig:
     headroom (same Qwen fix as the fidelity gate) so a long repaired PID is
     not truncated mid-JSON — a truncation would otherwise surface as a
     spurious repair failure instead of a transport/format problem.
+
+    ``retry`` is the B4 JSON-resilience policy: a truncated-JSON repair body
+    is retried (bounded, exponential backoff) by re-issuing the identical
+    request — transport failures are never retried here (B4 §2/§3).
     """
 
     max_tokens: int = 16384
     template: ReviewerPrompt = REPAIR_REGION_V1
     label: str = "phase4/region_repair"
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class BackendRepairCaller:
@@ -421,6 +451,14 @@ class BackendRepairCaller:
     converts it into a non-committed/debt outcome, never a semantic
     terminal status (rule "transport failure != semantic gate failure";
     no silent fallback).
+
+    B4 (JSON resilience): a truncated-JSON repair body is retried
+    (``config.retry``, bounded + exponential backoff) by re-issuing the
+    identical request — identity is unchanged by a retry. Transport failures
+    are never retried here. When the budget is exhausted the last
+    ``EmptyResponseError``/``TruncatedJSONError`` is re-raised, which the
+    repair layer converts into a non-committed/debt outcome — never a
+    semantic verdict.
     """
 
     def __init__(
@@ -465,12 +503,21 @@ class BackendRepairCaller:
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
-        try:
-            response = self._backend.complete(request)
-        except CompletionError as exc:
-            LOG.error("BackendRepairCaller: backend failure: %s", exc)
-            raise
-        return response.text
+
+        def _complete() -> str:
+            # Re-issues the identical request on a retry: same prompt, same
+            # model/backend, same request_options (none) — so retry never
+            # changes cache/resume identity (B2 backend identity) and never
+            # enables reasoning (B1).
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendRepairCaller: backend failure: %s", exc)
+                raise
+
+        return retry_json_call(
+            _complete, self._config.retry, label=self._config.label,
+        )
 
 
 @dataclass(frozen=True)
