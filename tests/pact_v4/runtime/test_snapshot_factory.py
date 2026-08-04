@@ -108,3 +108,17 @@ def test_chapter_memory_from_directory_handles_missing_files(tmp_path):
     assert memory.glossary == {}
     assert memory.book_memory == {}
     assert memory.source_dir == tmp_path
+
+
+
+def test_chapter_memory_from_directory_handles_null_book_memory(tmp_path):
+    # A book_memory.json containing JSON null loads as None (pre-existing
+    # _load_json tolerance); build_snapshot and the B5 allowlist builders
+    # must both handle it (None == empty memory).
+    (tmp_path / "book_memory.json").write_text("null", encoding="utf-8")
+    memory = ChapterMemory.from_directory(tmp_path)
+    assert memory.book_memory is None
+    blocks = [_block("p00001", "Only.", index=0)]
+    source = build_source_artifact(chapter_id="ch046", blocks=blocks)
+    snapshot = build_snapshot(chapter_id="ch046", source=source, memory=memory)
+    assert snapshot.book_memory_hash == canonical_json_hash({})

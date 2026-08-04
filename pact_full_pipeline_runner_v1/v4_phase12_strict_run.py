@@ -124,6 +124,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8094)
     p.add_argument("--max-consecutive-nonselections", type=int, default=3)
+    p.add_argument("--mixed-script-allow", action="append", default=None,
+                    metavar="ENTRY",
+                    help="B5 manual mixed_script allowlist entry (repeatable). "
+                         "Entries are tokenized like bible/glossary entries, so "
+                         "'R.D.T.' unblocks the tokens R/D/T; 'Blake' unblocks "
+                         "'Blake'. The combined allowlist is "
+                         "bible + glossary + source-derived + this manual set.")
     p.add_argument("--startup-timeout", type=float, default=240.0)
     p.add_argument("--unload-timeout", type=float, default=30.0)
     p.add_argument("--runtime-config", type=Path, default=None, metavar="FILE",
@@ -263,6 +270,7 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
         out_dir=args.out_dir, backend=backend,
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
+        deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
         run_label="v4-phase12-strict-chapter-trial",
     )
 

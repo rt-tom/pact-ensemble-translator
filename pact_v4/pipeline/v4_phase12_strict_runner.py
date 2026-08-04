@@ -63,7 +63,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -129,6 +129,13 @@ from pact_v4.runtime.snapshot_factory import (
     build_config_artifact,
     build_snapshot,
     build_source_artifact,
+)
+from pact_v4._integrity_checks import (
+    bible_script_tokens,
+    combine_script_tokens,
+    extract_script_tokens,
+    glossary_script_tokens,
+    source_derived_allowlist,
 )
 
 LOG = logging.getLogger(__name__)
@@ -210,6 +217,10 @@ class StrictRunConfig:
                     "max_incidents": self.max_formatting_incidents,
                     "policy_version": self.formatting_policy_version,
                 },
+                # B5 mixed_script-политика: the manual allowlist is a gate-policy
+                # input, so it is part of the run's config identity — changing it
+                # invalidates cache/resume exactly like a memory/source change.
+                "deterministic_mixed_script_allow": list(self.deterministic_mixed_script_allow),
             },
         )
 
@@ -1393,10 +1404,26 @@ def run_chapter_strict(
         temperature=cfg.temperature, seed=cfg.seed, max_tokens=cfg.max_tokens,
     )
     gen_cache = GenerationCache()
-    det_data = DeterministicGateData(
+    # B5 mixed_script-политика (V4_B5_MIXED_SCRIPT_POLICY_TASK_RU.md):
+    # combined allowlist = book_memory + glossary + source-derived + manual
+    # config. The static part (book_memory/glossary/manual) is derived once;
+    # the source-derived part is per-text (tokens present in BOTH the source
+    # and the translation under check), so per-chunk and per-phase det_data
+    # are built from this base below. The bible source is the v4
+    # ``book_memory`` (per V4_MVP_SPEC_RU.md §6 characters/facts/address
+    # register/voice notes; the task card's "book_bible.json" was a naming
+    # error — a real v4 book_bible is a B7 concern). Manual config entries are
+    # tokenized the same way as book_memory/glossary entries, so an entry like
+    # "R.D.T." unblocks the tokens R/D/T that ``find_mixed_script`` sees.
+    static_allow = combine_script_tokens(
+        bible_script_tokens(memory.book_memory),
+        glossary_script_tokens(memory.glossary),
+        extract_script_tokens(" ".join(cfg.deterministic_mixed_script_allow)),
+    )
+    det_data_base = DeterministicGateData(
         glossary_terms=cfg.deterministic_glossary_terms,
         names=cfg.deterministic_names,
-        mixed_script_allow=cfg.deterministic_mixed_script_allow,
+        mixed_script_allow=static_allow,
     )
 
     halted_early = False
@@ -1493,10 +1520,30 @@ def run_chapter_strict(
                     continue
 
                 candidates: List[Candidate] = list(outcome.candidates.values())
+                # B5: chunk-scoped source-derived allowlist. A Latin token in
+                # the candidate translation that also appears in this chunk's
+                # source is legitimate (e.g. source initials "R.D.T." preserved
+                # in the translation); the union over the chunk's candidates
+                # gives exactly "in source AND in translation" for every
+                # checked candidate without loosening the gate for tokens that
+                # never appear in the source.
+                chunk_source_text = " ".join(
+                    source_map[pid] for pid in plan_chunk.pids if pid in source_map
+                )
+                candidate_union_text = " ".join(
+                    text for cand in candidates for _, text in cand.translation
+                )
+                det_data_chunk = replace(
+                    det_data_base,
+                    mixed_script_allow=combine_script_tokens(
+                        static_allow,
+                        source_derived_allowlist(chunk_source_text, candidate_union_text),
+                    ),
+                )
                 try:
                     result: SelectionResult = select_candidate(
                         chunk_id=plan_chunk.chunk_id, candidates=candidates, source=source,
-                        qwen_evaluator=qwen_evaluator, det_data=det_data,
+                        qwen_evaluator=qwen_evaluator, det_data=det_data_chunk,
                         gemma_selector=gemma_selector,
                     )
                 except Exception as exc:  # noqa: BLE001 -- see run_chapter's identical handling
@@ -1642,13 +1689,37 @@ def run_chapter_strict(
         cfg.out_dir, selection_records,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config,
     )
+    # B5: whole-chapter source-derived allowlist for the Step 6 audit / Step 7
+    # repair. The assembled chapter is built from the committed selections and
+    # the quarantined chunks' best-variants, which are all carried by the
+    # merged generation records (and, for a resumed session, the committed
+    # translations). Unioning all candidate translations gives exactly "in
+    # source AND in translation" for every token the audit/repair actually
+    # checks, without loosening the gate for tokens that never appear in the
+    # source.
+    det_data_full = replace(
+        det_data_base,
+        mixed_script_allow=combine_script_tokens(
+            static_allow,
+            source_derived_allowlist(
+                " ".join(text for _, text in source.source),
+                " ".join(
+                    text
+                    for rec in merged_generation_records
+                    for variant in rec.get("candidates", {}).values()
+                    for _pid, text in variant.get("translation", {}).items()
+                )
+                + " " + " ".join(final_text_by_pid.values()),
+            ),
+        ),
+    )
     events_before_step6 = runtime.event_count()
     step6: Dict[str, Any]
     phase4_inputs: Optional[Dict[str, Any]] = None
     try:
         step6, phase4_inputs = _run_step6_audit(
             cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-            config=config, det_data=det_data, selection_records=merged_selection_records,
+            config=config, det_data=det_data_full, selection_records=merged_selection_records,
             selected_text_by_chunk=selected_text_by_chunk,
             generation_records=merged_generation_records,
             qwen_audit_evaluator=qwen_audit_evaluator,
@@ -1708,7 +1779,7 @@ def run_chapter_strict(
         try:
             step7 = _run_step7_repair(
                 cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-                config=config, det_data=det_data, phase4_inputs=phase4_inputs,
+                config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
                 repair_adapters=repair_adapters,
                 backend_identity_hash=cfg.backend.identity_hash,
                 backend_identity_hashes=acceptable_backend_hashes,
@@ -1815,6 +1886,25 @@ def run_chapter_strict(
         },
         "operational_policy": {
             "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
+        },
+        "mixed_script_policy": {
+            "sources": {
+                "book_memory": list(bible_script_tokens(memory.book_memory)),
+                "glossary": list(glossary_script_tokens(memory.glossary)),
+                "manual": list(cfg.deterministic_mixed_script_allow),
+                "source_derived_chapter": list(
+                    source_derived_allowlist(
+                        " ".join(text for _, text in source.source),
+                        " ".join(
+                            text
+                            for rec in merged_generation_records
+                            for variant in rec.get("candidates", {}).values()
+                            for _pid, text in variant.get("translation", {}).items()
+                        ),
+                    )
+                ),
+            },
+            "combined_static_allow": list(static_allow),
         },
         "resumed_from_index": resumed_from_index,
         "halted_early": halted_early,

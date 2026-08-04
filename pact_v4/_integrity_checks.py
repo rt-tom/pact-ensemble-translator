@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 __all__ = [
     "extract_digits",
@@ -28,6 +28,11 @@ __all__ = [
     "combine_glossary_terms",
     "strip_inline_markup",
     "RU_DIGIT_EQUIVALENTS",
+    "extract_script_tokens",
+    "combine_script_tokens",
+    "bible_script_tokens",
+    "glossary_script_tokens",
+    "source_derived_allowlist",
 ]
 
 _URL_OR_EMAIL_RE = re.compile(
@@ -134,6 +139,194 @@ def find_mixed_script(text: str, allow: Iterable[str] = ()) -> List[str]:
         seen.add(folded)
         result.append(token)
     return result
+
+
+# ---------------------------------------------------------------------------
+# mixed_script allowlist builders (V4 B5, mixed_script-политика)
+# ---------------------------------------------------------------------------
+#
+# ``find_mixed_script`` compares casefolded *tokens* against the allowlist.
+# The B5 allowlist is the union of tokens derived from four sources: the book
+# memory (``book_memory.json`` — the bible facts, per V4_MVP_SPEC_RU.md §6),
+# the glossary (``glossary.json``), the source text itself (source-derived: a
+# Latin token present in both the source and the translation is legitimate),
+# and the manual ``deterministic_mixed_script_allow`` config override. The
+# builders below produce exactly the token shape ``find_mixed_script`` matches
+# against, so a bible/glossary entry like "R.D.T." contributes the tokens
+# ``R``/``D``/``T`` and unblocks legitimate Latin initials in the translation.
+# Pure and stateless: no model calls, no disk I/O (the runner loads the JSON
+# files).
+
+
+def extract_script_tokens(text: str) -> Tuple[str, ...]:
+    """Latin-script tokens from ``text``, using the same tokenization as
+    ``find_mixed_script`` (URLs/emails removed first).
+
+    Returns case-insensitively unique tokens in first-seen order. Tokens with
+    no Latin letters (pure Cyrillic) are dropped, matching the mixed-script
+    check's own filter. The B5 allowlist is built from these tokens so that
+    an entry like ``"R.D.T."`` yields the tokens ``R``/``D``/``T`` that the
+    check actually sees in a translated paragraph.
+    """
+    cleaned = _URL_OR_EMAIL_RE.sub(" ", text or "")
+    result: List[str] = []
+    seen: set = set()
+    for token in _SCRIPT_TOKEN_RE.findall(cleaned):
+        if not re.search(r"[A-Za-z]", token):
+            continue
+        folded = token.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        result.append(token)
+    return tuple(result)
+
+
+def combine_script_tokens(*groups: Iterable[str]) -> Tuple[str, ...]:
+    """Union of token groups, case-insensitively deduplicated.
+
+    ``find_mixed_script`` casefolds both the allowlist and the target tokens,
+    so case differences between sources do not matter; the first-seen original
+    form is kept. Order is deterministic (stable), which keeps the value
+    reproducible for config/snapshot identity.
+    """
+    result: List[str] = []
+    seen: set = set()
+    for group in groups:
+        for token in group or ():
+            token = _norm(token)
+            if not token:
+                continue
+            folded = token.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            result.append(token)
+    return tuple(result)
+
+
+_BIBLE_SECTIONS = ("characters", "entities", "terms", "address_register", "facts", "chapters")
+
+
+def _bible_term_strings(bible: Any) -> List[str]:
+    """Collect the source-term strings carried by a bible/memory structure.
+
+    Tolerant of both shapes in use:
+
+    * v4 ``book_memory.json`` (V4_MVP_SPEC_RU.md §6 — персонажи, факты,
+      отношения, address register, voice notes): a flat ``{term: ...}``
+      dict keyed by entity/character name — the dict keys are the terms;
+    * the v3 ``book_bible.json`` / chapter-bible sectioned shape —
+      ``characters``/``entities``/``terms`` as ``{source_term: entry}``
+      dicts (or lists of dicts), plus ``address_register``/``facts``/
+      ``chapters`` as lists of dicts or strings.
+
+    A flat dict is only treated as a term map when no sectioned key is
+    present (a sectioned bible is parsed section-by-section so meta keys
+    like ``version`` are not mistaken for terms).
+    """
+    terms: List[str] = []
+    if not isinstance(bible, dict):
+        return terms
+    if any(section in bible for section in _BIBLE_SECTIONS):
+        for section in ("characters", "entities", "terms"):
+            entries = bible.get(section)
+            if isinstance(entries, dict):
+                terms.extend(str(key) for key in entries.keys())
+            elif isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        for key in ("source", "english", "name", "term"):
+                            value = entry.get(key)
+                            if isinstance(value, str):
+                                terms.append(value)
+        for section in ("address_register", "facts", "chapters"):
+            entries = bible.get(section)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    for key in ("source", "english", "name", "term"):
+                        value = entry.get(key)
+                        if isinstance(value, str):
+                            terms.append(value)
+                elif isinstance(entry, str):
+                    terms.append(entry)
+    else:
+        terms.extend(str(key) for key in bible.keys())
+    return terms
+
+
+def bible_script_tokens(bible: Any) -> Tuple[str, ...]:
+    """Latin script tokens from the book-memory / book-bible content.
+
+    The runner feeds this the frozen ``book_memory`` (v4 memory, per
+    V4_MVP_SPEC_RU.md §6); it also accepts the v3 ``book_bible.json``
+    sectioned shape. A term is added to the allowlist only when it contains
+    Latin characters (e.g. ``"R.D.T."``, ``"Dr."``, ``"Mr."``); it is then
+    tokenized into the exact tokens ``find_mixed_script`` matches. Pure
+    Cyrillic terms contribute nothing (they cannot trip the mixed-script
+    check).
+    """
+    tokens: List[str] = []
+    for term in _bible_term_strings(bible):
+        term = _norm(term)
+        if term and re.search(r"[A-Za-z]", term):
+            tokens.extend(extract_script_tokens(term))
+    return combine_script_tokens(tokens)
+
+
+def glossary_script_tokens(glossary: Any) -> Tuple[str, ...]:
+    """Latin script tokens from a glossary (``glossary.json``).
+
+    Accepts the same shapes as ``_shared_runner_helpers._glossary_entries``:
+    a ``{source_term: target | [target, ...]}`` dict or a list of
+    ``{"source_term"/"source": ..., "target_terms"/"target": ...}`` dicts.
+    Both the source term and its established target form(s) are scanned, so
+    an entry whose established form retains Latin (``"GPS" -> "GPS"``) lets
+    the translation keep that Latin legitimately.
+    """
+    terms: List[str] = []
+    if isinstance(glossary, dict):
+        items = list(glossary.items())
+    elif isinstance(glossary, list):
+        items = []
+        for entry in glossary:
+            if isinstance(entry, dict):
+                source = entry.get("source_term") or entry.get("source")
+                target = entry.get("target_terms") or entry.get("target")
+                if source is not None and target is not None:
+                    items.append((source, target))
+    else:
+        items = []
+    for source_term, target in items:
+        terms.append(str(source_term))
+        if isinstance(target, str):
+            terms.append(target)
+        elif isinstance(target, (list, tuple)):
+            terms.extend(str(item) for item in target if item)
+    tokens: List[str] = []
+    for term in terms:
+        term = _norm(term)
+        if term and re.search(r"[A-Za-z]", term):
+            tokens.extend(extract_script_tokens(term))
+    return combine_script_tokens(tokens)
+
+
+def source_derived_allowlist(source_text: str, translation_text: str) -> Tuple[str, ...]:
+    """Latin tokens present in BOTH the source text and the translation text.
+
+    This is the B5 source-derived rule: a Latin token that appears in the
+    source and is preserved in the translation is legitimate (e.g. the
+    initials ``"R.D.T."``), so it is added to the allowlist. A Latin token in
+    the translation that never appears in the source remains unallowlisted
+    and is still flagged by ``find_mixed_script``.
+    """
+    source_folded = {token.casefold() for token in extract_script_tokens(source_text)}
+    translated = extract_script_tokens(translation_text)
+    return combine_script_tokens(
+        token for token in translated if token.casefold() in source_folded
+    )
 
 
 _RU_ENDINGS = sorted({
