@@ -77,7 +77,11 @@ class JsonRetryPolicy:
     base_delay_seconds: float = 1.0
 
     def __post_init__(self) -> None:
-        if int(self.max_retries) != self.max_retries or self.max_retries < 0:
+        if (
+            isinstance(self.max_retries, bool)
+            or not isinstance(self.max_retries, int)
+            or self.max_retries < 0
+        ):
             raise ValueError("JsonRetryPolicy: max_retries must be a non-negative int")
         if self.base_delay_seconds < 0:
             raise ValueError(
@@ -128,6 +132,11 @@ def retry_json_call(
     times with exponential backoff; when the budget is exhausted the last
     ``EmptyResponseError`` / ``TruncatedJSONError`` is re-raised so the caller
     records a failed unit (audit) or debt (repair) — never a semantic verdict.
+
+    Logging: a retry-trigger event (a transient, self-healing blip) is logged
+    at ``INFO`` so a healthy run is not noisy; only budget exhaustion is
+    logged at ``WARNING`` (the raised error also carries the detail into the
+    failed-unit / debt record).
     """
     attempt = 0
     while True:
@@ -136,11 +145,15 @@ def retry_json_call(
             classify_response_text(raw)
         except _RETRYABLE as exc:  # type: ignore[arg-type]
             if attempt >= policy.max_retries:
+                LOG.warning(
+                    "%s: JSON retry budget exhausted (%s) after %d attempts; "
+                    "recording failed unit / debt",
+                    label, type(exc).__name__, policy.max_retries + 1,
+                )
                 raise
             delay = policy.delay_for(attempt)
-            LOG.warning(
-                "%s: retryable JSON failure (%s) on attempt %d/%d; "
-                "retrying in %.2fs",
+            LOG.info(
+                "%s: transient %s on attempt %d/%d; retrying in %.2fs",
                 label, type(exc).__name__, attempt + 1, policy.max_retries, delay,
             )
             time.sleep(delay)

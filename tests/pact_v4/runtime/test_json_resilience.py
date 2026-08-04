@@ -133,6 +133,10 @@ def test_json_retry_policy_defaults_and_validation():
         JsonRetryPolicy(max_retries=-1)
     with pytest.raises(ValueError):
         JsonRetryPolicy(base_delay_seconds=-0.1)
+    # bool is an int subclass; reject it explicitly (True would otherwise
+    # silently mean max_retries=1).
+    with pytest.raises(ValueError):
+        JsonRetryPolicy(max_retries=True)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +223,38 @@ def test_retry_reissues_identical_inputs():
     out = retry_json_call(lambda: _call("same-input"), _retry(max_retries=1), label="test")
     assert out == '{"issues": []}'
     assert seen == ["same-input", "same-input"]
+
+
+def test_retry_logs_info_on_retry_and_warning_on_exhaustion(caplog):
+    # A transient blip that self-heals is INFO (a healthy run is not noisy);
+    # only budget exhaustion is WARNING (review recommendation).
+    from pact_v4.runtime import json_resilience
+
+    attempts = []
+
+    def _call():
+        attempts.append(1)
+        if len(attempts) == 1:
+            return ""
+        return '{"issues": []}'
+
+    with caplog.at_level("INFO", logger="pact_v4.runtime.json_resilience"):
+        retry_json_call(_call, _retry(max_retries=1), label="test")
+    assert any(
+        record.levelname == "INFO" and "transient EmptyResponseError" in record.message
+        for record in caplog.records
+    )
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+    caplog.clear()
+    attempts.clear()
+    with caplog.at_level("INFO", logger="pact_v4.runtime.json_resilience"):
+        with pytest.raises(EmptyResponseError):
+            retry_json_call(_call, _retry(max_retries=0), label="test")
+    assert any(
+        record.levelname == "WARNING" and "retry budget exhausted" in record.message
+        for record in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
