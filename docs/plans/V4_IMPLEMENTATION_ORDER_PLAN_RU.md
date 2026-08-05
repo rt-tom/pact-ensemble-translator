@@ -151,8 +151,13 @@ workstream-тема, темы не смешивать.
 
 - **D1 = Phase 6**: role batching (loop-order fix), fewer reloads, monitor/usage
   record.
-- **D2 = Phase 0D**: pre-registered non-inferiority policy.
+- **D2 = Phase 0D**: pre-registered non-inferiority policy. **ОТМЕНЕНА
+  (решение владельца 2026-08-05): сравнения не проводим; strict остаётся
+  production-архитектурой; качество v4 — по валидационным прогонам и решениям
+  владельца.**
 - **D3 = Phase 7**: A/B release decision v3/v4 (зависит от 0D + benchmark).
+  **Упрощён (2026-08-05): решение владельца по итогам валидации, без
+  pre-registered gate.**
 
 ## 5. Зависимости и guardrails
 
