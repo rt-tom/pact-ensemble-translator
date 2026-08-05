@@ -246,7 +246,7 @@ def test_load_local_config():
     assert cfg.identity_hash
 
 
-def test_load_opencode_config_records_env_refs_only():
+def test_load_opencode_config_records_env_refs_only() -> None:
     payload = {
         "kind": "opencode_server",
         "base_url": "http://127.0.0.1:4096",
@@ -265,6 +265,150 @@ def test_load_opencode_config_records_env_refs_only():
     # Secret *values* are never present in the config.
     assert cfg.server.username is None
     assert cfg.server.password is None
+
+
+def test_load_opencode_remote_budget_parsed_from_yaml() -> None:
+    # B11: ``remote_budget`` is now a runtime-YAML field like the other
+    # OpenCodeServerBackendConfig options, not a code-only default.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": {
+            "max_requests_per_chapter": 700,
+            "max_retry_requests_per_chapter": 3,
+            "max_wait_seconds_on_rate_limit": 60.0,
+        },
+    }
+    cfg = load_runtime_config(payload)
+    assert isinstance(cfg, OpenCodeBackendConfig)
+    assert cfg.server.remote_budget.max_requests_per_chapter == 700
+    assert cfg.server.remote_budget.max_retry_requests_per_chapter == 3
+    assert cfg.server.remote_budget.max_wait_seconds_on_rate_limit == 60.0
+    # The budget participates in backend identity: a raised budget must
+    # produce a different identity than the default-500 config.
+    default_cfg = load_runtime_config(
+        {k: v for k, v in payload.items() if k != "remote_budget"}
+    )
+    assert default_cfg.identity_hash != cfg.identity_hash
+
+
+def test_load_opencode_remote_budget_defaults_to_500() -> None:
+    # B11: without a ``remote_budget`` block the loaded config carries the
+    # raised default (500), so the runtime YAML and the code default agree.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+    }
+    cfg = load_runtime_config(payload)
+    assert isinstance(cfg, OpenCodeBackendConfig)
+    assert cfg.server.remote_budget.max_requests_per_chapter == 500
+
+
+def test_load_opencode_remote_budget_partial_block_keeps_other_defaults() -> None:
+    # Only the overridden field changes; the rest fall back to the class
+    # defaults (B11 identity stability for a single-field budget block).
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": {"max_requests_per_chapter": 600},
+    }
+    cfg = load_runtime_config(payload)
+    assert cfg.server.remote_budget.max_requests_per_chapter == 600
+    assert cfg.server.remote_budget.max_retry_requests_per_chapter == 10
+    assert cfg.server.remote_budget.max_wait_seconds_on_rate_limit == 900.0
+
+
+def test_load_opencode_remote_budget_non_positive_rejected() -> None:
+    # B11: a <= 0 budget must fail loudly at load time, not after the run
+    # starts burning requests (RemoteBudget.__post_init__ contract).
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": {"max_requests_per_chapter": 0},
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "max_requests_per_chapter must be positive" in str(exc)
+    else:
+        raise AssertionError("expected a positive-budget ValueError")
+
+
+def test_load_opencode_remote_budget_scalar_rejected() -> None:
+    # B11-RV: an explicit scalar block (e.g. ``remote_budget: 700``) is a
+    # malformed budget, not an absent one; it must fail loudly instead of
+    # silently running with the 500 default and a different identity.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": 700,
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "remote_budget" in str(exc)
+        assert "mapping" in str(exc)
+    else:
+        raise AssertionError("expected a remote_budget-shape ValueError")
+
+
+def test_load_opencode_remote_budget_list_rejected() -> None:
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": [700, 10],
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "remote_budget" in str(exc)
+        assert "mapping" in str(exc)
+    else:
+        raise AssertionError("expected a remote_budget-shape ValueError")
+
+
+def test_load_opencode_remote_budget_bool_rejected() -> None:
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": True,
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "remote_budget" in str(exc)
+        assert "mapping" in str(exc)
+    else:
+        raise AssertionError("expected a remote_budget-shape ValueError")
+
+
+def test_load_opencode_remote_budget_null_keeps_default_500() -> None:
+    # B11-RV: ``null`` is equivalent to an absent key — both keep the
+    # dataclass default (500), never a rejection.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": None,
+    }
+    cfg = load_runtime_config(payload)
+    assert isinstance(cfg, OpenCodeBackendConfig)
+    assert cfg.server.remote_budget.max_requests_per_chapter == 500
 
 
 def test_load_composite_config():
@@ -335,6 +479,16 @@ def test_example_composite_config_loads_with_string_server_args():
         if isinstance(sub, LocalLlamaBackendConfig):
             for args in sub.server_args.values():
                 assert all(isinstance(a, str) for a in args), args
+
+
+def test_example_remote_config_loads_remote_budget_500():
+    """B11: the remote example carries the identity-bound budget block, and
+    the loader must surface it as the effective per-chapter budget."""
+    yaml = pytest.importorskip("yaml")
+    path = _repo_root() / "configs" / "runtime_remote.example.yaml"
+    cfg = load_runtime_config(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert isinstance(cfg, OpenCodeBackendConfig)
+    assert cfg.server.remote_budget.max_requests_per_chapter == 500
 
 
 def test_local_config_rejects_non_string_server_args():

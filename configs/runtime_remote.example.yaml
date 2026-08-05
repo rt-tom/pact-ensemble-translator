@@ -28,6 +28,13 @@ auth:
   username_env: OPENCODE_SERVER_USERNAME
   password_env: OPENCODE_SERVER_PASSWORD
 structured_output_mode: prompt_only
+# Remote budget (B11): max_requests_per_chapter caps model requests per
+# chapter (full cycle ~350-400 incl. convergence/repair/formatting/
+# quarantined-retry; default 500 keeps a reserve). This is an
+# IDENTITY parameter — changing it invalidates cache/resume, so change it
+# only BETWEEN runs (like --run-label), never mid-run.
+remote_budget:
+  max_requests_per_chapter: 500
 model_bindings:
   generator: opencode-go/deepseek-v4-flash
   fidelity_reviewer: opencode-go/qwen3.7-plus
