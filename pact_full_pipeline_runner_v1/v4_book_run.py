@@ -41,7 +41,16 @@ error, failed, unknown, needs_synthesis, incomplete_generation, malformed/
 missing selection records) contributes no pids, and missing/corrupt/empty/
 partial/foreign/duplicate/inconsistent plan-or-selection provenance fails
 closed for the entire candidate loop (no candidate, ledger, observation or
-glossary mutation; warning logged; no crash). The B7
+glossary mutation; warning logged; no crash). B9-F8 (review B9-RV7) closes
+the remaining fail-open in that gate: the canonical validation is no longer a
+weaker shadow subset — every chunk is reconstructed through the real
+``ChunkPlan`` constructor, so total words below ``ChunkPlan.MIN_WORDS``
+without ``undersized_exception``, total words above ``ChunkPlan.MAX_WORDS``
+(regardless of the flag), and plan PID ownership that is not EXACTLY the
+current chapter source PID set (both missing and extra pids, mirroring
+``ChunkPlanArtifact.validate_full_pid_ownership``) are structurally
+impossible and fail closed, while legal undersized chunks
+(``undersized_exception=True``) are preserved. The B7
 ``MemoryManager.promote`` path keeps the quarantined-chunk filter working;
 after ``promote`` any dict-valued glossary entry is restored to the flat
 ``{source: target}`` on-disk contract (``_glossary_entries`` skips dict
@@ -70,7 +79,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4._integrity_checks import (
     bible_script_tokens,
@@ -88,6 +97,8 @@ from pact_v4.phase1.glossary_candidates import (
 )
 from pact_v4.phase1.memory import MemoryManager
 from pact_v4.phase1.models import (
+    ChunkContext,
+    ChunkPlan,
     _require_exact_keys,
     _require_hash,
     canonical_json_hash,
@@ -309,7 +320,9 @@ def _strict_run_identities(out_dir: Path) -> Optional[Dict[str, str]]:
 
 
 def _validate_canonical_chunk_plan(
-    plan: Any, identities: Mapping[str, str],
+    plan: Any,
+    identities: Mapping[str, str],
+    authoritative_pids: Optional[Collection[str]] = None,
 ) -> Optional[Dict[str, str]]:
     """Validate ``chunk_plan.json`` as the canonical, identity-bound
     ``ChunkPlanArtifact`` payload of THIS strict run; returns ``{pid:
@@ -324,6 +337,21 @@ def _validate_canonical_chunk_plan(
     ``ChunkPlanArtifact._identity_payload``) and matches the record's
     ``chunk_plan_hash``. A structurally minimal or forged plan that is not
     the persisted artifact of this run fails closed.
+
+    B9-F8 (review B9-RV7): the validation is equivalent to the persisted
+    canonical model contract, not a weaker divergent shadow subset. Every
+    chunk is reconstructed through the real ``ChunkPlan`` constructor, so
+    the word-window invariants hold: total words below
+    ``ChunkPlan.MIN_WORDS`` while ``undersized_exception`` is false, or
+    total words above ``ChunkPlan.MAX_WORDS`` regardless of the flag, is
+    structurally impossible and fails closed (legal undersized chunks with
+    ``undersized_exception=True`` are preserved). When
+    ``authoritative_pids`` (the current chapter source PID set) is given,
+    plan PID ownership must be EXACTLY that set — both missing source pids
+    and extra plan pids fail closed, mirroring
+    ``ChunkPlanArtifact.validate_full_pid_ownership`` (which the
+    run-artifact path cannot invoke directly because the frozen Snapshot
+    identity cannot be reconstructed without the run-time memory hashes).
     """
     if not isinstance(plan, dict):
         return None
@@ -349,7 +377,7 @@ def _validate_canonical_chunk_plan(
         return None
     mapping: Dict[str, str] = {}
     seen_chunk_ids = set()
-    canonical_chunks: List[Dict[str, Any]] = []
+    chunk_objects: List[ChunkPlan] = []
     for chunk in chunks:
         if not isinstance(chunk, dict):
             return None  # malformed chunk entry
@@ -395,17 +423,26 @@ def _validate_canonical_chunk_plan(
             return None  # malformed chunk context
         if not isinstance(chunk["undersized_exception"], bool):
             return None  # malformed chunk flag
-        canonical_chunks.append({
-            "chunk_id": chunk_id,
-            "snapshot_hash": chunk["snapshot_hash"],
-            "pids": list(pids),
-            "word_counts": list(word_counts),
-            "context": {
-                "left_ru": context["left_ru"],
-                "right_en": list(context["right_en"]),
-            },
-            "undersized_exception": chunk["undersized_exception"],
-        })
+        # B9-F8: reconstruct the chunk through the canonical model — the
+        # real ChunkPlan constructor enforces the word-window invariants
+        # (total below MIN_WORDS without undersized_exception, total above
+        # MAX_WORDS regardless of the flag) and the per-chunk shape, so the
+        # persisted plan is accepted ONLY when it is a constructible
+        # ChunkPlanArtifact chunk, never a weaker structural lookalike.
+        try:
+            chunk_objects.append(ChunkPlan(
+                chunk_id=chunk_id,
+                snapshot_hash=chunk["snapshot_hash"],
+                pids=tuple(pids),
+                word_counts=tuple(word_counts),
+                context=ChunkContext(
+                    left_ru=context["left_ru"],
+                    right_en=tuple(context["right_en"]),
+                ),
+                undersized_exception=chunk["undersized_exception"],
+            ))
+        except (ValueError, TypeError):
+            return None  # noncanonical chunk (word window / per-chunk shape)
     # Content-derived identity: the plan_hash must recompute from the
     # canonical identity payload exactly like ChunkPlanArtifact._identity_payload
     # (artifact tag, snapshot_hash, canonical chunks) — a plan whose hash
@@ -413,10 +450,32 @@ def _validate_canonical_chunk_plan(
     identity_payload = {
         "artifact": "pact-v4-chunk-plan/v1",
         "snapshot_hash": identities["snapshot_hash"],
-        "chunks": canonical_chunks,
+        "chunks": [
+            {
+                "chunk_id": chunk.chunk_id,
+                "snapshot_hash": chunk.snapshot_hash,
+                "pids": list(chunk.pids),
+                "word_counts": list(chunk.word_counts),
+                "context": {
+                    "left_ru": chunk.context.left_ru,
+                    "right_en": list(chunk.context.right_en),
+                },
+                "undersized_exception": chunk.undersized_exception,
+            }
+            for chunk in chunk_objects
+        ],
     }
     if canonical_json_hash(identity_payload) != plan["plan_hash"]:
         return None  # tampered/inconsistent plan hash
+    # B9-F8: exact authoritative snapshot PID ownership. The plan must own
+    # EXACTLY the current chapter source PID set (the snapshot pids are the
+    # run-time source pids) — missing pids AND extra pids are both
+    # non-authoritative, exactly like validate_full_pid_ownership.
+    if authoritative_pids is not None:
+        plan_pids = set(mapping)
+        source_pids = {str(pid) for pid in authoritative_pids}
+        if plan_pids != source_pids:
+            return None  # plan owns a different PID set than the source
     return mapping
 
 
@@ -475,8 +534,9 @@ def _validate_selection_selected(
 
 def _authoritative_selected_provenance(
     out_dir: Path,
+    chapter_html: Optional[Path] = None,
 ) -> Optional[Tuple[Dict[str, str], set]]:
-    """B9-F7: bind the accepted_degraded evidence gate to the strict-run
+    """B9-F7/F8: bind the accepted_degraded evidence gate to the strict-run
     artifacts.
 
     Returns ``(pid_to_chunk, selected_chunk_ids)`` when the persisted
@@ -486,8 +546,15 @@ def _authoritative_selected_provenance(
     closed for the whole candidate loop — when the strict record identities,
     the plan, or the selection is missing, corrupt, empty, foreign (artifact/
     snapshot/plan identity mismatch), ambiguous (duplicate PID or chunk
-    ownership), malformed, or plan-vs-selection inconsistent. A warning is
-    logged with the specific reason; the book run never crashes.
+    ownership), malformed, or plan-vs-selection inconsistent.
+
+    B9-F8 (review B9-RV7) additionally validates the plan against the
+    current chapter source (``chapter_html``): every chunk must be a
+    constructible canonical ``ChunkPlan`` (word-window invariants) and the
+    plan must own EXACTLY the source PID set — missing and extra pids fail
+    closed. If the source cannot be read/parsed, exact ownership cannot be
+    proven and the gate fails closed too. A warning is logged with the
+    specific reason; the book run never crashes.
     """
     identities = _strict_run_identities(out_dir)
     if identities is None:
@@ -498,16 +565,39 @@ def _authoritative_selected_provenance(
             out_dir.name,
         )
         return None
+    # B9-F8: exact plan ownership must be validated against the CURRENT
+    # source PID set (the snapshot pids ARE the run-time source pids,
+    # re-derived here from the chapter html this book run already parsed).
+    # An unreadable/unparseable source leaves exact ownership unprovable —
+    # fail closed rather than skip the check.
+    source_pids: Optional[Collection[str]] = None
+    if chapter_html is not None:
+        try:
+            source_pids = {str(pid) for pid in _source_by_pid(chapter_html)}
+        except Exception:
+            source_pids = None
+    if source_pids is None:
+        LOG.warning(
+            "B9-F8: %s accepted_degraded but the chapter source "
+            "(%s) cannot be read/parsed, so exact plan PID ownership "
+            "cannot be validated; failing closed — no candidate "
+            "generation, ledger line, observation or glossary mutation",
+            out_dir.name, chapter_html,
+        )
+        return None
     plan = _load_json(out_dir / "chunk_plan.json", None)
-    pid_to_chunk = _validate_canonical_chunk_plan(plan, identities)
+    pid_to_chunk = _validate_canonical_chunk_plan(plan, identities, source_pids)
     if pid_to_chunk is None:
         LOG.warning(
-            "B9-F7: %s accepted_degraded but chunk_plan.json is not the "
-            "canonical identity-bound ChunkPlanArtifact of this run "
+            "B9-F7/B9-F8: %s accepted_degraded but chunk_plan.json is not "
+            "the canonical identity-bound ChunkPlanArtifact of this run "
             "(missing/corrupt/empty, foreign artifact/snapshot/plan "
-            "identity, duplicate PID/chunk ownership or malformed chunk/PID "
-            "data); failing closed — no candidate generation, ledger line, "
-            "observation or glossary mutation",
+            "identity, duplicate PID/chunk ownership, malformed chunk/PID "
+            "data, word-window invariant violation — total words below "
+            "ChunkPlan.MIN_WORDS without undersized_exception or above "
+            "ChunkPlan.MAX_WORDS — or PID ownership not exactly the "
+            "chapter's source PID set); failing closed — no candidate "
+            "generation, ledger line, observation or glossary mutation",
             out_dir.name,
         )
         return None
@@ -585,8 +675,13 @@ def _generate_and_align_chapter(
     (quarantined, error, failed, unknown, needs_synthesis,
     incomplete_generation, ...) are dropped from BOTH the source and the
     translation before generation and alignment, so candidates carry only
-    proven ``selected``-chunk occurrences. A present source/translation pid
-    the plan does not map (partial plan) still fails closed. ``complete``
+    proven ``selected``-chunk occurrences. B9-F8 (review B9-RV7): that
+    provenance tuple is only produced when the plan is a constructible
+    canonical ``ChunkPlanArtifact`` — ChunkPlan word-window invariants and
+    EXACT source-PID ownership (missing and extra pids both fail closed),
+    so a structurally impossible plan can never mark evidence authoritative.
+    A present source/translation pid the plan does not map (partial plan)
+    still fails closed. ``complete``
     chapters pass ``authoritative_provenance=None`` and keep the legacy
     path unchanged.
 
@@ -911,13 +1006,18 @@ def run_book(
         }
         if terminal_status in _PROMOTING_STATUSES:
             if terminal_status == "accepted_degraded":
-                # B9-F7: the accepted_degraded evidence gate binds the
+                # B9-F7/F8: the accepted_degraded evidence gate binds the
                 # candidate loop to the canonical identity-bound chunk plan
                 # and selection results of THIS strict run; evidence may
-                # originate ONLY in proven ``selected`` chunks. Missing/
-                # corrupt/foreign/inconsistent provenance fails closed
-                # (warning logged inside the gate; the run never crashes).
-                provenance = _authoritative_selected_provenance(out_dir)
+                # originate ONLY in proven ``selected`` chunks, and the plan
+                # itself must be a constructible canonical ChunkPlanArtifact
+                # (word-window invariants, exact source-PID ownership).
+                # Missing/corrupt/foreign/inconsistent provenance fails
+                # closed (warning logged inside the gate; the run never
+                # crashes).
+                provenance = _authoritative_selected_provenance(
+                    out_dir, chapter_html,
+                )
                 if provenance is None:
                     aligned = []
                 else:

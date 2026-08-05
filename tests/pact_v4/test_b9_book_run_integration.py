@@ -44,7 +44,17 @@ B9-RV2/B9-RV3 reviews of PR #128):
   originate ONLY in authoritatively ``selected`` chunks — quarantined /
   error / failed / unknown / needs_synthesis / incomplete_generation chunks
   contribute no pids; valid all-selected and mixed selected+quarantined
-  chapters keep their normal and selected-only behavior.
+  chapters keep their normal and selected-only behavior;
+* B9-F8 (review B9-RV7) fail-closed: the accepted_degraded gate is no longer
+  a weaker shadow subset of the canonical contract — every plan chunk is
+  reconstructed through the real ``ChunkPlan`` constructor (word-window
+  invariants: total below ``ChunkPlan.MIN_WORDS`` without
+  ``undersized_exception``, or above ``ChunkPlan.MAX_WORDS`` regardless of
+  the flag, fails closed; legal undersized chunks with the flag are
+  preserved) and plan PID ownership must be EXACTLY the current chapter
+  source PID set (missing and extra pids fail closed). Positive fixtures are
+  genuine constructible ``ChunkPlanArtifact`` payloads; an actual-style
+  selected+quarantined mixed plan still promotes selected-only evidence.
 
 The strict driver is faked (``_run_one_chapter`` monkeypatched) — the out_dir
 artifacts (``strict_chapter_trial_record.json``, ``selection_results.json``,
@@ -66,9 +76,30 @@ from pact_v4.phase1.models import canonical_json_hash
 _SNAPSHOT_HASH = "1" * 64
 
 
+def _canonical_word_counts(n: int) -> list:
+    """Per-PID source word counts that make a chunk a GENUINE constructible
+    canonical ``ChunkPlan``: the total sits inside
+    ``[ChunkPlan.MIN_WORDS=280, ChunkPlan.MAX_WORDS=640]`` (300 words split
+    evenly), so positive fixtures are real ``ChunkPlanArtifact`` chunks.
+
+    B9-RV7 (review F1): the old ``[1]*n`` default produced structurally
+    impossible payloads (total below the soft minimum with
+    ``undersized_exception=False``) — ``ChunkPlan`` itself rejects them, so
+    a positive fixture must use in-window totals (or an explicit
+    ``undersized_exception`` override).
+    """
+    base, remainder = divmod(300, n)
+    return [base + (1 if i < remainder else 0) for i in range(n)]
+
+
 def _plan_payload(chunks):
     """Canonical ``ChunkPlanArtifact`` payload with a real content-derived
-    ``plan_hash`` — the shape ``_validate_canonical_chunk_plan`` accepts."""
+    ``plan_hash`` — the shape ``_validate_canonical_chunk_plan`` accepts.
+
+    Per-chunk ``word_counts`` / ``context`` / ``undersized_exception`` may
+    be overridden (e.g. to build a deliberately noncanonical plan for a
+    B9-F8 fail-closed test); the defaults are genuine constructible
+    ``ChunkPlan`` chunks (B9-RV7)."""
     identity = {
         "artifact": "pact-v4-chunk-plan/v1",
         "snapshot_hash": _SNAPSHOT_HASH,
@@ -77,10 +108,12 @@ def _plan_payload(chunks):
                 "chunk_id": c["chunk_id"],
                 "snapshot_hash": _SNAPSHOT_HASH,
                 "pids": list(c["pids"]),
-                "word_counts": list(c.get("word_counts")
-                                    or [1] * len(c["pids"])),
-                "context": {"left_ru": "", "right_en": []},
-                "undersized_exception": False,
+                "word_counts": list(
+                    c.get("word_counts")
+                    or _canonical_word_counts(len(c["pids"]))
+                ),
+                "context": c.get("context", {"left_ru": "", "right_en": []}),
+                "undersized_exception": c.get("undersized_exception", False),
             }
             for c in chunks
         ],
@@ -771,7 +804,12 @@ class TestAcceptedDegradedAuthoritativeProvenance:
     plan_hash, exact contract shape) with plan-vs-selection membership
     agreement. Foreign/missing/corrupt/inconsistent provenance fails closed:
     zero candidates, no ledger line, no observation, no glossary mutation
-    (warning logged, no crash)."""
+    (warning logged, no crash).
+
+    B9-F8 (review B9-RV7) extends the same gate to the FULL canonical
+    contract: chunk word-window invariants (via the real ``ChunkPlan``
+    constructor) and EXACT source-PID ownership; the positive fixtures are
+    genuine constructible ``ChunkPlanArtifact`` payloads."""
 
     def _run(self, tmp_path, monkeypatch, html, translations,
              chunk_plan=_PLAN, *, statuses=None, record_identities=None,
@@ -1069,6 +1107,194 @@ class TestAcceptedDegradedAuthoritativeProvenance:
         assert records == {}
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
+
+    # ------------------------------------------------------------------
+    # B9-F8 (review B9-RV7): the accepted_degraded gate enforces the FULL
+    # canonical ChunkPlanArtifact contract — ChunkPlan word-window
+    # invariants and EXACT source-PID ownership — not a weaker shadow
+    # subset. Every invalid condition fails closed (zero candidates, no
+    # ledger, no observation, no glossary mutation, warning logged, no
+    # crash); legal undersized chunks (undersized_exception=True) and an
+    # actual-style selected+quarantined mix keep working.
+    # ------------------------------------------------------------------
+
+    def _assert_fail_closed(self, memory, out_base, result):
+        assert result["chapters"][0]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
+    def test_undersized_false_flag_fails_closed(self, tmp_path, monkeypatch, caplog):
+        """B9-RV7 repro: a plan whose chunk total words are below
+        ``ChunkPlan.MIN_WORDS`` with ``undersized_exception=False`` is
+        structurally impossible as a canonical ``ChunkPlanArtifact`` (the
+        real ``ChunkPlan`` constructor rejects it) — fail closed. The old
+        gate accepted this payload and promoted Blake from it."""
+        plan = _plan_payload([
+            {"chunk_id": "chunk0001",
+             "pids": ["p00001", "p00002", "p00003",
+                      "p00004", "p00005", "p00006"],
+             "word_counts": [1, 1, 1, 1, 1, 1]},
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, _CH1_HTML, _CH1_TRANSLATIONS,
+            chunk_plan=plan,
+        )
+        self._assert_fail_closed(memory, out_base, result)
+        assert any("B9-F7/B9-F8" in r.message for r in caplog.records)
+
+    def test_oversized_chunk_fails_closed(self, tmp_path, monkeypatch, caplog):
+        """Total words above ``ChunkPlan.MAX_WORDS`` are rejected even with
+        ``undersized_exception=True`` — the flag never relaxes the hard
+        maximum (ChunkPlan enforces it unconditionally)."""
+        plan = _plan_payload([
+            {"chunk_id": "chunk0001",
+             "pids": ["p00001", "p00002", "p00003",
+                      "p00004", "p00005", "p00006"],
+             "word_counts": [200, 200, 200, 200, 200, 200],
+             "undersized_exception": True},
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, _CH1_HTML, _CH1_TRANSLATIONS,
+            chunk_plan=plan,
+        )
+        self._assert_fail_closed(memory, out_base, result)
+        assert any("B9-F7/B9-F8" in r.message for r in caplog.records)
+
+    def test_missing_source_pid_fails_closed(self, tmp_path, monkeypatch, caplog):
+        """A canonical-valid plan that does not own EVERY chapter source
+        pid (p00006 is missing) fails closed — ownership must be exact, not
+        a subset."""
+        plan = _plan_payload([
+            {"chunk_id": "chunk0001",
+             "pids": ["p00001", "p00002", "p00003",
+                      "p00004", "p00005"]},
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, _CH1_HTML, _CH1_TRANSLATIONS,
+            chunk_plan=plan,
+        )
+        self._assert_fail_closed(memory, out_base, result)
+        assert any("B9-F7/B9-F8" in r.message for r in caplog.records)
+
+    def test_extra_pid_ownership_fails_closed(self, tmp_path, monkeypatch, caplog):
+        """B9-RV7 repro: a plan that owns PIDs OUTSIDE the chapter source
+        (extra p00007) passed the old ``present_pids <= plan_pids`` check
+        and generated/promoted evidence — exact ownership fails closed."""
+        plan = _plan_payload([
+            {"chunk_id": "chunk0001",
+             "pids": ["p00001", "p00002", "p00003"]},
+            {"chunk_id": "chunk0002",
+             "pids": ["p00004", "p00005", "p00006", "p00007"]},
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, _CH1_HTML, _CH1_TRANSLATIONS,
+            chunk_plan=plan,
+        )
+        self._assert_fail_closed(memory, out_base, result)
+        assert any("B9-F7/B9-F8" in r.message for r in caplog.records)
+
+    def test_legal_undersized_exception_still_generates(self, tmp_path, monkeypatch):
+        """Legal undersized chunk: total below ``ChunkPlan.MIN_WORDS`` WITH
+        ``undersized_exception=True`` is a constructible canonical
+        ``ChunkPlan`` (the canonical model permits it) — the gate must NOT
+        over-reject: generation, ledger and promotion keep working."""
+        plan = _plan_payload([
+            {"chunk_id": "chunk0001",
+             "pids": ["p00001", "p00002", "p00003",
+                      "p00004", "p00005", "p00006"],
+             "word_counts": [10, 10, 10, 10, 10, 10],
+             "undersized_exception": True},
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, _CH1_HTML, _CH1_TRANSLATIONS,
+            chunk_plan=plan,
+        )
+        # Same normal behavior as test_all_selected_accepted_degraded_generates_normally.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 2, "promoted": 1, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records["proper_name|blake"]["chapters"][0]["chunk_ids"] == [
+            "chunk0001",
+        ]
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+    def test_actual_style_mixed_selected_quarantined_promotes(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV7 positive: an ACTUAL-style canonical plan — many pids per
+        chunk, per-chunk totals inside the 280-640 word window — with a
+        selected + quarantined mix proves selected-only evidence still
+        promotes correctly (the quarantined chunk's Blake occurrences never
+        count)."""
+        quarantined_paras = [
+            "<p>Blake walked to the gate and Blake met the guard.</p>",
+            "<p>Blake knew the old road well.</p>",
+            "<p>Blake waited outside for Mary.</p>",
+            "<p>Blake returned home very late.</p>",
+            "<p>Blake heard a distant bell.</p>",
+            "<p>Blake nodded to the keeper.</p>",
+            "<p>Blake left before the dawn.</p>",
+            "<p>Blake closed the heavy door.</p>",
+        ]
+        selected_paras = [
+            "<p>He met Blake at the gate. Blake knew the way.</p>",
+            "<p>Blake waited outside for Mary.</p>",
+            "<p>Blake returned home later.</p>",
+            "<p>He saw Blake return home. Blake waved once more.</p>",
+            "<p>He met Blake again.</p>",
+            "<p>Blake left at noon.</p>",
+            "<p>The pact bound them all together.</p>",
+            "<p>The pact held firm against time.</p>",
+            "<p>The pact was old and strong.</p>",
+        ]
+        html = "\n".join(quarantined_paras + selected_paras)
+        translations = {
+            f"p{i:05d}": "Блэйк снова вышел к воротам." for i in range(1, 15)
+        }
+        translations["p00015"] = "Пакт связывал их всех вместе."
+        translations["p00016"] = "Пакт держался крепко против времени."
+        translations["p00017"] = "Пакт был старым и сильным."
+        plan = _plan_payload([
+            {"chunk_id": "chunk_q",
+             "pids": [f"p{i:05d}" for i in range(1, 9)],
+             "word_counts": [38] * 8},   # 304 words — inside the window
+            {"chunk_id": "chunk_a",
+             "pids": [f"p{i:05d}" for i in range(9, 18)],
+             "word_counts": [34] * 9},   # 306 words — inside the window
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            chunk_plan=plan,
+            statuses={"chunk_q": "quarantined", "chunk_a": "selected"},
+        )
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 2, "promoted": 1, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        blake = records["proper_name|blake"]
+        # Only the SELECTED chunk's 8 Blake occurrences count — the
+        # quarantined chunk's Blake text never contributed evidence.
+        assert blake["total_occurrences"] == 8
+        assert blake["chapters"][0]["chunk_ids"] == ["chunk_a"]
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
 
 
 # ---------------------------------------------------------------------------
