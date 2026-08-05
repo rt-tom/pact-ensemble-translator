@@ -1,8 +1,7 @@
 """B12 call-optimization validation on the chapter 0001 run_004_remote artifacts.
 
 Recomputes the model-call budget with the B12 optimizations on the frozen
-run artifacts (``D:\\pact\\gate_bench_runs\\v4_phase12_strict_0001\\
-run_004_remote``):
+run artifacts (``run_004_remote``):
 
   * formatting model-fallback: per-PID (78) -> per-chunk batches (15);
   * repair re-gate: per-region (95) -> per-chunk batches (16);
@@ -13,12 +12,17 @@ source + run_004 translations with a batch-capable fake caller and asserts
 the batched path resolves the same spans/incidents as the per-PID path with
 fewer calls (parity contract).
 
-The test is skipped when the run artifacts are not present (they live on a
-development machine, not in the repository).
+The external artifacts (the run directory and the chapter 0001 source HTML)
+are not part of the repository — they live on a development machine. Point at
+them with the environment variables ``PACT_B12_RUN004_DIR`` and
+``PACT_B12_CHAPTER_HTML``; the whole module is skipped when either variable is
+unset or points at a missing path. The resolution/skip contract is pinned
+independently of the artifacts in ``test_b12_validation_paths.py``.
 """
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -27,17 +31,42 @@ import pytest
 from pact_v4.phase0b.source_html import parse_source_html
 from pact_v4.phase5 import formatting as fmt
 
-RUN_DIR = Path(r"D:\pact\gate_bench_runs\v4_phase12_strict_0001\run_004_remote")
-CHAPTER_HTML = Path(r"D:\pact\pact_chapters\0001_bonds-1-1.html")
+PACT_B12_RUN004_DIR_ENV = "PACT_B12_RUN004_DIR"
+PACT_B12_CHAPTER_HTML_ENV = "PACT_B12_CHAPTER_HTML"
+
+
+def _resolve_external_paths() -> tuple[Path, Path] | None:
+    """Resolve the run_004 + chapter 0001 artifacts from the environment.
+
+    Returns ``(run_dir, chapter_html)`` when both ``PACT_B12_RUN004_DIR`` and
+    ``PACT_B12_CHAPTER_HTML`` are set and point at an existing directory /
+    existing file; returns ``None`` (skip) otherwise.
+    """
+    run_dir = os.environ.get(PACT_B12_RUN004_DIR_ENV)
+    chapter_html = os.environ.get(PACT_B12_CHAPTER_HTML_ENV)
+    if not run_dir or not chapter_html:
+        return None
+    run_path, chapter_path = Path(run_dir), Path(chapter_html)
+    if not run_path.is_dir() or not chapter_path.is_file():
+        return None
+    return run_path, chapter_path
+
+
+_EXTERNAL = _resolve_external_paths()
+_RUN_DIR, _CHAPTER_HTML = _EXTERNAL or (None, None)
 
 pytestmark = pytest.mark.skipif(
-    not RUN_DIR.exists() or not CHAPTER_HTML.exists(),
-    reason="chapter 0001 run artifacts are not present on this machine",
+    _EXTERNAL is None,
+    reason=(
+        "set PACT_B12_RUN004_DIR and PACT_B12_CHAPTER_HTML to the chapter 0001 "
+        "run_004 artifacts (they are not part of the repository)"
+    ),
 )
 
 
 def _load(name: str):
-    return json.loads((RUN_DIR / name).read_text(encoding="utf-8"))
+    assert _RUN_DIR is not None, "external run dir must be resolved before use"
+    return json.loads((_RUN_DIR / name).read_text(encoding="utf-8"))
 
 
 def test_b12_formatting_batches_pids_per_chunk():
@@ -120,8 +149,9 @@ class _EmptyBatchCaller:
 def test_b12_formatting_batched_parity_and_fewer_calls():
     # Light smoke on the real chapter: the batched path resolves exactly the
     # same spans/incidents as the per-PID path (parity) with fewer calls.
+    assert _CHAPTER_HTML is not None, "external chapter HTML must be resolved"
     chunk_plan = _load("chunk_plan.json")
-    blocks = parse_source_html(CHAPTER_HTML.read_text(encoding="utf-8"))
+    blocks = parse_source_html(_CHAPTER_HTML.read_text(encoding="utf-8"))
     translations = _load("translations.json")
 
     per_pid_caller = _EmptyBatchCaller()
