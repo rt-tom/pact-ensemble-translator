@@ -32,7 +32,19 @@ B9-RV2/B9-RV3 reviews of PR #128):
 * B9-F5 fail-closed: ``accepted_degraded`` + quarantined chunk + a
   missing/corrupt/empty/incomplete ``chunk_plan.json`` yields ZERO candidate
   generation, no ledger line, no observation and no glossary mutation —
-  unavailable PID->chunk provenance never lets unproven evidence through.
+  unavailable PID->chunk provenance never lets unproven evidence through;
+* B9-F7 (review B9-RV6) fail-closed: the ``accepted_degraded`` evidence gate
+  accepts ONLY the canonical ``ChunkPlanArtifact`` payload of the strict run
+  (artifact tag, snapshot/plan identity bound to the run record,
+  content-derived plan_hash, exact shape) whose ``selection_results.json``
+  binds to the same run with plan-exact chunk membership. A foreign/forged
+  plan, a plan-vs-selection membership mismatch, an identity mismatch, or
+  malformed/missing selection records fail closed (zero candidates, no
+  ledger, no observation, no glossary mutation); candidate evidence may
+  originate ONLY in authoritatively ``selected`` chunks — quarantined /
+  error / failed / unknown / needs_synthesis / incomplete_generation chunks
+  contribute no pids; valid all-selected and mixed selected+quarantined
+  chapters keep their normal and selected-only behavior.
 
 The strict driver is faked (``_run_one_chapter`` monkeypatched) — the out_dir
 artifacts (``strict_chapter_trial_record.json``, ``selection_results.json``,
@@ -47,6 +59,33 @@ from pathlib import Path
 import pytest
 
 from pact_v4.phase1.glossary_candidates import GlossaryCandidateLedger
+from pact_v4.phase1.models import canonical_json_hash
+
+# Valid-format sha256 identity shared by a chapter's artifacts (the strict
+# driver derives it from content; the tests only need one consistent hash).
+_SNAPSHOT_HASH = "1" * 64
+
+
+def _plan_payload(chunks):
+    """Canonical ``ChunkPlanArtifact`` payload with a real content-derived
+    ``plan_hash`` — the shape ``_validate_canonical_chunk_plan`` accepts."""
+    identity = {
+        "artifact": "pact-v4-chunk-plan/v1",
+        "snapshot_hash": _SNAPSHOT_HASH,
+        "chunks": [
+            {
+                "chunk_id": c["chunk_id"],
+                "snapshot_hash": _SNAPSHOT_HASH,
+                "pids": list(c["pids"]),
+                "word_counts": list(c.get("word_counts")
+                                    or [1] * len(c["pids"])),
+                "context": {"left_ru": "", "right_en": []},
+                "undersized_exception": False,
+            }
+            for c in chunks
+        ],
+    }
+    return {**identity, "plan_hash": canonical_json_hash(identity)}
 
 
 def _setup_memory(tmp_path: Path) -> Path:
@@ -74,27 +113,55 @@ def _make_chapter_artifacts(
     quarantined: list,
     translations: dict,
     chunk_plan: dict,
+    statuses: dict = None,
+    record_identities: dict = None,
+    selection_identities: dict = None,
 ) -> None:
-    """Pre-populate the per-chapter out_dir the way the strict driver would."""
+    """Pre-populate the per-chapter out_dir the way the strict driver would.
+
+    ``statuses`` overrides the per-chunk selection status
+    (``{chunk_id: status}``); default: quarantined chunks -> ``quarantined``,
+    everything else -> ``selected``. ``record_identities`` /
+    ``selection_identities`` override the identity fields written into the
+    strict record / selection results (default: taken from the plan's
+    ``snapshot_hash`` / ``plan_hash``).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_hash = chunk_plan.get("snapshot_hash")
+    plan_hash = chunk_plan.get("plan_hash")
     chunk_ids = [c["chunk_id"] for c in chunk_plan["chunks"]]
     results = []
     for chunk_id in chunk_ids:
-        is_q = chunk_id in quarantined
+        if statuses is not None:
+            status = statuses.get(chunk_id, "selected")
+        else:
+            status = "quarantined" if chunk_id in quarantined else "selected"
         results.append({
             "chunk_id": chunk_id,
-            "status": "quarantined" if is_q else "selected",
-            "quarantine_reason": "qwen_fidelity" if is_q else None,
+            "status": status,
+            "quarantine_reason": "qwen_fidelity" if status == "quarantined" else None,
         })
+    selection = {"chapter_id": chapter_id, "results": results}
+    if snapshot_hash is not None:
+        selection["snapshot_hash"] = snapshot_hash
+        selection["chunk_plan_hash"] = plan_hash
+    if selection_identities is not None:
+        selection.update(selection_identities)
     out_dir.joinpath("selection_results.json").write_text(
-        json.dumps({"chapter_id": chapter_id, "results": results},
-                   ensure_ascii=False),
+        json.dumps(selection, ensure_ascii=False),
         encoding="utf-8",
     )
+    record = {"chapter_id": chapter_id,
+              "step8": {"status": terminal_status}}
+    if snapshot_hash is not None:
+        record["identities"] = {
+            "snapshot_hash": snapshot_hash,
+            "chunk_plan_hash": plan_hash,
+        }
+    if record_identities is not None:
+        record["identities"] = record_identities
     out_dir.joinpath("strict_chapter_trial_record.json").write_text(
-        json.dumps({"chapter_id": chapter_id,
-                    "step8": {"status": terminal_status}},
-                   ensure_ascii=False),
+        json.dumps(record, ensure_ascii=False),
         encoding="utf-8",
     )
     out_dir.joinpath("translations.json").write_text(
@@ -139,21 +206,10 @@ _CH2_TRANSLATIONS = {
     "p00005": "Она открыла тяжёлую дверь.",
 }
 
-_PLAN = {
-    "artifact": "pact-v4-chunk-plan/v1",
-    "snapshot_hash": "test",
-    "plan_hash": "test",
-    "chunks": [
-        {"chunk_id": "chunk0001", "snapshot_hash": "test",
-         "pids": ["p00001", "p00002", "p00003"],
-         "word_counts": [], "context": {"left_ru": "", "right_en": []},
-         "undersized_exception": False},
-        {"chunk_id": "chunk0002", "snapshot_hash": "test",
-         "pids": ["p00004", "p00005", "p00006"],
-         "word_counts": [], "context": {"left_ru": "", "right_en": []},
-         "undersized_exception": False},
-    ],
-}
+_PLAN = _plan_payload([
+    {"chunk_id": "chunk0001", "pids": ["p00001", "p00002", "p00003"]},
+    {"chunk_id": "chunk0002", "pids": ["p00004", "p00005", "p00006"]},
+])
 
 
 class TestBookRunCandidateIntegration:
@@ -528,15 +584,15 @@ class TestQuarantinedProvenanceFailClosed:
         elif plan_mode == "empty":
             plan_path.write_text('{"chunks": []}', encoding="utf-8")
         elif plan_mode == "partial":
-            # chunk0002's pids (p00004-p00006) are missing from the plan —
-            # their provenance is unknown.
-            plan_path.write_text(json.dumps({
-                "artifact": "pact-v4-chunk-plan/v1",
-                "chunks": [
-                    {"chunk_id": "chunk0001",
-                     "pids": ["p00001", "p00002", "p00003"]},
-                ],
-            }), encoding="utf-8")
+            # A canonical, identity-bound plan that still omits some of the
+            # chapter's pids (p00002/p00003 are not owned by any chunk) —
+            # their provenance is unknown, so the candidate loop fails closed
+            # (B9-F7 incomplete-provenance check inside the generator).
+            plan_path.write_text(json.dumps(_plan_payload([
+                {"chunk_id": "chunk0001", "pids": ["p00001"]},
+                {"chunk_id": "chunk0002",
+                 "pids": ["p00004", "p00005", "p00006"]},
+            ])), encoding="utf-8")
         else:  # pragma: no cover
             raise AssertionError(f"unknown plan_mode {plan_mode!r}")
 
@@ -665,12 +721,7 @@ class TestQuarantinedProvenanceFailClosed:
             quarantined = ["chunk_q"]
         else:  # pragma: no cover
             raise AssertionError(f"unknown plan_mode {plan_mode!r}")
-        duplicate_plan = {
-            "artifact": "pact-v4-chunk-plan/v1",
-            "snapshot_hash": "test",
-            "plan_hash": "test",
-            "chunks": chunks,
-        }
+        duplicate_plan = _plan_payload(chunks)
         _write_chapter_html(src_dir, "0001", html)
         _make_chapter_artifacts(
             out_base / "chapter_0001", "0001",
@@ -703,6 +754,321 @@ class TestQuarantinedProvenanceFailClosed:
             (memory / "observations.json").read_text(encoding="utf-8")
         )
         assert observations.get("glossary", {}) == {}
+
+
+# ---------------------------------------------------------------------------
+# B9-F7: accepted_degraded evidence bound to authoritative selected-chunk
+# provenance (canonical identity-bound chunk plan + selection results)
+# ---------------------------------------------------------------------------
+
+
+class TestAcceptedDegradedAuthoritativeProvenance:
+    """B9-F7 (review B9-RV6): the accepted_degraded candidate loop accepts
+    evidence ONLY from chunks authoritatively ``selected`` in
+    ``selection_results.json``, and only when ``chunk_plan.json`` is the
+    canonical ``ChunkPlanArtifact`` payload of THIS strict run (artifact tag,
+    snapshot/plan identity bound to the run record, content-derived
+    plan_hash, exact contract shape) with plan-vs-selection membership
+    agreement. Foreign/missing/corrupt/inconsistent provenance fails closed:
+    zero candidates, no ledger line, no observation, no glossary mutation
+    (warning logged, no crash)."""
+
+    def _run(self, tmp_path, monkeypatch, html, translations,
+             chunk_plan=_PLAN, *, statuses=None, record_identities=None,
+             selection_identities=None, terminal_status="accepted_degraded",
+             selection_results=None):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        _write_chapter_html(src_dir, "0001", html)
+        out_dir = out_base / "chapter_0001"
+        _make_chapter_artifacts(
+            out_dir, "0001",
+            terminal_status=terminal_status, quarantined=[],
+            translations=translations, chunk_plan=chunk_plan,
+            statuses=statuses, record_identities=record_identities,
+            selection_identities=selection_identities,
+        )
+        if selection_results is not None:
+            # Full override of selection_results.json (e.g. a selection
+            # listing chunks the plan does not own).
+            out_dir.joinpath("selection_results.json").write_text(
+                json.dumps(selection_results, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+        return memory, out_base, result
+
+    def test_forged_plan_selection_quarantined_mismatch_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        """Finding 1 (B9-RV6 HIGH): strict record accepted_degraded, selection
+        says chunk_q is quarantined, but the plan maps the Blake pids to an
+        unrelated forged_accepted chunk. The foreign plan is not bound to the
+        run's selection: fail closed — no Blake candidate, no ledger, no
+        observation, no glossary mutation."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        forged_plan = _plan_payload([
+            {"chunk_id": "forged_accepted", "pids": ["p00001", "p00002"]},
+        ])
+        # The selection results of the run name the REAL quarantined chunk
+        # (chunk_q), which the forged plan never owns -> plan-vs-selection
+        # membership disagreement.
+        selection_results = {
+            "chapter_id": "0001",
+            "snapshot_hash": forged_plan["snapshot_hash"],
+            "chunk_plan_hash": forged_plan["plan_hash"],
+            "results": [{"chunk_id": "chunk_q", "status": "quarantined"}],
+        }
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            chunk_plan=forged_plan, selection_results=selection_results,
+        )
+
+        assert result["chapters"][0]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
+    def test_nonselected_error_status_evidence_excluded(self, tmp_path, monkeypatch):
+        """Finding 2 (B9-RV6 HIGH): a fully mapped accepted_degraded chapter
+        whose chunk has selection status ``error`` (no quarantined chunk) must
+        NOT promote from that non-accepted chunk. Only proven ``selected``
+        evidence may generate candidates."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        plan = _plan_payload([
+            {"chunk_id": "chunk0001", "pids": ["p00001", "p00002"]},
+        ])
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            chunk_plan=plan, statuses={"chunk0001": "error"},
+        )
+
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert "proper_name|blake" not in records
+        assert records == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
+    def test_mixed_selected_quarantined_keeps_only_selected_evidence(
+        self, tmp_path, monkeypatch,
+    ):
+        """Requirement 3: a mixed accepted_degraded chapter retains only the
+        selected chunk's PID/chunk evidence; the wholly-quarantined candidate
+        is absent and the mixed candidate's ledger/promotion provenance
+        carries only selected chunks."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>\n"
+                "<p>Blake returned home later.</p>\n"
+                "<p>He saw Blake return home. Blake waved once more.</p>\n"
+                "<p>He met Blake again.</p>\n"
+                "<p>Blake left at noon.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+            "p00003": "Блэйк вернулся домой позже.",
+            "p00004": "Он видел, как Блэйк вернулся домой. Блэйк помахал ещё раз.",
+            "p00005": "Он снова встретил Блэйка.",
+            "p00006": "Блэйк ушёл в полдень.",
+        }
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            statuses={"chunk0001": "quarantined", "chunk0002": "selected"},
+        )
+
+        # Blake's 4 accepted-chunk occurrences promote with accepted
+        # provenance; the quarantined chunk's occurrences never count.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 1, "promoted": 1, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        blake = records["proper_name|blake"]
+        assert blake["total_occurrences"] == 4  # not 8
+        assert blake["chapters"][0]["chunk_ids"] == ["chunk0002"]
+        assert set(blake["chapters"][0]["chunk_ids"]) <= {"chunk0002"}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+    def test_all_selected_accepted_degraded_generates_normally(
+        self, tmp_path, monkeypatch,
+    ):
+        """Requirement 3/5(d): a fully mapped accepted_degraded chapter with
+        every chunk authoritatively selected behaves like normal generation —
+        candidates, ledger and promotion all work."""
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, _CH1_HTML, _CH1_TRANSLATIONS,
+        )
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 2, "promoted": 1, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        # Blake lives in chunk0001 (p00001-p00003); all chunks are selected
+        # so the full chapter evidence is used and promotion is normal.
+        assert records["proper_name|blake"]["chapters"][0]["chunk_ids"] == [
+            "chunk0001",
+        ]
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+    def test_foreign_record_plan_identity_fails_closed(self, tmp_path, monkeypatch):
+        """Artifact/snapshot/plan identity mismatch: the plan is canonical but
+        the strict record's identities point at a different snapshot/plan —
+        the plan is not the artifact of THIS run -> fail closed."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            record_identities={
+                "snapshot_hash": "2" * 64, "chunk_plan_hash": "3" * 64,
+            },
+        )
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+
+    def test_foreign_selection_identity_fails_closed(self, tmp_path, monkeypatch):
+        """Selection results bound to a different run (snapshot/plan identity
+        mismatch) are not authoritative -> fail closed."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            selection_identities={"snapshot_hash": "4" * 64},
+        )
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+
+    def test_malformed_selection_results_fails_closed(self, tmp_path, monkeypatch):
+        """A selection record missing its status is malformed -> fail closed
+        (no evidence can be proven selected)."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        selection_results = {
+            "chapter_id": "0001",
+            "snapshot_hash": _PLAN["snapshot_hash"],
+            "chunk_plan_hash": _PLAN["plan_hash"],
+            "results": [{"chunk_id": "chunk0001"}],  # missing status
+        }
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, html, translations,
+            selection_results=selection_results,
+        )
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+
+    def test_missing_selection_results_fails_closed(self, tmp_path, monkeypatch):
+        """accepted_degraded with NO selection_results.json: provenance is
+        unavailable — fail closed (the old code read it as 'no quarantined
+        chunks' and generated from all evidence)."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+        _write_chapter_html(src_dir, "0001", _CH1_HTML)
+        out_dir = out_base / "chapter_0001"
+        _make_chapter_artifacts(
+            out_dir, "0001", terminal_status="accepted_degraded",
+            quarantined=[], translations=_CH1_TRANSLATIONS, chunk_plan=_PLAN,
+        )
+        (out_dir / "selection_results.json").unlink()
+
+        result = v4_book_run.run_book(
+            memory_dir=memory, chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
 
 
 # ---------------------------------------------------------------------------

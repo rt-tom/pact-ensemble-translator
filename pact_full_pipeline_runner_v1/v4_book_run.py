@@ -28,7 +28,20 @@ mixed candidate keeps only its accepted-chunk occurrences. When the PID->chunk
 plan backing that exclusion is missing, corrupt, empty, ambiguous (duplicate
 PID/chunk ownership, malformed data) or incomplete, the chapter fails closed
 (B9-F5/F6): no candidate, ledger, observation or glossary contribution, with a
-logged warning (the run never crashes). The B7
+logged warning (the run never crashes). B9-F7 (review B9-RV6) strengthens the
+``accepted_degraded`` gate: the persisted ``chunk_plan.json`` is accepted ONLY
+as the canonical ``ChunkPlanArtifact`` payload of this strict run — exact
+contract shape, ``pact-v4-chunk-plan/v1`` artifact tag, content-derived
+``plan_hash``, and identity bound to ``strict_chapter_trial_record.json``
+``identities`` (snapshot_hash / chunk_plan_hash) — and the evidence
+``selection_results.json`` must bind to the same run and match the plan's chunk
+membership exactly. Candidate evidence may then originate ONLY in
+authoritatively ``selected`` chunks; any nonselected chunk (quarantined,
+error, failed, unknown, needs_synthesis, incomplete_generation, malformed/
+missing selection records) contributes no pids, and missing/corrupt/empty/
+partial/foreign/duplicate/inconsistent plan-or-selection provenance fails
+closed for the entire candidate loop (no candidate, ledger, observation or
+glossary mutation; warning logged; no crash). The B7
 ``MemoryManager.promote`` path keeps the quarantined-chunk filter working;
 after ``promote`` any dict-valued glossary entry is restored to the flat
 ``{source: target}`` on-disk contract (``_glossary_entries`` skips dict
@@ -74,6 +87,11 @@ from pact_v4.phase1.glossary_candidates import (
     generate_candidates,
 )
 from pact_v4.phase1.memory import MemoryManager
+from pact_v4.phase1.models import (
+    _require_exact_keys,
+    _require_hash,
+    canonical_json_hash,
+)
 from pact_v4.runtime.bible_renderer import render_bible_section
 
 LOG = logging.getLogger(__name__)
@@ -222,6 +240,13 @@ def _pid_to_chunk(out_dir: Path) -> Optional[Dict[str, str]]:
     treat ``None`` as fail-closed (B9-F5/F6): an unavailable or
     ambiguous map cannot authoritatively exclude quarantined evidence
     and must not be read as "no quarantined chunks".
+
+    Since B9-F7 this lenient parse backs ONLY the ``complete`` path (and
+    the legacy quarantined-only exclusion it shares); ``accepted_degraded``
+    chapters go through ``_authoritative_selected_provenance`` instead,
+    which binds the plan to the strict-run identities and canonical
+    ``ChunkPlanArtifact`` contract (artifact tag, snapshot/plan hash,
+    exact shape, plan-vs-selection membership).
     """
     plan = _load_json(out_dir / "chunk_plan.json", None)
     if not isinstance(plan, dict):
@@ -254,6 +279,257 @@ def _pid_to_chunk(out_dir: Path) -> Optional[Dict[str, str]]:
     return mapping
 
 
+def _strict_run_identities(out_dir: Path) -> Optional[Dict[str, str]]:
+    """``{snapshot_hash, chunk_plan_hash}`` from the strict run record.
+
+    The strict driver persists its identity chain in
+    ``strict_chapter_trial_record.json`` → ``identities`` (source_hash /
+    snapshot_hash / chunk_plan_hash / config_identity). This is the
+    authoritative identity of the chapter's run: the persisted
+    ``chunk_plan.json`` and ``selection_results.json`` are only accepted
+    when their identity fields match these hashes (B9-F7). Returns ``None``
+    when the record is missing/corrupt or the identities are absent or not
+    valid content hashes — provenance is then unavailable and the caller
+    must fail closed.
+    """
+    record = _load_run_record(out_dir)
+    identities = record.get("identities")
+    if not isinstance(identities, dict):
+        return None
+    snapshot_hash = identities.get("snapshot_hash")
+    chunk_plan_hash = identities.get("chunk_plan_hash")
+    if not isinstance(snapshot_hash, str) or not isinstance(chunk_plan_hash, str):
+        return None
+    try:
+        _require_hash(snapshot_hash, "identities.snapshot_hash")
+        _require_hash(chunk_plan_hash, "identities.chunk_plan_hash")
+    except ValueError:
+        return None
+    return {"snapshot_hash": snapshot_hash, "chunk_plan_hash": chunk_plan_hash}
+
+
+def _validate_canonical_chunk_plan(
+    plan: Any, identities: Mapping[str, str],
+) -> Optional[Dict[str, str]]:
+    """Validate ``chunk_plan.json`` as the canonical, identity-bound
+    ``ChunkPlanArtifact`` payload of THIS strict run; returns ``{pid:
+    chunk_id}`` or ``None`` (foreign/corrupt/malformed — fail closed).
+
+    B9-F7: the plan is authoritative only when it is the canonical
+    ``ChunkPlanArtifact`` contract payload (exact keys, ``pact-v4-chunk-plan/v1``
+    artifact tag, per-chunk canonical shape, unique PID ownership) AND its
+    identity binds to the strict run: ``snapshot_hash`` matches the run
+    record, and ``plan_hash`` both recomputes from the canonical identity
+    payload (content-derived, same ``canonical_json_hash`` as
+    ``ChunkPlanArtifact._identity_payload``) and matches the record's
+    ``chunk_plan_hash``. A structurally minimal or forged plan that is not
+    the persisted artifact of this run fails closed.
+    """
+    if not isinstance(plan, dict):
+        return None
+    try:
+        _require_exact_keys(
+            plan, {"artifact", "snapshot_hash", "chunks", "plan_hash"},
+            "chunk_plan.json",
+        )
+    except ValueError:
+        return None
+    if plan["artifact"] != "pact-v4-chunk-plan/v1":
+        return None
+    if plan["snapshot_hash"] != identities["snapshot_hash"]:
+        return None
+    try:
+        _require_hash(plan["plan_hash"], "chunk_plan.json plan_hash")
+    except ValueError:
+        return None
+    if plan["plan_hash"] != identities["chunk_plan_hash"]:
+        return None
+    chunks = plan["chunks"]
+    if not isinstance(chunks, list) or not chunks:
+        return None
+    mapping: Dict[str, str] = {}
+    seen_chunk_ids = set()
+    canonical_chunks: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            return None  # malformed chunk entry
+        try:
+            _require_exact_keys(
+                chunk,
+                {"chunk_id", "snapshot_hash", "pids", "word_counts",
+                 "context", "undersized_exception"},
+                "chunk_plan.json chunk",
+            )
+            _require_exact_keys(
+                chunk["context"], {"left_ru", "right_en"},
+                "chunk_plan.json chunk context",
+            )
+        except ValueError:
+            return None
+        if chunk["snapshot_hash"] != identities["snapshot_hash"]:
+            return None  # foreign snapshot identity inside the plan
+        chunk_id = chunk["chunk_id"]
+        if not isinstance(chunk_id, str) or not chunk_id:
+            return None  # missing chunk identity
+        if chunk_id in seen_chunk_ids:
+            return None  # duplicate/ambiguous chunk identity
+        seen_chunk_ids.add(chunk_id)
+        pids = chunk["pids"]
+        word_counts = chunk["word_counts"]
+        if not isinstance(pids, list) or not pids:
+            return None  # malformed/non-list/empty PID data
+        if not isinstance(word_counts, list) or len(word_counts) != len(pids):
+            return None  # word_counts must be positionally aligned with pids
+        for pid, word_count in zip(pids, word_counts):
+            if not isinstance(pid, str) or not pid:
+                return None  # malformed PID data
+            if pid in mapping:
+                return None  # duplicate PID ownership (within/across chunks)
+            mapping[pid] = chunk_id
+            if not isinstance(word_count, int) or isinstance(word_count, bool) \
+                    or word_count < 0:
+                return None  # malformed word count
+        context = chunk["context"]
+        if not isinstance(context["left_ru"], str) \
+                or not isinstance(context["right_en"], list):
+            return None  # malformed chunk context
+        if not isinstance(chunk["undersized_exception"], bool):
+            return None  # malformed chunk flag
+        canonical_chunks.append({
+            "chunk_id": chunk_id,
+            "snapshot_hash": chunk["snapshot_hash"],
+            "pids": list(pids),
+            "word_counts": list(word_counts),
+            "context": {
+                "left_ru": context["left_ru"],
+                "right_en": list(context["right_en"]),
+            },
+            "undersized_exception": chunk["undersized_exception"],
+        })
+    # Content-derived identity: the plan_hash must recompute from the
+    # canonical identity payload exactly like ChunkPlanArtifact._identity_payload
+    # (artifact tag, snapshot_hash, canonical chunks) — a plan whose hash
+    # does not match its own content is not the artifact this run persisted.
+    identity_payload = {
+        "artifact": "pact-v4-chunk-plan/v1",
+        "snapshot_hash": identities["snapshot_hash"],
+        "chunks": canonical_chunks,
+    }
+    if canonical_json_hash(identity_payload) != plan["plan_hash"]:
+        return None  # tampered/inconsistent plan hash
+    return mapping
+
+
+def _validate_selection_selected(
+    selection: Any,
+    identities: Mapping[str, str],
+    plan_chunk_ids: set,
+) -> Optional[set]:
+    """Validate ``selection_results.json`` against the run identity and the
+    plan; returns the set of authoritatively ``selected`` chunk ids or
+    ``None`` (missing/corrupt/foreign/membership-inconsistent — fail closed).
+
+    The selection file must bind to the same run (``snapshot_hash`` /
+    ``chunk_plan_hash`` identity fields match the record) and its chunk
+    membership must match the plan exactly: every plan chunk has exactly one
+    selection record and no record names a chunk the plan does not own
+    (unknown/duplicate/missing chunk identity or plan-vs-selection
+    membership disagreement = non-authoritative). Candidate evidence may
+    originate ONLY in chunks with ``status == "selected"``; every other
+    status (``quarantined``, ``needs_synthesis``, ``incomplete_generation``,
+    ``error``, ``failed``, ``unknown``, ...) is nonselected and contributes
+    no evidence (B9-F7). A malformed record (non-dict, missing chunk_id/
+    status, non-string status) fails closed.
+    """
+    if not isinstance(selection, dict):
+        return None
+    if selection.get("snapshot_hash") != identities["snapshot_hash"]:
+        return None  # foreign snapshot identity
+    if selection.get("chunk_plan_hash") != identities["chunk_plan_hash"]:
+        return None  # foreign plan identity
+    results = selection.get("results")
+    if not isinstance(results, list) or not results:
+        return None  # missing/empty selection records
+    seen = set()
+    selected = set()
+    for item in results:
+        if not isinstance(item, dict):
+            return None  # malformed selection record
+        chunk_id = item.get("chunk_id")
+        if not isinstance(chunk_id, str) or not chunk_id:
+            return None  # malformed chunk identity in selection
+        if chunk_id not in plan_chunk_ids:
+            return None  # unknown chunk identity (plan-vs-selection mismatch)
+        if chunk_id in seen:
+            return None  # duplicate selection record
+        seen.add(chunk_id)
+        status = item.get("status")
+        if not isinstance(status, str) or not status:
+            return None  # malformed/missing selection status
+        if status == "selected":
+            selected.add(chunk_id)
+    if seen != plan_chunk_ids:
+        return None  # missing chunk identity / membership mismatch
+    return selected
+
+
+def _authoritative_selected_provenance(
+    out_dir: Path,
+) -> Optional[Tuple[Dict[str, str], set]]:
+    """B9-F7: bind the accepted_degraded evidence gate to the strict-run
+    artifacts.
+
+    Returns ``(pid_to_chunk, selected_chunk_ids)`` when the persisted
+    ``chunk_plan.json`` is the canonical identity-bound ``ChunkPlanArtifact``
+    payload of this run AND ``selection_results.json`` binds to the same run
+    with plan-exact membership. Returns ``None`` — the caller must fail
+    closed for the whole candidate loop — when the strict record identities,
+    the plan, or the selection is missing, corrupt, empty, foreign (artifact/
+    snapshot/plan identity mismatch), ambiguous (duplicate PID or chunk
+    ownership), malformed, or plan-vs-selection inconsistent. A warning is
+    logged with the specific reason; the book run never crashes.
+    """
+    identities = _strict_run_identities(out_dir)
+    if identities is None:
+        LOG.warning(
+            "B9-F7: %s accepted_degraded but strict run record identities "
+            "missing/corrupt/invalid; failing closed — no candidate "
+            "generation, ledger line, observation or glossary mutation",
+            out_dir.name,
+        )
+        return None
+    plan = _load_json(out_dir / "chunk_plan.json", None)
+    pid_to_chunk = _validate_canonical_chunk_plan(plan, identities)
+    if pid_to_chunk is None:
+        LOG.warning(
+            "B9-F7: %s accepted_degraded but chunk_plan.json is not the "
+            "canonical identity-bound ChunkPlanArtifact of this run "
+            "(missing/corrupt/empty, foreign artifact/snapshot/plan "
+            "identity, duplicate PID/chunk ownership or malformed chunk/PID "
+            "data); failing closed — no candidate generation, ledger line, "
+            "observation or glossary mutation",
+            out_dir.name,
+        )
+        return None
+    plan_chunk_ids = {str(chunk) for chunk in pid_to_chunk.values()}
+    selection = _load_json(out_dir / "selection_results.json", None)
+    selected_chunk_ids = _validate_selection_selected(
+        selection, identities, plan_chunk_ids,
+    )
+    if selected_chunk_ids is None:
+        LOG.warning(
+            "B9-F7: %s accepted_degraded but selection_results.json is "
+            "missing/corrupt/empty, foreign (snapshot/plan identity), "
+            "malformed (missing/duplicate/unknown chunk identity or status) "
+            "or inconsistent with the chunk plan membership; failing "
+            "closed — no candidate generation, ledger line, observation or "
+            "glossary mutation",
+            out_dir.name,
+        )
+        return None
+    return pid_to_chunk, selected_chunk_ids
+
+
 def _generate_and_align_chapter(
     chapter_html: Path,
     out_dir: Path,
@@ -264,6 +540,7 @@ def _generate_and_align_chapter(
     consensus_ratio: float,
     mixed_script_allow: Sequence[str] = (),
     excluded_chunk_ids: Sequence[str] = (),
+    authoritative_provenance: Optional[Tuple[Dict[str, str], set]] = None,
 ) -> List[Dict[str, Any]]:
     """B9-I2: generate candidates + consensus-align targets for one chapter.
 
@@ -299,6 +576,20 @@ def _generate_and_align_chapter(
     observation and mutates no glossary. A warning is logged; the book run
     never crashes.
 
+    B9-F7 (accepted_degraded — selected-only evidence, canonical binding):
+    when ``authoritative_provenance`` is provided (a ``(pid_to_chunk,
+    selected_chunk_ids)`` tuple produced by ``_authoritative_selected_provenance``,
+    which already verified the canonical identity-bound ``ChunkPlanArtifact``
+    payload, the strict-run identity chain, and plan-vs-selection membership),
+    the evidence gate is selected-only: pids owned by NONselected chunks
+    (quarantined, error, failed, unknown, needs_synthesis,
+    incomplete_generation, ...) are dropped from BOTH the source and the
+    translation before generation and alignment, so candidates carry only
+    proven ``selected``-chunk occurrences. A present source/translation pid
+    the plan does not map (partial plan) still fails closed. ``complete``
+    chapters pass ``authoritative_provenance=None`` and keep the legacy
+    path unchanged.
+
     Degrades to ``[]`` on missing artifacts (e.g. a chapter that failed
     before persisting translations) so the book run never crashes on the
     candidate loop. No model calls, no HTTP.
@@ -310,65 +601,91 @@ def _generate_and_align_chapter(
         translations = _load_json(out_dir / "translations.json", {})
         if not translations:
             return []
-        pid_to_chunk = _pid_to_chunk(out_dir)
-        excluded = {str(c) for c in (excluded_chunk_ids or ())}
-        if excluded:
-            # B9-F5/F6 (fail closed on unavailable or ambiguous
-            # quarantined-chunk provenance): an accepted_degraded chapter
-            # with quarantined chunks may only generate candidates when the
-            # PID->chunk plan authoritatively maps each source/translation
-            # PID exactly once to a valid chunk. A missing/corrupt/empty/
-            # ambiguous plan (``None`` — duplicate PID or chunk ownership,
-            # malformed data, missing chunk identity) or an incomplete plan
-            # (a source/translation pid the plan does not map) leaves pids
-            # of unknown provenance — they could belong to a quarantined
-            # chunk — so the chapter fails closed: no candidates, no ledger
-            # line, no observation, no glossary mutation (a warning is
-            # logged; the run never crashes).
-            if pid_to_chunk is None:
+        present_pids = (
+            {str(pid) for pid in source_by_pid}
+            | {str(pid) for pid in translations}
+        )
+        if authoritative_provenance is not None:
+            # B9-F7: accepted_degraded — selected-only evidence from the
+            # canonical, identity-bound plan+selection gate. Every present
+            # source/translation pid must be provably owned by a plan chunk
+            # (a partial plan leaves pids of unknown provenance — they could
+            # belong to a nonselected chunk), and only pids of
+            # authoritatively ``selected`` chunks may generate candidates.
+            pid_to_chunk, selected_chunk_ids = authoritative_provenance
+            if not present_pids <= set(pid_to_chunk):
                 LOG.warning(
-                    "B9-F6: %s accepted_degraded with quarantined chunks %s "
-                    "but PID->chunk provenance missing/corrupt/empty/"
-                    "ambiguous (duplicate or malformed ownership); failing "
-                    "closed — no candidate generation, ledger line, "
-                    "observation or glossary mutation",
-                    out_dir.name, sorted(excluded),
+                    "B9-F7: %s accepted_degraded but PID->chunk provenance "
+                    "incomplete (plan pids=%d, unmapped source/translation "
+                    "pids=%s); failing closed — no candidate generation, "
+                    "ledger line, observation or glossary mutation",
+                    out_dir.name, len(pid_to_chunk),
+                    sorted(present_pids - set(pid_to_chunk)),
                 )
                 return []
-            plan_pids = {str(pid) for pid in pid_to_chunk}
-            present_pids = (
-                {str(pid) for pid in source_by_pid}
-                | {str(pid) for pid in translations}
-            )
-            if not present_pids <= plan_pids:
-                LOG.warning(
-                    "B9-F5: %s accepted_degraded with quarantined chunks %s "
-                    "but PID->chunk provenance incomplete (plan pids=%d, "
-                    "unmapped source/translation pids=%s); failing closed — "
-                    "no candidate generation, ledger line, observation or "
-                    "glossary mutation",
-                    out_dir.name, sorted(excluded), len(plan_pids),
-                    sorted(present_pids - plan_pids),
-                )
-                return []
-            # Quarantined chunks carry no authoritative evidence: drop their
-            # pids from the source and the translation before generation and
-            # alignment (B9-RV3). Every present pid is provably mapped by the
-            # plan (checked above), so the remaining evidence is wholly from
-            # accepted chunks.
+            selected = {str(c) for c in selected_chunk_ids}
             drop_pids = {
                 pid for pid, chunk in pid_to_chunk.items()
-                if str(chunk) in excluded
+                if str(chunk) not in selected
             }
-            if drop_pids:
-                source_by_pid = {
-                    pid: text for pid, text in source_by_pid.items()
-                    if pid not in drop_pids
+        else:
+            pid_to_chunk = _pid_to_chunk(out_dir)
+            excluded = {str(c) for c in (excluded_chunk_ids or ())}
+            if excluded:
+                # B9-F5/F6 (fail closed on unavailable or ambiguous
+                # quarantined-chunk provenance): an accepted_degraded chapter
+                # with quarantined chunks may only generate candidates when the
+                # PID->chunk plan authoritatively maps each source/translation
+                # PID exactly once to a valid chunk. A missing/corrupt/empty/
+                # ambiguous plan (``None`` — duplicate PID or chunk ownership,
+                # malformed data, missing chunk identity) or an incomplete plan
+                # (a source/translation pid the plan does not map) leaves pids
+                # of unknown provenance — they could belong to a quarantined
+                # chunk — so the chapter fails closed: no candidates, no ledger
+                # line, no observation, no glossary mutation (a warning is
+                # logged; the run never crashes).
+                if pid_to_chunk is None:
+                    LOG.warning(
+                        "B9-F6: %s accepted_degraded with quarantined chunks %s "
+                        "but PID->chunk provenance missing/corrupt/empty/"
+                        "ambiguous (duplicate or malformed ownership); failing "
+                        "closed — no candidate generation, ledger line, "
+                        "observation or glossary mutation",
+                        out_dir.name, sorted(excluded),
+                    )
+                    return []
+                plan_pids = {str(pid) for pid in pid_to_chunk}
+                if not present_pids <= plan_pids:
+                    LOG.warning(
+                        "B9-F5: %s accepted_degraded with quarantined chunks %s "
+                        "but PID->chunk provenance incomplete (plan pids=%d, "
+                        "unmapped source/translation pids=%s); failing closed — "
+                        "no candidate generation, ledger line, observation or "
+                        "glossary mutation",
+                        out_dir.name, sorted(excluded), len(plan_pids),
+                        sorted(present_pids - plan_pids),
+                    )
+                    return []
+                # Quarantined chunks carry no authoritative evidence: drop their
+                # pids from the source and the translation before generation and
+                # alignment (B9-RV3). Every present pid is provably mapped by the
+                # plan (checked above), so the remaining evidence is wholly from
+                # accepted chunks.
+                drop_pids = {
+                    pid for pid, chunk in pid_to_chunk.items()
+                    if str(chunk) in excluded
                 }
-                translations = {
-                    pid: text for pid, text in translations.items()
-                    if pid not in drop_pids
-                }
+            else:
+                drop_pids = set()
+        if drop_pids:
+            source_by_pid = {
+                pid: text for pid, text in source_by_pid.items()
+                if pid not in drop_pids
+            }
+            translations = {
+                pid: text for pid, text in translations.items()
+                if pid not in drop_pids
+            }
         if not source_by_pid or not translations:
             return []
         glossary = _load_json(memory_dir / "glossary.json", {})
@@ -593,16 +910,38 @@ def run_book(
             "conflicts": 0,
         }
         if terminal_status in _PROMOTING_STATUSES:
-            aligned = _generate_and_align_chapter(
-                chapter_html,
-                out_dir,
-                memory_dir,
-                proper_name_min_occurrences=proper_name_min_occurrences,
-                term_min_occurrences=term_min_occurrences,
-                consensus_ratio=consensus_ratio,
-                mixed_script_allow=mixed_script_allow,
-                excluded_chunk_ids=quarantined,
-            )
+            if terminal_status == "accepted_degraded":
+                # B9-F7: the accepted_degraded evidence gate binds the
+                # candidate loop to the canonical identity-bound chunk plan
+                # and selection results of THIS strict run; evidence may
+                # originate ONLY in proven ``selected`` chunks. Missing/
+                # corrupt/foreign/inconsistent provenance fails closed
+                # (warning logged inside the gate; the run never crashes).
+                provenance = _authoritative_selected_provenance(out_dir)
+                if provenance is None:
+                    aligned = []
+                else:
+                    aligned = _generate_and_align_chapter(
+                        chapter_html,
+                        out_dir,
+                        memory_dir,
+                        proper_name_min_occurrences=proper_name_min_occurrences,
+                        term_min_occurrences=term_min_occurrences,
+                        consensus_ratio=consensus_ratio,
+                        mixed_script_allow=mixed_script_allow,
+                        authoritative_provenance=provenance,
+                    )
+            else:
+                aligned = _generate_and_align_chapter(
+                    chapter_html,
+                    out_dir,
+                    memory_dir,
+                    proper_name_min_occurrences=proper_name_min_occurrences,
+                    term_min_occurrences=term_min_occurrences,
+                    consensus_ratio=consensus_ratio,
+                    mixed_script_allow=mixed_script_allow,
+                    excluded_chunk_ids=quarantined,
+                )
             if aligned:
                 ledger.append_chapter(chapter_id, aligned)
             candidates_block["generated"] = len(aligned)
