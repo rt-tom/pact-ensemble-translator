@@ -113,6 +113,40 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
 - Codex and Claude Code may work in parallel only in distinct branches/worktrees.
 - For handoff, push a checkpoint commit; the next agent fetches and continues with a new commit.
 
+## Kanban-практика (Vibe Kanban, rule 2026-08-04)
+
+Урок B9 (25+ карточек вместо 6): раздувание доски — следствие параллельных
+сессий на одну задачу и по-фиксовых карточек, а не гранулярности как таковой.
+Правила для всех агентов:
+
+- **Гранулярность — средняя**: одна implementation-карточка на верифицируемую
+  единицу (модуль / интеграция / docs) + одна review-карточка на неё. Не
+  дробить на микро-задачи, не сливать крупный объём в одну карточку (ревью
+  диффа в тысячи строк пропускает дефекты).
+- **Fix-циклы группировать**: все замечания ОДНОГО ревью → одна fix-карточка →
+  одно re-review. Не создавать карточку на каждый дефект.
+- **Не блокировать фикс на ревью при созданной review-карточке**: если
+  review-карточка уже создана с parent на фикс-карточку, фикс после готовности
+  работы закрывают (complete) — иначе тупик: фикс ждёт ревью, ревью ждёт фикс
+  (случаи I3b→RV6-docs, F10→RV10). Незакоммиченный дифф ревьюер проверяет до
+  коммита, если такова инструкция задачи.
+- **Одна задача = один активный владелец**: не запускать параллельные сессии
+  на одну и ту же задачу (дубли карточек и ветки-близнецы — дороже любой
+  гранулярности). Дубликаты карточек отменять сразу (complete с пометкой).
+- **Новая сессия архитектора = статус-чек**: первым действием выполнить
+  `hermes kanban list` + `hermes kanban diagnostics`; новую карточку создавать
+  только если аналогичной нет на доске; решения владельца фиксировать в
+  карточке и/или DECISIONS.md, а не только в чате сессии (worker'ы не видят
+  историю чата другой сессии).
+- **Developer до отправки на ревью**: контракт-тесты, включая повреждённые
+  входные данные (corrupt/empty/ambiguous chunk_plan и т.п.), полный suite,
+  статический doc-vs-code чек. Часть HIGH-замечаний отсекается самопроверкой.
+- **Дифф-фёрст чтение (экономия токенов)**: для изменений кода использовать
+  `git diff`, а не чтение полных файлов; полные файлы/документы читать только
+  точечно (read_file с offset/limit), не целиком; в отчётах не дублировать
+  прочитанные тексты. Input-бюджет задач: у нас ~100–270k токенов на задачу,
+  основная часть — чтение полного контекста, а не диффов.
+
 ## Risk classification
 
 Use `LOW RISK` only for a narrow, unambiguous implementation defect that does not alter translation semantics, issue merging, verification, repair lifecycle, gates, terminal policy, cache identity/invalidation, persistent memory, or model/prompt policy. A regression test is required.
