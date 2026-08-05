@@ -25,9 +25,10 @@ source-derived, review F3), and for ``accepted_degraded`` the quarantined-chunk
 evidence is excluded BEFORE the ledger and auto-promotion (B9-RV3): a candidate
 whose occurrences come only from quarantined chunks is dropped entirely, and a
 mixed candidate keeps only its accepted-chunk occurrences. When the PID->chunk
-plan backing that exclusion is missing, corrupt, empty or incomplete, the
-chapter fails closed (B9-F5): no candidate, ledger, observation or glossary
-contribution, with a logged warning (the run never crashes). The B7
+plan backing that exclusion is missing, corrupt, empty, ambiguous (duplicate
+PID/chunk ownership, malformed data) or incomplete, the chapter fails closed
+(B9-F5/F6): no candidate, ledger, observation or glossary contribution, with a
+logged warning (the run never crashes). The B7
 ``MemoryManager.promote`` path keeps the quarantined-chunk filter working;
 after ``promote`` any dict-valued glossary entry is restored to the flat
 ``{source: target}`` on-disk contract (``_glossary_entries`` skips dict
@@ -207,26 +208,49 @@ def _source_by_pid(chapter_html: Path) -> Dict[str, str]:
     return {block.pid: block.text for block in blocks}
 
 
-def _pid_to_chunk(out_dir: Path) -> Dict[str, str]:
+def _pid_to_chunk(out_dir: Path) -> Optional[Dict[str, str]]:
     """``{pid: chunk_id}`` from the strict driver's ``chunk_plan.json``.
 
-    Missing/corrupt/empty plan -> empty mapping. Callers filtering
-    quarantined chunks MUST treat an empty or incomplete mapping as
-    fail-closed (B9-F5): an empty map cannot authoritatively exclude any
-    quarantined evidence and must not be read as "no quarantined chunks".
+    Returns ``None`` — NOT an empty dict — when the plan is missing,
+    corrupt, empty, or non-authoritative (B9-F6): duplicate PID
+    ownership (a PID listed in more than one chunk, or twice within one
+    chunk), malformed/non-list chunk or PID data, missing or duplicate
+    chunk identity. The core ``ChunkPlanArtifact`` contract rejects such
+    ownership, so the persisted plan is corrupt, not acceptable
+    provenance, and must never be normalized or overwritten into a
+    plausible-looking mapping. Callers filtering quarantined chunks MUST
+    treat ``None`` as fail-closed (B9-F5/F6): an unavailable or
+    ambiguous map cannot authoritatively exclude quarantined evidence
+    and must not be read as "no quarantined chunks".
     """
-    plan = _load_json(out_dir / "chunk_plan.json", {})
-    mapping: Dict[str, str] = {}
+    plan = _load_json(out_dir / "chunk_plan.json", None)
     if not isinstance(plan, dict):
-        return mapping
-    for chunk in plan.get("chunks", []) or []:
+        return None
+    chunks = plan.get("chunks")
+    if not isinstance(chunks, list):
+        return None
+    mapping: Dict[str, str] = {}
+    seen_chunk_ids = set()
+    for chunk in chunks:
         if not isinstance(chunk, dict):
-            continue
+            return None  # malformed chunk entry
         chunk_id = chunk.get("chunk_id")
-        if chunk_id is None:
-            continue
-        for pid in chunk.get("pids", []) or []:
-            mapping[str(pid)] = str(chunk_id)
+        if not isinstance(chunk_id, str) or not chunk_id:
+            return None  # missing chunk identity
+        if chunk_id in seen_chunk_ids:
+            return None  # duplicate/ambiguous chunk identity
+        seen_chunk_ids.add(chunk_id)
+        pids = chunk.get("pids")
+        if not isinstance(pids, list) or not pids:
+            return None  # malformed/non-list/empty PID data
+        for pid in pids:
+            if not isinstance(pid, str) or not pid:
+                return None  # malformed PID data
+            if pid in mapping:
+                return None  # duplicate PID ownership (within/across chunks)
+            mapping[pid] = chunk_id
+    if not mapping:
+        return None  # empty plan — nothing authoritatively mapped
     return mapping
 
 
@@ -263,13 +287,17 @@ def _generate_and_align_chapter(
     candidate whose evidence is wholly from quarantined chunks is therefore
     never generated at all: it has no ledger line and cannot promote.
 
-    B9-F5 (fail closed on unavailable provenance): when
+    B9-F5/F6 (fail closed on unavailable or ambiguous provenance): when
     ``excluded_chunk_ids`` is non-empty, the PID->chunk plan must first
     authoritatively exclude ALL quarantined evidence — a missing/corrupt/
-    empty ``chunk_plan.json`` (empty mapping) or an incomplete plan (a
-    source/translation pid the plan does not map) fails closed: the chapter
-    generates no candidates, appends no ledger line, creates no observation
-    and mutates no glossary. A warning is logged; the book run never crashes.
+    empty ``chunk_plan.json`` (``None`` mapping), a plan that does not map
+    each source/translation pid exactly once to a valid chunk (duplicate
+    PID ownership within/across chunks, duplicate or missing chunk
+    identity, malformed/non-list chunk or PID data), or an incomplete plan
+    (a source/translation pid the plan does not map) fails closed: the
+    chapter generates no candidates, appends no ledger line, creates no
+    observation and mutates no glossary. A warning is logged; the book run
+    never crashes.
 
     Degrades to ``[]`` on missing artifacts (e.g. a chapter that failed
     before persisting translations) so the book run never crashes on the
@@ -285,27 +313,40 @@ def _generate_and_align_chapter(
         pid_to_chunk = _pid_to_chunk(out_dir)
         excluded = {str(c) for c in (excluded_chunk_ids or ())}
         if excluded:
-            # B9-F5 (fail closed on unavailable quarantined-chunk provenance):
-            # an accepted_degraded chapter with quarantined chunks may only
-            # generate candidates when the PID->chunk plan authoritatively
-            # excludes ALL quarantined evidence. A missing/corrupt/empty plan
-            # (empty mapping) or an incomplete plan (a source/translation pid
-            # the plan does not map) leaves pids of unknown provenance — they
-            # could belong to a quarantined chunk — so the chapter fails
-            # closed: no candidates, no ledger line, no observation, no
-            # glossary mutation (a warning is logged; the run never crashes).
+            # B9-F5/F6 (fail closed on unavailable or ambiguous
+            # quarantined-chunk provenance): an accepted_degraded chapter
+            # with quarantined chunks may only generate candidates when the
+            # PID->chunk plan authoritatively maps each source/translation
+            # PID exactly once to a valid chunk. A missing/corrupt/empty/
+            # ambiguous plan (``None`` — duplicate PID or chunk ownership,
+            # malformed data, missing chunk identity) or an incomplete plan
+            # (a source/translation pid the plan does not map) leaves pids
+            # of unknown provenance — they could belong to a quarantined
+            # chunk — so the chapter fails closed: no candidates, no ledger
+            # line, no observation, no glossary mutation (a warning is
+            # logged; the run never crashes).
+            if pid_to_chunk is None:
+                LOG.warning(
+                    "B9-F6: %s accepted_degraded with quarantined chunks %s "
+                    "but PID->chunk provenance missing/corrupt/empty/"
+                    "ambiguous (duplicate or malformed ownership); failing "
+                    "closed — no candidate generation, ledger line, "
+                    "observation or glossary mutation",
+                    out_dir.name, sorted(excluded),
+                )
+                return []
             plan_pids = {str(pid) for pid in pid_to_chunk}
             present_pids = (
                 {str(pid) for pid in source_by_pid}
                 | {str(pid) for pid in translations}
             )
-            if not plan_pids or not present_pids <= plan_pids:
+            if not present_pids <= plan_pids:
                 LOG.warning(
                     "B9-F5: %s accepted_degraded with quarantined chunks %s "
-                    "but PID->chunk provenance missing/corrupt/empty/"
-                    "incomplete (plan pids=%d, unmapped source/translation "
-                    "pids=%s); failing closed — no candidate generation, "
-                    "ledger line, observation or glossary mutation",
+                    "but PID->chunk provenance incomplete (plan pids=%d, "
+                    "unmapped source/translation pids=%s); failing closed — "
+                    "no candidate generation, ledger line, observation or "
+                    "glossary mutation",
                     out_dir.name, sorted(excluded), len(plan_pids),
                     sorted(present_pids - plan_pids),
                 )

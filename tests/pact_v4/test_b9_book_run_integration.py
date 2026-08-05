@@ -598,6 +598,112 @@ class TestQuarantinedProvenanceFailClosed:
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
 
+    @pytest.mark.parametrize("plan_mode", ["across_chunks_accepted_wins",
+                                           "within_chunk_duplicate"])
+    def test_fail_closed_on_duplicate_pid_ownership(
+        self, tmp_path, monkeypatch, plan_mode,
+    ):
+        """B9-F6: a corrupt ``chunk_plan.json`` that maps a PID to more than
+        one chunk (or twice within one chunk) is non-authoritative and fails
+        closed — the old dict-assignment silently let the LAST chunk win, so
+        a later accepted chunk masked the same PID's earlier quarantined
+        ownership and quarantined evidence generated a candidate.
+
+        Reproduction from B9-RV5 on the reviewed tip: quarantined chunk owns
+        p00001/p00002 first, accepted chunk owns the SAME pids later ->
+        old code emitted a Blake->Блэйк candidate with
+        ``chunk_ids=['accepted']``. Here the same corrupt plan must yield
+        zero candidates, no ledger line, no observation, no glossary
+        mutation, and the terminal stays ``accepted_degraded``.
+        """
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        if plan_mode == "across_chunks_accepted_wins":
+            # Quarantined chunk owns p00001/p00002 FIRST, accepted chunk
+            # claims the SAME pids SECOND — the old ``mapping[pid] =
+            # chunk_id`` overwrite made the accepted chunk win, hiding the
+            # quarantined ownership from the drop filter.
+            chunks = [
+                {"chunk_id": "chunk_q", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00002"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+                {"chunk_id": "chunk_a", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00002"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+            ]
+            quarantined = ["chunk_q"]
+        elif plan_mode == "within_chunk_duplicate":
+            # One chunk lists the same pid twice; the accepted chunk also
+            # claims p00001 twice. Old code normalized the duplicate away.
+            chunks = [
+                {"chunk_id": "chunk_q", "snapshot_hash": "test",
+                 "pids": ["p00003"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+                {"chunk_id": "chunk_a", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00001", "p00002"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+            ]
+            quarantined = ["chunk_q"]
+        else:  # pragma: no cover
+            raise AssertionError(f"unknown plan_mode {plan_mode!r}")
+        duplicate_plan = {
+            "artifact": "pact-v4-chunk-plan/v1",
+            "snapshot_hash": "test",
+            "plan_hash": "test",
+            "chunks": chunks,
+        }
+        _write_chapter_html(src_dir, "0001", html)
+        _make_chapter_artifacts(
+            out_base / "chapter_0001", "0001",
+            terminal_status="accepted_degraded", quarantined=quarantined,
+            translations=translations, chunk_plan=duplicate_plan,
+        )
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+
+        # Terminal stays accepted_degraded (the run itself succeeded); the
+        # B9 loop failed closed on the corrupt provenance.
+        assert result["chapters"][0]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
 
 # ---------------------------------------------------------------------------
 # _auto_promote_glossary: thresholds and conflict paths (B9-I2 req 2)
