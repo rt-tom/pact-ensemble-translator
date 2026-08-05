@@ -55,6 +55,7 @@ from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.opencode_backend import (
     OpenCodeServerBackend,
     OpenCodeServerBackendConfig,
+    RemoteBudget,
     build_opencode_descriptor,
 )
 from pact_v4.runtime.opencode_server_lifecycle import (
@@ -820,7 +821,31 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
                 payload.get("server_version_policy", "compatible_minor"),
             ),
         )
-    server = OpenCodeServerBackendConfig(
+    remote_budget_payload = payload.get("remote_budget")
+    remote_budget: Optional[RemoteBudget] = None
+    if isinstance(remote_budget_payload, Mapping):
+        remote_budget = RemoteBudget(
+            max_requests_per_chapter=int(
+                remote_budget_payload.get(
+                    "max_requests_per_chapter",
+                    RemoteBudget().max_requests_per_chapter,
+                )
+            ),
+            max_retry_requests_per_chapter=int(
+                remote_budget_payload.get(
+                    "max_retry_requests_per_chapter",
+                    RemoteBudget().max_retry_requests_per_chapter,
+                )
+            ),
+            max_wait_seconds_on_rate_limit=float(
+                remote_budget_payload.get(
+                    "max_wait_seconds_on_rate_limit",
+                    RemoteBudget().max_wait_seconds_on_rate_limit,
+                )
+            ),
+            max_reported_cost=remote_budget_payload.get("max_reported_cost"),
+        )
+    server_kwargs = dict(
         base_url=str(payload.get("base_url", "http://127.0.0.1:4096")),
         server_version_policy=str(
             payload.get("server_version_policy", "compatible_minor")
@@ -837,6 +862,11 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
         default_temperature=payload.get("default_temperature"),
         default_max_output_tokens=payload.get("default_max_output_tokens"),
     )
+    if remote_budget is not None:
+        # None keeps the dataclass default (``RemoteBudget()``); only an
+        # explicit ``remote_budget`` YAML block overrides it.
+        server_kwargs["remote_budget"] = remote_budget
+    server = OpenCodeServerBackendConfig(**server_kwargs)
     return OpenCodeBackendConfig(
         server=server,
         server_mode=str(payload.get("server_mode", "external")),

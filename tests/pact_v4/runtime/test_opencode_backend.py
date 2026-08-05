@@ -704,36 +704,43 @@ def test_rate_limit_wait_budget_respected():
     assert exc_info.value.error_class == ERROR_REMOTE_BUDGET_EXHAUSTED
 
 
-def test_default_remote_budget_250_covers_full_chapter_cycle():
-    # B10: the default per-chapter remote budget was raised 100 -> 250 so a
-    # complete chapter cycle fits. Estimate: 16 chunks x (2 generation + 2
-    # fidelity + ~0.5 selection) + Step 6 audit 2x16 + repair + retry
-    # reserve. The default must cover that estimate.
+def test_default_remote_budget_500_covers_full_chapter_cycle():
+    # B11: the default per-chapter remote budget was raised 250 -> 500 so a
+    # complete chapter cycle fits with reserve. run_003_remote exhausted 250
+    # at the end of the cycle (convergence re-audit, repair 183 debt,
+    # formatting 102 incidents, quarantined retry all went to debt); a full
+    # cycle needs ~350-400. Estimate: 16 chunks x (2 generation + 2
+    # fidelity + ~0.5 selection) + Step 6 audit 2x16 + convergence + repair
+    # + formatting + quarantined retry + retry reserve. The default must
+    # cover that estimate.
     budget = RemoteBudget()
-    assert budget.max_requests_per_chapter == 250
+    assert budget.max_requests_per_chapter == 500
     chunks = 16
     generation_per_chunk = 2
     fidelity_per_chunk = 2
     selection_per_chunk = 0.5
     audit_units = 2 * chunks  # Qwen + Gemma per chunk
+    convergence_reserve = 2 * chunks  # re-audit of unedited PIDs
     repair_reserve = 16
+    formatting_reserve = 16
     retry_reserve = 16
     estimate = (
         chunks * (generation_per_chunk + fidelity_per_chunk + selection_per_chunk)
-        + audit_units + repair_reserve + retry_reserve
+        + audit_units + convergence_reserve + repair_reserve
+        + formatting_reserve + retry_reserve
     )
     assert budget.max_requests_per_chapter >= estimate
 
 
 def test_default_remote_budget_part_of_backend_identity():
-    # B10: remote_budget is identity-bound (build_opencode_descriptor), so a
-    # config with the raised default carries max_requests_per_chapter=250 in
-    # its identity payload.
+    # B10/B11: remote_budget is identity-bound (build_opencode_descriptor),
+    # so a config with the raised default carries max_requests_per_chapter=500
+    # in its identity payload.
     cfg = _cfg()
     from pact_v4.runtime.opencode_backend import build_opencode_descriptor
 
     desc = build_opencode_descriptor(cfg)
-    assert desc.effective_options["remote_budget"]["max_requests_per_chapter"] == 250
+    assert desc.effective_options["remote_budget"]["max_requests_per_chapter"] == 500
 
 
 # ---------------------------------------------------------------------------

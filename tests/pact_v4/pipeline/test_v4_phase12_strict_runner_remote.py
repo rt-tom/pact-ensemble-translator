@@ -365,3 +365,36 @@ def test_local_remote_parity_identities_and_translations(tmp_path: Path):
     remote_text = json.loads(remote_result.translations_path.read_text(encoding="utf-8"))
     assert local_text == remote_text
     assert all(text.startswith("Перевод номер") for text in remote_text.values())
+
+
+def test_remote_run_config_round_trips_loaded_remote_budget(tmp_path: Path):
+    """B11 regression: a runtime-config payload with ``remote_budget`` loads
+    through the real ``load_runtime_config`` path, flows into a
+    ``StrictRunConfig``, and the run's journal/record identity round-trips
+    against the config's backend identity (budget is identity-bound, so the
+    loaded 500 must be the identity the journal is written under)."""
+    from pact_v4.runtime.runtime_config import load_runtime_config
+
+    payload = {
+        "kind": "opencode_server",
+        "server_mode": "external",
+        "base_url": "http://127.0.0.1:4096",
+        "model_bindings": dict(ROLE_BINDINGS),
+        "remote_budget": {"max_requests_per_chapter": 500},
+    }
+    backend = load_runtime_config(payload)
+    assert isinstance(backend, OpenCodeBackendConfig)
+    assert backend.server.remote_budget.max_requests_per_chapter == 500
+    cfg = _make_cfg(tmp_path, backend=backend)
+    # Round-trip through the same loader must give the same identity.
+    reloaded = load_runtime_config(payload)
+    assert reloaded.identity_hash == backend.identity_hash
+    assert reloaded.server.remote_budget.max_requests_per_chapter == 500
+
+    result, _fake = _run_remote(cfg)
+    # The record's backend identity equals the config identity (the budget
+    # participates), and the loaded budget made it into the descriptor.
+    assert result.record["backend"]["identity_hash"] == cfg.backend.identity_hash
+    assert result.record["backend"]["identity_hash"] == backend.identity_hash
+    desc = cfg.backend.build_descriptor()
+    assert desc.effective_options["remote_budget"]["max_requests_per_chapter"] == 500
