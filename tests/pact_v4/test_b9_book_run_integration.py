@@ -28,7 +28,11 @@ B9-RV2/B9-RV3 reviews of PR #128):
 * the promoted glossary entries are FLAT ``{source: target}`` on disk;
 * strict conservative term alignment: co-occurring unrelated terms (e.g.
   ``bound``/``together`` next to ``pact``) never share a target and never
-  promote (B9-RV2/RV3).
+  promote (B9-RV2/RV3);
+* B9-F5 fail-closed: ``accepted_degraded`` + quarantined chunk + a
+  missing/corrupt/empty/incomplete ``chunk_plan.json`` yields ZERO candidate
+  generation, no ledger line, no observation and no glossary mutation —
+  unavailable PID->chunk provenance never lets unproven evidence through.
 
 The strict driver is faked (``_run_one_chapter`` monkeypatched) — the out_dir
 artifacts (``strict_chapter_trial_record.json``, ``selection_results.json``,
@@ -39,6 +43,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import pytest
 
 from pact_v4.phase1.glossary_candidates import GlossaryCandidateLedger
 
@@ -470,6 +476,127 @@ class TestBookRunCandidateIntegration:
         ).load()
         assert "term|corvidae" not in records
         assert "proper_name|beasley" in records
+
+
+# ---------------------------------------------------------------------------
+# B9-F5: fail closed on unavailable quarantined-chunk provenance
+# ---------------------------------------------------------------------------
+
+
+class TestQuarantinedProvenanceFailClosed:
+    """B9-F5: accepted_degraded + quarantined chunks must fail closed when
+    ``chunk_plan.json`` cannot authoritatively exclude the quarantined
+    evidence.
+
+    A missing, corrupt, empty, or incomplete PID->chunk plan leaves
+    source/translation pids of unknown provenance — they could belong to a
+    quarantined chunk — so the chapter must generate zero candidates, append
+    no ledger line, create no observation and mutate no glossary (the book
+    run never crashes).
+    """
+
+    def _run_plan_mode(self, tmp_path, monkeypatch, plan_mode):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        _write_chapter_html(src_dir, "0001", _CH1_HTML)
+        out_dir = out_base / "chapter_0001"
+        _make_chapter_artifacts(
+            out_dir, "0001",
+            terminal_status="accepted_degraded", quarantined=["chunk0001"],
+            translations=_CH1_TRANSLATIONS, chunk_plan=_PLAN,
+        )
+        # Now break / keep the plan that backs the quarantine exclusion.
+        plan_path = out_dir / "chunk_plan.json"
+        if plan_mode == "valid":
+            pass  # the _PLAN written above stays intact
+        elif plan_mode == "missing":
+            plan_path.unlink()
+        elif plan_mode == "corrupt":
+            plan_path.write_text(
+                '{"chunks": [{"chunk_id": "chunk0001", "pids": [',
+                encoding="utf-8",
+            )
+        elif plan_mode == "empty":
+            plan_path.write_text('{"chunks": []}', encoding="utf-8")
+        elif plan_mode == "partial":
+            # chunk0002's pids (p00004-p00006) are missing from the plan —
+            # their provenance is unknown.
+            plan_path.write_text(json.dumps({
+                "artifact": "pact-v4-chunk-plan/v1",
+                "chunks": [
+                    {"chunk_id": "chunk0001",
+                     "pids": ["p00001", "p00002", "p00003"]},
+                ],
+            }), encoding="utf-8")
+        else:  # pragma: no cover
+            raise AssertionError(f"unknown plan_mode {plan_mode!r}")
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+        return memory, out_base, result
+
+    @pytest.mark.parametrize("plan_mode", ["missing", "corrupt", "empty", "partial"])
+    def test_fail_closed_on_unavailable_quarantine_provenance(
+        self, tmp_path, monkeypatch, plan_mode,
+    ):
+        """accepted_degraded + quarantined chunk + broken chunk_plan.json:
+        zero candidates, no ledger line, no observation, no glossary change."""
+        memory, out_base, result = self._run_plan_mode(
+            tmp_path, monkeypatch, plan_mode,
+        )
+
+        assert result["chapters"][0]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "promoted": 0, "conflicts": 0,
+        }
+
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
+    def test_valid_plan_same_data_still_generates(self, tmp_path, monkeypatch):
+        """Positive control: the SAME chapter data with a VALID plan still
+        generates pact from the accepted chunk — the zero above is caused by
+        the broken plan, not by accepted_degraded + quarantined itself."""
+        memory, out_base, result = self._run_plan_mode(
+            tmp_path, monkeypatch, "valid",
+        )
+
+        # chunk0001 quarantined -> Blake's pids (p00001-p00003) are dropped;
+        # pact (chunk0002, accepted) generates but needs 2 chapters to promote.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 1, "promoted": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert "proper_name|blake" not in records
+        pact = records["term|pact"]
+        assert pact["total_occurrences"] == 3
+        assert pact["chapters"][0]["chunk_ids"] == ["chunk0002"]
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
 
 
 # ---------------------------------------------------------------------------
