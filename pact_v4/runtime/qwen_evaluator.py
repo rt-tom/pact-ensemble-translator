@@ -159,6 +159,46 @@ def _parse_qwen_verdict(raw: str) -> GateResult:
     )
 
 
+def _parse_qwen_verdicts(raw: str, *, count: int) -> Tuple[GateResult, ...]:
+    """Parse a batched Qwen verdict body into ``count`` ``GateResult``s.
+
+    B12 re-gate batching: the response is
+    ``{"verdicts": [{...}, ...]}`` (one verdict object per region, in
+    order). Every element is parsed by the same ``_parse_qwen_verdict`` as
+    the single-region re-gate, so batched verdicts are directly comparable
+    to narrow ones. Any structural failure (non-JSON body, missing
+    ``verdicts`` array, wrong element count) yields one failing ``GateResult``
+    per region — debt, never a semantic verdict (the caller records the
+    failure reason in the detail).
+    """
+    failed = lambda reason: GateResult(  # noqa: E731
+        gate="qwen_fidelity",
+        passed=False,
+        detail=f"qwen_fidelity: batch verdict failure ({reason}); body={raw[:200]!r}",
+    )
+    if not raw.strip():
+        return tuple(failed("empty response body") for _ in range(count))
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return tuple(failed(f"non-JSON response: {exc}") for _ in range(count))
+    if not isinstance(data, dict) or not isinstance(data.get("verdicts"), list):
+        return tuple(failed("response is not an object with a 'verdicts' array") for _ in range(count))
+    verdicts = data["verdicts"]
+    if len(verdicts) != count:
+        return tuple(
+            failed(f"expected {count} verdicts, got {len(verdicts)}")
+            for _ in range(count)
+        )
+    results = []
+    for item in verdicts:
+        if isinstance(item, dict):
+            results.append(_parse_qwen_verdict(json.dumps(item, ensure_ascii=False)))
+        else:
+            results.append(failed(f"verdict element is not an object: {item!r}"))
+    return tuple(results)
+
+
 class HttpQwenEvaluator:
     """Compatibility wrapper: real ``QwenEvaluator`` backed by ``ApiClient``.
 

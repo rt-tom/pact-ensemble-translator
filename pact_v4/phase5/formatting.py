@@ -212,6 +212,7 @@ class FormattingOutcome:
     policy_version: str
     max_formatting_incidents: int
     model_fallback_count: int = 0
+    model_call_count: int = 0
 
     @property
     def incident_count(self) -> int:
@@ -239,6 +240,7 @@ class FormattingOutcome:
             "resolved_count": self.resolved_count,
             "incident_count": self.incident_count,
             "model_fallback_count": self.model_fallback_count,
+            "model_call_count": self.model_call_count,
             "max_formatting_incidents": self.max_formatting_incidents,
             "blocking": self.blocking,
         }
@@ -259,6 +261,12 @@ class FormattingCaller(Protocol):
     knows nothing about HTTP — production wiring lives in the pipeline (the
     strict driver injects ``BackendFormattingCaller`` over the coordinator
     ``CompletionBackend``).
+
+    B12: a caller MAY also expose a ``batch`` method that maps several PIDs
+    in one call (the response is the same ``{"mappings": [...]}`` schema
+    with a ``pid`` per entry). ``run_formatting_align`` uses it to batch the
+    model-fallback tier per chunk; callers without ``batch`` keep the
+    per-PID path (backward compatible).
     """
 
     def __call__(
@@ -268,6 +276,11 @@ class FormattingCaller(Protocol):
         source_text: str,
         translation: str,
         spans: Sequence[Mapping[str, Any]],
+    ) -> str: ...
+
+    def batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
     ) -> str: ...
 
 
@@ -641,6 +654,7 @@ def run_formatting_align(
     backend_identity_hash: str,
     policy_version: str = FORMATTING_POLICY_VERSION,
     max_formatting_incidents: int = MAX_FORMATTING_INCIDENTS_DEFAULT,
+    pid_batches: Optional[Sequence[Sequence[str]]] = None,
 ) -> FormattingOutcome:
     """Run the Phase 5 formatting alignment over one chapter.
 
@@ -666,6 +680,17 @@ def run_formatting_align(
     (production default ``0``). A transport failure at the model fallback is
     recorded as incidents with reason ``transport_error`` — debt, never a
     semantic verdict.
+
+    B12 (call optimization): when ``pid_batches`` is provided **and** the
+    caller exposes ``batch``, the model-fallback tier groups the unresolved
+    PIDs by these batches and makes ONE model call per batch instead of one
+    call per PID (the response schema carries ``pid`` per mapping, so a
+    batch call maps all PIDs of the group). Per-PID occupancy/verification
+    semantics are unchanged — only the transport is batched. Without
+    ``pid_batches`` or a batch-capable caller, the model-fallback tier runs
+    per-PID exactly as before. ``model_fallback_count`` keeps counting PIDs
+    that needed the model tier; ``model_call_count`` records the actual
+    model calls made (the B12 observable for call reduction).
     """
     span_map: Dict[str, Tuple[SourceSpan, ...]] = {
         block.pid: tuple(block.inline_spans)
@@ -679,6 +704,19 @@ def run_formatting_align(
     span_mapping: List[SpanMappingRecord] = []
     incidents: List[FormattingIncident] = []
     model_fallback_count = 0
+    model_call_count = 0
+    batch_fn = (
+        getattr(formatting_caller, "batch", None)
+        if formatting_caller is not None else None
+    )
+    use_batch = batch_fn is not None and bool(pid_batches)
+
+    # Unresolved PIDs deferred to the model-fallback phase (batched when
+    # ``use_batch``). Each entry keeps its own per-PID occupied ranges, so
+    # batching never changes per-PID occupancy/verification semantics.
+    pending: List[
+        Tuple[str, str, str, List[SourceSpan], List[Tuple[int, int]]]
+    ] = []
 
     for pid, spans in span_map.items():
         text = translation.get(pid, "")
@@ -713,9 +751,15 @@ def run_formatting_align(
                     )
                     for span in unresolved
                 )
+            elif use_batch:
+                model_fallback_count += 1
+                pending.append(
+                    (pid, text, source_by_pid.get(pid, ""), unresolved, occupied)
+                )
             else:
                 allowed = {(pid, span.span_id): span for span in unresolved}
                 model_fallback_count += 1
+                model_call_count += 1
                 try:
                     raw = formatting_caller(
                         pid=pid,
@@ -748,6 +792,108 @@ def run_formatting_align(
                     span_mapping.extend(model_resolved)
                     incidents.extend(model_incidents)
 
+    # B12: batched model-fallback phase (one call per ``pid_batches`` group).
+    if pending:
+        assert formatting_caller is not None and batch_fn is not None
+        batch_index_of: Dict[str, int] = {}
+        for index, group in enumerate(pid_batches or ()):
+            for pid in group:
+                batch_index_of[pid] = index
+        groups: Dict[int, list] = {}
+        singles: list = []
+        for entry in pending:
+            pid = entry[0]
+            index = batch_index_of.get(pid)
+            if index is None:
+                # A PID not covered by any batch falls back to a per-PID call.
+                singles.append(entry)
+            else:
+                groups.setdefault(index, []).append(entry)
+
+        for group in groups.values():
+            model_call_count += 1
+            items = [
+                {
+                    "pid": pid,
+                    "source_text": source_text,
+                    "translation": text,
+                    "spans": [_span_payload(span) for span in unresolved],
+                }
+                for pid, text, source_text, unresolved, _occupied in group
+            ]
+            allowed = {
+                (pid, span.span_id): span
+                for pid, _text, _source_text, unresolved, _occupied in group
+                for span in unresolved
+            }
+            try:
+                raw = batch_fn(items=items)
+                mappings = _parse_format_mappings(
+                    raw, allowed=allowed, pid="<batch>",
+                )
+            except Exception as exc:  # transport or invalid structured output
+                LOG.warning(
+                    "Formatting batch model fallback failed: %s "
+                    "(recorded as debt, not a semantic verdict)",
+                    exc,
+                )
+                for pid, _text, _source_text, unresolved, _occupied in group:
+                    incidents.extend(
+                        FormattingIncident(
+                            pid=pid, span_id=span.span_id, tier=TIER_MODEL,
+                            reason="transport_error",
+                            detail=f"model fallback call failed: {exc!r}",
+                        )
+                        for span in unresolved
+                    )
+            else:
+                for pid, text, _source_text, unresolved, occupied in group:
+                    model_resolved, model_incidents = _apply_model_mappings(
+                        pid=pid, translation=text, spans=unresolved,
+                        mappings=mappings, occupied=occupied,
+                    )
+                    span_mapping.extend(model_resolved)
+                    incidents.extend(model_incidents)
+
+        # PIDs outside every batch: per-PID calls (identical to the unbatched
+        # model-fallback tier).
+        for pid, text, source_text, unresolved, occupied in singles:
+            model_call_count += 1
+            allowed = {(pid, span.span_id): span for span in unresolved}
+            try:
+                raw = formatting_caller(
+                    pid=pid,
+                    source_text=source_text,
+                    translation=text,
+                    spans=[_span_payload(span) for span in unresolved],
+                )
+                mappings = _parse_format_mappings(
+                    raw, allowed=allowed, pid=pid,
+                )
+            except Exception as exc:  # transport or invalid structured output
+                LOG.warning(
+                    "Formatting model fallback failed for %s: %s "
+                    "(recorded as debt, not a semantic verdict)",
+                    pid, exc,
+                )
+                incidents.extend(
+                    FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=TIER_MODEL,
+                        reason="transport_error",
+                        detail=f"model fallback call failed: {exc!r}",
+                    )
+                    for span in unresolved
+                )
+            else:
+                model_resolved, model_incidents = _apply_model_mappings(
+                    pid=pid, translation=text, spans=unresolved,
+                    mappings=mappings, occupied=occupied,
+                )
+                span_mapping.extend(model_resolved)
+                incidents.extend(model_incidents)
+
+    for pid, spans in span_map.items():
+        text = translation.get(pid, "")
         records_for_pid = [r for r in span_mapping if r.pid == pid]
         formatted[pid] = apply_span_mappings(text, records_for_pid)
 
@@ -767,4 +913,5 @@ def run_formatting_align(
         policy_version=policy_version,
         max_formatting_incidents=max_formatting_incidents,
         model_fallback_count=model_fallback_count,
+        model_call_count=model_call_count,
     )

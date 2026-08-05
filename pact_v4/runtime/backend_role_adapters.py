@@ -48,10 +48,12 @@ from pact_v4.runtime.prompts_runtime import (
     REPAIR_REGION_V1,
     ReviewerPrompt,
     render_formatting_prompt,
+    render_formatting_prompt_batch,
     render_gemma_audit_prompt,
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
     render_qwen_review_prompt,
+    render_region_fidelity_gate_batch_prompt,
     render_region_fidelity_gate_prompt,
     render_repair_prompt,
 )
@@ -59,6 +61,7 @@ from pact_v4.runtime.qwen_evaluator import (
     MAX_TOKENS_CEILING,
     TOKENS_PER_PID,
     _parse_qwen_verdict,
+    _parse_qwen_verdicts,
 )
 
 LOG = logging.getLogger(__name__)
@@ -741,6 +744,59 @@ class BackendRegionFidelityGate:
             )
         return _parse_qwen_verdict(raw)
 
+    def batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
+    ) -> Sequence[GateResult]:
+        """Re-gate several regions of the same chunk in one call (B12).
+
+        ``items`` is a list of ``{source_text, repaired_text, region}``
+        payloads; the batched prompt renders one ``REGION <index>:`` block
+        per item and the response is
+        ``{"verdicts": [{...verdict...}, ...]}`` — one verdict object per
+        region, in order. Each verdict is parsed by the same
+        ``_parse_qwen_verdict`` as the single-region re-gate, so a batched
+        verdict is directly comparable to a narrow one on a fixture. A
+        transport failure yields one failing ``GateResult`` per region
+        (debt, never a semantic verdict), mirroring the single-region path.
+        """
+        prompt = render_region_fidelity_gate_batch_prompt(
+            items=[dict(item) for item in items],
+            template=self._config.template,
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(
+                self._backend, ("fidelity_reviewer", "qwen_fidelity")
+            ),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=self._max_tokens * max(1, len(items)),
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+
+        def _complete() -> str:
+            try:
+                return self._backend.complete(request).text
+            except CompletionError as exc:
+                LOG.error("BackendRegionFidelityGate.batch: backend failure: %s", exc)
+                raise
+
+        try:
+            raw = retry_json_call(
+                _complete, self._config.retry, label=self._config.label,
+            )
+        except CompletionError as exc:
+            return tuple(
+                GateResult(
+                    gate="qwen_fidelity",
+                    passed=False,
+                    detail=f"qwen_fidelity: API failure: {exc}",
+                )
+                for _ in items
+            )
+        return _parse_qwen_verdicts(raw, count=len(items))
+
 
 @dataclass(frozen=True)
 class BackendFormattingCallerConfig:
@@ -817,6 +873,41 @@ class BackendFormattingCaller:
             response = self._backend.complete(request)
         except CompletionError as exc:
             LOG.error("BackendFormattingCaller: backend failure: %s", exc)
+            raise
+        return response.text
+
+    def batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """Map several PIDs' unresolved spans in one backend call (B12).
+
+        ``items`` is a list of ``{pid, source_text, translation, spans}``
+        payloads; the batched prompt renders one ``FORMAT_PID`` block per
+        item and the response is the same ``{"mappings": [...]}`` schema with
+        a ``pid`` per entry. Transport-only: output parsing/validation stays
+        in ``pact_v4.phase5.formatting``. ``max_output_tokens`` scales with
+        the batch size so a long multi-PID response is not truncated
+        mid-JSON (same per-PID headroom rationale as the single call).
+        """
+        prompt = render_formatting_prompt_batch(
+            items=[dict(item) for item in items],
+            template=self._config.template,
+        )
+        request = CompletionRequest(
+            model_ref=_model_ref_for(
+                self._backend, ("formatting", "repair", "generator")
+            ),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=self._max_tokens * max(1, len(items)),
+            temperature=0.0,
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+        )
+        try:
+            response = self._backend.complete(request)
+        except CompletionError as exc:
+            LOG.error("BackendFormattingCaller.batch: backend failure: %s", exc)
             raise
         return response.text
 

@@ -213,6 +213,30 @@ REGION_FIDELITY_GATE_V1 = ReviewerPrompt(
     ),
 )
 
+REGION_FIDELITY_GATE_BATCH_V1 = ReviewerPrompt(
+    role="region_fidelity_gate_batch",
+    version="pact-v4-reviewer-qwen-region-fidelity-batch/v1",
+    instructions=(
+        "You are a strict fidelity reviewer for several repaired regions of "
+        "a Russian translation of English fiction. Each REGION entry gives "
+        "the SOURCE text of one PID, the REPAIRED translation of that same "
+        "PID, and the located REGION span. For every region judge whether "
+        "the repaired text preserves the meaning, register, negation scope, "
+        "named entities, and numeric values of the source within that "
+        "region. Return STRICT JSON, no markdown fences, no commentary, "
+        "with exactly this schema:\n"
+        "  verdicts: array of objects, one per region in the given order, "
+        "each with:\n"
+        "    faithful_to_source: bool\n"
+        "    completeness: bool\n"
+        "    introduced_errors: bool\n"
+        "    confidence: 'high' | 'medium' | 'low'\n"
+        "    reason: short string (one or two sentences)\n"
+        "    passed: bool (true iff the repaired region is acceptable)\n"
+        "Do not include any other keys."
+    ),
+)
+
 
 # Phase 5 formatting alignment (§8.14 span contract). The model is asked to
 # map a PID's unresolved source inline spans to exact substrings of the
@@ -381,6 +405,32 @@ def render_region_fidelity_gate_prompt(
     )
 
 
+def render_region_fidelity_gate_batch_prompt(
+    *,
+    items: list[dict[str, Any]],
+    template: ReviewerPrompt = REGION_FIDELITY_GATE_BATCH_V1,
+) -> str:
+    """Render a multi-region L2b narrow Qwen re-gate request (B12 batching).
+
+    ``items`` is a list of per-region payloads (``source_text`` /
+    ``repaired_text`` / ``region``); each region is rendered as its own flat
+    ``REGION <index>:`` block with the same SOURCE / REPAIRED TRANSLATION /
+    REGION fields the single-region renderer uses, so the model returns one
+    verdict object per region in order.
+    """
+    blocks = []
+    for index, item in enumerate(items, start=1):
+        region = item["region"]
+        region_line = f"pid={region.pid} span=[{region.start}, {region.end})"
+        blocks.append(
+            f"REGION {index}:\n"
+            f"SOURCE (PID -> English text):\n  {region.pid}: {item['source_text']}\n\n"
+            f"REPAIRED TRANSLATION (same PID):\n  {region.pid}: {item['repaired_text']}\n\n"
+            f"REGION (the located repaired span):\n  {region_line}\n"
+        )
+    return f"{template.instructions}\n\n" + "\n\n".join(blocks)
+
+
 def render_formatting_prompt(
     *,
     pid: str,
@@ -405,3 +455,30 @@ def render_formatting_prompt(
         f"SOURCE_SPANS: {spans_json}\n"
         f"TRANSLATION: {translation}\n"
     )
+
+
+def render_formatting_prompt_batch(
+    *,
+    items: list[dict[str, Any]],
+    template: ReviewerPrompt = FORMAT_SPANS_V1,
+) -> str:
+    """Render a multi-PID Phase 5 span-mapping request as one user message.
+
+    B12 batching: ``items`` is a list of per-PID payloads
+    (``pid``/``source_text``/``translation``/``spans``), each rendered as the
+    same flat ``FORMAT_PID`` block the single-PID renderer produces, so the
+    model maps all PIDs of the batch in one call and the response's
+    ``{"mappings": [{"pid", "span_id", "target_text", "occurrence"}]}``
+    carries the pid per entry. The fake servers reuse the same per-PID
+    parsing on every block, keeping local/remote parity.
+    """
+    blocks = []
+    for item in items:
+        spans_json = json.dumps(list(item["spans"]), ensure_ascii=False)
+        blocks.append(
+            f"FORMAT_PID: {item['pid']}\n"
+            f"SOURCE: {item['source_text']}\n"
+            f"SOURCE_SPANS: {spans_json}\n"
+            f"TRANSLATION: {item['translation']}\n"
+        )
+    return f"{template.instructions}\n\n" + "\n\n".join(blocks)

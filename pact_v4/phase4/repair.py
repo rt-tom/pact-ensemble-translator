@@ -205,11 +205,23 @@ class RegionFidelityEvaluator(Protocol):
     This protocol knows nothing about HTTP — production wiring lives in the
     pipeline (``BackendRegionFidelityGate`` over the coordinator
     ``CompletionBackend``), never a local lifecycle adapter.
+
+    B12: a caller MAY also expose a ``batch`` method that re-gates several
+    regions of the same chunk in one call (the response is
+    ``{"verdicts": [{...}, ...]}``, one verdict per region in order, each
+    parsed by the same ``_parse_qwen_verdict``). ``_run_repair_round`` uses
+    it to batch the re-gate pass per chunk; callers without ``batch`` keep
+    the per-region path (backward compatible).
     """
 
     def __call__(
         self, *, source_text: str, repaired_text: str, region: Any
     ) -> GateResult: ...
+
+    def batch(
+        self,
+        items: Sequence[Mapping[str, Any]],
+    ) -> Sequence[GateResult]: ...
 
 
 class FormattingStep(Protocol):
@@ -858,6 +870,29 @@ def _re_gate_region(
     return tuple(gate_trace), det_result.passed and qwen_result.passed, repaired_candidate, ""
 
 
+class _BatchedGateResult:
+    """Adapter: present one pre-computed verdict as a per-region re-gate.
+
+    B12 re-gate batching: ``_run_repair_round`` calls ``region_fidelity_gate
+    .batch(items)`` once per chunk and reuses ``_re_gate_region`` for each
+    region (candidate + deterministic gate stay per-region and model-free);
+    this adapter feeds the batched verdict into that shared path without
+    re-calling the model. ``__call__`` is a plain function object adapter so
+    ``_re_gate_region``'s ``region_fidelity_gate(...)`` call contract is
+    preserved.
+    """
+
+    __slots__ = ("_result",)
+
+    def __init__(self, result: GateResult) -> None:
+        self._result = result
+
+    def __call__(
+        self, *, source_text: str, repaired_text: str, region: Any
+    ) -> GateResult:
+        return self._result
+
+
 def _commit_reason(gate_trace: Sequence[GateResult], gemma_status: str) -> str:
     """Build the non-commit ``reason`` from the gate trace + re-check status."""
     reason_parts: list[str] = []
@@ -1486,22 +1521,97 @@ def _run_repair_round(
     changed: list[str] = []
 
     # ---- Qwen re-gate pass (one lease) ----------------------------------
+    # B12: when the gate exposes ``batch``, regions of the same chunk are
+    # re-gated in ONE call (the response carries one verdict per region, in
+    # order) instead of one call per region. Per-region verdict parsing and
+    # the deterministic gate are unchanged — only the transport is batched.
+    # Gates without ``batch`` keep the per-region path (backward compatible).
     gate_results: Dict[
         str, Tuple[Tuple[GateResult, ...], bool, Optional[Candidate], str]
     ] = {}
-    for repair_id, (plan, tentative, _base, _unit_hash) in fresh.items():
-        gate_results[repair_id] = _re_gate_region(
-            plan=plan,
-            chunk=chunk_plan.chunk(plan.chunk_id),
-            audited_role=candidates[plan.chunk_id].role,
-            source=source,
-            snapshot=snapshot,
-            chunk_plan=chunk_plan,
-            config=config,
-            det_data=det_data,
-            tentative_translation=tentative,
-            region_fidelity_gate=region_fidelity_gate,
-        )
+    batch_fn = getattr(region_fidelity_gate, "batch", None)
+    if batch_fn is None:
+        for repair_id, (plan, tentative, _base, _unit_hash) in fresh.items():
+            gate_results[repair_id] = _re_gate_region(
+                plan=plan,
+                chunk=chunk_plan.chunk(plan.chunk_id),
+                audited_role=candidates[plan.chunk_id].role,
+                source=source,
+                snapshot=snapshot,
+                chunk_plan=chunk_plan,
+                config=config,
+                det_data=det_data,
+                tentative_translation=tentative,
+                region_fidelity_gate=region_fidelity_gate,
+            )
+    else:
+        by_chunk: Dict[str, List[Tuple[str, RepairPlan, Dict[str, str]]]] = {}
+        for repair_id, (plan, tentative, _base, _unit_hash) in fresh.items():
+            by_chunk.setdefault(plan.chunk_id, []).append(
+                (repair_id, plan, tentative)
+            )
+        for chunk_id, entries in by_chunk.items():
+            items = [
+                {
+                    "source_text": dict(source.source).get(plan.region.pid, ""),
+                    "repaired_text": tentative.get(plan.region.pid, ""),
+                    "region": plan.region,
+                }
+                for repair_id, plan, tentative in entries
+            ]
+            try:
+                qwen_results = list(batch_fn(items=items))
+            except Exception as exc:  # transport failure -> debt per region
+                LOG.warning(
+                    "Batched region re-gate failed for %s: %s "
+                    "(recorded as debt, not a semantic verdict)",
+                    chunk_id, exc,
+                )
+                qwen_results = [
+                    GateResult(
+                        gate="qwen_fidelity",
+                        passed=False,
+                        detail=f"qwen_fidelity: API failure: {exc!r}",
+                    )
+                    for _ in items
+                ]
+            if len(qwen_results) != len(entries):
+                # A batched response with the wrong verdict count is a
+                # contract violation: fail every region of the chunk (debt,
+                # never a semantic verdict) instead of silently dropping or
+                # fabricating verdicts.
+                LOG.warning(
+                    "Batched region re-gate returned %d verdicts for %d "
+                    "regions of %s (recorded as debt)",
+                    len(qwen_results), len(entries), chunk_id,
+                )
+                qwen_results = [
+                    GateResult(
+                        gate="qwen_fidelity",
+                        passed=False,
+                        detail=(
+                            f"qwen_fidelity: batched re-gate returned "
+                            f"{len(qwen_results)} verdicts for "
+                            f"{len(entries)} regions"
+                        ),
+                    )
+                    for _ in entries
+                ]
+            for (repair_id, plan, tentative), qwen_result in zip(
+                entries, qwen_results
+            ):
+                gate_results[repair_id] = _re_gate_region(
+                    plan=plan,
+                    chunk=chunk_plan.chunk(chunk_id),
+                    audited_role=candidates[chunk_id].role,
+                    source=source,
+                    snapshot=snapshot,
+                    chunk_plan=chunk_plan,
+                    config=config,
+                    det_data=det_data,
+                    tentative_translation=tentative,
+                    region_fidelity_gate=_BatchedGateResult(qwen_result),
+                )
 
     # ---- Gemma recheck pass (one lease) ---------------------------------
     recheck: Dict[str, str] = {}

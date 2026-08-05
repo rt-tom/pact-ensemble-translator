@@ -1225,6 +1225,7 @@ def _run_step7_repair(
             "resolved_count": formatting_payload["resolved_count"],
             "incident_count": formatting_payload["incident_count"],
             "model_fallback_count": formatting_payload["model_fallback_count"],
+            "model_call_count": formatting_payload["model_call_count"],
             "max_formatting_incidents": formatting_payload["max_formatting_incidents"],
             "report_path": str(_formatting_report_path(cfg.out_dir)),
         }
@@ -1726,6 +1727,7 @@ def _run_quarantined_retry_cycle(
             "resolved_count": formatting_outcome.resolved_count,
             "incident_count": formatting_outcome.incident_count,
             "model_fallback_count": formatting_outcome.model_fallback_count,
+            "model_call_count": formatting_outcome.model_call_count,
             "max_formatting_incidents": formatting_outcome.max_formatting_incidents,
             "report_path": str(_formatting_report_path(cfg.out_dir)),
         }
@@ -2301,6 +2303,9 @@ def run_chapter_strict(
                     backend_identity_hash=cfg.backend.identity_hash,
                     policy_version=cfg.formatting_policy_version,
                     max_formatting_incidents=cfg.max_formatting_incidents,
+                    pid_batches=[
+                        tuple(chunk.pids) for chunk in chunk_plan.chunks
+                    ],
                 )
 
             formatting_step = _formatting_step

@@ -33,6 +33,12 @@ _FORMAT_PID = re.compile(r"FORMAT_PID: (\S+)")
 _FORMAT_TRANSLATION = re.compile(r"^TRANSLATION: (.*)$", re.MULTILINE)
 _FORMAT_SPANS = re.compile(r"^SOURCE_SPANS: (.*)$", re.MULTILINE)
 
+# B12 batching: a formatting prompt may carry several ``FORMAT_PID`` blocks
+# (one per PID of a chunk). Split on the block marker and parse each block
+# with the same per-PID regexes the single-PID prompt uses, so a batched
+# remote fake produces the same mappings as per-PID local calls.
+_FORMAT_BLOCK = re.compile(r"FORMAT_PID: (\S+)(.*?)(?=FORMAT_PID: |\Z)", re.S)
+
 _QWEN_PASS_VERDICT = json.dumps({
     "faithful_to_source": True,
     "completeness": True,
@@ -68,19 +74,25 @@ def _formatting_response(text: str) -> str:
     Maps each unresolved source span to the corresponding word of the
     translation (span i -> word i), so a local fake and this remote fake
     produce byte-identical mappings for the same prompt. Used by the
-    dual-mode parity test (§14.3).
+    dual-mode parity test (§14.3). B12: the prompt may carry several
+    ``FORMAT_PID`` blocks (one per PID of a chunk); each block is parsed
+    with the same per-PID regexes and mapped independently.
     """
-    pid = _FORMAT_PID.search(text).group(1)
-    translation = _FORMAT_TRANSLATION.search(text).group(1)
-    spans = json.loads(_FORMAT_SPANS.search(text).group(1))
-    words = translation.split()
     mappings: list[Dict[str, Any]] = []
-    for index, span in enumerate(spans):
-        target = words[index] if index < len(words) else ""
-        mappings.append({
-            "pid": pid, "span_id": span["span_id"],
-            "target_text": target, "occurrence": 1,
-        })
+    for pid, body in _FORMAT_BLOCK.findall(text):
+        translation_match = _FORMAT_TRANSLATION.search(body)
+        spans_match = _FORMAT_SPANS.search(body)
+        if translation_match is None or spans_match is None:
+            continue
+        translation = translation_match.group(1)
+        spans = json.loads(spans_match.group(1))
+        words = translation.split()
+        for index, span in enumerate(spans):
+            target = words[index] if index < len(words) else ""
+            mappings.append({
+                "pid": pid, "span_id": span["span_id"],
+                "target_text": target, "occurrence": 1,
+            })
     return json.dumps({"mappings": mappings}, ensure_ascii=False)
 
 
@@ -97,6 +109,13 @@ def _respond_to_prompt(text: str) -> str:
         return json.dumps({"preferred_candidate_id": preferred, "reason": "dynamic fake"})
     if "strict fidelity auditor" in text:
         return _NO_ISSUES  # Qwen Step 6 audit
+    if "strict fidelity reviewer for several repaired regions" in text:
+        # B12 batched narrow re-gate: one passing verdict per REGION block.
+        count = len(re.findall(r"^REGION (\d+):", text, re.MULTILINE)) or 1
+        return json.dumps(
+            {"verdicts": [json.loads(_QWEN_PASS_VERDICT) for _ in range(count)]},
+            ensure_ascii=False,
+        )
     if "strict fidelity reviewer" in text:
         return _QWEN_PASS_VERDICT  # Qwen fidelity gate
     if "Russian-language editor" in text:

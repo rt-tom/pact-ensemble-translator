@@ -1332,3 +1332,135 @@ def test_l3_skipped_soft_findings_recorded_in_debt_trace():
     # The weak-soft finding stays in the store; only planning was filtered.
     assert len(result.rounds[0].records) == 0
     assert any("skipped by L3 policy" in reason for reason in result.debt_trace)
+
+
+# ---------------------------------------------------------------------------
+# B12: batched narrow Qwen re-gate (one call per chunk)
+# ---------------------------------------------------------------------------
+
+
+class BatchRegionGate(ScriptedRegionGate):
+    """``ScriptedRegionGate`` with a ``batch`` method (B12).
+
+    The batched call returns one verdict per item, in order — identical to
+    what per-region calls would return — so the batched re-gate path must
+    produce the same commit decisions as the per-region path; only the
+    number of model calls differs.
+    """
+
+    def __init__(self, passed: bool = True, detail: str = "OK"):
+        super().__init__(passed=passed, detail=detail)
+        self.batch_calls: list = []
+
+    def batch(self, items):
+        self.batch_calls.append([dict(item) for item in items])
+        return [
+            GateResult(gate="qwen_fidelity", passed=self.passed, detail=self.detail)
+            for _ in items
+        ]
+
+
+def _two_repair_env():
+    source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    pid_a, pid_b = chunk.pids[0], chunk.pids[1]
+    findings = [
+        _finding(chunk_id=chunk.chunk_id, candidate_id=candidate.candidate_id,
+                 pid=pid_a, snapshot_id=snapshot.snapshot_hash),
+        _finding(chunk_id=chunk.chunk_id, candidate_id=candidate.candidate_id,
+                 pid=pid_b, snapshot_id=snapshot.snapshot_hash),
+    ]
+    plans = plan_repairs_for_chunk(
+        chunk=chunk, findings=findings, current_text=candidate.as_pid_map(),
+        backend_identity_hash=_hash("backend"),
+    )
+    return (source, snapshot, chunk_plan, chunk, config, candidate, candidates,
+            chapter, handoff, pid_a, pid_b, plans)
+
+
+def test_b12_re_gate_batches_regions_of_one_chunk_into_one_call():
+    # Two repairs of the SAME chunk -> ONE batched gate call for both
+    # regions; both commit (verdict passed), the translation reflects both.
+    (source, snapshot, chunk_plan, chunk, config, candidate, candidates,
+     chapter, handoff, pid_a, pid_b, plans) = _two_repair_env()
+    repair_caller = TargetedRepairCaller(
+        {pid_a: "Исправленный вариант один.", pid_b: "Исправленный вариант два."})
+    region_gate = BatchRegionGate(passed=True)
+    gemma_audit = ScriptedGemmaAudit(issues=[])
+    translation_by_chunk = {chunk.chunk_id: dict(candidate.as_pid_map())}
+
+    records, changed = _run_repair_round(
+        chapter_hash=chapter.chapter_hash, chunk_plan=chunk_plan,
+        plans_by_chunk={chunk.chunk_id: plans}, candidates=candidates,
+        source=source, snapshot=snapshot, config=config,
+        det_data=DeterministicGateData(), translation_by_chunk=translation_by_chunk,
+        repair_caller=repair_caller, region_fidelity_gate=region_gate,
+        gemma_audit_evaluator=gemma_audit,
+        backend_identity_hash=_hash("backend"), cache=RepairCache(),
+    )
+    assert [r.committed for r in records] == [True, True]
+    assert len(region_gate.batch_calls) == 1  # one batched call for the chunk
+    assert len(region_gate.batch_calls[0]) == 2
+    assert len(region_gate.calls) == 0  # no per-region calls when batching
+    assert translation_by_chunk[chunk.chunk_id][pid_a] == "Исправленный вариант один."
+    assert translation_by_chunk[chunk.chunk_id][pid_b] == "Исправленный вариант два."
+
+
+def test_b12_re_gate_batch_transport_failure_is_debt_for_all_regions():
+    # A batched transport failure marks every region of the chunk as a
+    # failed re-gate -> no repair commits (debt), base text is kept.
+    (source, snapshot, chunk_plan, chunk, config, candidate, candidates,
+     chapter, handoff, pid_a, pid_b, plans) = _two_repair_env()
+    base = candidate.as_pid_map()
+
+    class ExplodingBatchGate(ScriptedRegionGate):
+        def batch(self, items):
+            raise RuntimeError("network down")
+
+    translation_by_chunk = {chunk.chunk_id: dict(base)}
+    records, _changed = _run_repair_round(
+        chapter_hash=chapter.chapter_hash, chunk_plan=chunk_plan,
+        plans_by_chunk={chunk.chunk_id: plans}, candidates=candidates,
+        source=source, snapshot=snapshot, config=config,
+        det_data=DeterministicGateData(), translation_by_chunk=translation_by_chunk,
+        repair_caller=TargetedRepairCaller(
+            {pid_a: "Исправленный вариант один.", pid_b: "Исправленный вариант два."}),
+        region_fidelity_gate=ExplodingBatchGate(passed=True),
+        gemma_audit_evaluator=ScriptedGemmaAudit(issues=[]),
+        backend_identity_hash=_hash("backend"), cache=RepairCache(),
+    )
+    assert [r.committed for r in records] == [False, False]
+    assert all("API failure" in r.reason or "not committed" in r.reason
+               for r in records)
+    assert translation_by_chunk[chunk.chunk_id][pid_a] == base[pid_a]
+    assert translation_by_chunk[chunk.chunk_id][pid_b] == base[pid_b]
+
+
+def test_b12_re_gate_batch_matches_per_region_path_on_identical_verdicts():
+    # Batched and per-region gates returning identical verdicts must yield
+    # identical commit decisions and gate traces (B12 parity contract).
+    (source, snapshot, chunk_plan, chunk, config, candidate, candidates,
+     chapter, handoff, pid_a, pid_b, plans) = _two_repair_env()
+    base = candidate.as_pid_map()
+    repair_texts = {pid_a: "Исправленный вариант один.", pid_b: "Исправленный вариант два."}
+
+    def run(gate, *, use_batch: bool):
+        translation_by_chunk = {chunk.chunk_id: dict(base)}
+        records, _changed = _run_repair_round(
+            chapter_hash=chapter.chapter_hash, chunk_plan=chunk_plan,
+            plans_by_chunk={chunk.chunk_id: plans}, candidates=candidates,
+            source=source, snapshot=snapshot, config=config,
+            det_data=DeterministicGateData(),
+            translation_by_chunk=translation_by_chunk,
+            repair_caller=TargetedRepairCaller(repair_texts),
+            region_fidelity_gate=gate,
+            gemma_audit_evaluator=ScriptedGemmaAudit(issues=[]),
+            backend_identity_hash=_hash("backend"), cache=RepairCache(),
+        )
+        return records, translation_by_chunk
+
+    per_region, per_region_map = run(ScriptedRegionGate(passed=True), use_batch=False)
+    batched, batched_map = run(BatchRegionGate(passed=True), use_batch=True)
+    assert [r.committed for r in per_region] == [r.committed for r in batched]
+    assert [r.gate_trace for r in per_region] == [r.gate_trace for r in batched]
+    assert batched_map == per_region_map
+    assert batched_map[chunk.chunk_id][pid_a] == repair_texts[pid_a]
