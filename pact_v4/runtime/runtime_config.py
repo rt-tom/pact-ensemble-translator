@@ -845,6 +845,19 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             ),
             max_reported_cost=remote_budget_payload.get("max_reported_cost"),
         )
+    elif remote_budget_payload is not None:
+        # An explicit non-mapping value (scalar/list/bool) is a malformed
+        # budget block, not an absent one: silently falling back to the 500
+        # default would start/resume the run with a different limit and a
+        # different identity than the operator asked for (B11-RV finding).
+        raise ValueError(
+            "load_runtime_config[opencode_server]: remote_budget must be a "
+            f"mapping, got {type(remote_budget_payload).__name__}: "
+            f"{remote_budget_payload!r} "
+            "(expected a block with max_requests_per_chapter and optional "
+            "max_retry_requests_per_chapter / max_wait_seconds_on_rate_limit "
+            "/ max_reported_cost; omit the key or use null for the 500 default)"
+        )
     server_kwargs = dict(
         base_url=str(payload.get("base_url", "http://127.0.0.1:4096")),
         server_version_policy=str(

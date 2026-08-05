@@ -342,6 +342,75 @@ def test_load_opencode_remote_budget_non_positive_rejected() -> None:
         raise AssertionError("expected a positive-budget ValueError")
 
 
+def test_load_opencode_remote_budget_scalar_rejected() -> None:
+    # B11-RV: an explicit scalar block (e.g. ``remote_budget: 700``) is a
+    # malformed budget, not an absent one; it must fail loudly instead of
+    # silently running with the 500 default and a different identity.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": 700,
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "remote_budget" in str(exc)
+        assert "mapping" in str(exc)
+    else:
+        raise AssertionError("expected a remote_budget-shape ValueError")
+
+
+def test_load_opencode_remote_budget_list_rejected() -> None:
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": [700, 10],
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "remote_budget" in str(exc)
+        assert "mapping" in str(exc)
+    else:
+        raise AssertionError("expected a remote_budget-shape ValueError")
+
+
+def test_load_opencode_remote_budget_bool_rejected() -> None:
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": True,
+    }
+    try:
+        load_runtime_config(payload)
+    except ValueError as exc:
+        assert "remote_budget" in str(exc)
+        assert "mapping" in str(exc)
+    else:
+        raise AssertionError("expected a remote_budget-shape ValueError")
+
+
+def test_load_opencode_remote_budget_null_keeps_default_500() -> None:
+    # B11-RV: ``null`` is equivalent to an absent key — both keep the
+    # dataclass default (500), never a rejection.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "remote_budget": None,
+    }
+    cfg = load_runtime_config(payload)
+    assert isinstance(cfg, OpenCodeBackendConfig)
+    assert cfg.server.remote_budget.max_requests_per_chapter == 500
+
+
 def test_load_composite_config():
     payload = {
         "kind": "composite",
