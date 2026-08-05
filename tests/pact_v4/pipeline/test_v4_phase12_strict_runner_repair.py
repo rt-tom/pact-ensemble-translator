@@ -251,6 +251,61 @@ def test_step7_rejects_foreign_repair_cache_on_resume(tmp_path: Path):
     assert "Foreign identity: repair cache" in result.step7["error"]
 
 
+def test_step7_resume_ignores_legacy_pre_f3_repair_cache(tmp_path: Path):
+    # B12-F4 (RV4 HIGH): a repair cache written under the pre-F3 contract
+    # (envelope schema + unit hashes under policy v1) must never be reused on
+    # resume — it may hold committed=True records fixed under the old
+    # bool("false") truthiness that the F3 fail-closed fix removed. The
+    # loader recognizes the legacy generation and starts a fresh cache, so
+    # the resumed run re-runs the fail-closed re-gate (repair caller called
+    # again) instead of silently reusing the stale records.
+    cfg = _make_cfg(tmp_path, n_paragraphs=8)
+    _run_with_repair(cfg)
+    cache_path = cfg.out_dir / "repair_cache.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    # Simulate the pre-F3 artifact: same chapter/snapshot/plan/config/backend
+    # identity, but the legacy cache schema (v1) and legacy policy-hashed
+    # unit entries (hashes recorded under pact-v4-repair-policy/v1).
+    legacy_units = []
+    from pact_v4.phase4.repair import _repair_unit_hash
+    for unit in payload["cache"]["units"]:
+        rec = unit["record"]
+        plan = type("Plan", (), {"repair": type("Rep", (), {
+            "repair_id": rec["repair_id"],
+            "action": rec["action"],
+            "target_pids": tuple(rec["target_pids"]),
+            "finding_ids": tuple(rec["finding_ids"]),
+        })()})()
+        legacy_hash = _repair_unit_hash(
+            chapter_hash=payload["chapter_hash"], plan=plan,
+            backend_identity_hash=payload["backend_identity_hash"],
+            policy_version="pact-v4-repair-policy/v1",
+        )
+        legacy_units.append({"unit_hash": legacy_hash, "record": rec})
+    legacy_payload = dict(payload)
+    legacy_payload["schema"] = "pact-v4-phase4-repair-cache/v1"
+    legacy_payload["cache"] = {
+        "schema": "pact-v4-phase4-repair-cache/v1",
+        "units": legacy_units,
+    }
+    cache_path.write_text(
+        json.dumps(legacy_payload, ensure_ascii=False), encoding="utf-8",
+    )
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+    )
+    result, _r, caller2 = _run_with_repair(resumed_cfg)
+    assert result.resumed_from_index >= 0
+    # The legacy cache was NOT reused: the fail-closed re-gate re-ran the
+    # repairs instead of replaying stale committed records.
+    assert caller2.calls
+    # The rewritten cache is the current generation again.
+    rewritten = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert rewritten["schema"] == "pact-v4-phase4-repair-cache/v2"
+
+
 # ---------------------------------------------------------------------------
 # Dual-mode parity (§14.3): local fake backend vs fake OpenCode server
 # ---------------------------------------------------------------------------

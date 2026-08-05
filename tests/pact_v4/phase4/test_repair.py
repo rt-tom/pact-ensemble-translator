@@ -49,9 +49,11 @@ from pact_v4.phase4 import repair as repair_module
 from pact_v4.phase4.repair import (
     REPAIR_POLICY_VERSION,
     RepairCache,
+    RepairRecord,
     SoftFindingsPolicy,
     _re_gate_region,
     _reaudit_chunks,
+    _repair_unit_hash,
     _run_repair_round,
     filter_soft_findings,
     plan_repair_challenge,
@@ -620,6 +622,117 @@ def test_repair_cache_round_trip_and_reuse():
 def test_repair_cache_rejects_foreign_schema():
     with pytest.raises(ValueError, match="Foreign identity"):
         RepairCache.from_payload({"schema": "pact-v4-other/v1", "units": []})
+
+
+def test_repair_unit_hash_bumps_with_policy_version():
+    # B12-F4 (RV4 HIGH): the repair unit identity embeds the repair policy
+    # version. A unit planned under the pre-F3 policy (v1) must produce a
+    # different hash than the same unit under the post-F4 policy (v2), so a
+    # legacy cache entry can never be looked up after the fail-closed fix.
+    source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    pid = chunk.pids[0]
+    findings = [_finding(
+        chunk_id=chunk.chunk_id, candidate_id=candidate.candidate_id,
+        pid=pid, snapshot_id=snapshot.snapshot_hash,
+    )]
+    plans = plan_repairs_for_chunk(
+        chunk=chunk, findings=findings, current_text=candidate.as_pid_map(),
+        backend_identity_hash=_hash("backend"),
+    )
+    plan = plans[0]
+    legacy_hash = _repair_unit_hash(
+        chapter_hash=chapter.chapter_hash, plan=plan,
+        backend_identity_hash=_hash("backend"),
+        policy_version="pact-v4-repair-policy/v1",  # pre-F3 generation
+    )
+    current_hash = _repair_unit_hash(
+        chapter_hash=chapter.chapter_hash, plan=plan,
+        backend_identity_hash=_hash("backend"),
+        policy_version=REPAIR_POLICY_VERSION,
+    )
+    assert REPAIR_POLICY_VERSION == "pact-v4-repair-policy/v2"
+    assert legacy_hash != current_hash
+
+
+def test_repair_cache_legacy_entry_not_supplied_under_post_f4_contract():
+    # B12-F4 (RV4 HIGH): a RepairCache that only holds an entry under the
+    # pre-F3 unit hash (policy v1) must not supply it for the same repair
+    # planned under the post-F4 policy — the hash lookup misses, so the
+    # repair re-runs through the fail-closed re-gate instead of reusing a
+    # record possibly committed under the old bool("false") truthiness.
+    source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    pid = chunk.pids[0]
+    findings = [_finding(
+        chunk_id=chunk.chunk_id, candidate_id=candidate.candidate_id,
+        pid=pid, snapshot_id=snapshot.snapshot_hash,
+    )]
+    plans = plan_repairs_for_chunk(
+        chunk=chunk, findings=findings, current_text=candidate.as_pid_map(),
+        backend_identity_hash=_hash("backend"),
+    )
+    plan = plans[0]
+
+    legacy_hash = _repair_unit_hash(
+        chapter_hash=chapter.chapter_hash, plan=plan,
+        backend_identity_hash=_hash("backend"),
+        policy_version="pact-v4-repair-policy/v1",
+    )
+    current_hash = _repair_unit_hash(
+        chapter_hash=chapter.chapter_hash, plan=plan,
+        backend_identity_hash=_hash("backend"),
+        policy_version=REPAIR_POLICY_VERSION,
+    )
+    assert legacy_hash != current_hash
+
+    # Simulate a pre-F3 cache: an entry keyed by the legacy hash, committed
+    # under the old truthiness semantics (this is exactly the record shape a
+    # malformed ``"passed": "false"`` could have produced pre-F3).
+    stale = RepairRecord(
+        repair_id=plan.repair.repair_id, chunk_id=plan.chunk_id,
+        finding_ids=plan.repair.finding_ids, target_pids=plan.repair.target_pids,
+        action=plan.repair.action,
+        new_translation=tuple((pid, "старый текст") for pid in chunk.pids),
+        gate_trace=(), gemma_recheck="not_required",
+        committed=True, reason="pre-F3 stale record",
+    )
+    cache = RepairCache()
+    cache.put(legacy_hash, stale)
+
+    # Under the post-F4 contract the legacy entry must not be served.
+    assert cache.get(current_hash) is None
+    assert cache.get(legacy_hash) is stale  # present, but unreachable via v2
+
+    # Re-running the repair under the current policy executes it afresh and
+    # stores the new record under the current hash.
+    repair_caller = ScriptedRepairCaller({pid: "Исправленный перевод."})
+    record = repair_region(
+        plan=plan, chapter_hash=chapter.chapter_hash, chunk=chunk,
+        audited_role="fidelity_first",
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        det_data=DeterministicGateData(), current_translation=candidate.as_pid_map(),
+        repair_caller=repair_caller, qwen_evaluator=ScriptedQwenGate(passed=True),
+        gemma_audit_evaluator=ScriptedGemmaAudit(),
+        backend_identity_hash=_hash("backend"), cache=cache,
+    )
+    assert repair_caller.calls  # the repair actually re-ran, not reused
+    assert record is not stale
+    assert record.committed is True
+    assert cache.get(current_hash) is not None
+
+    # Matching post-F4 cache reuse still works: a second identical repair
+    # now hits the current-hash entry without calling the model again.
+    calls_before = len(repair_caller.calls)
+    record2 = repair_region(
+        plan=plan, chapter_hash=chapter.chapter_hash, chunk=chunk,
+        audited_role="fidelity_first",
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        det_data=DeterministicGateData(), current_translation=candidate.as_pid_map(),
+        repair_caller=repair_caller, qwen_evaluator=ScriptedQwenGate(passed=True),
+        gemma_audit_evaluator=ScriptedGemmaAudit(),
+        backend_identity_hash=_hash("backend"), cache=cache,
+    )
+    assert record2 is record or record2 == record
+    assert len(repair_caller.calls) == calls_before
 
 
 # ---------------------------------------------------------------------------

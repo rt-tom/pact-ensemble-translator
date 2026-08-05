@@ -137,9 +137,15 @@ __all__ = [
     "run_repair_phase",
 ]
 
-REPAIR_UNIT_SCHEMA = "pact-v4-phase4-repair-cache/v1"
+REPAIR_UNIT_SCHEMA = "pact-v4-phase4-repair-cache/v2"
 REPAIR_REPORT_SCHEMA = "pact-v4-phase4-repair-report/v1"
-REPAIR_POLICY_VERSION = "pact-v4-repair-policy/v1"
+# B12-F4 (RV4 HIGH): F3 made the Qwen re-gate fail closed on malformed
+# verdict booleans — a repair cache written under the pre-F3 policy (v1)
+# may contain committed=True records fixed under the old truthiness
+# (bool("false")). The policy version participates in ``_repair_unit_hash``,
+# so bumping it invalidates every pre-F3 unit: a resume can never look up a
+# legacy record and re-runs the fail-closed re-gate instead.
+REPAIR_POLICY_VERSION = "pact-v4-repair-policy/v2"
 QWEN_REAUDIT_POLICY_VERSION = "qwen_convergence_reaudit/v1"
 GEMMA_RECHECK_POLICY_VERSION = "gemma_russian_recheck/v1"
 DETERMINISTIC_INTEGRITY_POLICY_VERSION = "deterministic_integrity/v1"
