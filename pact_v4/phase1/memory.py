@@ -55,6 +55,15 @@ class MemoryManager:
         set of chunk_ids that were quarantined; observations keyed by those
         chunk_ids are excluded.
         ``failed`` / ``quarantined``: do nothing (existing behaviour).
+
+        Byte preservation (B9-RV9): a category file is only read-modify-written
+        when that category has observations AND the merge actually changes a
+        value. A glossary-only promotion (no book_memory observations) never
+        touches ``book_memory.json``, so its exact bytes (and any raw-byte
+        hash such as ``v4_book_run._book_memory_hash``) stay unchanged; the
+        same holds for ``glossary.json`` on a book_memory-only promotion and
+        for observations that only hit established/locked conflicts. Genuine
+        new observations are still written (B7 behaviour unchanged).
         """
         if status not in ('complete', 'accepted_degraded'):
             return
@@ -64,13 +73,17 @@ class MemoryManager:
         if status == 'accepted_degraded' and quarantined_chunks:
             obs = self._filter_quarantined_obs(obs, quarantined_chunks)
 
-        glossary = load_json(self.glossary_path, {})
-        self._merge_with_conflict_resolution(glossary, obs.get('glossary', {}))
-        atomic_write(self.glossary_path, glossary)
+        glossary_obs = obs.get('glossary', {})
+        if glossary_obs:
+            glossary = load_json(self.glossary_path, {})
+            if self._merge_with_conflict_resolution(glossary, glossary_obs):
+                atomic_write(self.glossary_path, glossary)
 
-        book_memory = load_json(self.book_memory_path, {})
-        self._merge_with_conflict_resolution(book_memory, obs.get('book_memory', {}))
-        atomic_write(self.book_memory_path, book_memory)
+        book_memory_obs = obs.get('book_memory', {})
+        if book_memory_obs:
+            book_memory = load_json(self.book_memory_path, {})
+            if self._merge_with_conflict_resolution(book_memory, book_memory_obs):
+                atomic_write(self.book_memory_path, book_memory)
 
         atomic_write(self.observations_path, {'glossary': {}, 'book_memory': {}})
 
@@ -96,14 +109,24 @@ class MemoryManager:
             filtered[category] = kept
         return filtered
 
-    def _merge_with_conflict_resolution(self, main_mem: Dict, new_obs: Dict):
+    def _merge_with_conflict_resolution(self, main_mem: Dict, new_obs: Dict) -> bool:
+        """Merge ``new_obs`` into ``main_mem``; return True if anything changed.
+
+        Established/locked entries are never overwritten (conflict). An
+        assignment whose value equals the existing value counts as no change
+        so callers can skip the write and preserve the file's exact bytes.
+        """
+        changed = False
         for key, value in new_obs.items():
             if key in main_mem:
                 existing = main_mem[key]
                 if isinstance(existing, dict) and existing.get('status') in ('established', 'locked'):
                     # Conflict: do not overwrite
                     continue
-            main_mem[key] = value
+            if main_mem.get(key) != value:
+                main_mem[key] = value
+                changed = True
+        return changed
 
     def rollback(self):
         """Rollbacks to the last snapshot."""
