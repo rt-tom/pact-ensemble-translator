@@ -230,3 +230,103 @@ def test_elapsed_pinned_to_terminal_event_when_no_record(tmp_path: Path):
     identity = tracker._identity(out, tracker._load_events(out))
     assert identity["elapsed_seconds"] == 16.0  # 10:00:16 - 10:00:00
     assert identity["alive"] is False
+
+
+# ---------------------------------------------------------------------------
+# audit-status contract: audit_unit_* events from phase_progress.ndjson
+# (fix task t_4b23ed46: past audited chunks showed not_started instead of done)
+# ---------------------------------------------------------------------------
+
+
+def _audit_events() -> list:
+    """3 chunks, Step-6-only stream: c1 done, c2 in progress, c3 untouched."""
+    rows = [
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "run_started",
+         "ts": "2026-08-05T15:00:00+00:00", "started_at": "2026-08-05T15:00:00+00:00"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "chunk_done",
+         "ts": "2026-08-05T15:10:00+00:00", "chunk_id": "c1", "outcome": "selected"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "chunk_done",
+         "ts": "2026-08-05T15:11:00+00:00", "chunk_id": "c2", "outcome": "selected"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "chunk_done",
+         "ts": "2026-08-05T15:12:00+00:00", "chunk_id": "c3", "outcome": "selected"},
+        # c1: both detectors finished -> done.
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_started",
+         "ts": "2026-08-05T15:13:00+00:00", "chunk_id": "c1", "detector": "qwen_chapter_audit"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_done",
+         "ts": "2026-08-05T15:13:30+00:00", "chunk_id": "c1", "detector": "qwen_chapter_audit", "status": "ok"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_started",
+         "ts": "2026-08-05T15:13:30+00:00", "chunk_id": "c1", "detector": "gemma_russian_review"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_done",
+         "ts": "2026-08-05T15:14:00+00:00", "chunk_id": "c1", "detector": "gemma_russian_review", "status": "ok"},
+        # c2: only the first detector started -> in_progress.
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_started",
+         "ts": "2026-08-05T15:14:00+00:00", "chunk_id": "c2", "detector": "qwen_chapter_audit"},
+    ]
+    return rows
+
+
+def test_audit_status_contract_fixtures(tmp_path: Path):
+    out = tmp_path / "run_audit"
+    _write(out / "chunk_plan.json", {"chunks": [
+        {"chunk_id": "c1"}, {"chunk_id": "c2"}, {"chunk_id": "c3"},
+    ]})
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, _audit_events())
+    events = tracker._load_events(out)  # events come from phase_progress.ndjson
+
+    # done-события -> done
+    status, basis = tracker._audit_status("c1", {}, events)
+    assert status == "done"
+    assert "audit units done" in basis
+    assert "qwen_chapter_audit" in basis and "gemma_russian_review" in basis
+
+    # started без done -> in_progress
+    status, basis = tracker._audit_status("c2", {}, events)
+    assert status == "in_progress"
+    assert "qwen_chapter_audit" in basis
+
+    # нет событий -> not_started
+    status, basis = tracker._audit_status("c3", {}, events)
+    assert status == "not_started"
+
+
+def test_audit_status_handoff_precedence_over_events(tmp_path: Path):
+    # b2_handoff row wins: a completed run keeps its authoritative audit_status
+    # even though audit_unit_done events also exist.
+    events = _audit_events()
+    handoff = {"c1": {"chunk_id": "c1", "audit_status": "findings_present",
+                      "audited_candidate_id": "c1:sel"}}
+    status, basis = tracker._audit_status("c1", handoff, events)
+    assert status == "findings_present"
+    assert "b2_handoff" in basis
+
+
+def test_chunk_table_audit_column_live_shaped(tmp_path: Path):
+    # Mirrors the owner's live symptom (run_004): past audited chunks must
+    # show done, the current one in_progress, future ones not_started.
+    out = tmp_path / "run_live"
+    _write(out / "chunk_plan.json", {"chunks": [
+        {"chunk_id": "chunk0001"}, {"chunk_id": "chunk0002"}, {"chunk_id": "chunk0003"},
+    ]})
+    rows = [
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "run_started",
+         "ts": "2026-08-05T15:00:00+00:00", "started_at": "2026-08-05T15:00:00+00:00"},
+        # chunk0001: started + done -> done.
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_started",
+         "ts": "2026-08-05T15:01:00+00:00", "chunk_id": "chunk0001",
+         "detector": "qwen_chapter_audit"},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_done",
+         "ts": "2026-08-05T15:10:00+00:00", "chunk_id": "chunk0001",
+         "detector": "qwen_chapter_audit", "status": "ok"},
+        # chunk0002: started without done -> in_progress.
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "audit_unit_started",
+         "ts": "2026-08-05T15:11:00+00:00", "chunk_id": "chunk0002",
+         "detector": "qwen_chapter_audit"},
+        # chunk0003: no audit events -> not_started.
+    ]
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, rows)
+
+    table = tracker._chunk_table(out, tracker._load_events(out))
+    by_chunk = {row["chunk_id"]: row for row in table}
+    assert by_chunk["chunk0001"]["audit"] == "done"
+    assert by_chunk["chunk0002"]["audit"] == "in_progress"
+    assert by_chunk["chunk0003"]["audit"] == "not_started"
