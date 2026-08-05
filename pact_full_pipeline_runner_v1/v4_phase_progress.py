@@ -39,7 +39,7 @@ TRIAL_STATES = (
     "pending", "generated", "gated", "selected", "quarantined",
     "needs_synthesis", "incomplete_generation",
 )
-AUDIT_STATES = ("not_started", "in_progress", "clean", "findings_present", "unit_failed", "no_candidate")
+AUDIT_STATES = ("not_started", "in_progress", "done", "clean", "findings_present", "unit_failed", "no_candidate")
 REPAIR_STATES = ("not_started", "in_progress", "committed", "debt")
 
 ARTIFACT_NAMES = (
@@ -366,12 +366,18 @@ def _audit_status(chunk_id: str, handoff_by_chunk: Dict[str, Any], events: List[
         if candidate:
             detail += f" candidate={candidate}"
         return status, detail
-    # In-progress audit unit for this chunk.
-    done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "audit_unit_done"}
-    for event in events:
-        if event.get("event") == "audit_unit_started" and event.get("chunk_id") == chunk_id:
-            if (event.get("chunk_id"), event.get("detector")) not in done:
-                return "in_progress", f"audit unit started: detector={event.get('detector')}"
+    # No b2_handoff row yet (Step 6 still running): derive from audit unit
+    # events written by the ProgressTracker into phase_progress.ndjson.
+    started = {(e.get("chunk_id"), e.get("detector")) for e in events
+               if e.get("event") == "audit_unit_started" and e.get("chunk_id") == chunk_id}
+    if started:
+        done = {(e.get("chunk_id"), e.get("detector")) for e in events
+                if e.get("event") == "audit_unit_done" and e.get("chunk_id") == chunk_id}
+        if started <= done:
+            detectors = ", ".join(sorted(detector for _, detector in started))
+            return "done", f"audit units done: {detectors}"
+        pending = next((detector for chunk, detector in sorted(started - done)), None)
+        return "in_progress", f"audit unit started: detector={pending}"
     return "not_started", "no b2_handoff / audit unit event"
 
 
