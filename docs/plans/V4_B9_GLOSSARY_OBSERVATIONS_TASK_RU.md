@@ -59,10 +59,51 @@ snapshot (там только glossary + book_memory) и не участвует
 - **target**: извлекается консенсус-выравниванием по готовому переводу
   (pid→pid, доля варианта >= 0.8).
 - **Авто-промоут** по v3-порогам: proper >= 2, term >= 2 глав и >= 3 вхождений,
-  1 вариант.
+  единственный консистентный target в кумулятивном ledger-рекорде.
 - **Несогласованность** → ledger `conflicts` (не промоутится).
 - Ledger: `glossary_candidates.json` в out-base.
 - Промоут — через `observations` + `promote` (B7).
+
+### 3.1 Строгие свидетельства (решение владельца: Вариант B + строгие свидетельства)
+
+Промоут кандидата требует строгих свидетельств (B9-F2/F3/F5, review RV2/RV4):
+
+- **co-occurrence guard**: target, разделяемый >1 term-кандидатом в пределах
+  главы, отбрасывается — оба кандидата лишаются target и уходят в `conflicts`
+  (частотный контраст не отличает «перевод кандидата» от «слова, лишь
+  совстречающегося с кандидатом в тех же pids», B9-F2); ложные пары не
+  промоутятся.
+- **Кумулятивный ledger-рекорд**: промоут ТОЛЬКО при единственном консистентном
+  target в кумулятивном ledger-рекорде без cross-chapter конфликта (RV2 HIGH,
+  B9-F3) — запись, чьи главы разрешили source в разные targets, навсегда имеет
+  target None (слияние необратимо), считается `conflict` и никогда не
+  промоутится, даже если текущая глава однозначна.
+- **Quarantined fail-closed**: при `accepted_degraded` с quarantined-чанками и
+  недоступной/неполной provenance (chunk_plan) генерация/промоут fail-closed
+  (RV4 HIGH, B9-F5): пустой/битый/неполный `chunk_plan.json` (не может
+  авторитетно сопоставить каждый source/translation pid чанку) → ноль
+  кандидатов, ноль ledger-строк, ноль наблюдений, glossary не мутируется;
+  warning в лог, run не падает.
+
+### 3.2 Артефакты — семантика `book_run.json` candidates
+
+Per-chapter блок `candidates` `{generated, proposed, committed, conflicts}`
+(определения совпадают с docstring `v4_book_run.py`):
+
+- `generated` — число выровненных кандидатов главы (генерация + консенсус-
+  выравнивание, исключения применены); 0 для глав без принятого терминального
+  статуса (complete/accepted_degraded).
+- `proposed` — сколько кандидатов главы отправлено в `MemoryManager.
+  add_observation` (v3-пороги + единственный консистентный target + нет
+  established-конфликта) — это add_observation ДО B7-quarantined-фильтра.
+- `committed` — сколько из `proposed` реально попало в `glossary.json` после
+  `promote` (diff glossary до/после): наблюдение с quarantined `chunk_id`
+  отбрасывается B7-фильтром (accepted_degraded) → committed < proposed;
+  complete ⇒ committed == proposed.
+- `conflicts` — выровненные записи, НЕ отправленные в add_observation:
+  alignment-конфликт (несколько заметных вариантов, нет единственного target),
+  кумулятивный ledger target-конфликт (cross-chapter расхождение) или
+  established-конфликт (запись glossary с другим target) — не промоутятся.
 
 ### 4. Identity / кеши
 
