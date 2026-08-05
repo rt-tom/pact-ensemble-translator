@@ -1,7 +1,7 @@
 """B9 integration tests: candidate generation/ledger/promotion in the book run.
 
 Covers the B9 card requirements under the owner decision recorded in
-DECISIONS.md (2026-08-04 — Variant B: auto-promotion stays, with v3
+DECISIONS.md (2026-08-04 — V-final: auto-promotion stays, with v3
 thresholds and strict source->target evidence; B9-RV2/B9-RV3 reviews of
 PR #128, B9-F2/F3/F5/F6 follow-ups):
 
@@ -14,14 +14,18 @@ PR #128, B9-F2/F3/F5/F6 follow-ups):
   chapter's observations must never satisfy later thresholds (review F1);
 * candidates that meet the v3 thresholds with a single aligned target are
   auto-promoted through ``MemoryManager.add_observation`` -> the B7
-  ``promote`` path (Variant B); the per-chapter ``candidates`` block records
+  ``promote`` path (V-final); the per-chapter ``candidates`` block records
   ``{generated, proposed, committed, conflicts}``:
     - ``proposed`` — aligned records sent to ``add_observation`` this
       chapter (thresholds met, single target, no established conflict);
     - ``committed`` — how many of those actually landed in ``glossary.json``
-      after ``promote`` (the B7 quarantined-chunk filter can drop proposed
-      observations on ``accepted_degraded``, so ``committed`` may be smaller
-      than ``proposed``; ``complete`` promotes all observations);
+      after ``promote``. For B9-generated observations ``committed ==
+      proposed`` for ``complete`` AND ``accepted_degraded`` (valid plan):
+      quarantined pids are excluded before generation (B9-RV3, F5/F6
+      fail-closed), so proposed observations carry only accepted
+      ``chunk_id``s that the B7 filter keeps; the B7 quarantined filter stays
+      defense-in-depth and can lower ``committed`` only for independent
+      (e.g. manual) observations carrying a quarantined ``chunk_id``);
     - ``conflicts`` — aligned records NOT proposed because of an alignment
       conflict, a cumulative ledger target conflict (chapters resolved the
       source to different targets, B9-F3), or an established glossary entry
@@ -52,6 +56,7 @@ like the existing B7 wrapper tests.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -60,14 +65,19 @@ import pytest
 from pact_v4.phase1.glossary_candidates import GlossaryCandidateLedger
 
 
-def _setup_memory(tmp_path: Path) -> Path:
+def _setup_memory(tmp_path: Path, book_memory_bytes: bytes | None = None) -> Path:
     memory = tmp_path / "memory"
     memory.mkdir(parents=True, exist_ok=True)
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
-    (memory / "book_memory.json").write_text(
-        json.dumps({"pov": {"gender": "male"}}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    if book_memory_bytes is None:
+        (memory / "book_memory.json").write_text(
+            json.dumps({"pov": {"gender": "male"}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    else:
+        # Deliberately noncanonical formatting (compact, no indent) so the
+        # regression can detect any read-modify-write reformatting by bytes.
+        (memory / "book_memory.json").write_bytes(book_memory_bytes)
     (memory / "observations.json").write_text("{}", encoding="utf-8")
     return memory
 
@@ -117,7 +127,7 @@ def _make_chapter_artifacts(
 
 
 # ---------------------------------------------------------------------------
-# Two-chapter accumulation + promotion (B9 Variant B)
+# Two-chapter accumulation + promotion (B9 V-final)
 # ---------------------------------------------------------------------------
 
 _CH1_HTML = """<p>He met Blake at the gate. Blake knew the way.</p>
@@ -201,10 +211,10 @@ _CH2_DISAGREE_TRANSLATIONS = {
 
 class TestBookRunCandidateIntegration:
     def _run(self, tmp_path, monkeypatch, chapter_specs,
-             mixed_script_allow=()):
+             mixed_script_allow=(), book_memory_bytes=None):
         from pact_full_pipeline_runner_v1 import v4_book_run
 
-        memory = _setup_memory(tmp_path)
+        memory = _setup_memory(tmp_path, book_memory_bytes=book_memory_bytes)
         out_base = tmp_path / "out"
         src_dir = tmp_path / "src"
 
@@ -233,7 +243,7 @@ class TestBookRunCandidateIntegration:
     def test_two_chapters_accumulate_and_auto_promote(
         self, tmp_path, monkeypatch,
     ):
-        """Candidates accumulate in the ledger and auto-promote (Variant B).
+        """Candidates accumulate in the ledger and auto-promote (V-final).
 
         Both chapters are accepted, so the ledger accumulates pact across two
         chapters (6 occurrences) and Blake in chapter 0001. Blake meets the
@@ -254,7 +264,7 @@ class TestBookRunCandidateIntegration:
             "complete", "complete",
         ]
 
-        # Per-chapter candidates blocks (Variant B semantics):
+        # Per-chapter candidates blocks (V-final semantics):
         #   ch1: Blake proposed+committed; pact is term with 1 chapter < 2.
         #   ch2: pact proposed+committed; Blake already in glossary, so it is
         #        excluded from generation (glossary exclusions).
@@ -266,7 +276,7 @@ class TestBookRunCandidateIntegration:
             "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
         }
 
-        # Variant B: the B9 loop promoted both candidates into glossary.json,
+        # V-final: the B9 loop promoted both candidates into glossary.json,
         # stored flat {source: target} after _flatten_promoted_glossary.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {"Blake": "Блэйк", "pact": "пакт"}
@@ -289,6 +299,67 @@ class TestBookRunCandidateIntegration:
         blake = records["proper_name|blake"]
         assert blake["total_occurrences"] == 4
         assert [c["chapter_id"] for c in blake["chapters"]] == ["0001"]
+
+    def test_complete_glossary_promotion_preserves_book_memory_bytes(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV9 HIGH regression: a glossary-only promotion must NOT
+        read-modify-write ``book_memory.json``.
+
+        ``book_memory.json`` is seeded with deliberately noncanonical compact
+        JSON (``{"pov":{"gender":"male"}}`` — any reformatting would change
+        its bytes). A ``complete`` chapter promotes a glossary candidate; the
+        raw bytes and the recorded per-chapter ``_book_memory_hash`` must
+        stay exactly the same, so snapshot/cache identity cannot change
+        solely from JSON reformatting.
+        """
+        book_memory_bytes = b'{"pov":{"gender":"male"}}'
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (_CH1_HTML, "complete", [], _CH1_TRANSLATIONS),
+        }, book_memory_bytes=book_memory_bytes)
+
+        # Sanity: this IS a real glossary promotion (Blake, 4 occurrences).
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+        # Exact bytes preserved — no read-modify-write reformatting.
+        assert (memory / "book_memory.json").read_bytes() == book_memory_bytes
+
+        # The recorded per-chapter hashes are unchanged and still match the
+        # original raw bytes.
+        rec = result["chapters"][0]
+        assert rec["book_memory_hash_before"] == rec["book_memory_hash_after"]
+        assert rec["book_memory_hash_after"] == hashlib.sha256(
+            book_memory_bytes
+        ).hexdigest()
+
+    def test_accepted_degraded_glossary_promotion_preserves_book_memory_bytes(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV9 HIGH regression, accepted_degraded valid-plan path.
+
+        An ``accepted_degraded`` chapter WITHOUT quarantined chunks (valid
+        PID->chunk plan, no exclusion needed — the F5/F6 fail-closed branch
+        does not engage) promotes its glossary candidate while leaving
+        ``book_memory.json`` bytes and ``_book_memory_hash`` untouched.
+        """
+        book_memory_bytes = b'{"pov":{"gender":"male"}}'
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (_CH1_HTML, "accepted_degraded", [], _CH1_TRANSLATIONS),
+        }, book_memory_bytes=book_memory_bytes)
+
+        # Sanity: the accepted_degraded valid-plan chapter still promotes.
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+        # Exact bytes preserved — no read-modify-write reformatting.
+        assert (memory / "book_memory.json").read_bytes() == book_memory_bytes
+
+        rec = result["chapters"][0]
+        assert rec["book_memory_hash_before"] == rec["book_memory_hash_after"]
+        assert rec["book_memory_hash_after"] == hashlib.sha256(
+            book_memory_bytes
+        ).hexdigest()
 
     def test_cross_chapter_target_disagreement_never_promotes(
         self, tmp_path, monkeypatch,
@@ -391,9 +462,10 @@ class TestBookRunCandidateIntegration:
         """B9-RV3: accepted_degraded + quarantined chunk: a candidate wholly
         from a quarantined chunk has NO ledger line and NO promotion.
 
-        The old (Variant A) test asserted the candidate WAS shadow-recorded;
-        B9-RV3 requires quarantined-chunk evidence to be excluded BEFORE
-        ledger accumulation and auto-promotion.
+        The old (cancelled Variant A shadow-only policy) test asserted the
+        candidate WAS shadow-recorded; B9-RV3 requires quarantined-chunk
+        evidence to be excluded BEFORE ledger accumulation and
+        auto-promotion.
         """
         html = """<p>He met Blake at the gate. Blake knew the way.</p>
 <p>Blake waited outside for Mary.</p>"""
@@ -538,7 +610,7 @@ class TestBookRunCandidateIntegration:
         # allowlist; with the B5 allowlist wired through it is excluded.
         assert "term|corvidae" not in records
         # The control candidate (Beasley, not allowlisted) IS recorded and
-        # promotes under Variant B (2 proper_name occurrences, single target).
+        # promotes under V-final (2 proper_name occurrences, single target).
         assert "proper_name|beasley" in records
         assert result["chapters"][0]["candidates"] == {
             "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,

@@ -5,7 +5,8 @@ after each chapter based on its terminal status. The wrapper calls
 ``v4_phase12_strict_run`` for each chapter and ``MemoryManager.promote``
 between chapters.
 
-B9 (owner decision 2026-08-04: Variant B + strict source->target evidence,
+B9 (owner decision 2026-08-04, V-final: deterministic source candidates
++ strict source->target evidence,
 ``docs/plans/V4_B9_GLOSSARY_OBSERVATIONS_TASK_RU.md``; see DECISIONS.md) adds
 the glossary-candidate loop between the chapter run and ``promote``: after
 each chapter the deterministic generator + consensus alignment
@@ -63,11 +64,15 @@ Per-chapter ``candidates`` field semantics (exact definitions):
     collide with an established glossary entry.
   * ``committed`` — how many of the ``proposed`` candidates actually landed
     in ``glossary.json`` after ``MemoryManager.promote``. Counted as the
-    glossary key diff (before/after promote): a proposed candidate whose
-    observation carried a quarantined ``chunk_id`` is dropped by the B7
-    quarantined-chunk filter (``accepted_degraded``), so ``committed`` can be
-    smaller than ``proposed``; ``complete`` promotes all observations and
-    ``committed == proposed``.
+    glossary key diff (before/after promote). For B9-generated observations
+    ``committed == proposed`` for BOTH ``complete`` and ``accepted_degraded``
+    (valid plan): quarantined pids are excluded BEFORE candidate generation
+    (B9-RV3, with B9-F5/F6 fail-closed on unavailable or ambiguous PID->chunk
+    provenance), so every proposed candidate carries an accepted ``chunk_id``
+    that the B7 quarantined-chunk filter keeps. The B7 filter remains
+    defense-in-depth: only independent (e.g. manual) observations carrying a
+    quarantined ``chunk_id`` can be dropped, giving ``committed < proposed``
+    for those; it never drops a B9-generated proposed candidate.
   * ``conflicts`` — aligned records that were NOT proposed because of an
     alignment conflict (several notable variants, no single target), a
     cumulative ledger target conflict (previous chapters resolved the source
@@ -455,7 +460,7 @@ def _auto_promote_glossary(
 
     For every candidate aligned in THIS chapter, look up its cumulative
     ledger record (``merged_ledger``) and check the kind-specific thresholds
-    (B9 card, v3 mechanics; owner decision 2026-08-04 — Variant B):
+    (B9 card, v3 mechanics; owner decision 2026-08-04 — V-final):
 
       * ``proper_name``: ``total_occurrences >= proper_name_min_occurrences``
         and a single aligned target;
@@ -629,7 +634,7 @@ def run_book(
 
         quarantined = _quarantined_chunks_from_record(out_dir)
 
-        # B9 (Variant B, owner decision 2026-08-04): candidate generation +
+        # B9 (V-final, owner decision 2026-08-04): candidate generation +
         # consensus alignment -> ledger, then v3-threshold auto-promotion via
         # MemoryManager.add_observation, strictly after the chapter and
         # BEFORE MemoryManager.promote (GATE). Only chapters that reached an
@@ -714,10 +719,14 @@ def run_book(
 
         # B9: committed = how many of the proposed candidates actually
         # landed in glossary.json after promote. Counted as the glossary key
-        # diff (before/after promote): a proposed candidate whose observation
-        # carried a quarantined chunk_id is dropped by the B7 quarantined
-        # filter (accepted_degraded), so committed < proposed there;
-        # complete promotes all observations (committed == proposed).
+        # diff (before/after promote). For B9-generated observations
+        # committed == proposed for BOTH complete and accepted_degraded
+        # (valid plan): quarantined pids are excluded BEFORE generation
+        # (B9-RV3, F5/F6 fail-closed), so every proposed candidate carries an
+        # accepted chunk_id that the B7 filter keeps. The B7 filter is
+        # defense-in-depth: only independent (e.g. manual) observations with
+        # a quarantined chunk_id can be dropped (committed < proposed there);
+        # it never drops a B9-generated proposed candidate.
         glossary_after = _load_json(memory_dir / "glossary.json", {})
         new_glossary_keys = set(glossary_after) - set(glossary_before)
         candidates_block["committed"] = len(proposed_sources & new_glossary_keys)

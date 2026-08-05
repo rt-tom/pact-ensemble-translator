@@ -60,10 +60,12 @@ snapshot (там только glossary + book_memory) и не участвует
 
 - Точка вызова: `pact_full_pipeline_runner_v1/v4_book_run.py` — после каждой
   главы, **до** `MemoryManager.promote(status, quarantined_chunks)`.
-- Категории наблюдений:
-  - `glossary` — кандидаты терминов из финального текста главы;
-  - `book_memory` — опционально: наблюдения о персонажах/фактах (решение
-    владельца: ограничить scope B9 glossary-only или включить book_memory).
+- Категории наблюдений: B9 — строго **glossary-only** (решение владельца
+  2026-08-04, V-финал): в `add_observation` передаётся только категория
+  `glossary` — кандидаты терминов из финального текста главы. Категория
+  `book_memory` в scope B9 НЕ входит: B9 не создаёт наблюдений о
+  персонажах/фактах и не меняет `book_memory.json`/`book_memory_hash`
+  (см. §4).
 - `promote` (B7) уже переносит наблюдения с conflict resolution
   (established/locked не перезаписываются) и фильтрацией quarantined.
 
@@ -82,7 +84,7 @@ snapshot (там только glossary + book_memory) и не участвует
 - Ledger: `glossary_candidates.json` в out-base.
 - Промоут — через `observations` + `promote` (B7).
 
-### 3.1 Строгие свидетельства (решение владельца: Вариант B + строгие свидетельства)
+### 3.1 Строгие свидетельства (решение владельца: V-финал — авто-промоут со строгими свидетельствами)
 
 Промоут кандидата требует строгих свидетельств (B9-F2/F3/F5/F6, review
 RV2/RV4/RV5):
