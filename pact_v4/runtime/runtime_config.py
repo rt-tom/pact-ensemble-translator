@@ -636,8 +636,9 @@ def build_role_adapters(
     gemma_audit_evaluator)``. Imported lazily so ``runtime_config`` stays
     importable without ``backend_role_adapters`` (no import cycle).
 
-    ``json_retry_policy`` (B4, optional) overrides the JSON-resilience retry
-    policy of the Qwen audit adapter (default ``JsonRetryPolicy()``,
+    ``json_retry_policy`` (B4/B10, optional) overrides the JSON-resilience
+    retry policy of every role adapter — generation, Qwen fidelity gate,
+    Gemma selector, Qwen audit, Gemma audit (default ``JsonRetryPolicy()``,
     ``max_retries=2``). A runtime-config override is wired by the caller (the
     CLI); the policy is a resilience parameter and does not change backend
     identity.
@@ -653,7 +654,9 @@ def build_role_adapters(
         BackendGemmaAuditEvaluator,
         BackendGemmaAuditEvaluatorConfig,
         BackendGemmaSelector,
+        BackendGemmaSelectorConfig,
         BackendModelCaller,
+        BackendModelCallerConfig,
         BackendQwenAuditEvaluator,
         BackendQwenAuditEvaluatorConfig,
         BackendQwenEvaluator,
@@ -663,18 +666,20 @@ def build_role_adapters(
     retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
     return (
-        BackendModelCaller(backend),
+        BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry)),
         BackendQwenEvaluator(
-            backend, config=BackendQwenEvaluatorConfig(bible_text=bible_text),
+            backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text),
         ),
-        BackendGemmaSelector(backend),
+        BackendGemmaSelector(
+            backend, config=BackendGemmaSelectorConfig(retry=retry),
+        ),
         BackendQwenAuditEvaluator(
             backend,
             config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text),
         ),
         BackendGemmaAuditEvaluator(
             backend,
-            config=BackendGemmaAuditEvaluatorConfig(bible_text=bible_text),
+            config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text),
         ),
     )
 
@@ -699,11 +704,12 @@ def build_repair_adapters(
     retrofit needed). Imported lazily to avoid an import cycle with
     ``backend_role_adapters``.
 
-    ``json_retry_policy`` (B4, optional) overrides the JSON-resilience retry
-    policy of the repair caller and the Step 6 Qwen audit re-used during
-    convergence (default ``JsonRetryPolicy()``, ``max_retries=2``). A
-    runtime-config override is wired by the caller (the CLI); the policy is a
-    resilience parameter and does not change backend identity.
+    ``json_retry_policy`` (B4/B10, optional) overrides the JSON-resilience
+    retry policy of every Phase 4 adapter — repair caller, L2b region
+    re-gate, Step 6 Qwen audit re-used during convergence, Gemma audit
+    (default ``JsonRetryPolicy()``, ``max_retries=2``). A runtime-config
+    override is wired by the caller (the CLI); the policy is a resilience
+    parameter and does not change backend identity.
     """
     from pact_v4.runtime.backend_role_adapters import (
         BackendGemmaAuditEvaluator,
@@ -711,6 +717,7 @@ def build_repair_adapters(
         BackendQwenAuditEvaluator,
         BackendQwenAuditEvaluatorConfig,
         BackendRegionFidelityGate,
+        BackendRegionFidelityGateConfig,
         BackendRepairCaller,
         BackendRepairCallerConfig,
     )
@@ -719,14 +726,18 @@ def build_repair_adapters(
     backend = build_role_backend(cfg, runtime)
     return (
         BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry)),
-        BackendRegionFidelityGate(backend),
+        BackendRegionFidelityGate(
+            backend, config=BackendRegionFidelityGateConfig(retry=retry),
+        ),
         BackendQwenAuditEvaluator(
             backend, config=BackendQwenAuditEvaluatorConfig(
                 retry=retry, bible_text=bible_text,
             ),
         ),
         BackendGemmaAuditEvaluator(
-            backend, config=BackendGemmaAuditEvaluatorConfig(bible_text=bible_text),
+            backend, config=BackendGemmaAuditEvaluatorConfig(
+                retry=retry, bible_text=bible_text,
+            ),
         ),
     )
 

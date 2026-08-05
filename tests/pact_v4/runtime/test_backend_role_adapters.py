@@ -26,11 +26,17 @@ from pact_v4.runtime.backend_protocol import (
 )
 from pact_v4.runtime.backend_role_adapters import (
     BackendGemmaAuditEvaluator,
+    BackendGemmaAuditEvaluatorConfig,
     BackendGemmaSelector,
+    BackendGemmaSelectorConfig,
     BackendModelCaller,
+    BackendModelCallerConfig,
     BackendQwenAuditEvaluator,
     BackendQwenAuditEvaluatorConfig,
     BackendQwenEvaluator,
+    BackendQwenEvaluatorConfig,
+    BackendRegionFidelityGate,
+    BackendRegionFidelityGateConfig,
     BackendRepairCaller,
     BackendRepairCallerConfig,
 )
@@ -533,3 +539,293 @@ def test_repair_caller_does_not_retry_transport_failure_as_json_error():
     with pytest.raises(CompletionError, match="connection refused"):
         caller(**_repair_kwargs())
     assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# B10: B4 JSON-resilience extended to ALL role adapters
+# (generation, Qwen fidelity, Gemma selector, Gemma audit, region gate).
+# Empty/truncated JSON is retried with the identical request; transport
+# failures are never retried; exhaustion re-raises the last error — never a
+# semantic verdict.
+# ---------------------------------------------------------------------------
+
+
+def _no_backoff() -> JsonRetryPolicy:
+    return JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0)
+
+
+def _empty_then(ok_text: str):
+    return ScriptedBackend([_text_response(""), _text_response(ok_text)])
+
+
+# --- BackendModelCaller (Phase 2B generation) -----------------------------
+
+
+def test_model_caller_retries_empty_response_then_succeeds():
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+    backend = _empty_then(canned)
+    caller = BackendModelCaller(
+        backend, config=BackendModelCallerConfig(retry=_no_backoff()),
+    )
+    out = caller(_bundle())
+    assert json.loads(out) == {"p00001": "Один.", "p00002": "Два."}
+    # Empty body on the first call -> retry -> success on the second.
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_model_caller_raises_after_empty_retries_exhausted():
+    backend = ScriptedBackend([_text_response("")] * 3)
+    caller = BackendModelCaller(
+        backend, config=BackendModelCallerConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(EmptyResponseError):
+        caller(_bundle())
+    assert len(backend.requests) == 3
+
+
+def test_model_caller_does_not_retry_transport_failure():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    caller = BackendModelCaller(
+        _FailingBackend([]), config=BackendModelCallerConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(CompletionError, match="connection refused"):
+        caller(_bundle())
+    assert len(attempts) == 1
+
+
+# --- BackendQwenEvaluator (Phase 2C fidelity gate) ------------------------
+
+
+def test_qwen_evaluator_retries_empty_response_then_succeeds():
+    backend = _empty_then(_pass_verdict())
+    evaluator = BackendQwenEvaluator(
+        backend, config=BackendQwenEvaluatorConfig(retry=_no_backoff()),
+    )
+    result = evaluator({"p1": "Hi."}, {"p1": "Привет."})
+    assert result.passed is True
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_qwen_evaluator_raises_after_empty_retries_exhausted():
+    backend = ScriptedBackend([_text_response("")] * 3)
+    evaluator = BackendQwenEvaluator(
+        backend, config=BackendQwenEvaluatorConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(EmptyResponseError):
+        evaluator({"p1": "Hi."}, {"p1": "Привет."})
+    assert len(backend.requests) == 3
+
+
+def test_qwen_evaluator_does_not_retry_transport_failure():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    evaluator = BackendQwenEvaluator(
+        _FailingBackend([]), config=BackendQwenEvaluatorConfig(retry=_no_backoff()),
+    )
+    result = evaluator({"p1": "Hi."}, {"p1": "Привет."})
+    assert isinstance(result, GateResult)
+    assert result.passed is False
+    assert "API failure" in result.detail
+    assert len(attempts) == 1
+
+
+# --- BackendGemmaSelector (Phase 2C Russian preference) -------------------
+
+
+def _preference_ok() -> str:
+    return json.dumps({"preferred_candidate_id": "B", "reason": "more idiomatic"})
+
+
+def test_gemma_selector_retries_empty_response_then_succeeds():
+    backend = _empty_then(_preference_ok())
+    selector = BackendGemmaSelector(
+        backend, config=BackendGemmaSelectorConfig(retry=_no_backoff()),
+    )
+    candidates = [
+        ("A", {"p00001": "Стюард открыл дверь."}),
+        ("B", {"p00001": "Управляющий распахнул дверь."}),
+    ]
+    result = selector(candidates)
+    assert result.passed is True
+    assert result.detail == "B"
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_gemma_selector_raises_after_empty_retries_exhausted():
+    backend = ScriptedBackend([_text_response("")] * 3)
+    selector = BackendGemmaSelector(
+        backend, config=BackendGemmaSelectorConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(EmptyResponseError):
+        selector([("A", {"p1": "Привет."})])
+    assert len(backend.requests) == 3
+
+
+def test_gemma_selector_does_not_retry_transport_failure():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    selector = BackendGemmaSelector(
+        _FailingBackend([]), config=BackendGemmaSelectorConfig(retry=_no_backoff()),
+    )
+    result = selector([("A", {"p1": "Привет."})])
+    assert isinstance(result, GateResult)
+    assert result.passed is False
+    assert "API failure" in result.detail
+    assert len(attempts) == 1
+
+
+# --- BackendGemmaAuditEvaluator (Step 6 Gemma audit) ----------------------
+
+
+def test_gemma_audit_retries_empty_response_then_succeeds():
+    canned = json.dumps({"issues": []}, ensure_ascii=False)
+    backend = _empty_then(canned)
+    evaluator = BackendGemmaAuditEvaluator(
+        backend, config=BackendGemmaAuditEvaluatorConfig(retry=_no_backoff()),
+    )
+    out = evaluator(chunk_id="c", translation=_audit_translation())
+    assert out == canned
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_gemma_audit_raises_after_empty_retries_exhausted():
+    backend = ScriptedBackend([_text_response("")] * 3)
+    evaluator = BackendGemmaAuditEvaluator(
+        backend, config=BackendGemmaAuditEvaluatorConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(EmptyResponseError):
+        evaluator(chunk_id="c", translation=_audit_translation())
+    assert len(backend.requests) == 3
+
+
+def test_gemma_audit_does_not_retry_transport_failure():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    evaluator = BackendGemmaAuditEvaluator(
+        _FailingBackend([]), config=BackendGemmaAuditEvaluatorConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(CompletionError, match="connection refused"):
+        evaluator(chunk_id="c", translation=_audit_translation())
+    assert len(attempts) == 1
+
+
+# --- BackendRegionFidelityGate (Phase 4A L2b narrow re-gate) --------------
+
+
+def _region_gate_kwargs():
+    from pact_v4.phase1.models import Region
+
+    return dict(
+        source_text="Hello, world.",
+        repaired_text="Здравствуй, мир.",
+        region=Region(pid="p1", start=0, end=6),
+    )
+
+
+def test_region_fidelity_gate_retries_empty_response_then_succeeds():
+    backend = _empty_then(_pass_verdict())
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    result = gate(**_region_gate_kwargs())
+    assert result.passed is True
+    assert len(backend.requests) == 2
+    assert backend.requests[0] == backend.requests[1]
+
+
+def test_region_fidelity_gate_raises_after_empty_retries_exhausted():
+    backend = ScriptedBackend([_text_response("")] * 3)
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    with pytest.raises(EmptyResponseError):
+        gate(**_region_gate_kwargs())
+    assert len(backend.requests) == 3
+
+
+def test_region_fidelity_gate_does_not_retry_transport_failure():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    gate = BackendRegionFidelityGate(
+        _FailingBackend([]), config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    result = gate(**_region_gate_kwargs())
+    assert isinstance(result, GateResult)
+    assert result.passed is False
+    assert "API failure" in result.detail
+    assert len(attempts) == 1
+
+
+# --- GenerationCache interaction (B10: retry must not break cache.put) ----
+
+
+def test_generation_cache_put_after_retried_success():
+    """B10: a generation that succeeds only after a JSON retry still writes
+    the candidate into the GenerationCache (cache.put happens on success,
+    never skipped because of the retry)."""
+    from tests.pact_v4.phase2.test_generation import (
+        RiskBand,
+        make_env,
+        make_params,
+        make_risk,
+        valid_output_for,
+    )
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=2)
+    canned = valid_output_for(chunk)
+    backend = _empty_then(canned)
+    caller = BackendModelCaller(
+        backend, config=BackendModelCallerConfig(retry=_no_backoff()),
+    )
+    from pact_v4.phase2.generation import GenerationCache, generate_for_chunk
+
+    cache = GenerationCache()
+    kwargs = dict(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.LOW),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=caller,
+        cache=cache,
+    )
+    outcome = generate_for_chunk(**kwargs)
+    assert outcome.status == "complete"
+    assert len(backend.requests) == 2  # empty -> retry -> success
+    # The retried success was cached exactly like a first-try success: the
+    # second identical call is served from the cache (no third backend call).
+    outcome2 = generate_for_chunk(**kwargs)
+    assert outcome2.status == "complete"
+    assert len(backend.requests) == 2

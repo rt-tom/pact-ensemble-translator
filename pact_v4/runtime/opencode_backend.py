@@ -196,9 +196,16 @@ class RemoteBudget:
 
     Budget exhaustion is an explicit operational failure, never a semantic
     verdict.
+
+    ``max_requests_per_chapter`` default 250 (B10): a full chapter cycle
+    needs roughly 16 chunks x (2 generation + 2 fidelity + ~0.5 selection)
+    + audit 2x16 + repair + retry reserve; the earlier 100-per-chapter
+    default did not cover the complete cycle. The budget is part of the
+    backend identity (``build_opencode_descriptor``), so a run that changes
+    this value must use a fresh ``--out-dir``/``--run-label``.
     """
 
-    max_requests_per_chapter: int = 100
+    max_requests_per_chapter: int = 250
     max_retry_requests_per_chapter: int = 10
     max_wait_seconds_on_rate_limit: float = 900.0
     max_reported_cost: Optional[float] = None

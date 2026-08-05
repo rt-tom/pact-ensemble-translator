@@ -201,17 +201,20 @@ def test_build_repair_adapters_returns_backend_repair_caller_over_remote():
 
 
 def test_build_role_adapters_json_retry_policy_override():
-    # B4 §5: the JSON-resilience retry policy is overridable through the
-    # runtime-config build hook (default max_retries=2).
+    # B4 §5 / B10: the JSON-resilience retry policy is overridable through the
+    # runtime-config build hook (default max_retries=2) and is propagated to
+    # EVERY role adapter — generation, Qwen fidelity, Gemma selector, Qwen
+    # audit, Gemma audit (previously only the Qwen audit adapter got it).
     from pact_v4.runtime.json_resilience import JsonRetryPolicy
 
     cfg = _remote_cfg()
     runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
     policy = JsonRetryPolicy(max_retries=5, base_delay_seconds=0.5)
-    _caller, _qwen, _gemma, qwen_audit, _gemma_audit = build_role_adapters(
+    model_caller, qwen, gemma, qwen_audit, gemma_audit = build_role_adapters(
         cfg, runtime, json_retry_policy=policy,
     )
-    assert qwen_audit._config.retry == policy
+    for adapter in (model_caller, qwen, gemma, qwen_audit, gemma_audit):
+        assert adapter._config.retry == policy
     runtime.close()
 
 
@@ -221,11 +224,37 @@ def test_build_repair_adapters_json_retry_policy_override():
     cfg = _remote_cfg()
     runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
     policy = JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
-    repair_caller, _region_gate, qwen_audit, _gemma_audit = build_repair_adapters(
+    repair_caller, region_gate, qwen_audit, gemma_audit = build_repair_adapters(
         cfg, runtime, json_retry_policy=policy,
     )
-    assert repair_caller._config.retry == policy
-    assert qwen_audit._config.retry == policy
+    for adapter in (repair_caller, region_gate, qwen_audit, gemma_audit):
+        assert adapter._config.retry == policy
+    runtime.close()
+
+
+def test_build_role_adapters_retry_defaults_to_json_retry_policy():
+    # B10: without an explicit override every role adapter still gets a
+    # JsonRetryPolicy (the dataclass default) — the hooks must not pass None.
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    cfg = _remote_cfg()
+    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
+    model_caller, qwen, gemma, qwen_audit, gemma_audit = build_role_adapters(cfg, runtime)
+    for adapter in (model_caller, qwen, gemma, qwen_audit, gemma_audit):
+        assert isinstance(adapter._config.retry, JsonRetryPolicy)
+        assert adapter._config.retry.max_retries == 2
+    runtime.close()
+
+
+def test_build_repair_adapters_retry_defaults_to_json_retry_policy():
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    cfg = _remote_cfg()
+    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
+    repair_caller, region_gate, qwen_audit, gemma_audit = build_repair_adapters(cfg, runtime)
+    for adapter in (repair_caller, region_gate, qwen_audit, gemma_audit):
+        assert isinstance(adapter._config.retry, JsonRetryPolicy)
+        assert adapter._config.retry.max_retries == 2
     runtime.close()
 
 
