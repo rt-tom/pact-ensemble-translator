@@ -1,24 +1,34 @@
-"""B9-I2 integration tests: candidate generation/ledger in the book run (Variant A).
+"""B9-I2 integration tests: candidate generation/ledger/auto-promotion in the book run.
 
 Covers the B9-I2 card requirements under the owner decision recorded in
-DECISIONS.md (Variant A — shadow-only; B9-RV2 review of PR #128):
+DECISIONS.md (Variant B — auto-promotion with strict conservative evidence;
+B9-RV2/B9-RV3 reviews of PR #128):
 
 * ``run_book`` calls the generator + consensus alignment after each chapter
-  (source = chapter HTML, translation = ``out_dir/translations.json``) and
+  (source = chapter HTML, translation = ``out_dir/translations.json``),
   appends to the ledger (default ``<out_base>/glossary_candidates.json``)
   BEFORE ``MemoryManager.promote``;
+* v3-threshold auto-promotion through the existing
+  ``add_observation -> promote`` path (Variant B): proper_name >= 2
+  occurrences with a single target promotes; term needs >= 2 chapters AND
+  >= 3 total occurrences with a single target;
 * ONLY chapters with an accepted terminal result (``complete`` /
-  ``accepted_degraded``) contribute to the ledger — a failed chapter's
-  observations must never satisfy later thresholds (review F1);
-* the B9 loop NEVER auto-promotes: ``MemoryManager.add_observation`` is not
-  called, ``glossary.json`` stays untouched, and glossary growth remains a
-  human decision (Variant A; the B7 ``promote`` still moves manual
-  observations);
+  ``accepted_degraded``) contribute to the ledger — failed/unknown/error
+  chapters' observations never enter the ledger or satisfy later thresholds
+  (review F1);
+* quarantined-chunk evidence is excluded BEFORE ledger accumulation and
+  auto-promotion (B9-RV3): pids from quarantined chunks never generate
+  candidates, a candidate wholly from a quarantined chunk has no ledger line
+  and cannot promote, and a mixed candidate counts only its accepted-chunk
+  occurrences;
 * the B5 combined mixed-script allowlist (bible + glossary + manual +
-  source-derived) is threaded into candidate generation — an allowlisted
-  token is never recorded (review F3);
-* the promoted glossary entries are FLAT ``{source: target}`` on disk when
-  a manual observation is promoted.
+  source-derived) comes from the real book-run ``--mixed-script-allow`` flag
+  (same input as the strict driver, no divergent duplicate flag) — an
+  allowlisted token is never recorded and cannot promote (reviews F3/RV3);
+* the promoted glossary entries are FLAT ``{source: target}`` on disk;
+* strict conservative term alignment: co-occurring unrelated terms (e.g.
+  ``bound``/``together`` next to ``pact``) never share a target and never
+  promote (B9-RV2/RV3).
 
 The strict driver is faked (``_run_one_chapter`` monkeypatched) — the out_dir
 artifacts (``strict_chapter_trial_record.json``, ``selection_results.json``,
@@ -90,7 +100,7 @@ def _make_chapter_artifacts(
 
 
 # ---------------------------------------------------------------------------
-# Two-chapter accumulation (B9-I2 req 5, Variant A)
+# Two-chapter accumulation + promotion (B9-I2 req 5, Variant B)
 # ---------------------------------------------------------------------------
 
 _CH1_HTML = """<p>He met Blake at the gate. Blake knew the way.</p>
@@ -171,39 +181,33 @@ class TestBookRunCandidateIntegration:
         )
         return memory, out_base, result
 
-    def test_two_chapters_accumulate_in_ledger_shadow_only(
+    def test_two_chapters_accumulate_promote_flat_glossary(
         self, tmp_path, monkeypatch,
     ):
-        """Candidates accumulate in the ledger; nothing is auto-promoted.
-
-        Variant A (shadow-only): both chapters are accepted, so the ledger
-        accumulates pact across two chapters (6 occurrences) and Blake in
-        chapter 0001 — but ``glossary.json`` is NOT mutated by the B9 loop
-        (no ``add_observation`` call); glossary growth stays manual.
-        """
+        """Variant B: Blake promotes at ch1, pact at ch2; glossary stays flat."""
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (_CH1_HTML, "complete", [], _CH1_TRANSLATIONS),
             "0002": (_CH2_HTML, "complete", [], _CH2_TRANSLATIONS),
         })
 
-        # Both chapters reached complete (B7 promote still runs and moves
-        # only manual observations — here there are none).
+        # Both chapters reached complete and promoted observations.
         assert [r["terminal_status"] for r in result["chapters"]] == [
             "complete", "complete",
         ]
 
-        # Per-chapter candidates blocks (B9-I2 req 4); Variant A never
-        # reports promoted candidates.
+        # Per-chapter candidates blocks (B9-I2 req 4): proper_name promotes
+        # at ch1 (4 occurrences >= 2, single target); term waits for the
+        # second chapter.
         ch1, ch2 = result["chapters"]
-        assert ch1["candidates"] == {"generated": 2, "promoted": 0, "conflicts": 0}
-        assert ch2["candidates"] == {"generated": 1, "promoted": 0, "conflicts": 0}
+        assert ch1["candidates"] == {"generated": 2, "promoted": 1, "conflicts": 0}
+        assert ch2["candidates"] == {"generated": 1, "promoted": 1, "conflicts": 0}
 
-        # Variant A: the B9 loop never writes to glossary.json.
+        # Variant B: glossary.json updated with FLAT {source: target} pairs.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {}
+        assert glossary == {"Blake": "Блэйк", "pact": "пакт"}
+        assert all(isinstance(v, str) for v in glossary.values())
 
-        # Ledger accumulated: pact spans both chapters with 6 total
-        # occurrences; Blake only in 0001.
+        # Ledger accumulated: pact spans both chapters with 6 total occurrences.
         ledger_path = out_base / "glossary_candidates.json"
         assert result["candidates_ledger"] == str(ledger_path)
         assert ledger_path.exists()
@@ -242,47 +246,45 @@ class TestBookRunCandidateIntegration:
         ).load()
         pact = records["term|pact"]
         # Only the accepted chapter is counted — 3 occurrences, one chapter,
-        # so the 2-chapter/6-occurrence threshold of the old auto-promotion
-        # can never be reached by failed text.
+        # so the 2-chapter term threshold can never be reached by failed text.
         assert pact["total_occurrences"] == 3
         assert [c["chapter_id"] for c in pact["chapters"]] == ["0002"]
         # The failed chapter's proper-name candidate never entered the ledger.
         assert "proper_name|blake" not in records
 
-        # Variant A: nothing promoted, glossary untouched.
+        # With a single accepted chapter, pact (term) is below the 2-chapter
+        # threshold and Blake never appeared — nothing promoted.
+        assert result["chapters"][1]["candidates"] == {
+            "generated": 1, "promoted": 0, "conflicts": 0,
+        }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
 
-    def test_quarantined_chapter_candidates_shadow_only(
+    def test_quarantined_candidate_never_enters_ledger_or_promotes(
         self, tmp_path, monkeypatch,
     ):
-        """accepted_degraded + quarantined chunk: candidate is shadow-recorded
-        with its chunk_ids; no observation, so nothing is promoted."""
+        """B9-RV3: accepted_degraded + quarantined chunk: a candidate wholly
+        from a quarantined chunk has NO ledger line and NO promotion.
+
+        The old (Variant A) test asserted the candidate WAS shadow-recorded;
+        B9-RV3 requires quarantined-chunk evidence to be excluded BEFORE
+        ledger accumulation and auto-promotion.
+        """
         html = """<p>He met Blake at the gate. Blake knew the way.</p>
 <p>Blake waited outside for Mary.</p>"""
         translations = {
             "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
             "p00002": "Блэйк ждал снаружи Мэри.",
         }
-        plan = {
-            "artifact": "pact-v4-chunk-plan/v1",
-            "snapshot_hash": "test",
-            "plan_hash": "test",
-            "chunks": [
-                {"chunk_id": "chunk0001", "snapshot_hash": "test",
-                 "pids": ["p00001", "p00002"],
-                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
-                 "undersized_exception": False},
-            ],
-        }
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (html, "accepted_degraded", ["chunk0001"], translations),
         })
 
-        # The candidate was generated (shadow) but NEVER observed/promoted —
-        # Variant A does not call add_observation.
+        # The whole chapter is one quarantined chunk — the candidate's
+        # evidence is entirely quarantined, so nothing is generated, nothing
+        # enters the ledger, nothing promotes.
         assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "promoted": 0, "conflicts": 0,
+            "generated": 0, "promoted": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
@@ -291,23 +293,113 @@ class TestBookRunCandidateIntegration:
         )
         assert observations.get("glossary", {}) == {}
 
-        # The shadow ledger carries the candidate with its chunk provenance.
         records = GlossaryCandidateLedger(
             str(out_base / "glossary_candidates.json")
         ).load()
-        assert records["proper_name|blake"]["chapters"][0]["chunk_ids"] == [
-            "chunk0001",
-        ]
+        assert "proper_name|blake" not in records
+
+    def test_mixed_candidate_counts_only_accepted_chunks(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV3: a candidate spanning accepted + quarantined chunks counts
+        only its accepted-chunk occurrences; its ledger entry and promotion
+        provenance carry only accepted chunks."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>\n"
+                "<p>Blake returned home later.</p>\n"
+                "<p>He saw Blake return home. Blake waved once more.</p>\n"
+                "<p>He met Blake again.</p>\n"
+                "<p>Blake left at noon.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+            "p00003": "Блэйк вернулся домой позже.",
+            "p00004": "Он видел, как Блэйк вернулся домой. Блэйк помахал ещё раз.",
+            "p00005": "Он снова встретил Блэйка.",
+            "p00006": "Блэйк ушёл в полдень.",
+        }
+        # _PLAN: chunk0001 (p00001-p00003) is quarantined; chunk0002
+        # (p00004-p00006) is accepted. Blake has 8 raw occurrences, 4 in each
+        # chunk. Only the accepted chunk's 4 occurrences (with mid-sentence
+        # capitals) count.
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "accepted_degraded", ["chunk0001"], translations),
+        })
+
+        # Only the accepted chunk's evidence counts: 4 occurrences, so Blake
+        # still meets the proper_name threshold (2) and promotes with accepted
+        # provenance only.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 1, "promoted": 1, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        blake = records["proper_name|blake"]
+        assert blake["total_occurrences"] == 4  # not 8
+        assert blake["chapters"][0]["chunk_ids"] == ["chunk0002"]
+        # Promoted into the flat glossary (chunk_id = chunk0002 is accepted,
+        # so the B7 quarantined filter keeps it).
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+    def test_co_occurring_terms_never_promote_false_pair(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV2/RV3: bound/together next to pact never share 'пакт'.
+
+        The frequency-contrast heuristic cannot tell "the candidate's
+        translation" from "a word that merely co-occurs" — when all term
+        candidates dominate on the same Russian variant, EVERY candidate
+        loses the target. None of pact/bound/together may promote as «пакт».
+        """
+        html = ("<p>The pact bound them all together.</p>\n"
+                "<p>The pact bound them all together.</p>\n"
+                "<p>The pact bound them all together.</p>\n"
+                "<p>The others watched from afar.</p>\n"
+                "<p>The others watched from afar.</p>\n"
+                "<p>The others watched from afar.</p>")
+        translations = {
+            "p00001": "Пакт связывал их всех вместе.",
+            "p00002": "Пакт связывал их всех вместе.",
+            "p00003": "Пакт связывал их всех вместе.",
+            "p00004": "Остальные наблюдали издалека.",
+            "p00005": "Остальные наблюдали издалека.",
+            "p00006": "Остальные наблюдали издалека.",
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations),
+        })
+
+        # pact/bound/together (and the contrasting others/watched/afar) all
+        # co-occur in the same pids and all dominate on a shared variant —
+        # the conservative guard strips the shared target from every
+        # competing candidate, so nothing can promote.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 6, "promoted": 0, "conflicts": 6,
+        }
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        # The ledger records the evidence (for the human reviewer) but every
+        # candidate keeps target=None and «пакт» in conflicts.
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        for key in ("term|pact", "term|bound", "term|together"):
+            record = records[key]
+            assert record["target"] is None
+            assert "пакт" in record["conflicts"]
 
     def test_mixed_script_allowlist_token_never_recorded(
         self, tmp_path, monkeypatch,
     ):
-        """Review F3: an allowlisted token is excluded from the candidate scan
-        and never recorded in the ledger; a non-allowlisted control token is."""
+        """Reviews F3/RV3: an allowlisted token is excluded from the candidate
+        scan and never recorded or promoted; a non-allowlisted control token
+        is."""
         html = ("<p>The lawyer Beasley handled the case. Beasley knew the law.</p>"
                 "<p>Corvidae handled the papers. Corvidae signed them. Corvidae left.</p>")
         translations = {
-            "p00001": "Адвокат Бизли вёл дело. Бизли знал закон.",
+            "p00001": "Бизли вёл дело. Бизли знал закон.",
             "p00002": "Корвиды разбирали бумаги. Корвиды подписали их. Корвиды ушли.",
         }
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
@@ -320,14 +412,237 @@ class TestBookRunCandidateIntegration:
         # Corvidae (3 occurrences) would be a term candidate without the
         # allowlist; with the B5 allowlist wired through it is excluded.
         assert "term|corvidae" not in records
-        # The control candidate (Beasley, not allowlisted) IS recorded.
+        # The control candidate (Beasley, not allowlisted) IS recorded and
+        # promotes under Variant B (2 proper_name occurrences, single target).
         assert "proper_name|beasley" in records
-        # Nothing auto-promoted either way.
         assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "promoted": 0, "conflicts": 0,
+            "generated": 1, "promoted": 1, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {}
+        assert glossary == {"Beasley": "Бизли"}
+
+    def test_b5_mixed_script_flag_excludes_candidate_and_reaches_strict_driver(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV3: the REAL B5 book-run flag --mixed-script-allow excludes a
+        token from the ledger/promotion AND is re-forwarded to the strict
+        driver — no divergent duplicate candidate-only flag."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+        html = ("<p>The lawyer Beasley handled the case. Beasley knew the law.</p>"
+                "<p>Corvidae handled the papers. Corvidae signed them. Corvidae left.</p>")
+        translations = {
+            "p00001": "Бизли вёл дело. Бизли знал закон.",
+            "p00002": "Корвиды разбирали бумаги. Корвиды подписали их. Корвиды ушли.",
+        }
+        _write_chapter_html(src_dir, "0001", html)
+        _make_chapter_artifacts(
+            out_base / "chapter_0001", "0001",
+            terminal_status="complete", quarantined=[],
+            translations=translations, chunk_plan=_PLAN,
+        )
+
+        captured = {}
+
+        def fake_run_one(chapter_id, *, memory_dir, chapter_html_path,
+                         out_dir, extra_args=()):
+            captured["extra_args"] = list(extra_args)
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        rc = v4_book_run.main([
+            "--memory-dir", str(memory),
+            "--chapters", "0001",
+            "--chapter-html-pattern", str(src_dir / "{chapter_id}.html"),
+            "--out-base", str(out_base),
+            "--mixed-script-allow", "corvidae",
+        ])
+        assert rc == 0
+        # The B5 manual flag is forwarded verbatim to the strict driver.
+        assert captured["extra_args"] == ["--mixed-script-allow", "corvidae"]
+        # And it excluded the token from the B9 candidate ledger.
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert "term|corvidae" not in records
+        assert "proper_name|beasley" in records
+
+
+# ---------------------------------------------------------------------------
+# _auto_promote_glossary: thresholds and conflict paths (B9-I2 req 2)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoPromoteGlossary:
+    def _manager(self, tmp_path):
+        from pact_v4.phase1.memory import MemoryManager
+        memory = _setup_memory(tmp_path)
+        return MemoryManager(str(memory))
+
+    def _ledger(self, records) -> dict:
+        """One-entry ledger map keyed like ``GlossaryCandidateLedger.load``."""
+        from pact_v4.phase1.glossary_candidates import candidate_key
+        return {
+            candidate_key(r["source"], r["kind"]): r
+            for r in records
+        }
+
+    def _observation(self, tmp_path, source: str):
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        return observations.get("glossary", {}).get(source)
+
+    def test_proper_name_meets_threshold_is_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Blake", "kind": "proper_name",
+                    "occurrences": 3, "chunk_ids": ["chunk0002"],
+                    "target": "Блэйк", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "Blake", "kind": "proper_name",
+            "total_occurrences": 3,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": ["chunk0002"], "count": 3}],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert len(promoted) == 1
+        assert conflicts == []
+        obs = self._observation(tmp_path, "Blake")
+        assert obs == {"target": "Блэйк", "type": "proper_name",
+                       "chunk_id": "chunk0002"}
+
+    def test_term_below_chapters_threshold_not_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "pact", "kind": "term",
+                    "occurrences": 3, "chunk_ids": [],
+                    "target": "пакт", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "pact", "kind": "term",
+            "total_occurrences": 3,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": [], "count": 3}],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert conflicts == []
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        assert "pact" not in observations.get("glossary", {})
+
+    def test_term_meets_two_chapters_is_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "pact", "kind": "term",
+                    "occurrences": 3, "chunk_ids": ["chunk0002"],
+                    "target": "пакт", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "pact", "kind": "term",
+            "total_occurrences": 6,
+            "chapters": [
+                {"chapter_id": "0001", "chunk_ids": [], "count": 3},
+                {"chapter_id": "0002", "chunk_ids": ["chunk0002"], "count": 3},
+            ],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert len(promoted) == 1
+        assert self._observation(tmp_path, "pact") == {
+            "target": "пакт", "type": "term", "chunk_id": "chunk0002",
+        }
+
+    def test_established_different_target_is_conflict(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Blake", "kind": "proper_name",
+                    "occurrences": 3, "chunk_ids": [],
+                    "target": "Блэйк", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "Blake", "kind": "proper_name",
+            "total_occurrences": 3,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": [], "count": 3}],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {"Blake": "Блейк"},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert len(conflicts) == 1
+        assert conflicts[0]["established_target"] == "Блейк"
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        assert "Blake" not in observations.get("glossary", {})
+
+    def test_alignment_conflict_variants_never_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Duncan", "kind": "proper_name",
+                    "occurrences": 4, "chunk_ids": [],
+                    "target": None, "conflicts": ["Гордон", "Дункан"]}]
+        merged = self._ledger([{
+            "source": "Duncan", "kind": "proper_name",
+            "total_occurrences": 4,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": [], "count": 4}],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert len(conflicts) == 1
+        assert conflicts[0]["conflicts"] == ["Гордон", "Дункан"]
+
+    def test_already_established_same_target_is_noop(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Blake", "kind": "proper_name",
+                    "occurrences": 2, "chunk_ids": [],
+                    "target": "Блэйк", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "Blake", "kind": "proper_name",
+            "total_occurrences": 2,
+            "chapters": [{"chapter_id": "0002", "chunk_ids": [], "count": 2}],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {"Blake": "Блэйк"},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert conflicts == []
+
+    def test_flat_target_accepts_string_and_target_dict(self):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        assert v4_book_run._flat_target("Блэйк") == "Блэйк"
+        assert v4_book_run._flat_target({"target": "Блэйк"}) == "Блэйк"
+        assert v4_book_run._flat_target({"target": 5}) is None
+        assert v4_book_run._flat_target(None) is None
+        assert v4_book_run._flat_target({"name": "John"}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +652,9 @@ class TestBookRunCandidateIntegration:
 
 class TestBookRunCliArgs:
     def test_b9_args_parse_with_correct_dests(self):
-        """Real argparse parse: dest names must match run_book's kwargs."""
+        """Real argparse parse: dest names must match run_book's kwargs and
+        the B5 manual allowlist must come from --mixed-script-allow (the same
+        flag the strict driver uses)."""
         from pact_full_pipeline_runner_v1 import v4_book_run
 
         args, extra = v4_book_run.build_argparser().parse_known_args([
@@ -349,8 +666,8 @@ class TestBookRunCliArgs:
             "--term-min-chapters", "3",
             "--proper-name-min-occurrences", "5",
             "--consensus-ratio", "0.9",
-            "--candidate-mixed-script-allow", "corvidae",
-            "--candidate-mixed-script-allow", "R.D.T.",
+            "--mixed-script-allow", "corvidae",
+            "--mixed-script-allow", "R.D.T.",
             "--run-label", "test-run",  # unknown to book_run -> strict driver
         ])
         assert args.candidates_ledger == Path("led.json")
@@ -358,7 +675,7 @@ class TestBookRunCliArgs:
         assert args.term_min_chapters == 3
         assert args.proper_name_min_occurrences == 5
         assert args.consensus_ratio == 0.9
-        assert args.candidate_mixed_script_allow == ["corvidae", "R.D.T."]
+        assert args.mixed_script_allow == ["corvidae", "R.D.T."]
         # Unknown args still pass through to the strict driver.
         assert "--run-label" in extra and "test-run" in extra
 
@@ -375,4 +692,4 @@ class TestBookRunCliArgs:
         assert args.term_min_chapters == 2
         assert args.proper_name_min_occurrences == 2
         assert args.consensus_ratio == 0.8
-        assert args.candidate_mixed_script_allow is None
+        assert args.mixed_script_allow is None
