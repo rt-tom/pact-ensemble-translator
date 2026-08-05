@@ -113,6 +113,25 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
 - Codex and Claude Code may work in parallel only in distinct branches/worktrees.
 - For handoff, push a checkpoint commit; the next agent fetches and continues with a new commit.
 
+## Kanban-практика (Vibe Kanban, rule 2026-08-04)
+
+Урок B9 (25+ карточек вместо 6): раздувание доски — следствие параллельных
+сессий на одну задачу и по-фиксовых карточек, а не гранулярности как таковой.
+Правила для всех агентов:
+
+- **Гранулярность — средняя**: одна implementation-карточка на верифицируемую
+  единицу (модуль / интеграция / docs) + одна review-карточка на неё. Не
+  дробить на микро-задачи, не сливать крупный объём в одну карточку (ревью
+  диффа в тысячи строк пропускает дефекты).
+- **Fix-циклы группировать**: все замечания ОДНОГО ревью → одна fix-карточка →
+  одно re-review. Не создавать карточку на каждый дефект.
+- **Одна задача = один активный владелец**: не запускать параллельные сессии
+  на одну и ту же задачу (дубли карточек и ветки-близнецы — дороже любой
+  гранулярности). Дубликаты карточек отменять сразу (complete с пометкой).
+- **Developer до отправки на ревью**: контракт-тесты, включая повреждённые
+  входные данные (corrupt/empty/ambiguous chunk_plan и т.п.), полный suite,
+  статический doc-vs-code чек. Часть HIGH-замечаний отсекается самопроверкой.
+
 ## Risk classification
 
 Use `LOW RISK` only for a narrow, unambiguous implementation defect that does not alter translation semantics, issue merging, verification, repair lifecycle, gates, terminal policy, cache identity/invalidation, persistent memory, or model/prompt policy. A regression test is required.
