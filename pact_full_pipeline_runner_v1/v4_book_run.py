@@ -23,8 +23,15 @@ values). Only chapters that reached an accepted terminal result
 (``complete`` / ``accepted_degraded``) contribute to the ledger and to
 promotion — failed/unknown/errored chapters are excluded (review F1), and
 candidate generation skips the B5 mixed-script allowlist (bible + glossary +
-manual + source-derived, review F3). Zero model calls;
-identity/cache/journal untouched.
+manual + source-derived, review F3). For ``accepted_degraded`` the
+quarantined-chunk evidence is excluded BEFORE the ledger and auto-promotion
+(B9-RV3): a candidate whose occurrences come only from quarantined chunks is
+dropped entirely, and a mixed candidate keeps only its accepted-chunk
+occurrences. When the PID->chunk plan backing that exclusion is missing,
+corrupt, empty, ambiguous (duplicate PID/chunk ownership, malformed data) or
+incomplete, the chapter fails closed (B9-F5/F6): no candidate, ledger,
+observation or glossary contribution, with a logged warning (the run never
+crashes). Zero model calls; identity/cache/journal untouched.
 
 CLI::
 
@@ -226,24 +233,49 @@ def _source_by_pid(chapter_html: Path) -> Dict[str, str]:
     return {block.pid: block.text for block in blocks}
 
 
-def _pid_to_chunk(out_dir: Path) -> Dict[str, str]:
+def _pid_to_chunk(out_dir: Path) -> Optional[Dict[str, str]]:
     """``{pid: chunk_id}`` from the strict driver's ``chunk_plan.json``.
 
-    Missing/corrupt plan -> empty mapping (candidates then carry no
-    ``chunk_ids`` and are not filtered by quarantine).
+    Returns ``None`` — NOT an empty dict — when the plan is missing,
+    corrupt, empty, or non-authoritative (B9-F6): duplicate PID
+    ownership (a PID listed in more than one chunk, or twice within one
+    chunk), malformed/non-list chunk or PID data, missing or duplicate
+    chunk identity. The core ``ChunkPlanArtifact`` contract rejects such
+    ownership, so the persisted plan is corrupt, not acceptable
+    provenance, and must never be normalized or overwritten into a
+    plausible-looking mapping. Callers filtering quarantined chunks MUST
+    treat ``None`` as fail-closed (B9-F5/F6): an unavailable or
+    ambiguous map cannot authoritatively exclude quarantined evidence
+    and must not be read as "no quarantined chunks".
     """
-    plan = _load_json(out_dir / "chunk_plan.json", {})
-    mapping: Dict[str, str] = {}
+    plan = _load_json(out_dir / "chunk_plan.json", None)
     if not isinstance(plan, dict):
-        return mapping
-    for chunk in plan.get("chunks", []) or []:
+        return None
+    chunks = plan.get("chunks")
+    if not isinstance(chunks, list):
+        return None
+    mapping: Dict[str, str] = {}
+    seen_chunk_ids = set()
+    for chunk in chunks:
         if not isinstance(chunk, dict):
-            continue
+            return None  # malformed chunk entry
         chunk_id = chunk.get("chunk_id")
-        if chunk_id is None:
-            continue
-        for pid in chunk.get("pids", []) or []:
-            mapping[str(pid)] = str(chunk_id)
+        if not isinstance(chunk_id, str) or not chunk_id:
+            return None  # missing chunk identity
+        if chunk_id in seen_chunk_ids:
+            return None  # duplicate/ambiguous chunk identity
+        seen_chunk_ids.add(chunk_id)
+        pids = chunk.get("pids")
+        if not isinstance(pids, list) or not pids:
+            return None  # malformed/non-list/empty PID data
+        for pid in pids:
+            if not isinstance(pid, str) or not pid:
+                return None  # malformed PID data
+            if pid in mapping:
+                return None  # duplicate PID ownership (within/across chunks)
+            mapping[pid] = chunk_id
+    if not mapping:
+        return None  # empty plan — nothing authoritatively mapped
     return mapping
 
 
@@ -256,6 +288,7 @@ def _generate_and_align_chapter(
     term_min_occurrences: int,
     consensus_ratio: float,
     mixed_script_allow: Sequence[str] = (),
+    excluded_chunk_ids: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
     """B9-I2: generate candidates + consensus-align targets for one chapter.
 
@@ -270,6 +303,27 @@ def _generate_and_align_chapter(
     driver's ``chunk_plan.json`` so candidates carry ``chunk_ids`` for the B7
     quarantined-chunk filter.
 
+    B9-RV3 (quarantined evidence): when ``excluded_chunk_ids`` is non-empty
+    (``accepted_degraded`` chapter with quarantined chunks), the pids that
+    belong to those chunks are dropped from BOTH the source and the
+    translation BEFORE candidate generation and alignment — quarantined
+    occurrences never count toward occurrence thresholds, never appear in
+    candidate ``chunk_ids``, and never shape the consensus target. A
+    candidate whose evidence is wholly from quarantined chunks is therefore
+    never generated at all: it has no ledger line and cannot promote.
+
+    B9-F5/F6 (fail closed on unavailable or ambiguous provenance): when
+    ``excluded_chunk_ids`` is non-empty, the PID->chunk plan must first
+    authoritatively exclude ALL quarantined evidence — a missing/corrupt/
+    empty ``chunk_plan.json`` (``None`` mapping), a plan that does not map
+    each source/translation pid exactly once to a valid chunk (duplicate
+    PID ownership within/across chunks, duplicate or missing chunk
+    identity, malformed/non-list chunk or PID data), or an incomplete plan
+    (a source/translation pid the plan does not map) fails closed: the
+    chapter generates no candidates, appends no ledger line, creates no
+    observation and mutates no glossary. A warning is logged; the book run
+    never crashes.
+
     Degrades to ``[]`` on missing artifacts (e.g. a chapter that failed
     before persisting translations) so the book run never crashes on the
     candidate loop. No model calls, no HTTP.
@@ -280,6 +334,67 @@ def _generate_and_align_chapter(
         source_by_pid = _source_by_pid(chapter_html)
         translations = _load_json(out_dir / "translations.json", {})
         if not translations:
+            return []
+        pid_to_chunk = _pid_to_chunk(out_dir)
+        excluded = {str(c) for c in (excluded_chunk_ids or ())}
+        if excluded:
+            # B9-F5/F6 (fail closed on unavailable or ambiguous
+            # quarantined-chunk provenance): an accepted_degraded chapter
+            # with quarantined chunks may only generate candidates when the
+            # PID->chunk plan authoritatively maps each source/translation
+            # PID exactly once to a valid chunk. A missing/corrupt/empty/
+            # ambiguous plan (``None`` — duplicate PID or chunk ownership,
+            # malformed data, missing chunk identity) or an incomplete plan
+            # (a source/translation pid the plan does not map) leaves pids
+            # of unknown provenance — they could belong to a quarantined
+            # chunk — so the chapter fails closed: no candidates, no ledger
+            # line, no observation, no glossary mutation (a warning is
+            # logged; the run never crashes).
+            if pid_to_chunk is None:
+                LOG.warning(
+                    "B9-F6: %s accepted_degraded with quarantined chunks %s "
+                    "but PID->chunk provenance missing/corrupt/empty/"
+                    "ambiguous (duplicate or malformed ownership); failing "
+                    "closed — no candidate generation, ledger line, "
+                    "observation or glossary mutation",
+                    out_dir.name, sorted(excluded),
+                )
+                return []
+            plan_pids = {str(pid) for pid in pid_to_chunk}
+            present_pids = (
+                {str(pid) for pid in source_by_pid}
+                | {str(pid) for pid in translations}
+            )
+            if not present_pids <= plan_pids:
+                LOG.warning(
+                    "B9-F5: %s accepted_degraded with quarantined chunks %s "
+                    "but PID->chunk provenance incomplete (plan pids=%d, "
+                    "unmapped source/translation pids=%s); failing closed — "
+                    "no candidate generation, ledger line, observation or "
+                    "glossary mutation",
+                    out_dir.name, sorted(excluded), len(plan_pids),
+                    sorted(present_pids - plan_pids),
+                )
+                return []
+            # Quarantined chunks carry no authoritative evidence: drop their
+            # pids from the source and the translation before generation and
+            # alignment (B9-RV3). Every present pid is provably mapped by the
+            # plan (checked above), so the remaining evidence is wholly from
+            # accepted chunks.
+            drop_pids = {
+                pid for pid, chunk in pid_to_chunk.items()
+                if str(chunk) in excluded
+            }
+            if drop_pids:
+                source_by_pid = {
+                    pid: text for pid, text in source_by_pid.items()
+                    if pid not in drop_pids
+                }
+                translations = {
+                    pid: text for pid, text in translations.items()
+                    if pid not in drop_pids
+                }
+        if not source_by_pid or not translations:
             return []
         glossary = _load_json(memory_dir / "glossary.json", {})
         book_memory = _load_json(memory_dir / "book_memory.json", {})
@@ -301,7 +416,7 @@ def _generate_and_align_chapter(
             glossary=glossary,
             book_memory=book_memory,
             allowlist=allowlist,
-            pid_to_chunk=_pid_to_chunk(out_dir),
+            pid_to_chunk=pid_to_chunk,
             min_name_occurrences=proper_name_min_occurrences,
             min_term_occurrences=term_min_occurrences,
         )
@@ -523,7 +638,11 @@ def run_book(
         # are excluded (review F1): their text was never accepted and must
         # not satisfy later thresholds or appear as promotion evidence.
         # Candidate generation skips the B5 mixed-script allowlist (bible +
-        # glossary + manual + source-derived, review F3). The actual glossary
+        # glossary + manual + source-derived, review F3). For
+        # accepted_degraded, quarantined-chunk evidence is excluded BEFORE
+        # ledger accumulation and auto-promotion (B9-RV3) inside
+        # _generate_and_align_chapter, with fail-closed on unavailable or
+        # ambiguous PID->chunk provenance (B9-F5/F6). The actual glossary
         # write happens through the existing promote(status,
         # quarantined_chunks) below, so the B7 quarantined-chunk filter
         # applies to the proposed candidates.
@@ -544,6 +663,7 @@ def run_book(
                 term_min_occurrences=term_min_occurrences,
                 consensus_ratio=consensus_ratio,
                 mixed_script_allow=mixed_script_allow,
+                excluded_chunk_ids=quarantined,
             )
             if aligned:
                 ledger.append_chapter(chapter_id, aligned)
@@ -640,18 +760,21 @@ def build_argparser() -> argparse.ArgumentParser:
              "(default: <out-base>/glossary_candidates.json)",
     )
     parser.add_argument(
-        "--candidate-mixed-script-allow", action="append", default=None,
-        dest="candidate_mixed_script_allow",
-        help="B5 mixed-script allowlist entry for B9 candidate exclusion "
-             "(repeatable; combined with bible/glossary/source-derived "
-             "tokens, mirroring the strict runner's --mixed-script-allow)",
+        "--mixed-script-allow", action="append", default=None,
+        dest="mixed_script_allow",
+        help="B5 manual mixed_script allowlist entry (repeatable; combined "
+             "with bible/glossary/source-derived tokens for BOTH the B9 "
+             "candidate exclusion and the strict driver's mixed-script gate "
+             "— the same flag the strict run uses, so a book run configured "
+             "with B5's manual allowlist excludes those tokens from the "
+             "candidate ledger too)",
     )
     parser.add_argument("--term-min-occurrences", type=int, default=3,
                         help="term: min total occurrences across chapters (v3)")
     parser.add_argument("--term-min-chapters", type=int, default=2,
-                        help="term: min distinct chapters before promotion")
+                        help="term: min distinct chapters before promotion (v3)")
     parser.add_argument("--proper-name-min-occurrences", type=int, default=2,
-                        help="proper_name: min occurrences before promotion")
+                        help="proper_name: min occurrences before promotion (v3)")
     parser.add_argument("--consensus-ratio", type=float, default=0.8,
                         help="dominant-variant share required for a target (0-1)")
     return parser
@@ -660,6 +783,11 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_argparser()
     args, extra = parser.parse_known_args(argv)
+    # B5 manual allowlist: consumed here for B9 candidate exclusion, and
+    # re-forwarded to the strict driver so the real book-run allowlist is
+    # exactly the same input (no divergent duplicate flag).
+    for entry in (args.mixed_script_allow or ()):
+        extra += ["--mixed-script-allow", str(entry)]
     result = run_book(
         memory_dir=args.memory_dir,
         chapter_ids=args.chapters,
@@ -671,7 +799,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         term_min_chapters=args.term_min_chapters,
         proper_name_min_occurrences=args.proper_name_min_occurrences,
         consensus_ratio=args.consensus_ratio,
-        mixed_script_allow=args.candidate_mixed_script_allow or (),
+        mixed_script_allow=args.mixed_script_allow or (),
     )
     failed = 0
     for rec in result["chapters"]:

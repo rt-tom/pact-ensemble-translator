@@ -2,7 +2,8 @@
 
 Covers the B9 card requirements under the owner decision recorded in
 DECISIONS.md (2026-08-04 — Variant B: auto-promotion stays, with v3
-thresholds and strict source->target evidence; B9-RV2 review of PR #128):
+thresholds and strict source->target evidence; B9-RV2/B9-RV3 reviews of
+PR #128, B9-F2/F3/F5/F6 follow-ups):
 
 * ``run_book`` calls the generator + consensus alignment after each chapter
   (source = chapter HTML, translation = ``out_dir/translations.json``) and
@@ -23,12 +24,26 @@ thresholds and strict source->target evidence; B9-RV2 review of PR #128):
       than ``proposed``; ``complete`` promotes all observations);
     - ``conflicts`` — aligned records NOT proposed because of an alignment
       conflict, a cumulative ledger target conflict (chapters resolved the
-      source to different targets), or an established glossary entry with a
-      different target.
+      source to different targets, B9-F3), or an established glossary entry
+      with a different target.
+* quarantined-chunk evidence is excluded BEFORE ledger accumulation and
+  auto-promotion (B9-RV3): pids from quarantined chunks never generate
+  candidates, a candidate wholly from a quarantined chunk has no ledger line
+  and cannot promote, and a mixed candidate counts only its accepted-chunk
+  occurrences;
+* B9-F5/F6 fail-closed: ``accepted_degraded`` + quarantined chunk + a
+  missing/corrupt/empty/incomplete/ambiguous ``chunk_plan.json`` yields ZERO
+  candidate generation, no ledger line, no observation and no glossary
+  mutation — unavailable or non-authoritative PID->chunk provenance never
+  lets unproven evidence through (the run never crashes);
 * the B5 combined mixed-script allowlist (bible + glossary + manual +
-  source-derived) is threaded into candidate generation — an allowlisted
-  token is never recorded (review F3);
-* the promoted glossary entries are FLAT ``{source: target}`` on disk.
+  source-derived) comes from the real book-run ``--mixed-script-allow`` flag
+  (same input as the strict driver, no divergent duplicate flag) — an
+  allowlisted token is never recorded and cannot promote (reviews F3/RV3);
+* the promoted glossary entries are FLAT ``{source: target}`` on disk;
+* strict conservative term alignment: co-occurring unrelated terms (e.g.
+  ``bound``/``together`` next to ``pact``) never share a target and never
+  promote (B9-RV2/RV3).
 
 The strict driver is faked (``_run_one_chapter`` monkeypatched) — the out_dir
 artifacts (``strict_chapter_trial_record.json``, ``selection_results.json``,
@@ -40,18 +55,20 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from pact_v4.phase1.glossary_candidates import GlossaryCandidateLedger
 
 
 def _setup_memory(tmp_path: Path) -> Path:
     memory = tmp_path / "memory"
     memory.mkdir(parents=True, exist_ok=True)
-    (memory / "glossary.json").write_text("{}\n", encoding="utf-8")
+    (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "book_memory.json").write_text(
         json.dumps({"pov": {"gender": "male"}}, ensure_ascii=False),
         encoding="utf-8",
     )
-    (memory / "observations.json").write_text("{}\n", encoding="utf-8")
+    (memory / "observations.json").write_text("{}", encoding="utf-8")
     return memory
 
 
@@ -368,17 +385,15 @@ class TestBookRunCandidateIntegration:
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
 
-    def test_quarantined_chunk_proposed_gt_committed(
+    def test_quarantined_candidate_never_enters_ledger_or_promotes(
         self, tmp_path, monkeypatch,
     ):
-        """accepted_degraded + quarantined chunk: proposed > committed.
+        """B9-RV3: accepted_degraded + quarantined chunk: a candidate wholly
+        from a quarantined chunk has NO ledger line and NO promotion.
 
-        The candidate is wholly in chunk0001, which is quarantined. It meets
-        the proper_name threshold and is PROPOSED (sent to
-        ``add_observation`` with chunk_id=chunk0001), but the B7
-        ``promote(accepted_degraded, quarantined_chunks=[chunk0001])`` filter
-        drops the observation, so it is NOT committed to ``glossary.json``:
-        ``proposed == 1 > committed == 0`` (B9 card semantics).
+        The old (Variant A) test asserted the candidate WAS shadow-recorded;
+        B9-RV3 requires quarantined-chunk evidence to be excluded BEFORE
+        ledger accumulation and auto-promotion.
         """
         html = """<p>He met Blake at the gate. Blake knew the way.</p>
 <p>Blake waited outside for Mary.</p>"""
@@ -386,56 +401,130 @@ class TestBookRunCandidateIntegration:
             "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
             "p00002": "Блэйк ждал снаружи Мэри.",
         }
-        plan = {
-            "artifact": "pact-v4-chunk-plan/v1",
-            "snapshot_hash": "test",
-            "plan_hash": "test",
-            "chunks": [
-                {"chunk_id": "chunk0001", "snapshot_hash": "test",
-                 "pids": ["p00001", "p00002"],
-                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
-                 "undersized_exception": False},
-            ],
-        }
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (html, "accepted_degraded", ["chunk0001"], translations),
         })
 
-        candidates = result["chapters"][0]["candidates"]
-        assert candidates == {
-            "generated": 1, "proposed": 1, "committed": 0, "conflicts": 0,
+        # The whole chapter is one quarantined chunk — the candidate's
+        # evidence is entirely quarantined, so nothing is generated, nothing
+        # enters the ledger, nothing promotes.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
-        # The whole point of the split semantics: proposed > committed.
-        assert candidates["proposed"] > candidates["committed"]
-
-        # The quarantined observation never reached glossary.json.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
-        # observations.json was cleared by promote.
         observations = json.loads(
             (memory / "observations.json").read_text(encoding="utf-8")
         )
         assert observations.get("glossary", {}) == {}
 
-        # The shadow ledger still carries the candidate with its chunk
-        # provenance (shadow data for manual review).
         records = GlossaryCandidateLedger(
             str(out_base / "glossary_candidates.json")
         ).load()
-        assert records["proper_name|blake"]["chapters"][0]["chunk_ids"] == [
-            "chunk0001",
-        ]
+        assert "proper_name|blake" not in records
+
+    def test_mixed_candidate_counts_only_accepted_chunks(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV3: a candidate spanning accepted + quarantined chunks counts
+        only its accepted-chunk occurrences; its ledger entry and promotion
+        provenance carry only accepted chunks."""
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>\n"
+                "<p>Blake returned home later.</p>\n"
+                "<p>He saw Blake return home. Blake waved once more.</p>\n"
+                "<p>He met Blake again.</p>\n"
+                "<p>Blake left at noon.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+            "p00003": "Блэйк вернулся домой позже.",
+            "p00004": "Он видел, как Блэйк вернулся домой. Блэйк помахал ещё раз.",
+            "p00005": "Он снова встретил Блэйка.",
+            "p00006": "Блэйк ушёл в полдень.",
+        }
+        # _PLAN: chunk0001 (p00001-p00003) is quarantined; chunk0002
+        # (p00004-p00006) is accepted. Blake has 8 raw occurrences, 4 in each
+        # chunk. Only the accepted chunk's 4 occurrences (with mid-sentence
+        # capitals) count.
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "accepted_degraded", ["chunk0001"], translations),
+        })
+
+        # Only the accepted chunk's evidence counts: 4 occurrences, so Blake
+        # still meets the proper_name threshold (2) and promotes with accepted
+        # provenance only.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        blake = records["proper_name|blake"]
+        assert blake["total_occurrences"] == 4  # not 8
+        assert blake["chapters"][0]["chunk_ids"] == ["chunk0002"]
+        # Promoted into the flat glossary (chunk_id = chunk0002 is accepted,
+        # so the B7 quarantined filter keeps it).
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Blake": "Блэйк"}
+
+    def test_co_occurring_terms_never_promote_false_pair(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV2/RV3: bound/together next to pact never share 'пакт'.
+
+        The frequency-contrast heuristic cannot tell "the candidate's
+        translation" from "a word that merely co-occurs" — when all term
+        candidates dominate on the same Russian variant, EVERY candidate
+        loses the target. None of pact/bound/together may promote as «пакт».
+        """
+        html = ("<p>The pact bound them all together.</p>\n"
+                "<p>The pact bound them all together.</p>\n"
+                "<p>The pact bound them all together.</p>\n"
+                "<p>The others watched from afar.</p>\n"
+                "<p>The others watched from afar.</p>\n"
+                "<p>The others watched from afar.</p>")
+        translations = {
+            "p00001": "Пакт связывал их всех вместе.",
+            "p00002": "Пакт связывал их всех вместе.",
+            "p00003": "Пакт связывал их всех вместе.",
+            "p00004": "Остальные наблюдали издалека.",
+            "p00005": "Остальные наблюдали издалека.",
+            "p00006": "Остальные наблюдали издалека.",
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations),
+        })
+
+        # pact/bound/together (and the contrasting others/watched/afar) all
+        # co-occur in the same pids and all dominate on a shared variant —
+        # the conservative guard strips the shared target from every
+        # competing candidate, so nothing can promote.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 6, "proposed": 0, "committed": 0, "conflicts": 6,
+        }
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        # The ledger records the evidence (for the human reviewer) but every
+        # candidate keeps target=None and «пакт» in conflicts.
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        for key in ("term|pact", "term|bound", "term|together"):
+            record = records[key]
+            assert record["target"] is None
+            assert "пакт" in record["conflicts"]
 
     def test_mixed_script_allowlist_token_never_recorded(
         self, tmp_path, monkeypatch,
     ):
-        """Review F3: an allowlisted token is excluded from the candidate scan
-        and never recorded in the ledger; a non-allowlisted control token is.
-        """
+        """Reviews F3/RV3: an allowlisted token is excluded from the candidate
+        scan and never recorded or promoted; a non-allowlisted control token
+        is."""
         html = ("<p>The lawyer Beasley handled the case. Beasley knew the law.</p>"
                 "<p>Corvidae handled the papers. Corvidae signed them. Corvidae left.</p>")
         translations = {
-            "p00001": "Адвокат Бизли вёл дело. Бизли знал закон.",
+            "p00001": "Бизли вёл дело. Бизли знал закон.",
             "p00002": "Корвиды разбирали бумаги. Корвиды подписали их. Корвиды ушли.",
         }
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
@@ -449,17 +538,473 @@ class TestBookRunCandidateIntegration:
         # allowlist; with the B5 allowlist wired through it is excluded.
         assert "term|corvidae" not in records
         # The control candidate (Beasley, not allowlisted) IS recorded and
-        # meets the proper_name threshold, so it is proposed and committed.
+        # promotes under Variant B (2 proper_name occurrences, single target).
         assert "proper_name|beasley" in records
         assert result["chapters"][0]["candidates"] == {
             "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Beasley": "Адвокат"}
+        assert glossary == {"Beasley": "Бизли"}
+
+    def test_b5_mixed_script_flag_excludes_candidate_and_reaches_strict_driver(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-RV3: the REAL B5 book-run flag --mixed-script-allow excludes a
+        token from the ledger/promotion AND is re-forwarded to the strict
+        driver — no divergent duplicate candidate-only flag."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+        html = ("<p>The lawyer Beasley handled the case. Beasley knew the law.</p>"
+                "<p>Corvidae handled the papers. Corvidae signed them. Corvidae left.</p>")
+        translations = {
+            "p00001": "Бизли вёл дело. Бизли знал закон.",
+            "p00002": "Корвиды разбирали бумаги. Корвиды подписали их. Корвиды ушли.",
+        }
+        _write_chapter_html(src_dir, "0001", html)
+        _make_chapter_artifacts(
+            out_base / "chapter_0001", "0001",
+            terminal_status="complete", quarantined=[],
+            translations=translations, chunk_plan=_PLAN,
+        )
+
+        captured = {}
+
+        def fake_run_one(chapter_id, *, memory_dir, chapter_html_path,
+                         out_dir, extra_args=()):
+            captured["extra_args"] = list(extra_args)
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        rc = v4_book_run.main([
+            "--memory-dir", str(memory),
+            "--chapters", "0001",
+            "--chapter-html-pattern", str(src_dir / "{chapter_id}.html"),
+            "--out-base", str(out_base),
+            "--mixed-script-allow", "corvidae",
+        ])
+        assert rc == 0
+        # The B5 manual flag is forwarded verbatim to the strict driver.
+        assert captured["extra_args"] == ["--mixed-script-allow", "corvidae"]
+        # And it excluded the token from the B9 candidate ledger.
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert "term|corvidae" not in records
+        assert "proper_name|beasley" in records
 
 
 # ---------------------------------------------------------------------------
-# B9-F3: _auto_promote_glossary guards (direct helper tests)
+# B9-F5/F6: fail closed on unavailable / ambiguous quarantined-chunk provenance
+# ---------------------------------------------------------------------------
+
+
+class TestQuarantinedProvenanceFailClosed:
+    """B9-F5/F6: accepted_degraded + quarantined chunks must fail closed when
+    ``chunk_plan.json`` cannot authoritatively exclude the quarantined
+    evidence.
+
+    A missing, corrupt, empty, incomplete, or ambiguous (duplicate
+    PID/chunk ownership) PID->chunk plan leaves source/translation pids of
+    unknown provenance — they could belong to a quarantined chunk — so the
+    chapter must generate zero candidates, append no ledger line, create no
+    observation and mutate no glossary (the book run never crashes).
+    """
+
+    def _run_plan_mode(self, tmp_path, monkeypatch, plan_mode):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        _write_chapter_html(src_dir, "0001", _CH1_HTML)
+        out_dir = out_base / "chapter_0001"
+        _make_chapter_artifacts(
+            out_dir, "0001",
+            terminal_status="accepted_degraded", quarantined=["chunk0001"],
+            translations=_CH1_TRANSLATIONS, chunk_plan=_PLAN,
+        )
+        # Now break / keep the plan that backs the quarantine exclusion.
+        plan_path = out_dir / "chunk_plan.json"
+        if plan_mode == "valid":
+            pass  # the _PLAN written above stays intact
+        elif plan_mode == "missing":
+            plan_path.unlink()
+        elif plan_mode == "corrupt":
+            plan_path.write_text(
+                '{"chunks": [{"chunk_id": "chunk0001", "pids": [',
+                encoding="utf-8",
+            )
+        elif plan_mode == "empty":
+            plan_path.write_text('{"chunks": []}', encoding="utf-8")
+        elif plan_mode == "partial":
+            # chunk0002's pids (p00004-p00006) are missing from the plan —
+            # their provenance is unknown.
+            plan_path.write_text(json.dumps({
+                "artifact": "pact-v4-chunk-plan/v1",
+                "chunks": [
+                    {"chunk_id": "chunk0001",
+                     "pids": ["p00001", "p00002", "p00003"]},
+                ],
+            }), encoding="utf-8")
+        else:  # pragma: no cover
+            raise AssertionError(f"unknown plan_mode {plan_mode!r}")
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+        return memory, out_base, result
+
+    @pytest.mark.parametrize("plan_mode", ["missing", "corrupt", "empty", "partial"])
+    def test_fail_closed_on_unavailable_quarantine_provenance(
+        self, tmp_path, monkeypatch, plan_mode,
+    ):
+        """accepted_degraded + quarantined chunk + broken chunk_plan.json:
+        zero candidates, no ledger line, no observation, no glossary change."""
+        memory, out_base, result = self._run_plan_mode(
+            tmp_path, monkeypatch, plan_mode,
+        )
+
+        assert result["chapters"][0]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
+    def test_valid_plan_same_data_still_generates(self, tmp_path, monkeypatch):
+        """Positive control: the SAME chapter data with a VALID plan still
+        generates pact from the accepted chunk — the zero above is caused by
+        the broken plan, not by accepted_degraded + quarantined itself."""
+        memory, out_base, result = self._run_plan_mode(
+            tmp_path, monkeypatch, "valid",
+        )
+
+        # chunk0001 quarantined -> Blake's pids (p00001-p00003) are dropped;
+        # pact (chunk0002, accepted) generates but needs 2 chapters to promote.
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert "proper_name|blake" not in records
+        pact = records["term|pact"]
+        assert pact["total_occurrences"] == 3
+        assert pact["chapters"][0]["chunk_ids"] == ["chunk0002"]
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+
+    @pytest.mark.parametrize("plan_mode", ["across_chunks_accepted_wins",
+                                           "within_chunk_duplicate"])
+    def test_fail_closed_on_duplicate_pid_ownership(
+        self, tmp_path, monkeypatch, plan_mode,
+    ):
+        """B9-F6: a corrupt ``chunk_plan.json`` that maps a PID to more than
+        one chunk (or twice within one chunk) is non-authoritative and fails
+        closed — the old dict-assignment silently let the LAST chunk win, so
+        a later accepted chunk masked the same PID's earlier quarantined
+        ownership and quarantined evidence generated a candidate.
+
+        Reproduction from B9-RV5 on the reviewed tip: quarantined chunk owns
+        p00001/p00002 first, accepted chunk owns the SAME pids later ->
+        old code emitted a Blake->Блэйк candidate with
+        ``chunk_ids=['accepted']``. Here the same corrupt plan must yield
+        zero candidates, no ledger line, no observation, no glossary
+        mutation, and the terminal stays ``accepted_degraded``.
+        """
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        html = ("<p>He met Blake at the gate. Blake knew the way.</p>\n"
+                "<p>Blake waited outside for Mary.</p>")
+        translations = {
+            "p00001": "Блэйк встретил Блэйка у ворот. Блэйк знал дорогу.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+        }
+        if plan_mode == "across_chunks_accepted_wins":
+            # Quarantined chunk owns p00001/p00002 FIRST, accepted chunk
+            # claims the SAME pids SECOND — the old ``mapping[pid] =
+            # chunk_id`` overwrite made the accepted chunk win, hiding the
+            # quarantined ownership from the drop filter.
+            chunks = [
+                {"chunk_id": "chunk_q", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00002"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+                {"chunk_id": "chunk_a", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00002"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+            ]
+            quarantined = ["chunk_q"]
+        elif plan_mode == "within_chunk_duplicate":
+            # One chunk lists the same pid twice; the accepted chunk also
+            # claims p00001 twice. Old code normalized the duplicate away.
+            chunks = [
+                {"chunk_id": "chunk_q", "snapshot_hash": "test",
+                 "pids": ["p00003"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+                {"chunk_id": "chunk_a", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00001", "p00002"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+            ]
+            quarantined = ["chunk_q"]
+        else:  # pragma: no cover
+            raise AssertionError(f"unknown plan_mode {plan_mode!r}")
+        duplicate_plan = {
+            "artifact": "pact-v4-chunk-plan/v1",
+            "snapshot_hash": "test",
+            "plan_hash": "test",
+            "chunks": chunks,
+        }
+        _write_chapter_html(src_dir, "0001", html)
+        _make_chapter_artifacts(
+            out_base / "chapter_0001", "0001",
+            terminal_status="accepted_degraded", quarantined=quarantined,
+            translations=translations, chunk_plan=duplicate_plan,
+        )
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+
+        # Terminal stays accepted_degraded (the run itself succeeded); the
+        # B9 loop failed closed on the corrupt provenance.
+        assert result["chapters"][0]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][0]["candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        assert records == {}
+
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+
+
+# ---------------------------------------------------------------------------
+# _auto_promote_glossary: thresholds and conflict paths (B9-I2 req 2)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoPromoteGlossary:
+    def _manager(self, tmp_path):
+        from pact_v4.phase1.memory import MemoryManager
+        memory = _setup_memory(tmp_path)
+        return MemoryManager(str(memory))
+
+    def _ledger(self, records) -> dict:
+        """One-entry ledger map keyed like ``GlossaryCandidateLedger.load``."""
+        from pact_v4.phase1.glossary_candidates import candidate_key
+        return {
+            candidate_key(r["source"], r["kind"]): r
+            for r in records
+        }
+
+    def _observation(self, tmp_path, source: str):
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        return observations.get("glossary", {}).get(source)
+
+    def test_proper_name_meets_threshold_is_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Blake", "kind": "proper_name",
+                    "occurrences": 3, "chunk_ids": ["chunk0002"],
+                    "target": "Блэйк", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "Blake", "kind": "proper_name",
+            "total_occurrences": 3,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": ["chunk0002"], "count": 3}],
+            "target": "Блэйк", "targets_seen": ["Блэйк"], "conflicts": [],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert len(promoted) == 1
+        assert conflicts == []
+        obs = self._observation(tmp_path, "Blake")
+        assert obs == {"target": "Блэйк", "type": "proper_name",
+                       "chunk_id": "chunk0002"}
+
+    def test_term_below_chapters_threshold_not_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "pact", "kind": "term",
+                    "occurrences": 3, "chunk_ids": [],
+                    "target": "пакт", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "pact", "kind": "term",
+            "total_occurrences": 3,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": [], "count": 3}],
+            "target": "пакт", "targets_seen": ["пакт"], "conflicts": [],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert conflicts == []
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        assert "pact" not in observations.get("glossary", {})
+
+    def test_term_meets_two_chapters_is_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "pact", "kind": "term",
+                    "occurrences": 3, "chunk_ids": ["chunk0002"],
+                    "target": "пакт", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "pact", "kind": "term",
+            "total_occurrences": 6,
+            "chapters": [
+                {"chapter_id": "0001", "chunk_ids": [], "count": 3},
+                {"chapter_id": "0002", "chunk_ids": ["chunk0002"], "count": 3},
+            ],
+            "target": "пакт", "targets_seen": ["пакт"], "conflicts": [],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert len(promoted) == 1
+        assert self._observation(tmp_path, "pact") == {
+            "target": "пакт", "type": "term", "chunk_id": "chunk0002",
+        }
+
+    def test_established_different_target_is_conflict(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Blake", "kind": "proper_name",
+                    "occurrences": 3, "chunk_ids": [],
+                    "target": "Блэйк", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "Blake", "kind": "proper_name",
+            "total_occurrences": 3,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": [], "count": 3}],
+            "target": "Блэйк", "targets_seen": ["Блэйк"], "conflicts": [],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {"Blake": "Блейк"},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert len(conflicts) == 1
+        assert conflicts[0]["established_target"] == "Блейк"
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        assert "Blake" not in observations.get("glossary", {})
+
+    def test_alignment_conflict_variants_never_observed(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Duncan", "kind": "proper_name",
+                    "occurrences": 4, "chunk_ids": [],
+                    "target": None, "conflicts": ["Гордон", "Дункан"]}]
+        merged = self._ledger([{
+            "source": "Duncan", "kind": "proper_name",
+            "total_occurrences": 4,
+            "chapters": [{"chapter_id": "0001", "chunk_ids": [], "count": 4}],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert len(conflicts) == 1
+        assert conflicts[0]["conflicts"] == ["Гордон", "Дункан"]
+
+    def test_already_established_same_target_is_noop(self, tmp_path):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = self._manager(tmp_path)
+        aligned = [{"source": "Blake", "kind": "proper_name",
+                    "occurrences": 2, "chunk_ids": [],
+                    "target": "Блэйк", "conflicts": []}]
+        merged = self._ledger([{
+            "source": "Blake", "kind": "proper_name",
+            "total_occurrences": 2,
+            "chapters": [{"chapter_id": "0002", "chunk_ids": [], "count": 2}],
+            "target": "Блэйк", "targets_seen": ["Блэйк"], "conflicts": [],
+        }])
+        promoted, conflicts = v4_book_run._auto_promote_glossary(
+            manager, aligned, merged, {"Blake": "Блэйк"},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert promoted == []
+        assert conflicts == []
+
+    def test_flat_target_accepts_string_and_target_dict(self):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        assert v4_book_run._flat_target("Блэйк") == "Блэйк"
+        assert v4_book_run._flat_target({"target": "Блэйк"}) == "Блэйк"
+        assert v4_book_run._flat_target({"target": 5}) is None
+        assert v4_book_run._flat_target(None) is None
+        assert v4_book_run._flat_target({"name": "John"}) is None
+
+
+# ---------------------------------------------------------------------------
+# B9-F3: _auto_promote_glossary cumulative-ledger conflict guard
+# (direct helper tests, no book run)
 # ---------------------------------------------------------------------------
 
 
@@ -473,7 +1018,7 @@ class _RecordingManager:
         self.calls.append((category, key, value))
 
 
-class TestAutoPromoteGlossary:
+class TestAutoPromoteGlossaryCumulativeGuard:
     def _aligned_pact(self, target, conflicts=()):
         return [{
             "source": "pact", "kind": "term", "occurrences": 3,
@@ -592,7 +1137,9 @@ class TestAutoPromoteGlossary:
 
 class TestBookRunCliArgs:
     def test_b9_args_parse_with_correct_dests(self):
-        """Real argparse parse: dest names must match run_book's kwargs."""
+        """Real argparse parse: dest names must match run_book's kwargs and
+        the B5 manual allowlist must come from --mixed-script-allow (the same
+        flag the strict driver uses)."""
         from pact_full_pipeline_runner_v1 import v4_book_run
 
         args, extra = v4_book_run.build_argparser().parse_known_args([
@@ -604,8 +1151,8 @@ class TestBookRunCliArgs:
             "--term-min-chapters", "3",
             "--proper-name-min-occurrences", "5",
             "--consensus-ratio", "0.9",
-            "--candidate-mixed-script-allow", "corvidae",
-            "--candidate-mixed-script-allow", "R.D.T.",
+            "--mixed-script-allow", "corvidae",
+            "--mixed-script-allow", "R.D.T.",
             "--run-label", "test-run",  # unknown to book_run -> strict driver
         ])
         assert args.candidates_ledger == Path("led.json")
@@ -613,7 +1160,7 @@ class TestBookRunCliArgs:
         assert args.term_min_chapters == 3
         assert args.proper_name_min_occurrences == 5
         assert args.consensus_ratio == 0.9
-        assert args.candidate_mixed_script_allow == ["corvidae", "R.D.T."]
+        assert args.mixed_script_allow == ["corvidae", "R.D.T."]
         # Unknown args still pass through to the strict driver.
         assert "--run-label" in extra and "test-run" in extra
 
@@ -630,4 +1177,4 @@ class TestBookRunCliArgs:
         assert args.term_min_chapters == 2
         assert args.proper_name_min_occurrences == 2
         assert args.consensus_ratio == 0.8
-        assert args.candidate_mixed_script_allow is None
+        assert args.mixed_script_allow is None
