@@ -51,7 +51,9 @@ Per-chapter ``candidates`` field semantics (exact definitions):
     promotion thresholds (proper_name >= ``--proper-name-min-occurrences``
     with a single aligned target; term >= ``--term-min-chapters`` chapters
     AND >= ``--term-min-occurrences`` occurrences with a single aligned
-    target) and did not collide with an established glossary entry.
+    target), whose cumulative ledger record retains exactly one unambiguous
+    target consistent with the chapter's aligned target, and that did not
+    collide with an established glossary entry.
   * ``committed`` — how many of the ``proposed`` candidates actually landed
     in ``glossary.json`` after ``MemoryManager.promote``. Counted as the
     glossary key diff (before/after promote): a proposed candidate whose
@@ -60,7 +62,9 @@ Per-chapter ``candidates`` field semantics (exact definitions):
     smaller than ``proposed``; ``complete`` promotes all observations and
     ``committed == proposed``.
   * ``conflicts`` — aligned records that were NOT proposed because of an
-    alignment conflict (several notable variants, no single target) or a
+    alignment conflict (several notable variants, no single target), a
+    cumulative ledger target conflict (previous chapters resolved the source
+    to a different target, so the merged record has no single target), or a
     conflict with an established glossary entry (different target).
 """
 from __future__ import annotations
@@ -344,10 +348,18 @@ def _auto_promote_glossary(
         ``total_occurrences >= term_min_occurrences`` and a single aligned
         target.
 
+    Promotion additionally requires the cumulative ledger record to retain
+    exactly one unambiguous target consistent with the current chapter's
+    aligned target (B9-F3, review finding): a record whose chapters resolved
+    the source to DIFFERENT targets has ``target`` None forever (the merge is
+    irreversible) and must be reported as a conflict and never proposed, even
+    when this chapter alone is unambiguous.
+
     A candidate that passes is recorded as a glossary observation
     ``{target, type, chunk_id}`` (``chunk_id`` = first sorted chunk of the
     current chapter, so the existing B7 quarantined-chunk filter applies).
-    Conflicts — competing alignment variants (no single target) or an
+    Conflicts — competing alignment variants (no single target), a cumulative
+    ledger target conflict (cross-chapter target disagreement), or an
     established glossary entry with a different target — are returned and
     NOT observed. Zero model calls; ``MemoryManager`` is untouched.
 
@@ -371,6 +383,33 @@ def _auto_promote_glossary(
             continue
         record = merged_ledger.get(candidate_key(source, kind))
         if not record:
+            continue
+        # B9-F3 (review finding, HIGH): the CUMULATIVE ledger record is the
+        # authority on cross-chapter target agreement — the current chapter's
+        # aligned record alone must never justify promotion. A record whose
+        # chapters resolved the source to different targets has no single
+        # merged target (``target`` is None forever — the merge is
+        # irreversible, and every distinct chapter target sits in
+        # ``targets_seen``/``conflicts``). Such a record is a conflict and
+        # must never be proposed: proposing would persist an ambiguous
+        # source->target mapping into glossary.json.
+        record_target = record.get("target")
+        if record_target is None:
+            conflicts.append({
+                **dict(aligned),
+                "cumulative_targets": list(record.get("targets_seen") or []),
+            })
+            continue
+        if str(record_target) != str(target):
+            # Defensive: with the append-then-check ordering in run_book the
+            # merged target of a single-distinct-target record always equals
+            # the current chapter's aligned target; a mismatch means the
+            # record disagrees with the current alignment and must not
+            # promote.
+            conflicts.append({
+                **dict(aligned),
+                "ledger_target": str(record_target),
+            })
             continue
         total = int(record.get("total_occurrences") or 0)
         if kind == "proper_name":

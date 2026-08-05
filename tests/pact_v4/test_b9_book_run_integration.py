@@ -22,7 +22,9 @@ thresholds and strict source->target evidence; B9-RV2 review of PR #128):
       observations on ``accepted_degraded``, so ``committed`` may be smaller
       than ``proposed``; ``complete`` promotes all observations);
     - ``conflicts`` — aligned records NOT proposed because of an alignment
-      conflict or an established glossary entry with a different target.
+      conflict, a cumulative ledger target conflict (chapters resolved the
+      source to different targets), or an established glossary entry with a
+      different target.
 * the B5 combined mixed-script allowlist (bible + glossary + manual +
   source-derived) is threaded into candidate generation — an allowlisted
   token is never recorded (review F3);
@@ -147,6 +149,38 @@ _PLAN = {
     ],
 }
 
+# B9-F3 regression fixtures: two accepted chapters that resolve the SAME
+# term ("pact") to DIFFERENT targets (договор in 0001, пакт in 0002). pact
+# is the only candidate in each chapter (all other tokens occur once).
+
+_CH1_DISAGREE_HTML = """<p>The pact was sealed with blood.</p>
+<p>The pact bound them all.</p>
+<p>The pact held for years.</p>
+<p>He walked home alone.</p>
+<p>She closed the heavy door.</p>"""
+
+_CH1_DISAGREE_TRANSLATIONS = {
+    "p00001": "Договор был скреплён кровью.",
+    "p00002": "Договор связывал их всех.",
+    "p00003": "Договор держался годами.",
+    "p00004": "Он пошёл домой один.",
+    "p00005": "Она закрыла тяжёлую дверь.",
+}
+
+_CH2_DISAGREE_HTML = """<p>The pact grew stronger with time.</p>
+<p>The pact never broke its bond.</p>
+<p>The pact endured through the ages.</p>
+<p>He walked home in the dark.</p>
+<p>She opened the heavy door.</p>"""
+
+_CH2_DISAGREE_TRANSLATIONS = {
+    "p00001": "Пакт становился сильнее со временем.",
+    "p00002": "Пакт никогда не разрывал свою связь.",
+    "p00003": "Пакт выстоял сквозь века.",
+    "p00004": "Он пошёл домой в темноте.",
+    "p00005": "Она открыла тяжёлую дверь.",
+}
+
 
 class TestBookRunCandidateIntegration:
     def _run(self, tmp_path, monkeypatch, chapter_specs,
@@ -238,6 +272,57 @@ class TestBookRunCandidateIntegration:
         blake = records["proper_name|blake"]
         assert blake["total_occurrences"] == 4
         assert [c["chapter_id"] for c in blake["chapters"]] == ["0001"]
+
+    def test_cross_chapter_target_disagreement_never_promotes(
+        self, tmp_path, monkeypatch,
+    ):
+        """B9-F3 regression (review finding, HIGH): two accepted chapters
+        that resolve the SAME term to DIFFERENT targets must leave the
+        ledger in conflict and never auto-promote.
+
+        ch0001 aligns pact -> договор, ch0002 aligns pact -> пакт. The
+        cumulative ledger then has ``targets_seen`` [договор, пакт] and a
+        merged ``target`` of None (irreversible), so pact's thresholds are
+        met (2 chapters, 6 occurrences) but the cross-chapter disagreement
+        must surface as a conflict: no proposal, no commit, glossary.json
+        unchanged. Before the fix ``_auto_promote_glossary`` decided
+        promotion from the current chapter's aligned record alone and ch0002
+        proposed+committed pact -> пакт, persisting an ambiguous mapping.
+        """
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (_CH1_DISAGREE_HTML, "complete", [],
+                     _CH1_DISAGREE_TRANSLATIONS),
+            "0002": (_CH2_DISAGREE_HTML, "complete", [],
+                     _CH2_DISAGREE_TRANSLATIONS),
+        })
+
+        ch1, ch2 = result["chapters"]
+        # ch0001: pact is a single-chapter term (< 2 chapters) -> below the
+        # term threshold, neither proposed nor conflicting.
+        assert ch1["candidates"] == {
+            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+        # ch0002: pact meets the thresholds, but the cumulative ledger
+        # records the cross-chapter target disagreement -> conflict, never
+        # proposed, never committed.
+        assert ch2["candidates"] == {
+            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 1,
+        }
+
+        # The ambiguous mapping never reached glossary.json.
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+
+        # The ledger retains the conflict for human review: no merged
+        # target, both distinct chapter targets in conflicts.
+        records = GlossaryCandidateLedger(
+            str(out_base / "glossary_candidates.json")
+        ).load()
+        pact = records["term|pact"]
+        assert pact["target"] is None
+        assert pact["total_occurrences"] == 6
+        assert {c["chapter_id"] for c in pact["chapters"]} == {"0001", "0002"}
+        assert set(pact["conflicts"]) == {"договор", "пакт"}
 
     def test_failed_chapter_never_enters_ledger(self, tmp_path, monkeypatch):
         """Review F1: failed 0001 + complete 0002 -> ledger counts 0002 only.
@@ -371,6 +456,133 @@ class TestBookRunCandidateIntegration:
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {"Beasley": "Адвокат"}
+
+
+# ---------------------------------------------------------------------------
+# B9-F3: _auto_promote_glossary guards (direct helper tests)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingManager:
+    """MemoryManager stand-in that records ``add_observation`` calls."""
+
+    def __init__(self):
+        self.calls = []
+
+    def add_observation(self, category, key, value):
+        self.calls.append((category, key, value))
+
+
+class TestAutoPromoteGlossary:
+    def _aligned_pact(self, target, conflicts=()):
+        return [{
+            "source": "pact", "kind": "term", "occurrences": 3,
+            "chunk_ids": ["chunk0002"], "context": "The pact held.",
+            "variants": {target: 3}, "target": target,
+            "consensus_share": 1.0, "conflicts": list(conflicts),
+        }]
+
+    def test_cumulative_target_conflict_never_proposed(self):
+        """Direct reproduction of the B9-RV2 finding: a cumulative ledger
+        record with ``target`` None (targets_seen disagreement) plus a
+        current aligned target must be reported as a conflict and never sent
+        to ``add_observation`` — the record's ``total_occurrences`` and
+        ``chapters`` alone must not drive promotion.
+        """
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = _RecordingManager()
+        merged_ledger = {
+            v4_book_run.candidate_key("pact", "term"): {
+                "source": "pact", "kind": "term", "total_occurrences": 6,
+                "chapters": [
+                    {"chapter_id": "0001", "chunk_ids": [], "count": 3},
+                    {"chapter_id": "0002", "chunk_ids": [], "count": 3},
+                ],
+                "variants": {"договор": 3, "пакт": 3},
+                "target": None,
+                "targets_seen": ["договор", "пакт"],
+                "conflicts": ["договор", "пакт"],
+            },
+        }
+
+        proposed, conflicts = v4_book_run._auto_promote_glossary(
+            manager, self._aligned_pact("пакт"), merged_ledger, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert proposed == []
+        assert len(conflicts) == 1
+        assert set(conflicts[0]["cumulative_targets"]) == {"договор", "пакт"}
+        assert manager.calls == []
+
+    def test_established_glossary_conflict_never_proposed(self):
+        """The established-glossary guard: a candidate whose source already
+        has a DIFFERENT target in glossary.json is a conflict, never
+        proposed (defensive — ``run_book`` generation excludes glossary keys
+        upstream, so this branch is reachable only through direct use).
+        """
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = _RecordingManager()
+        merged_ledger = {
+            v4_book_run.candidate_key("pact", "term"): {
+                "source": "pact", "kind": "term", "total_occurrences": 6,
+                "chapters": [
+                    {"chapter_id": "0001", "chunk_ids": [], "count": 3},
+                    {"chapter_id": "0002", "chunk_ids": [], "count": 3},
+                ],
+                "variants": {"пакт": 6},
+                "target": "пакт",
+                "targets_seen": ["пакт"],
+                "conflicts": [],
+            },
+        }
+
+        proposed, conflicts = v4_book_run._auto_promote_glossary(
+            manager, self._aligned_pact("пакт"), merged_ledger,
+            {"pact": "договор"},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert proposed == []
+        assert len(conflicts) == 1
+        assert conflicts[0]["established_target"] == "договор"
+        assert manager.calls == []
+
+    def test_unambiguous_cumulative_target_still_proposes(self):
+        """The guard must not block the happy path: a ledger record with a
+        single distinct target consistent with the current chapter's aligned
+        target still proposes (v3 thresholds met).
+        """
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = _RecordingManager()
+        merged_ledger = {
+            v4_book_run.candidate_key("pact", "term"): {
+                "source": "pact", "kind": "term", "total_occurrences": 6,
+                "chapters": [
+                    {"chapter_id": "0001", "chunk_ids": [], "count": 3},
+                    {"chapter_id": "0002", "chunk_ids": [], "count": 3},
+                ],
+                "variants": {"пакт": 6},
+                "target": "пакт",
+                "targets_seen": ["пакт"],
+                "conflicts": [],
+            },
+        }
+
+        proposed, conflicts = v4_book_run._auto_promote_glossary(
+            manager, self._aligned_pact("пакт"), merged_ledger, {},
+            term_min_chapters=2, term_min_occurrences=3,
+            proper_name_min_occurrences=2,
+        )
+        assert len(proposed) == 1
+        assert conflicts == []
+        assert manager.calls == [
+            ("glossary", "pact",
+             {"target": "пакт", "type": "term", "chunk_id": "chunk0002"}),
+        ]
 
 
 # ---------------------------------------------------------------------------
