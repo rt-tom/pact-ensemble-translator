@@ -18,6 +18,7 @@ from pact_v4.runtime.qwen_evaluator import (
     HttpQwenEvaluator,
     HttpQwenEvaluatorConfig,
     _parse_qwen_verdict,
+    _parse_qwen_verdicts,
 )
 
 
@@ -138,6 +139,191 @@ def test_parse_qwen_verdict_rejects_non_object_json():
     result = _parse_qwen_verdict(json.dumps([1, 2, 3]))
     assert result.passed is False
     assert "not a JSON object" in result.detail
+
+
+def test_parse_qwen_verdict_rejects_string_passed_false():
+    """B12-RV3 HIGH: explicit ``"passed": "false"`` must fail closed,
+    never be coerced by Python truthiness into a passing verdict."""
+    raw = json.dumps({
+        "faithful_to_source": True,
+        "completeness": True,
+        "introduced_errors": False,
+        "confidence": "high",
+        "reason": "OK",
+        "passed": "false",  # schema-invalid: string, not a JSON bool
+    })
+    result = _parse_qwen_verdict(raw)
+    assert result.passed is False
+    assert "invalid 'passed'" in result.detail
+
+
+def test_parse_qwen_verdict_rejects_non_bool_passed_shapes():
+    """Numbers, null, and containers are equally schema-invalid for an
+    explicit ``passed`` and must fail closed."""
+    for bad in (0, 1, None, [], {}, "true", "yes"):
+        raw = json.dumps({
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "OK",
+            "passed": bad,
+        })
+        result = _parse_qwen_verdict(raw)
+        assert result.passed is False, f"passed={bad!r} must fail closed"
+        assert "invalid 'passed'" in result.detail
+
+
+def test_parse_qwen_verdict_explicit_false_is_rejected():
+    """A valid native JSON ``false`` keeps its contract: the gate fails."""
+    raw = json.dumps({
+        "faithful_to_source": False,
+        "completeness": False,
+        "introduced_errors": True,
+        "confidence": "low",
+        "reason": "Wrong.",
+        "passed": False,
+    })
+    result = _parse_qwen_verdict(raw)
+    assert result.passed is False
+
+
+def test_parse_qwen_verdict_implied_rejects_non_bool_fields():
+    """When ``passed`` is omitted the implied verdict must not accept
+    schema-invalid shapes for its sub-fields via Python truthiness."""
+    for key, bad in (
+        ("faithful_to_source", "yes"),
+        ("completeness", 1),
+        ("introduced_errors", "false"),
+        ("introduced_errors", 0),
+        ("faithful_to_source", None),
+    ):
+        fields = {
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "OK",
+        }
+        fields[key] = bad
+        result = _parse_qwen_verdict(json.dumps(fields))
+        assert result.passed is False, f"implied {key}={bad!r} must fail closed"
+        assert "invalid" in result.detail
+
+
+def test_parse_qwen_verdict_implied_native_bools_keep_contract():
+    """Valid native JSON booleans with ``passed`` omitted still drive the
+    implied decision exactly as before."""
+    raw = json.dumps({
+        "faithful_to_source": True,
+        "completeness": True,
+        "introduced_errors": False,
+        "confidence": "high",
+        "reason": "OK",
+    })
+    assert _parse_qwen_verdict(raw).passed is True
+
+
+# ---------------------------------------------------------------------------
+# _parse_qwen_verdicts — B12 batched verdict parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_qwen_verdicts_rejects_string_passed_false_per_region():
+    """A batch element with ``"passed": "false"`` fails closed for exactly
+    its own region; a neighbouring valid verdict is untouched."""
+    raw = json.dumps({"verdicts": [
+        {
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "ok",
+            "passed": "false",  # malformed
+        },
+        {
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "ok",
+            "passed": True,
+        },
+    ]}, ensure_ascii=False)
+    results = _parse_qwen_verdicts(raw, count=2)
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert "invalid 'passed'" in results[0].detail
+    assert results[1].passed is True
+
+
+def test_parse_qwen_verdicts_rejects_implied_invalid_bool_per_region():
+    """A batch element whose implied-decision fields are schema-invalid
+    fails closed for that region only."""
+    raw = json.dumps({"verdicts": [
+        {
+            "faithful_to_source": "true",  # malformed implied field
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "ok",
+        },
+        {
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "ok",
+        },
+    ]}, ensure_ascii=False)
+    results = _parse_qwen_verdicts(raw, count=2)
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert "invalid" in results[0].detail
+    assert results[1].passed is True
+
+
+def test_parse_qwen_verdicts_native_bools_keep_contract():
+    """Valid native JSON booleans in a batch pass/reject per region."""
+    raw = json.dumps({"verdicts": [
+        {
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "ok",
+            "passed": True,
+        },
+        {
+            "faithful_to_source": False,
+            "completeness": False,
+            "introduced_errors": True,
+            "confidence": "high",
+            "reason": "wrong",
+            "passed": False,
+        },
+    ]}, ensure_ascii=False)
+    results = _parse_qwen_verdicts(raw, count=2)
+    assert len(results) == 2
+    assert results[0].passed is True
+    assert results[1].passed is False
+
+
+def test_parse_qwen_verdicts_wrong_count_fails_all():
+    raw = json.dumps({"verdicts": [
+        {
+            "faithful_to_source": True,
+            "completeness": True,
+            "introduced_errors": False,
+            "confidence": "high",
+            "reason": "ok",
+            "passed": True,
+        },
+    ]}, ensure_ascii=False)
+    results = _parse_qwen_verdicts(raw, count=3)
+    assert len(results) == 3
+    assert all(r.passed is False for r in results)
+    assert all("expected 3 verdicts" in r.detail for r in results)
 
 
 # ---------------------------------------------------------------------------

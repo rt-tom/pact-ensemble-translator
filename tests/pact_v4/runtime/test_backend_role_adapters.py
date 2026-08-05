@@ -941,6 +941,37 @@ def test_region_fidelity_gate_batch_parses_failed_verdict_per_region():
     assert len(backend.requests) == 1
 
 
+def test_region_fidelity_gate_batch_string_passed_false_fails_closed():
+    """B12-RV3 HIGH: a batched element with explicit ``"passed": "false"``
+    (a string) must fail closed for its own region — never be coerced by
+    Python truthiness into a passing verdict that could commit a rejected
+    repair — while a neighbouring native-bool verdict is untouched."""
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": "false"},  # malformed
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert "invalid 'passed'" in results[0].detail
+    assert results[1].passed is True
+    assert len(backend.requests) == 1
+
+
 def test_region_fidelity_gate_batch_wrong_count_is_debt_for_all():
     from pact_v4.phase1.models import Region
 
