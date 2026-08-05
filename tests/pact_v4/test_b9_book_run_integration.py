@@ -1,24 +1,32 @@
-"""B9-I2 integration tests: candidate generation/ledger in the book run (Variant A).
+"""B9 integration tests: candidate generation/ledger/promotion in the book run.
 
-Covers the B9-I2 card requirements under the owner decision recorded in
-DECISIONS.md (Variant A — shadow-only; B9-RV2 review of PR #128):
+Covers the B9 card requirements under the owner decision recorded in
+DECISIONS.md (2026-08-04 — Variant B: auto-promotion stays, with v3
+thresholds and strict source->target evidence; B9-RV2 review of PR #128):
 
 * ``run_book`` calls the generator + consensus alignment after each chapter
   (source = chapter HTML, translation = ``out_dir/translations.json``) and
   appends to the ledger (default ``<out_base>/glossary_candidates.json``)
   BEFORE ``MemoryManager.promote``;
 * ONLY chapters with an accepted terminal result (``complete`` /
-  ``accepted_degraded``) contribute to the ledger — a failed chapter's
-  observations must never satisfy later thresholds (review F1);
-* the B9 loop NEVER auto-promotes: ``MemoryManager.add_observation`` is not
-  called, ``glossary.json`` stays untouched, and glossary growth remains a
-  human decision (Variant A; the B7 ``promote`` still moves manual
-  observations);
+  ``accepted_degraded``) contribute to the ledger or to promotion — a failed
+  chapter's observations must never satisfy later thresholds (review F1);
+* candidates that meet the v3 thresholds with a single aligned target are
+  auto-promoted through ``MemoryManager.add_observation`` -> the B7
+  ``promote`` path (Variant B); the per-chapter ``candidates`` block records
+  ``{generated, proposed, committed, conflicts}``:
+    - ``proposed`` — aligned records sent to ``add_observation`` this
+      chapter (thresholds met, single target, no established conflict);
+    - ``committed`` — how many of those actually landed in ``glossary.json``
+      after ``promote`` (the B7 quarantined-chunk filter can drop proposed
+      observations on ``accepted_degraded``, so ``committed`` may be smaller
+      than ``proposed``; ``complete`` promotes all observations);
+    - ``conflicts`` — aligned records NOT proposed because of an alignment
+      conflict or an established glossary entry with a different target.
 * the B5 combined mixed-script allowlist (bible + glossary + manual +
   source-derived) is threaded into candidate generation — an allowlisted
   token is never recorded (review F3);
-* the promoted glossary entries are FLAT ``{source: target}`` on disk when
-  a manual observation is promoted.
+* the promoted glossary entries are FLAT ``{source: target}`` on disk.
 
 The strict driver is faked (``_run_one_chapter`` monkeypatched) — the out_dir
 artifacts (``strict_chapter_trial_record.json``, ``selection_results.json``,
@@ -36,12 +44,12 @@ from pact_v4.phase1.glossary_candidates import GlossaryCandidateLedger
 def _setup_memory(tmp_path: Path) -> Path:
     memory = tmp_path / "memory"
     memory.mkdir(parents=True, exist_ok=True)
-    (memory / "glossary.json").write_text("{}", encoding="utf-8")
+    (memory / "glossary.json").write_text("{}\n", encoding="utf-8")
     (memory / "book_memory.json").write_text(
         json.dumps({"pov": {"gender": "male"}}, ensure_ascii=False),
         encoding="utf-8",
     )
-    (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "observations.json").write_text("{}\n", encoding="utf-8")
     return memory
 
 
@@ -90,7 +98,7 @@ def _make_chapter_artifacts(
 
 
 # ---------------------------------------------------------------------------
-# Two-chapter accumulation (B9-I2 req 5, Variant A)
+# Two-chapter accumulation + promotion (B9 Variant B)
 # ---------------------------------------------------------------------------
 
 _CH1_HTML = """<p>He met Blake at the gate. Blake knew the way.</p>
@@ -171,36 +179,52 @@ class TestBookRunCandidateIntegration:
         )
         return memory, out_base, result
 
-    def test_two_chapters_accumulate_in_ledger_shadow_only(
+    def test_two_chapters_accumulate_and_auto_promote(
         self, tmp_path, monkeypatch,
     ):
-        """Candidates accumulate in the ledger; nothing is auto-promoted.
+        """Candidates accumulate in the ledger and auto-promote (Variant B).
 
-        Variant A (shadow-only): both chapters are accepted, so the ledger
-        accumulates pact across two chapters (6 occurrences) and Blake in
-        chapter 0001 — but ``glossary.json`` is NOT mutated by the B9 loop
-        (no ``add_observation`` call); glossary growth stays manual.
+        Both chapters are accepted, so the ledger accumulates pact across two
+        chapters (6 occurrences) and Blake in chapter 0001. Blake meets the
+        proper_name threshold in chapter 0001 (4 occurrences >= 2, single
+        target) and is proposed+committed there; pact meets the term
+        threshold (2 chapters AND 6 occurrences) only in chapter 0002 and is
+        proposed+committed there. ``glossary.json`` ends up with both flat
+        ``{source: target}`` entries; ``observations.json`` is cleared by
+        ``promote``.
         """
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (_CH1_HTML, "complete", [], _CH1_TRANSLATIONS),
             "0002": (_CH2_HTML, "complete", [], _CH2_TRANSLATIONS),
         })
 
-        # Both chapters reached complete (B7 promote still runs and moves
-        # only manual observations — here there are none).
+        # Both chapters reached complete (B7 promote runs each time).
         assert [r["terminal_status"] for r in result["chapters"]] == [
             "complete", "complete",
         ]
 
-        # Per-chapter candidates blocks (B9-I2 req 4); Variant A never
-        # reports promoted candidates.
+        # Per-chapter candidates blocks (Variant B semantics):
+        #   ch1: Blake proposed+committed; pact is term with 1 chapter < 2.
+        #   ch2: pact proposed+committed; Blake already in glossary, so it is
+        #        excluded from generation (glossary exclusions).
         ch1, ch2 = result["chapters"]
-        assert ch1["candidates"] == {"generated": 2, "promoted": 0, "conflicts": 0}
-        assert ch2["candidates"] == {"generated": 1, "promoted": 0, "conflicts": 0}
+        assert ch1["candidates"] == {
+            "generated": 2, "proposed": 1, "committed": 1, "conflicts": 0,
+        }
+        assert ch2["candidates"] == {
+            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+        }
 
-        # Variant A: the B9 loop never writes to glossary.json.
+        # Variant B: the B9 loop promoted both candidates into glossary.json,
+        # stored flat {source: target} after _flatten_promoted_glossary.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {}
+        assert glossary == {"Blake": "Блэйк", "pact": "пакт"}
+
+        # observations.json is emptied by promote after each chapter.
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
 
         # Ledger accumulated: pact spans both chapters with 6 total
         # occurrences; Blake only in 0001.
@@ -234,7 +258,13 @@ class TestBookRunCandidateIntegration:
         ]
         # The failed chapter generated no candidates at all.
         assert result["chapters"][0]["candidates"] == {
-            "generated": 0, "promoted": 0, "conflicts": 0,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+        # pact is generated in 0002 but with a single chapter it does not
+        # meet the term threshold (>= 2 chapters), so it is neither proposed
+        # nor committed.
+        assert result["chapters"][1]["candidates"] == {
+            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 0,
         }
 
         records = GlossaryCandidateLedger(
@@ -242,22 +272,29 @@ class TestBookRunCandidateIntegration:
         ).load()
         pact = records["term|pact"]
         # Only the accepted chapter is counted — 3 occurrences, one chapter,
-        # so the 2-chapter/6-occurrence threshold of the old auto-promotion
-        # can never be reached by failed text.
+        # so the 2-chapter/6-occurrence threshold can never be reached by
+        # failed text.
         assert pact["total_occurrences"] == 3
         assert [c["chapter_id"] for c in pact["chapters"]] == ["0002"]
         # The failed chapter's proper-name candidate never entered the ledger.
         assert "proper_name|blake" not in records
 
-        # Variant A: nothing promoted, glossary untouched.
+        # Nothing proposed -> glossary untouched.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
 
-    def test_quarantined_chapter_candidates_shadow_only(
+    def test_quarantined_chunk_proposed_gt_committed(
         self, tmp_path, monkeypatch,
     ):
-        """accepted_degraded + quarantined chunk: candidate is shadow-recorded
-        with its chunk_ids; no observation, so nothing is promoted."""
+        """accepted_degraded + quarantined chunk: proposed > committed.
+
+        The candidate is wholly in chunk0001, which is quarantined. It meets
+        the proper_name threshold and is PROPOSED (sent to
+        ``add_observation`` with chunk_id=chunk0001), but the B7
+        ``promote(accepted_degraded, quarantined_chunks=[chunk0001])`` filter
+        drops the observation, so it is NOT committed to ``glossary.json``:
+        ``proposed == 1 > committed == 0`` (B9 card semantics).
+        """
         html = """<p>He met Blake at the gate. Blake knew the way.</p>
 <p>Blake waited outside for Mary.</p>"""
         translations = {
@@ -279,19 +316,24 @@ class TestBookRunCandidateIntegration:
             "0001": (html, "accepted_degraded", ["chunk0001"], translations),
         })
 
-        # The candidate was generated (shadow) but NEVER observed/promoted —
-        # Variant A does not call add_observation.
-        assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "promoted": 0, "conflicts": 0,
+        candidates = result["chapters"][0]["candidates"]
+        assert candidates == {
+            "generated": 1, "proposed": 1, "committed": 0, "conflicts": 0,
         }
+        # The whole point of the split semantics: proposed > committed.
+        assert candidates["proposed"] > candidates["committed"]
+
+        # The quarantined observation never reached glossary.json.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
+        # observations.json was cleared by promote.
         observations = json.loads(
             (memory / "observations.json").read_text(encoding="utf-8")
         )
         assert observations.get("glossary", {}) == {}
 
-        # The shadow ledger carries the candidate with its chunk provenance.
+        # The shadow ledger still carries the candidate with its chunk
+        # provenance (shadow data for manual review).
         records = GlossaryCandidateLedger(
             str(out_base / "glossary_candidates.json")
         ).load()
@@ -303,7 +345,8 @@ class TestBookRunCandidateIntegration:
         self, tmp_path, monkeypatch,
     ):
         """Review F3: an allowlisted token is excluded from the candidate scan
-        and never recorded in the ledger; a non-allowlisted control token is."""
+        and never recorded in the ledger; a non-allowlisted control token is.
+        """
         html = ("<p>The lawyer Beasley handled the case. Beasley knew the law.</p>"
                 "<p>Corvidae handled the papers. Corvidae signed them. Corvidae left.</p>")
         translations = {
@@ -320,14 +363,14 @@ class TestBookRunCandidateIntegration:
         # Corvidae (3 occurrences) would be a term candidate without the
         # allowlist; with the B5 allowlist wired through it is excluded.
         assert "term|corvidae" not in records
-        # The control candidate (Beasley, not allowlisted) IS recorded.
+        # The control candidate (Beasley, not allowlisted) IS recorded and
+        # meets the proper_name threshold, so it is proposed and committed.
         assert "proper_name|beasley" in records
-        # Nothing auto-promoted either way.
         assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "promoted": 0, "conflicts": 0,
+            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {}
+        assert glossary == {"Beasley": "Адвокат"}
 
 
 # ---------------------------------------------------------------------------
