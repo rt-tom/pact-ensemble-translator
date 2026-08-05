@@ -31,12 +31,30 @@ snapshot (там только glossary + book_memory) и не участвует
 - Вход: финальный текст главы (кандидаты по чанкам или по всей главе — как в v3).
 - Правила: source-термины (латиница) с частотой ≥ порога, отсутствующие в
   `glossary.json` / `book_memory.json` (variants/characters), с контекстом
-  (пример употребления, глава/chunk_id).
+  (пример употребления, глава/chunk_ids).
 - Исключения: уже established/locked в glossary; имена персонажей из библии;
   токены из mixed_script-allowlist (B5) — не кандидаты.
-- Формат записи-кандидата: `{source, target (пустой или предложение), type,
-  occurrences, context, chunk_id}` — поле `chunk_id` нужно для фильтрации
-  quarantined при promote (B7).
+
+Три разных контракта, их нельзя смешивать (review B9-RV3, HIGH):
+
+1. **Запись генератора (candidate)** — `{source, kind, occurrences,
+   chunk_ids, context}` (`pact_v4/phase1/glossary_candidates.py:325-345`):
+   `kind` — `"proper_name"`/`"term"`, `chunk_ids` — отсортированный список
+   уникальных чанков, где термин встретился (пуст, если нет pid-уровневого
+   входа). `target`/`type` в этой записи НЕТ.
+2. **Aligned record / ledger-строка** — кандидат + поля консенсус-выравнивания
+   (`matching_pid_count`, `variants`, `target`, `consensus_share`,
+   `conflicts`); в append-only ledger `glossary_candidates.json`
+   (`GlossaryCandidateLedger`) каждая строка — per-chapter наблюдение, слияние
+   по `candidate_key(source, kind)` даёт кумулятивную запись
+   `{source, kind, total_occurrences, chapters: [{chapter_id, chunk_ids,
+   count}], variants, target, targets_seen, conflicts, first_context}`.
+3. **Observation payload** — то, что `_auto_promote_glossary` передаёт в
+   `MemoryManager.add_observation("glossary", source, {target, type,
+   chunk_id})`: `source` — КЛЮЧ наблюдения (glossary-key), `type` == `kind`
+   кандидата, `chunk_id` — ПЕРВЫЙ отсортированный чанк главы (B7-совместимый
+   payload для quarantined-фильтра `promote`). Это НЕ формат кандидата и НЕ
+   формат ledger-строки.
 
 ### 2. Вызов add_observation в проде
 
@@ -66,7 +84,8 @@ snapshot (там только glossary + book_memory) и не участвует
 
 ### 3.1 Строгие свидетельства (решение владельца: Вариант B + строгие свидетельства)
 
-Промоут кандидата требует строгих свидетельств (B9-F2/F3/F5, review RV2/RV4):
+Промоут кандидата требует строгих свидетельств (B9-F2/F3/F5/F6, review
+RV2/RV4/RV5):
 
 - **co-occurrence guard**: target, разделяемый >1 term-кандидатом в пределах
   главы, отбрасывается — оба кандидата лишаются target и уходят в `conflicts`
@@ -78,12 +97,16 @@ snapshot (там только glossary + book_memory) и не участвует
   B9-F3) — запись, чьи главы разрешили source в разные targets, навсегда имеет
   target None (слияние необратимо), считается `conflict` и никогда не
   промоутится, даже если текущая глава однозначна.
-- **Quarantined fail-closed**: при `accepted_degraded` с quarantined-чанками и
-  недоступной/неполной provenance (chunk_plan) генерация/промоут fail-closed
-  (RV4 HIGH, B9-F5): пустой/битый/неполный `chunk_plan.json` (не может
-  авторитетно сопоставить каждый source/translation pid чанку) → ноль
-  кандидатов, ноль ledger-строк, ноль наблюдений, glossary не мутируется;
-  warning в лог, run не падает.
+- **Quarantined fail-closed**: при `accepted_degraded` с quarantined-чанками
+  генерация/промоут fail-closed, если `chunk_plan.json` не может авторитетно
+  исключить ВСЁ quarantined-свидетельство (RV4/RV5 HIGH, B9-F5/F6):
+  missing/corrupt/empty/incomplete план (source/translation PID без маппинга)
+  или неоднозначный (duplicate PID/chunk ownership, malformed данные) →
+  ноль кандидатов, ноль ledger-строк, ноль наблюдений, glossary не
+  мутируется; warning в лог, run не падает. Quarantined-чанки исключаются ДО
+  аккумуляции ledger и авто-промоута на уровне pids (B9-RV3): кандидат
+  целиком из quarantined-чанка не имеет ledger-строки и не промоутится,
+  смешанный кандидат учитывает только accepted-chunk occurrences.
 
 ### 3.2 Артефакты — семантика `book_run.json` candidates
 
@@ -97,9 +120,13 @@ Per-chapter блок `candidates` `{generated, proposed, committed, conflicts}`
   add_observation` (v3-пороги + единственный консистентный target + нет
   established-конфликта) — это add_observation ДО B7-quarantined-фильтра.
 - `committed` — сколько из `proposed` реально попало в `glossary.json` после
-  `promote` (diff glossary до/после): наблюдение с quarantined `chunk_id`
-  отбрасывается B7-фильтром (accepted_degraded) → committed < proposed;
-  complete ⇒ committed == proposed.
+  `promote` (diff glossary до/после). В финальном коде (B9-F5/F6) quarantined-
+  свидетельства исключаются ДО генерации на уровне pids (RV3), поэтому
+  B9-сгенерированные observations несут только accepted `chunk_id` →
+  B7-фильтр их не отбрасывает и committed == proposed для complete И
+  accepted_degraded (валидный план); B7-фильтр остаётся defense-in-depth
+  (например, ручные наблюдения с quarantined `chunk_id` могут дать
+  committed < proposed).
 - `conflicts` — выровненные записи, НЕ отправленные в add_observation:
   alignment-конфликт (несколько заметных вариантов, нет единственного target),
   кумулятивный ledger target-конфликт (cross-chapter расхождение) или
@@ -107,18 +134,29 @@ Per-chapter блок `candidates` `{generated, proposed, committed, conflicts}`
 
 ### 4. Identity / кеши
 
-- `observations.json` — вне снапшота и identity (проверено) → B9 не инвалидирует
-  cache сам по себе.
-- После promote меняются `glossary.json`/`book_memory.json` → `book_memory_hash`
-  меняется → следующая глава видит обновлённую библию (ожидаемое поведение B7).
+- `observations.json` и ledger `glossary_candidates.json` — вне снапшота и
+  identity (проверено B9-I1) → B9 сам по себе не инвалидирует cache.
+- B9-промоут добавляет только категорию `glossary` через
+  `MemoryManager.add_observation` -> `promote` (B7): после glossary-only
+  промоута меняется ТОЛЬКО `glossary.json` (flat `{source: target}`),
+  `book_memory.json` НЕ трогается → `book_memory_hash` (хеш только
+  `book_memory.json`, `_book_memory_hash()` в `v4_book_run.py`) остаётся
+  неизменным. Следующая глава читает обновлённый `glossary.json` (глава
+  исключает его ключи из кандидатов), а `book_memory_hash`/identity не
+  меняются. Утверждения о cache/resume ссылаются на фактически проверенный
+  identity field (snapshot/config identity), НЕ на `book_memory_hash`.
 
 ### 5. Тесты
 
 - Unit: генератор кандидатов (частотность, исключения allowlist/библии,
-  формат записи с chunk_id); add_observation-вызов в book_run (fake текст главы);
-  promote переносит кандидатов, quarantined-фильтрация работает по chunk_id.
+  формат записи `{source, kind, occurrences, chunk_ids, context}`);
+  add_observation-вызов в book_run (fake текст главы); promote переносит
+  кандидатов, quarantined-фильтрация работает по observation `chunk_id`
+  (B7) и по pre-ledger pid-исключению (RV3/F5/F6).
 - Integration: book-run двух глав — вторая видит обновлённый glossary после
-  promote первой (авто-промоут V-финал).
+  promote первой (авто-промоут V-финал); accepted_degraded с quarantined-
+  чанками и битым/неоднозначным `chunk_plan.json` — fail-closed (ноль
+  кандидатов/ledger/observations/glossary-мутаций).
 - Полный `tests/pact_v4/` зелёный.
 
 ### 6. Обязательный шаг перед первым боевым book-run — офлайн-валидация авто-промоута
@@ -141,9 +179,13 @@ conflicts), и только после этого включать в production
 
 1. Генератор кандидатов детерминированный, без вызовов моделей.
 2. `add_observation` вызывается в `v4_book_run` после каждой главы до promote.
-3. Наблюдения несут `chunk_id` (фильтрация quarantined работает).
-4. Identity/кеши: B9 сам по себе не инвалидирует cache; promote меняет
-   `book_memory_hash` ожидаемым образом.
+3. Candidate несёт `chunk_ids`; observation payload `{target, type, chunk_id}`
+   (ключ — `source`) фильтрует quarantined (B7) + pre-ledger pid-исключение
+   (RV3/F5/F6); битый/неоднозначный `chunk_plan.json` при quarantined —
+   fail-closed (ноль кандидатов/ledger/observations/glossary-мутаций).
+4. Identity/кеши: B9 сам по себе не инвалидирует cache; glossary-only промоут
+   оставляет `book_memory.json` и `book_memory_hash` неизменными, следующая
+   глава читает обновлённый `glossary.json`.
 5. DECISIONS.md — запись о политике наблюдений (V-финал) в том же коммите.
 6. Перед первым боевым book-run — офлайн-валидация авто-промоута на артефактах
    главы 0001 (`run_002_remote`) с выложенным результатом (что промоутнулось).
