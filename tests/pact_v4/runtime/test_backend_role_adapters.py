@@ -48,10 +48,13 @@ from pact_v4.runtime.json_resilience import (
     TruncatedJSONError,
 )
 from pact_v4.runtime.prompts_runtime import (
+    REGION_FIDELITY_GATE_V1,
+    ReviewerPrompt,
     render_gemma_audit_prompt,
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
     render_qwen_review_prompt,
+    render_region_fidelity_gate_prompt,
 )
 
 
@@ -985,3 +988,90 @@ def test_region_fidelity_gate_batch_transport_failure_is_debt_for_all():
     assert all(r.passed is False for r in results)
     assert all("API failure" in r.detail for r in results)
     assert len(attempts) == 1
+
+
+def test_region_fidelity_gate_batch_default_config_uses_batch_contract():
+    """B12-F1 regression: the default-config batch path must render the
+    multi-region batch instructions (``several repaired regions`` +
+    ``verdicts: array``), never the single-region schema (``single repaired
+    region``). Production wiring builds the gate with only ``retry``
+    overridden (runtime_config.build_phase4_adapters), so this is the exact
+    prompt the real batch re-gate sends.
+    """
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    # Default config: exactly what build_phase4_adapters wires (retry only).
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert all(r.passed for r in results)
+    sent = backend.requests[0].messages[0].content
+    assert "several repaired regions" in sent
+    assert "verdicts: array of objects, one per region" in sent
+    assert "single repaired region" not in sent
+    assert "REGION 1:" in sent
+    assert "REGION 2:" in sent
+
+
+def test_region_fidelity_gate_batch_explicit_batch_template_is_honored():
+    """B12-F1: a custom batch template configured via ``batch_template`` is
+    used by the batch path, while ``template`` still drives the single path.
+    """
+    from pact_v4.phase1.models import Region
+    from pact_v4.runtime.prompts_runtime import REGION_FIDELITY_GATE_BATCH_V1
+
+    custom = ReviewerPrompt(
+        role="region_fidelity_gate_batch",
+        version="pact-v4-reviewer-qwen-region-fidelity-batch/test-custom",
+        instructions=(
+            "You are a custom batch fidelity reviewer. Return STRICT JSON "
+            "with exactly this schema:\n"
+            "  verdicts: array of objects, one per region in the given order."
+        ),
+    )
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend,
+        config=BackendRegionFidelityGateConfig(
+            retry=_no_backoff(), batch_template=custom,
+        ),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 1
+    assert results[0].passed is True
+    sent = backend.requests[0].messages[0].content
+    assert "custom batch fidelity reviewer" in sent
+    assert "REGION 1:" in sent
+    # The batch path must not silently fall back to the single template.
+    assert sent != render_region_fidelity_gate_prompt(
+        source_text=items[0]["source_text"],
+        repaired_text=items[0]["repaired_text"],
+        region=items[0]["region"],
+        template=REGION_FIDELITY_GATE_V1,
+    )
+    # The single-region default template remains untouched.
+    assert BackendRegionFidelityGateConfig().template == REGION_FIDELITY_GATE_V1
+    assert BackendRegionFidelityGateConfig().batch_template == REGION_FIDELITY_GATE_BATCH_V1

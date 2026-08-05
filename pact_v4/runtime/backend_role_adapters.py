@@ -44,6 +44,7 @@ from pact_v4.runtime.prompts_runtime import (
     GEMMA_RUSSIAN_PREFERENCE_V1,
     QWEN_AUDIT_V1,
     QWEN_FIDELITY_V1,
+    REGION_FIDELITY_GATE_BATCH_V1,
     REGION_FIDELITY_GATE_V1,
     REPAIR_REGION_V1,
     ReviewerPrompt,
@@ -659,10 +660,19 @@ class BackendRegionFidelityGateConfig:
     single PID + region, so the output budget is small; ``max_tokens`` stays
     a floor with a generous ceiling so a verbose ``reason`` is never
     truncated mid-JSON.
+
+    ``template`` drives the single-region prompt (``__call__``);
+    ``batch_template`` drives the batched prompt (``batch``) and defaults to
+    the dedicated batch contract (``REGION_FIDELITY_GATE_BATCH_V1`` — the
+    ``{\"verdicts\": [...]}`` array schema the batched parser
+    ``_parse_qwen_verdicts`` requires). B12-F1: the batch path must never
+    inherit the single-region template, whose instructions ask for one
+    flat verdict object the batch parser would fail closed on.
     """
 
     max_tokens: int = 4096
     template: ReviewerPrompt = REGION_FIDELITY_GATE_V1
+    batch_template: ReviewerPrompt = REGION_FIDELITY_GATE_BATCH_V1
     label: str = "phase4/region_fidelity_gate"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
@@ -762,7 +772,7 @@ class BackendRegionFidelityGate:
         """
         prompt = render_region_fidelity_gate_batch_prompt(
             items=[dict(item) for item in items],
-            template=self._config.template,
+            template=self._config.batch_template,
         )
         request = CompletionRequest(
             model_ref=_model_ref_for(
