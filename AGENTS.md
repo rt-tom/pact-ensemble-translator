@@ -123,29 +123,25 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   единицу (модуль / интеграция / docs) + одна review-карточка на неё. Не
   дробить на микро-задачи, не сливать крупный объём в одну карточку (ревью
   диффа в тысячи строк пропускает дефекты).
-- **Цикл «2 карточки», без плодения (правило владельца 2026-08-05)**: на
-  задачу создаётся РОВНО 2 карточки — I (developer) и RV (reviewer) — и они
-  живут до финала; fix-карточки (F1/F2/RV2) НЕ создаются. Замечания ревью — в
-  комментариях. Цикл: I готова → I `blocked` (review-required) → RV ревьюит →
-  вердикт в комментарии: approve → `complete RV` + `complete I`; changes
-  requested → ревьюер пишет замечания в комментарий I, `unblock I` (I снова
-  ready), RV ждёт фикса → developer переклеймляет I, правит, коммитит, I →
-  `blocked` → RV снова ready («проверь меня») → повтор, пока approve. Диспетчер
-  не переклеймит blocked(review-required) I (`respawn_guarded active_pr`).
-  **ВАЖНО (урок B14)**: диспетчер promote'ит зависимые (parent) карточки
-  только после `complete` родителя — пока I жива, RV не стартует сама.
-  После перевода I в `blocked` (review-required) архитектор вручную выполняет
-  `hermes kanban promote --force <RV>` — ревью стартует; после фикса (I снова
-  blocked) — снова `promote --force <RV>`. **RV создаётся БЕЗ --parent**:
-  claim-гейт отклоняет заклейм RV, пока I не complete (`claim_rejected
-  parents_not_done`, урок B14) — порядок управляется только promote/blocked.
-  **RV создаётся ПОСЛЕ готовности I** (I → blocked review-required + Draft PR
-  создан), а не заранее: диспетчер клеймит ready-задачи мгновенно, и
-  dependency_wait-цикл даёт переклеймы каждую минуту (расход токенов на
-  перепроверки; урок: 3 RV висели в dependency_wait, пока developer работал).
-  При готовности I: `hermes kanban create <RV> ...` (ready) → ревьюер клеймит
-  и сразу ревьюит. RV создаётся БЕЗ --parent (claim-гейт: `claim_rejected
-  parents_not_done`, урок B14).
+- **Цикл «2 карточки», полностью автоматический (правило владельца 2026-08-05)**:
+  на задачу создаётся РОВНО 2 карточки — I (developer) и RV (reviewer); никаких
+  fix-карточек (F1/F2/RV2) и никаких ручных дёрганий архитектором. Воркеры
+  дёргают друг друга kanban-командами:
+  1. Developer завершил (коммит + **Draft PR создан**) → `hermes kanban block
+     <I> ready_for_review --kind dependency` (I — пауза) → **developer сам
+     создаёт RV** (`hermes kanban create <RV> --assignee reviewer ...` готовой
+     в ready) → диспетчер клеймит → ревью стартует.
+  2. Ревьюер: **approve** → коммент в PR + `complete <RV>` + `complete <I>`
+     (обе закрываются); **changes requested** → замечания комментарием в PR +
+     `unblock <I>` (I снова ready) + `block <RV> waiting_for_fix --kind
+     dependency` (RV — пауза, не переклеймится).
+  3. Developer (после фикса): коммит + push → `block <I> ready_for_review
+     --kind dependency` + **`unblock <RV>`** («проверь меня») → ревью снова.
+  4. Цикл повторяется, пока approve.
+  Архитектор: только создаёт I и вмешивается при тупиках/застреваниях. RV
+  создаётся БЕЗ --parent (claim-гейт `claim_rejected parents_not_done`,
+  урок B14); RV не создаётся заранее (dependency_wait-цикл = переклеймы и
+  расход токенов, урок 2026-08-06: 3 RV висели в ожидании).
 - **Draft PR обязателен + общение через PR-комментарии (правило владельца
   2026-08-05)**: developer после коммита ОБЯЗАН создать Draft PR
   (`gh pr create --draft`) для любой код-задачи (замечание B13: PR не
