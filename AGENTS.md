@@ -132,6 +132,11 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   ready), RV ждёт фикса → developer переклеймляет I, правит, коммитит, I →
   `blocked` → RV снова ready («проверь меня») → повтор, пока approve. Диспетчер
   не переклеймит blocked(review-required) I (`respawn_guarded active_pr`).
+  **ВАЖНО (урок B14)**: диспетчер promote'ит зависимые (parent) карточки
+  только после `complete` родителя — пока I жива, RV не стартует сама.
+  После перевода I в `blocked` (review-required) архитектор вручную выполняет
+  `hermes kanban promote --force <RV>` — ревью стартует; после фикса (I снова
+  blocked) — снова `promote --force <RV>`.
 - **Draft PR обязателен + общение через PR-комментарии (правило владельца
   2026-08-05)**: developer после коммита ОБЯЗАН создать Draft PR
   (`gh pr create --draft`) для любой код-задачи (замечание B13: PR не
