@@ -139,6 +139,10 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   blocked) — снова `promote --force <RV>`. **RV создаётся БЕЗ --parent**:
   claim-гейт отклоняет заклейм RV, пока I не complete (`claim_rejected
   parents_not_done`, урок B14) — порядок управляется только promote/blocked.
+  **Сразу после create RV переводится в ожидание** (`hermes kanban block
+  <RV> waiting_for_impl --kind dependency` — диспетчер клеймит ready-задачи
+  мгновенно); при готовности I (blocked review-required) — `unblock <RV>` —
+  ревью стартует на уже заклеймлённом воркере.
 - **Draft PR обязателен + общение через PR-комментарии (правило владельца
   2026-08-05)**: developer после коммита ОБЯЗАН создать Draft PR
   (`gh pr create --draft`) для любой код-задачи (замечание B13: PR не
