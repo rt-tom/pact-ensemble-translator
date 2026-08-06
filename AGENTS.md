@@ -93,6 +93,11 @@ Merge may proceed, but production deployment is forbidden until explicitly reque
 ### `Запускай` / `Возобновляй`
 
 Start the normal production pipeline only after successful deployment checks.
+**Прогоны запускаются ТОЛЬКО владельцем вручную, вне чата (в своём
+терминале). Из чата (ни агентом, ни владельцем в этой сессии) команды
+запуска прогона не выдаются и не исполняются — правило владельца
+2026-08-06. Агент не стартует пайплайн/llama-server ни по какой команде;
+максимум — подготовить команду запуска и ждать, пока владелец запустит сам.**
 
 ## Incident workflow
 
