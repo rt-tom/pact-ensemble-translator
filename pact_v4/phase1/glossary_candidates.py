@@ -53,7 +53,7 @@ import json
 import os
 import re
 import tempfile
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Tokenization / text helpers
@@ -226,12 +226,36 @@ def _glossary_terms(glossary: Any) -> List[str]:
     return terms
 
 
+def _glossary_target_strings(target: Any) -> Iterator[str]:
+    """Yield individual non-empty string targets from a glossary target value.
+
+    Tolerant of every value shape the B9 contract accepts: a scalar ``str``,
+    a ``list``/``tuple`` of targets, and a dict wrapper whose ``target`` /
+    ``target_terms`` value is a scalar or a list. Empty strings and non-string
+    values are ignored. Containers are never stringified — a list value
+    contributes each element, not one ``"['…']"`` string (P1 PR #138 re-review:
+    ``str(["Блэйк"])`` produced the reverse key ``"['блэйк']"`` and bypassed
+    the proper-name guard).
+    """
+    if isinstance(target, str):
+        if target:
+            yield target
+    elif isinstance(target, (list, tuple)):
+        for item in target:
+            yield from _glossary_target_strings(item)
+    elif isinstance(target, dict):
+        wrapped = target.get("target_terms") or target.get("target")
+        if wrapped is not None:
+            yield from _glossary_target_strings(wrapped)
+
+
 def _glossary_target_keys(glossary: Any) -> Dict[str, set]:
     """Casefolded glossary target VALUE -> set of source keys mapping to it.
 
     Mirror of ``_glossary_terms`` on the VALUE side, tolerant of both v4
     glossary shapes (flat dict ``{source: target}`` or list of
-    ``{source_term/source, target_terms/target}``). Used by the B9-fix
+    ``{source_term/source, target_terms/target}``) and of every target value
+    shape (scalar str, list/tuple, dict wrapper). Used by the B9-fix
     proper-name guard: a candidate whose aligned target equals the
     established translation of a DIFFERENT glossary key (``Master -> Блэйк``
     while the glossary already maps ``Blake -> Блэйк``) is aligning to a
@@ -252,10 +276,7 @@ def _glossary_target_keys(glossary: Any) -> Dict[str, set]:
     else:
         return result
     for source, target in items:
-        flat = str(target) if not isinstance(target, dict) else str(
-            target.get("target") or ""
-        )
-        if flat:
+        for flat in _glossary_target_strings(target):
             result.setdefault(flat.casefold(), set()).add(str(source).casefold())
     return result
 

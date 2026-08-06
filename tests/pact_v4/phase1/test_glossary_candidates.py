@@ -23,6 +23,7 @@ import pytest
 from pact_v4.phase1.glossary_candidates import (
     DEFAULT_CONSENSUS_RATIO,
     GlossaryCandidateLedger,
+    _glossary_target_keys,
     align_candidates,
     candidate_key,
     generate_candidates,
@@ -392,6 +393,76 @@ def test_alignment_proper_name_target_established_value_rejected():
     assert record["target"] is None
     assert "Блэйк" in record["conflicts"]
     assert record["consensus_share"] == 0.0
+
+
+@pytest.mark.parametrize("glossary", [
+    {"Blake": "Блэйк"},                                      # scalar str
+    {"Blake": ["Блэйк"]},                                    # dict list-value
+    {"Blake": ("Блэйк",)},                                   # dict tuple-value
+    [{"source_term": "Blake", "target_terms": ["Блэйк"]}],   # list-entry form
+    {"Blake": {"target": "Блэйк"}},                          # dict-wrapped scalar
+    {"Blake": {"target": ["Блэйк"]}},                        # dict-wrapped list
+])
+def test_alignment_proper_name_guard_flattens_list_and_wrapped_values(glossary):
+    # P1 (PR #138 re-review): EVERY supported glossary shape must index the
+    # individual target strings. The old code stringified the container
+    # (``str(["Блэйк"])`` -> reverse key ``"['блэйк']"``), so list-form and
+    # dict-wrapped glossaries bypassed the guard and Master -> Блэйк was
+    # auto-promoted with share 1.0.
+    source_by_pid = {
+        "p00001": "Are you accusing me of being a liar, Master Blake?",
+        "p00002": "She even said 'Master Blake'.",
+        "p00003": "I am a lawyer, Master Blake.",
+    }
+    translations = {
+        "p00001": "Вы обвиняете меня во лжи, мастер Блэйк?",
+        "p00002": "Она даже сказала «мастер Блэйк».",
+        "p00003": "Я юрист, мастер Блэйк.",
+    }
+    cand = {"source": "Master", "kind": "proper_name", "occurrences": 3,
+            "chunk_ids": [], "context": "Master Blake"}
+    record = align_candidates([cand], source_by_pid, translations,
+                              glossary=glossary)[0]
+    assert record["target"] is None
+    assert "Блэйк" in record["conflicts"]
+    assert record["consensus_share"] == 0.0
+
+
+def test_glossary_target_keys_ignores_empty_and_non_string_values():
+    # P1 (PR #138 re-review): the reverse index keeps only individual
+    # non-empty string targets — empty strings, non-strings and dict wrappers
+    # without a target key contribute nothing (conservative "no constraint"
+    # baseline, matching ``_glossary_entries``), and no container is
+    # stringified into a junk key.
+    assert _glossary_target_keys({
+        "Blake": ["Блэйк", "", 42, None],
+        "Duncan": 7,
+        "Evan": {"no_target_key": "Эван"},
+    }) == {"блэйк": {"blake"}}
+
+
+def test_alignment_proper_name_guard_list_values_keep_true_name():
+    # Positive control: a genuine proper name whose translation is NOT an
+    # established glossary value keeps its target (consensus 1.0, no
+    # conflicts) even when the supplied glossary uses the list-valued forms —
+    # the flattening guard only fires on real value collisions.
+    source_by_pid = {
+        **{f"p{i:05d}": "Ivy said hello." for i in range(1, 4)},
+        **{f"p{i:05d}": "The others watched." for i in range(4, 6)},
+    }
+    translations = {
+        **{f"p{i:05d}": "Айви поздоровалась." for i in range(1, 4)},
+        **{f"p{i:05d}": "Остальные смотрели." for i in range(4, 6)},
+    }
+    cand = {"source": "Ivy", "kind": "proper_name", "occurrences": 3,
+            "chunk_ids": [], "context": "Ivy said hello."}
+    for glossary in ({"Blake": ["Блэйк"]},
+                     [{"source_term": "Blake", "target_terms": ["Блэйк"]}]):
+        record = align_candidates([cand], source_by_pid, translations,
+                                  glossary=glossary)[0]
+        assert record["target"] == "Айви"
+        assert record["consensus_share"] == 1.0
+        assert record["conflicts"] == []
 
 
 def test_alignment_term_collocation_verb_loses_to_true_translation():
