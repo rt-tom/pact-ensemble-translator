@@ -21,7 +21,14 @@ calls in the book run). This module is the model-free core:
      same Russian variant, that variant is co-occurrence evidence for at most
      one of them — with no word-level alignment we cannot tell which, so both
      candidates lose the target (conservative, prevents unrelated co-occurring
-     source terms from being promoted as the same unrelated target).
+     source terms from being promoted as the same unrelated target). B9-fix
+     (t_800fedaf, dry-run run_005) adds two heuristics: term variants are
+     ranked by candidate-specificity (``in_count / (1 + out_count)``) so
+     chapter-wide collocations (получить/чувствовал/стороны) cannot outrank
+     the candidate's own candidate-specific translation
+     (преимущество/злость/блондинка), and a proper_name target equal to an
+     established glossary VALUE of a different key is dropped as a
+     co-occurring established name (Master -> Блэйк while Blake -> Блэйк).
   3. ``GlossaryCandidateLedger`` — append-only, line-based (one JSON object
      per line) accumulation into ``glossary_candidates.json``, v3-style merged
      records ``{source, kind, total_occurrences, chapters, variants, target,
@@ -217,6 +224,40 @@ def _glossary_terms(glossary: Any) -> List[str]:
     for source, _target in items:
         terms.append(str(source))
     return terms
+
+
+def _glossary_target_keys(glossary: Any) -> Dict[str, set]:
+    """Casefolded glossary target VALUE -> set of source keys mapping to it.
+
+    Mirror of ``_glossary_terms`` on the VALUE side, tolerant of both v4
+    glossary shapes (flat dict ``{source: target}`` or list of
+    ``{source_term/source, target_terms/target}``). Used by the B9-fix
+    proper-name guard: a candidate whose aligned target equals the
+    established translation of a DIFFERENT glossary key (``Master -> Блэйк``
+    while the glossary already maps ``Blake -> Блэйк``) is aligning to a
+    co-occurring established name, not to its own translation, and must not
+    be promoted.
+    """
+    result: Dict[str, set] = {}
+    if isinstance(glossary, dict):
+        items = list(glossary.items())
+    elif isinstance(glossary, list):
+        items = []
+        for entry in glossary:
+            if isinstance(entry, dict):
+                source = entry.get("source_term") or entry.get("source")
+                target = entry.get("target_terms") or entry.get("target")
+                if source is not None and target is not None:
+                    items.append((source, target))
+    else:
+        return result
+    for source, target in items:
+        flat = str(target) if not isinstance(target, dict) else str(
+            target.get("target") or ""
+        )
+        if flat:
+            result.setdefault(flat.casefold(), set()).add(str(source).casefold())
+    return result
 
 
 _MEMORY_SECTIONS = ("characters", "entities", "terms")
@@ -504,23 +545,6 @@ def _pick_display_form(stem: str, forms: Dict[str, int]) -> str:
     return max(sorted(forms), key=lambda form: (forms[form], form))
 
 
-def _dominant_variant(
-    variants: Dict[str, int], key_order: Sequence[str],
-) -> Optional[str]:
-    """Highest-count variant; ties broken by ``key_order`` (then alphabetically)."""
-    if not variants:
-        return None
-    best = None
-    best_key = None
-    for word in key_order:
-        if word not in variants:
-            continue
-        count = variants[word]
-        if best is None or count > best:
-            best, best_key = count, word
-    return best_key
-
-
 def align_candidates(
     candidates: Sequence[Mapping[str, Any]],
     source_by_pid: Mapping[str, str],
@@ -528,6 +552,7 @@ def align_candidates(
     *,
     consensus_ratio: float = DEFAULT_CONSENSUS_RATIO,
     contrast_ratio: float = DEFAULT_CONTRAST_RATIO,
+    glossary: Any = None,
 ) -> List[Dict[str, Any]]:
     """Align candidate targets against a finished chapter translation.
 
@@ -553,6 +578,26 @@ def align_candidates(
     ``consensus_ratio`` it becomes ``target``; otherwise ``conflicts`` lists
     all competing variants and there is no target.
 
+    Two B9-fix heuristics (t_800fedaf, offline validation of run_005) keep
+    the dominant honest:
+
+      * ``term`` variants are ranked by candidate-specificity
+        (``in_count / (1 + out_count)``, where ``out_count`` is how many
+        NON-matching pids the variant appears in), NOT by raw pid-presence.
+        A collocation/common word that also shows up all over the chapter
+        (``получить``, ``чувствовал``, ``стороны``) no longer outranks the
+        candidate's own candidate-specific translation (``преимущество``,
+        ``злость``, ``блондинка``) — without this, ``advantage -> получить``
+        / ``anger -> чувствовал`` / ``blonde -> стороны`` would auto-promote;
+      * a ``proper_name`` target that equals an established glossary VALUE of
+        a DIFFERENT key (``Master -> Блэйк`` while the glossary already maps
+        ``Blake -> Блэйк``) is a co-occurring established name, not this
+        candidate's own translation — the target is dropped (conflict), so
+        the pair can never promote.
+
+    ``glossary`` (optional, the established ``glossary.json``) powers the
+    second guard; without it (``None``) that guard is a no-op.
+
     A term target is only kept when it is unambiguous *within the chapter*
     (B9-F2 review PR #128): if two ``term`` candidates both dominate on the
     same Russian variant, that variant is co-occurrence evidence for at most
@@ -568,6 +613,9 @@ def align_candidates(
     Deterministic; no model calls.
     """
     aligned: List[Dict[str, Any]] = []
+    # Casefolded established glossary VALUE -> its source keys (B9-fix guard
+    # for proper_name targets that collide with another key's translation).
+    glossary_target_keys = _glossary_target_keys(glossary)
     for candidate in candidates:
         source = str(candidate.get("source") or "")
         if not source:
@@ -661,14 +709,38 @@ def align_candidates(
                     continue
                 display = _pick_display_form(stem, stem_forms[stem])
                 variant_counts[display] = in_count
+            # B9-fix (t_800fedaf, audit HIGH 2): rank term variants by
+            # candidate-specificity, not raw pid-presence. A variant that
+            # ALSO appears in many non-matching pids is a collocation/common
+            # word, not the candidate's own translation (advantage->получить,
+            # anger->чувствовал, blonde->стороны: получить/чувствовал/
+            # стороны show up all over the chapter, while the true
+            # translations преимущество/злость/блондинка are confined to the
+            # matching pids). Score = in_count / (1 + out_count); ties by
+            # in_count desc, then first-seen, then alphabetical
+            # (deterministic).
+            out_count = {stem: other_counts.get(stem, 0) for stem in stem_order}
             ordered_keys = sorted(
                 variant_counts,
-                key=lambda w: (-variant_counts[w],
+                key=lambda w: (-(variant_counts[w]
+                                 / (1 + out_count[_ru_stem(w)])),
+                               -variant_counts[w],
                                stem_order.index(_ru_stem(w)), w),
             )
 
         variants = {w: variant_counts[w] for w in ordered_keys}
-        dominant = _dominant_variant(variants, ordered_keys)
+        dominant = ordered_keys[0] if ordered_keys else None
+        if (dominant is not None and candidate.get("kind") == "proper_name"
+                and dominant.casefold() in glossary_target_keys
+                and source.casefold()
+                not in glossary_target_keys[dominant.casefold()]):
+            # B9-fix (t_800fedaf, audit HIGH 1): the aligned target is the
+            # established glossary VALUE of a DIFFERENT key (Master -> Блэйк
+            # while the glossary already maps Blake -> Блэйк) — a
+            # co-occurring established name, not this candidate's own
+            # translation. Drop the target: the wrong pair must never
+            # promote (and never reach the ledger).
+            dominant = None
         share = (variant_counts[dominant] / len(examined)) if dominant else 0.0
         if dominant is not None and share >= consensus_ratio:
             target: Optional[str] = dominant

@@ -365,6 +365,158 @@ def test_alignment_no_model_calls_uses_only_arguments():
 
 
 # ---------------------------------------------------------------------------
+# B9-fix (t_800fedaf): false positives from the run_005 dry-run
+# ---------------------------------------------------------------------------
+
+def test_alignment_proper_name_target_established_value_rejected():
+    # B9-fix HIGH 1: "Master" is a capitalized title used with Blake's name
+    # ("Master Blake"); in the matching translations the capitalized word is
+    # Блэйк — the ESTABLISHED glossary value of the key "Blake". Aligning
+    # Master -> Блэйк would auto-promote a wrong pair (Master is not Blake).
+    # The guard must drop the target (conflict) so the pair never promotes.
+    source_by_pid = {
+        "p00001": "Are you accusing me of being a liar, Master Blake?",
+        "p00002": "She even said 'Master Blake'.",
+        "p00003": "I am a lawyer, Master Blake.",
+    }
+    translations = {
+        "p00001": "Вы обвиняете меня во лжи, мастер Блэйк?",
+        "p00002": "Она даже сказала «мастер Блэйк».",
+        "p00003": "Я юрист, мастер Блэйк.",
+    }
+    cand = {"source": "Master", "kind": "proper_name", "occurrences": 3,
+            "chunk_ids": [], "context": "Master Blake"}
+    glossary = {"Blake": "Блэйк", "Blake Thorburn": "Блэйк Торбёрн"}
+    record = align_candidates([cand], source_by_pid, translations,
+                              glossary=glossary)[0]
+    assert record["target"] is None
+    assert "Блэйк" in record["conflicts"]
+    assert record["consensus_share"] == 0.0
+
+
+def test_alignment_term_collocation_verb_loses_to_true_translation():
+    # B9-fix HIGH 2: "получить" (to get) co-occurs with "advantage" in the
+    # phrase "get an advantage" and appears in ALL matching pids, so raw
+    # pid-presence made it the dominant variant (3/3) over the true
+    # translation "преимущество" (2/3). Candidate-specificity (how few
+    # NON-matching pids contain the word) must demote the collocation verb
+    # and keep the true translation; with преимущество at 2/3 < consensus
+    # the candidate has no single target — it must NOT promote.
+    source_by_pid = {
+        **{f"p{i:05d}": "Trying to get an advantage." for i in range(1, 4)},
+        **{f"p{i:05d}": "They wanted to get the money." for i in range(4, 9)},
+    }
+    translations = {
+        "p00001": "Пытаясь получить преимущество.",
+        "p00002": "Он хотел получить преимущество.",
+        "p00003": "Он хотел получить шанс.",
+        **{f"p{i:05d}": "Они хотели получить деньги." for i in range(4, 9)},
+    }
+    cand = {"source": "advantage", "kind": "term", "occurrences": 3,
+            "chunk_ids": [], "context": "Trying to get an advantage."}
+    record = align_candidates([cand], source_by_pid, translations)[0]
+    assert record["target"] is None
+    assert "получить" not in record["variants"] or record["target"] != "получить"
+    # преимущество is the true translation and stays candidate-specific.
+    assert record["variants"].get("преимущество") == 2
+
+
+def test_alignment_term_verb_collocation_loses_to_noun():
+    # B9-fix HIGH 2: "чувствовал" (felt) co-occurs with "anger" ("I could
+    # feel the anger" -> "чувствовал злость") and outranks the true
+    # translation "злость" under raw pid-presence (tie 2/2, first-seen
+    # wins). Candidate-specificity must prefer "злость" (only in matching
+    # pids) over "чувствовал" (also in non-matching pids).
+    source_by_pid = {
+        **{f"p{i:05d}": "I could feel the anger stirring." for i in range(1, 3)},
+        **{f"p{i:05d}": "He felt the cold air." for i in range(3, 7)},
+    }
+    translations = {
+        **{f"p{i:05d}": "Я чувствовал, как злость закипает." for i in range(1, 3)},
+        **{f"p{i:05d}": "Он чувствовал холодный воздух." for i in range(3, 7)},
+    }
+    cand = {"source": "anger", "kind": "term", "occurrences": 3,
+            "chunk_ids": [], "context": "I could feel the anger."}
+    record = align_candidates([cand], source_by_pid, translations)[0]
+    assert record["target"] == "злость"
+    assert "чувствовал" not in record["conflicts"]
+
+
+def test_alignment_term_side_collocation_loses_to_adjective():
+    # B9-fix HIGH 2: "стороны" (sides, from "on one side") co-occurs with
+    # "blonde" in every matching pid and is a common word across the
+    # chapter; the true translation "блондинка" is candidate-specific.
+    # Raw pid-presence handed the target to "стороны" (tie 3/3, first-seen);
+    # candidate-specificity must prefer "блондинка".
+    source_by_pid = {
+        **{f"p{i:05d}": "On one side, all the women were blonde." for i in range(1, 4)},
+        **{f"p{i:05d}": "On the other side stood the men." for i in range(4, 10)},
+        **{f"p{i:05d}": "The men were silent." for i in range(10, 14)},
+    }
+    translations = {
+        "p00001": "С одной стороны была блондинка.",
+        "p00002": "С другой стороны стояла блондинка.",
+        "p00003": "С третьей стороны появилась блондинка.",
+        **{f"p{i:05d}": "С другой стороны стояли мужчины." for i in range(4, 8)},
+        **{f"p{i:05d}": "Мужчины молчали." for i in range(8, 14)},
+    }
+    cand = {"source": "blonde", "kind": "term", "occurrences": 3,
+            "chunk_ids": [], "context": "all the women were blonde"}
+    record = align_candidates([cand], source_by_pid, translations)[0]
+    assert record["target"] == "блондинка"
+    assert "стороны" not in record["conflicts"] or record["target"] is not None
+
+
+def test_alignment_proper_name_unaffected_by_unrelated_glossary_values():
+    # B9-fix positive case: a genuine proper name (Ivy) whose translation is
+    # NOT an established glossary value keeps its target even when the
+    # glossary is supplied — the established-value guard must only fire on
+    # real collisions.
+    source_by_pid = {
+        **{f"p{i:05d}": "Ivy said hello." for i in range(1, 4)},
+        **{f"p{i:05d}": "The others watched." for i in range(4, 6)},
+    }
+    translations = {
+        **{f"p{i:05d}": "Айви поздоровалась." for i in range(1, 4)},
+        **{f"p{i:05d}": "Остальные смотрели." for i in range(4, 6)},
+    }
+    cand = {"source": "Ivy", "kind": "proper_name", "occurrences": 3,
+            "chunk_ids": [], "context": "Ivy said hello."}
+    glossary = {"Blake": "Блэйк", "Blake Thorburn": "Блэйк Торбёрн"}
+    record = align_candidates([cand], source_by_pid, translations,
+                              glossary=glossary)[0]
+    assert record["target"] == "Айви"
+    assert record["consensus_share"] == 1.0
+    assert record["conflicts"] == []
+
+
+def test_alignment_term_specific_translation_still_promotes():
+    # B9-fix positive case: a term whose true translation is genuinely
+    # candidate-specific (ботинки, out=0) still reaches consensus and
+    # promotes even with a co-occurring common word (дверь appears widely
+    # across non-matching pids) — the specificity ranking must not starve
+    # correct candidates.
+    source_by_pid = {
+        **{f"p{i:05d}": "He wore heavy boots." for i in range(1, 4)},
+        **{f"p{i:05d}": "The door was heavy too." for i in range(4, 9)},
+        **{f"p{i:05d}": "She wore a scarf." for i in range(9, 13)},
+    }
+    translations = {
+        "p00001": "Он носил тяжёлые ботинки.",
+        "p00002": "Он носил свои ботинки.",
+        "p00003": "Он носил новые ботинки.",
+        **{f"p{i:05d}": "Дверь тоже была тяжёлой." for i in range(4, 9)},
+        **{f"p{i:05d}": "Она носила шарф." for i in range(9, 13)},
+    }
+    cand = {"source": "boots", "kind": "term", "occurrences": 3,
+            "chunk_ids": [], "context": "He wore heavy boots."}
+    record = align_candidates([cand], source_by_pid, translations)[0]
+    assert record["target"] == "ботинки"
+    assert record["consensus_share"] == 1.0
+    assert record["conflicts"] == []
+
+
+# ---------------------------------------------------------------------------
 # Ledger
 # ---------------------------------------------------------------------------
 
