@@ -354,6 +354,83 @@ def test_backend_sink_writes_final_failure_with_error_class(tmp_path: Path, monk
     writer.close()
 
 
+def test_backend_sink_writes_session_create_failure(tmp_path: Path, monkeypatch):
+    """A session-creation transport failure is journaled exactly once.
+
+    D1 review finding (PR #139): ``_create_session()`` ran outside the
+    failure-recording path, so an ``OpenCodeError`` from ``POST /session``
+    after a successful preflight bypassed both ``BackendCallRecord`` and
+    ``usage.ndjson``. The row must carry the real ``error_class`` and no
+    fabricated session/request ids or usage.
+    """
+    fake = DynamicFakeOpenCodeServer()
+    backend = OpenCodeServerBackend(config=_remote_backend_config(), session=fake)
+    writer = UsageRecordWriter(tmp_path)
+    backend.set_usage_sink(writer.write_call)
+
+    from pact_v4.runtime.opencode_backend import (
+        ERROR_TRANSPORT_NETWORK,
+        OpenCodeError,
+    )
+
+    def _boom(*args, **kwargs):
+        raise OpenCodeError(
+            ERROR_TRANSPORT_NETWORK, "session create: connection refused"
+        )
+
+    monkeypatch.setattr(backend, "_create_session", _boom)
+    try:
+        backend.complete(_completion_request("generator"))
+    except OpenCodeError:
+        pass
+    rows = _load_rows(tmp_path / USAGE_FILENAME)
+    assert len(rows) == 1
+    assert rows[0]["error_class"] == ERROR_TRANSPORT_NETWORK
+    # No session/request id exists for a failed session creation — never
+    # invented, and no usage either.
+    assert rows[0]["session_id"] is None
+    assert rows[0]["request_id"] is None
+    assert "input_tokens" not in rows[0]
+    assert "reported_cost" not in rows[0]
+    writer.close()
+
+
+def test_backend_sink_writes_budget_admission_failure(tmp_path: Path):
+    """Request-budget admission failure is journaled exactly once.
+
+    ``_check_budget_request()`` (inside ``_create_session``) raising
+    ``remote_budget_exhausted`` before any session exists must produce one
+    row carrying the real error_class and no fabricated ids/usage.
+    """
+    fake = DynamicFakeOpenCodeServer()
+    backend = OpenCodeServerBackend(config=_remote_backend_config(), session=fake)
+    # Exhaust the request budget so the real admission check raises on the
+    # next call (before any session is created).
+    backend._request_count = backend._cfg.remote_budget.max_requests_per_chapter
+    writer = UsageRecordWriter(tmp_path)
+    backend.set_usage_sink(writer.write_call)
+
+    from pact_v4.runtime.opencode_backend import (
+        ERROR_REMOTE_BUDGET_EXHAUSTED,
+        OpenCodeError,
+    )
+
+    try:
+        backend.complete(_completion_request("generator"))
+    except OpenCodeError as exc:
+        assert exc.error_class == ERROR_REMOTE_BUDGET_EXHAUSTED
+    else:  # pragma: no cover - the admission check must raise
+        raise AssertionError("expected remote_budget_exhausted from admission")
+    rows = _load_rows(tmp_path / USAGE_FILENAME)
+    assert len(rows) == 1
+    assert rows[0]["error_class"] == ERROR_REMOTE_BUDGET_EXHAUSTED
+    assert rows[0]["session_id"] is None
+    assert rows[0]["request_id"] is None
+    assert "input_tokens" not in rows[0]
+    assert "reported_cost" not in rows[0]
+    writer.close()
+
+
 # ---------------------------------------------------------------------------
 # Runner wiring
 # ---------------------------------------------------------------------------

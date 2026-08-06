@@ -954,7 +954,19 @@ class OpenCodeServerBackend:
         attempt_log: list[dict] = []
 
         while True:
-            session_id = self._create_session(request.label)
+            try:
+                session_id = self._create_session(request.label)
+            except OpenCodeError as exc:
+                # Session creation (POST /session) or request-budget
+                # admission failed after a successful preflight. This is a
+                # failed remote completion call and must be journaled exactly
+                # once (D1 acceptance §1). No session/request id exists yet,
+                # so the record carries only the real error_class, the label
+                # and the attempt entry — never fabricated ids or usage.
+                attempt_log.append(
+                    _attempt_entry(exc, exc.session_id, request.model_ref)
+                )
+                self._raise_final(exc, attempt_log, started, request)
             try:
                 info, parts, status = self._post_message(
                     session_id, request, provider_id=provider_id, model_id=model_id
