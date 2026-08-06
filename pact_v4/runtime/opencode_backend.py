@@ -458,6 +458,13 @@ class OpenCodeServerBackend:
         self._descriptor: Optional[BackendDescriptor] = None
 
         self._records: list[BackendCallRecord] = []
+        # D1: optional per-call usage sink (a UsageRecordWriter.write_call).
+        # Invoked at the exact moment a call completes (success or final
+        # failure) so usage.ndjson is written per completed call — a crash
+        # inside a phase never loses already-completed calls. Each call is
+        # appended to ``_records`` exactly once, so a resumed run (fresh
+        # backend) can never duplicate an already-journaled call.
+        self._usage_sink: Optional[Any] = None
         # Sessions created by THIS backend: {session_id: outcome}
         # outcome in {"success", "failed"}. Used for close() cleanup and to
         # prove we never touch foreign sessions.
@@ -947,7 +954,19 @@ class OpenCodeServerBackend:
         attempt_log: list[dict] = []
 
         while True:
-            session_id = self._create_session(request.label)
+            try:
+                session_id = self._create_session(request.label)
+            except OpenCodeError as exc:
+                # Session creation (POST /session) or request-budget
+                # admission failed after a successful preflight. This is a
+                # failed remote completion call and must be journaled exactly
+                # once (D1 acceptance §1). No session/request id exists yet,
+                # so the record carries only the real error_class, the label
+                # and the attempt entry — never fabricated ids or usage.
+                attempt_log.append(
+                    _attempt_entry(exc, exc.session_id, request.model_ref)
+                )
+                self._raise_final(exc, attempt_log, started, request)
             try:
                 info, parts, status = self._post_message(
                     session_id, request, provider_id=provider_id, model_id=model_id
@@ -1077,6 +1096,10 @@ class OpenCodeServerBackend:
                     raw_metadata=response.raw_metadata,
                 )
             )
+            # D1: per-call usage write at completion (crash-safe: the call
+            # is in usage.ndjson the moment it finishes, not at a phase
+            # boundary). Local lifecycle calls never reach this backend.
+            self._emit_usage(self._records[-1])
             return response
 
     def _raise_final(
@@ -1138,6 +1161,9 @@ class OpenCodeServerBackend:
                 },
             )
         )
+        # D1: failed calls are written to usage.ndjson too (per completed
+        # call, crash-safe — same moment the failure is finalized).
+        self._emit_usage(self._records[-1])
 
     def _backoff(self, exc: OpenCodeError) -> None:
         delay = exc.retry_after
@@ -1167,6 +1193,28 @@ class OpenCodeServerBackend:
             LOG.warning(
                 "OpenCodeServerBackend: error closing HTTP session: %s", exc
             )
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """Attach a per-call usage sink (``UsageRecordWriter.write_call``).
+
+        Called at the exact moment each call completes (success or final
+        failure), so ``usage.ndjson`` is written per completed call — a
+        crash inside a phase never loses already-completed calls. Each call
+        is recorded exactly once, so a resumed run (a fresh backend) can
+        never duplicate an already-journaled call.
+        """
+        self._usage_sink = sink
+
+    def _emit_usage(self, record: BackendCallRecord) -> None:
+        if self._usage_sink is not None:
+            try:
+                self._usage_sink(record)
+            except Exception:  # noqa: BLE001 -- usage is diagnostics, never a gate
+                LOG.warning(
+                    "OpenCodeServerBackend: usage sink failed; disabling",
+                    exc_info=True,
+                )
+                self._usage_sink = None
 
     def call_records(self) -> Sequence[BackendCallRecord]:
         return list(self._records)
