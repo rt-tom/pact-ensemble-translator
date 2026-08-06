@@ -603,31 +603,39 @@ def _apply_model_mappings(
 def apply_span_mappings(
     text: str, records: Sequence[SpanMappingRecord]
 ) -> str:
-    """Wrap the located fragments in their source tags, HTML-escaping all text.
+    """Wrap the located fragments in their source tags, wrap-only (B14).
 
     ``records`` must be the resolved mappings for one PID; ranges are applied
-    left-to-right with every non-fragment slice HTML-escaped and every
-    fragment wrapped in ``<tag attrs...>fragment</tag>``. A record whose
+    left-to-right with every non-fragment slice passed through verbatim and
+    every fragment wrapped in ``<tag attrs...>fragment</tag>``. A record whose
     range overlaps an already-applied one is skipped defensively (the
-    alignment tiers already guarantee non-overlap). The result is inner HTML
-    — the final chapter text that Step 8 and the terminal transition see.
+    alignment tiers already guarantee non-overlap).
+
+    B14 (owner decision 2026-08-05): the wrap is **wrap-only without
+    entities** — the translated text is no longer HTML-escaped while real
+    tags are added around the fragment. Escaping the text was what produced
+    run_005's double-escaping (``&lt;em&gt;<em>…</em>&lt;/em&gt;``: the
+    model's own raw ``<em>`` got escaped into an entity while the wrap added
+    a real tag). The final chapter text is normalized to clean tags when it
+    is written to ``translations.json`` (``normalize_inline_markup``); the
+    visible text is otherwise unchanged.
     """
     parts: List[str] = []
     cursor = 0
     for record in sorted(records, key=lambda r: r.start):
         if record.start < cursor:
             continue
-        parts.append(html.escape(text[cursor:record.start]))
+        parts.append(text[cursor:record.start])
         attrs = "".join(
             f' {html.escape(str(key), quote=True)}="'
             f'{html.escape(str(value), quote=True)}"'
             for key, value in sorted(record.attrs.items())
         )
         parts.append(f"<{record.tag}{attrs}>")
-        parts.append(html.escape(text[record.start:record.end]))
+        parts.append(text[record.start:record.end])
         parts.append(f"</{record.tag}>")
         cursor = record.end
-    parts.append(html.escape(text[cursor:]))
+    parts.append(text[cursor:])
     return "".join(parts)
 
 
@@ -661,9 +669,10 @@ def run_formatting_align(
     ``blocks`` are the parsed source blocks (``pact_v4.phase0b.source_html``)
     carrying the inline spans; ``translation`` is the repaired chapter PID
     map produced by Phase 4 convergence. The output ``formatted_text`` covers
-    every PID of ``translation`` (inner HTML with the restored inline
-    markup); it is the text the Step 8 final integrity check and the
-    terminal transition must see.
+    every PID of ``translation`` (the visible text passed through verbatim
+    with the restored inline tags — B14: wrap-only without entities); it is
+    the text the Step 8 final integrity check and the terminal transition
+    must see.
 
     Tier cascade per PID with a span contract:
 
@@ -698,8 +707,11 @@ def run_formatting_align(
         if block.inline_spans
     }
     source_by_pid: Dict[str, str] = {block.pid: block.text for block in blocks}
+    # B14: wrap-only without entities — the translated text is passed through
+    # verbatim (no html.escape); only the restored inline tags are added.
+    # See ``apply_span_mappings`` for the run_005 double-escaping rationale.
     formatted: Dict[str, str] = {
-        pid: html.escape(text) for pid, text in translation.items()
+        pid: text for pid, text in translation.items()
     }
     span_mapping: List[SpanMappingRecord] = []
     incidents: List[FormattingIncident] = []
