@@ -282,18 +282,10 @@ def test_translations_json_normalizes_html_entities_from_repair(tmp_path: Path):
     # run_005 defect: the final translation can carry double-escaped markup
     # (&lt;em&gt;). B13 keeps the original's italics by unescaping entities
     # to clean tags when merging into translations.json; the visible text is
-    # otherwise unchanged (full normalization is card B14).
-    #
-    # The entity text itself is Latin-script ("lt"/"em"/"gt"), so without
-    # B14's mixed_script tag exemption the deterministic re-gate would
-    # reject the repaired text before it ever reaches final_translation.
-    # The config allowlist here is the test-fixture stand-in for that future
-    # exemption: it lets the entity-carrying repair commit, exercising
-    # exactly the B13 merge/normalization boundary (B14 = production tag
-    # exemption, out of B13 scope).
-    cfg = _make_chapter_cfg(
-        tmp_path, n_paragraphs=24, mixed_script_allow=("em", "lt", "gt"),
-    )
+    # otherwise unchanged. B14 completes the fix: the mixed_script detector
+    # ignores the tag tokens itself, so no config allowlist is needed for
+    # the entity-carrying repair text to commit.
+    cfg = _make_chapter_cfg(tmp_path, n_paragraphs=24)
     result, _router, _caller, _audit, repair_caller = _run_combined(
         cfg, repair_text_entities=True,
     )
@@ -339,7 +331,10 @@ def test_load_repair_report_final_translation_reads_on_disk_report(tmp_path: Pat
 def test_normalize_final_markup_only_unescapes_entities(tmp_path: Path):
     assert _normalize_final_markup("&lt;em&gt;курсив&lt;/em&gt;") == "<em>курсив</em>"
     assert _normalize_final_markup("обычный текст") == "обычный текст"
-    assert _normalize_final_markup("&amp; &quot; &#39;") == "& \" '"
+    # B14 contract: only INLINE-TAG entities are converted to tags; other
+    # entities and the visible text are left byte-identical ("текст не
+    # меняется" — a literal &amp; stays &amp;).
+    assert _normalize_final_markup("&amp; &quot; &#39;") == "&amp; &quot; &#39;"
 
 
 # ---------------------------------------------------------------------------

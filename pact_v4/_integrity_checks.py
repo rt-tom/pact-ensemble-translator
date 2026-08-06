@@ -15,6 +15,7 @@ concerns, no disk I/O.
 """
 from __future__ import annotations
 
+import html
 import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Tuple
@@ -27,6 +28,7 @@ __all__ = [
     "target_form_present",
     "combine_glossary_terms",
     "strip_inline_markup",
+    "normalize_inline_markup",
     "RU_DIGIT_EQUIVALENTS",
     "extract_script_tokens",
     "combine_script_tokens",
@@ -48,8 +50,15 @@ _SOURCE_BOUNDARY = r"A-Za-z0-9_"
 # ``b``/``a``). Phase 5 formatting restores exactly these around translated
 # fragments, so the Step 8 content checks must look at the visible text, not
 # at the injected markup — ``strip_inline_markup`` removes them (with their
-# attributes) for every shared check.
-_INLINE_TAG_RE = re.compile(r"</?(?:em|strong|i|b|a)(?:\s[^>]*)?>", re.I)
+# attributes) for every shared check. B14: the entity-encoded forms
+# (``&lt;em&gt;`` … — the double-escaped output Phase 5's model fallback can
+# produce) are stripped too, so legitimate markup never leaks "em"/"i"
+# tokens into the mixed-script detector.
+_INLINE_TAG_RE = re.compile(
+    r"</?(?:em|strong|i|b|a)(?:\s[^>]*)?>|"
+    r"&lt;/?\s*(?:em|strong|i|b|a)(?:\s[^>]*?)?&gt;",
+    re.I,
+)
 
 
 def _norm(value) -> str:
@@ -57,8 +66,76 @@ def _norm(value) -> str:
 
 
 def strip_inline_markup(text: str) -> str:
-    """Remove inline formatting tags (and their attributes) from a text."""
+    """Remove inline formatting tags (and their attributes) from a text.
+
+    Handles both the normalized form (``<em>…</em>``) and, before markup
+    normalization, the entity-encoded form (``&lt;em&gt;…&lt;/em&gt;``) —
+    see ``normalize_inline_markup``. B14: legitimate inline markup must not
+    influence text comparison or the mixed-script detector.
+    """
     return _INLINE_TAG_RE.sub("", text)
+
+
+def normalize_inline_markup(text: str) -> str:
+    """Normalize inline markup to clean tags (B14, owner decision 2026-08-05).
+
+    Phase 5 formatting restores the original's emphasis with ``<em>…</em>``
+    tags, but the model-fallback tier can double-escape them
+    (``&lt;em&gt;…&lt;/em&gt;``) or wrap an already-tagged fragment again
+    (``&lt;em&gt;<em>…</em>&lt;/em&gt;``). The final translation keeps the
+    italics, so when it is written to ``translations.json`` the markup is
+    normalized:
+
+    * entity-encoded inline tags (``&lt;em&gt;``, ``&lt;/em&gt;``,
+      ``&lt;i&gt;``, ``&lt;strong&gt;`` …) become clean tags (``<em>``,
+      ``</em>`` …);
+    * double wraps of the same tag collapse into one
+      (``&lt;em&gt;<em>…</em>&lt;/em&gt;`` → ``<em>…</em>``);
+    * the visible text is otherwise unchanged.
+
+    Deterministic, stateless, model-free: the same input always yields the
+    same output. Not idempotent-required beyond one pass, but safe to call
+    repeatedly.
+    """
+    if not text:
+        return text
+    # Entity-encoded inline tags -> clean tags. Only the inline tag set is
+    # unescaped; other entities (e.g. a literal ``&amp;``) are untouched so
+    # the visible text is not altered.
+    for _ in range(8):  # bounded: triple/quadruple escapes collapse fully
+        unescaped = _INLINE_TAG_ENTITY_RE.sub(
+            lambda m: "<" + html.unescape(m.group(1)) + ">", text,
+        )
+        if unescaped == text:
+            break
+        text = unescaped
+    # Double wraps of the same tag (from entity + real tag pairs) collapse.
+    for _ in range(8):
+        collapsed = _DOUBLE_WRAP_RE.sub(r"<\1\2>\3</\1>", text)
+        if collapsed == text:
+            break
+        text = collapsed
+    return text
+
+
+# Entity-encoded inline tag: ``&lt;em&gt;``, ``&lt;/em&gt;``, ``&lt;i&gt;`` …
+# (the ``html.escape`` output of an inline tag). ``(1)`` is the inner text:
+# an optional ``/``, the tag name and optional attributes. ``[^>]*?`` is
+# lazy and never crosses the terminating ``&gt;`` (which contains no literal
+# ``>``), so attribute values that themselves carry entities (``&quot;``,
+# ``&amp;``) are consumed as part of the tag.
+_INLINE_TAG_ENTITY_RE = re.compile(
+    r"&lt;(/?\s*(?:em|strong|i|b|a)(?:\s[^>]*?)?)&gt;",
+    re.I,
+)
+
+# A tag immediately wrapped in the same tag: ``<em><em>…</em></em>`` (or
+# ``<em class=…><em>…</em></em>``). ``(1)`` is the tag, ``(2)`` the outer
+# attributes, ``(3)`` the inner content.
+_DOUBLE_WRAP_RE = re.compile(
+    r"<(em|strong|i|b|a)((?:\s[^>]*)?)><\1(?:\s[^>]*)?>(.*?)</\1></\1>",
+    re.I | re.S,
+)
 
 
 def extract_digits(text: str) -> List[str]:
@@ -128,7 +205,12 @@ def source_term_present(text: str, source: str) -> bool:
 
 def find_mixed_script(text: str, allow: Iterable[str] = ()) -> List[str]:
     allowed = {_norm(str(item)).casefold() for item in allow if _norm(str(item))}
-    cleaned = _URL_OR_EMAIL_RE.sub(" ", text or "")
+    # B14 (architect): do NOT hand-parse tokens inside tags — strip the
+    # inline markup (both normalized <em> and entity-encoded &lt;em&gt;
+    # forms) before tokenizing, so legitimate markup never produces
+    # mixed-script flags. Latin outside tags is checked exactly as before.
+    cleaned = strip_inline_markup(text or "")
+    cleaned = _URL_OR_EMAIL_RE.sub(" ", cleaned)
     result: List[str] = []
     seen: set = set()
     for token in _SCRIPT_TOKEN_RE.findall(cleaned):

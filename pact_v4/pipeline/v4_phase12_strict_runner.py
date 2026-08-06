@@ -60,7 +60,6 @@ What is genuinely new here (not present in either existing driver):
 """
 from __future__ import annotations
 
-import html
 import json
 import logging
 import time
@@ -158,6 +157,7 @@ from pact_v4._integrity_checks import (
     combine_script_tokens,
     extract_script_tokens,
     glossary_script_tokens,
+    normalize_inline_markup,
     source_derived_allowlist,
 )
 from pact_v4.runtime.bible_renderer import render_bible_section, extract_narrator_gender
@@ -1053,17 +1053,20 @@ def _load_repair_report_final_translation(
 
 
 def _normalize_final_markup(text: str) -> str:
-    """Normalize HTML entities back to real inline tags in a PID's text.
+    """Normalize the final chapter text's inline markup to clean tags.
 
     B13 (owner decision 2026-08-05): Phase 5 formatting restores the
     original's italic with ``<em>…</em>`` tags, but the model-fallback tier
     can double-escape them (``&lt;em&gt;…&lt;/em&gt;``). The final
     translation keeps the italics, so when it is merged into
-    ``translations.json`` the entities are unescaped to clean tags; the
-    visible text is not otherwise changed. Full markup normalization and the
-    mixed_script tag exemption are tracked separately (card B14).
+    ``translations.json`` the markup is normalized to clean tags; the
+    visible text is otherwise unchanged.
+
+    B14: this delegates to the single shared deterministic helper
+    ``normalize_inline_markup`` (``pact_v4._integrity_checks``) — entities
+    of inline tags become clean tags and double wraps collapse into one.
     """
-    return html.unescape(text)
+    return normalize_inline_markup(text)
 
 
 def _formatting_report_path(out_dir: Path) -> Path:

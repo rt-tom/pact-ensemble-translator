@@ -231,7 +231,8 @@ def test_model_fallback_transport_failure_is_debt_not_verdict():
     assert incident.tier == TIER_MODEL
     # Blocking incident (default limit 0) but structurally valid PID map:
     # the terminal policy downgrades to accepted_degraded, never `failed`
-    # from transport alone. The formatted text is still the escaped input.
+    # from transport alone. The formatted text is still the verbatim input
+    # (B14: wrap-only, no entity escaping).
     assert out.blocking
     assert dict(out.formatted_text)["p00001"] == "Привет мир."
 
@@ -559,7 +560,7 @@ def test_batch_call_matches_per_pid_path_on_identical_mappings():
 def test_batch_call_transport_failure_is_debt_for_all_spans():
     # A batched transport failure marks every span of the batch as
     # transport_error debt (never a semantic verdict), and the formatted text
-    # stays the escaped input.
+    # stays the verbatim input (B14: wrap-only, no entity escaping).
     blocks = _blocks(
         "<html><body>"
         "<p>Hello <em>world</em> one.</p>"
@@ -624,3 +625,42 @@ def test_model_call_count_in_payload():
     payload = out.to_payload()
     assert payload["model_fallback_count"] == 2
     assert payload["model_call_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# B14: wrap-only without entities (run_005 double-escaping)
+# ---------------------------------------------------------------------------
+
+
+def test_formatting_output_has_no_entity_escaping():
+    # run_005 defect: apply_span_mappings html.escaped the text (turning the
+    # model's own raw <em> into &lt;em&gt;) while adding a real <em> wrap —
+    # producing "&lt;em&gt;<em>…</em>&lt;/em&gt;". B14: the wrap is
+    # wrap-only without entities — the visible text passes through verbatim
+    # and the pre-existing tags survive as real tags.
+    out = _align(
+        "<html><body><p>Hello <em>мир</em>.</p></body></html>",
+        {"p00001": "<em>Привет, мир</em>."},
+    )
+    formatted = dict(out.formatted_text)["p00001"]
+    # No entity-encoded markup anywhere in the output.
+    assert "&lt;" not in formatted
+    assert "&gt;" not in formatted
+    # The wrap is applied around the located fragment; the pre-existing
+    # tags stay real tags (normalization collapses the double wrap at the
+    # final write — see normalize_inline_markup), never entity-escaped.
+    assert formatted.count("<em>") == formatted.count("</em>")
+    assert "мир" in formatted
+
+
+def test_formatting_output_with_literal_ampersand_passthrough():
+    # A literal ampersand in the translation is not entity-escaped by the
+    # wrap (text is passed through verbatim; the final normalization keeps
+    # non-tag entities untouched).
+    out = _align(
+        "<html><body><p>Hello <em>мир</em>.</p></body></html>",
+        {"p00001": "R&D мир."},
+    )
+    formatted = dict(out.formatted_text)["p00001"]
+    assert "R&D" in formatted
+    assert "&amp;" not in formatted
