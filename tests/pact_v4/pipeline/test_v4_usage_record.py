@@ -450,6 +450,90 @@ def test_resume_appends_without_duplicates(tmp_path: Path):
     assert len(request_ids) == len(set(request_ids))
 
 
+def test_resume_after_crash_keeps_first_post_resume_record(tmp_path: Path):
+    """D1 review HIGH-1 regression: a crash leaves an unterminated partial
+    trailing line; a fresh resume writer must NOT glue its first append onto
+    that line. Both the pre-crash valid row and the first post-resume row
+    must be readable.
+    """
+    first = UsageRecordWriter(tmp_path)
+    first.write_call(_success_record("generator"))
+    first.close()
+    path = tmp_path / USAGE_FILENAME
+    # Simulate a crash mid-write: partial trailing line, no newline.
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"schema": "pact-v4-usage/ndjson/v1", "label": "genera')
+
+    # Fresh writer = resume. Before its first append the writer must isolate
+    # the partial tail (trailing newline), so the resumed row is a clean
+    # line of its own.
+    resumed = UsageRecordWriter(tmp_path)
+    resumed.write_call(_success_record("repair"))
+    resumed.close()
+
+    rows = v4_usage._read_ndjson(path)
+    labels = [row["label"] for row in rows]
+    assert labels == ["generator", "repair"], labels
+
+
+def test_resume_durable_dedup_skips_journaled_identity(tmp_path: Path):
+    """D1 review HIGH-2 regression: re-pushing a call whose session/request
+    identity is already journaled (previous writer instance = resume) must
+    NOT add a duplicate row.
+    """
+    first = UsageRecordWriter(tmp_path)
+    first.write_call(_success_record("generator"))
+    first.close()
+    assert len(_load_rows(tmp_path / USAGE_FILENAME)) == 1
+
+    # Fresh writer instance re-pushes the SAME call identity.
+    resumed = UsageRecordWriter(tmp_path)
+    resumed.write_call(_success_record("generator"))
+    resumed.write_call(_success_record("generator"))  # repeated push too
+    resumed.close()
+
+    rows = _load_rows(tmp_path / USAGE_FILENAME)
+    assert len(rows) == 1
+    assert rows[0]["label"] == "generator"
+    assert rows[0]["session_id"] == "ses_generator"
+    assert rows[0]["request_id"] == "req_generator"
+
+
+def test_durable_dedup_keeps_distinct_calls_without_identity(tmp_path: Path):
+    """D1 review HIGH-2 boundary: calls WITHOUT an identity (either id
+    missing — e.g. local backend) are always written, never deduped, so
+    distinct calls stay distinct.
+    """
+    from pact_v4.runtime.backend_protocol import BackendCallRecord
+
+    def _no_id(label: str) -> BackendCallRecord:
+        return BackendCallRecord(
+            label=label,
+            model_ref="local/llama",
+            request_id=None,
+            session_id=None,
+            retry_count=0,
+            finish_reason="end_turn",
+            usage={"input_tokens": 1, "output_tokens": 1},
+            wall_seconds=0.1,
+            raw_metadata={},
+        )
+
+    writer = UsageRecordWriter(tmp_path)
+    writer.write_call(_no_id("generator"))
+    writer.write_call(_no_id("repair"))  # different label, still no identity
+    writer.close()
+    rows = _load_rows(tmp_path / USAGE_FILENAME)
+    assert len(rows) == 2
+
+    # A fresh writer (resume) re-pushing the same identity-less call must
+    # also keep it (no identity to dedup on).
+    resumed = UsageRecordWriter(tmp_path)
+    resumed.write_call(_no_id("generator"))
+    resumed.close()
+    assert len(_load_rows(tmp_path / USAGE_FILENAME)) == 3
+
+
 # ---------------------------------------------------------------------------
 # Read-only aggregator
 # ---------------------------------------------------------------------------
