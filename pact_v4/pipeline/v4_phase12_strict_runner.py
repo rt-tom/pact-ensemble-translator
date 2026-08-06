@@ -60,6 +60,7 @@ What is genuinely new here (not present in either existing driver):
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import time
@@ -1023,6 +1024,48 @@ def _repair_report_path(out_dir: Path) -> Path:
     return out_dir / "repair_report.json"
 
 
+def _load_repair_report_final_translation(
+    out_dir: Path,
+) -> Optional[Dict[str, str]]:
+    """Return the authoritative final translation from ``repair_report.json``.
+
+    B13 (owner decision 2026-08-05): the single source of the chapter's
+    final translation is ``repair_report.final_translation`` — the PID map
+    after Step 7 repair, Phase 5 formatting and the B6 quarantined-retry
+    cycle. The on-disk report is authoritative over the in-memory
+    ``RepairPhaseResult`` because ``_run_quarantined_retry_cycle`` re-writes
+    it with the merged map (retry winners replace the best-variant text), but
+    the frozen dataclass is never updated. Returns ``None`` when the report
+    is missing or carries no ``final_translation`` (the caller falls back to
+    the historical selected-candidates map).
+    """
+    path = _repair_report_path(out_dir)
+    if not path.exists():
+        return None
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    final = report.get("final_translation")
+    if not final:
+        return None
+    return {pid: text for pid, text in final}
+
+
+def _normalize_final_markup(text: str) -> str:
+    """Normalize HTML entities back to real inline tags in a PID's text.
+
+    B13 (owner decision 2026-08-05): Phase 5 formatting restores the
+    original's italic with ``<em>…</em>`` tags, but the model-fallback tier
+    can double-escape them (``&lt;em&gt;…&lt;/em&gt;``). The final
+    translation keeps the italics, so when it is merged into
+    ``translations.json`` the entities are unescaped to clean tags; the
+    visible text is not otherwise changed. Full markup normalization and the
+    mixed_script tag exemption are tracked separately (card B14).
+    """
+    return html.unescape(text)
+
+
 def _formatting_report_path(out_dir: Path) -> Path:
     return out_dir / "formatting_report.json"
 
@@ -1919,15 +1962,34 @@ def run_chapter_strict(
 
     # A resumed run's committed translations live in the *previous* run's
     # translations.json (this run overwrites that path only at the very
-    # end). Load it before the loop so selected_text_by_chunk can be
-    # reconstructed from chunk_plan.pids -> text, not re-derived from the
-    # journal (which deliberately does not store translation text).
+    # end). Load it before the loop so final_text_by_pid is seeded and
+    # selected_text_by_chunk can be reconstructed from chunk_plan.pids ->
+    # text, not re-derived from the journal (which deliberately does not
+    # store translation text).
+    #
+    # B13: translations.json is now the chapter's FINAL translation
+    # (repair + formatting + retry merged, owner decision 2026-08-05), so it
+    # can no longer serve as the source for the ORIGINAL selected-candidate
+    # text that Step 6/7 audit. The committed candidates' text lives in
+    # generation_outcomes.json (identity-validated below); fall back to
+    # prior_translations only for chunks without a persisted generation
+    # record (e.g. a crash before generation_outcomes.json was written,
+    # where the incremental translations.json still holds the un-repaired
+    # candidates).
     prior_translations: Dict[str, str] = {}
     if prior_entries and translations_path_exists(cfg.out_dir):
         prior_translations = json.loads(
             (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
         )
     final_text_by_pid.update(prior_translations)
+
+    prior_generation_by_chunk: Dict[str, Dict[str, Any]] = {}
+    if prior_entries:
+        for _rec in _merge_generation_outcomes(
+            cfg.out_dir, [], snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config,
+        ):
+            prior_generation_by_chunk[_rec["chunk_id"]] = _rec
 
     for entry in prior_entries:
         outcome = entry["outcome"]
@@ -1947,10 +2009,29 @@ def run_chapter_strict(
                 selected_role_counts.get(entry["selected_role"], 0) + 1
             )
             plan_chunk = chunk_plan.chunk(entry["chunk_id"])
-            selected_text_by_chunk[entry["chunk_id"]] = {
-                pid: prior_translations[pid] for pid in plan_chunk.pids
-                if pid in prior_translations
-            }
+            # B13: prefer the original selected candidate's committed text
+            # from the persisted generation record — the exact text Step 6
+            # audited in the previous session — so the assembled chapter and
+            # the audit/repair cache keys are stable across resume. The
+            # final translations.json (post-repair) must NOT feed the audit.
+            chunk_text: Optional[Dict[str, str]] = None
+            _gen = prior_generation_by_chunk.get(entry["chunk_id"])
+            _selected_id = entry.get("selected_candidate_id")
+            if _gen is not None and _selected_id:
+                for _variant in _gen.get("candidates", {}).values():
+                    if _variant.get("candidate_id") == _selected_id:
+                        _translation = _variant.get("translation") or {}
+                        chunk_text = {
+                            pid: _translation[pid] for pid in plan_chunk.pids
+                            if pid in _translation
+                        }
+                        break
+            if chunk_text is None:
+                chunk_text = {
+                    pid: prior_translations[pid] for pid in plan_chunk.pids
+                    if pid in prior_translations
+                }
+            selected_text_by_chunk[entry["chunk_id"]] = chunk_text
         elif outcome == "quarantined":
             quarantined_count += 1
         elif outcome == "needs_synthesis":
@@ -2308,6 +2389,9 @@ def run_chapter_strict(
     events_before_step7 = runtime.event_count()
     step7: Dict[str, Any]
     step8: Dict[str, Any]
+    # B13: the repair phase result (or None when repair never ran / failed /
+    # was skipped) decides the final translations.json write below.
+    repair_phase_result: Optional[RepairPhaseResult] = None
     if repair_adapters is not None and phase4_inputs is not None:
         # Phase 5 formatting (B3): build the formatting step over the source
         # blocks + the injected formatting caller (a Backend adapter over the
@@ -2490,9 +2574,29 @@ def run_chapter_strict(
         "outcomes": merged_generation_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Final write is redundant with the incremental one after each
-    # selected chunk (below) but kept for a clean end-state file.
-    _atomic_write_json(translations_path, final_text_by_pid)
+    # B13 (owner decision 2026-08-05): the single source of the chapter's
+    # final translation is repair_report.final_translation — committed
+    # repairs, formatting and healed quarantined-retry chunks would otherwise
+    # be lost to book_run / B9, which read translations.json. When the
+    # repair phase produced a result, translations.json is a full rewrite of
+    # the authoritative on-disk final_translation (the retry cycle merges
+    # retry winners into the report, which the in-memory frozen
+    # RepairPhaseResult never reflects); the format stays {pid: text} and
+    # HTML entities (&lt;em&gt; …) are normalized to clean tags so the
+    # original's italics survive. Otherwise the historical fallback —
+    # final_text_by_pid (the original selected candidates) — is written.
+    # The incremental per-chunk writes above are untouched (resume safety).
+    if repair_phase_result is not None and repair_phase_result.final_translation:
+        final_translation = _load_repair_report_final_translation(cfg.out_dir)
+        if final_translation is None:
+            final_translation = dict(repair_phase_result.final_translation)
+        final_translation = {
+            pid: _normalize_final_markup(text)
+            for pid, text in final_translation.items()
+        }
+    else:
+        final_translation = final_text_by_pid
+    _atomic_write_json(translations_path, final_translation)
     selection_path = cfg.out_dir / "selection_results.json"
     selection_path.write_text(json.dumps({
         "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,

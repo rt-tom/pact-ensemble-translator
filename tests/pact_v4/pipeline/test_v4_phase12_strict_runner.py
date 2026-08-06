@@ -900,26 +900,31 @@ def test_step6_audit_rejects_foreign_audit_cache_on_resume(tmp_path: Path):
 
 def test_step6_audit_skipped_on_incomplete_translation(tmp_path: Path):
     # A chunk is selected in the journal but its committed text no longer
-    # covers the plan's PIDs (e.g. prior translations.json was tampered or a
-    # resume reconstruction came up short). The audit must refuse to assemble
-    # a partial chunk with a distinct skip reason, not misread it as a clean
-    # chapter or crash with a generic ownership error.
+    # covers the plan's PIDs (e.g. a resume reconstruction came up short).
+    # The audit must refuse to assemble a partial chunk with a distinct skip
+    # reason, not misread it as a clean chapter or crash with a generic
+    # ownership error.
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
     first_result, _router = _run(cfg)
     assert first_result.step6["status"] == "complete"
 
-    # Drop one PID owned by chunk0001 from the committed translations.
+    # B13: translations.json is now the chapter's FINAL translation
+    # (repair/formatting/retry merged, owner decision 2026-08-05) and is no
+    # longer the audit's input — resume reconstructs a selected chunk's
+    # committed text from the persisted generation record. Drop one PID
+    # owned by chunk0001 from the generation record's selected candidate to
+    # simulate the committed text coming up short.
     plan_payload = json.loads(
         (cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8")
     )
     chunk0001 = next(c for c in plan_payload["chunks"] if c["chunk_id"] == "chunk0001")
     missing_pid = chunk0001["pids"][0]
-    translations_path = cfg.out_dir / "translations.json"
-    translations = json.loads(translations_path.read_text(encoding="utf-8"))
-    del translations[missing_pid]
-    translations_path.write_text(
-        json.dumps(translations, ensure_ascii=False), encoding="utf-8"
-    )
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    gen_payload = json.loads(gen_path.read_text(encoding="utf-8"))
+    chunk1_rec = next(r for r in gen_payload["outcomes"] if r["chunk_id"] == "chunk0001")
+    for variant in chunk1_rec["candidates"].values():
+        variant["translation"].pop(missing_pid, None)
+    gen_path.write_text(json.dumps(gen_payload, ensure_ascii=False), encoding="utf-8")
 
     resumed_cfg = StrictRunConfig(
         chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
