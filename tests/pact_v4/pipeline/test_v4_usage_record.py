@@ -534,6 +534,31 @@ def test_aggregator_crash_safe_read(tmp_path: Path):
     assert "input_tokens: 1" in report
 
 
+def test_aggregator_crash_safe_read_truncated_multibyte_utf8_tail(tmp_path: Path):
+    """A partial trailing line that is an incomplete UTF-8 multibyte
+    sequence (crash mid-write of a non-ASCII record) must not crash the
+    reader: prior complete lines are still reported."""
+    out = tmp_path / "run"
+    path = out / USAGE_FILENAME
+    _write_ndjson(path, [
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "generator",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 1, "output_tokens": 1, "wall_seconds": 1.0,
+         "request_id": "r1", "session_id": "s1", "retry_count": 0},
+    ])
+    # Incomplete multibyte UTF-8: 'Р' (U+0420) is 0xD0 0xA0; write only the
+    # leading byte 0xC3 would be an invalid start — use 0xD0 alone (an
+    # incomplete 2-byte sequence) to model a crash mid non-ASCII write.
+    with open(path, "ab") as handle:
+        handle.write(b'{"schema": "pact-v4-usage/ndjson/v1", "label": "\xd0')
+    rows = v4_usage._read_ndjson(path)
+    assert len(rows) == 1
+    assert rows[0]["label"] == "generator"
+    report = v4_usage.render_usage_report(out)
+    assert "1 call(s)" in report
+    assert "input_tokens: 1" in report
+
+
 def test_aggregator_falls_back_to_record_aggregate_without_usage_ndjson(tmp_path: Path):
     out = tmp_path / "run"
     out.mkdir(parents=True, exist_ok=True)

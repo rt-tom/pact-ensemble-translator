@@ -54,10 +54,21 @@ COST_KEY = "reported_cost"
 def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
     rows: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
+    for raw_line in raw.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            # Crash-safe: a crash mid-write can leave a partial trailing
+            # line that is also an incomplete multibyte UTF-8 sequence
+            # (the writer uses ensure_ascii=False). Skip only the malformed
+            # fragment; valid completed records are never altered.
             continue
         try:
             rows.append(json.loads(line))
