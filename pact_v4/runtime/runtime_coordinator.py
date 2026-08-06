@@ -369,6 +369,20 @@ class RemoteRuntimeCoordinator:
     def backend(self) -> CompletionBackend:
         return self._backend
 
+    def set_usage_writer(self, writer: Any) -> None:
+        """Attach a usage writer to the backend's per-call completion sink.
+
+        The ``OpenCodeServerBackend`` writes each completed remote call
+        (success and failure) into ``usage.ndjson`` at the exact moment the
+        call finishes — not at phase boundaries — so a crash inside a phase
+        still leaves the already-completed calls in the artifact. Each
+        backend materializes each call exactly once, so a resumed run (a
+        fresh backend) appends only new calls, never duplicates.
+        """
+        sink = getattr(self._backend, "set_usage_sink", None)
+        if sink is not None:
+            sink(writer.write_call)
+
     def add_cleanup(self, fn: Any) -> None:
         """Register a teardown callback run by ``close()`` (idempotent hooks)."""
         self._cleanup.append(fn)
@@ -473,6 +487,16 @@ class CompositeRuntimeCoordinator:
                 "was attached"
             )
         return self._backend
+
+    def set_usage_writer(self, writer: Any) -> None:
+        """Forward the usage writer to the remote sub-coordinator.
+
+        Local switch events are never written (the writer only accepts
+        remote-call events), so a composite run's local calls stay in
+        ``local_lifecycle`` exactly like a local-only run.
+        """
+        if self._remote is not None:
+            self._remote.set_usage_writer(writer)
 
     @property
     def backend_descriptor(self) -> BackendDescriptor:
