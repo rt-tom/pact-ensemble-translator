@@ -136,7 +136,9 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   только после `complete` родителя — пока I жива, RV не стартует сама.
   После перевода I в `blocked` (review-required) архитектор вручную выполняет
   `hermes kanban promote --force <RV>` — ревью стартует; после фикса (I снова
-  blocked) — снова `promote --force <RV>`.
+  blocked) — снова `promote --force <RV>`. **RV создаётся БЕЗ --parent**:
+  claim-гейт отклоняет заклейм RV, пока I не complete (`claim_rejected
+  parents_not_done`, урок B14) — порядок управляется только promote/blocked.
 - **Draft PR обязателен + общение через PR-комментарии (правило владельца
   2026-08-05)**: developer после коммита ОБЯЗАН создать Draft PR
   (`gh pr create --draft`) для любой код-задачи (замечание B13: PR не
