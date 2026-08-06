@@ -430,6 +430,7 @@ def _generate_and_align_chapter(
         return align_candidates(
             candidates, source_by_pid, translations,
             consensus_ratio=consensus_ratio,
+            glossary=glossary,
         )
     except Exception as exc:  # defensive: the candidate loop must not break a run
         LOG.warning("B9-I2: candidate generation skipped for %s: %s",
