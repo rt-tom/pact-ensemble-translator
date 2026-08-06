@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 
 from pact_v4.phase1.models import GateResult
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
@@ -135,16 +135,47 @@ def _parse_qwen_verdict(raw: str) -> GateResult:
 
     reason = str(data.get("reason", "")).strip() or "(no reason)"
     if "passed" in data:
-        passed = bool(data["passed"])
+        # The verdict contract is native JSON booleans. Python truthiness
+        # must never decide a verdict: an explicit ``"passed": "false"``
+        # (string), ``0``/``1`` (number), ``null`` or a container is
+        # schema-invalid and fails the gate closed — never coerced to a
+        # passing verdict (B12-RV3 HIGH finding).
+        passed_value = data["passed"]
+        if type(passed_value) is not bool:
+            return GateResult(
+                gate="qwen_fidelity",
+                passed=False,
+                detail=(
+                    f"qwen_fidelity: invalid 'passed' verdict field "
+                    f"{passed_value!r} (must be a JSON boolean); "
+                    f"body={raw[:200]!r}"
+                ),
+            )
+        passed = passed_value
     else:
         # The protocol says passed is "implied or explicit". When the
         # reviewer omits it, the implied verdict is "no introduced errors
         # AND faithful AND complete" — that is the only sensible default
-        # that does not silently flip the cascade on a missing key.
+        # that does not silently flip the cascade on a missing key. The
+        # implied fields are part of the schema, so any *present* value
+        # must be a native JSON boolean as well: a string/number/null/
+        # container is schema-invalid and fails the gate closed instead
+        # of being accepted by Python truthiness.
+        for key in ("faithful_to_source", "completeness", "introduced_errors"):
+            if key in data and type(data[key]) is not bool:
+                return GateResult(
+                    gate="qwen_fidelity",
+                    passed=False,
+                    detail=(
+                        f"qwen_fidelity: invalid {key!r} verdict field "
+                        f"{data[key]!r} (must be a JSON boolean when "
+                        f"'passed' is omitted); body={raw[:200]!r}"
+                    ),
+                )
         passed = (
-            bool(data.get("faithful_to_source", False))
-            and bool(data.get("completeness", False))
-            and not bool(data.get("introduced_errors", True))
+            data.get("faithful_to_source", False) is True
+            and data.get("completeness", False) is True
+            and data.get("introduced_errors", True) is False
         )
 
     return GateResult(
@@ -157,6 +188,46 @@ def _parse_qwen_verdict(raw: str) -> GateResult:
             f"confidence={confidence}; {reason}"
         ),
     )
+
+
+def _parse_qwen_verdicts(raw: str, *, count: int) -> Tuple[GateResult, ...]:
+    """Parse a batched Qwen verdict body into ``count`` ``GateResult``s.
+
+    B12 re-gate batching: the response is
+    ``{"verdicts": [{...}, ...]}`` (one verdict object per region, in
+    order). Every element is parsed by the same ``_parse_qwen_verdict`` as
+    the single-region re-gate, so batched verdicts are directly comparable
+    to narrow ones. Any structural failure (non-JSON body, missing
+    ``verdicts`` array, wrong element count) yields one failing ``GateResult``
+    per region — debt, never a semantic verdict (the caller records the
+    failure reason in the detail).
+    """
+    failed = lambda reason: GateResult(  # noqa: E731
+        gate="qwen_fidelity",
+        passed=False,
+        detail=f"qwen_fidelity: batch verdict failure ({reason}); body={raw[:200]!r}",
+    )
+    if not raw.strip():
+        return tuple(failed("empty response body") for _ in range(count))
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return tuple(failed(f"non-JSON response: {exc}") for _ in range(count))
+    if not isinstance(data, dict) or not isinstance(data.get("verdicts"), list):
+        return tuple(failed("response is not an object with a 'verdicts' array") for _ in range(count))
+    verdicts = data["verdicts"]
+    if len(verdicts) != count:
+        return tuple(
+            failed(f"expected {count} verdicts, got {len(verdicts)}")
+            for _ in range(count)
+        )
+    results = []
+    for item in verdicts:
+        if isinstance(item, dict):
+            results.append(_parse_qwen_verdict(json.dumps(item, ensure_ascii=False)))
+        else:
+            results.append(failed(f"verdict element is not an object: {item!r}"))
+    return tuple(results)
 
 
 class HttpQwenEvaluator:

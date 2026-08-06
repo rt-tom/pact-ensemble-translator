@@ -100,6 +100,7 @@ from pact_v4.phase4.quarantined_retry import (
     run_quarantined_retry,
 )
 from pact_v4.phase4.repair import (
+    REPAIR_POLICY_VERSION,
     REPAIR_REPORT_SCHEMA,
     RepairCache,
     RepairPhaseResult,
@@ -168,7 +169,14 @@ AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
 AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
 HANDOFF_SCHEMA = "pact-v4-step6-b2-handoff/v1"
 SELECTION_META_SCHEMA = "pact-v4-strict-selection-meta/v1"
-REPAIR_CACHE_SCHEMA = "pact-v4-phase4-repair-cache/v1"
+# B12-F4 (RV4 HIGH): the repair-cache envelope is versioned with the repair
+# policy. ``_repair_unit_hash`` embeds ``REPAIR_POLICY_VERSION`` (now v2
+# after the F3 fail-closed Qwen verdict fix), so a cache file written under
+# the pre-F3 contract (schema v1, unit hashes under policy v1) must never be
+# reused on resume — it may hold ``committed=True`` records fixed under the
+# old ``bool("false")`` truthiness.
+REPAIR_CACHE_SCHEMA = "pact-v4-phase4-repair-cache/v2"
+LEGACY_REPAIR_CACHE_SCHEMA = "pact-v4-phase4-repair-cache/v1"
 REPAIR_REPORT_SCHEMA = "pact-v4-phase4-repair-report/v1"
 
 NO_LEFT_CONTEXT_SENTINEL = "pact-v4-strict/no-left-context"
@@ -1035,13 +1043,34 @@ def _load_repair_cache(
     so a resumed run deterministically reuses already-committed repairs
     (same findings/re-gates) instead of re-paying model calls or silently
     reusing a cache written under a different backend.
+
+    B12-F4 (RV4 HIGH): a cache whose envelope schema is the known legacy
+    ``pact-v4-phase4-repair-cache/v1`` (pre-F3 repair policy, unit hashes
+    under ``pact-v4-repair-policy/v1``) is deliberately not reusable — its
+    ``committed=True`` records may have been fixed under the old
+    ``bool("false")`` truthiness the F3 fail-closed fix removed. It is
+    treated as a fresh start (return ``None``), never as a reusable cache.
+    An unknown schema is still foreign identity and raises.
     """
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema") != REPAIR_CACHE_SCHEMA:
+    schema = payload.get("schema")
+    if schema == LEGACY_REPAIR_CACHE_SCHEMA:
+        # B12-F4 (RV4 HIGH): a cache written under the pre-F3 repair policy
+        # (unit hashes under ``pact-v4-repair-policy/v1``) is a known legacy
+        # generation, not foreign data — it may hold ``committed=True``
+        # records fixed under the old ``bool("false")`` truthiness. Never
+        # reuse it: start a fresh cache so the fail-closed re-gate re-runs.
+        LOG.info(
+            "Repair cache from the pre-F4 repair policy (%s) is not reusable; "
+            "starting a fresh repair cache",
+            schema,
+        )
+        return None
+    if schema != REPAIR_CACHE_SCHEMA:
         raise ValueError(
-            f"Foreign identity: repair cache schema={payload.get('schema')!r}"
+            f"Foreign identity: repair cache schema={schema!r}"
         )
     if payload.get("backend_identity_hash") not in backend_identity_hashes:
         raise ValueError(
@@ -1092,7 +1121,7 @@ def _build_phase4_provenance(
         config_identity=config.config_identity,
         code_version="pact-v4-b2/1",
         policy_versions={
-            "repair": "pact-v4-repair-policy/v1",
+            "repair": REPAIR_POLICY_VERSION,
             "terminal": "pact-v4-terminal/v1",
         },
     )
@@ -1225,6 +1254,7 @@ def _run_step7_repair(
             "resolved_count": formatting_payload["resolved_count"],
             "incident_count": formatting_payload["incident_count"],
             "model_fallback_count": formatting_payload["model_fallback_count"],
+            "model_call_count": formatting_payload["model_call_count"],
             "max_formatting_incidents": formatting_payload["max_formatting_incidents"],
             "report_path": str(_formatting_report_path(cfg.out_dir)),
         }
@@ -1726,6 +1756,7 @@ def _run_quarantined_retry_cycle(
             "resolved_count": formatting_outcome.resolved_count,
             "incident_count": formatting_outcome.incident_count,
             "model_fallback_count": formatting_outcome.model_fallback_count,
+            "model_call_count": formatting_outcome.model_call_count,
             "max_formatting_incidents": formatting_outcome.max_formatting_incidents,
             "report_path": str(_formatting_report_path(cfg.out_dir)),
         }
@@ -2301,6 +2332,9 @@ def run_chapter_strict(
                     backend_identity_hash=cfg.backend.identity_hash,
                     policy_version=cfg.formatting_policy_version,
                     max_formatting_incidents=cfg.max_formatting_incidents,
+                    pid_batches=[
+                        tuple(chunk.pids) for chunk in chunk_plan.chunks
+                    ],
                 )
 
             formatting_step = _formatting_step

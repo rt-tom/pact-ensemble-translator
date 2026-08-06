@@ -25,6 +25,8 @@ from pact_v4.runtime.backend_protocol import (
     Message,
 )
 from pact_v4.runtime.backend_role_adapters import (
+    BackendFormattingCaller,
+    BackendFormattingCallerConfig,
     BackendGemmaAuditEvaluator,
     BackendGemmaAuditEvaluatorConfig,
     BackendGemmaSelector,
@@ -46,10 +48,13 @@ from pact_v4.runtime.json_resilience import (
     TruncatedJSONError,
 )
 from pact_v4.runtime.prompts_runtime import (
+    REGION_FIDELITY_GATE_V1,
+    ReviewerPrompt,
     render_gemma_audit_prompt,
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
     render_qwen_review_prompt,
+    render_region_fidelity_gate_prompt,
 )
 
 
@@ -829,3 +834,275 @@ def test_generation_cache_put_after_retried_success():
     outcome2 = generate_for_chunk(**kwargs)
     assert outcome2.status == "complete"
     assert len(backend.requests) == 2
+
+
+# ---------------------------------------------------------------------------
+# B12: batched adapters (one backend call for several PIDs / regions)
+# ---------------------------------------------------------------------------
+
+
+def _formatting_batch_items() -> list:
+    return [
+        {
+            "pid": "p00001",
+            "source_text": "Hello world one.",
+            "translation": "Привет мир один.",
+            "spans": [{"span_id": "em01", "tag": "em", "text": "world", "occurrence": 1}],
+        },
+        {
+            "pid": "p00002",
+            "source_text": "Hello world two.",
+            "translation": "Привет мир два.",
+            "spans": [{"span_id": "em02", "tag": "em", "text": "world", "occurrence": 1}],
+        },
+    ]
+
+
+def test_formatting_caller_batch_sends_one_request_for_many_pids():
+    backend = ScriptedBackend([
+        _text_response(json.dumps({"mappings": [
+            {"pid": "p00001", "span_id": "em01", "target_text": "Привет", "occurrence": 1},
+            {"pid": "p00002", "span_id": "em02", "target_text": "Привет", "occurrence": 1},
+        ]}, ensure_ascii=False)),
+    ])
+    caller = BackendFormattingCaller(backend)
+    out = caller.batch(items=_formatting_batch_items())
+    assert "p00001" in out and "p00002" in out
+    assert len(backend.requests) == 1  # one call for the whole batch
+    sent = backend.requests[0].messages[0].content
+    assert "FORMAT_PID: p00001" in sent
+    assert "FORMAT_PID: p00002" in sent
+
+
+def test_formatting_caller_batch_propagates_transport_failure():
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    caller = BackendFormattingCaller(_FailingBackend([]))
+    with pytest.raises(CompletionError, match="connection refused"):
+        caller.batch(items=_formatting_batch_items())
+    assert len(attempts) == 1
+
+
+def test_region_fidelity_gate_batch_sends_one_request_for_many_regions():
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert all(r.passed for r in results)
+    assert len(backend.requests) == 1
+    sent = backend.requests[0].messages[0].content
+    assert "REGION 1:" in sent
+    assert "REGION 2:" in sent
+
+
+def test_region_fidelity_gate_batch_parses_failed_verdict_per_region():
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+        {"faithful_to_source": False, "completeness": False, "introduced_errors": True,
+         "confidence": "high", "reason": "wrong", "passed": False},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert results[0].passed is True
+    assert results[1].passed is False
+    assert len(backend.requests) == 1
+
+
+def test_region_fidelity_gate_batch_string_passed_false_fails_closed():
+    """B12-RV3 HIGH: a batched element with explicit ``"passed": "false"``
+    (a string) must fail closed for its own region — never be coerced by
+    Python truthiness into a passing verdict that could commit a rejected
+    repair — while a neighbouring native-bool verdict is untouched."""
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": "false"},  # malformed
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert results[0].passed is False
+    assert "invalid 'passed'" in results[0].detail
+    assert results[1].passed is True
+    assert len(backend.requests) == 1
+
+
+def test_region_fidelity_gate_batch_wrong_count_is_debt_for_all():
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)  # only 1 verdict for 2 regions
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert all(r.passed is False for r in results)
+    assert all("expected 2 verdicts" in r.detail for r in results)
+
+
+def test_region_fidelity_gate_batch_transport_failure_is_debt_for_all():
+    from pact_v4.phase1.models import Region
+
+    attempts = []
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            attempts.append(request)
+            raise CompletionError("connection refused")
+
+    gate = BackendRegionFidelityGate(
+        _FailingBackend([]), config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert all(r.passed is False for r in results)
+    assert all("API failure" in r.detail for r in results)
+    assert len(attempts) == 1
+
+
+def test_region_fidelity_gate_batch_default_config_uses_batch_contract():
+    """B12-F1 regression: the default-config batch path must render the
+    multi-region batch instructions (``several repaired regions`` +
+    ``verdicts: array``), never the single-region schema (``single repaired
+    region``). Production wiring builds the gate with only ``retry``
+    overridden (runtime_config.build_phase4_adapters), so this is the exact
+    prompt the real batch re-gate sends.
+    """
+    from pact_v4.phase1.models import Region
+
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    # Default config: exactly what build_phase4_adapters wires (retry only).
+    gate = BackendRegionFidelityGate(
+        backend, config=BackendRegionFidelityGateConfig(retry=_no_backoff()),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+        {"source_text": "Hello two.", "repaired_text": "Привет два.",
+         "region": Region(pid="p2", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 2
+    assert all(r.passed for r in results)
+    sent = backend.requests[0].messages[0].content
+    assert "several repaired regions" in sent
+    assert "verdicts: array of objects, one per region" in sent
+    assert "single repaired region" not in sent
+    assert "REGION 1:" in sent
+    assert "REGION 2:" in sent
+
+
+def test_region_fidelity_gate_batch_explicit_batch_template_is_honored():
+    """B12-F1: a custom batch template configured via ``batch_template`` is
+    used by the batch path, while ``template`` still drives the single path.
+    """
+    from pact_v4.phase1.models import Region
+    from pact_v4.runtime.prompts_runtime import REGION_FIDELITY_GATE_BATCH_V1
+
+    custom = ReviewerPrompt(
+        role="region_fidelity_gate_batch",
+        version="pact-v4-reviewer-qwen-region-fidelity-batch/test-custom",
+        instructions=(
+            "You are a custom batch fidelity reviewer. Return STRICT JSON "
+            "with exactly this schema:\n"
+            "  verdicts: array of objects, one per region in the given order."
+        ),
+    )
+    verdict = json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True},
+    ]}, ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(verdict)])
+    gate = BackendRegionFidelityGate(
+        backend,
+        config=BackendRegionFidelityGateConfig(
+            retry=_no_backoff(), batch_template=custom,
+        ),
+    )
+    items = [
+        {"source_text": "Hello one.", "repaired_text": "Привет один.",
+         "region": Region(pid="p1", start=0, end=6)},
+    ]
+    results = gate.batch(items=items)
+    assert len(results) == 1
+    assert results[0].passed is True
+    sent = backend.requests[0].messages[0].content
+    assert "custom batch fidelity reviewer" in sent
+    assert "REGION 1:" in sent
+    # The batch path must not silently fall back to the single template.
+    assert sent != render_region_fidelity_gate_prompt(
+        source_text=items[0]["source_text"],
+        repaired_text=items[0]["repaired_text"],
+        region=items[0]["region"],
+        template=REGION_FIDELITY_GATE_V1,
+    )
+    # The single-region default template remains untouched.
+    assert BackendRegionFidelityGateConfig().template == REGION_FIDELITY_GATE_V1
+    assert BackendRegionFidelityGateConfig().batch_template == REGION_FIDELITY_GATE_BATCH_V1

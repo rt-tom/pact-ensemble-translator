@@ -436,3 +436,191 @@ def test_run_formatting_align_rejects_pid_drop_at_repair_layer():
     assert isinstance(out, FormattingOutcome)
     assert isinstance(out.incidents, tuple)
     assert all(isinstance(i, FormattingIncident) for i in out.incidents)
+
+
+# ---------------------------------------------------------------------------
+# B12: batched model-fallback tier (one call per pid_batches group)
+# ---------------------------------------------------------------------------
+
+
+class BatchFormattingCaller(CannedFormattingCaller):
+    """``CannedFormattingCaller`` with a ``batch`` method.
+
+    The batched call maps every PID's spans with the same per-PID word
+    mapping as the per-PID ``__call__``, so the batched path and the
+    per-PID path produce identical span_mapping/incidents on the same
+    chapter — only the number of model calls differs.
+    """
+
+    def __init__(self, *, fail: Exception | None = None, empty: bool = False):
+        super().__init__(fail=fail, empty=empty)
+        self.batch_calls: list = []
+
+    def batch(self, items):
+        self.batch_calls.append([dict(item) for item in items])
+        if self.fail is not None:
+            raise self.fail
+        mappings = []
+        for item in items:
+            words = item["translation"].split()
+            for index, span in enumerate(item["spans"]):
+                target = "" if self.empty else (
+                    words[index] if index < len(words) else ""
+                )
+                mappings.append({
+                    "pid": item["pid"], "span_id": span["span_id"],
+                    "target_text": target + self.suffix, "occurrence": 1,
+                })
+        return json.dumps({"mappings": mappings}, ensure_ascii=False)
+
+
+def test_batch_call_groups_pids_into_one_call():
+    # Two PIDs with unresolved spans in ONE batch -> exactly one model call
+    # for the group; model_fallback_count still counts PIDs, model_call_count
+    # counts actual calls.
+    blocks = _blocks(
+        "<html><body>"
+        "<p>Hello <em>world</em> one.</p>"
+        "<p>Hello <em>world</em> two.</p>"
+        "</body></html>"
+    )
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
+    caller = BatchFormattingCaller()
+    out = run_formatting_align(
+        blocks=blocks,
+        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
+        formatting_caller=caller,
+        backend_identity_hash=IDENTITY,
+        pid_batches=[[pid0, pid1]],
+    )
+    assert len(caller.batch_calls) == 1
+    assert len(caller.batch_calls[0]) == 2
+    assert len(caller.calls) == 0  # no per-PID calls when batching is active
+    assert out.resolved_count == 2
+    assert out.incident_count == 0
+    assert out.model_fallback_count == 2  # PIDs needing the model tier
+    assert out.model_call_count == 1  # one batched call
+    assert "<em>Привет</em> мир один." in dict(out.formatted_text)[pid0]
+
+
+def test_batch_call_splits_by_pid_batches():
+    # Two separate batches -> two model calls, same resolution as per-PID.
+    blocks = _blocks(
+        "<html><body>"
+        "<p>Hello <em>world</em> one.</p>"
+        "<p>Hello <em>world</em> two.</p>"
+        "</body></html>"
+    )
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
+    caller = BatchFormattingCaller()
+    out = run_formatting_align(
+        blocks=blocks,
+        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
+        formatting_caller=caller,
+        backend_identity_hash=IDENTITY,
+        pid_batches=[[pid0], [pid1]],
+    )
+    assert len(caller.batch_calls) == 2
+    assert out.resolved_count == 2
+    assert out.model_fallback_count == 2
+    assert out.model_call_count == 2
+
+
+def test_batch_call_matches_per_pid_path_on_identical_mappings():
+    # Batched and per-PID callers resolving identically must produce the same
+    # span_mapping/incidents — only the transport differs (B12 contract).
+    blocks = _blocks(
+        "<html><body>"
+        "<p>Hello <em>world</em> one.</p>"
+        "<p>Hello <em>world</em> two.</p>"
+        "</body></html>"
+    )
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
+    translation = {pid0: "Привет мир один.", pid1: "Привет мир два."}
+    per_pid = run_formatting_align(
+        blocks=blocks, translation=translation,
+        formatting_caller=CannedFormattingCaller(),
+        backend_identity_hash=IDENTITY,
+    )
+    batched = run_formatting_align(
+        blocks=blocks, translation=translation,
+        formatting_caller=BatchFormattingCaller(),
+        backend_identity_hash=IDENTITY,
+        pid_batches=[[pid0, pid1]],
+    )
+    assert batched.span_mapping == per_pid.span_mapping
+    assert batched.incidents == per_pid.incidents
+    assert batched.formatted_text == per_pid.formatted_text
+    assert batched.model_fallback_count == per_pid.model_fallback_count == 2
+    assert batched.model_call_count == 1
+    assert per_pid.model_call_count == 2
+
+
+def test_batch_call_transport_failure_is_debt_for_all_spans():
+    # A batched transport failure marks every span of the batch as
+    # transport_error debt (never a semantic verdict), and the formatted text
+    # stays the escaped input.
+    blocks = _blocks(
+        "<html><body>"
+        "<p>Hello <em>world</em> one.</p>"
+        "<p>Hello <em>world</em> two.</p>"
+        "</body></html>"
+    )
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
+    out = run_formatting_align(
+        blocks=blocks,
+        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
+        formatting_caller=BatchFormattingCaller(fail=RuntimeError("network down")),
+        backend_identity_hash=IDENTITY,
+        pid_batches=[[pid0, pid1]],
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 2
+    assert {i.reason for i in out.incidents} == {"transport_error"}
+    assert {i.tier for i in out.incidents} == {TIER_MODEL}
+    assert out.model_call_count == 1
+    assert dict(out.formatted_text)[pid0] == "Привет мир один."
+
+
+def test_pid_outside_batches_falls_back_to_per_pid_call():
+    # A PID not covered by any pid_batches group keeps the per-PID path even
+    # when the caller supports batch.
+    blocks = _blocks(
+        "<html><body>"
+        "<p>Hello <em>world</em> one.</p>"
+        "<p>Hello <em>world</em> two.</p>"
+        "</body></html>"
+    )
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
+    caller = BatchFormattingCaller()
+    out = run_formatting_align(
+        blocks=blocks,
+        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
+        formatting_caller=caller,
+        backend_identity_hash=IDENTITY,
+        pid_batches=[[pid0]],  # pid1 is outside the batch
+    )
+    assert len(caller.batch_calls) == 1
+    assert len(caller.calls) == 1  # pid1 via per-PID call
+    assert out.resolved_count == 2
+    assert out.model_call_count == 2
+
+
+def test_model_call_count_in_payload():
+    blocks = _blocks(
+        "<html><body>"
+        "<p>Hello <em>world</em> one.</p>"
+        "<p>Hello <em>world</em> two.</p>"
+        "</body></html>"
+    )
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
+    out = run_formatting_align(
+        blocks=blocks,
+        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
+        formatting_caller=BatchFormattingCaller(),
+        backend_identity_hash=IDENTITY,
+        pid_batches=[[pid0, pid1]],
+    )
+    payload = out.to_payload()
+    assert payload["model_fallback_count"] == 2
+    assert payload["model_call_count"] == 1
