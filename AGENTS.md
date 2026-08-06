@@ -142,6 +142,12 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   создаётся БЕЗ --parent (claim-гейт `claim_rejected parents_not_done`,
   урок B14); RV не создаётся заранее (dependency_wait-цикл = переклеймы и
   расход токенов, урок 2026-08-06: 3 RV висели в ожидании).
+  **ВАЖНО (урок 2026-08-06, D1)**: диспетчер НЕ переклеймит завершённую
+  developer-задачу с активным PR (`respawn_guarded active_pr` — защита от
+  повторного запуска; снятие guard'а через close PR / block-unblock /
+  рестарт gateway НЕ работает). Поэтому фикс-цикл после changes-requested —
+  **НЕ реклайм I, а новая I-fix карточка** (замечания — в комментариях/PR;
+  ветка та же). Это допускает до +1 карточки на цикл фикса.
 - **Draft PR обязателен + общение через PR-комментарии (правило владельца
   2026-08-05)**: developer после коммита ОБЯЗАН создать Draft PR
   (`gh pr create --draft`) для любой код-задачи (замечание B13: PR не
