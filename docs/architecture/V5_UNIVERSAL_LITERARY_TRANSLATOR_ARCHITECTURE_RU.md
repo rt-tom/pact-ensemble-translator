@@ -443,6 +443,19 @@ Exporter:
 work units с aggregate validation, даже если модель способна увидеть книгу
 целиком.
 
+> **Уточнение (2026-08-06): characters/aliases/pronouns — deterministic-first.**
+> Character entities / aliases / pronouns и recurring terminology / invented words
+> извлекаются **без модели**: капитализированные токены + частота по BookArtifact
+> (term_min_chapters ≥ 2, фильтр glossary/book_memory, стоп-слова) + consensus
+> alignment по PID→PID + co-occurrence guard (как B9: frequency ≥ 2 глав
+> и consensus ≥ 0.8). Это покрывает ~80% сущностей (Blake, Ivy, Jacob's Bell)
+> с PID evidence и gate blocking constraint с PID. LLM используется только для
+> ambiguous clusters — описательных алиасов (the fat man = ghoul, the man with
+> the watch = Цирюльник), Mags ≠ Maggie, конфликтных pronouns. Итого Phase 6
+> сводится к deterministic map (0 вызовов) + 1-2 LLM map (conflict resolver) + 1
+> reduce → frozen BookResearchSnapshot — ~3 LLM-вызова на книгу вместо ~10,
+> амортизируется как ~0.02 выз/главу.
+
 ### 8.2. Web research — опциональный enrichment
 
 Query planner использует по умолчанию:
