@@ -125,6 +125,7 @@ from pact_v4.pipeline._shared_runner_helpers import (
     _serialize_generation_outcome,
 )
 from pact_v4.pipeline.phase_progress import PhaseProgressWriter
+from pact_v4.pipeline.usage_record import UsageRecordWriter
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
@@ -1813,6 +1814,7 @@ def _run_quarantined_retry_cycle(
 # Main run
 # ---------------------------------------------------------------------------
 
+
 def run_chapter_strict(
     cfg: StrictRunConfig,
     *,
@@ -1827,6 +1829,7 @@ def run_chapter_strict(
     formatting_adapters: Optional[Sequence[Any]] = None,
     now: Optional[Any] = None,
     progress: Optional[Any] = None,
+    usage_writer: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Run the strict single-resident driver for one chapter.
 
@@ -1886,6 +1889,16 @@ def run_chapter_strict(
     started_at = now_fn().isoformat(timespec="seconds")
     wall_t0 = time.monotonic()
     progress_writer = progress or PhaseProgressWriter(cfg.out_dir, now=now_fn)
+    usage_writer = usage_writer or UsageRecordWriter(cfg.out_dir, now=now_fn)
+    # D1: per-call usage writing. Remote/composite coordinators forward the
+    # writer to their backend's per-call completion sink, so every completed
+    # remote call (success and failure) is appended to usage.ndjson at the
+    # moment it finishes — crash-safe inside a phase, not at phase
+    # boundaries. LocalLifecycleCoordinator has no sink: local calls stay in
+    # local_lifecycle and local runs write no usage.ndjson.
+    attach = getattr(runtime, "set_usage_writer", None)
+    if attach is not None:
+        attach(usage_writer)
 
     # ------------------------------------------------------------------
     # Rebuild source/snapshot/plan -- identical to run_chapter/run_generate.
@@ -2704,11 +2717,14 @@ def run_chapter_strict(
 
     # Terminal teardown only at the very end: closes the remote backend /
     # stops a managed server the runtime started, releases the local router.
+    # D1 usage writes already happened per completed call via the backend
+    # sink; only the writer handle needs closing.
     try:
         runtime.close()
     except Exception:  # noqa: BLE001
         LOG.exception("Failed to close runtime at end of run")
     progress_writer.close()
+    usage_writer.close()
 
     return StrictChapterRunResult(
         chapter_id=cfg.chapter_id, out_dir=cfg.out_dir, chunk_count=len(chunk_plan.chunks),
