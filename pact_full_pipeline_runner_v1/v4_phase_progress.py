@@ -9,8 +9,11 @@ touches the pipeline; it is pure diagnostics.
 
 Usage::
 
-    python -m pact_full_pipeline_runner_v1.v4_phase_progress \
-        --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_0001/run_001" \
+    python -m pact_full_pipeline_runner_v1.v4_phase_progress \\
+        --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_0001/run_001" \\
+        [--watch 10]
+    python -m pact_full_pipeline_runner_v1.v4_phase_progress \\
+        --out-base "D:/pact/gate_bench_runs/v4_book_0001-0002_remote_eff-a1a2" \\
         [--watch 10]
 
 ``--watch`` re-renders the report every N seconds. Without a
@@ -18,6 +21,17 @@ Usage::
 falls back to a coarse inference from the artifacts that do exist
 (``journal.ndjson``, ``b2_handoff.json``, ``repair_report.json``,
 ``strict_chapter_trial_record.json``), with the same phase/status vocabulary.
+
+``--out-base`` is the multi-chapter (book-run) mode: the monitor discovers
+``chapter_*/`` subdirectories that carry ``phase_progress.ndjson`` (chapters
+appear dynamically as the book run reaches them), renders a chapters header
+table (chunk/journal counts, phase step, terminal status, calls and provider
+cost from each chapter's ``usage.ndjson``) and then the full detail report of
+the currently active chapter. ``--out-dir`` keeps the single-chapter mode.
+
+The usage-by-step-x-model counters block reuses ``phase_for_label()`` from
+``pact_full_pipeline_runner_v1.v4_usage.py`` (V4 Efficiency A1.3, already on
+``main``) — the label->phase rules are never duplicated here.
 
 Everything reported here is a *diagnostic* read: "green" progress never
 implies translation quality (see ``AGENTS.md`` permanent pipeline rules).
@@ -32,8 +46,52 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from pact_v4.pipeline.phase_progress import PHASE_PROGRESS_FILENAME
+from pact_v4.pipeline.usage_record import USAGE_FILENAME
+from pact_full_pipeline_runner_v1.v4_usage import phase_for_label
 
 FRESHNESS_WINDOW_SECONDS = 300.0
+
+# V4 monitor v2 (owner-approved spec, docs/plans/V4_PHASE12_..._RU.md,
+# "Дизайн обновлённого монитора"): usage-label group -> step-group mapping.
+# The label -> phase leg is delegated to phase_for_label() from v4_usage.py
+# (A1.3) — never duplicated here; this table only maps the *phase* it
+# returns to the step-group the monitor displays.
+PHASE_TO_STEP_GROUP = {
+    "gen": "Steps1-5",
+    "qwen_fidelity": "Step2c",
+    "gemma_preference": "Step2c",
+    "audit": "Step6",
+    "repair": "Step7",
+    "formatting": "Step8",
+}
+
+# Friendly role name shown in the usage-by-step-x-model "label-group" column
+# for labels whose phase has no sub-role of its own (phase2b per-chunk
+# labels, phase3 audit detectors, phase5 formatting).
+PHASE_FRIENDLY_ROLE = {
+    "gen": "generation",
+    "audit": "audit",
+    "formatting": "formatting",
+}
+
+# Step-groups that carry a sub-role in the label (phase2c/phase4) keep that
+# sub-role in the label-group column (e.g. "phase2c qwen_fidelity",
+# "phase4 region_repair"); everything else falls back to PHASE_FRIENDLY_ROLE.
+LABEL_GROUP_SUBROLE_PREFIXES = ("phase2c", "phase4")
+
+# Display-only canonical prefix per phase (same design as
+# PHASE_TO_STEP_GROUP). Lets legacy hyphen labels ("phase2c-qwen-fidelity")
+# render the canonical "phase2c qwen_fidelity" label-group instead of the
+# raw "phase2c-qwen-fidelity qwen_fidelity"; the label -> phase leg stays
+# fully delegated to phase_for_label() from v4_usage.py, never duplicated.
+PHASE_TO_LABEL_PREFIX = {
+    "gen": "phase2b",
+    "qwen_fidelity": "phase2c",
+    "gemma_preference": "phase2c",
+    "audit": "phase3",
+    "repair": "phase4",
+    "formatting": "phase5",
+}
 
 TRIAL_STATES = (
     "pending", "generated", "gated", "selected", "quarantined",
@@ -125,6 +183,12 @@ def _terminal_event(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return terminal[-1] if terminal else None
 
 
+def _last_usage_record(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """Last ``usage.ndjson`` row (ts/label/model), or None when absent."""
+    rows = _read_usage_rows(out_dir)
+    return rows[-1] if rows else None
+
+
 def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
     record = _read_json(out_dir / "strict_chapter_trial_record.json")
     started = _run_started_event(events)
@@ -160,6 +224,17 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
             elapsed = None
 
     log_count, newest_age = _server_log_freshness(out_dir)
+    # V4 monitor v2 (owner observation eff-a1a2): server_logs are static
+    # after server start on remote runs (opencode_serve_*.log), so they are
+    # NOT a liveness indicator. Liveness comes from the last usage.ndjson
+    # record (written per remote call) and the last phase_progress event.
+    last_usage = _last_usage_record(out_dir)
+    usage_age: Optional[float] = None
+    if last_usage is not None and last_usage.get("ts"):
+        usage_age = _ts_age(str(last_usage["ts"]))
+    recent_usage = usage_age is not None and usage_age <= FRESHNESS_WINDOW_SECONDS
+    recent_event = bool(started) and bool(_recent_event_age(events) <= FRESHNESS_WINDOW_SECONDS)
+
     alive_basis: List[str] = []
     if record is not None:
         alive = False
@@ -168,15 +243,13 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         alive = False
         alive_basis.append("terminal event written (run finished)")
     else:
-        recent_logs = newest_age is not None and newest_age <= FRESHNESS_WINDOW_SECONDS
-        recent_event = bool(started) and bool(_recent_event_age(events) <= FRESHNESS_WINDOW_SECONDS)
-        alive = bool(recent_logs or recent_event)
-        if recent_logs:
-            alive_basis.append(f"server_logs newest age {newest_age:.0f}s <= {FRESHNESS_WINDOW_SECONDS:.0f}s")
+        alive = bool(recent_usage or recent_event)
+        if recent_usage:
+            alive_basis.append(f"last usage.ndjson {usage_age:.0f}s ago")
         if recent_event:
             alive_basis.append(f"last progress event {_recent_event_age(events):.0f}s ago")
         if not alive_basis:
-            alive_basis.append("no recent server_logs / progress events (stalled or unknown)")
+            alive_basis.append("no recent usage.ndjson / progress events (stalled or unknown)")
 
     return {
         "alive": alive,
@@ -192,7 +265,22 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "out_dir": str(out_dir),
         "server_log_count": log_count,
         "server_log_newest_age": newest_age,
+        "last_usage": last_usage,
+        "last_usage_age": usage_age,
     }
+
+
+def _ts_age(ts: str) -> float:
+    """Age in seconds of an ISO timestamp vs now (inf on parse failure)."""
+    if not ts:
+        return float("inf")
+    try:
+        parsed = datetime.fromisoformat(ts)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (_now() - parsed).total_seconds())
+    except ValueError:
+        return float("inf")
 
 
 def _recent_event_age(events: List[Dict[str, Any]]) -> float:
@@ -203,13 +291,7 @@ def _recent_event_age(events: List[Dict[str, Any]]) -> float:
             latest_ts = ts
     if not latest_ts:
         return float("inf")
-    try:
-        parsed = datetime.fromisoformat(latest_ts)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return max(0.0, (_now() - parsed).total_seconds())
-    except ValueError:
-        return float("inf")
+    return _ts_age(latest_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +317,31 @@ def _detect_phase(out_dir: Path, events: List[Dict[str, Any]]) -> Tuple[str, str
     if b2 is not None:
         round_number = _current_round(events)
         round_hint = f"; round {round_number}" if round_number else ""
-        return "step7", f"b2_handoff.json exists; repair_report.json absent{round_hint}"
+        region_hint = _region_progress_hint(events)
+        return "step7", (f"b2_handoff.json exists; repair_report.json absent"
+                         f"{round_hint}{region_hint}")
     if total is not None and len(journal) >= total:
         return "step6", "journal full; b2_handoff.json absent"
     if total is not None:
         return "steps1-5", f"journal {len(journal)}/{total} chunks journaled"
     return "unknown", "no chunk_plan.json / journal found"
+
+
+def _region_progress_hint(events: List[Dict[str, Any]]) -> str:
+    """Live repair progress from ``region_done``/``region_*`` events.
+
+    ``repair_report.json`` is written only at the end of Step 7, so its
+    absence does *not* mean "repair not started": the committed/debt counts
+    come from the region events the ProgressTracker emits during the round
+    (owner observation eff-a1a2: committed=47 debt=26 with no report yet).
+    """
+    region_counts = _region_counts(events)
+    if not region_counts["done"] and not region_counts["in_progress"]:
+        return ""
+    return (f"; regions done={region_counts['done']} "
+            f"committed={region_counts['committed']} "
+            f"debt={region_counts['debt']} "
+            f"in_progress={region_counts['in_progress']}")
 
 
 def _current_round(events: List[Dict[str, Any]]) -> Optional[int]:
@@ -523,6 +624,168 @@ def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Usage by step x model (V4 monitor v2)
+# ---------------------------------------------------------------------------
+
+
+def _read_usage_rows(out_dir: Path) -> List[Dict[str, Any]]:
+    """Parse ``usage.ndjson`` rows (crash-safe, same reader as v4_usage)."""
+    return _read_ndjson(out_dir / USAGE_FILENAME)
+
+
+def _label_group(label: Optional[str]) -> str:
+    """Human label-group for the usage-by-step-x-model column.
+
+    ``phase2b/...`` -> ``phase2b generation``, ``phase3/...`` -> ``phase3
+    audit``, ``phase5/...`` -> ``phase5 formatting`` (friendly phase role);
+    ``phase2c/<sub>`` and ``phase4/<sub>`` keep their label sub-role
+    (``phase2c qwen_fidelity``, ``phase4 region_repair``,
+    ``phase4 region_fidelity_gate``). Uses ``phase_for_label()`` for the
+    phase leg — the same label->phase rules as v4_usage, never duplicated.
+    """
+    parts = (label or "").split("/")
+    phase = phase_for_label(label)
+    # Canonical prefix from the phase (handles legacy hyphen labels such as
+    # "phase2c-qwen-fidelity" -> "phase2c"); fall back to the raw token for
+    # labels phase_for_label does not recognize.
+    prefix = PHASE_TO_LABEL_PREFIX.get(phase, parts[0] if parts and parts[0] else "(unknown)")
+    if prefix in LABEL_GROUP_SUBROLE_PREFIXES and len(parts) > 1 and parts[1]:
+        role = parts[1]
+    else:
+        role = PHASE_FRIENDLY_ROLE.get(phase, phase)
+    return f"{prefix} {role}"
+
+
+def _usage_group_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate usage rows into per-(label-group, model) buckets.
+
+    Each bucket carries the step-group (from ``PHASE_TO_STEP_GROUP`` via
+    ``phase_for_label``), the label-group, the model, calls, summed
+    input/output/reasoning/cached tokens and summed ``reported_cost``.
+    """
+    buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        label = row.get("label")
+        phase = phase_for_label(label)
+        group = _label_group(label)
+        # The spec table shows the short model name (``qwen3.7-plus``,
+        # ``deepseek-v4-flash``); fall back to the full model_ref.
+        model = row.get("model") or row.get("model_ref") or "(unknown)"
+        key = (group, str(model))
+        bucket = buckets.setdefault(key, {
+            "step": PHASE_TO_STEP_GROUP.get(phase, phase),
+            "label_group": group,
+            "model": model,
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_input_tokens": 0,
+            "cached_write_tokens": 0,
+            "reported_cost": 0.0,
+            "has_cost": False,
+        })
+        bucket["calls"] += 1
+        for token_key in ("input_tokens", "output_tokens", "reasoning_tokens",
+                          "cached_input_tokens", "cached_write_tokens"):
+            value = row.get(token_key)
+            if value is not None:
+                bucket[token_key] += int(value)
+        cost = row.get("reported_cost")
+        if cost is not None:
+            bucket["reported_cost"] += float(cost)
+            bucket["has_cost"] = True
+    return list(buckets.values())
+
+
+def _usage_totals(groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_calls = sum(g["calls"] for g in groups)
+    total_cost = sum(g["reported_cost"] for g in groups if g["has_cost"])
+    return {
+        "calls": total_calls,
+        "reported_cost": total_cost,
+        "any_cost": any(g["has_cost"] for g in groups),
+    }
+
+
+def _fmt_tokens(value: int) -> str:
+    """Compact token display: ``108`` stays ``108``, ``42100`` -> ``42.1k``."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
+def _fmt_cost(value: float) -> str:
+    return f"${value:.4f}"
+
+
+def _fmt_cost_short(value: float) -> str:
+    """Header-table cost (2 decimals, e.g. ``$1.11`` per the spec sketch)."""
+    return f"${value:.2f}"
+
+
+_SHORT_STATUS = {
+    "accepted_degraded": "accepted_degr.",
+    "complete": "complete",
+    "failed": "failed",
+}
+
+
+def _usage_block_lines(out_dir: Path) -> List[str]:
+    """``-- usage by step x model --`` block (from usage.ndjson)."""
+    rows = _read_usage_rows(out_dir)
+    if not rows:
+        return ["-- usage by step x model --", "  (no usage.ndjson yet)"]
+    groups = _usage_group_rows(rows)
+    totals = _usage_totals(groups)
+    show_cost = totals["any_cost"] and totals["reported_cost"] != 0.0
+    show_reasoning = any(g["reasoning_tokens"] for g in groups)
+    show_cached = any(
+        g["cached_input_tokens"] or g["cached_write_tokens"] for g in groups
+    )
+
+    lines = ["-- usage by step x model (из usage.ndjson) --"]
+    header = (f"{'step':<9} {'label-group':<25} {'model':<18}"
+              f"{'calls':>6}{'input':>9}{'output':>9}")
+    if show_reasoning:
+        header += f"{'reasoning':>10}"
+    if show_cached:
+        header += f"{'cached':>9}"
+    if show_cost:
+        header += f"{'cost':>11}"
+    lines.append(header)
+
+    step_order = {"Steps1-5": 0, "Step2c": 1, "Step6": 2, "Step7": 3, "Step8": 4}
+    for g in sorted(
+        groups,
+        key=lambda g: (step_order.get(g["step"], 99), g["label_group"], g["model"]),
+    ):
+        row = (f"{g['step']:<9} {g['label_group']:<25} {str(g['model'])[:18]:<18}"
+               f"{g['calls']:>6}{_fmt_tokens(g['input_tokens']):>9}"
+               f"{_fmt_tokens(g['output_tokens']):>9}")
+        if show_reasoning:
+            row += f"{_fmt_tokens(g['reasoning_tokens']):>10}"
+        if show_cached:
+            row += f"{_fmt_tokens(g['cached_input_tokens'] + g['cached_write_tokens']):>9}"
+        if show_cost:
+            row += f"{_fmt_cost(g['reported_cost']):>11}"
+        lines.append(row)
+
+    total_row = (f"{'TOTAL':<9} {'':<25} {'':<18}"
+                 f"{totals['calls']:>6}{'~':>9}{'~':>9}")
+    if show_reasoning:
+        total_row += f"{'~':>10}"
+    if show_cached:
+        total_row += f"{'~':>9}"
+    if show_cost:
+        total_row += f"{_fmt_cost(totals['reported_cost']):>11}"
+    lines.append(total_row)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -591,20 +854,190 @@ def render_report(out_dir: Path) -> str:
         )
     else:
         lines.append("Step 6/7 detail: not available (coarse mode, no phase_progress.ndjson)")
-    lines.append(f"Step 8: formatting incidents={formatting['incidents']} blocking={formatting['blocking']}"
-                 f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
+    # V4 monitor v2 (owner observation eff-a1a2): before Step 8 starts the
+    # old text read as "formatting incidents=None ... terminal=None" — a
+    # broken-looking Step 8 block. Show an explicit "not started" instead.
+    if phase in ("steps1-5", "step6", "step7", "unknown"):
+        lines.append("Step 8: not started (ожидание formatting/terminal)")
+    else:
+        lines.append(f"Step 8: formatting incidents={formatting['incidents']} blocking={formatting['blocking']}"
+                     f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
+    lines.append("")
+    lines.extend(_usage_block_lines(out_dir))
 
     lines.append("")
     lines.append("-- model activity --")
+    # V4 monitor v2: primary liveness is the last usage.ndjson record
+    # (ts/label/model) plus the last phase_progress event; server_logs are
+    # shown separately as age since server start (static on remote runs).
+    last_usage = identity["last_usage"]
+    if last_usage is not None:
+        age_text = f" ({identity['last_usage_age']:.0f}s ago)" if identity["last_usage_age"] is not None else ""
+        lines.append(
+            f"last usage.ndjson: {last_usage.get('ts')} label={last_usage.get('label')} "
+            f"model={last_usage.get('model_ref')}{age_text}"
+        )
     if in_flight:
         for item in in_flight:
             lines.append(f"in flight: {item}")
-    else:
-        lines.append("no *_started without *_done (no model call currently visible)")
+    if not last_usage and not in_flight:
+        lines.append("no usage.ndjson record and no *_started without *_done")
     log_count, newest_age = _server_log_freshness(out_dir)
     age_text = f"{newest_age:.0f}s" if newest_age is not None else "n/a"
-    lines.append(f"server_logs: {log_count} file(s), newest age {age_text}")
+    lines.append(f"server_logs: {log_count} file(s), age since server start {age_text}")
 
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Multi-chapter (book-run) mode: --out-base
+# ---------------------------------------------------------------------------
+
+
+def _discover_chapters(out_base: Path) -> List[Path]:
+    """``chapter_*/`` subdirs of ``out_base`` carrying phase_progress.ndjson.
+
+    Chapters appear dynamically: book_run creates each chapter dir in order,
+    so a re-render (--watch) picks up a newly started chapter on its own.
+    """
+    out_base = Path(out_base)
+    if not out_base.is_dir():
+        return []
+    chapters: List[Path] = []
+    for child in sorted(out_base.iterdir()):
+        if child.is_dir() and child.name.startswith("chapter_"):
+            if (child / PHASE_PROGRESS_FILENAME).exists():
+                chapters.append(child)
+    return chapters
+
+
+def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
+    """One row of the chapters table: id, chunks, step, status, calls, cost."""
+    events = _load_events(chapter_dir)
+    phase, _ = _detect_phase(chapter_dir, events)
+
+    chunk_plan = _read_json(chapter_dir / "chunk_plan.json")
+    total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
+    journal = _journal_by_chunk(chapter_dir)
+
+    usage = _read_usage_rows(chapter_dir)
+    calls = len(usage)
+    costs = [float(row["reported_cost"]) for row in usage
+             if row.get("reported_cost") is not None]
+    cost = sum(costs)
+
+    if phase == "done":
+        step = "8"
+        terminal = _terminal_counts(chapter_dir, events)
+        status = terminal["status"] or "done"
+    elif phase == "step8":
+        step = "8"
+        status = "step8"
+    elif phase == "step7":
+        step = "7"
+        round_number = _current_round(events)
+        status = f"repair r{round_number}" if round_number else "step7"
+    elif phase == "step6":
+        step = "6"
+        status = "step6"
+    elif phase == "steps1-5":
+        step = "1-5"
+        status = "steps1-5"
+    else:
+        step = "?"
+        status = phase
+
+    return {
+        "chapter_id": chapter_dir.name,
+        "chunks": f"{len(journal)}/{total}",
+        "step": step,
+        "status": status,
+        "calls": calls,
+        "cost": cost,
+        # Present only when at least one usage row actually reported a
+        # non-zero provider cost: all 0/None -> hide the column gracefully
+        # (spec), not "$0.00" noise.
+        "cost_present": any(c != 0 for c in costs),
+        "events": events,
+    }
+
+
+def _render_chapters_table(chapters: List[Path]) -> List[str]:
+    rows = [_chapter_summary_row(ch) for ch in chapters]
+    total_calls = sum(r["calls"] for r in rows)
+    total_cost = sum(r["cost"] for r in rows)
+    # Cost column only when at least one chapter actually reported a cost
+    # (all 0/None -> hide gracefully, no "$0.00" noise).
+    show_cost = any(r["cost_present"] for r in rows)
+
+    lines = [f"-- chapters ({len(chapters)}) {'-' * 56}"]
+    header = (f"{'chapter_id':<24} {'chunks':>7} {'step':>5} {'status':<15}"
+              f"{'calls':>7}")
+    if show_cost:
+        header += f" {'cost(prov.)':>10}"
+    lines.append(header)
+    for row in rows:
+        status = _SHORT_STATUS.get(row["status"], row["status"])[:15]
+        line = (f"{row['chapter_id']:<24} {row['chunks']:>7} {row['step']:>5}"
+                f" {status:<15}{row['calls']:>7}")
+        if show_cost:
+            line += f" {_fmt_cost_short(row['cost']):>10}"
+        lines.append(line)
+    total_line = (f"{'TOTAL':<24} {'':>7} {'':>5} {'':<15}{total_calls:>7}")
+    if show_cost:
+        total_line += f" {_fmt_cost_short(total_cost):>10}"
+    lines.append(total_line)
+    return lines
+
+
+def _active_chapter(chapters: List[Path]) -> Optional[Path]:
+    """The chapter being processed now: the newest activity among those
+    that have not reached a terminal state; fall back to the newest overall.
+    """
+    def _activity_ts(chapter_dir: Path) -> str:
+        events = _load_events(chapter_dir)
+        latest = ""
+        for event in events:
+            ts = event.get("ts") or ""
+            if ts > latest:
+                latest = ts
+        usage = _read_usage_rows(chapter_dir)
+        for row in usage:
+            ts = row.get("ts") or ""
+            if ts > latest:
+                latest = ts
+        return latest
+
+    def _not_terminal(chapter_dir: Path) -> bool:
+        events = _load_events(chapter_dir)
+        record = _read_json(chapter_dir / "strict_chapter_trial_record.json")
+        return record is None and _terminal_event(events) is None
+
+    active = [c for c in chapters if _not_terminal(c)]
+    if not active:
+        active = chapters
+    return max(active, key=_activity_ts) if active else None
+
+
+def render_book_report(out_base: Path) -> str:
+    """Read-only multi-chapter (book-run) report over ``--out-base``."""
+    out_base = Path(out_base)
+    if not out_base.is_dir():
+        return f"<no such directory: {out_base}>"
+
+    chapters = _discover_chapters(out_base)
+    lines: List[str] = [f"== V4 book progress: {out_base} =="]
+    if not chapters:
+        lines.append("(no chapter_*/ with phase_progress.ndjson found yet)")
+        return "\n".join(lines)
+
+    lines.extend(_render_chapters_table(chapters))
+
+    active = _active_chapter(chapters)
+    if active is not None:
+        lines.append("")
+        lines.append(f"-- active chapter: {active.name} --")
+        lines.append(render_report(active))
     return "\n".join(lines)
 
 
@@ -618,8 +1051,11 @@ def build_argparser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--out-dir", type=Path, required=True,
-                    help="Run directory (the dir that contains phase_progress.ndjson and the run artifacts).")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--out-dir", type=Path, default=None,
+                        help="Run directory (contains phase_progress.ndjson and the run artifacts).")
+    target.add_argument("--out-base", type=Path, default=None,
+                        help="Book-run directory (contains chapter_*/ with phase_progress.ndjson).")
     p.add_argument("--watch", type=float, default=None, metavar="SEC",
                     help="Re-render the report every SEC seconds until interrupted.")
     return p
@@ -628,7 +1064,10 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_argparser().parse_args(argv)
     while True:
-        print(render_report(args.out_dir))
+        if args.out_base is not None:
+            print(render_book_report(args.out_base))
+        else:
+            print(render_report(args.out_dir))
         if args.watch is None or args.watch <= 0:
             break
         time.sleep(args.watch)
