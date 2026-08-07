@@ -26,7 +26,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -495,3 +497,125 @@ def test_verifier_detects_non_finite_numeric_cell(
     problems = verify.check_report(mutated, committed_evidence)
     assert problems, f"cell substituted with {bad!r} was NOT detected"
     assert any("architect" in p and "Input sum" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# 8. Committed evidence schema: `all` groups carry n_sessions (derived contract).
+# ---------------------------------------------------------------------------
+def test_committed_evidence_all_groups_have_n_sessions(committed_evidence) -> None:
+    """Regression (RV2 t_008a13e0): the re-packed evidence dropped
+    ``profile["all"]["n_sessions"]`` while ``agg()`` emits it and
+    ``token_analysis_derived.derived()`` reads it (KeyError: 'n_sessions')."""
+    for name, prof in committed_evidence["profiles"].items():
+        assert "n_sessions" in prof["all"], f"{name}: all.n_sessions missing"
+        assert prof["all"]["n_sessions"] == prof["n_sessions_total"], name
+        for src, g in prof["by_source"].items():
+            assert "n_sessions" in g, f"{name}/{src}: n_sessions missing"
+
+
+def test_derived_tool_cli_on_committed_evidence(committed_evidence) -> None:
+    """The acceptance command
+    ``python tools/token_analysis_derived.py docs/audits/...evidence.json``
+    must exit 0 (KeyError: 'n_sessions' regression)."""
+    evidence = REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json"
+    res = subprocess.run(
+        [sys.executable, str(TOOLS / "token_analysis_derived.py"), str(evidence)],
+        capture_output=True, text=True, encoding="utf-8", timeout=120,
+    )
+    assert res.returncode == 0, f"derived tool failed:\n{res.stderr}"
+    out = json.loads(res.stdout)
+    for name, prof in committed_evidence["profiles"].items():
+        assert out["profiles"][name]["all"]["n_sessions"] == prof["n_sessions_total"]
+
+
+# ---------------------------------------------------------------------------
+# 9. Failure-path redaction: no machine-specific/absolute paths in output.
+# ---------------------------------------------------------------------------
+_ABS_PATH_RE = re.compile(r"[A-Za-z]:[\\/]")
+_USERS_PATH_RE = re.compile(r"[\\/]Users[\\/]")
+
+
+def _assert_redacted(text: str, tmp_path: Path) -> None:
+    """The redacted-output contract: no absolute / machine-specific path may
+    appear in stdout or stderr for missing mandatory inputs."""
+    assert str(tmp_path) not in text, f"absolute tmp path leaked: {text!r}"
+    assert not _ABS_PATH_RE.search(text), f"drive-letter path leaked: {text!r}"
+    assert not _USERS_PATH_RE.search(text), f"user-profile path leaked: {text!r}"
+
+
+def _make_profiles_root(tmp_path: Path, name: str = "root") -> Path:
+    d = tmp_path / name
+    d.mkdir()
+    for p in ("architect", "developer", "reviewer"):
+        (d / p).mkdir()
+    return d
+
+
+def test_missing_profiles_dir_error_is_redacted(tmp_path, capsys) -> None:
+    rc = baseline.main(["--profiles-dir", str(tmp_path / "does-not-exist")])
+    cap = capsys.readouterr()
+    assert rc != 0
+    _assert_redacted(cap.out + cap.err, tmp_path)
+    assert "profiles dir not found" in cap.err
+
+
+def test_missing_state_db_errors_are_redacted(tmp_path, capsys) -> None:
+    d = _make_profiles_root(tmp_path)
+    for p in ("architect", "developer", "reviewer"):
+        (d / p / "config.yaml").write_text("reasoning_effort: high\n", encoding="utf-8")
+    rc = baseline.main(["--profiles-dir", str(d)])
+    cap = capsys.readouterr()
+    assert rc != 0
+    _assert_redacted(cap.out + cap.err, tmp_path)
+    out = json.loads(cap.out)
+    for name in ("architect", "developer", "reviewer"):
+        assert "state.db not found in profile" in out["profiles"][name]["error"]
+        assert str(tmp_path) not in out["profiles"][name]["error"]
+
+
+def test_missing_config_yaml_errors_are_redacted(tmp_path, capsys) -> None:
+    d = _make_profiles_root(tmp_path)
+    for p in ("architect", "developer", "reviewer"):
+        _make_state_db(d / p / "state.db")
+    rc = baseline.main(["--profiles-dir", str(d)])
+    cap = capsys.readouterr()
+    assert rc != 0
+    _assert_redacted(cap.out + cap.err, tmp_path)
+    out = json.loads(cap.out)
+    for name in ("architect", "developer", "reviewer"):
+        assert "config.yaml not found in profile" in out["profiles"][name]["error"]
+        assert str(tmp_path) not in out["profiles"][name]["error"]
+
+
+def test_sanitize_error_never_globbed_by_bare_dot_needle() -> None:
+    """A profiles-dir whose str() is '.' / '' must not glob every dot in the
+    message (regression: 'state.db' -> 'state<profiles-dir>db')."""
+    # Path('.') — str() is '.', a 1-char needle that must be skipped
+    msg = "state.db not found in profile architect"
+    out = baseline._sanitize_error(msg, Path("."))
+    assert out == msg
+    # an absolute profiles dir IS collapsed to the label
+    out2 = baseline._sanitize_error(
+        f"state.db not found: {Path('C:/Users/someone/hermes/profiles/architect')}",
+        Path("C:/Users/someone/hermes/profiles"),
+    )
+    assert "C:" not in out2
+    assert "<profiles-dir>" in out2
+
+
+def test_unusable_state_db_errors_are_redacted(tmp_path, capsys) -> None:
+    """A corrupt state.db (sqlite error) must surface as a redacted
+    BaselineError, not a raw traceback with absolute paths."""
+    d = _make_profiles_root(tmp_path)
+    for p in ("architect", "developer", "reviewer"):
+        (d / p / "config.yaml").write_text("reasoning_effort: high\n", encoding="utf-8")
+        (d / p / "state.db").write_text("this is not a sqlite database", encoding="utf-8")
+    rc = baseline.main(["--profiles-dir", str(d)])
+    cap = capsys.readouterr()
+    assert rc != 0
+    _assert_redacted(cap.out + cap.err, tmp_path)
+    assert "Traceback" not in cap.err
+    out = json.loads(cap.out)
+    for name in ("architect", "developer", "reviewer"):
+        assert "state.db unusable in profile" in out["profiles"][name]["error"]
+        assert str(tmp_path) not in out["profiles"][name]["error"]

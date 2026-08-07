@@ -28,10 +28,11 @@ Reproducibility:
   describes exactly the bytes the aggregates were computed from.
 
 Failure semantics:
-- Any mandatory input missing (profile state.db, config.yaml, required table
-  or required allowlisted column) raises :class:`BaselineError`; ``main``
+- Any mandatory input missing or unusable (profile state.db, config.yaml, required
+  table or required allowlisted column) raises :class:`BaselineError`; ``main``
   prints the partial JSON with per-profile ``error`` entries and exits with a
-  NON-ZERO code.
+  NON-ZERO code. Error strings are sanitized to profile/input labels — never
+  absolute or machine-specific paths (redacted-output contract).
 
 Usage:
     python tools/hermes_profile_token_baseline.py [--profiles-dir DIR] [--json out.json]
@@ -43,6 +44,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -152,6 +154,30 @@ def _default_profiles_dir() -> str:
 
 def _redact(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+
+
+# Absolute-path pattern (Windows drive or UNC-ish) used to strip any
+# machine-specific path that could leak into an error string.
+_ABS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']*")
+
+
+def _sanitize_error(msg: str, base: Path) -> str:
+    """Collapse machine-specific paths in an error message to input labels.
+
+    The redacted-output contract forbids absolute / user-specific paths in
+    stdout, stderr and JSON. ``analyze_profile`` raises BaselineError with
+    profile/input labels already, but this is a structural guarantee: any
+    path that still reaches ``main`` (e.g. embedded in an unexpected
+    message) is replaced with a placeholder before emission.
+    """
+    s = str(msg)
+    for p in (base, base.resolve()):
+        repl = str(p)
+        # never use a bare "." / "" as a replacement needle: it would glob
+        # every dot in the message (e.g. "state.db")
+        if len(repl) > 1:
+            s = s.replace(repl, "<profiles-dir>")
+    return _ABS_PATH_RE.sub("<path>", s)
 
 
 # ---------------------------------------------------------------------------
@@ -357,33 +383,43 @@ def _consistent_snapshot(db: Path):
 def analyze_profile(profile_dir: Path) -> dict:
     db = profile_dir / "state.db"
     if not db.exists():
-        raise BaselineError(f"state.db not found: {db}")
+        raise BaselineError(f"state.db not found in profile {profile_dir.name}")
     cfg = profile_dir / "config.yaml"
     if not cfg.exists():
-        raise BaselineError(f"config.yaml not found: {cfg}")
+        raise BaselineError(f"config.yaml not found in profile {profile_dir.name}")
 
-    snap, journal_mode = _consistent_snapshot(db)
     try:
-        fingerprint = {
-            # sha256 of the CONSISTENT snapshot the aggregates were computed
-            # from (main file + WAL), not of the raw main file — raw main-file
-            # bytes are not a stable fingerprint under WAL.
-            "snapshot_sha256": hashlib.sha256(snap.read_bytes()).hexdigest(),
-            "snapshot_bytes": snap.stat().st_size,
-            "journal_mode": journal_mode,
-            "config_yaml_sha256": (
-                hashlib.sha256(cfg.read_bytes()).hexdigest() if cfg.exists() else None
-            ),
-        }
-        con = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
-        cur = con.cursor()
+        snap, journal_mode = _consistent_snapshot(db)
+    except sqlite3.Error as e:
+        raise BaselineError(
+            f"state.db unusable in profile {profile_dir.name}"
+        ) from e
+    try:
         try:
-            _check_schema(cur)
-            sessions = _session_summary(cur)
-            usage = _usage_summary(cur)
-            msgs = _message_summary(cur)
-        finally:
-            con.close()
+            fingerprint = {
+                # sha256 of the CONSISTENT snapshot the aggregates were computed
+                # from (main file + WAL), not of the raw main file — raw main-file
+                # bytes are not a stable fingerprint under WAL.
+                "snapshot_sha256": hashlib.sha256(snap.read_bytes()).hexdigest(),
+                "snapshot_bytes": snap.stat().st_size,
+                "journal_mode": journal_mode,
+                "config_yaml_sha256": (
+                    hashlib.sha256(cfg.read_bytes()).hexdigest() if cfg.exists() else None
+                ),
+            }
+            con = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+            cur = con.cursor()
+            try:
+                _check_schema(cur)
+                sessions = _session_summary(cur)
+                usage = _usage_summary(cur)
+                msgs = _message_summary(cur)
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            raise BaselineError(
+                f"state.db unusable in profile {profile_dir.name}"
+            ) from e
 
         # source split (kanban vs non-kanban)
         by_source = {}
@@ -466,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
 
     base = Path(args.profiles_dir)
     if not base.is_dir():
-        print(f"ERROR: profiles dir not found: {base}", file=sys.stderr)
+        print(f"ERROR: profiles dir not found: {_sanitize_error(base, base)}", file=sys.stderr)
         return 1
 
     result = {
@@ -479,8 +515,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result["profiles"][p] = analyze_profile(base / p)
         except BaselineError as e:
-            result["profiles"][p] = {"error": str(e)}
-            print(f"ERROR [{p}]: {e}", file=sys.stderr)
+            err = _sanitize_error(str(e), base)
+            result["profiles"][p] = {"error": err}
+            print(f"ERROR [{p}]: {err}", file=sys.stderr)
             exit_code = 1
 
     text = json.dumps(result, indent=2, ensure_ascii=False)

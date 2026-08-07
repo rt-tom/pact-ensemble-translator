@@ -6,6 +6,7 @@
       "profile": "architect",
       "n_sessions_total": 23,
       "all": {
+        "n_sessions": 23,
         "api_calls": {
           "count": 23,
           "sum": 1929.0,
@@ -508,6 +509,7 @@
       "profile": "developer",
       "n_sessions_total": 55,
       "all": {
+        "n_sessions": 55,
         "api_calls": {
           "count": 55,
           "sum": 3950.0,
@@ -857,6 +859,7 @@
       "profile": "reviewer",
       "n_sessions_total": 117,
       "all": {
+        "n_sessions": 117,
         "api_calls": {
           "count": 117,
           "sum": 1275.0,
