@@ -1,29 +1,57 @@
-# Hermes Profile Token Baseline — Phase 0 (scorecard)
+# Hermes Profile Token Baseline — финальный отчёт (Phase 0)
 
-> Отчёт-бейзлайн по Phase 0 плана `2026-08-06_221320-hermes-profile-token-efficiency.md`.
-> Назначение: зафиксировать измеряемое состояние потребления токенов/вызовов по
-> профилям `architect`, `developer`, `reviewer` **до** каких-либо изменений
+> Отчёт-бейзлайн Phase 0 плана `2026-08-06_221320-hermes-profile-token-efficiency.md`.
+> **Финальная версия (2-я волна, карточка t_2f3a3975)**: объединяет черновой
+> DB-анализ (`t_8954ee3d`, ветка `wt/t_8954ee3d`, RV `t_3118d37a` APPROVE) с
+> контекст-базлайном (`t_6e10923e`, ветка `wt/t_6e10923e` — AGENTS.md размер +
+> resolved CLI-тулсеты). Заменяет scorecard первой волны (снапшот 06:08Z) —
+> финальные числа на снапшоте **2026-08-07T14:23:56Z**.
+> Назначение: зафиксировать измеряемое состояние потребления токенов/вызовов
+> по профилям `architect`, `developer`, `reviewer` **до** каких-либо изменений
 > модели/reasoning/compression. Изменений конфигурации, prompts, toolsets,
 > AGENTS.md, кода или Kanban-протокола отчёт не делает — только измеряет.
 
-## 1. Вводные и метод
+## 0. Мета и fingerprint
 
 - Источник: `state.db` (таблицы `sessions`, `session_model_usage`, `messages`) и
-  `config.yaml` трёх профилей Hermes; репозиторный `AGENTS.md`.
-- Режим: строго read-only (`sqlite3` с `mode=ro`); никакие колонки с содержимым
-  (prompts, messages.content, system_prompt, title, origin_json, user_id, task,
-  billing_base_url, base_url, креды, handoff/compression-ошибки) **не читаются**.
-  Чтение — только по явным per-table allowlist'ам (`_SESSIONS_ALLOW` /
-  `_USAGE_ALLOW` в `tools/hermes_profile_token_baseline.py`), никакого
-  deny-list / SELECT-all; `messages` опрашивается фиксированными агрегатными
-  запросами по `role`/`finish_reason`/`tool_name`.
-- Инструмент воспроизводимости: `tools/hermes_profile_token_baseline.py`
-  (stdlib-only, read-only, redacted-JSON на stdout).
+  `config.yaml` трёх профилей Hermes; репозиторный `AGENTS.md`; dispatcher-
+  резолв CLI-тулсетов.
+- Снапшот: `generated_at_utc = 2026-08-07T14:23:56+00:00` (фиксированный
+  JSON-эвиденс: `docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`).
+- Контекст-базлайн (AGENTS.md + CLI-тулсеты): `tools/context_baseline.json`
+  (`measured_at_utc = 2026-08-07T07:40:00Z`, ветка `wt/t_6e10923e`, HEAD 38b1091).
+- WAL-согласованный fingerprint (sha256/размер **backup-копии** state.db через
+  SQLite backup API — main+WAL в одном согласованном состоянии, `journal_mode`):
+
+| Профиль | snapshot sha256 (первые 16) | snapshot байт | config.yaml sha256 (первые 16) |
+|---|---:|---:|---:|
+| architect | `b81479d9b7ad00bb` | 37 937 152 | `cf33d8ab1adafc00` |
+| developer | `0d2d23b4516a1b22` | 80 855 040 | `fa83b5736392d44a` |
+| reviewer | `8d97db60b6957571` | 50 274 304 | `2bb5098e41759b50` |
+
+- Все числа ниже — **измеренные** из state.db на момент снапшота. Оценки
+  помечены явно словом «оценка». Повторный запуск инструмента даст чуть другие
+  суммы (state.db живые), поэтому отчёт опирается на зафиксированный JSON-снимок.
+
+## 1. Метод
+
+- Режим: строго read-only (`sqlite3` с `mode=ro`); колонки с приватным
+  содержимым (промпты, тексты сообщений, системные промпты, заголовки,
+  идентификаторы пользователей/чатов, конфигурация биллинга, креды,
+  ошибки handoff/compression) **не читаются вовсе** — только по явным
+  per-table allowlist'ам (`_SESSIONS_ALLOW` / `_USAGE_ALLOW` в
+  `tools/hermes_profile_token_baseline.py`), никакого deny-list /
+  SELECT-all; `messages` опрашивается фиксированными агрегатными запросами
+  по `role`/`finish_reason`/`tool_name`.
+- Инструменты воспроизводимости: `tools/hermes_profile_token_baseline.py`
+  (stdlib-only, read-only, redacted-JSON на stdout) + `tools/token_analysis_derived.py`
+  (производные метрики из вывода репортёра) + `tools/context_baseline.json`
+  (контекст-базлайн).
 - Перцентили: **линейная интерполяция между ближайшими рангами (R-7)** — тот же
   метод, что `numpy.percentile` по умолчанию и `PERCENTILE.INC` в Excel.
-  Поэтому `p50` — это стандартная медиана (для чётного n — среднее двух
-  центральных значений), `p90` — стандартный интерполированный 90-й перцентиль.
-  Граничные случаи покрыты тестами (n=1, 2, 10).
+  Поэтому `p50` — стандартная медиана (для чётного n — среднее двух центральных
+  значений), `p90` — стандартный интерполированный 90-й перцентиль. Граничные
+  случаи покрыты тестами (n=1, 2, 10).
 - **Снимок и fingerprint (WAL-корректно).** state.db работает в режиме WAL, и
   хэш одного main-файла `state.db` **не** описывает то, что видит read-only
   подключение (агрегаты читают main + WAL). Репортёр сначала копирует живую БД
@@ -32,21 +60,8 @@
   **именно snapshot** и считает все агрегаты из него. `fingerprint` в evidence —
   sha256/размер этого snapshot + `journal_mode`, т.е. fingerprint и агрегаты
   относятся к одним и тем же байтам.
-- Снимок данных: `generated_at_utc = 2026-08-07T06:08:24+00:00`
-  (фиксированный JSON-эвиденс: `docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`).
-- Хэши входов на момент снимка (sha256, только метаданные; snapshot — это
-  согласованная backup-копия state.db, см. выше):
-
-| Профиль | snapshot sha256 (первые 16) | snapshot байт | config.yaml sha256 (первые 16) |
-|---|---:|---:|---:|
-| architect | `141245fc2248c357` | 31 047 680 | `b2966389abb31afc` |
-| developer | `c69a2954fb8eca90` | 77 623 296 | `fa83b5736392d44a` |
-| reviewer | `f250e23c95cf59df` | 46 575 616 | `786c415b66a22a25` |
-
-- Все числа ниже — **измеренные** из state.db на момент снимка. Оценки
-  помечены явно словом «оценка». Повторный запуск инструмента даст чуть другие
-  суммы (state.db живые, в него пишут текущие сессии), поэтому отчёт
-  опирается на зафиксированный JSON-снимок.
+- Redaction: id сессий — только sha256-префиксы (12 hex); идентификация
+  конкретных задач/чатов не выполнялась.
 
 ## 2. Сводные агрегаты по профилям (все сессии)
 
@@ -55,235 +70,337 @@
 
 | Профиль | Сессий | Вызовов (sum) | Вызовов p50/p90 | Input sum | Input p50/p90 | Output sum | Reasoning sum | Reasoning p50/p90 | Cache-read sum | Cache-write sum |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| architect | 14 | 1 678 | 26.5 / 250.2 | 5 253 728 | 78 937.5 / 1 004 216.6 | 1 258 386 | 781 379 | 12 959.5 / 106 107.6 | 327 638 677 | 285 236 |
-| developer | 51 | 3 807 | 66 / 137 | 6 076 649 | 105 913 / 190 361 | 4 637 840 | 3 459 928 | 41 484 / 143 525 | 609 940 096 | 0 |
-| reviewer | 113 | 1 182 | 8 / 17.8 | 9 941 344 | 73 091 / 146 014.8 | 566 824 | 248 194 | 958 / 5 141.4 | 83 987 712 | 0 |
+| architect | 23 | 1 929 | 21 / 176 | 6 244 902 | 74 960 / 227 858.8 | 1 574 329 | 1 010 435 | 13 148 / 83 714.2 | 357 905 685 | 285 236 |
+| developer | 55 | 3 950 | 65 / 135 | 6 310 914 | 105 902 / 185 250.2 | 4 797 403 | 3 561 184 | 40 264 / 143 410.2 | 630 367 488 | 0 |
+| reviewer | 117 | 1 275 | 9 / 19.4 | 10 574 808 | 77 606 / 147 471.2 | 613 515 | 273 323 | 1 697 / 5 464 | 91 153 152 | 0 |
 
-Ключевые производные (по суммам):
+Max по сессиям (измерено): architect — вызовы 944, input 2 944 126, output 728 031,
+reasoning 424 156; developer — вызовы 191, input 480 308, output 317 907,
+reasoning 278 196; reviewer — вызовы 42, input 273 098, output 16 337,
+reasoning 9 035. Потолок `max_turns: 500` нигде не достигается.
+
+Ключевые производные (по суммам; арифметика над измеренными суммами):
 
 | Профиль | reasoning/input | cache-read/input | output/input | вызовов на сессию (avg) |
 |---|---:|---:|---:|---:|
-| architect | 14.9 % | ~62× | 24.0 % | 120 |
-| developer | 56.9 % | ~100× | 76.3 % | 75 |
-| reviewer | 2.5 % | ~8× | 5.7 % | 10 |
+| architect | 16.2 % | ~57× | 25.2 % | 84 |
+| developer | 56.4 % | ~100× | 76.0 % | 72 |
+| reviewer | 2.6 % | ~9× | 5.8 % | 11 |
 
 ## 3. Kanban vs non-kanban (по `sessions.source`)
 
 | Профиль | source | Сессий | Вызовы | Input | Output | Reasoning | Cache-read |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| architect | desktop | 8 | 1 408 | 3 478 125 | 1 033 767 | 628 719 | 299 869 184 |
-| architect | kanban | 5 | 80 | 439 104 | 97 558 | 68 657 | 6 717 568 |
+| architect | desktop | 8 | 1 461 | 3 639 559 | 1 066 506 | 643 820 | 308 215 296 |
+| architect | kanban | 14 | 278 | 1 268 844 | 380 762 | 282 612 | 28 638 464 |
 | architect | telegram | 1 | 190 | 1 336 499 | 127 061 | 84 003 | 21 051 925 |
-| developer | kanban | 51 | 3 807 | 6 076 649 | 4 637 840 | 3 459 928 | 609 940 096 |
+| developer | kanban | 55 | 3 950 | 6 310 914 | 4 797 403 | 3 561 184 | 630 367 488 |
 | reviewer | desktop | 2 | 3 | 40 150 | 151 | 62 | 18 944 |
-| reviewer | kanban | 111 | 1 179 | 9 901 194 | 566 673 | 248 132 | 83 968 768 |
+| reviewer | kanban | 115 | 1 272 | 10 534 658 | 613 364 | 273 261 | 91 134 208 |
 
-Вывод: у developer и reviewer почти весь объём — kanban-работа. У architect
-kanban-сессии малы (5 сессий, 80 вызовов); основной объём architect — это
-desktop/telegram-сессии (в т.ч. одна большая: 891 вызов / 2,78M input).
+- **developer** — 100 % kanban (55/55 сессий). **reviewer** — 99.6 % input
+  kanban (115/117 сессий).
+- **architect** — kanban лишь 20.3 % input (14 сессий); основная масса —
+  desktop (58.3 %) и одна telegram-сессия (21.4 %); каналы смешаны, как и
+  ожидалось для профиля-«оркестратора».
 
 ## 4. Модели / провайдеры / reasoning (из `session_model_usage` + `model_config`)
 
 | Профиль | model | provider | Вызовов | Input | Output | Reasoning | Cache-read | Сессий |
-|---|---:|---|---:|---:|---:|---:|---:|---:|
-| architect | deepseek-v4-flash | opencode-go | 1 489 | 2 904 053 | 1 150 114 | 734 963 | 295 188 224 | 14 |
-| architect | deepseek-v4-flash | opencode-go (chat_completions) | 128 | 715 437 | 69 072 | 32 243 | 26 619 136 | 1 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| architect | deepseek-v4-flash | opencode-go | 1 687 | 3 733 793 | 1 433 318 | 948 918 | 317 109 120 | 23 |
+| architect | deepseek-v4-flash | opencode-go (chat_completions) | 181 | 876 871 | 101 811 | 47 344 | 34 965 248 | 1 |
 | architect | qwen3.7-plus | opencode-go (anthropic_messages) | 17 | 614 812 | 3 896 | 0 | 1 482 389 | 1 |
 | architect | gpt-5.6-terra | openai-codex (subscription_included) | 28 | 454 208 | 22 457 | 5 962 | 1 969 664 | 1 |
 | architect | mimo-v2.5 | opencode-go (chat_completions) | 7 | 339 223 | 2 897 | 1 832 | 842 496 | 1 |
 | architect | New | moa (chat_completions) | 9 | 225 995 | 9 950 | 6 379 | 1 536 768 | 1 |
-| architect | deepseek-v4-flash | auto | 109 | 139 525 | 80 359 | 58 963 | 25 472 | 19 |
+| architect | deepseek-v4-flash | auto | 137 | 149 554 | 83 786 | 62 278 | 32 896 | 23 |
 | architect | gpt-5.6-terra | auto | 3 | 111 307 | 14 179 | 0 | 0 | 2 |
 | architect | gemini-3.6-flash | — | 1 | 395 | 1 | 0 | 0 | 1 |
-| developer | deepseek-v4-flash | opencode-go | 3 807 | 6 076 649 | 4 637 840 | 3 459 928 | 609 940 096 | 51 |
-| developer | deepseek-v4-flash | auto | 485 | 160 310 | 82 571 | 73 898 | 125 952 | 51 |
+| developer | deepseek-v4-flash | opencode-go | 3 950 | 6 310 914 | 4 797 403 | 3 561 184 | 630 367 488 | 53 |
+| developer | deepseek-v4-flash | auto | 526 | 181 343 | 91 081 | 82 244 | 135 936 | 53 |
 | developer | gemini-3.6-flash | — | 1 | 374 | 0 | 0 | 0 | 1 |
+| developer | deepseek-v4-flash | — | 1 | 301 | 67 | 63 | 256 | 1 |
 | reviewer | gpt-5.6-terra | openai-codex (subscription_included) | 896 | 8 323 360 | 460 141 | 199 315 | 62 553 600 | 98 |
-| reviewer | gpt-5.6-luna | openai-codex (subscription_included) | 271 | 1 577 394 | 96 385 | 42 456 | 20 900 864 | 14 |
+| reviewer | gpt-5.6-luna | openai-codex (subscription_included) | 364 | 2 210 858 | 143 076 | 67 585 | 28 066 304 | 18 |
 | reviewer | gpt-5.6-terra | auto | 161 | 71 147 | 5 830 | 0 | 0 | 49 |
+| reviewer | gpt-5.6-luna | auto | 109 | 45 015 | 5 426 | 0 | 0 | 12 |
 | reviewer | deepseek-v4-flash | opencode-go | 15 | 40 590 | 10 298 | 6 423 | 533 248 | 1 |
-| reviewer | gpt-5.6-luna | auto | 92 | 37 279 | 4 402 | 0 | 0 | 8 |
+
+(Строки с provider `auto`/пустым mode — дубли-подписи сессий в
+`session_model_usage`; для сумм по сессиям корректна таблица `sessions`, см.
+§7 ограничения.)
+
+Наблюдаемые модели: architect/developer — deepseek-v4-flash/opencode-go (рабочая
+пара); reviewer — gpt-5.6-terra+gpt-5.6-luna/openai-codex. Внимание:
+конфиг-дефолт reviewer — gpt-5.6-luna, а доминирующая наблюдаемая —
+gpt-5.6-terra (не смешивать).
 
 Reasoning-effort, записанный в сессиях (`model_config.reasoning_config.effort`):
 
 | Профиль | medium | high |
 |---|---:|---:|
-| architect | 4 | 10 |
-| developer | 51 | 0 |
-| reviewer | 1 | 112 |
+| architect | 4 | 19 |
+| developer | 55 | 0 |
+| reviewer | 1 | 116 |
 
 (Настроенные дефолты из `config.yaml`: developer `reasoning_effort: medium`;
 architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: [bfl]`
-у всех; `platform_toolsets.cli` — см. §6.)
+у всех.)
 
-## 5. Сигналы завершения / reclaim / cancellation (где доступно)
+## 5. Сигналы завершения / reclaim / cancellation
 
-- `sessions.end_reason`: у architect 13× NULL + 1× `ws_orphan_reap`;
-  developer 51× NULL; reviewer 111× NULL + 2× `ws_orphan_reap`.
-  В state.db более детальных меток reclaim/cancellation для kanban-задач нет —
-  они живут в `kanban.db` (вне скоупа этой карточки), см. ограничения.
+- `sessions.end_reason`: architect — 22× NULL + 1× `ws_orphan_reap`; developer —
+  55× NULL; reviewer — 114× NULL + 1× `agent_close` + 2× `ws_orphan_reap`.
+  Детальных меток reclaim/cancellation для kanban-задач в state.db **нет** (они
+  живут в `kanban.db` — вне разрешённых входов этой карточки).
 - `messages.finish_reason` (по всем сообщениям):
 
 | Профиль | stop | tool_calls | length | (null) |
 |---|---:|---:|---:|---:|
-| architect | 319 | 1 743 | 0 | 2 331 |
-| developer | 50 | 3 863 | 1 | 4 413 |
-| reviewer | 113 | 1 068 | 0 | 2 624 |
+| architect | 334 | 1 979 | 0 | 2 647 |
+| developer | 52 | 4 004 | 1 | 4 580 |
+| reviewer | 117 | 1 155 | 0 | 2 793 |
 
-  Один `finish_reason='length'` у developer — единственный зафиксированный
-  признак обрезанного ответа (внутри 51 сессии); систематического тренда нет.
+  Один `finish_reason='length'` у developer — единственный признак обрезанного
+  ответа (на 117+ сессий всех профилей). Систематического reclaim/обрезания по
+  state.db **не видно**; вывод «нет систематического вклада» — отсутствие
+  сигнала в разрешённом источнике, а не доказательство отсутствия (§7).
+- Top-tools (counts, измерено): у всех доминирует `terminal` (arch 1 703,
+  dev 2 570, rev 1 281); developer — инструментальная работа (`patch` 565,
+  `read_file` 771); reviewer — чтение/kanban (`skill_view` 337, `kanban_show` 214,
+  `kanban_comment` 101, `kanban_block` 70, `kanban_complete` 50); architect —
+  тоже kanban-инструменты среди top-10 (`kanban_show` 42, `skill_view` 40).
 
-## 6. Текущий resolved CLI-toolset и размер AGENTS.md
+## 6. Контекст-базлайн: resolved CLI-тулсеты и AGENTS.md
 
-- `platform_toolsets.cli` из `config.yaml` (это и есть диспетчерский resolved
-  toolset для worker'ов):
-  - **developer**: 10 тулсетов — file, terminal, kanban, skills, web, todo,
-    memory, session_search, code_execution, delegation;
-  - **reviewer**: 10 тулсетов — тот же список;
-  - **architect**: 14 тулсетов — browser, clarify, code_execution, cronjob,
-    delegation, file, kanban, memory, session_search, skills, terminal, todo,
-    vision, web.
-- У всех: `delegation.max_iterations: 50`, filesystem checkpoints включены,
-  `compression` идентичен (enabled, threshold 0.5, target_ratio 0.2,
-  protect_last_n 20, proactive_prune_tokens 0), `prompt_caching.cache_ttl: 5m`.
-- **AGENTS.md (измерено):** 19 073 байта / 15 507 UTF-8 символов / 288 строк;
-  sha256 `0495d94b28dd10ccec3178bc2480017433164acd0c8a7d17f9dbedc8567686a8`.
-  Оценка токенов (по 4/3 символа на токен): ≈ 3 876–5 169 токенов на сессию
-  холодного старта — это константный вклад в static context каждого worker-раза.
+Измерено `t_6e10923e` (дифф-фёрст, только чтение; источник —
+`tools/context_baseline.json`).
 
-## 7. Top-5 сессий по input и по reasoning (id ред. — sha256 префикс)
+- **Resolved CLI-тулсеты** (путь разрешения тот же, что у диспетчера:
+  `hermes_cli.kanban_db._resolve_worker_cli_toolsets(<profile_dir>)`; источник —
+  `config.yaml` → `platform_toolsets.cli` (явный список) минус
+  `agent.disabled_toolsets` = `[bfl]`):
+  - **architect: 14** — browser, clarify, code_execution, cronjob, delegation,
+    file, kanban, memory, session_search, skills, terminal, todo, vision, web;
+  - **developer: 10** — code_execution, delegation, file, kanban, memory,
+    session_search, skills, terminal, todo, web;
+  - **reviewer: 10** — тот же список, что developer.
+- Прочее из `config.yaml` (одинаково у всех): `delegation.max_iterations: 50`,
+  filesystem checkpoints включены, `compression` идентичен (enabled,
+  threshold 0.5, target_ratio 0.2, protect_last_n 20, proactive_prune_tokens 0),
+  `prompt_caching.cache_ttl: 5m`.
+- **AGENTS.md (измерено, HEAD 38b1091 == HEAD ветки отчёта):**
+  - 19 073 байта / 15 507 UTF-8 символов / 287 строк (splitlines; `wc -l`
+    согласуется; с хвостовым newline `len(split('\n'))` = 288);
+  - sha256 `0495d94b28dd10ccec3178bc2480017433164acd0c8a7d17f9dbedc8567686a8`;
+  - оценка токенов (по 4/3 символа на токен, НЕ токенизатором): ≈ 3.9–5.2K
+    токенов на сессию холодного старта — константный вклад в static context
+    каждого worker-раза.
+
+## 7. Top-5 сессий по input и по reasoning (id — sha256-префиксы)
 
 ### architect
 | метрика | id (ред.) | source | model | effort | вызовов | msgs | tools | input | reasoning |
 |---|---|---:|---|---:|---:|---:|---:|---:|---:|
-| input | `593a124a2054` | desktop | gpt-5.6-terra | medium | 891 | 232 | 112 | 2 782 692 | 409 055 |
+| input | `593a124a2054` | desktop | deepseek-v4-flash | medium | 944 | 339 | 158 | 2 944 126 | 424 156 |
 | input | `58df02b27639` | telegram | deepseek-v4-flash | medium | 190 | 409 | 188 | 1 336 499 | 84 003 |
 | input | `d4840b0674be` | desktop | deepseek-v4-flash | medium | 120 | 271 | 135 | 228 891 | 49 562 |
 | input | `005c62b0d947` | desktop | deepseek-v4-flash | high | 276 | 555 | 263 | 223 730 | 115 581 |
-| input | `cb9a9389584a` | kanban | deepseek-v4-flash | high | 40 | 97 | 56 | 145 358 | 33 231 |
-| reasoning | `593a124a2054` | desktop | gpt-5.6-terra | medium | 891 | 232 | 112 | 2 782 692 | 409 055 |
+| input | `67aaa81efd8e` | kanban | deepseek-v4-flash | high | 58 | 133 | 74 | 165 418 | 82 559 |
+| reasoning | `593a124a2054` | desktop | deepseek-v4-flash | medium | 944 | 339 | 158 | 2 944 126 | 424 156 |
 | reasoning | `005c62b0d947` | desktop | deepseek-v4-flash | high | 276 | 555 | 263 | 223 730 | 115 581 |
 | reasoning | `58df02b27639` | telegram | deepseek-v4-flash | medium | 190 | 409 | 188 | 1 336 499 | 84 003 |
-| reasoning | `d4840b0674be` | desktop | deepseek-v4-flash | medium | 120 | 271 | 135 | 228 891 | 49 562 |
-| reasoning | `cb9a9389584a` | kanban | deepseek-v4-flash | high | 40 | 97 | 56 | 145 358 | 33 231 |
+| reasoning | `67aaa81efd8e` | kanban | deepseek-v4-flash | high | 58 | 133 | 74 | 165 418 | 82 559 |
+| reasoning | `49ba52d34a62` | kanban | deepseek-v4-flash | high | 31 | 68 | 36 | 147 597 | 55 956 |
 
 ### developer (все — kanban)
-| метрика | id (ред.) | model | effort | вызовов | msgs | tools | input | reasoning |
-|---|---|---:|---|---:|---:|---:|---:|---:|
-| input | `c6f8d9f3f41e` | deepseek-v4-flash | medium | 191 | 235 | 116 | 480 308 | 228 105 |
-| input | `daead227a833` | deepseek-v4-flash | medium | 28 | 63 | 34 | 252 771 | 12 494 |
-| input | `f83ecd9fd0ab` | deepseek-v4-flash | medium | 111 | 233 | 121 | 215 899 | 227 140 |
-| input | `22852dba5dd9` | deepseek-v4-flash | medium | 169 | 345 | 175 | 205 670 | 231 941 |
-| input | `1ff0305ac249` | deepseek-v4-flash | medium | 129 | 283 | 153 | 192 401 | 38 743 |
-| reasoning | `21a16f144d54` | deepseek-v4-flash | medium | 137 | 291 | 153 | 168 618 | 278 196 |
-| reasoning | `22852dba5dd9` | deepseek-v4-flash | medium | 169 | 345 | 175 | 205 670 | 231 941 |
-| reasoning | `c6f8d9f3f41e` | deepseek-v4-flash | medium | 191 | 235 | 116 | 480 308 | 228 105 |
-| reasoning | `f83ecd9fd0ab` | deepseek-v4-flash | medium | 111 | 233 | 121 | 215 899 | 227 140 |
-| reasoning | `8b6b152f8627` | deepseek-v4-flash | medium | 125 | 253 | 127 | 176 453 | 191 985 |
+| метрика | id (ред.) | source | model | effort | вызовов | msgs | tools | input | reasoning |
+|---|---|---:|---|---:|---:|---:|---:|---:|---:|
+| input | `c6f8d9f3f41e` | kanban | deepseek-v4-flash | medium | 191 | 235 | 116 | 480 308 | 228 105 |
+| input | `daead227a833` | kanban | deepseek-v4-flash | medium | 28 | 63 | 34 | 252 771 | 12 494 |
+| input | `f83ecd9fd0ab` | kanban | deepseek-v4-flash | medium | 111 | 233 | 121 | 215 899 | 227 140 |
+| input | `22852dba5dd9` | kanban | deepseek-v4-flash | medium | 169 | 345 | 175 | 205 670 | 231 941 |
+| input | `1ff0305ac249` | kanban | deepseek-v4-flash | medium | 129 | 283 | 153 | 192 401 | 38 743 |
+| reasoning | `21a16f144d54` | kanban | deepseek-v4-flash | medium | 137 | 291 | 153 | 168 618 | 278 196 |
+| reasoning | `22852dba5dd9` | kanban | deepseek-v4-flash | medium | 169 | 345 | 175 | 205 670 | 231 941 |
+| reasoning | `c6f8d9f3f41e` | kanban | deepseek-v4-flash | medium | 191 | 235 | 116 | 480 308 | 228 105 |
+| reasoning | `f83ecd9fd0ab` | kanban | deepseek-v4-flash | medium | 111 | 233 | 121 | 215 899 | 227 140 |
+| reasoning | `8b6b152f8627` | kanban | deepseek-v4-flash | medium | 125 | 253 | 127 | 176 453 | 191 985 |
 
 ### reviewer (все — kanban)
-| метрика | id (ред.) | model | effort | вызовов | msgs | tools | input | reasoning |
-|---|---|---:|---|---:|---:|---:|---:|---:|
-| input | `fc111add0304` | gpt-5.6-terra | high | 14 | 48 | 33 | 269 814 | 6 437 |
-| input | `169b5fc67904` | gpt-5.6-terra | high | 14 | 50 | 35 | 231 563 | 2 974 |
-| input | `94404d816383` | gpt-5.6-luna | high | 42 | 93 | 50 | 208 991 | 6 933 |
-| input | `e2cdcf50cd64` | gpt-5.6-luna | high | 18 | 54 | 35 | 200 314 | 3 967 |
-| input | `b28084d3e685` | gpt-5.6-terra | high | 12 | 50 | 37 | 187 230 | 4 912 |
-| reasoning | `a95bca0fd1d2` | gpt-5.6-terra | high | 14 | 47 | 32 | 120 405 | 8 351 |
-| reasoning | `aff3995f3a75` | gpt-5.6-terra | high | 18 | 49 | 30 | 145 114 | 8 007 |
-| reasoning | `2161ec3b77b2` | gpt-5.6-luna | high | 29 | 80 | 50 | 178 533 | 7 893 |
-| reasoning | `94404d816383` | gpt-5.6-luna | high | 42 | 93 | 50 | 208 991 | 6 933 |
-| reasoning | `fc111add0304` | gpt-5.6-terra | high | 14 | 48 | 33 | 269 814 | 6 437 |
+| метрика | id (ред.) | source | model | effort | вызовов | msgs | tools | input | reasoning |
+|---|---|---:|---|---:|---:|---:|---:|---:|---:|
+| input | `cd8e21a9de49` | kanban | gpt-5.6-luna | high | 29 | 85 | 55 | 273 098 | 6 446 |
+| input | `fc111add0304` | kanban | gpt-5.6-terra | high | 14 | 48 | 33 | 269 814 | 6 437 |
+| input | `169b5fc67904` | kanban | gpt-5.6-terra | high | 14 | 50 | 35 | 231 563 | 2 974 |
+| input | `94404d816383` | kanban | gpt-5.6-luna | high | 42 | 93 | 50 | 208 991 | 6 933 |
+| input | `e2cdcf50cd64` | kanban | gpt-5.6-luna | high | 18 | 54 | 35 | 200 314 | 3 967 |
+| reasoning | `9a8cd2457056` | kanban | gpt-5.6-luna | high | 20 | 52 | 33 | 133 306 | 9 035 |
+| reasoning | `a95bca0fd1d2` | kanban | gpt-5.6-terra | high | 14 | 47 | 32 | 120 405 | 8 351 |
+| reasoning | `aff3995f3a75` | kanban | gpt-5.6-terra | high | 18 | 49 | 30 | 145 114 | 8 007 |
+| reasoning | `2161ec3b77b2` | kanban | gpt-5.6-luna | high | 29 | 80 | 50 | 178 533 | 7 893 |
+| reasoning | `94404d816383` | kanban | gpt-5.6-luna | high | 42 | 93 | 50 | 208 991 | 6 933 |
 
-## 8. Что доминирует в расходах (драйверы)
+## 8. Дрейф между снапшотами (06:08Z первая волна → 14:23:56Z этот снапшот)
 
-- **developer**: reasoning — 56.9 % от input (3.5M из 6.1M), output — 76.3 % от
-  input; длинные «нормальные» сессии: p50 66 / p90 137 вызовов, max 191
-  (потолок `max_turns: 500` не достигается). Драйвер — глубина reasoning +
-  tool-петли (tool_calls finish 3 863 против 50 stop; top-tool terminal 2 462).
-- **reviewer**: наоборот — reasoning всего 2.5 % input; объём создаётся
-  **повторяемым статическим контекстом** (короткие сессии: p50 8 / p90 17.8
-  вызовов, но p50 input 73 091): kanban worker-контекст + skills + AGENTS.md
-  загружаются на каждый раз. Cache-read всего ~8× input — контекст в основном
-  не кэширован между короткими сессиями.
-- **architect**: смешанно; основную массу дают **не-kanban** длинные сессии
-  (одна desktop-сессия 891 вызов / 2,78M input), kanban-часть мала. Reasoning
-  14.9 % input.
-- Дубли/реclaim-циклы в state.db не видны (см. ограничения); по видимым данным
-  систематического вклада retry/reclaim нет (end_reason почти весь NULL, один
-  `length`).
+| Профиль | Сессий | Вызовов | Input | Δ вызовов | Δ input |
+|---|---:|---:|---:|---:|---:|
+| architect | 14 → 23 | 1 678 → 1 929 | 5.25M → 6.24M | +15.0 % | +18.9 % |
+| developer | 51 → 55 | 3 807 → 3 950 | 6.08M → 6.31M | +3.8 % | +3.9 % |
+| reviewer | 113 → 117 | 1 182 → 1 275 | 9.94M → 10.57M | +7.9 % | +6.4 % |
 
-## 9. Ограничения
+Рост за ~8 ч ожидаем (активные сессии пишутся). architect вырос сильнее всех —
+за счёт длинных desktop/telegram-сессий (см. §3), а не kanban-части.
 
-1. **Доллары не выводятся.** Все `estimated_cost_usd`/`actual_cost_usd` = 0,
-   `cost_source='none'`/`cost_status=unknown|included|None`. Из нулевых полей
-   стоимости фактический USD-биллинг **не выводится**; приведённые токены —
-   метрика объёма, а не денег.
-2. **Cache-read токены — не «бесплатные».** Они записаны как отдельная
-   категория; тарификация cache-чтений зависит от провайдера и здесь не
-   известна. Отчёт не утверждает, что cache-read ничего не стоят.
-3. `messages.token_count` в базе не заполнен (0 строк > 0) — поминутная
-   атрибуция токенов по сообщениям невозможна; надёжный слой — агрегаты
+## 9. Доминирующие драйверы (ИНТЕРПРЕТАЦИЯ поверх измеренных данных)
+
+Ниже — аналитические выводы. Числа — измеренные (§2–§7); причинно-следственная
+привязка «что именно генерирует объём» — интерпретация, помечена как таковая.
+
+1. **developer — reasoning + инструментальные циклы (нормальная длинная работа).**
+   Reasoning = 56.4 % input (3.56M из 6.31M); output = 76 % input, но видимый
+   текст — лишь 25.8 % output → ~3/4 output-токенов это reasoning. Tool-петли:
+   `tool_calls` finish_reason 4 004 против 52 `stop` (≈98.7 %); top-tools —
+   terminal/patch/read_file. Cache-read ÷ input = 99.9× — длинные сессии
+   (p50 65 вызовов) активно переиспользуют кэшированный префикс. Потолок
+   `max_turns: 500` не достигается (max 191) → это «нормальная длинная
+   kanban-работа», а не обрыв/ретраи. Кандидат для Phase 2 (политика reasoning
+   на задачу): снижение reasoning напрямую режет и output, и input.
+2. **reviewer — повторяемый статический контекст на каждую сессию.**
+   Короткие сессии (p50 9 вызовов, p90 19.4), но высокий p50 input 77 606 →
+   ~8.6K токенов на вызов в среднем (оценка: p50 input ÷ p50 вызовов).
+   Reasoning всего 2.6 % input — объём создаёт НЕ думание, а повторяемую
+   загрузку контекста (AGENTS.md ≈ 3.9–5.2K токенов на сессию, skills —
+   `skill_view` 337 вызовов, kanban-контекст — `kanban_show` 214). Cache-read ÷
+   input всего 8.6× — между короткими сессиями кэш почти не переиспользуется
+   (каждая ревью-сессия стартует холодно). Крупнейший рычаг Phase 1
+   (компактный AGENTS.md): 115 kanban-сессий × повторяемый префикс.
+3. **architect — смешанно; масса уходит в не-kanban длинные сессии.**
+   Kanban-часть мала (20.3 % input, 14 сессий). Основной объём — desktop
+   (58.3 %) и одна telegram-сессия (21.4 %); одна desktop-сессия
+   `593a124a2054` = 2.94M input (47 % всего input профиля) при 944 вызовах —
+   нормальная длинная интерактивная работа, не kanban-воркер. Reasoning
+   16.2 % input. Для kanban-эффективности architect вторичен; его объём — это
+   сессии владельца/оркестрации.
+4. **Дубли/реclaim/retry-циклы — в state.db не видны.** По разрешённым данным
+   систематического вклада нет: end_reason почти весь NULL, единственный
+   `length`, один `agent_close`, три `ws_orphan_reap`. Если нужно
+   подтвердить/исключить вклад reclaim-циклов — источник `kanban.db` (вне
+   разрешённых входов этой карточки).
+5. **Cache-write почти нулевой** (285 236 только у architect, в telegram-сессии) —
+   измеренный факт; интерпретация: провайдеры-рантаймы (opencode-go/codex) не
+   сообщают cache_write на большинстве вызовов; это НЕ значит, что кэш не
+   пишется.
+
+## 10. Доступность стоимости
+
+**USD-биллинг из нулевых cost-полей не выводится.** Все
+`estimated_cost_usd`/`actual_cost_usd` = 0 (`cost_fields_nonzero_anywhere: false`),
+`cost_source='none'`/`cost_status=unknown|included|None`. Приведённые токены —
+метрика объёма, а не денег. **Cache-read токены не называются бесплатными**:
+они записаны отдельной категорией, тарификация cache-чтений зависит от
+провайдера и здесь не известна (у reviewer — `subscription_included`, но из
+нулевых cost-полей стоимость не выводится).
+
+## 11. Разделение measured / assumptions
+
+**Measured (измерено):** все суммы/p50/p90/max токенов и вызовов, распределения
+source/effort/end_reason/finish_reason, топ-инструменты, разбивки по моделям,
+cache-соотношения (арифметика над измеренными суммами), дрейф между снапшотами,
+размер/хэш AGENTS.md, resolved CLI-тулсеты.
+
+**Assumptions (оценки/интерпретации):**
+- «Видимый текст = output − reasoning» — по спецификации §9.10 (reasoning входит
+  в output); арифметическое тождество, не прямое измерение видимых токенов.
+- «~8.6K токенов на вызов у reviewer» — p50 input ÷ p50 вызовов (грубая оценка).
+- AGENTS.md ≈ 3.9–5.2K токенов — по 4/3 символа на токен (не токенизатором).
+- Причинная привязка драйверов (§9) — интерпретация паттернов, не измерение.
+- «Cache-read ÷ input» — соотношение объёмов, НЕ утверждение о бесплатности.
+
+## 12. Ограничения
+
+1. **Доллары не выводятся.** Все cost-поля = 0 → фактический USD-биллинг **не
+   выводится**; токены — метрика объёма, не денег.
+2. **Cache-read токены — не «бесплатные».** Тарификация cache-чтений зависит от
+   провайдера и здесь не известна.
+3. `messages.token_count` в базе не заполнен (0 строк > 0) — поминутная/
+   по-сообщённая атрибуция токенов невозможна; надёжный слой — агрегаты
    сессий/моделей.
-4. В `session_model_usage` есть «дубли» по провайдеру `auto` (например,
-   developer: opencode-go 3 807 + auto 485) — одна сессия может быть записана
-   под несколькими (model, provider); для итогов по сессиям корректна таблица
-   `sessions`.
-5. Reclaim/cancellation-метки kanban-задач живут в `kanban.db` — вне
-   разрешённых входов этой карточки; по state.db видны только `end_reason` и
-   `finish_reason`.
+4. В `session_model_usage` есть «дубли» по провайдеру `auto` (одна сессия может
+   быть записана под несколькими (model, provider)); для итогов по сессиям
+   корректна таблица `sessions`.
+5. Reclaim/cancellation-метки kanban-задач живут в `kanban.db` (board) — вне
+   разрешённых входов; по state.db видны только `end_reason` и `finish_reason`.
 6. state.db живые: суммы дрейфуют со временем; зафиксирован JSON-снимок
-   (`HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`) и хэши входов.
+   (fingerprint внутри, `generated_at_utc`).
 7. **Fingerprint — это snapshot, а не сырой main-файл.** state.db работает в
    WAL; `fingerprint.snapshot_sha256` — sha256 согласованной backup-копии
-   (main + WAL), из которой реально посчитаны агрегаты. Хэш одного
-   `state.db` до чтения не был бы согласован с агрегатами и потому не
-   используется; повторные запуски дают новый snapshot (дрейф данных).
+   (main + WAL), из которой реально посчитаны агрегаты. Хэш одного `state.db`
+   до чтения не был бы согласован с агрегатами и потому не используется;
+   повторные запуски дают новый snapshot (дрейф данных).
 8. Идентификация сессий — ред. sha256-префиксы; сопоставление с конкретными
    задачами/чатами не выполнялось и в отчёте не записано.
-9. Активный чат-рантайм (gpt-5.6-terra/openai-codex) — это текущая сессия
-   владельца, а не воркер-использование; воркер-профили разбираются по своим
-   state.db (см. §4).
+9. Конфиг-дефолт ≠ доминирующая наблюдаемая модель (reviewer: config
+   gpt-5.6-luna, наблюдаемая gpt-5.6-terra) — не смешивать.
+10. `reasoning_config.effort` отсутствует в части строк model_config
+    (architect: 4 medium записаны явно, остальное high) — при отсутствии NULL,
+    не подставлять.
+11. Длительность: у живых сессий `ended_at` NULL → в duration-метрики не
+    включались (в этой карточке длительность не считалась).
+12. `output_tokens` включает reasoning (developer ~74 % output — reasoning);
+    видимый текст ≈ output − reasoning.
+13. Активный чат-рантайм (gpt-5.6-terra/openai-codex) — это текущая сессия
+    владельца, а не воркер-использование; воркер-профили разбираются по своим
+    state.db (см. §4).
 
-## 10. Рекомендация: ОДИН обратимый пилот
+## 13. Рекомендация: ОДИН обратимый пилот
 
 **Пилот: Phase 1 — компактный authoritative project context (AGENTS.md).**
 
 Обоснование по данным:
 - Наибольший устойчивый вклад в input у **reviewer** — повторяемый статический
-  контекст (97.5 % input не-reasoning; p50 input 73 091 при p50 8 вызовах).
-  `AGENTS.md` ≈ 3 876–5 169 токенов загружается на каждую сессию всех трёх
-  профилей; это измеряемый, полностью обратимый docs-only рычаг.
-- У **developer** доминирует reasoning (56.9 % input) — это кандидат на
-  Phase 2 (per-task reasoning policy), но Phase 2 меняет политику reasoning и
-  требует базы из Phase 1 для сравнения; поэтому в качестве первого пилота
-  выбирается только Phase 1.
-- Phase 1 — docs-only: коммит в git, откат = revert; не трогает model/reasoning/
-  compression-дефолты, toolsets, prompts, cache, Kanban-протокол.
+  контекст (97.4 % input не-reasoning; p50 input 77 606 при p50 9 вызовах;
+  cache-read лишь 8.6× input — холодные старты). `AGENTS.md` ≈ 3.9–5.2K токенов
+  загружается на каждую сессию всех трёх профилей; это измеряемый, полностью
+  обратимый docs-only рычаг.
+- У **developer** доминирует reasoning (56.4 % input) — кандидат на Phase 2
+  (per-task reasoning policy), но Phase 2 меняет политику reasoning и требует
+  базы из Phase 1 для сравнения; поэтому в качестве первого пилота выбирается
+  только Phase 1.
+- Phase 1 — docs-only: коммит в git, откат = revert; не трогает
+  model/reasoning/compression-дефолты, toolsets, prompts, cache, Kanban-протокол.
 
 Критерий перехода: после Phase 1 замерить тот же бейзлайн тем же инструментом и
 сравнить input/p50/p90; если сжатие AGENTS.md без потери правил даст
-материальное снижение повторяемого контекста — переходить к Phase 2
-(reasoning) как второму пилоту, снова через I+RV-цикл.
+материальное снижение повторяемого контекста — переходить к Phase 2 (reasoning)
+как второму пилоту, снова через I+RV-цикл. Никаких других пилотов в этой фазе
+не предлагается (ровно один).
 
-## 11. Проверка (команды)
+## 14. Воспроизводимость (команды)
 
 ```text
-# воспроизведение JSON-эвиденса (новый согласованный WAL-snapshot; суммы
-# чуть дрейфуют — state.db живые; fingerprint в evidence описывает именно
-# тот snapshot, из которого посчитаны агрегаты):
-C:\Python314\python.exe tools\hermes_profile_token_baseline.py --json out.json
+# 1) свежий согласованный WAL-снапшот (суммы чуть дрейфуют — fingerprint в
+#    evidence описывает именно тот snapshot, из которого посчитаны агрегаты):
+C:\Python314\python.exe tools\hermes_profile_token_baseline.py --json live.json
 
-# хэш/размер AGENTS.md (PowerShell):
+# 2) производные метрики из вывода репортёра:
+C:\Python314\python.exe tools\token_analysis_derived.py live.json
+
+# 3) структурная сверка отчёта с evidence (таблицы, top-5, производные,
+#    fingerprint; --self-test доказывает, что подмена числа из другого
+#    профиля обнаруживается):
+C:\Python314\python.exe tools\verify_baseline_report.py
+C:\Python314\python.exe tools\verify_baseline_report.py --self-test
+
+# 4) размер/хэш AGENTS.md (PowerShell):
 Get-FileHash AGENTS.md -Algorithm SHA256
 (Get-Item AGENTS.md).Length                        # 19073 байт
 (Get-Content AGENTS.md -Raw).Length                # 15507 UTF-8 символов
 
-# структурная сверка отчёта с evidence (таблицы, top-5, производные,
-# fingerprint; --self-test доказывает, что подмена числа из другого профиля
-# обнаруживается):
-C:\Python314\python.exe tools\verify_baseline_report.py
-C:\Python314\python.exe tools\verify_baseline_report.py --self-test
-
-# итоги по профилям — см. docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json
+# 5) redaction-check по evidence/отчёту: 0 совпадений с запрещёнными
+#    паттернами спека (имена приватных колонок/секретов — см. §1)
 ```
+
+Итоговые агрегаты — в `docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`;
+контекст-базлайн — в `tools/context_baseline.json`.

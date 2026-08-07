@@ -409,7 +409,7 @@ def _insert_row_after(md: str, needle: str, new_row: str) -> str:
 
 def test_verifier_detects_missing_profile_row(committed_evidence, committed_report) -> None:
     """Deleting a whole profile row from the main aggregate table is caught."""
-    mutated = _drop_row(committed_report, "| architect | 14 | 1 678 |")
+    mutated = _drop_row(committed_report, "| architect | 23 | 1 929 |")
     problems = verify.check_report(mutated, committed_evidence)
     assert problems, "deleting the architect aggregate row was NOT detected"
     assert any("missing" in p and "architect" in p for p in problems)
@@ -417,7 +417,7 @@ def test_verifier_detects_missing_profile_row(committed_evidence, committed_repo
 
 def test_verifier_detects_missing_fingerprint_row(committed_evidence, committed_report) -> None:
     """Deleting a whole fingerprint row (reviewer) is caught."""
-    mutated = _drop_row(committed_report, "| reviewer | `f250e23c95cf59df`")
+    mutated = _drop_row(committed_report, "| reviewer | `8d97db60b6957571`")
     problems = verify.check_report(mutated, committed_evidence)
     assert problems, "deleting the reviewer fingerprint row was NOT detected"
     assert any("missing" in p and "reviewer" in p for p in problems)
@@ -443,9 +443,9 @@ def test_verifier_detects_duplicate_profile_row(committed_evidence, committed_re
     """Duplicating an existing aggregate row (architect) is caught."""
     arch_line = next(
         l for l in committed_report.splitlines()
-        if l.lstrip().startswith("|") and "| architect | 14 | 1 678 |" in l
+        if l.lstrip().startswith("|") and "| architect | 23 | 1 929 |" in l
     )
-    mutated = _insert_row_after(committed_report, "| architect | 14 | 1 678 |", arch_line)
+    mutated = _insert_row_after(committed_report, "| architect | 23 | 1 929 |", arch_line)
     problems = verify.check_report(mutated, committed_evidence)
     assert problems, "duplicating the architect aggregate row was NOT detected"
     assert any("duplicate" in p and "architect" in p for p in problems)
@@ -454,7 +454,7 @@ def test_verifier_detects_duplicate_profile_row(committed_evidence, committed_re
 def test_verifier_detects_extra_profile_row(committed_evidence, committed_report) -> None:
     """An extra row for a profile unknown to the evidence is caught."""
     fake = "| admin | 1 | 1 | 1 / 1 | 1 | 1 / 1 | 1 | 1 | 1 / 1 | 1 | 1 |"
-    mutated = _insert_row_after(committed_report, "| architect | 14 | 1 678 |", fake)
+    mutated = _insert_row_after(committed_report, "| architect | 23 | 1 929 |", fake)
     problems = verify.check_report(mutated, committed_evidence)
     assert problems, "an extra unknown profile row in the aggregate table was NOT detected"
     assert any("extra" in p and "admin" in p for p in problems)
