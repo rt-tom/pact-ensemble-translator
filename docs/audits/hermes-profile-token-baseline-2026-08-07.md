@@ -1,9 +1,8 @@
 # Hermes Profile Token Baseline — финальный отчёт (Phase 0)
 
 > Отчёт-бейзлайн Phase 0 плана `2026-08-06_221320-hermes-profile-token-efficiency.md`.
-> **Финальная версия (2-я волна, карточка t_2f3a3975)**: объединяет черновой
-> DB-анализ (`t_8954ee3d`, ветка `wt/t_8954ee3d`, RV `t_3118d37a` APPROVE) с
-> контекст-базлайном (`t_6e10923e`, ветка `wt/t_6e10923e` — AGENTS.md размер +
+> **Финальная версия (2-я волна)**: объединяет черновой
+> DB-анализ (RV APPROVE) с контекст-базлайном (AGENTS.md размер +
 > resolved CLI-тулсеты). Заменяет scorecard первой волны (снапшот 06:08Z) —
 > финальные числа на снапшоте **2026-08-07T14:23:56Z**.
 > Назначение: зафиксировать измеряемое состояние потребления токенов/вызовов
@@ -19,7 +18,8 @@
 - Снапшот: `generated_at_utc = 2026-08-07T14:23:56+00:00` (фиксированный
   JSON-эвиденс: `docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`).
 - Контекст-базлайн (AGENTS.md + CLI-тулсеты): `tools/context_baseline.json`
-  (`measured_at_utc = 2026-08-07T07:40:00Z`, ветка `wt/t_6e10923e`, HEAD 38b1091).
+  (`measured_at_utc = 2026-08-07T17:30:05Z`, ветка — Phase 0 branch,
+  HEAD `d1eeafb7405ba72ac348746f2dcc4f94d3c05a06`).
 - WAL-согласованный fingerprint (sha256/размер **backup-копии** state.db через
   SQLite backup API — main+WAL в одном согласованном состоянии, `journal_mode`):
 
@@ -153,7 +153,7 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
 - `sessions.end_reason`: architect — 22× NULL + 1× `ws_orphan_reap`; developer —
   55× NULL; reviewer — 114× NULL + 1× `agent_close` + 2× `ws_orphan_reap`.
   Детальных меток reclaim/cancellation для kanban-задач в state.db **нет** (они
-  живут в `kanban.db` — вне разрешённых входов этой карточки).
+  живут в `kanban.db` — вне разрешённых входов этого отчёта).
 - `messages.finish_reason` (по всем сообщениям):
 
 | Профиль | stop | tool_calls | length | (null) |
@@ -174,8 +174,8 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
 
 ## 6. Контекст-базлайн: resolved CLI-тулсеты и AGENTS.md
 
-Измерено `t_6e10923e` (дифф-фёрст, только чтение; источник —
-`tools/context_baseline.json`).
+Измерено на HEAD ветки отчёта (Phase 0 branch, `git show HEAD:AGENTS.md` —
+только чтение; источник — `tools/context_baseline.json`).
 
 - **Resolved CLI-тулсеты** (путь разрешения тот же, что у диспетчера:
   `hermes_cli.kanban_db._resolve_worker_cli_toolsets(<profile_dir>)`; источник —
@@ -190,11 +190,12 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
   filesystem checkpoints включены, `compression` идентичен (enabled,
   threshold 0.5, target_ratio 0.2, protect_last_n 20, proactive_prune_tokens 0),
   `prompt_caching.cache_ttl: 5m`.
-- **AGENTS.md (измерено, HEAD 38b1091 == HEAD ветки отчёта):**
-  - 19 073 байта / 15 507 UTF-8 символов / 287 строк (splitlines; `wc -l`
-    согласуется; с хвостовым newline `len(split('\n'))` = 288);
-  - sha256 `0495d94b28dd10ccec3178bc2480017433164acd0c8a7d17f9dbedc8567686a8`;
-  - оценка токенов (по 4/3 символа на токен, НЕ токенизатором): ≈ 3.9–5.2K
+- **AGENTS.md (измерено, HEAD `d1eeafb7405ba72ac348746f2dcc4f94d3c05a06` == HEAD
+  ветки отчёта; содержимое == origin/main — Phase-0 коммиты AGENTS.md не меняют):**
+  - 20 456 байт / 16 438 UTF-8 символов / 300 строк (splitlines; `wc -l`
+    согласуется; с хвостовым newline `len(split('\n'))` = 301);
+  - sha256 `f94960ea68228c6cc018511154399bf60547c838f033968c262f16c75c69c87a`;
+  - оценка токенов (по 4/3 символа на токен, НЕ токенизатором): ≈ 4.1–5.5K
     токенов на сессию холодного старта — константный вклад в static context
     каждого worker-раза.
 
@@ -271,7 +272,7 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
    Короткие сессии (p50 9 вызовов, p90 19.4), но высокий p50 input 77 606 →
    ~8.6K токенов на вызов в среднем (оценка: p50 input ÷ p50 вызовов).
    Reasoning всего 2.6 % input — объём создаёт НЕ думание, а повторяемую
-   загрузку контекста (AGENTS.md ≈ 3.9–5.2K токенов на сессию, skills —
+   загрузку контекста (AGENTS.md ≈ 4.1–5.5K токенов на сессию, skills —
    `skill_view` 337 вызовов, kanban-контекст — `kanban_show` 214). Cache-read ÷
    input всего 8.6× — между короткими сессиями кэш почти не переиспользуется
    (каждая ревью-сессия стартует холодно). Крупнейший рычаг Phase 1
@@ -287,7 +288,7 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
    систематического вклада нет: end_reason почти весь NULL, единственный
    `length`, один `agent_close`, три `ws_orphan_reap`. Если нужно
    подтвердить/исключить вклад reclaim-циклов — источник `kanban.db` (вне
-   разрешённых входов этой карточки).
+   разрешённых входов этого отчёта).
 5. **Cache-write почти нулевой** (285 236 только у architect, в telegram-сессии) —
    измеренный факт; интерпретация: провайдеры-рантаймы (opencode-go/codex) не
    сообщают cache_write на большинстве вызовов; это НЕ значит, что кэш не
@@ -314,7 +315,7 @@ cache-соотношения (арифметика над измеренными
 - «Видимый текст = output − reasoning» — по спецификации §9.10 (reasoning входит
   в output); арифметическое тождество, не прямое измерение видимых токенов.
 - «~8.6K токенов на вызов у reviewer» — p50 input ÷ p50 вызовов (грубая оценка).
-- AGENTS.md ≈ 3.9–5.2K токенов — по 4/3 символа на токен (не токенизатором).
+- AGENTS.md ≈ 4.1–5.5K токенов — по 4/3 символа на токен (не токенизатором).
 - Причинная привязка драйверов (§9) — интерпретация паттернов, не измерение.
 - «Cache-read ÷ input» — соотношение объёмов, НЕ утверждение о бесплатности.
 
@@ -361,7 +362,7 @@ cache-соотношения (арифметика над измеренными
 Обоснование по данным:
 - Наибольший устойчивый вклад в input у **reviewer** — повторяемый статический
   контекст (97.4 % input не-reasoning; p50 input 77 606 при p50 9 вызовах;
-  cache-read лишь 8.6× input — холодные старты). `AGENTS.md` ≈ 3.9–5.2K токенов
+  cache-read лишь 8.6× input — холодные старты). `AGENTS.md` ≈ 4.1–5.5K токенов
   загружается на каждую сессию всех трёх профилей; это измеряемый, полностью
   обратимый docs-only рычаг.
 - У **developer** доминирует reasoning (56.4 % input) — кандидат на Phase 2
@@ -395,11 +396,12 @@ python tools\verify_baseline_report.py --self-test
 
 # 4) размер/хэш AGENTS.md (PowerShell):
 Get-FileHash AGENTS.md -Algorithm SHA256
-(Get-Item AGENTS.md).Length                        # 19073 байт
-(Get-Content AGENTS.md -Raw).Length                # 15507 UTF-8 символов
+(Get-Item AGENTS.md).Length                        # 20456 байт
+(Get-Content AGENTS.md -Raw).Length                # 16438 UTF-8 символов
 
-# 5) redaction-check по evidence/отчёту: 0 совпадений с запрещёнными
-#    паттернами спека (имена приватных колонок/секретов — см. §1)
+# 5) redaction-check (встроен в verify_baseline_report.py): 0 совпадений с
+#    запрещёнными паттернами (kanban task-ids, worktree-ветки, абсолютные
+#    пути, имена приватных колонок/секретов) в report/evidence/context_baseline.json
 ```
 
 Итоговые агрегаты — в `docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`;

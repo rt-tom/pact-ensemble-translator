@@ -1,21 +1,21 @@
 {
   "schema_version": 1,
-  "description": "Read-only baseline: repository AGENTS.md size and resolved CLI toolsets per Hermes profile. Task t_6e10923e, Phase 0 report assembly input.",
-  "measured_at_utc": "2026-08-07T07:40:00Z",
+  "description": "Read-only baseline: repository AGENTS.md size (as committed on the Phase 0 branch HEAD; content identical to origin/main — Phase-0 commits do not modify AGENTS.md) and resolved CLI toolsets per Hermes profile. Phase 0 report assembly input.",
+  "measured_at_utc": "2026-08-07T17:30:05Z",
   "repository": {
     "root": "<repo-root>",
-    "branch": "wt/t_6e10923e",
-    "head_commit": "38b1091",
-    "head_subject": "docs(v4): Efficiency A rev.2 — A1b: исследование финального перевода перед решениями о типографике (находки eff-a1a2: p00157 \\n, chunk0012 ASCII-кавычки)"
+    "branch": "Phase 0 baseline branch (AGENTS.md identical to origin/main)",
+    "head_commit": "d1eeafb7405ba72ac348746f2dcc4f94d3c05a06",
+    "head_subject": "fix(audits): malformed numeric cells -> sanitized BaselineError; UNC/POSIX path redaction; verifier requires committed-HEAD AGENTS.md + redaction regression check"
   },
   "agents_md": {
-    "path": "AGENTS.md (repo root, as committed on HEAD)",
-    "bytes": 19073,
-    "chars_utf8": 15507,
-    "lines_splitlines": 287,
-    "newlines": 287,
+    "path": "AGENTS.md (repo root, as committed on HEAD — git show HEAD:AGENTS.md, never the working tree)",
+    "bytes": 20456,
+    "chars_utf8": 16438,
+    "lines_splitlines": 300,
+    "newlines": 300,
     "ends_with_newline": true,
-    "measurement_method": "git show HEAD:AGENTS.md -> decode utf-8; lines = text.splitlines() count; wc -l agrees (287). Note: len(text.split('\\n')) would be 288 (trailing empty element after final newline)."
+    "measurement_method": "git show HEAD:AGENTS.md -> decode utf-8; lines = text.splitlines() count; wc -l agrees. Note: len(text.split('\\n')) would be lines+1 (trailing empty element after final newline)."
   },
   "cli_toolsets": {
     "resolve_method": "hermes_cli.kanban_db._resolve_worker_cli_toolsets(<profile_dir>) with Windows paths (MSYS paths silently fail config load), HERMES_HOME set to each profile dir",
@@ -24,41 +24,101 @@
       "architect": {
         "config_path": "<HERMES_PROFILES_DIR>/architect/config.yaml",
         "config_platform_toolsets_cli": [
-          "browser", "clarify", "code_execution", "cronjob", "delegation",
-          "file", "kanban", "memory", "session_search", "skills",
-          "terminal", "todo", "vision", "web"
+          "browser",
+          "clarify",
+          "code_execution",
+          "cronjob",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "vision",
+          "web"
         ],
-        "config_disabled_toolsets": ["bfl"],
+        "config_disabled_toolsets": [
+          "bfl"
+        ],
         "resolved_cli_toolsets": [
-          "browser", "clarify", "code_execution", "cronjob", "delegation",
-          "file", "kanban", "memory", "session_search", "skills",
-          "terminal", "todo", "vision", "web"
+          "browser",
+          "clarify",
+          "code_execution",
+          "cronjob",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "vision",
+          "web"
         ],
         "resolved_count": 14
       },
       "developer": {
         "config_path": "<HERMES_PROFILES_DIR>/developer/config.yaml",
         "config_platform_toolsets_cli": [
-          "file", "terminal", "kanban", "skills", "web", "todo",
-          "memory", "session_search", "code_execution", "delegation"
+          "file",
+          "terminal",
+          "kanban",
+          "skills",
+          "web",
+          "todo",
+          "memory",
+          "session_search",
+          "code_execution",
+          "delegation"
         ],
-        "config_disabled_toolsets": ["bfl"],
+        "config_disabled_toolsets": [
+          "bfl"
+        ],
         "resolved_cli_toolsets": [
-          "code_execution", "delegation", "file", "kanban", "memory",
-          "session_search", "skills", "terminal", "todo", "web"
+          "code_execution",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "web"
         ],
         "resolved_count": 10
       },
       "reviewer": {
         "config_path": "<HERMES_PROFILES_DIR>/reviewer/config.yaml",
         "config_platform_toolsets_cli": [
-          "file", "terminal", "kanban", "skills", "web", "todo",
-          "memory", "session_search", "code_execution", "delegation"
+          "file",
+          "terminal",
+          "kanban",
+          "skills",
+          "web",
+          "todo",
+          "memory",
+          "session_search",
+          "code_execution",
+          "delegation"
         ],
-        "config_disabled_toolsets": ["bfl"],
+        "config_disabled_toolsets": [
+          "bfl"
+        ],
         "resolved_cli_toolsets": [
-          "code_execution", "delegation", "file", "kanban", "memory",
-          "session_search", "skills", "terminal", "todo", "web"
+          "code_execution",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "web"
         ],
         "resolved_count": 10
       }
@@ -67,6 +127,6 @@
   "non_goals": [
     "No toolsets, config.yaml, AGENTS.md, or profile settings were changed",
     "No pipeline / llama-server / book / chapter runs started",
-    "No tracked config or production files changed (only new untracked file tools/context_baseline.json added)"
+    "No tracked config or production files changed (only tools/context_baseline.json and Phase 0 report/evidence added)"
   ]
 }
