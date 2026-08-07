@@ -33,7 +33,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 EVIDENCE = REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json"
-REPORT = REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_RU.md"
+REPORT = REPO / "docs/audits/hermes-profile-token-baseline-2026-08-07.md"
 AGENTS = REPO / "AGENTS.md"
 
 PROFILES = ("architect", "developer", "reviewer")
