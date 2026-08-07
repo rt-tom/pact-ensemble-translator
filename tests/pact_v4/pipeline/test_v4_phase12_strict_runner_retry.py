@@ -216,11 +216,16 @@ def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None,
     The repair re-gate is forced to fail (``StubRegionGate(passed=False)``),
     so a quarantined chunk's best-variant repair can never commit — that is
     the repair debt that triggers the separate retry cycle.
+
+    Returns ``(result, router, caller, qwen_audit, reaudit_qwen)`` — the
+    last element is the Qwen evaluator used by the retry cycle's re-audit
+    (``repair_adapters[2]``), so a test can prove the re-audit re-ran.
     """
     router = _make_router()
     inner = caller or LookaheadChunkCaller()
     model_caller = _LifecycleAwareModelCaller(router, inner)
     qwen_audit = ContentAudit()
+    reaudit_qwen = StubQwenAudit()
     result = run_chapter_strict(
         cfg, router=router,
         model_caller=model_caller,
@@ -231,12 +236,12 @@ def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None,
         repair_adapters=(
             StubRepairCaller(),
             StubRegionGate(passed=False, reason="re-gate fails"),
-            _LifecycleAwareQwenAudit(router, StubQwenAudit()),
+            _LifecycleAwareQwenAudit(router, reaudit_qwen),
             _LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
         ),
         formatting_adapters=formatting_adapters,
     )
-    return result, router, inner, qwen_audit
+    return result, router, inner, qwen_audit, reaudit_qwen
 
 
 def _load_report(cfg: StrictRunConfig) -> Dict[str, Any]:
@@ -257,7 +262,7 @@ def _load_retry_history(cfg: StrictRunConfig) -> Dict[str, Any]:
 
 def test_quarantined_retry_unlocks_complete(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
-    result, _router, caller, _audit = _run_with_retry(cfg)
+    result, _router, caller, _audit, _reaudit = _run_with_retry(cfg)
 
     # Phase 1-2: chunk0001 quarantined (bad text), chunk0002 selected.
     assert result.quarantined_count == 1
@@ -311,7 +316,7 @@ def test_quarantined_retry_unlocks_complete(tmp_path: Path):
 
 def test_quarantined_retry_fallback_marks_final(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
-    result, _router, _caller, _audit = _run_with_retry(
+    result, _router, _caller, _audit, _reaudit = _run_with_retry(
         cfg, caller=AlwaysBadChunk1Caller(),
     )
     assert result.step7["quarantined_retry"]["status"] == "ran"
@@ -338,7 +343,7 @@ def test_quarantined_retry_fallback_marks_final(tmp_path: Path):
 
 def test_quarantined_retry_resume_reuses_prior_attempt(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
-    first_result, _r1, _c1, _audit1 = _run_with_retry(cfg)
+    first_result, _r1, _c1, _audit1, first_reaudit = _run_with_retry(cfg)
     assert first_result.step8["status"] == "complete"
     # The first run's Step 6 audit evaluator saw the quarantined chunk; record
     # that call count so the resume's zero-call assertion below is meaningful
@@ -349,7 +354,7 @@ def test_quarantined_retry_resume_reuses_prior_attempt(tmp_path: Path):
         chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
     )
-    second_result, _r2, caller2, qwen_audit2 = _run_with_retry(resumed_cfg)
+    second_result, _r2, caller2, qwen_audit2, second_reaudit = _run_with_retry(resumed_cfg)
     assert second_result.resumed_from_index == 2
     # The retry reuses the prior session's selected attempt: the generation
     # caller is never invoked during the resumed run (Phase 1-2 skipped all
@@ -361,6 +366,9 @@ def test_quarantined_retry_resume_reuses_prior_attempt(tmp_path: Path):
     # Any calls beyond the first session's count would be the elided re-audit
     # path (one per retried chunk — chunk0001 only here).
     assert len(qwen_audit2.calls) == first_step6_audit_calls
+    # A1c Phase 0: the pure-resume skip held — the retry cycle's own re-audit
+    # evaluator saw no calls (policy + final_text_hash matched).
+    assert second_reaudit.calls == []
     retry_block = second_result.step7["quarantined_retry"]
     assert retry_block["status"] == "ran"
     assert retry_block["selected_chunk_ids"] == ["chunk0001"]
@@ -381,6 +389,64 @@ def test_quarantined_retry_resume_reuses_prior_attempt(tmp_path: Path):
     )
 
 
+def test_quarantined_retry_pure_resume_disabled_on_policy_version_mismatch(tmp_path: Path):
+    # A1c Phase 0 (review §3.6): the pure-resume lease skip is only safe when
+    # the retry policy matches. A quarantined_retry.json written under an
+    # older retry policy must NOT be eligible for the skip — the retry
+    # cycle's re-audit re-runs under the current policy (its Qwen evaluator
+    # sees calls), whereas a clean pure resume never calls it.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    first_result, _r1, _c1, _audit1, _first_reaudit = _run_with_retry(cfg)
+    assert first_result.step8["status"] == "complete"
+
+    history_path = cfg.out_dir / "quarantined_retry.json"
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
+    payload["policy_version"] = "pact-v4-quarantined-retry/v1"  # stale policy
+    history_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+    )
+    second_result, _r2, _caller2, _qwen_audit2, second_reaudit = _run_with_retry(resumed_cfg)
+    assert second_result.resumed_from_index == 2
+    # Policy mismatch -> pure-resume skip disabled -> the retry re-audit
+    # re-ran (a clean pure resume never calls the re-audit evaluator).
+    assert second_reaudit.calls
+    # The history is rewritten under the current policy version.
+    rewritten = _load_retry_history(resumed_cfg)
+    assert rewritten["policy_version"] == "pact-v4-quarantined-retry/v2"
+
+
+def test_quarantined_retry_pure_resume_disabled_on_final_text_hash_mismatch(tmp_path: Path):
+    # A1c Phase 0 (review §3.6): the pure-resume skip additionally requires
+    # the final chapter text to be byte-identical to the session that wrote
+    # the retry history. Tampering final_text_hash (text drift) must disable
+    # the skip — the retry re-audit re-runs instead of trusting a stale
+    # verdict (its Qwen evaluator sees calls again).
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    first_result, _r1, _c1, _audit1, _first_reaudit = _run_with_retry(cfg)
+    assert first_result.step8["status"] == "complete"
+
+    history_path = cfg.out_dir / "quarantined_retry.json"
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
+    assert payload["final_text_hash"], "the retry history records the final text hash"
+    payload["final_text_hash"] = "deadbeef" * 8  # simulate drifted final text
+    history_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+    )
+    second_result, _r2, _caller2, _qwen_audit2, second_reaudit = _run_with_retry(resumed_cfg)
+    assert second_result.resumed_from_index == 2
+    # final_text_hash mismatch -> pure-resume disabled -> re-audit re-ran.
+    assert second_reaudit.calls
+    # The history is rewritten with the current run's authoritative hash.
+    rewritten = _load_retry_history(resumed_cfg)
+    assert rewritten["final_text_hash"] != "deadbeef" * 8
+
+
 # ---------------------------------------------------------------------------
 # No retry when there is nothing to retry
 # ---------------------------------------------------------------------------
@@ -396,7 +462,7 @@ def test_quarantined_retry_not_fired_without_quarantined_debt(tmp_path: Path):
                 ensure_ascii=False,
             )
 
-    result, _router, _caller, _audit = _run_with_retry(cfg, caller=_AllGoodCaller())
+    result, _router, _caller, _audit, _reaudit = _run_with_retry(cfg, caller=_AllGoodCaller())
     # All chunks selected (no quarantine, no repair debt) -> no retry cycle.
     assert result.selected_count == result.chunk_count
     assert "quarantined_retry" not in result.step7
@@ -418,7 +484,7 @@ def test_quarantined_retry_reruns_formatting_over_updated_text(tmp_path: Path):
     # carry the re-run outcome (not the pre-retry one).
     cfg = _make_cfg_with_spans(tmp_path, n_paragraphs=24)
     formatting_caller = CannedFormattingCaller()
-    result, _router, _caller, _audit = _run_with_retry(
+    result, _router, _caller, _audit, _reaudit = _run_with_retry(
         cfg, formatting_adapters=(formatting_caller,),
     )
     # The retry succeeded (chunk0001 unlocked) and formatting re-ran.

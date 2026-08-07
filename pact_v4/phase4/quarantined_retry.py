@@ -77,7 +77,12 @@ from pact_v4.pipeline._shared_runner_helpers import (
 LOG = logging.getLogger(__name__)
 
 QUARANTINED_RETRY_SCHEMA = "pact-v4-phase4-quarantined-retry/v1"
-QUARANTINED_RETRY_POLICY_VERSION = "pact-v4-quarantined-retry/v1"
+# A1c Phase 0 (review §3.6): v2 records the fail-closed retry contract — the
+# loader validates policy_version and the pure-resume lease skip additionally
+# requires the final_text_hash match (byte-identical final chapter text).
+# Old v1 histories are not eligible for the lease skip; the re-audit re-runs
+# under the current policy.
+QUARANTINED_RETRY_POLICY_VERSION = "pact-v4-quarantined-retry/v2"
 
 # The separate repair cycle is bounded: at most one regeneration per
 # quarantined chunk with debt (card, acceptance criterion 2). A chunk that
