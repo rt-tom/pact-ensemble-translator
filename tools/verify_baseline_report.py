@@ -688,9 +688,21 @@ def check_report(
         problems.append("top-5 tables not found")
     else:
         seen_top: dict[tuple, int] = {}
+        bad_headings: set[str] = set()
         for prof, header, row in top5_rows:
             metric = row[0] if row else None
-            name = prof.split()[0] if prof else None
+            # Profile identity for top-5 rows comes EXCLUSIVELY from the
+            # section heading, and it must be exact: a suffixed / unknown /
+            # ambiguous heading (e.g. "### architect altered") is a
+            # misattribution and must fail closed. The old split()[0]
+            # mapping accepted any heading starting with a valid profile.
+            name = prof if prof else None
+            if name not in PROFILES and name not in bad_headings:
+                bad_headings.add(name)
+                problems.append(
+                    f"top-5: section heading {prof!r} is not exactly one of "
+                    f"{list(PROFILES)}"
+                )
             cells = {h: row[i] for i, h in enumerate(header) if i < len(row)}
             id_cell = cells.get("id (ред.)", "").strip().strip("`")
             seen_top[(name, metric, id_cell)] = seen_top.get((name, metric, id_cell), 0) + 1

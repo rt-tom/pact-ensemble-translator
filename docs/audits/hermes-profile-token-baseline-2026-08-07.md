@@ -215,7 +215,7 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
 | reasoning | `67aaa81efd8e` | kanban | deepseek-v4-flash | high | 58 | 133 | 74 | 165 418 | 82 559 |
 | reasoning | `49ba52d34a62` | kanban | deepseek-v4-flash | high | 31 | 68 | 36 | 147 597 | 55 956 |
 
-### developer (все — kanban)
+### developer
 | метрика | id (ред.) | source | model | effort | вызовов | msgs | tools | input | reasoning |
 |---|---|---:|---|---:|---:|---:|---:|---:|---:|
 | input | `c6f8d9f3f41e` | kanban | deepseek-v4-flash | medium | 191 | 235 | 116 | 480 308 | 228 105 |
@@ -229,7 +229,7 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
 | reasoning | `f83ecd9fd0ab` | kanban | deepseek-v4-flash | medium | 111 | 233 | 121 | 215 899 | 227 140 |
 | reasoning | `8b6b152f8627` | kanban | deepseek-v4-flash | medium | 125 | 253 | 127 | 176 453 | 191 985 |
 
-### reviewer (все — kanban)
+### reviewer
 | метрика | id (ред.) | source | model | effort | вызовов | msgs | tools | input | reasoning |
 |---|---|---:|---|---:|---:|---:|---:|---:|---:|
 | input | `cd8e21a9de49` | kanban | gpt-5.6-luna | high | 29 | 85 | 55 | 273 098 | 6 446 |

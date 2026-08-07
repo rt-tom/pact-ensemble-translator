@@ -461,6 +461,17 @@ def test_verifier_detects_missing_top5_row(committed_evidence, committed_report)
     assert any("missing" in p and "593a124a2054" in p for p in problems)
 
 
+def test_verifier_rejects_ambiguous_top5_heading(committed_evidence, committed_report) -> None:
+    """A top-5 section heading suffixed with an arbitrary word (e.g. '### architect
+    altered') is a misattribution and must fail closed — the verifier must not
+    truncate the heading to the bare profile name (RV t_28a4ab51 finding:
+    prof.split()[0] accepted any heading starting with a valid profile)."""
+    mutated = committed_report.replace("### architect", "### architect altered", 1)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "a suffixed/ambiguous top-5 section heading was NOT detected"
+    assert any("heading" in p and "architect altered" in p for p in problems)
+
+
 def test_verifier_detects_duplicate_profile_row(committed_evidence, committed_report) -> None:
     """Duplicating an existing aggregate row (architect) is caught."""
     arch_line = next(
@@ -569,6 +580,31 @@ def test_verifier_cli_exits_nonzero_on_duplicate_first_header(
     header cell of a mandatory table is duplicated in the committed report
     (RV3 finding: it used to crash with an uncaught AttributeError)."""
     mutated = _dup_first_header_cell(committed_report, ("Профиль", "medium", "high"))
+    ev_path = tmp_path / "evidence.json"
+    rpt_path = tmp_path / "report.md"
+    ctx_path = tmp_path / "context.json"
+    ev_path.write_text(
+        (REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json")
+        .read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    rpt_path.write_text(mutated, encoding="utf-8")
+    ctx_path.write_text(
+        (REPO / "tools/context_baseline.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(verify, "EVIDENCE", ev_path)
+    monkeypatch.setattr(verify, "REPORT", rpt_path)
+    monkeypatch.setattr(verify, "CONTEXT", ctx_path)
+    assert verify.main() == 1
+
+
+def test_verifier_cli_exits_nonzero_on_ambiguous_top5_heading(
+    committed_evidence, committed_report, tmp_path, monkeypatch
+) -> None:
+    """The CLI must exit non-zero when a top-5 section heading is suffixed /
+    ambiguous (e.g. '### architect altered') instead of an exact profile name."""
+    mutated = committed_report.replace("### architect", "### architect altered", 1)
     ev_path = tmp_path / "evidence.json"
     rpt_path = tmp_path / "report.md"
     ctx_path = tmp_path / "context.json"
