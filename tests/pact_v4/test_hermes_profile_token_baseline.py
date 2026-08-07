@@ -15,14 +15,26 @@ Covers the RV findings fixed on vk/hermes-profile-token-baseline:
    with a non-zero code, not a JSON-with-error-and-exit-0.
 5. verify_baseline_report.py structurally catches a number swapped in from
    another profile (substitution detection).
+6. Failure contract: malformed (non-numeric / non-finite) cells in mandatory
+   numeric columns raise a sanitized BaselineError and exit non-zero — never
+   an uncaught ValueError traceback or a silently-typed 0.
+7. Path redaction covers every supported form (Windows drive, UNC, POSIX)
+   without mangling URLs / slash-separated word lists.
+8. Verifier requires AGENTS.md as a COMMITTED-HEAD input (git show
+   HEAD:AGENTS.md) — hard failure when absent, never a dirty working-tree
+   file — and rejects a stale HEAD citation (freshness).
+9. Redaction regression check over the committed report / evidence / context:
+   no task ids, worktree identifiers, absolute paths or sensitive
+   column/credential words in published output.
 
-All tests are hermetic: they build synthetic SQLite DBs / temp profile dirs and
-never touch live Hermes profile data. The verifier test runs against the
+All tests are hermetic: they build synthetic SQLite DBs / temp profile dirs
+and never touch live Hermes profile data. The verifier tests run against the
 committed report+evidence in this repo.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -619,3 +631,246 @@ def test_unusable_state_db_errors_are_redacted(tmp_path, capsys) -> None:
     for name in ("architect", "developer", "reviewer"):
         assert "state.db unusable in profile" in out["profiles"][name]["error"]
         assert str(tmp_path) not in out["profiles"][name]["error"]
+
+
+# ---------------------------------------------------------------------------
+# 10. Failure contract: malformed numeric cells -> sanitized BaselineError.
+# ---------------------------------------------------------------------------
+def _make_state_db_with_bad_session_cell(path: Path) -> None:
+    """state.db with a non-numeric input_tokens cell in `sessions`."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("PRAGMA journal_mode=wal")
+        con.executescript(
+            "CREATE TABLE sessions (" + ", ".join(f"{n} {t}" for n, t in SESSIONS_SCHEMA) + ");"
+        )
+        con.executescript(
+            "CREATE TABLE session_model_usage ("
+            + ", ".join(f"{n} {t}" for n, t in USAGE_SCHEMA) + ");"
+        )
+        con.executescript(
+            "CREATE TABLE messages (" + ", ".join(f"{n} {t}" for n, t in MESSAGES_SCHEMA) + ");"
+        )
+        con.execute(
+            "INSERT INTO sessions (id, source, model, end_reason, message_count, "
+            "input_tokens) VALUES (?,?,?,?,?,?)",
+            ("sess-bad", "kanban", "deepseek-v4-flash", None, 1, "not-a-number"),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _make_state_db_with_bad_usage_cell(path: Path) -> None:
+    """state.db with a non-numeric input_tokens cell in session_model_usage."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("PRAGMA journal_mode=wal")
+        con.executescript(
+            "CREATE TABLE sessions (" + ", ".join(f"{n} {t}" for n, t in SESSIONS_SCHEMA) + ");"
+        )
+        con.executescript(
+            "CREATE TABLE session_model_usage ("
+            + ", ".join(f"{n} {t}" for n, t in USAGE_SCHEMA) + ");"
+        )
+        con.executescript(
+            "CREATE TABLE messages (" + ", ".join(f"{n} {t}" for n, t in MESSAGES_SCHEMA) + ");"
+        )
+        con.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, "
+            "billing_mode, input_tokens) VALUES (?,?,?,?,?)",
+            ("sess-bad", "deepseek-v4-flash", "opencode-go", "chat_completions", "oops"),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_stats_malformed_numeric_raises_baseline_error() -> None:
+    """A non-numeric / non-finite cell in a mandatory numeric column raises a
+    sanitized BaselineError (regression: previously an uncaught ValueError)."""
+    with pytest.raises(baseline.BaselineError, match="non-numeric value in numeric column input_tokens"):
+        baseline._stats(["abc", 10, 20], "input_tokens")
+    with pytest.raises(baseline.BaselineError, match="non-finite value in numeric column"):
+        baseline._stats([float("nan"), 10], "input_tokens")
+    with pytest.raises(baseline.BaselineError, match="non-finite value in numeric column"):
+        baseline._stats([float("inf"), 10], "input_tokens")
+
+
+@pytest.mark.parametrize(
+    "bad_maker",
+    [_make_state_db_with_bad_session_cell, _make_state_db_with_bad_usage_cell],
+)
+def test_malformed_numeric_cell_is_sanitized_nonzero(tmp_path, capsys, bad_maker) -> None:
+    """Malformed mandatory numeric input -> per-profile BaselineError entry,
+    non-zero exit, no traceback, no machine-specific path in output."""
+    d = _make_profiles_root(tmp_path)
+    for p in ("architect", "developer", "reviewer"):
+        (d / p / "config.yaml").write_text("reasoning_effort: high\n", encoding="utf-8")
+        bad_maker(d / p / "state.db")
+    rc = baseline.main(["--profiles-dir", str(d)])
+    cap = capsys.readouterr()
+    assert rc != 0
+    assert "Traceback" not in cap.err
+    _assert_redacted(cap.out + cap.err, tmp_path)
+    out = json.loads(cap.out)
+    for name in ("architect", "developer", "reviewer"):
+        err = out["profiles"][name]["error"]
+        assert "non-numeric value in numeric column" in err, err
+        assert str(tmp_path) not in err
+
+
+# ---------------------------------------------------------------------------
+# 11. Reporter redaction covers UNC and POSIX absolute paths.
+# ---------------------------------------------------------------------------
+def test_sanitize_error_redacts_unc_and_posix_paths() -> None:
+    """The documented guarantee covers every supported path form: Windows
+    drive, UNC (\\\\server\\share) and POSIX (/a/b)."""
+    base = Path("C:/Users/someone/hermes/profiles")
+    msg = (
+        "unexpected C:\\Users\\someone\\hermes\\x and "
+        "\\\\srv\\share\\dir\\f and /home/someone/f"
+    )
+    out = baseline._sanitize_error(msg, base)
+    assert "C:\\Users" not in out
+    assert "\\\\srv" not in out
+    assert "/home/" not in out
+    assert out.count("<path>") == 3, out
+
+
+def test_sanitize_error_does_not_mangle_urls_or_word_lists() -> None:
+    """URLs, slash-separated word lists and 'a / b' cells are NOT paths and
+    must survive redaction untouched."""
+    base = Path("C:/Users/someone/hermes/profiles")
+    msg = "see https://example.com/a?b=c and model/reasoning/x and p50/p90 and 21 / 176"
+    out = baseline._sanitize_error(msg, base)
+    assert "https://example.com/a?b=c" in out
+    assert "model/reasoning/x" in out
+    assert "p50/p90" in out
+    assert "21 / 176" in out
+
+
+# ---------------------------------------------------------------------------
+# 12. Verifier: AGENTS.md is a MANDATORY committed-HEAD input.
+# ---------------------------------------------------------------------------
+def _make_git_repo(tmp_path: Path, agents_content: str, *, with_agents: bool = True) -> Path:
+    """Minimal git repo with AGENTS.md committed at HEAD (or, when
+    with_agents=False, a README instead so HEAD exists without AGENTS.md)."""
+    repo = tmp_path / "vrepo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "test"], check=True, capture_output=True)
+    if with_agents:
+        (repo / "AGENTS.md").write_text(agents_content, encoding="utf-8")
+    else:
+        (repo / "README.md").write_text("no agents here", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True, capture_output=True)
+    return repo
+
+
+def test_committed_agents_requires_agents_md_in_head(tmp_path) -> None:
+    """AGENTS.md absent from HEAD is a hard failure — never a silent skip."""
+    repo = _make_git_repo(tmp_path, "", with_agents=False)
+    with pytest.raises(RuntimeError, match="AGENTS.md"):
+        verify.committed_agents(repo)
+
+
+MINIMAL_EV = {"profiles": {p: {} for p in verify.PROFILES}}
+
+
+def _agents_facts(report_text: str, head: str, blob: bytes) -> str:
+    """Report prose carrying the AGENTS.md facts (bytes/chars/sha + HEAD)."""
+    text = blob.decode("utf-8")
+    return (
+        f"AGENTS.md at HEAD `{head}`: {len(blob)} байт / "
+        f"{len(text)} UTF-8 символов / sha256 `{hashlib.sha256(blob).hexdigest()}`"
+    )
+
+
+def test_check_report_validates_committed_head_not_dirty_worktree(tmp_path) -> None:
+    """The verifier validates the COMMITTED HEAD blob (git show HEAD:AGENTS.md),
+    never an arbitrary dirty working-tree file."""
+    repo = _make_git_repo(tmp_path, "AGENTS CONTENT A\n")
+    head, blob = verify.committed_agents(repo)
+    # dirty the working tree with a different, much larger AGENTS.md
+    (repo / "AGENTS.md").write_text("AGENTS CONTENT A\n" + "DIRTY" * 5000, encoding="utf-8")
+    facts = _agents_facts("", head, blob)
+    # facts that match the committed blob pass the AGENTS checks
+    probs = verify.check_report(facts, MINIMAL_EV, blob, head)
+    assert not any("AGENTS.md" in p for p in probs), probs
+    # facts that match the DIRTY working-tree file must FAIL
+    dirty_facts = facts.replace(str(len(blob)), str(len(blob) + 20000))
+    probs = verify.check_report(dirty_facts, MINIMAL_EV, blob, head)
+    assert any("AGENTS.md bytes" in p for p in probs), probs
+
+
+def test_check_report_rejects_stale_head_citation(tmp_path) -> None:
+    """Freshness: a report citing an older HEAD commit must fail."""
+    repo = _make_git_repo(tmp_path, "AGENTS CONTENT A\n")
+    head, blob = verify.committed_agents(repo)
+    facts = _agents_facts("", head, blob)
+    stale = facts.replace(head, "38b1091" + "0" * (len(head) - 7))
+    probs = verify.check_report(stale, MINIMAL_EV, blob, head)
+    assert any("HEAD" in p and "AGENTS.md" in p for p in probs), probs
+    # and the committed report (with its own cited HEAD) passes the table checks
+    # even when the AGENTS facts are injected as mandatory inputs
+    good = verify.check_report(_agents_facts("", head, blob), MINIMAL_EV, blob, head)
+    assert not any("AGENTS.md" in p for p in good), good
+
+
+def test_check_report_requires_agents_facts_when_blob_provided(tmp_path) -> None:
+    """Once the committed blob is provided, missing AGENTS.md facts in the
+    report are a hard failure, not a silent skip."""
+    repo = _make_git_repo(tmp_path, "AGENTS CONTENT A\n")
+    head, blob = verify.committed_agents(repo)
+    probs = verify.check_report("no facts here at all", MINIMAL_EV, blob, head)
+    assert any("AGENTS.md" in p for p in probs)
+
+
+# ---------------------------------------------------------------------------
+# 13. Redaction regression check on committed artifacts.
+# ---------------------------------------------------------------------------
+def test_check_redaction_clean_on_committed_artifacts(committed_evidence, committed_report) -> None:
+    """No task ids, worktree identifiers, absolute paths or sensitive
+    column/credential words may appear in the committed report / evidence /
+    context output."""
+    context_text = (REPO / "tools/context_baseline.json").read_text(encoding="utf-8")
+    evidence_text = (REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json").read_text(
+        encoding="utf-8"
+    )
+    probs = verify.check_redaction(
+        {"report": committed_report, "evidence": evidence_text, "context": context_text}
+    )
+    assert probs == [], probs
+
+
+def test_check_redaction_catches_provenance_markers() -> None:
+    """Each forbidden marker class must be detected."""
+    planted = (
+        "| task | t_0123456789abcdef | wt/t_0123abcd | C:\\Users\\x\\y | "
+        "\\\\srv\\share\\f | /home/x/f | user_id=1 | billing_base_url=x | api_key=y |"
+    )
+    probs = verify.check_redaction({"p": planted})
+    joined = "\n".join(probs)
+    assert "kanban task id" in joined
+    assert "worktree branch identifier" in joined
+    assert "windows drive absolute path" in joined
+    assert "UNC path" in joined
+    assert "posix absolute path" in joined
+    assert "user_id column" in joined
+    assert "billing_base_url column" in joined
+    assert "api_key" in joined
+
+
+def test_redaction_does_not_flag_legitimate_words() -> None:
+    """Token/task words, source labels and slash-separated word lists are not
+    provenance markers and must not be flagged."""
+    legit = (
+        "input_tokens=100, per-task reasoning policy, source kanban, "
+        "model/reasoning/compression defaults, sums/p50/p90/max, "
+        "<HERMES_PROFILES_DIR>/architect/config.yaml, tools/context_baseline.json"
+    )
+    probs = verify.check_redaction({"legit": legit})
+    assert probs == [], probs

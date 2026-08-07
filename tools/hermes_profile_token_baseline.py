@@ -32,7 +32,10 @@ Failure semantics:
   table or required allowlisted column) raises :class:`BaselineError`; ``main``
   prints the partial JSON with per-profile ``error`` entries and exits with a
   NON-ZERO code. Error strings are sanitized to profile/input labels — never
-  absolute or machine-specific paths (redacted-output contract).
+  absolute or machine-specific paths (redacted-output contract). A malformed
+  (non-numeric / non-finite) cell in a mandatory numeric column is treated the
+  same way: sanitized :class:`BaselineError` + non-zero exit, never an uncaught
+  ValueError traceback and never a silently-typed 0.
 
 Usage:
     python tools/hermes_profile_token_baseline.py [--profiles-dir DIR] [--json out.json]
@@ -43,6 +46,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -156,9 +160,25 @@ def _redact(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
 
 
-# Absolute-path pattern (Windows drive or UNC-ish) used to strip any
-# machine-specific path that could leak into an error string.
-_ABS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']*")
+# Absolute-path patterns used to strip any machine-specific path that could
+# leak into an error string. The redacted-output contract covers every
+# supported path form:
+#   - Windows drive absolute:  C:\Users\...  and  C:/Users/...
+#   - UNC:                     \\server\share\...  (and //server/share/...,
+#     which also matches the POSIX branch below)
+#   - POSIX absolute:          /home/user/...
+# URLs (scheme://host/...) are deliberately NOT matched: the drive branch
+# refuses a letter glued to a word ("s:" inside "https:"), the POSIX branch
+# refuses a slash preceded by ':' (scheme separator) or '/', and the UNC
+# branch requires a backslash-separated server+share shape. JSON-escaped
+# literals like "\\n" (backslash + backslash + n) are not matched either
+# (they lack a backslash-separated second component).
+_PATH_RE = re.compile(
+    r"(?<!\w)[A-Za-z]:[\\/][^\s\"']*"             # drive absolute (C:\ or C:/)
+    r"|\\\\[^\\\s\"']+\\[^\s\"']+"                # UNC backslash (\\server\share)
+    r"|(?<![\w.:/<>-])"                           # not inside a URL/word/placeholder
+    r"/(?:[A-Za-z0-9_.~-]+/)+[A-Za-z0-9_.~-]*"    # POSIX absolute (/a/b[/c])
+)
 
 
 def _sanitize_error(msg: str, base: Path) -> str:
@@ -168,7 +188,8 @@ def _sanitize_error(msg: str, base: Path) -> str:
     stdout, stderr and JSON. ``analyze_profile`` raises BaselineError with
     profile/input labels already, but this is a structural guarantee: any
     path that still reaches ``main`` (e.g. embedded in an unexpected
-    message) is replaced with a placeholder before emission.
+    message) is replaced with a placeholder before emission. All supported
+    path forms (Windows drive, UNC, POSIX) are collapsed.
     """
     s = str(msg)
     for p in (base, base.resolve()):
@@ -177,12 +198,31 @@ def _sanitize_error(msg: str, base: Path) -> str:
         # every dot in the message (e.g. "state.db")
         if len(repl) > 1:
             s = s.replace(repl, "<profiles-dir>")
-    return _ABS_PATH_RE.sub("<path>", s)
+    return _PATH_RE.sub("<path>", s)
 
 
 # ---------------------------------------------------------------------------
 # Percentiles.
 # ---------------------------------------------------------------------------
+def _as_number(value, column: str) -> float:
+    """Convert one numeric DB cell; malformed mandatory input raises BaselineError.
+
+    Numeric columns (token/call counts) are mandatory inputs: a non-numeric
+    or non-finite cell makes the profile's aggregate untrustworthy, so it
+    must surface as a sanitized :class:`BaselineError` (label only — never a
+    path) rather than an uncaught ValueError crash or a silently-typed 0.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise BaselineError(
+            f"non-numeric value in numeric column {column}"
+        ) from None
+    if not math.isfinite(v):
+        raise BaselineError(f"non-finite value in numeric column {column}")
+    return v
+
+
 def _pct(sorted_vals, p: float):
     """Linear-interpolated percentile (R-7; same as numpy default / Excel PERCENTILE.INC).
 
@@ -202,8 +242,8 @@ def _pct(sorted_vals, p: float):
     return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
 
 
-def _stats(values):
-    sv = sorted(float(v) for v in values)
+def _stats(values, column: str = ""):
+    sv = sorted(_as_number(v, column) for v in values)
     if not sv:
         return None
     return {
@@ -323,8 +363,12 @@ def _usage_summary(cur):
         )
         for k in ("api_call_count", "input_tokens", "output_tokens",
                   "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"):
-            v = d.get(k) or 0
-            g[k] = (g[k] if isinstance(g[k], int) else 0) + (v if isinstance(v, int) else 0)
+            v = d.get(k)
+            if v is None or v == "":
+                v = 0
+            # malformed (non-numeric / non-finite) cell in a mandatory numeric
+            # column -> sanitized BaselineError, never a silently-typed 0
+            g[k] += int(_as_number(v, k))
         g["sessions"] += 1
         g["cost_nonzero"] = g["cost_nonzero"] or bool(
             (d.get("estimated_cost_usd") or 0) not in (0, None, "", "0")
@@ -432,12 +476,12 @@ def analyze_profile(profile_dir: Path) -> dict:
                 return [s[name] for s in src_sessions if s.get(name) is not None]
             return {
                 "n_sessions": len(src_sessions),
-                "api_calls": _stats(col("api_call_count")),
-                "input_tokens": _stats(col("input_tokens")),
-                "output_tokens": _stats(col("output_tokens")),
-                "cache_read_tokens": _stats(col("cache_read_tokens")),
-                "cache_write_tokens": _stats(col("cache_write_tokens")),
-                "reasoning_tokens": _stats(col("reasoning_tokens")),
+                "api_calls": _stats(col("api_call_count"), "api_call_count"),
+                "input_tokens": _stats(col("input_tokens"), "input_tokens"),
+                "output_tokens": _stats(col("output_tokens"), "output_tokens"),
+                "cache_read_tokens": _stats(col("cache_read_tokens"), "cache_read_tokens"),
+                "cache_write_tokens": _stats(col("cache_write_tokens"), "cache_write_tokens"),
+                "reasoning_tokens": _stats(col("reasoning_tokens"), "reasoning_tokens"),
             }
 
         def top5(src_sessions, metric):

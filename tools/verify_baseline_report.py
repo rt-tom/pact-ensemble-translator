@@ -14,10 +14,18 @@ This verifier instead:
 3. Fails on ANY cell mismatch — including a value that exists in the
    evidence but belongs to another profile — and on ANY missing,
    duplicate or extra row in the mandatory tables (completeness).
-4. Verifies the AGENTS.md size/char-count/hash claims against the live repo
-   file (read-only).
+4. Verifies the AGENTS.md size/char-count/hash claims against the COMMITTED
+   HEAD blob (``git show HEAD:AGENTS.md`` — never an arbitrary dirty
+   working-tree file). AGENTS.md is a mandatory input: if it is absent from
+   HEAD the check fails; it is never silently skipped. The report's cited
+   HEAD commit must also equal ``git rev-parse HEAD`` (freshness).
+5. Runs a redaction regression check over the committed report / evidence /
+   context artifacts: no kanban task ids, no ``wt/`` worktree identifiers,
+   no absolute (drive / UNC / POSIX) paths, no sensitive column/credential
+   words may appear in the published output.
 
-Prose is not trusted; only tables and explicit AGENTS.md facts are checked.
+Prose is not trusted; only tables, explicit AGENTS.md facts and the
+redaction allowlist are checked.
 
 Usage:
     python tools/verify_baseline_report.py            # check committed report
@@ -26,18 +34,104 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 EVIDENCE = REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json"
 REPORT = REPO / "docs/audits/hermes-profile-token-baseline-2026-08-07.md"
+CONTEXT = REPO / "tools/context_baseline.json"
 AGENTS = REPO / "AGENTS.md"
 
 PROFILES = ("architect", "developer", "reviewer")
+
+
+# ---------------------------------------------------------------------------
+# Committed-HEAD resolution (AGENTS.md is a MANDATORY input).
+# ---------------------------------------------------------------------------
+def _git(repo: Path, *args: str) -> bytes:
+    """Run a read-only git command; raise RuntimeError when git fails."""
+    res = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        timeout=60,
+    )
+    if res.returncode != 0:
+        err = res.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {err}")
+    return res.stdout
+
+
+def committed_agents(repo: Path) -> tuple[str, bytes]:
+    """Return ``(HEAD sha, AGENTS.md blob as committed at HEAD)``.
+
+    Raises RuntimeError when git is unavailable, HEAD is unborn, or AGENTS.md
+    is not committed at HEAD — the caller must treat that as a hard failure,
+    never a silent skip.
+    """
+    head = _git(repo, "rev-parse", "HEAD").strip().decode("ascii")
+    blob = _git(repo, "show", "HEAD:AGENTS.md")
+    return head, blob
+
+
+# ---------------------------------------------------------------------------
+# Redaction regression check (published artifacts).
+# ---------------------------------------------------------------------------
+# Forbidden provenance / privacy markers in the committed report, evidence
+# and context-baseline output. "token"/"task" words themselves are NOT banned
+# (legitimate prose and column names like input_tokens); task provenance is
+# identified by kanban task ids (t_<hex>), worktree identifiers (wt/...) and
+# machine-specific paths.
+_REDACTION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bt_[0-9a-f]{6,}\b"), "kanban task id"),
+    (re.compile(r"\bwt/[A-Za-z0-9_.-]+"), "worktree branch identifier"),
+    (re.compile(r"(?<!\w)[A-Za-z]:[\\/]"), "windows drive absolute path"),
+    (re.compile(r"\\\\[^\\\s\"']+\\[^\s\"']+"), "UNC path"),
+    (re.compile(r"(?<![\w.:/<>-])/(?:[A-Za-z0-9_.~-]+/)+[A-Za-z0-9_.~-]*"),
+     "posix absolute path"),
+    (re.compile(r"\buser_id\b"), "user_id column"),
+    (re.compile(r"\bbilling_base_url\b"), "billing_base_url column"),
+    (re.compile(r"\bapi_key\b"), "api_key"),
+    (re.compile(r"\bpassword\b"), "password"),
+    (re.compile(r"\bcredential"), "credential"),
+    (re.compile(r"\bsecret\b"), "secret"),
+    (re.compile(r"\bhandoff_error\b"), "handoff_error column"),
+    (re.compile(r"\bcompression_failure_error\b"), "compression_failure_error column"),
+    (re.compile(r"\bsystem_prompt\b"), "system_prompt column"),
+    (re.compile(r"\borigin_json\b"), "origin_json column"),
+    (re.compile(r"\bsession_key\b"), "session_key column"),
+    (re.compile(r"\bchat_id\b"), "chat_id column"),
+    (re.compile(r"\bthread_id\b"), "thread_id column"),
+    (re.compile(r"\bdisplay_name\b"), "display_name column"),
+    (re.compile(r"\bapi_content\b"), "api_content column"),
+    (re.compile(r"\breasoning_content\b"), "reasoning_content column"),
+    (re.compile(r"\breasoning_details\b"), "reasoning_details column"),
+    (re.compile(r"\bcodex_reasoning_items\b"), "codex_reasoning_items column"),
+    (re.compile(r"\bcodex_message_items\b"), "codex_message_items column"),
+    (re.compile(r"\bgit_repo_root\b"), "git_repo_root column"),
+    (re.compile(r"\bgit_branch\b"), "git_branch column"),
+    (re.compile(r"\blast_activity_description\b"), "last_activity_description column"),
+    (re.compile(r"\bcwd\b"), "cwd column"),
+    (re.compile(r"\bbase_url\b"), "base_url column"),
+]
+
+
+def check_redaction(artifacts: dict[str, str]) -> list[str]:
+    """Scan named artifact texts for forbidden provenance markers.
+
+    Returns a list of problems; empty list means the artifacts are clean.
+    """
+    problems: list[str] = []
+    for name, text in artifacts.items():
+        for pat, label in _REDACTION_PATTERNS:
+            for m in pat.finditer(text):
+                problems.append(f"redaction[{name}]: {label}: {m.group(0)!r}")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +281,21 @@ def _top5_rows(ev_p: dict, metric: str):
 # ---------------------------------------------------------------------------
 # The actual check.
 # ---------------------------------------------------------------------------
-def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = None) -> list[str]:
-    """Return a list of problems; empty list means the report is consistent."""
+def check_report(
+    report_text: str,
+    evidence: dict,
+    agents_bytes: bytes | None = None,
+    head_sha: str | None = None,
+) -> list[str]:
+    """Return a list of problems; empty list means the report is consistent.
+
+    ``agents_bytes`` is the AGENTS.md blob COMMITTED at HEAD (see
+    :func:`committed_agents`); when provided, the AGENTS.md facts are
+    mandatory — the report must cite bytes/UTF-8 chars/sha256 and they must
+    match the committed blob exactly. ``head_sha`` is ``git rev-parse HEAD``;
+    when provided, the report's cited HEAD commit must match it (freshness:
+    artifacts must not cite an older HEAD).
+    """
     problems: list[str] = []
     ev = evidence["profiles"]
     tables = parse_tables(report_text)
@@ -514,21 +621,46 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
             if name not in PROFILES or metric not in ("input", "reasoning"):
                 problems.append(f"top-5: extra row {name!r}/{metric!r}/{id_cell!r}")
 
-    # -- 9) AGENTS.md facts (§6) vs the live repo file ---------------------
+    # -- 9) AGENTS.md facts (§6) vs the COMMITTED HEAD blob -----------------
+    # AGENTS.md is a mandatory input: when the committed blob was resolved the
+    # report MUST cite the facts and they MUST match the committed HEAD file
+    # (never an arbitrary dirty working-tree file).
     if agents_bytes is not None:
         text = agents_bytes.decode("utf-8", errors="replace")
         m_bytes = re.search(r"(\d[\d ]*)\s*байт", report_text)
         m_chars = re.search(r"(\d[\d ]*)\s*UTF-8 символов", report_text)
         m_sha = re.search(r"sha256\s*`?([0-9a-f]{64})", report_text)
-        if m_bytes and _num(m_bytes.group(1)) != len(agents_bytes):
-            problems.append(f"AGENTS.md bytes: report {m_bytes.group(1)!r}, file {len(agents_bytes)}")
-        if m_chars and _num(m_chars.group(1)) != len(text):
-            problems.append(f"AGENTS.md chars: report {m_chars.group(1)!r}, file {len(text)}")
-        if m_sha:
-            import hashlib
+        if m_bytes is None:
+            problems.append("AGENTS.md: report does not state the byte count (mandatory)")
+        elif _num(m_bytes.group(1)) != len(agents_bytes):
+            problems.append(
+                f"AGENTS.md bytes: report {m_bytes.group(1)!r}, committed HEAD {len(agents_bytes)}"
+            )
+        if m_chars is None:
+            problems.append("AGENTS.md: report does not state the UTF-8 char count (mandatory)")
+        elif _num(m_chars.group(1)) != len(text):
+            problems.append(
+                f"AGENTS.md chars: report {m_chars.group(1)!r}, committed HEAD {len(text)}"
+            )
+        if m_sha is None:
+            problems.append("AGENTS.md: report does not state the sha256 (mandatory)")
+        else:
             real = hashlib.sha256(agents_bytes).hexdigest()
             if m_sha.group(1) != real:
-                problems.append(f"AGENTS.md sha256: report {m_sha.group(1)}, file {real}")
+                problems.append(f"AGENTS.md sha256: report {m_sha.group(1)}, committed HEAD {real}")
+
+    # -- 10) freshness: the report's cited HEAD commit must be the real HEAD --
+    if head_sha is not None:
+        m_head = re.search(r"HEAD\s+`?([0-9a-f]{7,40})`?", report_text)
+        if m_head is None:
+            problems.append(
+                "AGENTS.md: report does not cite the HEAD commit (expected 'HEAD <sha>')"
+            )
+        elif head_sha[: len(m_head.group(1))] != m_head.group(1):
+            problems.append(
+                f"AGENTS.md: report cites HEAD {m_head.group(1)!r}, "
+                f"committed HEAD is {head_sha[:12]}"
+            )
 
     return problems
 
@@ -560,23 +692,52 @@ def _self_test(evidence: dict, report_text: str) -> list[str]:
 
 
 def main() -> int:
-    evidence = json.loads(EVIDENCE.read_text(encoding="utf-8"))
+    evidence_text = EVIDENCE.read_text(encoding="utf-8")
     report_text = REPORT.read_text(encoding="utf-8")
-    agents_bytes = AGENTS.read_bytes() if AGENTS.exists() else None
+    context_text = CONTEXT.read_text(encoding="utf-8")
+    evidence = json.loads(evidence_text)
 
-    problems = check_report(report_text, evidence, agents_bytes)
+    problems: list[str] = []
+    # AGENTS.md is a MANDATORY input: resolve the COMMITTED HEAD blob. A git
+    # failure or an AGENTS.md absent from HEAD is a hard failure — never a
+    # silent skip — and a dirty working-tree file is never trusted.
+    try:
+        head_sha, agents_bytes = committed_agents(REPO)
+    except RuntimeError as e:
+        problems.append(f"AGENTS.md: committed HEAD file required but unavailable: {e}")
+        head_sha, agents_bytes = None, None
+
+    problems += check_report(report_text, evidence, agents_bytes, head_sha)
+    problems += check_redaction(
+        {
+            "report": report_text,
+            "evidence": evidence_text,
+            "context_baseline": context_text,
+        }
+    )
+
     if "--self-test" in sys.argv:
         st = _self_test(evidence, report_text)
+        # prove the redaction regression check catches provenance markers
+        red_mutated = report_text + "\n| task | t_0123456789abcdef | wt/t_0123abcd |\n"
+        red_problems = check_redaction({"self-test": red_mutated})
+        if not red_problems:
+            st.append(
+                "self-test FAILED: planted kanban task id / worktree marker was NOT detected"
+            )
         print("self-test:", "OK (substitution detected)" if not st else "\n".join(st))
         if st:
             return 1
 
     if problems:
-        print("REPORT MISMATCHES EVIDENCE:")
+        print("REPORT MISMATCHES EVIDENCE / REDACTION:")
         for p in problems:
             print("  ", p)
         return 1
-    print("OK: report tables/fingerprints/derived ratios match the committed evidence.")
+    print(
+        "OK: report tables/fingerprints/derived ratios match the committed evidence; "
+        "AGENTS.md facts match committed HEAD; redaction clean."
+    )
     return 0
 
 
