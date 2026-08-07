@@ -127,6 +127,25 @@ def test_usage_grouping_reuses_phase_for_label(tmp_path: Path):
     assert by_group[("phase3 audit", "qwen3.7-plus")]["reported_cost"] == 0.04
 
 
+def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
+    # Non-blocking review observation: legacy adapter labels
+    # ("phase2c-qwen-fidelity") carry the phase namespace inside the token;
+    # the label-group must render the canonical "phase2c qwen_fidelity",
+    # not the raw "phase2c-qwen-fidelity qwen_fidelity".
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / USAGE_FILENAME, [
+        _usage_row("phase2c-qwen-fidelity", model="qwen3.7-plus", cost=0.01),
+        _usage_row("phase2c-gemma-russian-preference", cost=0.02),
+    ])
+
+    groups = tracker._usage_group_rows(tracker._read_usage_rows(out))
+    by_group = {(g["label_group"], g["model"]): g for g in groups}
+
+    assert by_group[("phase2c qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
+    assert by_group[("phase2c gemma_preference", "deepseek-v4-flash")]["step"] == "Step2c"
+    assert not any(g.startswith("phase2c-qwen-fidelity") for g, _ in by_group)
+
+
 def test_usage_block_hides_cost_column_when_all_zero(tmp_path: Path):
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     # Zero-cost provider: reported_cost absent / 0 on every row.
@@ -211,6 +230,33 @@ def test_chapters_table_hides_cost_when_none_reported(tmp_path: Path):
     report = tracker.render_book_report(base)
     table = report.split("-- active chapter", 1)[0]
     assert "cost(prov.)" not in table
+
+
+def test_chapters_table_hides_cost_when_all_zero_reported(tmp_path: Path):
+    # Regression for review MEDIUM: a chapter whose usage rows all carry
+    # reported_cost 0.0 (or a 0.0/None mix) must hide the cost column —
+    # "all 0/None -> hide gracefully", never "$0.00" noise.
+    base = tmp_path / "book"
+    base.mkdir()
+    ch1 = _chapter_dir(base, "chapter_0001", _iso(3600))
+    _write_ndjson(ch1 / USAGE_FILENAME, [
+        _usage_row("phase2b/balanced_literary/chunk0001", cost=0.0),
+        _usage_row("phase2c/qwen_fidelity", model="qwen3.7-plus", cost=None),
+        _usage_row("phase3/qwen_chapter_audit", model="qwen3.7-plus", cost=0.0),
+    ])
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "cost(prov.)" not in table
+    assert "$0.00" not in table
+    # Calls are still counted; the cost column is the only casualty.
+    assert "3" in table
+
+    # A single non-zero reported_cost anywhere brings the column back.
+    _write_ndjson(ch1 / USAGE_FILENAME, [_usage_row("phase2b/balanced_literary/chunk0001", cost=0.01)])
+    report2 = tracker.render_book_report(base)
+    table2 = report2.split("-- active chapter", 1)[0]
+    assert "cost(prov.)" in table2
+    assert "$0.01" in table2
 
 
 # ---------------------------------------------------------------------------

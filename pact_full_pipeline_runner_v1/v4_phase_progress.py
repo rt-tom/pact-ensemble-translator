@@ -79,6 +79,20 @@ PHASE_FRIENDLY_ROLE = {
 # "phase4 region_repair"); everything else falls back to PHASE_FRIENDLY_ROLE.
 LABEL_GROUP_SUBROLE_PREFIXES = ("phase2c", "phase4")
 
+# Display-only canonical prefix per phase (same design as
+# PHASE_TO_STEP_GROUP). Lets legacy hyphen labels ("phase2c-qwen-fidelity")
+# render the canonical "phase2c qwen_fidelity" label-group instead of the
+# raw "phase2c-qwen-fidelity qwen_fidelity"; the label -> phase leg stays
+# fully delegated to phase_for_label() from v4_usage.py, never duplicated.
+PHASE_TO_LABEL_PREFIX = {
+    "gen": "phase2b",
+    "qwen_fidelity": "phase2c",
+    "gemma_preference": "phase2c",
+    "audit": "phase3",
+    "repair": "phase4",
+    "formatting": "phase5",
+}
+
 TRIAL_STATES = (
     "pending", "generated", "gated", "selected", "quarantined",
     "needs_synthesis", "incomplete_generation",
@@ -630,8 +644,11 @@ def _label_group(label: Optional[str]) -> str:
     phase leg — the same label->phase rules as v4_usage, never duplicated.
     """
     parts = (label or "").split("/")
-    prefix = parts[0] if parts and parts[0] else "(unknown)"
     phase = phase_for_label(label)
+    # Canonical prefix from the phase (handles legacy hyphen labels such as
+    # "phase2c-qwen-fidelity" -> "phase2c"); fall back to the raw token for
+    # labels phase_for_label does not recognize.
+    prefix = PHASE_TO_LABEL_PREFIX.get(phase, parts[0] if parts and parts[0] else "(unknown)")
     if prefix in LABEL_GROUP_SUBROLE_PREFIXES and len(parts) > 1 and parts[1]:
         role = parts[1]
     else:
@@ -937,7 +954,10 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
         "status": status,
         "calls": calls,
         "cost": cost,
-        "cost_present": bool(costs),
+        # Present only when at least one usage row actually reported a
+        # non-zero provider cost: all 0/None -> hide the column gracefully
+        # (spec), not "$0.00" noise.
+        "cost_present": any(c != 0 for c in costs),
         "events": events,
     }
 
