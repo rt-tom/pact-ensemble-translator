@@ -407,6 +407,17 @@ def check_report(
     # mandatory header schemas — a mutation must never be silently ignored
     _check_table_structure(problems, tables)
     _check_mandatory_headers(problems, tables)
+    if problems:
+        # A malformed table structure (duplicated / renamed header cell, row
+        # width mismatch) makes the section-specific checks below unsafe:
+        # they assume every row matches its header width and would index past
+        # the row (crashing on None, or silently misreading a partial cell).
+        # Fail closed: report the structural problems and stop. RV3 finding:
+        # duplicating the first header cell of the reasoning-effort,
+        # finish_reason and top-5 tables used to raise an uncaught
+        # AttributeError ('NoneType' object has no attribute 'strip') after
+        # the structural problems were already appended.
+        return problems
 
     # -- 1) fingerprint table (§1) -----------------------------------------
     fp_rows = _mandatory_rows(tables, "fingerprint")

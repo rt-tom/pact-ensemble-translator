@@ -525,6 +525,69 @@ def test_verifier_rejects_renamed_header_cell(committed_evidence, committed_repo
     assert any("expected" in p and "aggregates" in p for p in problems)
 
 
+def _dup_first_header_cell(md: str, expected: tuple) -> str:
+    """Duplicate the first cell of the first header line equal to `expected`."""
+    for line in md.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if tuple(cells) == expected:
+            first = expected[0]
+            mutated = line.replace(f"| {first} |", f"| {first} | {first} |", 1)
+            assert mutated != line
+            return md.replace(line, mutated, 1)
+    raise AssertionError(f"header {expected} not found in report")
+
+
+@pytest.mark.parametrize(
+    "spec",
+    verify._MANDATORY_TABLES,
+    ids=[s[0] for s in verify._MANDATORY_TABLES],
+)
+def test_verifier_duplicate_first_header_cell_fails_closed(
+    committed_evidence, committed_report, spec
+) -> None:
+    """Duplicating the FIRST header cell of any mandatory table must return
+    structural problems, never an uncaught exception (RV3 finding: a
+    duplicated first cell crashed the reasoning-effort / finish_reason /
+    top-5 checks with AttributeError after the structural problems were
+    already appended)."""
+    name, _pred, expected = spec
+    mutated = _dup_first_header_cell(committed_report, expected)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, f"{name}: duplicated first header cell was NOT detected"
+    assert any(
+        "duplicate header" in p or ("header" in p and "expected" in p)
+        for p in problems
+    ), f"{name}: no structural reason in problems: {problems}"
+
+
+def test_verifier_cli_exits_nonzero_on_duplicate_first_header(
+    committed_evidence, committed_report, tmp_path, monkeypatch
+) -> None:
+    """The CLI must exit non-zero with a structural reason when the first
+    header cell of a mandatory table is duplicated in the committed report
+    (RV3 finding: it used to crash with an uncaught AttributeError)."""
+    mutated = _dup_first_header_cell(committed_report, ("Профиль", "medium", "high"))
+    ev_path = tmp_path / "evidence.json"
+    rpt_path = tmp_path / "report.md"
+    ctx_path = tmp_path / "context.json"
+    ev_path.write_text(
+        (REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json")
+        .read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    rpt_path.write_text(mutated, encoding="utf-8")
+    ctx_path.write_text(
+        (REPO / "tools/context_baseline.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(verify, "EVIDENCE", ev_path)
+    monkeypatch.setattr(verify, "REPORT", rpt_path)
+    monkeypatch.setattr(verify, "CONTEXT", ctx_path)
+    assert verify.main() == 1
+
+
 # ---------------------------------------------------------------------------
 # 7. Structural verifier rejects non-finite numeric cells (nan / inf).
 # ---------------------------------------------------------------------------
