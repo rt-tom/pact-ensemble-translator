@@ -237,6 +237,12 @@ class StrictRunConfig:
     max_formatting_incidents: int = 0
     formatting_required: bool = True
     formatting_policy_version: str = "pact-v4-formatting/v1"
+    # V4 Efficiency A2: single balanced_literary candidate per chunk with a
+    # lazy fidelity_first fallback when the primary fails the Qwen/
+    # deterministic gates. False restores the legacy 2-candidate A/B + Gemma
+    # scheme (full rollback). It is part of the config identity (see
+    # to_config_artifact) so flipping it invalidates resume/cache correctly.
+    lazy_balanced: bool = True
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -273,6 +279,12 @@ class StrictRunConfig:
                 # makes any pre-policy journal a foreign identity -> resume
                 # refuses instead of silently reusing.
                 "glossary_budget_policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
+                # V4 Efficiency A2: the lazy balanced-only generation scheme is
+                # part of the run's config identity — flipping it changes which
+                # candidates are generated (balanced-only vs A/B pair), so a
+                # journal written under the other scheme must be refused on
+                # resume (same reasoning as glossary_budget_policy_version).
+                "efficiency": {"lazy_balanced": self.lazy_balanced},
             },
         )
 
@@ -2250,6 +2262,7 @@ def run_chapter_strict(
                     glossary=chunk_glossary, style_constraints={}, bible_text=bible_text,
                     config=config, params=generation_params,
                     model_caller=model_caller, cache=gen_cache,
+                    lazy_balanced=cfg.lazy_balanced,
                 )
                 generation_records.append(_serialize_generation_outcome(outcome))
 
@@ -2368,6 +2381,92 @@ def run_chapter_strict(
                         )
                         break
                     continue
+
+                # ---- V4 Efficiency A2: lazy balanced-only fallback ----
+                # The single balanced_literary candidate failed the
+                # Qwen/deterministic gates. Lazily generate the fidelity_first
+                # safety net and run the cascade on it alone: one passing
+                # candidate → selected (Gemma is never invoked with a single
+                # candidate), both failing → quarantined, exactly as the
+                # pre-A2 2-candidate cascade would have. With
+                # cfg.lazy_balanced=False this block never runs (legacy
+                # 2-candidate + Gemma behavior, full rollback).
+                if cfg.lazy_balanced and result.quarantine:
+                    primary_quarantine_reason = result.quarantine_reason
+                    lazy_outcome = generate_for_chunk(
+                        chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
+                        chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
+                        glossary=chunk_glossary, style_constraints={}, bible_text=bible_text,
+                        config=config, params=generation_params,
+                        model_caller=model_caller, cache=gen_cache,
+                        roles=("fidelity_first",),
+                    )
+                    generation_records.append(_serialize_generation_outcome(lazy_outcome))
+                    if lazy_outcome.status == "complete":
+                        candidates = list(lazy_outcome.candidates.values())
+                        # The lazy fidelity candidate's own text must join the
+                        # source-derived mixed-script allowlist, exactly as both
+                        # candidates' texts did pre-A2 (the union was computed
+                        # above from the balanced candidate alone). Without this
+                        # a Latin token fidelity preserves (and balanced did
+                        # not) — e.g. source initials — would be wrongly
+                        # flagged by the deterministic gate and the lazy rescue
+                        # would degrade a chunk the legacy cascade selected.
+                        det_data_lazy = replace(
+                            det_data_base,
+                            mixed_script_allow=combine_script_tokens(
+                                static_allow,
+                                source_derived_allowlist(
+                                    chunk_source_text,
+                                    candidate_union_text + " " + " ".join(
+                                        text for cand in candidates for _, text in cand.translation
+                                    ),
+                                ),
+                            ),
+                        )
+                        try:
+                            result = select_candidate(
+                                chunk_id=plan_chunk.chunk_id, candidates=candidates, source=source,
+                                qwen_evaluator=qwen_evaluator, det_data=det_data_lazy,
+                                gemma_selector=gemma_selector,
+                            )
+                        except Exception as exc:  # noqa: BLE001 -- see primary select_candidate handling
+                            LOG.exception(
+                                "select_candidate raised on lazy fidelity for %s", plan_chunk.chunk_id
+                            )
+                            result = SelectionResult(
+                                chunk_id=plan_chunk.chunk_id, quarantine=True,
+                                quarantine_reason=f"lazy fidelity cascade raised: {exc!r}",
+                                candidates_evaluated=len(candidates),
+                            )
+                        outcome = lazy_outcome
+                        if result.quarantine:
+                            # Both the primary balanced_literary and the lazy
+                            # fidelity_first failed → quarantined; keep both
+                            # reasons in the audit trail.
+                            result = replace(
+                                result,
+                                quarantine_reason=(
+                                    "balanced_literary failed the gates: "
+                                    f"{primary_quarantine_reason} | lazy fidelity_first also failed: "
+                                    f"{result.quarantine_reason}"
+                                ),
+                            )
+                    else:
+                        # Lazy generation itself failed validation (e.g.
+                        # invalid JSON) → both attempts failed → quarantined.
+                        outcome = lazy_outcome
+                        candidates = []
+                        result = SelectionResult(
+                            chunk_id=plan_chunk.chunk_id, quarantine=True,
+                            quarantine_reason=(
+                                "balanced_literary failed the gates; lazy fidelity_first "
+                                "generation incomplete: "
+                                + ", ".join(
+                                    f"{r}={e.detail}" for r, e in lazy_outcome.errors.items()
+                                )
+                            ),
+                        )
 
                 q_delta, n_delta, selected_text = _record_selection(
                     selection_records=selection_records, final_text_by_pid=final_text_by_pid,

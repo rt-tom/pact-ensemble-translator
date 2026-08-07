@@ -16,6 +16,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -376,6 +377,9 @@ def test_high_risk_chunk_with_agreeing_candidates_calls_gemma_preference(tmp_pat
     # restart-accounting case test_two_low_risk_chunks_... does not cover:
     # a real switch back to Gemma for preference within the same chunk,
     # not just the next chunk's generation.
+    # lazy_balanced=False: Gemma preference needs 2+ passing candidates,
+    # which only the legacy A/B scheme produces (V4 Efficiency A2's lazy
+    # mode generates a single candidate, so this stays a legacy-path test).
     chapter_html = tmp_path / "046.html"
     chapter_html.write_text(
         "<html><body>" + "<p>You must not open box 7.</p>" * 9 + "</body></html>",
@@ -386,6 +390,7 @@ def test_high_risk_chunk_with_agreeing_candidates_calls_gemma_preference(tmp_pat
     cfg = StrictRunConfig(
         chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
         out_dir=tmp_path / "out", backend=_make_backend(),
+        lazy_balanced=False,
     )
     router = _make_router()
     stub_gemma = StubGemma()
@@ -439,6 +444,234 @@ def test_quarantine_halts_after_max_consecutive_nonselections(tmp_path: Path):
     assert by_id["chunk0002"]["status"] == "incomplete_generation"
     assert by_id["chunk0002"]["uncovered_pids"] == by_id["chunk0002"]["plan_pids"]
     assert by_id["chunk0002"]["audit_status"] == "no_candidate"
+
+
+# ---------------------------------------------------------------------------
+# V4 Efficiency A2 — lazy balanced-only generation
+# ---------------------------------------------------------------------------
+
+
+def _high_risk_single_chunk_cfg(tmp_path: Path) -> StrictRunConfig:
+    """One high-risk chunk ("You must not open box 7." trips the risk
+    pre-screen), lazy_balanced=True (the A2 default)."""
+    chapter_html = tmp_path / "046.html"
+    chapter_html.write_text(
+        "<html><body>" + "<p>You must not open box 7.</p>" * 9 + "</body></html>",
+        encoding="utf-8",
+    )
+    memory_dir = tmp_path / "memory"
+    _write_empty_memory(memory_dir)
+    return StrictRunConfig(
+        chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
+        out_dir=tmp_path / "out", backend=_make_backend(),
+    )
+
+
+def test_a2_high_risk_balanced_passing_skips_lazy_and_gemma(tmp_path: Path):
+    """A2 acceptance `high+passed→no lazy`: when the single balanced_literary
+    candidate passes the Qwen/deterministic gates it is selected directly —
+    no lazy fidelity_first generation and no Gemma preference call."""
+    cfg = _high_risk_single_chunk_cfg(tmp_path)
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
+    stub_gemma = StubGemma()
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=_LifecycleAwareQwen(router, StubQwen(passed=True)),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, stub_gemma),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+    # exactly one generation call (the balanced primary); no lazy fidelity
+    assert [b.role for b in model_caller._inner.calls] == ["balanced_literary"]
+    assert stub_gemma.calls == []  # single candidate → Gemma never invoked
+    sel = json.loads((result.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+    assert sel["results"][0]["selected_role"] == "balanced_literary"
+    assert sel["results"][0]["candidates_evaluated"] == 1
+
+
+def test_a2_balanced_failing_lazily_generates_fidelity_first(tmp_path: Path):
+    """A2 acceptance `high+failed→lazy fidelity` (run_005 chunk0010/0014
+    fidelity-wins behavior): the balanced_literary primary fails the Qwen
+    gate, the driver lazily generates fidelity_first and re-runs the cascade
+    on it alone, and the passing fidelity candidate is selected — Gemma is
+    never invoked (only ever one candidate per cascade pass)."""
+    cfg = _high_risk_single_chunk_cfg(tmp_path)
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
+    stub_gemma = StubGemma()
+
+    class _FailFirstQwen(StubQwen):
+        def __init__(self) -> None:
+            super().__init__(passed=True)
+            self._n = 0
+
+        def __call__(self, source, translation):
+            self._n += 1
+            return GateResult(
+                gate="qwen_fidelity", passed=self._n > 1,
+                detail="first candidate rejected, then OK",
+            )
+
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=_LifecycleAwareQwen(router, _FailFirstQwen()),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, stub_gemma),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+    # balanced (primary) then fidelity_first (lazy) — exactly two gen calls
+    assert [b.role for b in model_caller._inner.calls] == [
+        "balanced_literary", "fidelity_first",
+    ]
+    assert stub_gemma.calls == []
+    sel = json.loads((result.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+    assert sel["results"][0]["selected_role"] == "fidelity_first"
+    assert sel["results"][0]["candidates_evaluated"] == 1  # the lazy cascade pass
+    # The persisted generation record for the chunk is the lazy (final)
+    # outcome — the one that determined the chunk's fate.
+    gen = json.loads((result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8"))
+    chunk_rec = next(r for r in gen["outcomes"] if r["chunk_id"] == "chunk0001")
+    assert chunk_rec["expected_roles"] == ["fidelity_first"]
+    assert chunk_rec["status"] == "complete"
+    journal = [
+        json.loads(line) for line in result.journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert journal[0]["outcome"] == "selected"
+    assert journal[0]["selected_role"] == "fidelity_first"
+
+
+def test_a2_both_candidates_failing_quarantines_with_both_reasons(tmp_path: Path):
+    """A2 acceptance `оба failed→quarantined`: the balanced primary fails the
+    gates AND the lazily generated fidelity_first also fails → the chunk is
+    quarantined, with both attempts' reasons preserved in the audit trail."""
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
+    stub_gemma = StubGemma()
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=_LifecycleAwareQwen(router, StubQwen(passed=False, reason="meaning drift")),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, stub_gemma),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    assert result.quarantined_count == 1
+    assert result.processed_count == 1  # halted after the first chunk
+    assert [b.role for b in model_caller._inner.calls] == [
+        "balanced_literary", "fidelity_first",
+    ]
+    assert stub_gemma.calls == []
+    journal = [
+        json.loads(line) for line in result.journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert journal[0]["outcome"] == "quarantined"
+    sel = json.loads((result.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+    rec = sel["results"][0]
+    assert rec["status"] == "quarantined"
+    assert "balanced_literary failed the gates" in rec["quarantine_reason"]
+    assert "lazy fidelity_first also failed" in rec["quarantine_reason"]
+
+
+def test_a2_lazy_fidelity_source_derived_allowlist_uses_its_own_text(tmp_path: Path):
+    """The lazy fidelity candidate is gated with a source-derived mixed-script
+    allowlist that includes ITS OWN text (the primary det_data was built from
+    the balanced candidate alone). Without this, a Latin token fidelity
+    preserves (and balanced dropped) — e.g. source initials \"R.D.T.\" — would
+    be wrongly flagged by the deterministic gate and the lazy rescue would
+    degrade a chunk the legacy cascade selected."""
+    cfg = _marker_cfg(tmp_path)  # one chunk, source has "R.D.T."
+
+    class _BalancedDropsMarkerCaller:
+        def __init__(self, marker: str) -> None:
+            self.marker = marker
+            self.calls: list = []
+
+        def __call__(self, bundle: PromptBundle) -> str:
+            self.calls.append(bundle)
+            out: Dict[str, str] = {}
+            for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+                if bundle.role == "balanced_literary":
+                    # balanced drops the Latin initials entirely
+                    out[pid] = f"Перевод номер{index}"
+                elif self.marker in text:
+                    out[pid] = f"{self.marker} стоит у окна."
+                else:
+                    out[pid] = f"Перевод номер{index}"
+            return json.dumps(out, ensure_ascii=False)
+
+    class _FailFirstQwen(StubQwen):
+        def __init__(self) -> None:
+            super().__init__(passed=True)
+            self._n = 0
+
+        def __call__(self, source, translation):
+            self._n += 1
+            return GateResult(
+                gate="qwen_fidelity", passed=self._n > 1,
+                detail="balanced rejected, lazy fidelity OK",
+            )
+
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, _BalancedDropsMarkerCaller("R.D.T."))
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=_LifecycleAwareQwen(router, _FailFirstQwen()),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    assert result.selected_count == 1
+    assert result.quarantined_count == 0
+    sel = json.loads((result.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+    assert sel["results"][0]["selected_role"] == "fidelity_first"
+    assert sel["results"][0]["status"] == "selected"
+
+
+def test_resume_rejects_journal_written_under_different_lazy_balanced(tmp_path: Path):
+    """A2: the lazy_balanced flag is part of the config identity — a journal
+    written under the opposite scheme (here: pre-flag identity without the
+    efficiency key) must be refused on resume, exactly like the A1
+    glossary-budget policy version."""
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+    first_result, _router1 = _run(cfg, qwen=StubQwen(passed=False, reason="meaning drift"))
+    assert first_result.processed_count == 1  # journal has one entry
+
+    artifact = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
+    pre_flag_values = {
+        key: _plain_json(value) for key, value in artifact.values.items()
+        if key != "efficiency"
+    }
+    pre_flag_identity = build_config_artifact(
+        version=cfg.config_version, values=pre_flag_values
+    ).config_identity
+    assert pre_flag_identity != artifact.config_identity  # flag IS in the identity
+
+    # Rewrite the journal as if it had been written without the flag.
+    journal_path = cfg.out_dir / "journal.ndjson"
+    lines = journal_path.read_text(encoding="utf-8").splitlines()
+    rewritten = []
+    for line in lines:
+        entry = json.loads(line)
+        entry["config_identity"] = pre_flag_identity
+        rewritten.append(json.dumps(entry, ensure_ascii=False))
+    journal_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        max_consecutive_terminal_nonselections=3,
+    )
+    try:
+        _run(resumed_cfg, qwen=StubQwen(passed=True))
+    except ValueError as exc:
+        assert "Foreign identity" in str(exc)
+    else:
+        raise AssertionError("expected a Foreign identity ValueError")
 
 
 def test_resume_skips_already_journaled_chunks_and_completes(tmp_path: Path):
@@ -614,7 +847,12 @@ def test_step6_audits_partial_selection_with_best_variant(tmp_path: Path):
     # must audit BOTH chunks (owner decision 2026-08-02) — the quarantined
     # one through its deterministic best-variant, the selected one through
     # its committed winner — and hand off the real per-chunk status.
+    # lazy_balanced=False: the _FailOnceQwen rejects the FIRST candidate of
+    # the legacy A/B pair, which is what produces a quarantined chunk here;
+    # in A2 lazy mode that first failure would trigger the lazy fidelity
+    # rescue instead (covered by the dedicated lazy-path tests below).
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = replace(cfg, lazy_balanced=False)
 
     class _FailOnceQwen(StubQwen):
         def __init__(self):
@@ -666,6 +904,9 @@ def test_step6_best_variant_picks_fidelity_first_among_two_gemma_variants(tmp_pa
     # quarantined. Step 6's best-variant rule (owner decision 2026-08-02)
     # must deterministically pick A: equal gates passed on each candidate's
     # own decision_trace, then role priority fidelity_first > balanced_literary.
+    # lazy_balanced=False: two simultaneous candidates only exist in the
+    # legacy A/B scheme (the A2 lazy path generates at most one candidate
+    # per cascade pass, so the tie-breaking rule is exercised here).
     chapter_html = tmp_path / "046.html"
     chapter_html.write_text(
         "<html><body>" + "<p>You must not open box 7.</p>" * 9 + "</body></html>",
@@ -676,6 +917,7 @@ def test_step6_best_variant_picks_fidelity_first_among_two_gemma_variants(tmp_pa
     cfg = StrictRunConfig(
         chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
         out_dir=tmp_path / "out", backend=_make_backend(),
+        lazy_balanced=False,
     )
     router = _make_router()
     model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())

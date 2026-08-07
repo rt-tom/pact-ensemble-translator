@@ -310,7 +310,21 @@ class GenerationOutcome:
         object.__setattr__(self, "errors", MappingProxyType(dict(self.errors)))
 
 
-def _roles_for_band(band: RiskBand) -> Tuple[str, ...]:
+def _roles_for_band(band: RiskBand, *, lazy_balanced: bool = True) -> Tuple[str, ...]:
+    """Roles to generate up-front for a risk band.
+
+    V4 Efficiency A2 (lazy balanced-only, default ``lazy_balanced=True``):
+    exactly one primary candidate (``balanced_literary``) for every band.
+    ``fidelity_first`` is NOT generated up-front — the strict driver
+    generates it lazily only when the primary fails the Qwen/deterministic
+    gates (run_005 chunk0010/0014 fidelity-wins cases).
+
+    ``lazy_balanced=False`` restores the legacy scheme: one ``fidelity_first``
+    candidate for low risk, the A/B pair (``fidelity_first`` +
+    ``balanced_literary``) for medium/high risk.
+    """
+    if lazy_balanced:
+        return ("balanced_literary",)
     if band is RiskBand.LOW:
         return ("fidelity_first",)
     if band in (RiskBand.MEDIUM, RiskBand.HIGH):
@@ -533,6 +547,8 @@ def generate_for_chunk(
     params: GenerationParams,
     model_caller: ModelCaller,
     cache: Optional[GenerationCache] = None,
+    lazy_balanced: bool = True,
+    roles: Optional[Tuple[str, ...]] = None,
 ) -> GenerationOutcome:
     """Generate the risk-gated candidate set for one chunk.
 
@@ -540,6 +556,17 @@ def generate_for_chunk(
     medium/high risk -> exactly two candidates, ``fidelity_first`` (A) and
     ``balanced_literary`` (B). There is no third candidate and no
     selection/winner logic here (Phase 2C).
+
+    V4 Efficiency A2: with ``lazy_balanced=True`` (default) every band
+    generates exactly one primary candidate (``balanced_literary``);
+    ``fidelity_first`` is deferred to the strict driver's lazy fallback.
+    ``lazy_balanced=False`` restores the legacy A/B scheme above.
+
+    ``roles`` (optional) overrides the risk-based role routing entirely and
+    generates exactly those roles — used by the strict driver's A2 lazy
+    fallback to re-generate a single ``fidelity_first`` candidate after the
+    primary failed the gates. Must be non-empty and contain only known roles;
+    ``lazy_balanced`` is ignored for role resolution when ``roles`` is given.
 
     ``glossary``/``style_constraints`` are the frozen snapshot's actual
     character/style/voice constraints (structured, not a caller-flattened
@@ -552,7 +579,17 @@ def generate_for_chunk(
     if cache is None:
         cache = GenerationCache()
 
-    roles = _roles_for_band(risk.band)
+    if roles is not None:
+        if not roles:
+            raise ValueError("generate_for_chunk: roles must be non-empty")
+        unknown = set(roles) - set(_TEMPLATES)
+        if unknown:
+            raise ValueError(
+                f"generate_for_chunk: unknown role(s) {sorted(unknown)}; "
+                f"known roles are {sorted(_TEMPLATES)}"
+            )
+    else:
+        roles = _roles_for_band(risk.band, lazy_balanced=lazy_balanced)
     style_pairs = tuple(sorted(style_constraints.items()))
 
     candidates: Dict[str, Candidate] = {}

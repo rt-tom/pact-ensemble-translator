@@ -196,6 +196,9 @@ def test_generation_parity_fake_vs_opencode_backend():
     canned = valid_output_for(chunk)
 
     ref_gen = ConstantGenerator(lambda bundle: canned)
+    # lazy_balanced=False: the parity contract compares the FULL legacy A/B
+    # candidate pair across backend wirings (the A2 lazy default would
+    # shrink it to a single balanced_literary candidate).
     ref_outcome = generate_for_chunk(
         chunk_id=chunk.chunk_id,
         risk=risk,
@@ -205,6 +208,7 @@ def test_generation_parity_fake_vs_opencode_backend():
         config=config,
         params=make_params(),
         model_caller=ref_gen,
+        lazy_balanced=False,
     )
     ref_bundle = ref_gen.calls[0]
 
@@ -222,6 +226,7 @@ def test_generation_parity_fake_vs_opencode_backend():
         config=config,
         params=make_params(),
         model_caller=back_caller,
+        lazy_balanced=False,
     )
 
     assert set(back_outcome.candidates) == set(ref_outcome.candidates)
@@ -300,6 +305,8 @@ def test_selection_parity_fake_vs_opencode_backend():
     canned_out = valid_output_for(chunk)
     canned_qwen = _qwen_pass_verdict()
 
+    # lazy_balanced=False: parity compares the full legacy A/B pair and the
+    # Gemma preference over two passing candidates (see below).
     ref_outcome = generate_for_chunk(
         chunk_id=chunk.chunk_id,
         risk=risk,
@@ -309,6 +316,7 @@ def test_selection_parity_fake_vs_opencode_backend():
         config=config,
         params=make_params(),
         model_caller=ConstantGenerator(lambda bundle: canned_out),
+        lazy_balanced=False,
     )
     back_outcome = generate_for_chunk(
         chunk_id=chunk.chunk_id,
@@ -322,6 +330,7 @@ def test_selection_parity_fake_vs_opencode_backend():
             OpenCodeStub([canned_out, canned_out]),
             config=BackendModelCallerConfig(max_tokens=512),
         ),
+        lazy_balanced=False,
     )
 
     preferred = ref_outcome.candidates["fidelity_first"].candidate_id

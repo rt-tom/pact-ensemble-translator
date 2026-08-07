@@ -147,6 +147,8 @@ class ConstantGenerator:
 
 
 def test_low_risk_calls_generator_exactly_once():
+    # V4 Efficiency A2: the lazy balanced-only default generates exactly one
+    # primary candidate (balanced_literary) for every band, low risk included.
     source, snapshot, chunk_plan, chunk, config = make_env()
     generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
 
@@ -163,11 +165,38 @@ def test_low_risk_calls_generator_exactly_once():
 
     assert generator.call_count == 1
     assert outcome.status == "complete"
-    assert set(outcome.candidates) == {"fidelity_first"}
+    assert set(outcome.candidates) == {"balanced_literary"}
 
 
 @pytest.mark.parametrize("band", [RiskBand.MEDIUM, RiskBand.HIGH])
 def test_medium_and_high_risk_produce_exactly_a_and_b(band):
+    # Legacy 2-candidate scheme, explicitly opted out of the A2 lazy default
+    # (lazy_balanced=False → fidelity_first A + balanced_literary B).
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(band),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+        lazy_balanced=False,
+    )
+
+    assert generator.call_count == 2
+    assert set(outcome.candidates) == {"fidelity_first", "balanced_literary"}
+    assert outcome.status == "complete"
+
+
+@pytest.mark.parametrize("band", [RiskBand.LOW, RiskBand.MEDIUM, RiskBand.HIGH])
+def test_lazy_balanced_generates_single_balanced_candidate_for_every_band(band):
+    """A2 acceptance `low→1 balanced` (and the same single-candidate default
+    for every band): lazy mode never generates more than one candidate up
+    front — fidelity_first is deferred to the driver's lazy fallback."""
     source, snapshot, chunk_plan, chunk, config = make_env()
     generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
 
@@ -182,9 +211,60 @@ def test_medium_and_high_risk_produce_exactly_a_and_b(band):
         model_caller=generator,
     )
 
-    assert generator.call_count == 2
-    assert set(outcome.candidates) == {"fidelity_first", "balanced_literary"}
+    assert generator.call_count == 1
     assert outcome.status == "complete"
+    assert set(outcome.candidates) == {"balanced_literary"}
+    assert outcome.expected_roles == ("balanced_literary",)
+
+
+def test_roles_override_generates_exactly_those_roles():
+    """The strict driver's A2 lazy fallback re-generates a single
+    fidelity_first candidate via the explicit ``roles`` override, bypassing
+    risk-based routing; unknown/empty role lists are rejected."""
+    source, snapshot, chunk_plan, chunk, config = make_env()
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+
+    outcome = generate_for_chunk(
+        chunk_id=chunk.chunk_id,
+        risk=make_risk(RiskBand.HIGH),
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        params=make_params(),
+        model_caller=generator,
+        roles=("fidelity_first",),
+    )
+    assert generator.call_count == 1
+    assert outcome.status == "complete"
+    assert set(outcome.candidates) == {"fidelity_first"}
+    assert outcome.expected_roles == ("fidelity_first",)
+    assert generator.calls[0].role == "fidelity_first"
+
+    with pytest.raises(ValueError, match="unknown role"):
+        generate_for_chunk(
+            chunk_id=chunk.chunk_id,
+            risk=make_risk(RiskBand.HIGH),
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            config=config,
+            params=make_params(),
+            model_caller=generator,
+            roles=("synthesis",),
+        )
+    with pytest.raises(ValueError, match="non-empty"):
+        generate_for_chunk(
+            chunk_id=chunk.chunk_id,
+            risk=make_risk(RiskBand.HIGH),
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            config=config,
+            params=make_params(),
+            model_caller=generator,
+            roles=(),
+        )
 
 
 def test_no_role_other_than_fidelity_first_or_balanced_literary_is_ever_produced():
@@ -233,6 +313,7 @@ def test_a_and_b_use_different_versioned_templates():
         config=config,
         params=make_params(),
         model_caller=generator,
+        lazy_balanced=False,
     )
     assert outcome.status == "complete"
 
@@ -269,7 +350,7 @@ def test_identical_call_reuses_cache():
     second = generate_for_chunk(**kwargs)
 
     assert generator.call_count == 1
-    assert first.candidates["fidelity_first"].candidate_id == second.candidates["fidelity_first"].candidate_id
+    assert first.candidates["balanced_literary"].candidate_id == second.candidates["balanced_literary"].candidate_id
 
 
 def _base_kwargs(source, snapshot, chunk_plan, chunk, config, generator, cache):
@@ -340,7 +421,7 @@ def test_changing_prompt_version_invalidates_cache_end_to_end():
     generate_for_chunk(
         chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.HIGH), source=source,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
-        model_caller=generator, cache=cache,
+        model_caller=generator, cache=cache, lazy_balanced=False,
     )
     assert generator.call_count == 2
     assert len({call.bundle_hash for call in generator.calls}) == 2
@@ -362,11 +443,12 @@ def test_changing_role_invalidates_cache():
         params=make_params(),
         model_caller=generator,
         cache=cache,
+        lazy_balanced=False,
     )
 
-    # low (1 call, risk_band="low") + high (2 calls: risk_band is itself part
-    # of the bundle identity, so fidelity_first@high is a fresh cache miss
-    # even though fidelity_first@low was already generated) = 3.
+    # low (1 call, risk_band="low", lazy default -> balanced_literary) + high
+    # (2 calls, legacy A/B: risk_band is itself part of the bundle identity,
+    # so both high candidates are fresh cache misses) = 3.
     assert generator.call_count == 3
 
 
@@ -521,8 +603,8 @@ def test_pid_mismatch_variants_are_rejected(corrupt):
     )
 
     assert outcome.status == "incomplete"
-    assert "fidelity_first" in outcome.errors
-    assert outcome.errors["fidelity_first"].code == GenerationErrorCode.PID_MISMATCH
+    assert "balanced_literary" in outcome.errors
+    assert outcome.errors["balanced_literary"].code == GenerationErrorCode.PID_MISMATCH
     assert outcome.candidates == {}
 
 
@@ -541,7 +623,7 @@ def test_context_pid_leakage_is_rejected():
     )
 
     assert outcome.status == "incomplete"
-    assert outcome.errors["fidelity_first"].code == GenerationErrorCode.CONTEXT_LEAKAGE
+    assert outcome.errors["balanced_literary"].code == GenerationErrorCode.CONTEXT_LEAKAGE
 
 
 @pytest.mark.parametrize(
@@ -566,10 +648,12 @@ def test_truncated_or_invalid_json_never_becomes_a_candidate(raw):
 
     assert outcome.status == "incomplete"
     assert outcome.candidates == {}
-    assert outcome.errors["fidelity_first"].code == GenerationErrorCode.INVALID_JSON
+    assert outcome.errors["balanced_literary"].code == GenerationErrorCode.INVALID_JSON
 
 
 def test_one_of_ab_failing_yields_incomplete_never_a_substitute():
+    # Legacy A/B scheme (lazy_balanced=False): one role failing validation
+    # must never let the other role's candidate substitute for it.
     source, snapshot, chunk_plan, chunk, config = make_env(pid_count=5)
 
     def gen(bundle):
@@ -581,7 +665,7 @@ def test_one_of_ab_failing_yields_incomplete_never_a_substitute():
     outcome = generate_for_chunk(
         chunk_id=chunk.chunk_id, risk=make_risk(RiskBand.HIGH), source=source,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
-        model_caller=generator,
+        model_caller=generator, lazy_balanced=False,
     )
 
     assert outcome.status == "incomplete"
@@ -701,7 +785,7 @@ def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
         snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
         model_caller=generator, cache=cache,
     )
-    real_candidate = outcome.candidates["fidelity_first"]
+    real_candidate = outcome.candidates["balanced_literary"]
 
     # Simulate cache poisoning: plant a *different-role* candidate under
     # some other bundle hash, then generate again with a request whose
@@ -717,16 +801,16 @@ def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
         snapshot=other_snapshot, chunk_plan=other_chunk_plan, config=other_config,
         params=make_params(), model_caller=other_generator,
     )
-    foreign_candidate = other_outcome.candidates["fidelity_first"]
+    foreign_candidate = other_outcome.candidates["balanced_literary"]
 
     # Recompute the exact bundle_hash our victim call will use, then poison
     # the shared cache at that key with the foreign candidate.
     from pact_v4.phase2.generation import PromptBundle
-    from pact_v4.phase2.prompts import FIDELITY_FIRST_V1
+    from pact_v4.phase2.prompts import BALANCED_LITERARY_V1
 
     victim_bundle = PromptBundle(
-        template=FIDELITY_FIRST_V1,
-        role="fidelity_first",
+        template=BALANCED_LITERARY_V1,
+        role="balanced_literary",
         risk_band="low",
         risk_policy_version=make_risk(RiskBand.LOW).policy_version,
         required_risk_feature_codes=(),
@@ -764,7 +848,7 @@ def test_candidate_provenance_carries_the_full_bundle_hash():
         snapshot=snapshot, chunk_plan=chunk_plan, config=config, params=make_params(),
         model_caller=generator,
     )
-    candidate = outcome.candidates["fidelity_first"]
+    candidate = outcome.candidates["balanced_literary"]
     bundle = generator.calls[0]
 
     matching = [

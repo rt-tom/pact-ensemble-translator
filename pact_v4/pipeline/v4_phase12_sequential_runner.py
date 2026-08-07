@@ -412,6 +412,10 @@ def run_generate(
             if pid in source_map
         )
 
+        # lazy_balanced=False: the sequential benchmark driver depends on the
+        # fidelity_first DRAFT as the left-context source for chunk N+1, so it
+        # must keep the legacy A/B generation (V4 Efficiency A2 changes only
+        # the production strict driver).
         outcome = generate_for_chunk(
             chunk_id=plan_chunk.chunk_id,
             risk=risk,
@@ -426,6 +430,7 @@ def run_generate(
             params=generation_params,
             model_caller=model_caller,
             cache=gen_cache,
+            lazy_balanced=False,
         )
         outcome_records.append({
             "chunk_id": outcome.chunk_id,
