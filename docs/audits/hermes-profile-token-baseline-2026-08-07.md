@@ -18,8 +18,8 @@
 - Снапшот: `generated_at_utc = 2026-08-07T14:23:56+00:00` (фиксированный
   JSON-эвиденс: `docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_evidence.json`).
 - Контекст-базлайн (AGENTS.md + CLI-тулсеты): `tools/context_baseline.json`
-  (`measured_at_utc = 2026-08-07T17:30:05Z`, ветка — Phase 0 branch,
-  HEAD `d1eeafb7405ba72ac348746f2dcc4f94d3c05a06`).
+  (`measured_at_utc = 2026-08-07T17:33:46Z`, ветка — Phase 0 branch,
+  HEAD `1141373b360841268e064ea16a7f9451b5cbcee9`).
 - WAL-согласованный fingerprint (sha256/размер **backup-копии** state.db через
   SQLite backup API — main+WAL в одном согласованном состоянии, `journal_mode`):
 
@@ -190,12 +190,12 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
   filesystem checkpoints включены, `compression` идентичен (enabled,
   threshold 0.5, target_ratio 0.2, protect_last_n 20, proactive_prune_tokens 0),
   `prompt_caching.cache_ttl: 5m`.
-- **AGENTS.md (измерено, HEAD `d1eeafb7405ba72ac348746f2dcc4f94d3c05a06` == HEAD
+- **AGENTS.md (измерено, HEAD `1141373b360841268e064ea16a7f9451b5cbcee9` == HEAD
   ветки отчёта; содержимое == origin/main — Phase-0 коммиты AGENTS.md не меняют):**
-  - 20 456 байт / 16 438 UTF-8 символов / 300 строк (splitlines; `wc -l`
-    согласуется; с хвостовым newline `len(split('\n'))` = 301);
-  - sha256 `f94960ea68228c6cc018511154399bf60547c838f033968c262f16c75c69c87a`;
-  - оценка токенов (по 4/3 символа на токен, НЕ токенизатором): ≈ 4.1–5.5K
+  - 21 824 байта / 17 227 UTF-8 символов / 311 строк (splitlines; `wc -l`
+    согласуется; с хвостовым newline `len(split('\n'))` = 312);
+  - sha256 `18262785f6b71e67002daac95b1120b09cd17414afb94450f8ff177e7840a4f3`;
+  - оценка токенов (по 4/3 символа на токен, НЕ токенизатором): ≈ 4.3–5.7K
     токенов на сессию холодного старта — константный вклад в static context
     каждого worker-раза.
 
@@ -272,7 +272,7 @@ architect и reviewer `high`; `max_turns: 500` у всех; `disabled_toolsets: 
    Короткие сессии (p50 9 вызовов, p90 19.4), но высокий p50 input 77 606 →
    ~8.6K токенов на вызов в среднем (оценка: p50 input ÷ p50 вызовов).
    Reasoning всего 2.6 % input — объём создаёт НЕ думание, а повторяемую
-   загрузку контекста (AGENTS.md ≈ 4.1–5.5K токенов на сессию, skills —
+   загрузку контекста (AGENTS.md ≈ 4.3–5.7K токенов на сессию, skills —
    `skill_view` 337 вызовов, kanban-контекст — `kanban_show` 214). Cache-read ÷
    input всего 8.6× — между короткими сессиями кэш почти не переиспользуется
    (каждая ревью-сессия стартует холодно). Крупнейший рычаг Phase 1
@@ -315,7 +315,7 @@ cache-соотношения (арифметика над измеренными
 - «Видимый текст = output − reasoning» — по спецификации §9.10 (reasoning входит
   в output); арифметическое тождество, не прямое измерение видимых токенов.
 - «~8.6K токенов на вызов у reviewer» — p50 input ÷ p50 вызовов (грубая оценка).
-- AGENTS.md ≈ 4.1–5.5K токенов — по 4/3 символа на токен (не токенизатором).
+- AGENTS.md ≈ 4.3–5.7K токенов — по 4/3 символа на токен (не токенизатором).
 - Причинная привязка драйверов (§9) — интерпретация паттернов, не измерение.
 - «Cache-read ÷ input» — соотношение объёмов, НЕ утверждение о бесплатности.
 
@@ -362,7 +362,7 @@ cache-соотношения (арифметика над измеренными
 Обоснование по данным:
 - Наибольший устойчивый вклад в input у **reviewer** — повторяемый статический
   контекст (97.4 % input не-reasoning; p50 input 77 606 при p50 9 вызовах;
-  cache-read лишь 8.6× input — холодные старты). `AGENTS.md` ≈ 4.1–5.5K токенов
+  cache-read лишь 8.6× input — холодные старты). `AGENTS.md` ≈ 4.3–5.7K токенов
   загружается на каждую сессию всех трёх профилей; это измеряемый, полностью
   обратимый docs-only рычаг.
 - У **developer** доминирует reasoning (56.4 % input) — кандидат на Phase 2
@@ -396,8 +396,8 @@ python tools\verify_baseline_report.py --self-test
 
 # 4) размер/хэш AGENTS.md (PowerShell):
 Get-FileHash AGENTS.md -Algorithm SHA256
-(Get-Item AGENTS.md).Length                        # 20456 байт
-(Get-Content AGENTS.md -Raw).Length                # 16438 UTF-8 символов
+(Get-Item AGENTS.md).Length                        # 21824 байт
+(Get-Content AGENTS.md -Raw).Length                # 17227 UTF-8 символов
 
 # 5) redaction-check (встроен в verify_baseline_report.py): 0 совпадений с
 #    запрещёнными паттернами (kanban task-ids, worktree-ветки, абсолютные
