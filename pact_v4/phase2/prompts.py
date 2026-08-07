@@ -165,15 +165,21 @@ def render_prompt(bundle: "Any") -> str:
         else ""
     )
     bible_block = bundle.bible_text if bundle.bible_text else ""
+    # V4 Efficiency A1.2 (provider cache): the static blocks (template
+    # instructions, the full bible, style/policy constants) are placed at
+    # the START of the message so they form a common prefix across chunks
+    # of one run (cached_input_tokens on the provider side). The dynamic
+    # blocks (CHUNK_ID, risk band, source, context, glossary) follow.
+    # Content is unchanged — only the order moves.
     return (
         f"{bundle.template.instructions}\n\n"
+        f"{bible_block}"
+        f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
         f"RISK_BAND: {bundle.risk_band}\n"
         f"OWNED_SOURCE (translate exactly these PIDs, in this order):\n{owned_source}\n"
         f"left_context (read-only, already-committed Russian): {left_context}\n"
         f"right_context (read-only English source): {right_context}\n"
         f"GLOSSARY:\n{glossary}\n"
-        f"{bible_block}"
-        f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n"
         f"{required_category_block}"
     )

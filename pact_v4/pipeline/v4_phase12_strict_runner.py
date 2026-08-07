@@ -119,7 +119,9 @@ from pact_v4.phase5.formatting import (
 )
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
+    _glossary_entries_for_chunk,
     _left_ru_for_chunk,
+    _narrator_glossary_terms,
     _record_selection,
     _risk_for_chunk,
     _serialize_generation_outcome,
@@ -171,6 +173,14 @@ AUDIT_CACHE_SCHEMA = "pact-v4-strict-audit-cache/v1"
 AUDIT_FINDINGS_SCHEMA = "pact-v4-strict-audit-findings/v1"
 HANDOFF_SCHEMA = "pact-v4-step6-b2-handoff/v1"
 SELECTION_META_SCHEMA = "pact-v4-strict-selection-meta/v1"
+GLOSSARY_BUDGET_SCHEMA = "pact-v4-glossary-budget/v1"
+# V4 Efficiency A1.1: per-chunk glossary budget policy. A pair enters the
+# generation bundle only when its source term is present in the chunk's text
+# or it is always_include (fail-closed: narrator_gender name pairs,
+# glossary_conflict-carrying entries, and entries tied to the chunk's
+# required risk categories number_word/tone_profanity are never cut). The
+# bible is NOT filtered (owner decision, plan rev.2 §0.1).
+GLOSSARY_BUDGET_POLICY_VERSION = "pact-v4-glossary-budget/v1"
 # B12-F4 (RV4 HIGH): the repair-cache envelope is versioned with the repair
 # policy. ``_repair_unit_hash`` embeds ``REPAIR_POLICY_VERSION`` (now v2
 # after the F3 fail-closed Qwen verdict fix), so a cache file written under
@@ -1930,11 +1940,17 @@ def run_chapter_strict(
     glossary = _glossary_entries(memory)
     bible_text = render_bible_section(memory.book_memory)
     narrator_gender = extract_narrator_gender(memory.book_memory)
+    narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
     source_map = dict(source.source)
     risk_by_chunk = {
         pc.chunk_id: _risk_for_chunk(chunk=pc, source_map=source_map, glossary=glossary)
         for pc in chunk_plan.chunks
     }
+    # V4 Efficiency A1.1 diagnostics: per-chunk kept/dropped glossary pairs
+    # for the "dropped N pairs: [terms]" report (written at the end of the
+    # run as glossary_budget_report.json; a diagnostic only — never read
+    # back by the pipeline).
+    glossary_budget_report: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Resume: replay journal, verify identities, reconstruct state.
@@ -2120,10 +2136,37 @@ def run_chapter_strict(
 
                 progress_writer.chunk_started(chunk_id=plan_chunk.chunk_id)
 
+                # V4 Efficiency A1.1: per-chunk glossary budget. The full
+                # chapter glossary feeds the risk pre-screen above; the
+                # *generation bundle* gets only the pairs relevant to this
+                # chunk (term present in owned+left+right, or always_include
+                # fail-closed). bundle_hash is derived by PromptBundle from
+                # the filtered set, so a chunk whose glossary was not
+                # filtered keeps its old hash — resume/cache are not
+                # invalidated spuriously.
+                chunk_glossary, dropped_glossary = _glossary_entries_for_chunk(
+                    glossary,
+                    chunk_text=" ".join(
+                        [text for _, text in left_context]
+                        + [text for _, text in right_context]
+                        + [source_map[pid] for pid in plan_chunk.pids if pid in source_map]
+                    ),
+                    risk_feature_codes=(
+                        feature.code for feature in risk.features
+                    ),
+                    narrator_gender=narrator_gender,
+                    narrator_source_terms=narrator_source_terms,
+                )
+                glossary_budget_report[plan_chunk.chunk_id] = {
+                    "kept": [entry.source_term for entry in chunk_glossary],
+                    "dropped": list(dropped_glossary),
+                    "dropped_count": len(dropped_glossary),
+                }
+
                 outcome = generate_for_chunk(
                     chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
                     chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
-                    glossary=glossary, style_constraints={}, bible_text=bible_text,
+                    glossary=chunk_glossary, style_constraints={}, bible_text=bible_text,
                     config=config, params=generation_params,
                     model_caller=model_caller, cache=gen_cache,
                 )
@@ -2631,6 +2674,25 @@ def run_chapter_strict(
         "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
         "records": merged_selection_records,
     })
+    # V4 Efficiency A1.1 diagnostics: per-chunk glossary budget report
+    # ("отброшено N пар: [термины]"). A diagnostic artifact only — the
+    # pipeline never reads it back; the owner uses it to validate the
+    # budget on a real run (card acceptance: dry-run report on run_005).
+    # Rows cover the chunks processed in this session; resumed chunks
+    # (replayed from the journal) were not re-budgeted, so they stay
+    # absent rather than being re-derived from stale context. A full
+    # resume (every chunk replayed) writes nothing, so the prior session's
+    # report is not clobbered by an empty one.
+    if glossary_budget_report or resumed_from_index == 0:
+        _atomic_write_json(cfg.out_dir / "glossary_budget_report.json", {
+            "schema": GLOSSARY_BUDGET_SCHEMA,
+            "policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
+            "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+            "glossary_total": len(glossary),
+            "narrator_gender": narrator_gender,
+            "chunks": glossary_budget_report,
+        })
 
     finished_at = now_fn().isoformat(timespec="seconds")
     runtime_summary = dict(runtime.summary())

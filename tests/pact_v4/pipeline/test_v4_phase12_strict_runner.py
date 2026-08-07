@@ -1176,6 +1176,61 @@ def test_b5_mixed_script_still_flags_unjustified_latin(tmp_path: Path):
     assert journal and journal[0]["outcome"] == "quarantined"
 
 
+# ---------------------------------------------------------------------------
+# V4 Efficiency A1.1 — glossary budget report artifact
+# ---------------------------------------------------------------------------
+
+
+def _glossary_cfg(tmp_path: Path) -> StrictRunConfig:
+    """Fixture cfg with a glossary: one present term, one narrator-locked
+    name, one always-absent term that the budget must drop in every chunk."""
+    chapter_html = tmp_path / "046.html"
+    paragraph_text = " ".join(f"word{i}" for i in range(WORDS_PER_PARAGRAPH))
+    body = "\n".join(f"<p>{paragraph_text}</p>" for _ in range(24))
+    chapter_html.write_text("<html><body>" + body + "</body></html>", encoding="utf-8")
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "glossary.json").write_text(json.dumps({
+        "word3": "слово3",
+        "NarratorName": "Рассказчик",
+        "steward": "стюард",
+    }), encoding="utf-8")
+    (memory_dir / "book_memory.json").write_text(json.dumps({
+        "pov": {"gender": "male", "source_name": "NarratorName"},
+    }), encoding="utf-8")
+    return StrictRunConfig(
+        chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
+        out_dir=tmp_path / "out", backend=_make_backend(),
+        max_consecutive_terminal_nonselections=3,
+    )
+
+
+def test_run_writes_glossary_budget_report(tmp_path: Path):
+    """The A1.1 per-chunk glossary budget report is written with the
+    correct schema and per-chunk kept/dropped pairs: present terms and
+    narrator-locked names stay, absent non-locked terms are dropped and
+    listed in the diagnostic."""
+    cfg = _glossary_cfg(tmp_path)
+    result, _router = _run(cfg)
+    report_path = cfg.out_dir / "glossary_budget_report.json"
+    assert report_path.exists()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "pact-v4-glossary-budget/v1"
+    assert payload["glossary_total"] == 3
+    assert payload["narrator_gender"] == "male"
+    assert len(payload["chunks"]) == result.chunk_count
+    for chunk_id, row in payload["chunks"].items():
+        assert chunk_id.startswith("chunk")
+        # present term and narrator-locked name are never dropped
+        assert "word3" in row["kept"]
+        assert "NarratorName" in row["kept"]
+        assert "steward" not in row["kept"]
+        # the always-absent term is dropped and reported
+        assert row["dropped"] == ["steward"]
+        assert row["dropped_count"] == 1
+
+
+
 def test_b5_mixed_script_manual_entry_dotted_form(tmp_path: Path):
     # A manual config entry written as the dotted form "R.D.T." is tokenized
     # into R/D/T (same as a bible entry), so it must unblock the initials.

@@ -679,6 +679,73 @@ def test_aggregator_shows_per_call_input_output_tps(tmp_path: Path):
     assert "input tps (avg)" in report
 
 
+def test_aggregator_breaks_down_by_phase(tmp_path: Path):
+    """V4 Efficiency A1.3: the report adds a per-phase breakdown (gen /
+    qwen_fidelity / gemma_preference / audit / repair / formatting) with
+    calls and cached/reasoning tokens, grouping the namespaced adapter
+    labels and the legacy role names."""
+    out = tmp_path / "run"
+    _write_ndjson(out / USAGE_FILENAME, [
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase2b/fidelity_first/chunk0001",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 100, "output_tokens": 50, "cached_input_tokens": 10,
+         "wall_seconds": 10.0, "request_id": "r1", "session_id": "s1", "retry_count": 0},
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase2b/balanced_literary/chunk0001",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 200, "output_tokens": 90, "cached_input_tokens": 20,
+         "wall_seconds": 20.0, "request_id": "r2", "session_id": "s2", "retry_count": 0},
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase2c/qwen_fidelity",
+         "model_ref": "opencode-go/q", "provider": "opencode-go", "model": "q",
+         "input_tokens": 10, "output_tokens": 5, "wall_seconds": 2.0,
+         "request_id": "r3", "session_id": "s3", "retry_count": 0},
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase2c/gemma_russian_preference",
+         "model_ref": "opencode-go/g", "provider": "opencode-go", "model": "g",
+         "input_tokens": 5, "output_tokens": 2, "wall_seconds": 1.0,
+         "request_id": "r4", "session_id": "s4", "retry_count": 0},
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase3/qwen_chapter_audit",
+         "model_ref": "opencode-go/q", "provider": "opencode-go", "model": "q",
+         "input_tokens": 30, "output_tokens": 20, "wall_seconds": 3.0,
+         "request_id": "r5", "session_id": "s5", "retry_count": 0},
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase4/region_repair",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 7, "output_tokens": 4, "wall_seconds": 1.5,
+         "request_id": "r6", "session_id": "s6", "retry_count": 0},
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "phase5/formatting_align",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 3, "output_tokens": 2, "wall_seconds": 0.5,
+         "request_id": "r7", "session_id": "s7", "retry_count": 0},
+        # legacy role name still maps to its phase
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "generator",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 40, "output_tokens": 20, "reasoning_tokens": 0,
+         "wall_seconds": 4.0, "request_id": "r8", "session_id": "s8", "retry_count": 0},
+        # unknown label -> (other)
+        {"schema": USAGE_SCHEMA, "ts": "t", "label": "mystery_role",
+         "model_ref": "opencode-go/x", "provider": "opencode-go", "model": "x",
+         "input_tokens": 1, "output_tokens": 1, "wall_seconds": 0.1,
+         "request_id": "r9", "session_id": "s9", "retry_count": 0},
+    ])
+    report = v4_usage.render_usage_report(out)
+    assert "-- by phase" in report
+    # gen: phase2b x2 (300 in) + legacy generator (40 in) = 3 calls, 340 in,
+    # cached 30
+    assert "gen: 3 call(s)" in report
+    assert "input_tokens=340" in report
+    assert "cached_input_tokens=30" in report
+    # qwen_fidelity / gemma_preference / audit / repair / formatting
+    assert "qwen_fidelity: 1 call(s)" in report
+    assert "gemma_preference: 1 call(s)" in report
+    assert "audit: 1 call(s)" in report
+    assert "repair: 1 call(s)" in report
+    assert "formatting: 1 call(s)" in report
+    # unknown label bucketed separately, not silently merged into a phase
+    assert "(other): 1 call(s)" in report
+    # reasoning tokens surface in the phase bucket too
+    assert "reasoning_tokens=0" in report
+    # the plain per-role section still exists alongside
+    assert "-- by role (label) --" in report
+
+
 def test_aggregator_crash_safe_read(tmp_path: Path):
     out = tmp_path / "run"
     path = out / USAGE_FILENAME
