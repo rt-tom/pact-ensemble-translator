@@ -336,7 +336,7 @@ def committed_evidence() -> dict:
 
 @pytest.fixture(scope="module")
 def committed_report() -> str:
-    return (REPO / "docs/audits/HERMES_PROFILE_TOKEN_BASELINE_PHASE0_RU.md").read_text(
+    return (REPO / "docs/audits/hermes-profile-token-baseline-2026-08-07.md").read_text(
         encoding="utf-8"
     )
 
