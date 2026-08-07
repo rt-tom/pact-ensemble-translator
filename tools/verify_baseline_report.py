@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -47,7 +48,10 @@ def _num(cell: str):
     """Parse a report cell into a float. Returns None for non-numeric cells.
 
     Handles space thousands separators, '~'/'×'/'%' decorations, bold/italic
-    markdown and backticks.
+    markdown and backticks. Non-finite values ('nan', 'inf', '-inf') are
+    rejected too: every numeric comparison in this module is
+    ``abs(got - want) > eps``, which is silently False for NaN, so a cell
+    substituted with 'nan' would otherwise pass as valid.
     """
     s = cell.strip().replace(" ", "").replace("\u00a0", "")
     s = s.replace("~", "").replace("×", "").replace("%", "").replace(",", ".")
@@ -55,9 +59,12 @@ def _num(cell: str):
     if s in ("", "—", "-", "(null)", "None", "null"):
         return None
     try:
-        return float(s)
+        v = float(s)
     except ValueError:
         return None
+    if not math.isfinite(v):
+        return None
+    return v
 
 
 def _fmt_int(v) -> str:
