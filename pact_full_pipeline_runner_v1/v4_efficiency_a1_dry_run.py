@@ -26,9 +26,13 @@ writes the JSON payload to a separate path.
 Usage::
 
     python -m pact_full_pipeline_runner_v1.v4_efficiency_a1_dry_run \\
-        --out-dir "D:/pact/gate_bench_runs/v4_phase12_strict_0001/run_005_remote" \\
-        --chapter-html "D:/pact/pact_chapters/0001_bonds-1-1.html" \\
-        --memory-dir "D:/pact/pact_chapters"
+        --out-dir "<RUN_OUT_DIR>" \\
+        --chapter-html "<CHAPTER_HTML>" \\
+        --memory-dir "<MEMORY_DIR>"
+
+(``<RUN_OUT_DIR>`` is a completed run directory, e.g. ``run_005``;
+``<CHAPTER_HTML>`` is the chapter's source HTML; ``<MEMORY_DIR>`` holds
+``glossary.json`` / ``book_memory.json``.)
 """
 from __future__ import annotations
 

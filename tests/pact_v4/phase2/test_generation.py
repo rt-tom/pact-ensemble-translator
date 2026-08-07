@@ -1025,5 +1025,3 @@ def test_bundle_hash_changes_only_when_glossary_was_filtered():
     )
     assert with_narrator_lock == full_glossary
     assert _hash_of(with_narrator_lock) == _hash_of(full_glossary)
-
-

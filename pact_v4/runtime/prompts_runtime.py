@@ -286,9 +286,13 @@ def render_qwen_review_prompt(
     # V4 Efficiency A1.2 (provider cache): static blocks (instructions, the
     # full bible) come first as a common prefix across chunks; the dynamic
     # SOURCE/TRANSLATION blocks follow. Content unchanged — only the order.
+    # A1.2 review fix (LOW): a valid non-empty ``bible_text`` may lack a
+    # trailing newline; add an explicit delimiter so the SOURCE block never
+    # glues onto the bible's last line (reproduced "...maleSOURCE ...").
+    bible_sep = "\n" if bible_block and not bible_block.endswith("\n") else ""
     return (
         f"{template.instructions}\n\n"
-        f"{bible_block}"
+        f"{bible_block}{bible_sep}"
         f"SOURCE (PID -> English text, source order):\n{src_lines}\n\n"
         f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
     )
@@ -325,9 +329,13 @@ def render_qwen_audit_prompt(
     # V4 Efficiency A1.2 (provider cache): static blocks (instructions, the
     # full bible) come first as a common prefix across chunks; the dynamic
     # CHUNK/SOURCE/TRANSLATION blocks follow. Content unchanged.
+    # A1.2 review fix (LOW): a valid non-empty ``bible_text`` may lack a
+    # trailing newline; add an explicit delimiter so the CHUNK block never
+    # glues onto the bible's last line (reproduced "...maleCHUNK: ...").
+    bible_sep = "\n" if bible_block and not bible_block.endswith("\n") else ""
     return (
         f"{template.instructions}\n\n"
-        f"{bible_block}"
+        f"{bible_block}{bible_sep}"
         f"CHUNK: {chunk_id}\n\n"
         f"SOURCE (PID -> English text):\n{src_lines}\n\n"
         f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
@@ -347,9 +355,13 @@ def render_gemma_audit_prompt(
     # V4 Efficiency A1.2 (provider cache): static blocks (instructions, the
     # full bible) come first as a common prefix across chunks; the dynamic
     # CHUNK/TRANSLATION blocks follow. Content unchanged.
+    # A1.2 review fix (LOW): a valid non-empty ``bible_text`` may lack a
+    # trailing newline; add an explicit delimiter so the CHUNK block never
+    # glues onto the bible's last line (reproduced "...maleCHUNK: ...").
+    bible_sep = "\n" if bible_block and not bible_block.endswith("\n") else ""
     return (
         f"{template.instructions}\n\n"
-        f"{bible_block}"
+        f"{bible_block}{bible_sep}"
         f"CHUNK: {chunk_id}\n\n"
         f"TRANSLATION (PID -> Russian text):\n{tr_lines}\n"
     )

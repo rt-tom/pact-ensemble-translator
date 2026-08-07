@@ -171,9 +171,15 @@ def render_prompt(bundle: "Any") -> str:
     # of one run (cached_input_tokens on the provider side). The dynamic
     # blocks (CHUNK_ID, risk band, source, context, glossary) follow.
     # Content is unchanged — only the order moves.
+    # A1.2 review fix (LOW): a valid non-empty ``bible_text`` may lack a
+    # trailing newline; the bible block must still be separated from the
+    # next block by an explicit delimiter, so the following block never
+    # glues onto the bible's last line (reproduced "...maleSTYLE_VOICE_..."
+    # when the bible ended in "male" with no newline).
+    bible_sep = "\n" if bible_block and not bible_block.endswith("\n") else ""
     return (
         f"{bundle.template.instructions}\n\n"
-        f"{bible_block}"
+        f"{bible_block}{bible_sep}"
         f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
         f"RISK_BAND: {bundle.risk_band}\n"

@@ -112,6 +112,17 @@ def test_generation_no_bible_no_empty_block() -> None:
     assert prompt.startswith("You are a translator.")
 
 
+def test_generation_bible_without_trailing_newline_keeps_blocks_separated() -> None:
+    # A1.2 review fix (LOW): a valid non-empty bible_text may lack a
+    # trailing newline; the bible block must still be separated from the
+    # next block (reproduced "...maleSTYLE_VOICE_CONSTRAINTS:" gluing).
+    prompt = render_prompt(_FakeBundle(bible_text="BIBLE:\n  - Narrator: male"))
+    assert "maleSTYLE_VOICE_CONSTRAINTS:" not in prompt
+    assert "male\nSTYLE_VOICE_CONSTRAINTS:" in prompt
+    # static-first ordering is unchanged
+    assert prompt.index("STYLE_VOICE_CONSTRAINTS:") < prompt.index("CHUNK_ID:")
+
+
 # ---------------------------------------------------------------------------
 # Qwen fidelity review prompt
 # ---------------------------------------------------------------------------
@@ -123,6 +134,17 @@ def test_qwen_review_bible_precedes_source() -> None:
     )
     assert prompt.index(BIBLE) < prompt.index("SOURCE (PID -> English text, source order):")
     assert prompt.index("SOURCE") < prompt.index("TRANSLATION")
+
+
+def test_qwen_review_bible_without_trailing_newline_keeps_blocks_separated() -> None:
+    # A1.2 review fix (LOW): non-newline bible_text must not glue the bible
+    # onto the SOURCE block (reproduced "...maleSOURCE ...").
+    prompt = render_qwen_review_prompt(
+        source={"p1": "Hello"}, translation={"p1": "Привет"},
+        bible_text="BIBLE:\n  - Narrator: male",
+    )
+    assert "maleSOURCE" not in prompt
+    assert "male\nSOURCE (PID -> English text, source order):" in prompt
 
 
 def test_qwen_review_static_prefix_identical_across_chunks() -> None:
@@ -152,6 +174,17 @@ def test_qwen_audit_bible_precedes_chunk() -> None:
     assert prompt.index("CHUNK: chunk0001") < prompt.index(source_block)
 
 
+def test_qwen_audit_bible_without_trailing_newline_keeps_blocks_separated() -> None:
+    # A1.2 review fix (LOW): non-newline bible_text must not glue the bible
+    # onto the CHUNK block (reproduced "...maleCHUNK: ...").
+    prompt = render_qwen_audit_prompt(
+        chunk_id="chunk0001", source={"p1": "Hello"}, translation={"p1": "Привет"},
+        bible_text="BIBLE:\n  - Narrator: male",
+    )
+    assert "maleCHUNK" not in prompt
+    assert "male\nCHUNK: chunk0001" in prompt
+
+
 def test_qwen_audit_static_prefix_identical_across_chunks() -> None:
     prompt_a = render_qwen_audit_prompt(
         chunk_id="chunk0001", source={"p1": "Hello"}, translation={"p1": "Привет"},
@@ -178,6 +211,17 @@ def test_gemma_audit_bible_precedes_chunk() -> None:
     translation_block = "TRANSLATION (PID -> Russian text):\n"
     assert prompt.index(BIBLE) < prompt.index("CHUNK: chunk0001")
     assert prompt.index("CHUNK: chunk0001") < prompt.index(translation_block)
+
+
+def test_gemma_audit_bible_without_trailing_newline_keeps_blocks_separated() -> None:
+    # A1.2 review fix (LOW): non-newline bible_text must not glue the bible
+    # onto the CHUNK block (reproduced "...maleCHUNK: ...").
+    prompt = render_gemma_audit_prompt(
+        chunk_id="chunk0001", translation={"p1": "Привет"},
+        bible_text="BIBLE:\n  - Narrator: male",
+    )
+    assert "maleCHUNK" not in prompt
+    assert "male\nCHUNK: chunk0001" in prompt
 
 
 def test_gemma_audit_static_prefix_identical_across_chunks() -> None:

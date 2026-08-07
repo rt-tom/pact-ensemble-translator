@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from pact_v4.phase1.models import ChunkPlanArtifact, GateResult
+from pact_v4.phase1.models import ChunkPlanArtifact, GateResult, _plain_json
 from pact_v4.phase1.chunker import ChunkPlanner
 from pact_v4.phase2.generation import PromptBundle
 from pact_v4.pipeline import _shared_runner_helpers
@@ -36,6 +36,7 @@ from pact_v4.phase0b.source_html import load_source
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.snapshot_factory import (
     ChapterMemory,
+    build_config_artifact,
     build_snapshot,
     build_source_artifact,
 )
@@ -1181,7 +1182,7 @@ def test_b5_mixed_script_still_flags_unjustified_latin(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _glossary_cfg(tmp_path: Path) -> StrictRunConfig:
+def _glossary_cfg(tmp_path: Path, *, max_consecutive: int = 3) -> StrictRunConfig:
     """Fixture cfg with a glossary: one present term, one narrator-locked
     name, one always-absent term that the budget must drop in every chunk."""
     chapter_html = tmp_path / "046.html"
@@ -1201,7 +1202,7 @@ def _glossary_cfg(tmp_path: Path) -> StrictRunConfig:
     return StrictRunConfig(
         chapter_id="046", chapter_html_path=chapter_html, memory_dir=memory_dir,
         out_dir=tmp_path / "out", backend=_make_backend(),
-        max_consecutive_terminal_nonselections=3,
+        max_consecutive_terminal_nonselections=max_consecutive,
     )
 
 
@@ -1228,6 +1229,76 @@ def test_run_writes_glossary_budget_report(tmp_path: Path):
         # the always-absent term is dropped and reported
         assert row["dropped"] == ["steward"]
         assert row["dropped_count"] == 1
+
+
+def test_resume_rejects_pre_policy_glossary_budget_journal(tmp_path: Path):
+    """A1.1 review fix (HIGH): the glossary-budget policy version is part of
+    the run's config identity, so a journal written under a PRE-policy
+    identity (full-glossary prompts, no budget filter) must be refused on
+    resume — replaying its chunks would mix full-glossary historical
+    candidates with post-policy filtered candidates in one run."""
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+    first_result, _router1 = _run(cfg, qwen=StubQwen(passed=False, reason="meaning drift"))
+    assert first_result.processed_count == 1  # journal has one entry
+
+    # What the config identity WAS before the budget policy was pinned:
+    # the same artifact values minus the glossary_budget_policy_version key
+    # (values are the frozen in-memory view — un-freeze before rehashing).
+    artifact = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
+    pre_policy_values = {
+        key: _plain_json(value) for key, value in artifact.values.items()
+        if key != "glossary_budget_policy_version"
+    }
+    pre_policy_identity = build_config_artifact(
+        version=cfg.config_version, values=pre_policy_values
+    ).config_identity
+    assert pre_policy_identity != artifact.config_identity  # policy IS in the identity
+
+    # Rewrite the journal as if it had been written pre-policy.
+    journal_path = cfg.out_dir / "journal.ndjson"
+    lines = journal_path.read_text(encoding="utf-8").splitlines()
+    rewritten = []
+    for line in lines:
+        entry = json.loads(line)
+        entry["config_identity"] = pre_policy_identity
+        rewritten.append(json.dumps(entry, ensure_ascii=False))
+    journal_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        max_consecutive_terminal_nonselections=3,
+    )
+    try:
+        _run(resumed_cfg)
+    except ValueError as exc:
+        assert "Foreign identity" in str(exc)
+    else:
+        raise AssertionError("expected a Foreign identity ValueError for a pre-policy journal")
+
+
+def test_glossary_budget_report_rows_survive_partial_resume(tmp_path: Path):
+    """A1.1 review fix (MEDIUM): a partial resume replays already-journaled
+    chunks without re-budgeting them, so the report must MERGE the prior
+    session's rows (after schema/policy/run-identity validation) instead of
+    overwriting the artifact with only the post-resume rows — every chunk's
+    row stays available."""
+    cfg = _glossary_cfg(tmp_path, max_consecutive=1)
+    first_result, _router1 = _run(cfg, qwen=StubQwen(passed=False, reason="meaning drift"))
+    assert first_result.halted_early is True
+    report_path = cfg.out_dir / "glossary_budget_report.json"
+    first_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert set(first_payload["chunks"]) == {"chunk0001"}
+
+    resumed_cfg = _glossary_cfg(tmp_path, max_consecutive=3)
+    second_result, _router2 = _run(resumed_cfg, qwen=StubQwen(passed=True))
+    assert second_result.resumed_from_index == 1
+    assert second_result.processed_count == 2
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert set(payload["chunks"]) == {"chunk0001", "chunk0002"}
+    # The replayed chunk's row survived the resume (merged, not clobbered).
+    assert payload["chunks"]["chunk0001"] == first_payload["chunks"]["chunk0001"]
 
 
 
