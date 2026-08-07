@@ -119,6 +119,94 @@ changed_chunk_ids`, `debt_trace`, `formatting`).
   `v4_phase12_strict_run.py`).
 - Live: **`--watch`**.
 
+## Корректировки по первому боевому прогону (eff-a1a2, 2026-08-07) — TODO
+
+Наблюдения владельца при мониторинге главы 0002 (фаза repair round 2), что
+монитор показывает неверно/вводит в заблуждение:
+
+1. **Фаза Step 7 с активным ремонтом выглядит как «ремонт не начат»**:
+   `phase: step7 -- b2_handoff.json exists; repair_report.json absent` —
+   `repair_report.json` пишется только в конце Step 7, поэтому «absent» не
+   значит «не начат». Монитор должен выводить прогресс ремонта из событий
+   `region_done`/`region_*` (regions done/committed/debt), а не только из
+   наличия `repair_report.json`. (Реальный случай: `committed=47 debt=26` при
+   «repair_report.json absent».)
+2. **Step 8 блок на активной фазе 7**: `formatting incidents=None
+   blocking=None (no formatting artifacts); terminal=None` — выглядит как
+   «8 фаза сломана». Когда Step 8 ещё не начался, выводить явно `Step 8: not
+   started (ожидание formatting/terminal)` вместо `None`.
+3. **`server_logs` не индикатор живости для remote-прогонов**: файлы
+   `opencode_serve_*.log` статичны с момента старта сервера (возраст ~14000s
+   при живом прогоне). Живость модели определять по свежести `usage.ndjson`
+   (последний `ts`) и `phase_progress.ndjson`, а `server_logs` показывать как
+   «age с момента старта сервера» отдельно, без тревожной формулировки.
+4. **«no model call currently visible» ложно при активном remote-прогоне**:
+   монитор смотрит только пары `*_started`/`*_done` в `phase_progress.ndjson`
+   и игнорирует `usage.ndjson` (D1), который пишется на каждый вызов. Считать
+   активность модели по последней записи `usage.ndjson` (label, ts) и выводить
+   её, если она свежее последнего `*_started`.
+
+## Дизайн обновлённого монитора (утверждён владельцем 2026-08-07) — единая спецификация
+
+### CLI
+
+- `v4_phase_progress.py --out-base <book_dir> [--watch N]` — мультиглава
+  (новый режим): сам находит `chapter_*/` с `phase_progress.ndjson`; главы
+  добавляются динамически (book_run идёт по порядку).
+- `v4_phase_progress.py --out-dir <chapter_dir> [--watch N]` — одна глава
+  (как сейчас).
+
+### Шапка (--out-base): таблица глав
+
+```text
+-- chapters (2) ---------------------------------------------------------
+chapter_id            chunks   step  status         calls   cost(prov.)
+chapter_0001_bonds-1-1  16/16    8    accepted_degr.   312    $1.11
+chapter_0002_bonds-1-2  16/16    7    repair r2       262    $0.92
+TOTAL                                           574    $2.03
+```
+
+- `calls` и `cost(prov.)` — из `usage.ndjson` главы (сумма `reported_cost`);
+- если у провайдера все `reported_cost` = 0/None — колонка cost скрывается
+  (graceful, без «$0.00»-мусора), остаются только calls/tokens;
+- статус главы: terminal-статус (accepted_degraded/complete/failed) или
+  текущий шаг (step 7, repair r2).
+
+### Детальная секция главы (активная глава в --out-base, или --out-dir)
+
+Как сейчас (chunks, counters), плюс исправления из раздела выше
+(Step 8 not started, repair из region-событий, живость по usage).
+
+### Usage-блок в --counters--
+
+```text
+-- usage by step x model (из usage.ndjson) --
+step      label-group          model            calls   input     output    cost
+Steps1-5  phase2b generation   deepseek-v4-…      18    42.1k     18.1k   $0.0186
+Step2c    phase2c qwen_fidelity qwen3.7-plus      18    108      70.3k    $0.1007
+Step6     phase3 audit         qwen3.7-plus       51    306     241.2k    $0.6290
+Step6     phase3 audit         deepseek-v4-…      72  195.5k      25.3k   $0.0903
+Step7     phase4 region_repair deepseek-v4-…      75  220.7k       8.6k   $0.0149
+Step7     phase4 fidelity_gate qwen3.7-plus       28    168      37.2k   $0.0674
+TOTAL                                           262               ~       $0.9208
+```
+
+- Группировка **step × model** по label-группе: phase2b→Steps1-5,
+  phase2c→Step2c, phase3→Step6, phase4→Step7, phase5→Step8;
+- Step-маппинг переиспользует существующий `phase_for_label()` из
+  `pact_full_pipeline_runner_v1/v4_usage.py` (A1.3, уже в main) — не
+  дублировать;
+- колонки: calls, input_tokens, output_tokens (reasoning/cached — если
+  ненулевые), cost = сумма reported_cost по группе.
+
+### Живость / model activity
+
+- Основной индикатор: последняя запись `usage.ndjson` (ts, label, model) +
+  последнее событие `phase_progress.ndjson`;
+- `server_logs` — отдельной строкой «age с момента старта сервера», без
+  тревожной формулировки (remote-прогоны: файлы opencode_serve_*.log
+  статичны после старта сервера).
+
 ## Известные риски
 
 - Шум событий при 95+ регионах — файл лёгкий (десятки КБ), append-only.
