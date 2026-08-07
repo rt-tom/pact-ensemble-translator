@@ -1,7 +1,7 @@
 # V4 Efficiency A1 — glossary budgeter + prompt prefix ordering + D1-telemetry
 
 - План: `docs/plans/V4_EFFICIENCY_A_OPTIMIZATION_PLAN_RU.md` (ред. 2, §2)
-- Статус: к реализации (I+RV, протокол «2 карточки», PR после approve)
+- Статус: реализовано (A1.1–A1.3, ветка vk/v4-efficiency-a1, 7552267+c4d219d+c0a91e7) — интеграционная проверка пройдена (135 целевых теста; смоук 21/21: статичный префикс, glossary-фильтр с always_include, D1-фазы с legacy hyphen-лейблами адаптеров), на ревью (RV; PR после approve)
 - Масштаб: `pact_v4/pipeline`, `pact_v4/phase2/*`, `pact_v4/runtime/prompts_runtime.py`, `pact_v4/runtime/backend_role_adapters.py` + тесты/скрипты валидации. Без `v4_book_run`/glossary-схемы.
 
 ## A1.1 Glossary budgeter

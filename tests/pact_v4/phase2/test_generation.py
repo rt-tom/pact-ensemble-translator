@@ -961,3 +961,67 @@ def test_generation_module_has_no_hardcoded_required_category_literals():
     assert '"tone_profanity"' not in source_text
     assert "'number_word'" not in source_text
     assert "'tone_profanity'" not in source_text
+
+
+def test_bundle_hash_changes_only_when_glossary_was_filtered():
+    """V4 Efficiency A1.1: ``bundle_hash`` must follow the *filtered*
+    glossary set — a chunk whose glossary was not filtered (nothing
+    dropped) keeps the identical hash (no spurious cache/resume
+    invalidation), while a chunk whose glossary lost a pair gets a
+    different hash (cache identity reflects the content actually sent).
+    """
+    from pact_v4.pipeline._shared_runner_helpers import _glossary_entries_for_chunk
+
+    source, snapshot, chunk_plan, chunk, config = make_env(pid_count=4)
+    generator = ConstantGenerator(lambda bundle: valid_output_for(chunk))
+    risk = make_risk(RiskBand.LOW)
+
+    full_glossary = (
+        GlossaryEntry(source_term="Blake", target_terms=("Блэйк",)),
+        GlossaryEntry(source_term="steward", target_terms=("стюард",)),
+    )
+
+    def _hash_of(glossary):
+        # Fresh cache per measurement: an identical bundle hash would be a
+        # cache hit (no model call), which is exactly the property under
+        # test — but the hash must be captured from a real call, so each
+        # measurement starts from an empty cache.
+        generator.calls.clear()
+        generate_for_chunk(
+            chunk_id=chunk.chunk_id, risk=risk, source=source,
+            snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+            params=make_params(), model_caller=generator,
+            cache=GenerationCache(), glossary=glossary,
+        )
+        return generator.calls[0].bundle_hash
+
+    def _filtered_for(chunk_text, **filter_kwargs):
+        filtered, _dropped = _glossary_entries_for_chunk(
+            full_glossary, chunk_text=chunk_text, **filter_kwargs
+        )
+        return filtered
+
+    # (1) Nothing to drop: every term present -> filtered == full -> the
+    # exact same bundle_hash as the unfiltered run (no spurious
+    # invalidation).
+    both_present = "Blake and the steward spoke."
+    assert _filtered_for(both_present) == full_glossary
+    assert _hash_of(_filtered_for(both_present)) == _hash_of(full_glossary)
+
+    # (2) One pair dropped: "Blake" absent here and no narrator lock ->
+    # filtered set differs -> hash differs from the unfiltered run.
+    only_steward = "The steward entered."
+    assert _filtered_for(only_steward) == (
+        GlossaryEntry(source_term="steward", target_terms=("стюард",)),
+    )
+    assert _hash_of(_filtered_for(only_steward)) != _hash_of(full_glossary)
+
+    # (3) Same chunk, but the narrator lock keeps "Blake": with the lock the
+    # filtered set equals the full set again -> hash matches the unfiltered
+    # run (the lock prevents a spurious hash change on an otherwise-absent
+    # locked pair).
+    with_narrator_lock = _filtered_for(
+        only_steward, narrator_gender="male", narrator_source_terms=("Blake",)
+    )
+    assert with_narrator_lock == full_glossary
+    assert _hash_of(with_narrator_lock) == _hash_of(full_glossary)

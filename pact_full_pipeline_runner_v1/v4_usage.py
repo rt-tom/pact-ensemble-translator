@@ -45,6 +45,63 @@ TOKEN_KEYS = (
 )
 COST_KEY = "reported_cost"
 
+# V4 Efficiency A1.3: per-call label -> phase mapping for the "by phase"
+# breakdown. Labels are the namespaced request labels the role adapters
+# emit (``phase2b/...``, ``phase2c/qwen_fidelity``,
+# ``phase2c/gemma_russian_preference``, ``phase3/...``, ``phase4/...``,
+# ``phase5/...``); legacy labels (``generator``, ``qwen_audit``, ...) from
+# pre-namespace runs are matched by exact role name. The runtime adapters'
+# default labels are still the legacy hyphen forms
+# (``phase2c-qwen-fidelity`` from qwen_evaluator.py,
+# ``phase2c-gemma-russian-preference`` from gemma_selector.py), so both the
+# slash- and hyphen-spelled phase2c forms map to the same phases. Order
+# matters: the phase2c prefix is checked before the generic phase3/4/5
+# prefixes would not collide (they are distinct prefixes), but ``phase2c``
+# itself must split qwen_fidelity from gemma_russian_preference (both
+# spellings) before the fallbacks.
+_PHASE_RULES: Tuple[Tuple[str, str], ...] = (
+    ("phase2b", "gen"),
+    ("phase2c/qwen_fidelity", "qwen_fidelity"),
+    ("phase2c/gemma_russian_preference", "gemma_preference"),
+    ("phase2c-qwen-fidelity", "qwen_fidelity"),
+    ("phase2c-gemma-russian-preference", "gemma_preference"),
+    ("phase2c", "(other)"),
+    ("phase3", "audit"),
+    ("phase4", "repair"),
+    ("phase5", "formatting"),
+)
+_PHASE_ROLE_NAMES = {
+    "generator": "gen",
+    "fidelity_reviewer": "qwen_fidelity",
+    "qwen_fidelity": "qwen_fidelity",
+    "russian_selector": "gemma_preference",
+    "gemma_russian_preference": "gemma_preference",
+    "qwen_audit": "audit",
+    "gemma_audit": "audit",
+    "repair": "repair",
+    "formatting": "formatting",
+    "formatting_align": "formatting",
+}
+
+
+def phase_for_label(label: Optional[str]) -> str:
+    """Map a usage-row ``label`` to its phase (gen / qwen_fidelity /
+    gemma_preference / audit / repair / formatting), ``(other)`` otherwise.
+
+    Read-only helper (A1.3) — never changes the pipeline, only how the
+    diagnostic report groups rows. Prefix rules are checked first (the
+    adapters' namespaced slash labels and their legacy hyphen defaults,
+    e.g. ``phase2c/qwen_fidelity`` and ``phase2c-qwen-fidelity``), then
+    exact legacy role names.
+    """
+    if not label:
+        return "(other)"
+    folded = str(label).strip()
+    for prefix, phase in _PHASE_RULES:
+        if folded.startswith(prefix):
+            return phase
+    return _PHASE_ROLE_NAMES.get(folded, "(other)")
+
 
 # ---------------------------------------------------------------------------
 # Read helpers (all read-only)
@@ -99,21 +156,41 @@ def _bucketed(rows: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, Any]]
     buckets: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         bucket_key = row.get(key) or "(unknown)"
-        bucket = buckets.setdefault(bucket_key, {
-            "calls": 0, "failed": 0, "wall_seconds": 0.0,
-        })
-        for token_key in TOKEN_KEYS:
-            value = row.get(token_key)
-            if value is not None:
-                bucket[token_key] = bucket.get(token_key, 0) + int(value)
-        cost = row.get(COST_KEY)
-        if cost is not None:
-            bucket[COST_KEY] = bucket.get(COST_KEY, 0.0) + float(cost)
-        bucket["calls"] += 1
-        if row.get("error_class"):
-            bucket["failed"] += 1
-        bucket["wall_seconds"] += float(row.get("wall_seconds") or 0.0)
+        _bucket_row(buckets, bucket_key, row)
     return buckets
+
+
+def _bucketed_by_phase(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Aggregate usage rows into per-phase buckets (V4 Efficiency A1.3).
+
+    Phase = ``phase_for_label(row["label"])`` (gen / qwen_fidelity /
+    gemma_preference / audit / repair / formatting). Shares the token/cost
+    aggregation of ``_bucketed`` so the breakdown is directly comparable to
+    the by-model / by-role sections.
+    """
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        _bucket_row(buckets, phase_for_label(row.get("label")), row)
+    return buckets
+
+
+def _bucket_row(
+    buckets: Dict[str, Dict[str, Any]], bucket_key: str, row: Dict[str, Any]
+) -> None:
+    bucket = buckets.setdefault(bucket_key, {
+        "calls": 0, "failed": 0, "wall_seconds": 0.0,
+    })
+    for token_key in TOKEN_KEYS:
+        value = row.get(token_key)
+        if value is not None:
+            bucket[token_key] = bucket.get(token_key, 0) + int(value)
+    cost = row.get(COST_KEY)
+    if cost is not None:
+        bucket[COST_KEY] = bucket.get(COST_KEY, 0.0) + float(cost)
+    bucket["calls"] += 1
+    if row.get("error_class"):
+        bucket["failed"] += 1
+    bucket["wall_seconds"] += float(row.get("wall_seconds") or 0.0)
 
 
 def _per_call_rates(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -151,6 +228,10 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Full report payload from parsed usage.ndjson rows."""
     by_model = _bucketed(rows, key="model_ref")
     by_role = _bucketed(rows, key="label")
+    # V4 Efficiency A1.3: per-phase breakdown (gen / qwen_fidelity /
+    # gemma_preference / audit / repair / formatting) for the efficiency
+    # call/token accounting — read-only grouping of the same rows.
+    by_phase = _bucketed_by_phase(rows)
 
     total_calls = len(rows)
     total_failed = sum(1 for row in rows if row.get("error_class"))
@@ -187,6 +268,7 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "totals": totals,
         "by_model": by_model,
         "by_role": by_role,
+        "by_phase": by_phase,
         "per_call": _per_call_rates(rows),
     }
 
@@ -264,6 +346,11 @@ def render_usage_report(out_dir: Path) -> str:
         lines.append("")
         lines.append("-- by role (label) --")
         lines.extend(_fmt_bucket_rows(agg["by_role"]) or ["  (none)"])
+
+        lines.append("")
+        lines.append("-- by phase (A1.3: gen / qwen_fidelity / "
+                     "gemma_preference / audit / repair / formatting) --")
+        lines.extend(_fmt_bucket_rows(agg["by_phase"]) or ["  (none)"])
 
         lines.append("")
         lines.append("-- per-call rates (input/output tokens per wall-second; "

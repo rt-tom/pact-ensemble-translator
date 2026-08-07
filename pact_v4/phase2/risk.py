@@ -156,6 +156,27 @@ def _term_present(text: str, term: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE) is not None
 
 
+def source_term_required_categories(source_term: str) -> frozenset[str]:
+    """Required-risk categories a glossary source term is tied to.
+
+    A1.1 (glossary budgeter) keeps every entry whose source term belongs to
+    a category the chunk's risk pre-screen flagged as required — an entry
+    like ``"fuck"`` is exactly what the ``tone_profanity`` constraint
+    prescribes, and ``"hundred"`` what ``number_word`` prescribes, so they
+    must never be dropped from the prompt while the chunk carries that
+    category. Returns a subset of ``REQUIRED_RISK_CATEGORIES``
+    (``{"number_word", "tone_profanity"}``); the same frozen regexes that
+    drive the pre-screen are used, so an entry cannot disagree with the
+    category it is claimed to protect.
+    """
+    codes = set()
+    if _NUMBER_WORD_RE.search(source_term):
+        codes.add("number_word")
+    if _PROFANITY_RE.search(source_term):
+        codes.add("tone_profanity")
+    return frozenset(codes)
+
+
 def _glossary_conflicts(
     text: str, glossary: Sequence[GlossaryEntry]
 ) -> tuple[str, ...]:

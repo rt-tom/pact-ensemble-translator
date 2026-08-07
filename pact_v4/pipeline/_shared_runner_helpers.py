@@ -23,7 +23,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from pact_v4.phase1.models import ChunkPlan, ChunkPlanArtifact
 from pact_v4.phase2.cascade import SelectionResult
 from pact_v4.phase2.generation import GenerationOutcome
-from pact_v4.phase2.risk import GlossaryEntry, RiskAssessment, assess_source_risk
+from pact_v4.phase2.risk import (
+    GlossaryEntry,
+    RiskAssessment,
+    _term_present,
+    assess_source_risk,
+    source_term_required_categories,
+)
 from pact_v4.runtime.snapshot_factory import ChapterMemory
 
 # ---------------------------------------------------------------------------
@@ -114,6 +120,123 @@ def _glossary_entries(memory: ChapterMemory) -> Tuple[GlossaryEntry, ...]:
         except ValueError:
             continue
     return tuple(entries)
+
+
+def _narrator_glossary_terms(book_memory: Any) -> Tuple[str, ...]:
+    """Source-name tokens of the narrator, when the memory pins a narrator.
+
+    A1.1 (glossary budgeter) treats the narrator's own name entries as
+    ``always_include``: the narrator_gender check (B7) is a locked,
+    chapter-level constraint, and the narrator's name pairs (``Blake ->
+    Блэйк``) are exactly what keeps the model consistent with the bible
+    even in chunks that do not mention the narrator by name. Reads
+    ``pov.source_name`` (current shape) or the legacy top-level
+    ``narrator_source_name`` / ``narrator_name`` keys; returns an empty
+    tuple when the memory does not pin a narrator name (the rule is then
+    inert, never wrong).
+    """
+    if not isinstance(book_memory, Mapping):
+        return ()
+    pov = book_memory.get("pov")
+    source_name = ""
+    if isinstance(pov, Mapping):
+        value = pov.get("source_name")
+        if isinstance(value, str):
+            source_name = value
+    if not source_name:
+        for key in ("narrator_source_name", "narrator_name"):
+            value = book_memory.get(key)
+            if isinstance(value, str) and value.strip():
+                source_name = value
+                break
+    return tuple(
+        dict.fromkeys(token for token in source_name.split() if token.strip())
+    )
+
+
+def _glossary_entries_for_chunk(
+    glossary: Sequence[GlossaryEntry],
+    *,
+    chunk_text: str,
+    risk_feature_codes: Iterable[str] = (),
+    narrator_gender: Optional[str] = None,
+    narrator_source_terms: Iterable[str] = (),
+) -> Tuple[Tuple[GlossaryEntry, ...], Tuple[str, ...]]:
+    """Per-chunk glossary budget (V4 Efficiency A1.1).
+
+    A pair from the full chapter glossary enters ``PromptBundle.glossary``
+    only when its source term is present in the chunk's text
+    (``owned_source + left_context + right_context``, same ``_term_present``
+    as the risk pre-screen: ``(?<!\\w)...(?!\\w)``, IGNORECASE, multi-word
+    terms supported) **or** it is ``always_include`` (fail-closed — locked
+    constraints are never cut):
+
+    * entries whose source term is tied to a ``required_risk_feature_codes``
+      category of this chunk (``number_word`` / ``tone_profanity`` — the
+      same frozen regexes that flag the chunk flag the entry, so they cannot
+      disagree);
+    * entries that carry a ``glossary_conflict`` (the same source term maps
+      to more than one distinct prescribed target form anywhere in the
+      glossary — dropping half a conflict would silently hide it);
+    * the narrator's own name entries when ``narrator_gender`` is pinned
+      (the narrator_gender constraint is chapter-level locked).
+
+    Returns ``(kept, dropped_source_terms)`` so callers can emit the
+    "dropped N pairs: [terms]" diagnostic. ``bundle_hash`` is derived by
+    ``PromptBundle`` from the *kept* set, so cache/resume identity follows
+    the filtered content automatically (a chunk whose glossary was not
+    filtered keeps its old hash — no spurious invalidation).
+    """
+    # Conflict-carrying sources: a source term with >1 distinct prescribed
+    # target form anywhere in the glossary is locked (same casefolded-key
+    # aggregation as risk._glossary_conflicts).
+    by_source: dict[str, set[str]] = {}
+    for entry in glossary:
+        key = entry.source_term.casefold().strip()
+        if key:
+            by_source.setdefault(key, set()).update(
+                target.casefold().strip() for target in entry.target_terms
+            )
+    conflict_sources = frozenset(
+        key for key, targets in by_source.items() if len(targets) > 1
+    )
+    narrator_terms = frozenset(term.casefold() for term in narrator_source_terms)
+    required_codes = frozenset(risk_feature_codes)
+
+    def _narrator_locked(source_term: str) -> bool:
+        """The entry names the narrator (locked when narrator_gender is
+        pinned): either the exact casefolded source term is one of the
+        narrator's name tokens, or every whitespace token of the source
+        term is (covers multi-word name entries like ``Blake Thorburn``
+        when the memory pins ``pov.source_name = "Blake Thorburn"``). A
+        term with any non-narrator token (e.g. ``Thorburn Estate``) is not
+        the narrator and stays subject to the presence filter."""
+        if not narrator_terms:
+            return False
+        folded = source_term.casefold()
+        if folded in narrator_terms:
+            return True
+        tokens = tuple(token for token in folded.split() if token)
+        return bool(tokens) and all(token in narrator_terms for token in tokens)
+
+    kept: List[GlossaryEntry] = []
+    dropped: List[str] = []
+    for entry in glossary:
+        source_term = entry.source_term.strip()
+        if not source_term:
+            continue
+        present = _term_present(chunk_text, source_term)
+        categories = source_term_required_categories(source_term)
+        always = bool(
+            (required_codes & categories)
+            or (entry.source_term.casefold().strip() in conflict_sources)
+            or (narrator_gender is not None and _narrator_locked(source_term))
+        )
+        if present or always:
+            kept.append(entry)
+        else:
+            dropped.append(source_term)
+    return tuple(kept), tuple(dropped)
 
 
 def _risk_for_chunk(
