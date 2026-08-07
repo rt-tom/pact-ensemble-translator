@@ -458,3 +458,40 @@ def test_verifier_detects_extra_profile_row(committed_evidence, committed_report
     problems = verify.check_report(mutated, committed_evidence)
     assert problems, "an extra unknown profile row in the aggregate table was NOT detected"
     assert any("extra" in p and "admin" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# 7. Structural verifier rejects non-finite numeric cells (nan / inf).
+# ---------------------------------------------------------------------------
+def test_num_rejects_non_finite() -> None:
+    """_num() must reject NaN/±Inf instead of returning them; every caller
+    treats None as a mismatch, whereas `abs(nan - want) > 0.05` is False."""
+    for bad in ("nan", "NaN", "inf", "-inf", "Infinity", "~inf"):
+        assert verify._num(bad) is None, f"_num({bad!r}) must be None"
+    # finite numbers and report decorations still parse
+    assert verify._num("5 253 728") == 5253728.0
+    assert verify._num("14.9 %") == 14.9
+    assert verify._num("~62×") == 62.0
+
+
+def _input_sum_cell(md: str, profile: str) -> str:
+    """The Input-sum cell value for `profile` in the main aggregate table."""
+    for _prof, header, row in verify.parse_tables(md):
+        if not any("Вызовов (sum)" in h for h in header) or not row:
+            continue
+        if row[0] == profile and "Input sum" in header:
+            return row[header.index("Input sum")]
+    raise AssertionError(f"{profile} Input sum cell not found")
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_verifier_detects_non_finite_numeric_cell(
+    committed_evidence, committed_report, bad
+) -> None:
+    """A numeric cell substituted with nan/±inf must make check_report non-empty
+    (previously nan slipped through: abs(nan - want) > 0.05 is False)."""
+    arch_cell = _input_sum_cell(committed_report, "architect")
+    mutated = committed_report.replace(arch_cell, bad, 1)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, f"cell substituted with {bad!r} was NOT detected"
+    assert any("architect" in p and "Input sum" in p for p in problems)
