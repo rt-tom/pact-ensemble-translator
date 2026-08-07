@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "description": "Read-only baseline: repository AGENTS.md size (as committed on the Phase 0 branch HEAD; content identical to origin/main — Phase-0 commits do not modify AGENTS.md) and resolved CLI toolsets per Hermes profile. Phase 0 report assembly input.",
+  "measured_at_utc": "2026-08-07T17:33:46Z",
+  "repository": {
+    "root": "<repo-root>",
+    "branch": "Phase 0 baseline branch (AGENTS.md identical to origin/main)",
+    "head_commit": "1141373b360841268e064ea16a7f9451b5cbcee9",
+    "head_subject": "docs(audits): regenerate Phase 0 baseline on current origin/main — neutral provenance, fresh AGENTS.md facts, no task/worktree identifiers"
+  },
+  "agents_md": {
+    "path": "AGENTS.md (repo root, as committed on HEAD — git show HEAD:AGENTS.md, never the working tree)",
+    "bytes": 21824,
+    "chars_utf8": 17227,
+    "lines_splitlines": 311,
+    "newlines": 311,
+    "ends_with_newline": true,
+    "measurement_method": "git show HEAD:AGENTS.md -> decode utf-8; lines = text.splitlines() count; wc -l agrees. Note: len(text.split('\\n')) would be lines+1 (trailing empty element after final newline)."
+  },
+  "cli_toolsets": {
+    "resolve_method": "hermes_cli.kanban_db._resolve_worker_cli_toolsets(<profile_dir>) with Windows paths (MSYS paths silently fail config load), HERMES_HOME set to each profile dir",
+    "resolve_source": "profile config.yaml platform_toolsets.cli (explicit list, no hermes-cli composite) + agent.disabled_toolsets (drops bfl via _enable_recently_shipped_toolsets subtraction)",
+    "profiles": {
+      "architect": {
+        "config_path": "<HERMES_PROFILES_DIR>/architect/config.yaml",
+        "config_platform_toolsets_cli": [
+          "browser",
+          "clarify",
+          "code_execution",
+          "cronjob",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "vision",
+          "web"
+        ],
+        "config_disabled_toolsets": [
+          "bfl"
+        ],
+        "resolved_cli_toolsets": [
+          "browser",
+          "clarify",
+          "code_execution",
+          "cronjob",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "vision",
+          "web"
+        ],
+        "resolved_count": 14
+      },
+      "developer": {
+        "config_path": "<HERMES_PROFILES_DIR>/developer/config.yaml",
+        "config_platform_toolsets_cli": [
+          "file",
+          "terminal",
+          "kanban",
+          "skills",
+          "web",
+          "todo",
+          "memory",
+          "session_search",
+          "code_execution",
+          "delegation"
+        ],
+        "config_disabled_toolsets": [
+          "bfl"
+        ],
+        "resolved_cli_toolsets": [
+          "code_execution",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "web"
+        ],
+        "resolved_count": 10
+      },
+      "reviewer": {
+        "config_path": "<HERMES_PROFILES_DIR>/reviewer/config.yaml",
+        "config_platform_toolsets_cli": [
+          "file",
+          "terminal",
+          "kanban",
+          "skills",
+          "web",
+          "todo",
+          "memory",
+          "session_search",
+          "code_execution",
+          "delegation"
+        ],
+        "config_disabled_toolsets": [
+          "bfl"
+        ],
+        "resolved_cli_toolsets": [
+          "code_execution",
+          "delegation",
+          "file",
+          "kanban",
+          "memory",
+          "session_search",
+          "skills",
+          "terminal",
+          "todo",
+          "web"
+        ],
+        "resolved_count": 10
+      }
+    }
+  },
+  "non_goals": [
+    "No toolsets, config.yaml, AGENTS.md, or profile settings were changed",
+    "No pipeline / llama-server / book / chapter runs started",
+    "No tracked config or production files changed (only tools/context_baseline.json and Phase 0 report/evidence added)"
+  ]
+}
