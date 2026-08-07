@@ -119,6 +119,33 @@ changed_chunk_ids`, `debt_trace`, `formatting`).
   `v4_phase12_strict_run.py`).
 - Live: **`--watch`**.
 
+## Корректировки по первому боевому прогону (eff-a1a2, 2026-08-07) — TODO
+
+Наблюдения владельца при мониторинге главы 0002 (фаза repair round 2), что
+монитор показывает неверно/вводит в заблуждение:
+
+1. **Фаза Step 7 с активным ремонтом выглядит как «ремонт не начат»**:
+   `phase: step7 -- b2_handoff.json exists; repair_report.json absent` —
+   `repair_report.json` пишется только в конце Step 7, поэтому «absent» не
+   значит «не начат». Монитор должен выводить прогресс ремонта из событий
+   `region_done`/`region_*` (regions done/committed/debt), а не только из
+   наличия `repair_report.json`. (Реальный случай: `committed=47 debt=26` при
+   «repair_report.json absent».)
+2. **Step 8 блок на активной фазе 7**: `formatting incidents=None
+   blocking=None (no formatting artifacts); terminal=None` — выглядит как
+   «8 фаза сломана». Когда Step 8 ещё не начался, выводить явно `Step 8: not
+   started (ожидание formatting/terminal)` вместо `None`.
+3. **`server_logs` не индикатор живости для remote-прогонов**: файлы
+   `opencode_serve_*.log` статичны с момента старта сервера (возраст ~14000s
+   при живом прогоне). Живость модели определять по свежести `usage.ndjson`
+   (последний `ts`) и `phase_progress.ndjson`, а `server_logs` показывать как
+   «age с момента старта сервера» отдельно, без тревожной формулировки.
+4. **«no model call currently visible» ложно при активном remote-прогоне**:
+   монитор смотрит только пары `*_started`/`*_done` в `phase_progress.ndjson`
+   и игнорирует `usage.ndjson` (D1), который пишется на каждый вызов. Считать
+   активность модели по последней записи `usage.ndjson` (label, ts) и выводить
+   её, если она свежее последнего `*_started`.
+
 ## Известные риски
 
 - Шум событий при 95+ регионах — файл лёгкий (десятки КБ), append-only.
