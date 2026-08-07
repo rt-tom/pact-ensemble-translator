@@ -1,6 +1,6 @@
 {
   "schema": "pact-v4-efficiency-a1-dry-run/v1",
-  "run_dir": "D:\\pact\\gate_bench_runs\\v4_phase12_strict_0001\\run_005_remote",
+  "run_dir": "run_005_remote",
   "chapter_id": "0001_bonds-1-1",
   "glossary_total": 119,
   "narrator_gender": "male",

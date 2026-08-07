@@ -238,7 +238,7 @@ def build_dry_run_report(
     )
     return {
         "schema": "pact-v4-efficiency-a1-dry-run/v1",
-        "run_dir": str(out_dir),
+        "run_dir": out_dir.name,
         "chapter_id": generation_payload["chapter_id"],
         "glossary_total": len(glossary),
         "narrator_gender": narrator_gender,
