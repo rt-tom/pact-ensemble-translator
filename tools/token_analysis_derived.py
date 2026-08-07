@@ -5,7 +5,7 @@ Read-only, stdlib only. Input: JSON produced by tools/hermes_profile_token_basel
 Output: derived ratios/aggregates per profile (and per source) printed as JSON.
 
 No private data is read: the input JSON is already redacted (sha256-prefix ids,
-no content columns). This script only re-combines the published aggregates.
+no message fields). This script only re-combines the published aggregates.
 """
 
 from __future__ import annotations
