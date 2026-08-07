@@ -532,11 +532,15 @@ def test_a2_balanced_failing_lazily_generates_fidelity_first(tmp_path: Path):
     sel = json.loads((result.out_dir / "selection_results.json").read_text(encoding="utf-8"))
     assert sel["results"][0]["selected_role"] == "fidelity_first"
     assert sel["results"][0]["candidates_evaluated"] == 1  # the lazy cascade pass
-    # The persisted generation record for the chunk is the lazy (final)
-    # outcome — the one that determined the chunk's fate.
+    # The persisted generation record for the chunk is now CUMULATIVE (RV A2
+    # finding 1): it keeps BOTH produced candidates — the primary
+    # balanced_literary and the lazy fidelity_first — so Step 6 can always
+    # pick the deterministic best-variant among the variants the chunk
+    # actually produced, across this run and on resume.
     gen = json.loads((result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8"))
     chunk_rec = next(r for r in gen["outcomes"] if r["chunk_id"] == "chunk0001")
-    assert chunk_rec["expected_roles"] == ["fidelity_first"]
+    assert chunk_rec["expected_roles"] == ["balanced_literary", "fidelity_first"]
+    assert set(chunk_rec["candidates"]) == {"balanced_literary", "fidelity_first"}
     assert chunk_rec["status"] == "complete"
     journal = [
         json.loads(line) for line in result.journal_path.read_text(encoding="utf-8").splitlines()
@@ -575,6 +579,19 @@ def test_a2_both_candidates_failing_quarantines_with_both_reasons(tmp_path: Path
     assert rec["status"] == "quarantined"
     assert "balanced_literary failed the gates" in rec["quarantine_reason"]
     assert "lazy fidelity_first also failed" in rec["quarantine_reason"]
+    # RV A2 finding 1: the cumulative generation record keeps BOTH produced
+    # candidates, and Step 6's handoff lists them both as available variants
+    # — a last-wins merge would have dropped the primary balanced_literary
+    # and left only fidelity_first recoverable.
+    gen = json.loads((result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8"))
+    chunk_rec = next(r for r in gen["outcomes"] if r["chunk_id"] == "chunk0001")
+    assert set(chunk_rec["candidates"]) == {"balanced_literary", "fidelity_first"}
+    assert result.step6["status"] == "complete"
+    handoff = json.loads((result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    row = next(r for r in handoff["chunks"] if r["chunk_id"] == "chunk0001")
+    roles = {v["role"] for v in row["available_variants"]}
+    assert roles == {"balanced_literary", "fidelity_first"}
+    assert row["status"] == "quarantined"
 
 
 def test_a2_lazy_fidelity_source_derived_allowlist_uses_its_own_text(tmp_path: Path):
@@ -1120,6 +1137,54 @@ def test_step6_resume_reloads_generation_outcomes_for_quarantined_chunks(tmp_pat
     assert "meaning drift" in chunk1_sel["quarantine_reason"]
 
 
+def test_a2_resume_preserves_both_lazy_variants_for_quarantined_chunk(tmp_path: Path):
+    """RV A2 finding 1 regression: the lazy rescue's two records for one
+    chunk_id (primary balanced_literary + lazy fidelity_first) must coalesce
+    into one cumulative generation record, and a resume must preserve BOTH
+    variants — Step 6 needs them to pick the deterministic best-variant
+    among the variants the chunk actually produced. Without the fix the
+    last-wins merge dropped the primary balanced_literary, so b2_handoff
+    listed only fidelity_first (downstream contract + resume diagnostics)."""
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+    first_result, _router1 = _run(cfg, qwen=StubQwen(passed=False, reason="meaning drift"))
+    assert first_result.quarantined_count == 1
+    assert first_result.processed_count == 1
+    # Run 1 alone must already keep both candidates in the cumulative record.
+    gen1 = json.loads(
+        (first_result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    rec1 = next(r for r in gen1["outcomes"] if r["chunk_id"] == "chunk0001")
+    assert set(rec1["candidates"]) == {"balanced_literary", "fidelity_first"}
+    assert rec1["expected_roles"] == ["balanced_literary", "fidelity_first"]
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        max_consecutive_terminal_nonselections=3,
+    )
+    second_result, _router2 = _run(resumed_cfg, qwen=StubQwen(passed=True))
+    assert second_result.resumed_from_index == 1
+    assert second_result.selected_count == 1
+    assert second_result.step6["status"] == "complete"
+
+    # After the resume the persisted file is cumulative and the quarantined
+    # chunk's record still carries BOTH variants.
+    gen2 = json.loads(
+        (second_result.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    assert {rec["chunk_id"] for rec in gen2["outcomes"]} == {"chunk0001", "chunk0002"}
+    rec1_after = next(r for r in gen2["outcomes"] if r["chunk_id"] == "chunk0001")
+    assert set(rec1_after["candidates"]) == {"balanced_literary", "fidelity_first"}
+    assert rec1_after["expected_roles"] == ["balanced_literary", "fidelity_first"]
+
+    handoff = json.loads((second_result.out_dir / "b2_handoff.json").read_text(encoding="utf-8"))
+    by_id = {row["chunk_id"]: row for row in handoff["chunks"]}
+    assert by_id["chunk0001"]["status"] == "quarantined"
+    roles = {v["role"] for v in by_id["chunk0001"]["available_variants"]}
+    assert roles == {"balanced_literary", "fidelity_first"}
+    assert by_id["chunk0001"]["audited_candidate_id"] is not None  # best-variant recovered
+
+
 def test_step6_audit_rejects_foreign_audit_cache_on_resume(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
     _run(cfg)
@@ -1557,3 +1622,62 @@ def test_b5_mixed_script_manual_entry_dotted_form(tmp_path: Path):
     assert result.quarantined_count == 0
     # The run record carries the allowlist provenance.
     assert result.record["mixed_script_policy"]["sources"]["manual"] == ["R.D.T."]
+
+
+def test_a2_dry_run_report_v2_consistency():
+    """RV A2 finding 2 regression: the dry-run audit report must not mix the
+    legacy (run_005 actual) selected role into the lazy A2 fields. v2 names
+    ``legacy_selected_role`` (what run_005 selected) and ``lazy_selected_role``
+    (what the A2 lazy scheme would select) separately, and every row must be
+    self-consistent: lazy_selected_role agrees with
+    lazy_balanced_passed/lazy_rescued_by_fidelity, quarantined <=> no lazy
+    winner, and lazy_calls match the lazy flags. chunk0010 — a run_005
+    fidelity-wins-by-Gemma-preference chunk — must show lazy_selected_role
+    ``balanced_literary`` (the A2 primary passes on its own, so Gemma is
+    never invoked)."""
+    report_path = (
+        Path(__file__).resolve().parents[3]
+        / "docs" / "audits" / "V4_EFFICIENCY_A2_RUN005_DRY_RUN.json"
+    )
+    assert report_path.exists(), f"missing audit report: {report_path}"
+    d = json.loads(report_path.read_text(encoding="utf-8"))
+    assert d["schema"] == "pact-v4-efficiency-a2-dry-run/v2"
+    rows = d["per_chunk"]
+    assert len(rows) == 16
+    # Every row is self-consistent.
+    for row in rows:
+        cid = row["chunk_id"]
+        lsp = row["lazy_selected_role"]
+        if row["lazy_balanced_passed"]:
+            assert lsp == "balanced_literary", cid
+            assert row["lazy_calls"]["gen"] == 1, cid
+        elif row["lazy_rescued_by_fidelity"]:
+            assert lsp == "fidelity_first", cid
+            assert row["lazy_calls"]["gen"] == 2, cid
+        else:
+            assert lsp is None, cid
+            assert row["lazy_calls"]["gen"] == 2, cid
+        assert (row["status"] == "quarantined") == (lsp is None), cid
+        assert row["lazy_calls"]["gen"] == row["lazy_calls"]["qwen_fidelity"], cid
+        assert row["lazy_calls"]["gemma_preference"] == 0, cid
+        # The legacy role is whatever run_005 actually selected — it is NOT
+        # the lazy role, and may differ when Gemma's preference decided.
+        assert row["legacy_selected_role"] in ("balanced_literary", "fidelity_first", None), cid
+    # chunk0010: run_005 selected fidelity_first via Gemma preference (both
+    # candidates passed); the lazy A2 scheme selects balanced_literary alone.
+    by_id = {row["chunk_id"]: row for row in rows}
+    assert by_id["chunk0010"]["legacy_selected_role"] == "fidelity_first"
+    assert by_id["chunk0010"]["lazy_selected_role"] == "balanced_literary"
+    assert by_id["chunk0010"]["lazy_balanced_passed"] is True
+    assert by_id["chunk0010"]["lazy_rescued_by_fidelity"] is False
+    # chunk0014: run_005 fidelity-wins-by-fail; lazy rescues with fidelity.
+    assert by_id["chunk0014"]["legacy_selected_role"] == "fidelity_first"
+    assert by_id["chunk0014"]["lazy_selected_role"] == "fidelity_first"
+    assert by_id["chunk0014"]["lazy_balanced_passed"] is False
+    assert by_id["chunk0014"]["lazy_rescued_by_fidelity"] is True
+    # Totals agree with the per-chunk rows (legacy 32/32/13 -> lazy 19/19/0).
+    totals = d["totals"]
+    assert totals["legacy"]["gen"] == sum(r["legacy_calls"]["gen"] for r in rows)
+    assert totals["lazy"]["gen"] == sum(r["lazy_calls"]["gen"] for r in rows)
+    assert totals["lazy"]["gemma_preference"] == 0
+    assert totals["gen_delta"] == totals["lazy"]["gen"] - totals["legacy"]["gen"]

@@ -552,15 +552,16 @@ def generate_for_chunk(
 ) -> GenerationOutcome:
     """Generate the risk-gated candidate set for one chunk.
 
-    low risk -> exactly one candidate (``fidelity_first``).
-    medium/high risk -> exactly two candidates, ``fidelity_first`` (A) and
-    ``balanced_literary`` (B). There is no third candidate and no
-    selection/winner logic here (Phase 2C).
-
-    V4 Efficiency A2: with ``lazy_balanced=True`` (default) every band
+    V4 Efficiency A2 (default, ``lazy_balanced=True``): every risk band
     generates exactly one primary candidate (``balanced_literary``);
-    ``fidelity_first`` is deferred to the strict driver's lazy fallback.
-    ``lazy_balanced=False`` restores the legacy A/B scheme above.
+    ``fidelity_first`` is deferred to the strict driver's lazy fallback
+    (re-generated only when the primary fails the gates).
+
+    Legacy scheme (``lazy_balanced=False``): low risk -> exactly one
+    candidate (``fidelity_first``); medium/high risk -> exactly two
+    candidates, ``fidelity_first`` (A) and ``balanced_literary`` (B).
+    There is no third candidate and no selection/winner logic here
+    (Phase 2C).
 
     ``roles`` (optional) overrides the risk-based role routing entirely and
     generates exactly those roles — used by the strict driver's A2 lazy

@@ -1,7 +1,7 @@
 {
- "schema": "pact-v4-efficiency-a2-dry-run/v1",
+ "schema": "pact-v4-efficiency-a2-dry-run/v2",
  "run_005_dir": "D:\\pact\\gate_bench_runs\\v4_phase12_strict_0001\\run_005_remote",
- "note": "Deterministic call-count simulation of the lazy balanced-only scheme from run_005's selection results (no models started).",
+ "note": "Deterministic call-count simulation of the lazy balanced-only scheme from run_005's selection results (no models started). v2: legacy_selected_role = what run_005 selected (A/B + Gemma); lazy_selected_role = what the A2 lazy scheme would select (balanced_literary on primary pass, fidelity_first on lazy rescue, None when both failed).",
  "totals": {
   "legacy": {
    "gen": 32,
@@ -17,11 +17,33 @@
   "qwen_fidelity_delta": -13,
   "gemma_preference_delta": -13
  },
+ "consistency": {
+  "check": "per_chunk lazy_selected_role agrees with lazy_balanced_passed/lazy_rescued_by_fidelity; quarantined <=> no lazy winner; lazy_calls.gen == qwen_fidelity; gemma_preference == 0",
+  "rows_checked": [
+   "chunk0001",
+   "chunk0002",
+   "chunk0003",
+   "chunk0004",
+   "chunk0005",
+   "chunk0006",
+   "chunk0007",
+   "chunk0008",
+   "chunk0009",
+   "chunk0010",
+   "chunk0011",
+   "chunk0012",
+   "chunk0013",
+   "chunk0014",
+   "chunk0015",
+   "chunk0016"
+  ]
+ },
  "per_chunk": [
   {
    "chunk_id": "chunk0001",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -40,7 +62,8 @@
   {
    "chunk_id": "chunk0002",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -59,7 +82,8 @@
   {
    "chunk_id": "chunk0003",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -78,7 +102,8 @@
   {
    "chunk_id": "chunk0004",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -97,7 +122,8 @@
   {
    "chunk_id": "chunk0005",
    "status": "quarantined",
-   "selected_role": null,
+   "legacy_selected_role": null,
+   "lazy_selected_role": null,
    "candidates_passed": 0,
    "candidates_failed": 2,
    "legacy_calls": {
@@ -116,7 +142,8 @@
   {
    "chunk_id": "chunk0006",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -135,7 +162,8 @@
   {
    "chunk_id": "chunk0007",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -154,7 +182,8 @@
   {
    "chunk_id": "chunk0008",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -173,7 +202,8 @@
   {
    "chunk_id": "chunk0009",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -192,7 +222,8 @@
   {
    "chunk_id": "chunk0010",
    "status": "selected",
-   "selected_role": "fidelity_first",
+   "legacy_selected_role": "fidelity_first",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -211,7 +242,8 @@
   {
    "chunk_id": "chunk0011",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -230,7 +262,8 @@
   {
    "chunk_id": "chunk0012",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -249,7 +282,8 @@
   {
    "chunk_id": "chunk0013",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -268,7 +302,8 @@
   {
    "chunk_id": "chunk0014",
    "status": "selected",
-   "selected_role": "fidelity_first",
+   "legacy_selected_role": "fidelity_first",
+   "lazy_selected_role": "fidelity_first",
    "candidates_passed": 1,
    "candidates_failed": 1,
    "legacy_calls": {
@@ -287,7 +322,8 @@
   {
    "chunk_id": "chunk0015",
    "status": "selected",
-   "selected_role": "balanced_literary",
+   "legacy_selected_role": "balanced_literary",
+   "lazy_selected_role": "balanced_literary",
    "candidates_passed": 2,
    "candidates_failed": 0,
    "legacy_calls": {
@@ -306,7 +342,8 @@
   {
    "chunk_id": "chunk0016",
    "status": "quarantined",
-   "selected_role": null,
+   "legacy_selected_role": null,
+   "lazy_selected_role": null,
    "candidates_passed": 0,
    "candidates_failed": 2,
    "legacy_calls": {

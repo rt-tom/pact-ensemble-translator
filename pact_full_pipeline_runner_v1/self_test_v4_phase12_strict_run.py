@@ -18,10 +18,20 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+
+# Make the self-test runnable from anywhere without PYTHONPATH: the runner
+# dir (for ``import v4_phase12_strict_run``, the Phase 0A convention) and the
+# repo root (for ``from pact_v4...`` imports inside the module under test).
+_RUNNER_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _RUNNER_DIR.parent
+for _path in (_RUNNER_DIR, _REPO_ROOT):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 import v4_phase12_strict_run as m
 
