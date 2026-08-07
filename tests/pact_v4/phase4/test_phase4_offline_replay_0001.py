@@ -299,12 +299,13 @@ def _legacy_committed(
     ))
     reaudit_findings: Tuple[Finding, ...] = ()
     if reaudit_scope:
-        reaudit_findings = _reaudit_chunks(
+        reaudit_outcome = _reaudit_chunks(
             source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
             det_data=det_data, translation_by_chunk=translation_by_chunk,
             chunk_ids=reaudit_scope,
             qwen_audit_evaluator=qwen_audit, gemma_audit_evaluator=gemma_audit,
         )
+        reaudit_findings = reaudit_outcome.findings
 
     # ---- round 2 (interleaved) ------------------------------------------
     blocking_findings = tuple(
@@ -430,9 +431,26 @@ def test_offline_replay_0001_commits_equivalent_to_current_implementation():
         f"commit sets differ: only-legacy={sorted(legacy_ids - new_ids)}, "
         f"only-new={sorted(new_ids - legacy_ids)}"
     )
-    # Debt trace (L3 disabled) is unchanged as a set.
-    assert set(result.debt_trace) == set(legacy_debt)
-    # Terminal status is unchanged.
+    # Debt trace (L3 disabled): the A1c convergence fail-open fix makes the
+    # new flow's debt a strict superset of the legacy flow's — every legacy
+    # reason is preserved, and residual blocking findings / failed re-audit
+    # units of the last round are ADDITIONALLY recorded (the legacy flow
+    # silently dropped them, which is the fail-open being fixed). Terminal
+    # status must be unchanged.
+    assert set(legacy_debt) <= set(result.debt_trace), (
+        "the fail-closed flow must never drop a legacy debt reason"
+    )
+    # The additions are exactly the fail-closed convergence entries (residual
+    # blockers / failed re-audit units of the last round, and Step 6
+    # unit_failed chunks).
+    new_only = set(result.debt_trace) - set(legacy_debt)
+    assert new_only, "the fail-closed flow must add residual-blocker debt"
+    for reason in new_only:
+        assert (
+            "remains after the last convergence re-audit" in reason
+            or ("convergence re-audit" in reason and "failed" in reason)
+            or "Step 6 audit unit failed" in reason
+        ), f"unexpected new debt reason: {reason}"
     assert result.status == legacy_terminal
 
 

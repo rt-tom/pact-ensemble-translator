@@ -306,6 +306,52 @@ def test_step7_resume_ignores_legacy_pre_f3_repair_cache(tmp_path: Path):
     assert rewritten["schema"] == "pact-v4-phase4-repair-cache/v2"
 
 
+def test_step7_resume_reruns_repairs_when_cache_hashed_under_old_policy(tmp_path: Path):
+    # A1c Phase 0 (review §3.5/§5): REPAIR_POLICY_VERSION participates in the
+    # repair unit hash, so a repair cache written under the previous policy
+    # (hashes recorded under pact-v4-repair-policy/v2) must NOT be reused on
+    # resume — every lookup misses and the repairs re-run under the current
+    # policy (which now records the fail-closed convergence debt). This is
+    # the policy-identity half of "cache identity must invalidate old caches".
+    cfg = _make_cfg(tmp_path, n_paragraphs=8)
+    _run_with_repair(cfg)
+    cache_path = cfg.out_dir / "repair_cache.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    # Keep the current envelope schema (v2) and identity, but rewrite every
+    # unit hash under the PREVIOUS repair policy version.
+    old_policy_units = []
+    from pact_v4.phase4.repair import REPAIR_POLICY_VERSION, _repair_unit_hash
+    assert REPAIR_POLICY_VERSION == "pact-v4-repair-policy/v3"
+    for unit in payload["cache"]["units"]:
+        rec = unit["record"]
+        plan = type("Plan", (), {"repair": type("Rep", (), {
+            "repair_id": rec["repair_id"],
+            "action": rec["action"],
+            "target_pids": tuple(rec["target_pids"]),
+            "finding_ids": tuple(rec["finding_ids"]),
+        })()})()
+        old_hash = _repair_unit_hash(
+            chapter_hash=payload["chapter_hash"], plan=plan,
+            backend_identity_hash=payload["backend_identity_hash"],
+            policy_version="pact-v4-repair-policy/v2",
+        )
+        old_policy_units.append({"unit_hash": old_hash, "record": rec})
+    payload["cache"]["units"] = old_policy_units
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+    )
+    result, _r, caller2 = _run_with_repair(resumed_cfg)
+    assert result.resumed_from_index >= 0
+    # Old-policy unit hashes miss under the current policy: the repair model
+    # is called again instead of replaying stale committed records.
+    assert caller2.calls
+    rewritten = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert rewritten["cache"]["units"]  # fresh entries recorded under v3
+
+
 # ---------------------------------------------------------------------------
 # Dual-mode parity (§14.3): local fake backend vs fake OpenCode server
 # ---------------------------------------------------------------------------

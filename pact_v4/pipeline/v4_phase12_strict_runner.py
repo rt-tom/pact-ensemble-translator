@@ -105,6 +105,7 @@ from pact_v4.phase4.repair import (
     RepairCache,
     RepairPhaseResult,
     SoftFindingsPolicy,
+    _chapter_text_identity_hash,
     _reaudit_chunks,
     _run_repair_round,
     decide_terminal_state,
@@ -1543,7 +1544,7 @@ def _load_prior_quarantined_retries(
     chunk_plan: ChunkPlanArtifact,
     config: ConfigArtifact,
     acceptable_backend_hashes: Sequence[str],
-) -> Dict[str, QuarantinedRetryAttempt]:
+) -> Tuple[Dict[str, QuarantinedRetryAttempt], Optional[str], bool]:
     """Reload a prior session's retry history, refusing foreign identity.
 
     Mirrors ``_merge_generation_outcomes`` / ``_load_repair_cache``: the
@@ -1551,10 +1552,24 @@ def _load_prior_quarantined_retries(
     (snapshot/plan/config/backend) match, so a resumed run deterministically
     reuses already-recorded attempts instead of re-paying the bounded
     regeneration or silently mixing retry state across runs.
+
+    Returns ``(attempts, final_text_hash, policy_matches)``:
+
+    * ``attempts`` — the prior per-chunk attempts (usable for candidate
+      reconstruction regardless of policy: a candidate's text is not
+      policy-bound, and ``Candidate.create`` re-validates its identity);
+    * ``final_text_hash`` — the canonical hash of the final chapter text the
+      prior session's retry cycle ended with (``None`` when the file is from
+      a session that never completed the cycle);
+    * ``policy_matches`` — whether the file's ``policy_version`` equals the
+      current retry policy. When ``False`` the history is NOT eligible for
+      the pure-resume lease skip (the re-audit / repair round / formatting
+      re-run under the new policy), but the attempts still reconstruct the
+      prior candidates.
     """
     path = _quarantined_retry_path(out_dir)
     if not path.exists():
-        return {}
+        return {}, None, True
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema") != QUARANTINED_RETRY_SCHEMA:
         raise ValueError(
@@ -1577,14 +1592,27 @@ def _load_prior_quarantined_retries(
             f"{list(acceptable_backend_hashes)!r} -- refusing to resume against "
             "retry history written under a different model backend."
         )
+    policy_matches = payload.get("policy_version") == QUARANTINED_RETRY_POLICY_VERSION
+    if not policy_matches:
+        LOG.info(
+            "quarantined_retry.json written under retry policy %r; current "
+            "policy is %r — pure-resume lease skip disabled (re-audit will "
+            "re-run under the current policy)",
+            payload.get("policy_version"), QUARANTINED_RETRY_POLICY_VERSION,
+        )
     attempts = payload.get("attempts") or []
     if not isinstance(attempts, list):
         raise ValueError("quarantined_retry.json: attempts must be an array")
-    return {
-        item["chunk_id"]: QuarantinedRetryAttempt.from_payload(item)
-        for item in attempts
-        if item.get("chunk_id")
-    }
+    final_text_hash = payload.get("final_text_hash")
+    return (
+        {
+            item["chunk_id"]: QuarantinedRetryAttempt.from_payload(item)
+            for item in attempts
+            if item.get("chunk_id")
+        },
+        final_text_hash,
+        policy_matches,
+    )
 
 
 def _run_quarantined_retry_cycle(
@@ -1641,7 +1669,7 @@ def _run_quarantined_retry_cycle(
     status).
     """
     handoff_chunks = phase4_inputs["handoff_chunks"]
-    prior_attempts = _load_prior_quarantined_retries(
+    prior_attempts, prior_final_text_hash, retry_policy_matches = _load_prior_quarantined_retries(
         cfg.out_dir,
         snapshot=snapshot,
         chunk_plan=chunk_plan,
@@ -1673,9 +1701,27 @@ def _run_quarantined_retry_cycle(
     # are pure waste. The terminal / repair_report / formatting_report are
     # still re-written from the prior attempt so consumers see the same shape
     # as a non-resume run; only the lease cost is elided.
+    #
+    # A1c Phase 0 (review §3.6): the skip is only safe when the retry policy
+    # AND the final chapter text are byte-identical to the session that wrote
+    # the history. ``prior_final_text_hash`` was recorded against the prior
+    # session's final text; the current session's final text (from the fresh
+    # Step 7 repair) must hash identically — otherwise the re-audit verdict
+    # is not provably reusable and the leases must be re-paid under the
+    # current policy.
     fresh_debt = chunk_ids and bool(debt_chunks)
+    current_final_text_hash = _chapter_text_identity_hash(
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        translation=dict(repair_phase_result.final_translation),
+    )
     pure_resume = (
         not fresh_debt
+        and retry_policy_matches
+        and prior_final_text_hash is not None
+        and prior_final_text_hash == current_final_text_hash
         and all(chunk_id in prior_attempts for chunk_id in chunk_ids)
         and all(
             prior_attempts[chunk_id].outcome in (OUTCOME_SELECTED, OUTCOME_QUARANTINED_FINAL)
@@ -1733,7 +1779,7 @@ def _run_quarantined_retry_cycle(
             }
             for chunk_id in selected_chunks
         }
-        reaudit_findings = _reaudit_chunks(
+        reaudit_outcome = _reaudit_chunks(
             source=source,
             snapshot=snapshot,
             chunk_plan=chunk_plan,
@@ -1745,6 +1791,12 @@ def _run_quarantined_retry_cycle(
             gemma_audit_evaluator=repair_adapters[3],
             progress=progress,
         )
+        reaudit_findings = reaudit_outcome.findings
+        for chunk_id, detector in reaudit_outcome.failed_units:
+            retry_debt.append(
+                f"{chunk_id}: quarantined-retry re-audit {detector} failed "
+                "(transport/parse) — findings incomplete"
+            )
 
         plans_by_chunk: Dict[str, list] = {}
         policy = SoftFindingsPolicy()
@@ -1837,6 +1889,7 @@ def _run_quarantined_retry_cycle(
                 "reaudit_findings": [
                     finding.to_payload() for finding in reaudit_findings
                 ],
+                "failed_units": [list(unit) for unit in reaudit_outcome.failed_units],
                 "changed_chunk_ids": selected_chunks,
             }
             _atomic_write_json(_repair_cache_path(cfg.out_dir), {
@@ -1931,6 +1984,24 @@ def _run_quarantined_retry_cycle(
     )
     if progress is not None:
         progress.terminal(status=terminal.status)
+
+    # A1c Phase 0 (review §3.6): persist the final text hash the retry
+    # outcome was verified against. The early write above is crash-safety for
+    # the attempts; this final write adds the authoritative hash so a later
+    # resume can prove a clean pure-resume (same policy + byte-identical
+    # final text) and re-pay the re-audit leases otherwise.
+    _atomic_write_json(_quarantined_retry_path(cfg.out_dir), {
+        "schema": QUARANTINED_RETRY_SCHEMA,
+        "policy_version": QUARANTINED_RETRY_POLICY_VERSION,
+        "chapter_id": cfg.chapter_id,
+        "source_hash": source.source_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": backend_identity_hash,
+        "final_text_hash": integrity["frozen_hash"],
+        "attempts": [attempt.to_payload() for attempt in result.attempts],
+    })
 
     # Re-write the repair report with the retry outcome (schema additions:
     # quarantined_final / retry_attempts / quarantined_retry block).

@@ -408,7 +408,7 @@ def test_translations_json_retry_resume_reuses_prior_attempt_and_final_map(tmp_p
         chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
     )
-    second, _r2, caller2, _audit2 = _run_with_retry(resumed_cfg)
+    second, _r2, caller2, _audit2, _reaudit2 = _run_with_retry(resumed_cfg)
     assert second.resumed_from_index > 0
     assert caller2.calls == []  # prior retry attempt reused, no re-generation
     translations = json.loads(second.translations_path.read_text(encoding="utf-8"))
