@@ -412,6 +412,11 @@ def _retry_one_chunk(
     right_context = lookahead_right_context(
         chunk_id=chunk_id, chunk_plan=chunk_plan, source=source,
     )
+    # lazy_balanced=False: the B6 quarantined-retry regeneration stays on the
+    # legacy A/B scheme (fidelity_first + balanced_literary). V4 Efficiency A2
+    # changes only the strict driver's primary Phase 1-2 loop; the retry keeps
+    # its wider regeneration net so a look-ahead retry never narrows its
+    # chances under the new default.
     outcome = generate_for_chunk(
         chunk_id=chunk_id,
         risk=risk,
@@ -427,6 +432,7 @@ def _retry_one_chunk(
         params=generation_params,
         model_caller=model_caller,
         cache=gen_cache,
+        lazy_balanced=False,
     )
     serialized = _serialize_generation_outcome(outcome)
     candidate_ids = tuple(candidate.candidate_id for candidate in outcome.candidates.values())

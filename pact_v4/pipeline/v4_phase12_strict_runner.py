@@ -66,7 +66,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
@@ -237,6 +237,12 @@ class StrictRunConfig:
     max_formatting_incidents: int = 0
     formatting_required: bool = True
     formatting_policy_version: str = "pact-v4-formatting/v1"
+    # V4 Efficiency A2: single balanced_literary candidate per chunk with a
+    # lazy fidelity_first fallback when the primary fails the Qwen/
+    # deterministic gates. False restores the legacy 2-candidate A/B + Gemma
+    # scheme (full rollback). It is part of the config identity (see
+    # to_config_artifact) so flipping it invalidates resume/cache correctly.
+    lazy_balanced: bool = True
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -273,6 +279,12 @@ class StrictRunConfig:
                 # makes any pre-policy journal a foreign identity -> resume
                 # refuses instead of silently reusing.
                 "glossary_budget_policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
+                # V4 Efficiency A2: the lazy balanced-only generation scheme is
+                # part of the run's config identity — flipping it changes which
+                # candidates are generated (balanced-only vs A/B pair), so a
+                # journal written under the other scheme must be refused on
+                # resume (same reasoning as glossary_budget_policy_version).
+                "efficiency": {"lazy_balanced": self.lazy_balanced},
             },
         )
 
@@ -631,7 +643,22 @@ def _audit_candidate_map(
         for rec in selection_records
         if rec.get("status") == "selected" and rec.get("selected_candidate_id")
     }
-    gen_by_chunk = {rec["chunk_id"]: rec for rec in generation_records}
+    # Keyed by chunk_id like _merge_generation_outcomes; coalesce any
+    # duplicate records for one chunk (the A2 lazy rescue's primary +
+    # lazy outcomes) so every produced candidate is visible to the
+    # best-variant rule — a last-wins dict would silently drop the
+    # primary balanced candidate (RV A2 finding 1).
+    gen_by_chunk: Dict[str, Dict[str, Any]] = {}
+    for rec in generation_records:
+        chunk_id = rec.get("chunk_id")
+        if not chunk_id:
+            continue
+        if chunk_id in gen_by_chunk:
+            gen_by_chunk[chunk_id] = _coalesce_generation_outcome_records(
+                [gen_by_chunk[chunk_id], rec]
+            )
+        else:
+            gen_by_chunk[chunk_id] = rec
 
     candidates: Dict[str, Candidate] = {}
     handoff_rows: List[Dict[str, Any]] = []
@@ -845,6 +872,79 @@ def _merge_selection_meta(
     return [merged[chunk.chunk_id] for chunk in chunk_plan.chunks if chunk.chunk_id in merged]
 
 
+def _coalesce_generation_outcome_records(
+    records: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge several serialized generation-outcome records of the SAME chunk
+    into one cumulative record.
+
+    V4 Efficiency A2 lazy rescue produces two records for one chunk_id: the
+    primary ``balanced_literary`` outcome and the lazy ``fidelity_first``
+    outcome. Downstream consumers key generation records by chunk_id
+    (``_merge_generation_outcomes``, ``_audit_candidate_map``), so a
+    last-wins merge would silently drop the primary candidate — Step 6 could
+    no longer pick a deterministic best-variant among the variants the chunk
+    actually produced. Coalescing keeps every candidate, every error trace
+    and the union of expected roles in one record.
+
+    ``status`` is re-derived from the coalesced content (``complete`` only
+    when every expected role has a produced candidate), matching the
+    semantics of ``_serialize_generation_outcome``.
+    """
+    if not records:
+        return {}
+    base = dict(records[0])
+    candidates: Dict[str, Any] = dict(base.get("candidates") or {})
+    errors: Dict[str, Any] = dict(base.get("errors") or {})
+    expected_roles: List[str] = list(base.get("expected_roles") or [])
+    for rec in records[1:]:
+        for role, candidate in (rec.get("candidates") or {}).items():
+            candidates[role] = candidate
+        for role, error in (rec.get("errors") or {}).items():
+            errors[role] = error
+        for role in rec.get("expected_roles") or []:
+            if role not in expected_roles:
+                expected_roles.append(role)
+    base["expected_roles"] = expected_roles
+    base["candidates"] = candidates
+    base["errors"] = errors
+    base["status"] = "complete" if len(candidates) == len(expected_roles) else "incomplete"
+    return base
+
+
+def _coalesce_lazy_record_into_primary(
+    generation_records: List[Dict[str, Any]],
+    chunk_id: str,
+    lazy_outcome: Any,
+) -> None:
+    """Coalesce a lazy A2 fidelity outcome into the chunk's PRIMARY
+    generation record (in place).
+
+    The primary balanced_literary record was appended when the chunk's
+    initial generation completed; the lazy rescue produced a second outcome
+    for the SAME chunk_id. Downstream consumers (``_merge_generation_outcomes``
+    and Step 6's ``_audit_candidate_map``) key generation records by
+    chunk_id, so a naive second append would make a last-wins merge drop the
+    primary balanced candidate — Step 6 could not pick the deterministic
+    best-variant among the variants the chunk actually produced. This helper
+    merges the lazy outcome into the existing primary record so both
+    candidates (and both decision traces / errors) survive in the cumulative
+    record. The final selected/quarantine outcome is decided by the caller
+    and is untouched here.
+    """
+    lazy_serialized = _serialize_generation_outcome(lazy_outcome)
+    for index in range(len(generation_records) - 1, -1, -1):
+        if generation_records[index].get("chunk_id") == chunk_id:
+            generation_records[index] = _coalesce_generation_outcome_records(
+                [generation_records[index], lazy_serialized]
+            )
+            return
+    # No primary record found (should not happen — the primary always
+    # precedes the lazy rescue) — fall back to appending so the lazy
+    # outcome is at least persisted.
+    generation_records.append(lazy_serialized)
+
+
 def _merge_generation_outcomes(
     out_dir: Path,
     current_records: List[Dict[str, Any]],
@@ -863,6 +963,11 @@ def _merge_generation_outcomes(
     The final write below persists the merged list, making the file cumulative
     across resumes (fixes the ``generation_outcomes.json`` reconstruction gap
     recorded in ``DECISIONS.md`` 2026-08-01).
+
+    Records are keyed by chunk_id; multiple records for the same chunk (the
+    A2 lazy rescue's primary + lazy outcomes) are coalesced into one
+    cumulative record rather than last-wins, so every produced candidate
+    survives into Step 6 and across resumes.
     """
     path = _generation_outcomes_path(out_dir)
     prior: List[Dict[str, Any]] = []
@@ -882,11 +987,16 @@ def _merge_generation_outcomes(
         if not isinstance(outcomes, list):
             raise ValueError("generation_outcomes.json: outcomes must be an array")
         prior = outcomes
-    merged = {rec.get("chunk_id"): rec for rec in prior if rec.get("chunk_id")}
-    for rec in current_records:
-        if rec.get("chunk_id"):
-            merged[rec["chunk_id"]] = rec
-    return [merged[chunk.chunk_id] for chunk in chunk_plan.chunks if chunk.chunk_id in merged]
+    by_chunk: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in list(prior) + list(current_records):
+        chunk_id = rec.get("chunk_id")
+        if chunk_id:
+            by_chunk.setdefault(chunk_id, []).append(rec)
+    return [
+        _coalesce_generation_outcome_records(by_chunk[chunk.chunk_id])
+        for chunk in chunk_plan.chunks
+        if chunk.chunk_id in by_chunk
+    ]
 
 
 def _load_audit_cache(
@@ -2250,6 +2360,7 @@ def run_chapter_strict(
                     glossary=chunk_glossary, style_constraints={}, bible_text=bible_text,
                     config=config, params=generation_params,
                     model_caller=model_caller, cache=gen_cache,
+                    lazy_balanced=cfg.lazy_balanced,
                 )
                 generation_records.append(_serialize_generation_outcome(outcome))
 
@@ -2368,6 +2479,106 @@ def run_chapter_strict(
                         )
                         break
                     continue
+
+                # ---- V4 Efficiency A2: lazy balanced-only fallback ----
+                # The single balanced_literary candidate failed the
+                # Qwen/deterministic gates. Lazily generate the fidelity_first
+                # safety net and run the cascade on it alone: one passing
+                # candidate → selected (Gemma is never invoked with a single
+                # candidate), both failing → quarantined, exactly as the
+                # pre-A2 2-candidate cascade would have. With
+                # cfg.lazy_balanced=False this block never runs (legacy
+                # 2-candidate + Gemma behavior, full rollback).
+                if cfg.lazy_balanced and result.quarantine:
+                    primary_quarantine_reason = result.quarantine_reason
+                    lazy_outcome = generate_for_chunk(
+                        chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
+                        chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
+                        glossary=chunk_glossary, style_constraints={}, bible_text=bible_text,
+                        config=config, params=generation_params,
+                        model_caller=model_caller, cache=gen_cache,
+                        roles=("fidelity_first",),
+                    )
+                    # RV A2 fix: the lazy fidelity outcome must join the
+                    # chunk's PRIMARY generation record instead of being
+                    # appended as a second record for the same chunk_id —
+                    # downstream consumers key generation records by
+                    # chunk_id (_merge_generation_outcomes, and Step 6's
+                    # _audit_candidate_map builds gen_by_chunk the same way),
+                    # so a last-wins merge would drop the primary balanced
+                    # candidate and Step 6 could no longer pick a
+                    # deterministic best-variant among the variants the chunk
+                    # actually produced. Coalesce keeps both candidates (and
+                    # both decision traces / errors) in one cumulative record
+                    # without changing the final selected/quarantine outcome.
+                    _coalesce_lazy_record_into_primary(
+                        generation_records, plan_chunk.chunk_id, lazy_outcome,
+                    )
+                    if lazy_outcome.status == "complete":
+                        candidates = list(lazy_outcome.candidates.values())
+                        # The lazy fidelity candidate's own text must join the
+                        # source-derived mixed-script allowlist, exactly as both
+                        # candidates' texts did pre-A2 (the union was computed
+                        # above from the balanced candidate alone). Without this
+                        # a Latin token fidelity preserves (and balanced did
+                        # not) — e.g. source initials — would be wrongly
+                        # flagged by the deterministic gate and the lazy rescue
+                        # would degrade a chunk the legacy cascade selected.
+                        det_data_lazy = replace(
+                            det_data_base,
+                            mixed_script_allow=combine_script_tokens(
+                                static_allow,
+                                source_derived_allowlist(
+                                    chunk_source_text,
+                                    candidate_union_text + " " + " ".join(
+                                        text for cand in candidates for _, text in cand.translation
+                                    ),
+                                ),
+                            ),
+                        )
+                        try:
+                            result = select_candidate(
+                                chunk_id=plan_chunk.chunk_id, candidates=candidates, source=source,
+                                qwen_evaluator=qwen_evaluator, det_data=det_data_lazy,
+                                gemma_selector=gemma_selector,
+                            )
+                        except Exception as exc:  # noqa: BLE001 -- see primary select_candidate handling
+                            LOG.exception(
+                                "select_candidate raised on lazy fidelity for %s", plan_chunk.chunk_id
+                            )
+                            result = SelectionResult(
+                                chunk_id=plan_chunk.chunk_id, quarantine=True,
+                                quarantine_reason=f"lazy fidelity cascade raised: {exc!r}",
+                                candidates_evaluated=len(candidates),
+                            )
+                        outcome = lazy_outcome
+                        if result.quarantine:
+                            # Both the primary balanced_literary and the lazy
+                            # fidelity_first failed → quarantined; keep both
+                            # reasons in the audit trail.
+                            result = replace(
+                                result,
+                                quarantine_reason=(
+                                    "balanced_literary failed the gates: "
+                                    f"{primary_quarantine_reason} | lazy fidelity_first also failed: "
+                                    f"{result.quarantine_reason}"
+                                ),
+                            )
+                    else:
+                        # Lazy generation itself failed validation (e.g.
+                        # invalid JSON) → both attempts failed → quarantined.
+                        outcome = lazy_outcome
+                        candidates = []
+                        result = SelectionResult(
+                            chunk_id=plan_chunk.chunk_id, quarantine=True,
+                            quarantine_reason=(
+                                "balanced_literary failed the gates; lazy fidelity_first "
+                                "generation incomplete: "
+                                + ", ".join(
+                                    f"{r}={e.detail}" for r, e in lazy_outcome.errors.items()
+                                )
+                            ),
+                        )
 
                 q_delta, n_delta, selected_text = _record_selection(
                     selection_records=selection_records, final_text_by_pid=final_text_by_pid,

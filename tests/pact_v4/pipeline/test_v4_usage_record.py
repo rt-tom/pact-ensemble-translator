@@ -23,6 +23,7 @@ offline fake OpenCode server as the C2 remote runner tests.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -454,9 +455,13 @@ def _run_remote(cfg: StrictRunConfig):
 
 
 def test_remote_run_writes_usage_ndjson_per_call(tmp_path: Path):
-    remote_cfg = _make_remote_cfg(tmp_path, backend=OpenCodeBackendConfig(
+    # lazy_balanced=False: this usage-writer test keeps the legacy A/B
+    # generation roles (fidelity_first + balanced_literary) so the label
+    # assertions cover the full role set; V4 Efficiency A2's lazy default is
+    # covered by the dedicated A2 runner tests.
+    remote_cfg = replace(_make_remote_cfg(tmp_path, backend=OpenCodeBackendConfig(
         server=_remote_backend_config(),
-    ))
+    )), lazy_balanced=False)
     result, fake = _run_remote(remote_cfg)
     assert result.chunk_count == 2
     path = remote_cfg.out_dir / USAGE_FILENAME

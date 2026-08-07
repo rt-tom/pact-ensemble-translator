@@ -339,6 +339,9 @@ def run_chapter(
         )
 
         # ---- Phase 2B: generate candidates for this chunk ----------
+        # lazy_balanced=False: this benchmark driver keeps the legacy A/B
+        # 2-candidate scheme (V4 Efficiency A2 changes only the production
+        # strict driver; the draft driver's A/B contract is unchanged).
         outcome = generate_for_chunk(
             chunk_id=plan_chunk.chunk_id,
             risk=risk,
@@ -353,6 +356,7 @@ def run_chapter(
             params=generation_params,
             model_caller=model_caller,
             cache=gen_cache,
+            lazy_balanced=False,
         )
         generation_records.append(_serialize_generation_outcome(outcome))
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -140,6 +141,13 @@ def build_argparser() -> argparse.ArgumentParser:
                          "bible + glossary + source-derived + this manual set.")
     p.add_argument("--startup-timeout", type=float, default=240.0)
     p.add_argument("--unload-timeout", type=float, default=30.0)
+    p.add_argument("--lazy-balanced", action=argparse.BooleanOptionalAction, default=None,
+                   help="V4 Efficiency A2: generate a single balanced_literary candidate "
+                        "per chunk and lazily generate fidelity_first only when the primary "
+                        "fails the Qwen/deterministic gates. Overrides the "
+                        "PACT_EFFICIENCY_LAZY_BALANCED env var; default true. "
+                        "--no-lazy-balanced restores the legacy 2-candidate A/B + Gemma "
+                        "scheme (full rollback).")
     p.add_argument("--runtime-config", type=Path, default=None, metavar="FILE",
                     help="YAML/JSON tagged runtime profile (kind local_llama | "
                          "opencode_server | composite). When absent the historical "
@@ -272,6 +280,26 @@ def _log_result(result: Any) -> None:
     )
 
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    """Parse a boolean env-var override (e.g. ``PACT_EFFICIENCY_LAZY_BALANCED``).
+
+    Accepts ``1/true/yes/on`` and ``0/false/no/off`` (case-insensitive);
+    anything else is an error rather than a silent misconfiguration.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"{name}: expected a boolean value, got {raw!r} "
+        "(use 1/true/yes/on or 0/false/no/off)"
+    )
+
+
 def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig:
     return StrictRunConfig(
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
@@ -279,6 +307,13 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
         run_label=args.run_label,
+        # V4 Efficiency A2: CLI flag (--lazy-balanced/--no-lazy-balanced)
+        # overrides the env var, which defaults to true (lazy mode on).
+        lazy_balanced=(
+            args.lazy_balanced
+            if args.lazy_balanced is not None
+            else _env_flag("PACT_EFFICIENCY_LAZY_BALANCED", default=True)
+        ),
     )
 
 
