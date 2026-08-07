@@ -798,25 +798,51 @@ def test_check_report_validates_committed_head_not_dirty_worktree(tmp_path) -> N
     (repo / "AGENTS.md").write_text("AGENTS CONTENT A\n" + "DIRTY" * 5000, encoding="utf-8")
     facts = _agents_facts("", head, blob)
     # facts that match the committed blob pass the AGENTS checks
-    probs = verify.check_report(facts, MINIMAL_EV, blob, head)
+    probs = verify.check_report(facts, MINIMAL_EV, blob, head, repo=repo)
     assert not any("AGENTS.md" in p for p in probs), probs
     # facts that match the DIRTY working-tree file must FAIL
     dirty_facts = facts.replace(str(len(blob)), str(len(blob) + 20000))
-    probs = verify.check_report(dirty_facts, MINIMAL_EV, blob, head)
+    probs = verify.check_report(dirty_facts, MINIMAL_EV, blob, head, repo=repo)
     assert any("AGENTS.md bytes" in p for p in probs), probs
 
 
 def test_check_report_rejects_stale_head_citation(tmp_path) -> None:
-    """Freshness: a report citing an older HEAD commit must fail."""
+    """Freshness: a report citing a HEAD whose AGENTS.md is not the committed
+    one (or that does not exist) must fail."""
     repo = _make_git_repo(tmp_path, "AGENTS CONTENT A\n")
     head, blob = verify.committed_agents(repo)
     facts = _agents_facts("", head, blob)
     stale = facts.replace(head, "38b1091" + "0" * (len(head) - 7))
-    probs = verify.check_report(stale, MINIMAL_EV, blob, head)
+    probs = verify.check_report(stale, MINIMAL_EV, blob, head, repo=repo)
     assert any("HEAD" in p and "AGENTS.md" in p for p in probs), probs
-    # and the committed report (with its own cited HEAD) passes the table checks
-    # even when the AGENTS facts are injected as mandatory inputs
-    good = verify.check_report(_agents_facts("", head, blob), MINIMAL_EV, blob, head)
+    # an exact citation of the current HEAD passes the AGENTS checks
+    good = verify.check_report(_agents_facts("", head, blob), MINIMAL_EV, blob, head, repo=repo)
+    assert not any("AGENTS.md" in p for p in good), good
+
+
+def test_check_report_freshness_uses_cited_blob_identity(tmp_path) -> None:
+    """Freshness = the cited HEAD carries the SAME AGENTS.md blob as the
+    committed HEAD. A report generated at an older commit whose AGENTS.md
+    changed fails; the measurement-commit case (AGENTS.md unchanged between
+    the cited commit and HEAD) passes."""
+    repo = _make_git_repo(tmp_path, "AGENTS CONTENT A\n")
+    head_a, blob_a = verify.committed_agents(repo)
+    # change AGENTS.md -> commit B (different blob)
+    (repo / "AGENTS.md").write_text("AGENTS CONTENT B\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "AGENTS.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "change agents"], check=True, capture_output=True)
+    head_b, blob_b = verify.committed_agents(repo)
+    assert blob_a != blob_b
+    # report generated at A, checked at B: A's AGENTS.md differs from B's -> fail
+    probs = verify.check_report(_agents_facts("", head_a, blob_a), MINIMAL_EV, blob_b, head_b, repo=repo)
+    assert any("HEAD" in p and "AGENTS.md" in p for p in probs), probs
+    # revert AGENTS.md -> commit C restores A's blob: report citing A now passes at C
+    (repo / "AGENTS.md").write_text("AGENTS CONTENT A\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "AGENTS.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "revert agents"], check=True, capture_output=True)
+    head_c, blob_c = verify.committed_agents(repo)
+    assert blob_c == blob_a
+    good = verify.check_report(_agents_facts("", head_a, blob_c), MINIMAL_EV, blob_c, head_c, repo=repo)
     assert not any("AGENTS.md" in p for p in good), good
 
 

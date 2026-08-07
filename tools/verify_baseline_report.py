@@ -17,8 +17,10 @@ This verifier instead:
 4. Verifies the AGENTS.md size/char-count/hash claims against the COMMITTED
    HEAD blob (``git show HEAD:AGENTS.md`` — never an arbitrary dirty
    working-tree file). AGENTS.md is a mandatory input: if it is absent from
-   HEAD the check fails; it is never silently skipped. The report's cited
-   HEAD commit must also equal ``git rev-parse HEAD`` (freshness).
+   HEAD the check fails; it is never silently skipped. Freshness: the
+   report's cited HEAD commit must carry the SAME AGENTS.md blob as the
+   committed HEAD (an artifact regenerated against an older commit with a
+   different AGENTS.md fails).
 5. Runs a redaction regression check over the committed report / evidence /
    context artifacts: no kanban task ids, no ``wt/`` worktree identifiers,
    no absolute (drive / UNC / POSIX) paths, no sensitive column/credential
@@ -286,6 +288,7 @@ def check_report(
     evidence: dict,
     agents_bytes: bytes | None = None,
     head_sha: str | None = None,
+    repo: Path = REPO,
 ) -> list[str]:
     """Return a list of problems; empty list means the report is consistent.
 
@@ -293,8 +296,10 @@ def check_report(
     :func:`committed_agents`); when provided, the AGENTS.md facts are
     mandatory — the report must cite bytes/UTF-8 chars/sha256 and they must
     match the committed blob exactly. ``head_sha`` is ``git rev-parse HEAD``;
-    when provided, the report's cited HEAD commit must match it (freshness:
-    artifacts must not cite an older HEAD).
+    when provided, the report's cited HEAD must carry the same AGENTS.md blob
+    as the committed HEAD (freshness: artifacts must not describe an older
+    AGENTS.md target). ``repo`` is the repository used for the freshness
+    blob lookup (defaults to this repo).
     """
     problems: list[str] = []
     ev = evidence["profiles"]
@@ -649,7 +654,14 @@ def check_report(
             if m_sha.group(1) != real:
                 problems.append(f"AGENTS.md sha256: report {m_sha.group(1)}, committed HEAD {real}")
 
-    # -- 10) freshness: the report's cited HEAD commit must be the real HEAD --
+    # -- 10) freshness: the report's cited HEAD must describe the current target --
+    # The artifacts may legitimately cite the measurement commit (the commit
+    # they were generated at, e.g. the branch tip before the artifact commit
+    # itself). Freshness therefore means: the cited commit's AGENTS.md blob
+    # must be IDENTICAL to the committed HEAD blob (git show HEAD:AGENTS.md).
+    # An artifact regenerated against an old commit with a different AGENTS.md
+    # (the 38b1091 regression) fails here; an exact citation of the current
+    # HEAD passes trivially.
     if head_sha is not None:
         m_head = re.search(r"HEAD\s+`?([0-9a-f]{7,40})`?", report_text)
         if m_head is None:
@@ -657,10 +669,16 @@ def check_report(
                 "AGENTS.md: report does not cite the HEAD commit (expected 'HEAD <sha>')"
             )
         elif head_sha[: len(m_head.group(1))] != m_head.group(1):
-            problems.append(
-                f"AGENTS.md: report cites HEAD {m_head.group(1)!r}, "
-                f"committed HEAD is {head_sha[:12]}"
-            )
+            try:
+                cited_blob = _git(repo, "show", f"{m_head.group(1)}:AGENTS.md")
+            except RuntimeError:
+                cited_blob = None
+            if cited_blob != agents_bytes:
+                problems.append(
+                    f"AGENTS.md: report cites HEAD {m_head.group(1)!r} whose AGENTS.md "
+                    f"differs from committed HEAD {head_sha[:12]} — refresh the "
+                    f"artifacts on the current target"
+                )
 
     return problems
 
