@@ -12,7 +12,8 @@ This verifier instead:
    arithmetic the reporter uses: sums, R-7 p50/p90, derived percentages and
    ratios, fingerprint prefixes).
 3. Fails on ANY cell mismatch — including a value that exists in the
-   evidence but belongs to another profile.
+   evidence but belongs to another profile — and on ANY missing,
+   duplicate or extra row in the mandatory tables (completeness).
 4. Verifies the AGENTS.md size/char-count/hash claims against the live repo
    file (read-only).
 
@@ -105,6 +106,31 @@ def parse_tables(md: str):
 
 
 # ---------------------------------------------------------------------------
+# Section row collection + completeness helpers.
+# ---------------------------------------------------------------------------
+def _rows(tables, pred):
+    """All (profile_heading, header, row) whose header satisfies pred."""
+    return [
+        (prof, header, row)
+        for prof, header, row in tables
+        if row and pred(header)
+    ]
+
+
+def _complete_profiles(problems, section, seen, label="profile row"):
+    """Require every mandatory profile; flag duplicate and extra rows."""
+    for p in PROFILES:
+        if p not in seen:
+            problems.append(f"{section}: missing {label} {p}")
+    for name, cnt in seen.items():
+        if cnt > 1:
+            problems.append(f"{section}: duplicate {label} {name}")
+    for name in seen:
+        if name not in PROFILES:
+            problems.append(f"{section}: extra {label} {name!r}")
+
+
+# ---------------------------------------------------------------------------
 # Expected values from evidence.
 # ---------------------------------------------------------------------------
 def _expected_main(ev_p: dict) -> dict:
@@ -160,21 +186,15 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
     ev = evidence["profiles"]
     tables = parse_tables(report_text)
 
-    def find_table(needle: str):
-        for prof, header, _rows in tables:
-            if any(needle in h for h in header):
-                return header
-        return None
-
     # -- 1) fingerprint table (§1) -----------------------------------------
-    fp_header = find_table("sha256")
-    if fp_header is None:
+    fp_rows = _rows(tables, lambda h: any("sha256" in x for x in h))
+    if not fp_rows:
         problems.append("fingerprint table not found")
     else:
-        for prof, header, row in tables:
-            if not any("sha256" in h for h in header) or not row:
-                continue
+        seen_fp: dict[str, int] = {}
+        for prof, header, row in fp_rows:
             name = row[0]
+            seen_fp[name] = seen_fp.get(name, 0) + 1
             if name not in PROFILES:
                 continue
             fp = ev[name]["fingerprint"]
@@ -202,16 +222,17 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
                 problems.append(
                     f"{name}: config.yaml sha256 prefix {got_cfg.strip()!r} != evidence {exp['config_sha16']!r}"
                 )
+        _complete_profiles(problems, "fingerprint", seen_fp)
 
     # -- 2) per-profile aggregate table (§2, "Вызовов (sum)") --------------
-    main_header = find_table("Вызовов (sum)")
-    if main_header is None:
+    main_rows = _rows(tables, lambda h: any("Вызовов (sum)" in x for x in h))
+    if not main_rows:
         problems.append("main aggregate table not found")
     else:
-        for prof, header, row in tables:
-            if not any("Вызовов (sum)" in h for h in header) or not row:
-                continue
+        seen_main: dict[str, int] = {}
+        for prof, header, row in main_rows:
             name = row[0]
+            seen_main[name] = seen_main.get(name, 0) + 1
             if name not in PROFILES:
                 continue
             cells = {h: row[i] for i, h in enumerate(header) if i < len(row)}
@@ -259,16 +280,17 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
                     problems.append(
                         f"{name}: {label} p90 = {parts[1]!r}, evidence {_fmt_int(exp[k90])}"
                     )
+        _complete_profiles(problems, "aggregates", seen_main)
 
     # -- 3) derived ratio table (§2, "reasoning/input") ---------------------
-    der_header = find_table("reasoning/input")
-    if der_header is None:
+    der_rows = _rows(tables, lambda h: any("reasoning/input" in x for x in h))
+    if not der_rows:
         problems.append("derived ratio table not found")
     else:
-        for prof, header, row in tables:
-            if not any("reasoning/input" in h for h in header) or not row:
-                continue
+        seen_der: dict[str, int] = {}
+        for prof, header, row in der_rows:
             name = row[0]
+            seen_der[name] = seen_der.get(name, 0) + 1
             if name not in PROFILES:
                 continue
             cells = {h: row[i] for i, h in enumerate(header) if i < len(row)}
@@ -286,19 +308,25 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
             got = cells.get("вызовов на сессию (avg)")
             if got is None or _num(got) is None or abs(_num(got) - round(exp["calls_per_session"])) > 0.05:
                 problems.append(f"{name}: avg calls/session = {got.strip() if got else None!r}, evidence {int(round(exp['calls_per_session']))}")
+        _complete_profiles(problems, "derived", seen_der)
 
     # -- 4) by_source table (§3) -------------------------------------------
-    src_header = find_table("source")
-    if src_header is None:
+    src_rows = _rows(
+        tables,
+        lambda h: any("source" in x for x in h) and not any("метрика" in x for x in h),
+    )
+    if not src_rows:
         problems.append("by_source table not found")
     else:
-        for prof, header, row in tables:
-            if not any("source" in h for h in header) or not row:
-                continue
-            name, src = row[0], row[1]
+        seen_src: dict[tuple, int] = {}
+        for prof, header, row in src_rows:
+            name = row[0]
+            src = row[1] if len(row) > 1 else None
+            seen_src[(name, src)] = seen_src.get((name, src), 0) + 1
             if name not in PROFILES:
                 continue
-            if len(row) < 8:
+            if src is None or len(row) < 8:
+                problems.append(f"{name}: by_source row malformed ({len(row)} columns)")
                 continue
             bs = ev[name].get("by_source", {}).get(src)
             if bs is None:
@@ -319,19 +347,30 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
                     problems.append(
                         f"{name}/{src}: {label} = {cell.strip() if cell else None!r}, evidence {_fmt_int(want)}"
                     )
+        for p in PROFILES:
+            for s in ev[p].get("by_source", {}):
+                if (p, s) not in seen_src:
+                    problems.append(f"by_source: missing row {p}/{s}")
+        for (name, src), cnt in seen_src.items():
+            if cnt > 1:
+                problems.append(f"by_source: duplicate row {name}/{src}")
+        for name, src in seen_src:
+            if name not in PROFILES:
+                problems.append(f"by_source: extra profile row {name!r}")
 
     # -- 5) usage_by_model table (§4) --------------------------------------
-    use_header = find_table("provider")
-    if use_header is None:
+    use_rows = _rows(tables, lambda h: any("provider" in x for x in h))
+    if not use_rows:
         problems.append("usage_by_model table not found")
     else:
-        for prof, header, row in tables:
-            if not any("provider" in h for h in header) or not row:
-                continue
-            name, model = row[0], row[1]
+        seen_use: dict[tuple, int] = {}
+        for prof, header, row in use_rows:
+            name = row[0]
+            model = row[1] if len(row) > 1 else None
+            prov = row[2] if len(row) > 2 else None
+            seen_use[(name, model, prov)] = seen_use.get((name, model, prov), 0) + 1
             if name not in PROFILES:
                 continue
-            prov = row[2] if len(row) > 2 else None
             cells = {h: row[i] for i, h in enumerate(header) if i < len(row)}
             found = None
             for u in ev[name]["usage_by_model"]:
@@ -355,16 +394,27 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
                     problems.append(
                         f"{name}/{model}: {label} = {cell.strip() if cell else None!r}, evidence {_fmt_int(want)}"
                     )
+        for p in PROFILES:
+            for u in ev[p]["usage_by_model"]:
+                k = (p, u["model"], _provider_display(u["billing_provider"], u["billing_mode"]))
+                if k not in seen_use:
+                    problems.append(f"usage_by_model: missing row {k[0]}/{k[1]}/{k[2]}")
+        for (name, model, prov), cnt in seen_use.items():
+            if cnt > 1:
+                problems.append(f"usage_by_model: duplicate row {name}/{model}/{prov}")
+        for name, model, prov in seen_use:
+            if name not in PROFILES:
+                problems.append(f"usage_by_model: extra profile row {name!r}")
 
     # -- 6) reasoning effort table (§5) ------------------------------------
-    eff_header = find_table("medium")
-    if eff_header is None:
+    eff_rows = _rows(tables, lambda h: any("medium" in x for x in h))
+    if not eff_rows:
         problems.append("reasoning effort table not found")
     else:
-        for prof, header, row in tables:
-            if not any("medium" in h for h in header) or not row:
-                continue
+        seen_eff: dict[str, int] = {}
+        for prof, header, row in eff_rows:
             name = row[0]
+            seen_eff[name] = seen_eff.get(name, 0) + 1
             if name not in PROFILES:
                 continue
             dist = ev[name].get("reasoning_effort_distribution", {})
@@ -377,16 +427,17 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
             for k, v in dist.items():
                 if k not in header[1:]:
                     problems.append(f"{name}: effort[{k}]={v} missing from report table")
+        _complete_profiles(problems, "reasoning effort", seen_eff)
 
     # -- 7) finish_reason table (§5) ---------------------------------------
-    fin_header = find_table("tool_calls")
-    if fin_header is None:
+    fin_rows = _rows(tables, lambda h: any("tool_calls" in x for x in h))
+    if not fin_rows:
         problems.append("finish_reason table not found")
     else:
-        for prof, header, row in tables:
-            if not any("tool_calls" in h for h in header) or not row:
-                continue
+        seen_fin: dict[str, int] = {}
+        for prof, header, row in fin_rows:
             name = row[0]
+            seen_fin[name] = seen_fin.get(name, 0) + 1
             if name not in PROFILES:
                 continue
             counts = {f["finish_reason"]: f["count"] for f in ev[name]["messages"]["finish_reason"]}
@@ -399,48 +450,62 @@ def check_report(report_text: str, evidence: dict, agents_bytes: bytes | None = 
             for k, v in counts.items():
                 if k not in header[1:]:
                     problems.append(f"{name}: finish_reason[{k}]={v} missing from report table")
+        _complete_profiles(problems, "finish_reason", seen_fin)
 
     # -- 8) top-5 tables (§7) ----------------------------------------------
-    top5_headers = [t for t in tables if any("метрика" in h for h in t[1])]
-    if not top5_headers:
+    top5_rows = _rows(tables, lambda h: any("метрика" in x for x in h))
+    if not top5_rows:
         problems.append("top-5 tables not found")
-    for prof, header, row in top5_headers:
-        metric = row[0] if row else None
-        if metric not in ("input", "reasoning"):
-            continue
-        name = prof.split()[0] if prof else None
-        if name not in PROFILES:
-            continue
-        rows = _top5_rows(ev[name], metric)
-        cells = {h: row[i] for i, h in enumerate(header) if i < len(row)}
-        id_cell = cells.get("id (ред.)", "").strip().strip("`")
-        inp = _num(cells.get("input"))
-        rsn = _num(cells.get("reasoning"))
-        calls = _num(cells.get("вызовов"))
-        msgs = _num(cells.get("msgs"))
-        tools = _num(cells.get("tools"))
-        match = next((t for t in rows if t["id_redacted"] == id_cell), None)
-        if match is None:
-            problems.append(f"{name}: top5-{metric} id {id_cell!r} not in evidence")
-            continue
-        if inp is None or abs(inp - match["input_tokens"]) > 0.05:
-            problems.append(f"{name}: top5-{metric} {id_cell} input = {cells.get('input')!r}, evidence {match['input_tokens']}")
-        if rsn is None or abs(rsn - match["reasoning_tokens"]) > 0.05:
-            problems.append(f"{name}: top5-{metric} {id_cell} reasoning = {cells.get('reasoning')!r}, evidence {match['reasoning_tokens']}")
-        if calls is None or abs(calls - match["api_call_count"]) > 0.05:
-            problems.append(f"{name}: top5-{metric} {id_cell} calls = {cells.get('вызовов')!r}, evidence {match['api_call_count']}")
-        if msgs is None or abs(msgs - match["message_count"]) > 0.05:
-            problems.append(f"{name}: top5-{metric} {id_cell} msgs = {cells.get('msgs')!r}, evidence {match['message_count']}")
-        if tools is None or abs(tools - match["tool_call_count"]) > 0.05:
-            problems.append(f"{name}: top5-{metric} {id_cell} tools = {cells.get('tools')!r}, evidence {match['tool_call_count']}")
-        if "source" in cells and cells["source"].strip() != (match["source"] or ""):
-            problems.append(f"{name}: top5-{metric} {id_cell} source = {cells.get('source')!r}, evidence {match['source']!r}")
-        if "model" in cells and cells["model"].strip() != (match["model"] or ""):
-            problems.append(f"{name}: top5-{metric} {id_cell} model = {cells.get('model')!r}, evidence {match['model']!r}")
-        if "effort" in cells and cells["effort"].strip() != (match["reasoning_effort"] or "(none)"):
-            problems.append(
-                f"{name}: top5-{metric} {id_cell} effort = {cells.get('effort')!r}, evidence {match['reasoning_effort']!r}"
-            )
+    else:
+        seen_top: dict[tuple, int] = {}
+        for prof, header, row in top5_rows:
+            metric = row[0] if row else None
+            name = prof.split()[0] if prof else None
+            cells = {h: row[i] for i, h in enumerate(header) if i < len(row)}
+            id_cell = cells.get("id (ред.)", "").strip().strip("`")
+            seen_top[(name, metric, id_cell)] = seen_top.get((name, metric, id_cell), 0) + 1
+            if name not in PROFILES or metric not in ("input", "reasoning"):
+                continue
+            rows = _top5_rows(ev[name], metric)
+            inp = _num(cells.get("input"))
+            rsn = _num(cells.get("reasoning"))
+            calls = _num(cells.get("вызовов"))
+            msgs = _num(cells.get("msgs"))
+            tools = _num(cells.get("tools"))
+            match = next((t for t in rows if t["id_redacted"] == id_cell), None)
+            if match is None:
+                problems.append(f"{name}: top5-{metric} id {id_cell!r} not in evidence")
+                continue
+            if inp is None or abs(inp - match["input_tokens"]) > 0.05:
+                problems.append(f"{name}: top5-{metric} {id_cell} input = {cells.get('input')!r}, evidence {match['input_tokens']}")
+            if rsn is None or abs(rsn - match["reasoning_tokens"]) > 0.05:
+                problems.append(f"{name}: top5-{metric} {id_cell} reasoning = {cells.get('reasoning')!r}, evidence {match['reasoning_tokens']}")
+            if calls is None or abs(calls - match["api_call_count"]) > 0.05:
+                problems.append(f"{name}: top5-{metric} {id_cell} calls = {cells.get('вызовов')!r}, evidence {match['api_call_count']}")
+            if msgs is None or abs(msgs - match["message_count"]) > 0.05:
+                problems.append(f"{name}: top5-{metric} {id_cell} msgs = {cells.get('msgs')!r}, evidence {match['message_count']}")
+            if tools is None or abs(tools - match["tool_call_count"]) > 0.05:
+                problems.append(f"{name}: top5-{metric} {id_cell} tools = {cells.get('tools')!r}, evidence {match['tool_call_count']}")
+            if "source" in cells and cells["source"].strip() != (match["source"] or ""):
+                problems.append(f"{name}: top5-{metric} {id_cell} source = {cells.get('source')!r}, evidence {match['source']!r}")
+            if "model" in cells and cells["model"].strip() != (match["model"] or ""):
+                problems.append(f"{name}: top5-{metric} {id_cell} model = {cells.get('model')!r}, evidence {match['model']!r}")
+            if "effort" in cells and cells["effort"].strip() != (match["reasoning_effort"] or "(none)"):
+                problems.append(
+                    f"{name}: top5-{metric} {id_cell} effort = {cells.get('effort')!r}, evidence {match['reasoning_effort']!r}"
+                )
+        for p in PROFILES:
+            for metric in ("input", "reasoning"):
+                for t in ev[p].get(f"top5_by_{metric}", []):
+                    k = (p, metric, t["id_redacted"])
+                    if k not in seen_top:
+                        problems.append(f"top-5: missing row {p}/{metric}/{t['id_redacted']}")
+        for (name, metric, id_cell), cnt in seen_top.items():
+            if cnt > 1:
+                problems.append(f"top-5: duplicate row {name}/{metric}/{id_cell}")
+        for name, metric, id_cell in seen_top:
+            if name not in PROFILES or metric not in ("input", "reasoning"):
+                problems.append(f"top-5: extra row {name!r}/{metric!r}/{id_cell!r}")
 
     # -- 9) AGENTS.md facts (§6) vs the live repo file ---------------------
     if agents_bytes is not None:

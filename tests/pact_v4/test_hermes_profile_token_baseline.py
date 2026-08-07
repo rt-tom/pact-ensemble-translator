@@ -374,3 +374,87 @@ def test_verifier_detects_cross_profile_substitution(
 def test_verifier_self_test_mode(committed_evidence, committed_report) -> None:
     st = verify._self_test(committed_evidence, committed_report)
     assert st == []
+
+
+# ---------------------------------------------------------------------------
+# 6. Structural verifier completeness: missing / duplicate / extra rows.
+# ---------------------------------------------------------------------------
+def _drop_row(md: str, needle: str) -> str:
+    """Remove the first markdown table row line containing `needle`."""
+    lines = md.splitlines()
+    out: list[str] = []
+    dropped = False
+    for l in lines:
+        if not dropped and l.lstrip().startswith("|") and needle in l:
+            dropped = True
+            continue
+        out.append(l)
+    assert dropped, f"report row {needle!r} not found"
+    return "\n".join(out)
+
+
+def _insert_row_after(md: str, needle: str, new_row: str) -> str:
+    """Append `new_row` right after the first table row line containing `needle`."""
+    lines = md.splitlines()
+    out: list[str] = []
+    done = False
+    for l in lines:
+        out.append(l)
+        if not done and l.lstrip().startswith("|") and needle in l:
+            out.append(new_row)
+            done = True
+    assert done, f"report row {needle!r} not found"
+    return "\n".join(out)
+
+
+def test_verifier_detects_missing_profile_row(committed_evidence, committed_report) -> None:
+    """Deleting a whole profile row from the main aggregate table is caught."""
+    mutated = _drop_row(committed_report, "| architect | 14 | 1 678 |")
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "deleting the architect aggregate row was NOT detected"
+    assert any("missing" in p and "architect" in p for p in problems)
+
+
+def test_verifier_detects_missing_fingerprint_row(committed_evidence, committed_report) -> None:
+    """Deleting a whole fingerprint row (reviewer) is caught."""
+    mutated = _drop_row(committed_report, "| reviewer | `f250e23c95cf59df`")
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "deleting the reviewer fingerprint row was NOT detected"
+    assert any("missing" in p and "reviewer" in p for p in problems)
+
+
+def test_verifier_detects_missing_by_source_row(committed_evidence, committed_report) -> None:
+    """Deleting one by_source row (architect/telegram) is caught."""
+    mutated = _drop_row(committed_report, "| architect | telegram |")
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "deleting the architect/telegram by_source row was NOT detected"
+    assert any("missing" in p and "telegram" in p for p in problems)
+
+
+def test_verifier_detects_missing_top5_row(committed_evidence, committed_report) -> None:
+    """Deleting one top-5 row (architect input, 593a124a2054) is caught."""
+    mutated = _drop_row(committed_report, "| input | `593a124a2054`")
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "deleting an architect top-5 input row was NOT detected"
+    assert any("missing" in p and "593a124a2054" in p for p in problems)
+
+
+def test_verifier_detects_duplicate_profile_row(committed_evidence, committed_report) -> None:
+    """Duplicating an existing aggregate row (architect) is caught."""
+    arch_line = next(
+        l for l in committed_report.splitlines()
+        if l.lstrip().startswith("|") and "| architect | 14 | 1 678 |" in l
+    )
+    mutated = _insert_row_after(committed_report, "| architect | 14 | 1 678 |", arch_line)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "duplicating the architect aggregate row was NOT detected"
+    assert any("duplicate" in p and "architect" in p for p in problems)
+
+
+def test_verifier_detects_extra_profile_row(committed_evidence, committed_report) -> None:
+    """An extra row for a profile unknown to the evidence is caught."""
+    fake = "| admin | 1 | 1 | 1 / 1 | 1 | 1 / 1 | 1 | 1 | 1 / 1 | 1 | 1 |"
+    mutated = _insert_row_after(committed_report, "| architect | 14 | 1 678 |", fake)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "an extra unknown profile row in the aggregate table was NOT detected"
+    assert any("extra" in p and "admin" in p for p in problems)
