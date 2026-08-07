@@ -746,6 +746,31 @@ def test_aggregator_breaks_down_by_phase(tmp_path: Path):
     assert "-- by role (label) --" in report
 
 
+def test_phase_for_label_maps_legacy_hyphen_phase2c_labels():
+    """A1 review regression: the runtime adapters' default labels are the
+    legacy hyphen forms (``phase2c-qwen-fidelity`` from qwen_evaluator.py,
+    ``phase2c-gemma-russian-preference`` from gemma_selector.py), which
+    previously fell into ``(other)``. Both spellings must group into the
+    same phases as the namespaced slash forms; exact legacy role names and
+    unknown labels keep their existing mapping.
+    """
+    # Regression: legacy hyphen labels now classify into their phases.
+    assert v4_usage.phase_for_label("phase2c-qwen-fidelity") == "qwen_fidelity"
+    assert v4_usage.phase_for_label(
+        "phase2c-gemma-russian-preference") == "gemma_preference"
+    # Current namespaced slash labels keep classifying the same way.
+    assert v4_usage.phase_for_label("phase2c/qwen_fidelity") == "qwen_fidelity"
+    assert v4_usage.phase_for_label(
+        "phase2c/gemma_russian_preference") == "gemma_preference"
+    # Exact legacy role names are not broken by the added prefix rules.
+    assert v4_usage.phase_for_label("fidelity_reviewer") == "qwen_fidelity"
+    assert v4_usage.phase_for_label("russian_selector") == "gemma_preference"
+    assert v4_usage.phase_for_label("generator") == "gen"
+    # Unknown labels still fall through to ``(other)``.
+    assert v4_usage.phase_for_label("mystery_role") == "(other)"
+    assert v4_usage.phase_for_label("phase2c/some_other_gate") == "(other)"
+
+
 def test_aggregator_crash_safe_read(tmp_path: Path):
     out = tmp_path / "run"
     path = out / USAGE_FILENAME

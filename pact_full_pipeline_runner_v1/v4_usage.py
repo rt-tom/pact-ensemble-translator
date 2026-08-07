@@ -50,14 +50,21 @@ COST_KEY = "reported_cost"
 # emit (``phase2b/...``, ``phase2c/qwen_fidelity``,
 # ``phase2c/gemma_russian_preference``, ``phase3/...``, ``phase4/...``,
 # ``phase5/...``); legacy labels (``generator``, ``qwen_audit``, ...) from
-# pre-namespace runs are matched by exact role name. Order matters: the
-# phase2c prefix is checked before the generic phase3/4/5 prefixes would
-# not collide (they are distinct prefixes), but ``phase2c`` itself must
-# split qwen_fidelity from gemma_russian_preference before the fallbacks.
+# pre-namespace runs are matched by exact role name. The runtime adapters'
+# default labels are still the legacy hyphen forms
+# (``phase2c-qwen-fidelity`` from qwen_evaluator.py,
+# ``phase2c-gemma-russian-preference`` from gemma_selector.py), so both the
+# slash- and hyphen-spelled phase2c forms map to the same phases. Order
+# matters: the phase2c prefix is checked before the generic phase3/4/5
+# prefixes would not collide (they are distinct prefixes), but ``phase2c``
+# itself must split qwen_fidelity from gemma_russian_preference (both
+# spellings) before the fallbacks.
 _PHASE_RULES: Tuple[Tuple[str, str], ...] = (
     ("phase2b", "gen"),
     ("phase2c/qwen_fidelity", "qwen_fidelity"),
     ("phase2c/gemma_russian_preference", "gemma_preference"),
+    ("phase2c-qwen-fidelity", "qwen_fidelity"),
+    ("phase2c-gemma-russian-preference", "gemma_preference"),
     ("phase2c", "(other)"),
     ("phase3", "audit"),
     ("phase4", "repair"),
@@ -83,7 +90,9 @@ def phase_for_label(label: Optional[str]) -> str:
 
     Read-only helper (A1.3) — never changes the pipeline, only how the
     diagnostic report groups rows. Prefix rules are checked first (the
-    adapters' namespaced labels), then exact legacy role names.
+    adapters' namespaced slash labels and their legacy hyphen defaults,
+    e.g. ``phase2c/qwen_fidelity`` and ``phase2c-qwen-fidelity``), then
+    exact legacy role names.
     """
     if not label:
         return "(other)"
