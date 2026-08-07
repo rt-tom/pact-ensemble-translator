@@ -3,7 +3,7 @@
   "description": "Read-only baseline: repository AGENTS.md size and resolved CLI toolsets per Hermes profile. Task t_6e10923e, Phase 0 report assembly input.",
   "measured_at_utc": "2026-08-07T07:40:00Z",
   "repository": {
-    "root": "D:\\pact\\pact_translator_v4",
+    "root": "<repo-root>",
     "branch": "wt/t_6e10923e",
     "head_commit": "38b1091",
     "head_subject": "docs(v4): Efficiency A rev.2 — A1b: исследование финального перевода перед решениями о типографике (находки eff-a1a2: p00157 \\n, chunk0012 ASCII-кавычки)"
@@ -22,7 +22,7 @@
     "resolve_source": "profile config.yaml platform_toolsets.cli (explicit list, no hermes-cli composite) + agent.disabled_toolsets (drops bfl via _enable_recently_shipped_toolsets subtraction)",
     "profiles": {
       "architect": {
-        "config_path": "C:\\Users\\ustom\\AppData\\Local\\hermes\\profiles\\architect\\config.yaml",
+        "config_path": "<HERMES_PROFILES_DIR>/architect/config.yaml",
         "config_platform_toolsets_cli": [
           "browser", "clarify", "code_execution", "cronjob", "delegation",
           "file", "kanban", "memory", "session_search", "skills",
@@ -37,7 +37,7 @@
         "resolved_count": 14
       },
       "developer": {
-        "config_path": "C:\\Users\\ustom\\AppData\\Local\\hermes\\profiles\\developer\\config.yaml",
+        "config_path": "<HERMES_PROFILES_DIR>/developer/config.yaml",
         "config_platform_toolsets_cli": [
           "file", "terminal", "kanban", "skills", "web", "todo",
           "memory", "session_search", "code_execution", "delegation"
@@ -50,7 +50,7 @@
         "resolved_count": 10
       },
       "reviewer": {
-        "config_path": "C:\\Users\\ustom\\AppData\\Local\\hermes\\profiles\\reviewer\\config.yaml",
+        "config_path": "<HERMES_PROFILES_DIR>/reviewer/config.yaml",
         "config_platform_toolsets_cli": [
           "file", "terminal", "kanban", "skills", "web", "todo",
           "memory", "session_search", "code_execution", "delegation"

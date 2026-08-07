@@ -382,16 +382,16 @@ cache-соотношения (арифметика над измеренными
 ```text
 # 1) свежий согласованный WAL-снапшот (суммы чуть дрейфуют — fingerprint в
 #    evidence описывает именно тот snapshot, из которого посчитаны агрегаты):
-C:\Python314\python.exe tools\hermes_profile_token_baseline.py --json live.json
+python tools\hermes_profile_token_baseline.py --json live.json
 
 # 2) производные метрики из вывода репортёра:
-C:\Python314\python.exe tools\token_analysis_derived.py live.json
+python tools\token_analysis_derived.py live.json
 
 # 3) структурная сверка отчёта с evidence (таблицы, top-5, производные,
 #    fingerprint; --self-test доказывает, что подмена числа из другого
 #    профиля обнаруживается):
-C:\Python314\python.exe tools\verify_baseline_report.py
-C:\Python314\python.exe tools\verify_baseline_report.py --self-test
+python tools\verify_baseline_report.py
+python tools\verify_baseline_report.py --self-test
 
 # 4) размер/хэш AGENTS.md (PowerShell):
 Get-FileHash AGENTS.md -Algorithm SHA256
