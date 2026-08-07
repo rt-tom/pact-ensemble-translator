@@ -1889,6 +1889,7 @@ def _run_quarantined_retry_cycle(
                 "reaudit_findings": [
                     finding.to_payload() for finding in reaudit_findings
                 ],
+                "failed_units": [list(unit) for unit in reaudit_outcome.failed_units],
                 "changed_chunk_ids": selected_chunks,
             }
             _atomic_write_json(_repair_cache_path(cfg.out_dir), {
