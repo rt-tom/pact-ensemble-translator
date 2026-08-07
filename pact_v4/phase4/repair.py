@@ -130,6 +130,7 @@ __all__ = [
     "RepairRecord",
     "RepairRoundResult",
     "RepairPhaseResult",
+    "ReauditOutcome",
     "SoftFindingsPolicy",
     "filter_soft_findings",
     "plan_repairs_for_chunk",
@@ -145,9 +146,17 @@ REPAIR_REPORT_SCHEMA = "pact-v4-phase4-repair-report/v1"
 # (bool("false")). The policy version participates in ``_repair_unit_hash``,
 # so bumping it invalidates every pre-F3 unit: a resume can never look up a
 # legacy record and re-runs the fail-closed re-gate instead.
-REPAIR_POLICY_VERSION = "pact-v4-repair-policy/v2"
-QWEN_REAUDIT_POLICY_VERSION = "qwen_convergence_reaudit/v1"
-GEMMA_RECHECK_POLICY_VERSION = "gemma_russian_recheck/v1"
+#
+# A1c Phase 0 (convergence fail-open fix): v3 records the fail-closed
+# convergence contract — re-audit failed units and residual blocking
+# findings of the last round join the debt trace (previously they could be
+# dropped, yielding a false 'complete'). Bumping invalidates repair caches
+# written under v2 and re-audit findings under the older re-audit policies,
+# so a resumed run re-runs the now-fail-closed re-audit instead of trusting
+# stale verdicts.
+REPAIR_POLICY_VERSION = "pact-v4-repair-policy/v3"
+QWEN_REAUDIT_POLICY_VERSION = "qwen_convergence_reaudit/v2"
+GEMMA_RECHECK_POLICY_VERSION = "gemma_russian_recheck/v2"
 DETERMINISTIC_INTEGRITY_POLICY_VERSION = "deterministic_integrity/v1"
 
 # A repair is treated as a *challenge* of a finding when the model output
@@ -1090,6 +1099,7 @@ class RepairRoundResult:
     round_number: int
     records: Tuple[RepairRecord, ...]
     reaudit_findings: Tuple[Finding, ...] = ()
+    failed_units: Tuple[Tuple[str, str], ...] = ()
     changed_chunk_ids: Tuple[str, ...] = ()
 
     def to_payload(self) -> Dict[str, Any]:
@@ -1097,6 +1107,7 @@ class RepairRoundResult:
             "round_number": self.round_number,
             "records": [record.to_payload() for record in self.records],
             "reaudit_findings": [finding.to_payload() for finding in self.reaudit_findings],
+            "failed_units": [list(unit) for unit in self.failed_units],
             "changed_chunk_ids": list(self.changed_chunk_ids),
         }
 
@@ -1118,6 +1129,22 @@ def _neighbour_chunk_ids(
     return tuple(neighbours)
 
 
+@dataclass(frozen=True)
+class ReauditOutcome:
+    """Outcome of one convergence re-audit pass (A1c Phase 0).
+
+    ``findings`` is the canonicalised finding set of the re-audited chunks.
+    ``failed_units`` are the ``(chunk_id, detector)`` model units that did
+    not complete (transport/parse failure) — the re-audit for those units
+    produced no verdict, so the chapter's convergence is not verified for
+    them. ``audited_targets`` is the chunk-id set the pass covered.
+    """
+
+    findings: Tuple[Finding, ...] = ()
+    failed_units: Tuple[Tuple[str, str], ...] = ()
+    audited_targets: Tuple[str, ...] = ()
+
+
 def _reaudit_chunks(
     *,
     source: SourceArtifact,
@@ -1130,10 +1157,12 @@ def _reaudit_chunks(
     qwen_audit_evaluator: QwenAuditEvaluator,
     gemma_audit_evaluator: GemmaAuditEvaluator,
     progress: Optional[Any] = None,
-) -> Tuple[Finding, ...]:
+) -> ReauditOutcome:
     """Re-audit a targeted set of chunks (changed PIDs + discourse neighbours).
 
-    Returns the fresh findings for exactly those chunks. Deterministic layer
+    Returns a ``ReauditOutcome`` with the fresh findings for exactly those
+    chunks, the model units that failed to complete (``failed_units``) and
+    the audited chunk-id set. Deterministic layer
     (numbers/glossary/mixed-script/missing) is re-run per chunk (model-free)
     alongside the model tracks so the re-audit is self-contained and needs no
     cached Step 6 results.
@@ -1148,6 +1177,7 @@ def _reaudit_chunks(
     """
     source_map = dict(source.source)
     all_findings: list[Finding] = []
+    failed_units: list[Tuple[str, str]] = []
 
     # Deterministic layer (model-free), per chunk.
     for chunk_id in chunk_ids:
@@ -1247,6 +1277,7 @@ def _reaudit_chunks(
                     detector, chunk_id, exc,
                 )
                 unit_status = "failed"
+                failed_units.append((chunk_id, detector))
             if progress is not None:
                 progress.reaudit_unit_done(chunk_id=chunk_id, detector=detector, status=unit_status)
             if unit_status != "ok":
@@ -1271,7 +1302,11 @@ def _reaudit_chunks(
                     else GEMMA_RECHECK_POLICY_VERSION
                 ),
             ))
-    return tuple(sorted(all_findings, key=lambda finding: finding.content_hash))
+    return ReauditOutcome(
+        findings=tuple(sorted(all_findings, key=lambda finding: finding.content_hash)),
+        failed_units=tuple(failed_units),
+        audited_targets=tuple(chunk_ids),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1339,27 @@ def _needs_qwen_smoke(
         ):
             return True
     return False
+
+
+def _chapter_text_identity_hash(
+    *,
+    source: SourceArtifact,
+    snapshot: Snapshot,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    translation: Mapping[str, str],
+) -> str:
+    """Canonical identity hash of a chapter's final text (same recipe as the
+    Step 8 ``frozen_hash``). Used to prove a resumed session's final text is
+    byte-identical to the one the retry history was written against."""
+    return canonical_json_hash({
+        "artifact": "pact-v4-assembled-chapter/v1",
+        "source_hash": source.source_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "translation": [list(item) for item in sorted(translation.items())],
+    })
 
 
 def run_integrity_check(
@@ -1351,14 +1407,13 @@ def run_integrity_check(
         ).items():
             if source_term_present(en_text, en_term) and not target_form_present(target, ru_term):
                 glossary.append(pid)
-    frozen_hash = canonical_json_hash({
-        "artifact": "pact-v4-assembled-chapter/v1",
-        "source_hash": source.source_hash,
-        "snapshot_hash": snapshot.snapshot_hash,
-        "chunk_plan_hash": chunk_plan.plan_hash,
-        "config_identity": config.config_identity,
-        "translation": [list(item) for item in sorted(final_translation.items())],
-    })
+    frozen_hash = _chapter_text_identity_hash(
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        translation=final_translation,
+    )
     return {
         "status": "complete" if not (missing_pids or numeric_missing or mixed_script or glossary)
         else "failed",
@@ -1825,6 +1880,20 @@ def run_repair_phase(
     }
     debt_reasons: list[str] = []
 
+    # Step 6 audit completeness (A1c Phase 0, review §3.5): a chunk whose
+    # Step 6 audit unit failed (transport/parse) has incomplete findings —
+    # the audit never verified it, so it can never be 'complete' even when
+    # the PID map is structurally valid. The B1 handoff contract carries
+    # ``audit_status`` per chunk (``clean`` / ``findings_present`` /
+    # ``unit_failed`` / ``no_candidate``); ``unit_failed`` joins the debt
+    # trace as an unresolved verification gap.
+    for row in handoff_chunks:
+        if row.get("audit_status") == "unit_failed":
+            debt_reasons.append(
+                f"{row.get('chunk_id', '?')}: Step 6 audit unit failed — "
+                "findings incomplete (terminal cannot be complete)"
+            )
+
     # Plan repairs per chunk, applying the L3 severity pre-filter before the
     # region resolver (findings stay in the store; only planning is filtered).
     round_one_plans: Dict[str, list[RepairPlan]] = {}
@@ -1899,8 +1968,9 @@ def run_repair_phase(
         reaudit_scope.extend(_neighbour_chunk_ids(chunk_plan, chunk_id))
     reaudit_scope = list(dict.fromkeys(reaudit_scope))
     reaudit_findings: Tuple[Finding, ...] = ()
+    reaudit_failed_units: Tuple[Tuple[str, str], ...] = ()
     if reaudit_scope:
-        reaudit_findings = _reaudit_chunks(
+        reaudit_outcome = _reaudit_chunks(
             source=source,
             snapshot=snapshot,
             chunk_plan=chunk_plan,
@@ -1912,11 +1982,14 @@ def run_repair_phase(
             gemma_audit_evaluator=gemma_audit_evaluator,
             progress=progress,
         )
+        reaudit_findings = reaudit_outcome.findings
+        reaudit_failed_units = reaudit_outcome.failed_units
 
     round_one = RepairRoundResult(
         round_number=1,
         records=tuple(round_one_records),
         reaudit_findings=reaudit_findings,
+        failed_units=reaudit_failed_units,
         changed_chunk_ids=tuple(changed_chunk_ids),
     )
 
@@ -1936,6 +2009,7 @@ def run_repair_phase(
 
     round_two_records: list[RepairRecord] = []
     round_two_findings: Tuple[Finding, ...] = ()
+    round_two_failed_units: Tuple[Tuple[str, str], ...] = ()
     round_two_changed: list[str] = []
     round_two_ran = False
     blocking_findings = tuple(
@@ -2012,7 +2086,7 @@ def run_repair_phase(
             for chunk_id in round_two_changed:
                 scope2.extend(_neighbour_chunk_ids(chunk_plan, chunk_id))
             scope2 = list(dict.fromkeys(scope2))
-            round_two_findings = _reaudit_chunks(
+            round_two_outcome = _reaudit_chunks(
                 source=source,
                 snapshot=snapshot,
                 chunk_plan=chunk_plan,
@@ -2024,11 +2098,54 @@ def run_repair_phase(
                 gemma_audit_evaluator=gemma_audit_evaluator,
                 progress=progress,
             )
+            round_two_findings = round_two_outcome.findings
+            round_two_failed_units = round_two_outcome.failed_units
+
+    # ---- A1c Phase 0: convergence fail-open fix (review §3.5 / §5) ----
+    # The final re-audit's outcome IS the chapter's last verification pass.
+    # * Failed re-audit units (transport/parse): the pass produced no verdict
+    #   for those (chunk, detector) units — convergence is unverified, so the
+    #   finding set cannot be trusted as empty. They join the debt trace.
+    # * Residual findings of the LAST round: findings that survived every
+    #   repair round and the final re-audit are unresolved debt — a chapter
+    #   with them can never be 'complete'. Blocking findings are hard debt;
+    #   weak-soft findings stay L3-debt (round-1 weak-soft was already
+    #   recorded above with the identical string, so dedup keeps one entry).
+    # If round 2 committed nothing, the final re-audit is round 1's — its
+    # residual findings and failed units are equally debt.
+    if round_two_changed:
+        last_failed_units = round_two_failed_units
+        last_scope = scope2
+        last_findings = round_two_findings
+    else:
+        last_failed_units = reaudit_failed_units
+        last_scope = reaudit_scope
+        last_findings = reaudit_findings
+    for chunk_id, detector in last_failed_units:
+        debt_reasons.append(
+            f"{chunk_id}: convergence re-audit {detector} failed "
+            "(transport/parse) — findings incomplete"
+        )
+    for finding in last_findings:
+        if finding.chunk_id not in last_scope:
+            continue
+        if _is_blocking(finding):
+            debt_reasons.append(
+                f"{finding.chunk_id}: {finding.region.pid}: blocking "
+                f"{finding.detector}/{finding.category} finding remains after "
+                "the last convergence re-audit"
+            )
+        else:
+            debt_reasons.append(
+                f"{finding.chunk_id}: {finding.region.pid}: soft Gemma finding "
+                f"({finding.category}) left open by L3 policy (weak evidence)"
+            )
 
     round_two = RepairRoundResult(
         round_number=2,
         records=tuple(round_two_records),
         reaudit_findings=round_two_findings,
+        failed_units=round_two_failed_units,
         changed_chunk_ids=tuple(round_two_changed),
     )
 

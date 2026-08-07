@@ -650,7 +650,7 @@ def test_repair_unit_hash_bumps_with_policy_version():
         backend_identity_hash=_hash("backend"),
         policy_version=REPAIR_POLICY_VERSION,
     )
-    assert REPAIR_POLICY_VERSION == "pact-v4-repair-policy/v2"
+    assert REPAIR_POLICY_VERSION == "pact-v4-repair-policy/v3"
     assert legacy_hash != current_hash
 
 
@@ -746,8 +746,11 @@ def _run_phase(
     findings_override=None, candidate_overrides=None,
     max_rounds: int = 2,
     soft_findings_policy=None,
+    handoff_override=None,
 ):
     source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    if handoff_override is not None:
+        handoff = handoff_override
     overrides = candidate_overrides or {}
     if overrides:
         candidate = _candidate(
@@ -875,6 +878,79 @@ def test_no_second_round_without_blocking_finding():
     )
     assert len(result.rounds) == 2  # second round result is empty
     assert result.rounds[1].records == ()
+
+
+# ---------------------------------------------------------------------------
+# A1c Phase 0: convergence fail-open fix (review §3.5 / §5)
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_accepted_degraded_when_round2_reaudit_has_residual_blocking():
+    # Round 2 ran, committed text, and the mandatory final re-audit STILL
+    # found a blocking finding. Before the fix, round_two_findings were only
+    # serialized (never appended to debt) — the residual blocker silently
+    # disappeared and the chapter could yield a false 'complete'.
+    source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    pid = chunk.pids[0]
+    qwen_audit = ScriptedQwenAudit(issues=[
+        {"pid": pid, "category": "omission", "note": "still missing"}
+    ])
+    result, *_ = _run_phase(
+        repair_caller=ScriptedRepairCaller({pid: "Исправленный перевод."}),
+        region_gate=ScriptedRegionGate(passed=True),
+        qwen_audit=qwen_audit,
+        gemma_audit=ScriptedGemmaAudit(issues=[]),
+    )
+    assert len(result.rounds) == 2
+    assert result.rounds[1].changed_chunk_ids  # round 2 changed text
+    assert result.status == "accepted_degraded"
+    assert result.terminal.status == "accepted_degraded"
+    assert any(
+        "blocking" in reason and "last convergence re-audit" in reason
+        for reason in result.debt_trace
+    )
+
+
+def test_reaudit_transport_failure_is_debt_and_not_complete():
+    # A transport failure in the convergence re-audit unit means the pass
+    # produced no verdict for that (chunk, detector) — convergence is
+    # unverified. Before the fix, the failure was logged as "recorded as
+    # debt" but the debt stayed empty and the chapter could be 'complete'.
+    source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    pid = chunk.pids[0]
+    result, *_ = _run_phase(
+        repair_caller=ScriptedRepairCaller({pid: "Исправленный перевод."}),
+        region_gate=ScriptedRegionGate(passed=True),
+        qwen_audit=ScriptedQwenAudit(fail=RuntimeError("transport down")),
+        gemma_audit=ScriptedGemmaAudit(issues=[]),
+    )
+    assert result.status == "accepted_degraded"
+    assert result.terminal.status == "accepted_degraded"
+    assert any(
+        "convergence re-audit" in reason and "failed" in reason
+        for reason in result.debt_trace
+    )
+    # The failed unit is surfaced on the round result for diagnostics.
+    assert result.rounds[0].failed_units
+
+
+def test_step6_unit_failed_prevents_complete():
+    # The B1 handoff contract carries per-chunk audit_status; 'unit_failed'
+    # means Step 6 never verified the chunk. Even with no repair debt at all,
+    # the chapter cannot be 'complete' — the audit is an unresolved gap.
+    source, snapshot, chunk_plan, chunk, config, candidate, candidates, chapter, handoff = _env()
+    handoff = [dict(row, audit_status="unit_failed") for row in handoff]
+    result, *_ = _run_phase(
+        repair_caller=ScriptedRepairCaller({}),
+        region_gate=ScriptedRegionGate(passed=True),
+        qwen_audit=ScriptedQwenAudit(issues=[]),
+        gemma_audit=ScriptedGemmaAudit(issues=[]),
+        findings_override=[],
+        handoff_override=handoff,
+    )
+    assert result.status == "accepted_degraded"
+    assert result.terminal.status == "accepted_degraded"
+    assert any("Step 6 audit unit failed" in reason for reason in result.debt_trace)
 
 
 # ---------------------------------------------------------------------------
@@ -1033,8 +1109,12 @@ def test_reaudit_chunks_findings_set_identical_across_chunk_order():
         chunk_ids=["chunk0002", "chunk0001"],
         qwen_audit_evaluator=qwen_audit_ba, gemma_audit_evaluator=gemma_audit_ba,
     )
-    assert [f.content_hash for f in findings_ab] == [f.content_hash for f in findings_ba]
-    assert len(findings_ab) == 4
+    assert [f.content_hash for f in findings_ab.findings] == [f.content_hash for f in findings_ba.findings]
+    assert len(findings_ab.findings) == 4
+    # No model unit failed: the outcome carries empty failed_units and the
+    # audited target set equals the requested chunk ids (A1c Phase 0).
+    assert findings_ab.failed_units == ()
+    assert findings_ab.audited_targets == ("chunk0001", "chunk0002")
 
 
 # ---------------------------------------------------------------------------
