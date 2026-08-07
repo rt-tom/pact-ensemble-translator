@@ -164,18 +164,22 @@ def _redact(session_id: str) -> str:
 # leak into an error string. The redacted-output contract covers every
 # supported path form:
 #   - Windows drive absolute:  C:\Users\...  and  C:/Users/...
-#   - UNC:                     \\server\share\...  (and //server/share/...,
-#     which also matches the POSIX branch below)
+#   - UNC backslash:           \\server\share\...
+#   - UNC forward slash:       //server/share/...  (also matched below in the
+#     POSIX branch when written with a single leading slash, but the
+#     double-slash form needs its own branch — the POSIX lookbehind refuses
+#     a slash preceded by '/')
 #   - POSIX absolute:          /home/user/...
 # URLs (scheme://host/...) are deliberately NOT matched: the drive branch
 # refuses a letter glued to a word ("s:" inside "https:"), the POSIX branch
 # refuses a slash preceded by ':' (scheme separator) or '/', and the UNC
-# branch requires a backslash-separated server+share shape. JSON-escaped
-# literals like "\\n" (backslash + backslash + n) are not matched either
-# (they lack a backslash-separated second component).
+# branches require a (backslash or forward slash) server+share shape.
+# JSON-escaped literals like "\\n" (backslash + backslash + n) are not
+# matched either (they lack a backslash-separated second component).
 _PATH_RE = re.compile(
     r"(?<!\w)[A-Za-z]:[\\/][^\s\"']*"             # drive absolute (C:\ or C:/)
     r"|\\\\[^\\\s\"']+\\[^\s\"']+"                # UNC backslash (\\server\share)
+    r"|(?<![\w.:/<>-])//[^/\s\"']+/[^\s\"']+"     # UNC forward (//server/share)
     r"|(?<![\w.:/<>-])"                           # not inside a URL/word/placeholder
     r"/(?:[A-Za-z0-9_.~-]+/)+[A-Za-z0-9_.~-]*"    # POSIX absolute (/a/b[/c])
 )
@@ -297,6 +301,21 @@ def _check_schema(cur) -> None:
 # ---------------------------------------------------------------------------
 # Aggregates (all read from the consistent snapshot).
 # ---------------------------------------------------------------------------
+def _session_numeric(value, column: str):
+    """Coerce one selected numeric session cell; None/'' stay absent.
+
+    Counts such as ``message_count`` / ``tool_call_count`` are mandatory
+    numeric inputs: a non-numeric or non-finite cell must raise a sanitized
+    :class:`BaselineError` instead of flowing into the evidence / top-5 as a
+    string. Valid integral values are normalized back to ``int`` so the
+    JSON output keeps the same shape as before.
+    """
+    if value is None or value == "":
+        return None
+    v = _as_number(value, column)
+    return int(v) if v.is_integer() else v
+
+
 def _session_summary(cur):
     """Per-session aggregates from `sessions` — allowlisted columns only."""
     sel = ", ".join(_SESSIONS_ALLOW)
@@ -319,14 +338,14 @@ def _session_summary(cur):
             "model": d.get("model"),
             "end_reason": d.get("end_reason"),
             "reasoning_effort": effort,
-            "message_count": d.get("message_count"),
-            "tool_call_count": d.get("tool_call_count"),
-            "api_call_count": d.get("api_call_count"),
-            "input_tokens": d.get("input_tokens"),
-            "output_tokens": d.get("output_tokens"),
-            "cache_read_tokens": d.get("cache_read_tokens"),
-            "cache_write_tokens": d.get("cache_write_tokens"),
-            "reasoning_tokens": d.get("reasoning_tokens"),
+            "message_count": _session_numeric(d.get("message_count"), "message_count"),
+            "tool_call_count": _session_numeric(d.get("tool_call_count"), "tool_call_count"),
+            "api_call_count": _session_numeric(d.get("api_call_count"), "api_call_count"),
+            "input_tokens": _session_numeric(d.get("input_tokens"), "input_tokens"),
+            "output_tokens": _session_numeric(d.get("output_tokens"), "output_tokens"),
+            "cache_read_tokens": _session_numeric(d.get("cache_read_tokens"), "cache_read_tokens"),
+            "cache_write_tokens": _session_numeric(d.get("cache_write_tokens"), "cache_write_tokens"),
+            "reasoning_tokens": _session_numeric(d.get("reasoning_tokens"), "reasoning_tokens"),
         }
         # cost fields only as aggregate-safe flags (they are 0 / absent anyway)
         rec["cost_nonzero"] = any(

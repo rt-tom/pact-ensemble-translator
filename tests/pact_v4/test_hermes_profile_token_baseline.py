@@ -18,14 +18,22 @@ Covers the RV findings fixed on vk/hermes-profile-token-baseline:
 6. Failure contract: malformed (non-numeric / non-finite) cells in mandatory
    numeric columns raise a sanitized BaselineError and exit non-zero — never
    an uncaught ValueError traceback or a silently-typed 0.
-7. Path redaction covers every supported form (Windows drive, UNC, POSIX)
-   without mangling URLs / slash-separated word lists.
+7. Path redaction covers every supported form (Windows drive, UNC backslash,
+   UNC forward-slash //server/share, POSIX) without mangling URLs /
+   slash-separated word lists.
 8. Verifier requires AGENTS.md as a COMMITTED-HEAD input (git show
    HEAD:AGENTS.md) — hard failure when absent, never a dirty working-tree
    file — and rejects a stale HEAD citation (freshness).
 9. Redaction regression check over the committed report / evidence / context:
    no task ids, worktree identifiers, absolute paths or sensitive
    column/credential words in published output.
+10. Verifier is fail-closed on table STRUCTURE: an extra cell in a row, a
+    duplicated header cell, or a renamed mandatory column all fail, even
+    when every checked value still matches the evidence.
+11. Selected numeric session fields (message_count / tool_call_count /
+    api_call_count / token counts) are validated before output/ranking:
+    malformed cells raise a sanitized BaselineError and a non-zero exit
+    instead of leaking a string into the evidence / top-5.
 
 All tests are hermetic: they build synthetic SQLite DBs / temp profile dirs
 and never touch live Hermes profile data. The verifier tests run against the
@@ -474,6 +482,49 @@ def test_verifier_detects_extra_profile_row(committed_evidence, committed_report
     assert any("extra" in p and "admin" in p for p in problems)
 
 
+def test_verifier_detects_extra_cell_in_row(committed_evidence, committed_report) -> None:
+    """Appending an extra cell to a valid row is a structural mutation and
+    must fail closed (RV2 finding: an extra `|` used to be silently ignored
+    because the cells dict only read the first len(header) cells)."""
+    arch_line = next(
+        l for l in committed_report.splitlines()
+        if l.lstrip().startswith("|") and "| architect | 23 | 1 929 |" in l
+    )
+    mutated = committed_report.replace(arch_line, arch_line.rstrip() + " extra |", 1)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "an extra cell appended to the architect aggregate row was NOT detected"
+    assert any("width" in p and "architect" in p for p in problems)
+
+
+def test_verifier_detects_duplicate_header_cell(committed_evidence, committed_report) -> None:
+    """Duplicating a header cell in a mandatory table is a structural
+    mutation and must fail closed (RV2 finding: a duplicated header used to
+    collapse silently in the cells dict)."""
+    hdr_line = next(
+        l for l in committed_report.splitlines()
+        if l.lstrip().startswith("|") and "Вызовов (sum)" in l and "Профиль" in l
+    )
+    mutated = committed_report.replace(
+        hdr_line, hdr_line.replace("| Сессий |", "| Сессий | Сессий |", 1), 1
+    )
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "a duplicated header cell in the aggregate table was NOT detected"
+    assert any("duplicate header" in p or "header" in p and "expected" in p for p in problems)
+
+
+def test_verifier_rejects_renamed_header_cell(committed_evidence, committed_report) -> None:
+    """Renaming a mandatory column (same width, same values) must fail: the
+    exact header schema is part of the contract, not just the values."""
+    hdr_line = next(
+        l for l in committed_report.splitlines()
+        if l.lstrip().startswith("|") and "Вызовов (sum)" in l and "Профиль" in l
+    )
+    mutated = committed_report.replace(hdr_line, hdr_line.replace("Сессий", "Sessions", 1), 1)
+    problems = verify.check_report(mutated, committed_evidence)
+    assert problems, "a renamed header cell in the aggregate table was NOT detected"
+    assert any("expected" in p and "aggregates" in p for p in problems)
+
+
 # ---------------------------------------------------------------------------
 # 7. Structural verifier rejects non-finite numeric cells (nan / inf).
 # ---------------------------------------------------------------------------
@@ -686,6 +737,35 @@ def _make_state_db_with_bad_usage_cell(path: Path) -> None:
         con.close()
 
 
+def _make_state_db_with_bad_message_count_cell(path: Path) -> None:
+    """state.db with a non-numeric sessions.message_count cell.
+
+    ``message_count`` / ``tool_call_count`` are selected numeric session
+    fields too: a malformed value must be rejected before it can flow into
+    the evidence / top-5 as a string (RV2 finding)."""
+    con = sqlite3.connect(path)
+    try:
+        con.execute("PRAGMA journal_mode=wal")
+        con.executescript(
+            "CREATE TABLE sessions (" + ", ".join(f"{n} {t}" for n, t in SESSIONS_SCHEMA) + ");"
+        )
+        con.executescript(
+            "CREATE TABLE session_model_usage ("
+            + ", ".join(f"{n} {t}" for n, t in USAGE_SCHEMA) + ");"
+        )
+        con.executescript(
+            "CREATE TABLE messages (" + ", ".join(f"{n} {t}" for n, t in MESSAGES_SCHEMA) + ");"
+        )
+        con.execute(
+            "INSERT INTO sessions (id, source, model, end_reason, message_count, "
+            "input_tokens) VALUES (?,?,?,?,?,?)",
+            ("sess-bad", "kanban", "deepseek-v4-flash", None, "oops", 100),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def test_stats_malformed_numeric_raises_baseline_error() -> None:
     """A non-numeric / non-finite cell in a mandatory numeric column raises a
     sanitized BaselineError (regression: previously an uncaught ValueError)."""
@@ -699,7 +779,11 @@ def test_stats_malformed_numeric_raises_baseline_error() -> None:
 
 @pytest.mark.parametrize(
     "bad_maker",
-    [_make_state_db_with_bad_session_cell, _make_state_db_with_bad_usage_cell],
+    [
+        _make_state_db_with_bad_session_cell,
+        _make_state_db_with_bad_usage_cell,
+        _make_state_db_with_bad_message_count_cell,
+    ],
 )
 def test_malformed_numeric_cell_is_sanitized_nonzero(tmp_path, capsys, bad_maker) -> None:
     """Malformed mandatory numeric input -> per-profile BaselineError entry,
@@ -751,6 +835,34 @@ def test_sanitize_error_does_not_mangle_urls_or_word_lists() -> None:
 
 
 # ---------------------------------------------------------------------------
+
+def test_sanitize_error_redacts_forward_slash_unc() -> None:
+    """Forward-slash UNC paths (//server/share/dir/file) are redacted too
+    (RV2 finding: the double-slash form slipped past both UNC branches)."""
+    base = Path("C:/Users/someone/hermes/profiles")
+    out = baseline._sanitize_error("failed to open //server/share/dir/file", base)
+    assert "//server" not in out
+    assert out.count("<path>") == 1, out
+    # both UNC forms in one message are collapsed independently
+    msg2 = r"a: //srv/share/f and b: \\srv\share\f"
+    out2 = baseline._sanitize_error(msg2, base)
+    assert "//srv" not in out2
+    assert "\\srv" not in out2
+    assert out2.count("<path>") == 2, out2
+
+
+def test_sanitize_error_forward_slash_unc_does_not_mangle_urls() -> None:
+    """A double slash belonging to a URL scheme (https://) must survive even
+    though a bare //server/share path is redacted."""
+    base = Path("C:/Users/someone/hermes/profiles")
+    msg = "see https://example.com/a?b=c then //server/share/f"
+    out = baseline._sanitize_error(msg, base)
+    assert "https://example.com/a?b=c" in out
+    assert "//server" not in out
+    assert out.count("<path>") == 1, out
+
+
+
 # 12. Verifier: AGENTS.md is a MANDATORY committed-HEAD input.
 # ---------------------------------------------------------------------------
 def _make_git_repo(tmp_path: Path, agents_content: str, *, with_agents: bool = True) -> Path:
@@ -898,5 +1010,22 @@ def test_redaction_does_not_flag_legitimate_words() -> None:
         "model/reasoning/compression defaults, sums/p50/p90/max, "
         "<HERMES_PROFILES_DIR>/architect/config.yaml, tools/context_baseline.json"
     )
+    probs = verify.check_redaction({"legit": legit})
+    assert probs == [], probs
+
+
+def test_check_redaction_catches_forward_slash_unc() -> None:
+    """A forward-slash UNC path (//server/share/dir/file) must be flagged
+    (RV2 finding: the double-slash form evaded the backslash-only UNC
+    pattern)."""
+    probs = verify.check_redaction({"p": "config at //server/share/dir/file"})
+    joined = "\n".join(probs)
+    assert "UNC path" in joined, joined
+
+
+def test_check_redaction_does_not_flag_urls_or_slash_lists() -> None:
+    """URLs (scheme://) and slash-separated word lists are not UNC paths and
+    must not be flagged by the forward-slash UNC pattern."""
+    legit = "https://example.com/a?b=c and model/reasoning/x and p50/p90 and 21 / 176"
     probs = verify.check_redaction({"legit": legit})
     assert probs == [], probs

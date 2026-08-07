@@ -93,7 +93,8 @@ _REDACTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bt_[0-9a-f]{6,}\b"), "kanban task id"),
     (re.compile(r"\bwt/[A-Za-z0-9_.-]+"), "worktree branch identifier"),
     (re.compile(r"(?<!\w)[A-Za-z]:[\\/]"), "windows drive absolute path"),
-    (re.compile(r"\\\\[^\\\s\"']+\\[^\s\"']+"), "UNC path"),
+    (re.compile(r"(?<![\w.:/<>-])//[^/\s\"']+/[^\s\"']+"), "UNC path (forward slash)"),
+    (re.compile(r"\\\\[^\\\s\"']+\\[^\s\"']+"), "UNC path (backslash)"),
     (re.compile(r"(?<![\w.:/<>-])/(?:[A-Za-z0-9_.~-]+/)+[A-Za-z0-9_.~-]*"),
      "posix absolute path"),
     (re.compile(r"\buser_id\b"), "user_id column"),
@@ -281,6 +282,104 @@ def _top5_rows(ev_p: dict, metric: str):
 
 
 # ---------------------------------------------------------------------------
+# Mandatory table schemas: the exact header each required table must carry.
+# A table whose header differs (renamed / extra / duplicated column) is a
+# structural mutation and must fail closed even when every value still
+# matches the evidence. Row widths must equal the header width exactly —
+# an extra or missing cell is rejected even when the checked labels all
+# still compare equal.
+# ---------------------------------------------------------------------------
+_MANDATORY_TABLES = (
+    (
+        "fingerprint",
+        lambda h: any("sha256" in x for x in h),
+        ("Профиль", "snapshot sha256 (первые 16)", "snapshot байт",
+         "config.yaml sha256 (первые 16)"),
+    ),
+    (
+        "aggregates",
+        lambda h: any("Вызовов (sum)" in x for x in h),
+        ("Профиль", "Сессий", "Вызовов (sum)", "Вызовов p50/p90",
+         "Input sum", "Input p50/p90", "Output sum", "Reasoning sum",
+         "Reasoning p50/p90", "Cache-read sum", "Cache-write sum"),
+    ),
+    (
+        "derived",
+        lambda h: any("reasoning/input" in x for x in h),
+        ("Профиль", "reasoning/input", "cache-read/input", "output/input",
+         "вызовов на сессию (avg)"),
+    ),
+    (
+        "by_source",
+        lambda h: any("source" in x for x in h)
+        and not any("метрика" in x for x in h),
+        ("Профиль", "source", "Сессий", "Вызовы", "Input", "Output",
+         "Reasoning", "Cache-read"),
+    ),
+    (
+        "usage_by_model",
+        lambda h: any("provider" in x for x in h),
+        ("Профиль", "model", "provider", "Вызовов", "Input", "Output",
+         "Reasoning", "Cache-read", "Сессий"),
+    ),
+    (
+        "reasoning effort",
+        lambda h: any("medium" in x for x in h),
+        ("Профиль", "medium", "high"),
+    ),
+    (
+        "finish_reason",
+        lambda h: any("tool_calls" in x for x in h),
+        ("Профиль", "stop", "tool_calls", "length", "(null)"),
+    ),
+    (
+        "top-5",
+        lambda h: any("метрика" in x for x in h),
+        ("метрика", "id (ред.)", "source", "model", "effort", "вызовов",
+         "msgs", "tools", "input", "reasoning"),
+    ),
+)
+
+
+def _mandatory_rows(tables, name: str):
+    """Rows belonging to one mandatory table, found by its schema predicate."""
+    pred = next(spec[1] for spec in _MANDATORY_TABLES if spec[0] == name)
+    return _rows(tables, pred)
+
+
+def _check_table_structure(problems, tables) -> None:
+    """Fail-closed structural validation over every parsed markdown table.
+
+    Each data row must have EXACTLY as many cells as its header (an extra
+    cell appended to a valid row previously slipped through — RV2 finding),
+    and the header itself must not contain duplicated column names (a
+    duplicated header previously collapsed silently in the cells dict).
+    """
+    for prof, header, row in tables:
+        if len(row) != len(header):
+            problems.append(
+                f"table structure: row width {len(row)} != header width "
+                f"{len(header)} (heading {prof!r}, row {row!r})"
+            )
+        dups = [c for c in header if header.count(c) > 1]
+        if dups:
+            problems.append(
+                f"table structure: duplicate header cells {dups!r} (heading {prof!r})"
+            )
+
+
+def _check_mandatory_headers(problems, tables) -> None:
+    """Every mandatory table must carry its exact documented header schema."""
+    for name, _pred, expected in _MANDATORY_TABLES:
+        for prof, header, _row in _rows(tables, _pred):
+            if tuple(header) != expected:
+                problems.append(
+                    f"{name} table: header {list(header)!r} != expected "
+                    f"{list(expected)!r} (heading {prof!r})"
+                )
+
+
+# ---------------------------------------------------------------------------
 # The actual check.
 # ---------------------------------------------------------------------------
 def check_report(
@@ -304,9 +403,13 @@ def check_report(
     problems: list[str] = []
     ev = evidence["profiles"]
     tables = parse_tables(report_text)
+    # fail-closed structure first: exact row widths, unique headers, exact
+    # mandatory header schemas — a mutation must never be silently ignored
+    _check_table_structure(problems, tables)
+    _check_mandatory_headers(problems, tables)
 
     # -- 1) fingerprint table (§1) -----------------------------------------
-    fp_rows = _rows(tables, lambda h: any("sha256" in x for x in h))
+    fp_rows = _mandatory_rows(tables, "fingerprint")
     if not fp_rows:
         problems.append("fingerprint table not found")
     else:
@@ -344,7 +447,7 @@ def check_report(
         _complete_profiles(problems, "fingerprint", seen_fp)
 
     # -- 2) per-profile aggregate table (§2, "Вызовов (sum)") --------------
-    main_rows = _rows(tables, lambda h: any("Вызовов (sum)" in x for x in h))
+    main_rows = _mandatory_rows(tables, "aggregates")
     if not main_rows:
         problems.append("main aggregate table not found")
     else:
@@ -402,7 +505,7 @@ def check_report(
         _complete_profiles(problems, "aggregates", seen_main)
 
     # -- 3) derived ratio table (§2, "reasoning/input") ---------------------
-    der_rows = _rows(tables, lambda h: any("reasoning/input" in x for x in h))
+    der_rows = _mandatory_rows(tables, "derived")
     if not der_rows:
         problems.append("derived ratio table not found")
     else:
@@ -430,10 +533,7 @@ def check_report(
         _complete_profiles(problems, "derived", seen_der)
 
     # -- 4) by_source table (§3) -------------------------------------------
-    src_rows = _rows(
-        tables,
-        lambda h: any("source" in x for x in h) and not any("метрика" in x for x in h),
-    )
+    src_rows = _mandatory_rows(tables, "by_source")
     if not src_rows:
         problems.append("by_source table not found")
     else:
@@ -478,7 +578,7 @@ def check_report(
                 problems.append(f"by_source: extra profile row {name!r}")
 
     # -- 5) usage_by_model table (§4) --------------------------------------
-    use_rows = _rows(tables, lambda h: any("provider" in x for x in h))
+    use_rows = _mandatory_rows(tables, "usage_by_model")
     if not use_rows:
         problems.append("usage_by_model table not found")
     else:
@@ -526,7 +626,7 @@ def check_report(
                 problems.append(f"usage_by_model: extra profile row {name!r}")
 
     # -- 6) reasoning effort table (§5) ------------------------------------
-    eff_rows = _rows(tables, lambda h: any("medium" in x for x in h))
+    eff_rows = _mandatory_rows(tables, "reasoning effort")
     if not eff_rows:
         problems.append("reasoning effort table not found")
     else:
@@ -549,7 +649,7 @@ def check_report(
         _complete_profiles(problems, "reasoning effort", seen_eff)
 
     # -- 7) finish_reason table (§5) ---------------------------------------
-    fin_rows = _rows(tables, lambda h: any("tool_calls" in x for x in h))
+    fin_rows = _mandatory_rows(tables, "finish_reason")
     if not fin_rows:
         problems.append("finish_reason table not found")
     else:
@@ -572,7 +672,7 @@ def check_report(
         _complete_profiles(problems, "finish_reason", seen_fin)
 
     # -- 8) top-5 tables (§7) ----------------------------------------------
-    top5_rows = _rows(tables, lambda h: any("метрика" in x for x in h))
+    top5_rows = _mandatory_rows(tables, "top-5")
     if not top5_rows:
         problems.append("top-5 tables not found")
     else:
