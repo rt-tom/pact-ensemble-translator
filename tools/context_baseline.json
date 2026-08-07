@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "description": "Read-only baseline: repository AGENTS.md size and resolved CLI toolsets per Hermes profile. Task t_6e10923e, Phase 0 report assembly input.",
+  "measured_at_utc": "2026-08-07T07:40:00Z",
+  "repository": {
+    "root": "D:\\pact\\pact_translator_v4",
+    "branch": "wt/t_6e10923e",
+    "head_commit": "38b1091",
+    "head_subject": "docs(v4): Efficiency A rev.2 — A1b: исследование финального перевода перед решениями о типографике (находки eff-a1a2: p00157 \\n, chunk0012 ASCII-кавычки)"
+  },
+  "agents_md": {
+    "path": "AGENTS.md (repo root, as committed on HEAD)",
+    "bytes": 19073,
+    "chars_utf8": 15507,
+    "lines_splitlines": 287,
+    "newlines": 287,
+    "ends_with_newline": true,
+    "measurement_method": "git show HEAD:AGENTS.md -> decode utf-8; lines = text.splitlines() count; wc -l agrees (287). Note: len(text.split('\\n')) would be 288 (trailing empty element after final newline)."
+  },
+  "cli_toolsets": {
+    "resolve_method": "hermes_cli.kanban_db._resolve_worker_cli_toolsets(<profile_dir>) with Windows paths (MSYS paths silently fail config load), HERMES_HOME set to each profile dir",
+    "resolve_source": "profile config.yaml platform_toolsets.cli (explicit list, no hermes-cli composite) + agent.disabled_toolsets (drops bfl via _enable_recently_shipped_toolsets subtraction)",
+    "profiles": {
+      "architect": {
+        "config_path": "C:\\Users\\ustom\\AppData\\Local\\hermes\\profiles\\architect\\config.yaml",
+        "config_platform_toolsets_cli": [
+          "browser", "clarify", "code_execution", "cronjob", "delegation",
+          "file", "kanban", "memory", "session_search", "skills",
+          "terminal", "todo", "vision", "web"
+        ],
+        "config_disabled_toolsets": ["bfl"],
+        "resolved_cli_toolsets": [
+          "browser", "clarify", "code_execution", "cronjob", "delegation",
+          "file", "kanban", "memory", "session_search", "skills",
+          "terminal", "todo", "vision", "web"
+        ],
+        "resolved_count": 14
+      },
+      "developer": {
+        "config_path": "C:\\Users\\ustom\\AppData\\Local\\hermes\\profiles\\developer\\config.yaml",
+        "config_platform_toolsets_cli": [
+          "file", "terminal", "kanban", "skills", "web", "todo",
+          "memory", "session_search", "code_execution", "delegation"
+        ],
+        "config_disabled_toolsets": ["bfl"],
+        "resolved_cli_toolsets": [
+          "code_execution", "delegation", "file", "kanban", "memory",
+          "session_search", "skills", "terminal", "todo", "web"
+        ],
+        "resolved_count": 10
+      },
+      "reviewer": {
+        "config_path": "C:\\Users\\ustom\\AppData\\Local\\hermes\\profiles\\reviewer\\config.yaml",
+        "config_platform_toolsets_cli": [
+          "file", "terminal", "kanban", "skills", "web", "todo",
+          "memory", "session_search", "code_execution", "delegation"
+        ],
+        "config_disabled_toolsets": ["bfl"],
+        "resolved_cli_toolsets": [
+          "code_execution", "delegation", "file", "kanban", "memory",
+          "session_search", "skills", "terminal", "todo", "web"
+        ],
+        "resolved_count": 10
+      }
+    }
+  },
+  "non_goals": [
+    "No toolsets, config.yaml, AGENTS.md, or profile settings were changed",
+    "No pipeline / llama-server / book / chapter runs started",
+    "No tracked config or production files changed (only new untracked file tools/context_baseline.json added)"
+  ]
+}
