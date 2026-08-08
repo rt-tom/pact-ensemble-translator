@@ -8,6 +8,7 @@ send the same requests, and parse results identically to the previous
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Mapping, Optional, Sequence, Tuple
 
 import pytest
@@ -159,6 +160,22 @@ def test_model_caller_returns_text_and_sends_rendered_prompt():
     assert request.temperature == pytest.approx(0.2)
     assert request.label == "phase2b/fidelity_first/chunk0001"
     assert request.response_schema is not None
+    # Default reasoning=0 keeps the baseline: no request_options at all.
+    assert request.request_options == {}
+
+
+def test_model_caller_transports_reasoning_via_request_options():
+    # V4.1: the generation caller forwards bundle.params.reasoning into the
+    # CompletionRequest.request_options so the opencode backend can map it to
+    # reasoningEffort; reasoning=0 keeps the historical empty options.
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+    backend = ScriptedBackend([_text_response(canned), _text_response(canned)])
+    caller = BackendModelCaller(backend)
+    caller(_bundle())  # reasoning=0 baseline
+    assert backend.requests[0].request_options == {}
+    high = replace(_bundle().params, reasoning=3)
+    caller(replace(_bundle(), params=high))
+    assert backend.requests[1].request_options == {"reasoning": 3}
 
 
 def test_model_caller_propagates_completion_error():

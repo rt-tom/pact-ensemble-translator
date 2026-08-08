@@ -32,11 +32,12 @@ Error classification (explicit, per B4 §3):
 Retry invariants (B4 §4/§5):
 
   * A retry re-issues the **identical** ``CompletionRequest`` (same prompt,
-    same ``max_output_tokens``, same ``model_ref``, same backend), so retry
-    never changes cache/resume identity (same prompt/backend -> same
-    unit_hash/backend identity). It also preserves the B1 decision to *not*
-    set ``request_options`` (``reasoning=0`` stays the B1 baseline — the
-    retry must not start adding per-request options; DECISIONS 2026-08-01).
+    same ``max_output_tokens``, same ``model_ref``, same backend, same
+    ``request_options`` — including any pinned V4.1 generation reasoning
+    budget), so retry never changes cache/resume identity (same
+    prompt/backend -> same unit_hash/backend identity) and never switches
+    the reasoning budget mid-request (B1 baseline: no option is ever
+    *added* by a retry; DECISIONS 2026-08-01).
   * ``max_retries`` defaults to 2 (three attempts total) and is overridable
     per-adapter via ``JsonRetryPolicy`` and the runtime-config build hooks.
   * When the budget is exhausted the last error is re-raised: the audit unit
