@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import ModelCaller, PromptBundle
@@ -158,6 +158,15 @@ class BackendModelCaller:
         # "fidelity_first"/"balanced_literary" to a different model than
         # "generator", this lookup honours the bundle role first and the
         # alias only as a fallback.
+        request_options: Dict[str, Any] = {}
+        if bundle.params.reasoning:
+            # V4.1: Phase 2B generation reasoning budget (0=off, 1=low,
+            # 2=medium, 3=high). Transported via request_options so the
+            # opencode backend can map it to the top-level ``reasoningEffort``
+            # field; 0/absent keeps the historical B1 baseline (no field).
+            # Only the generation caller carries it — the Qwen audit / repair
+            # / formatting adapters never set request_options.
+            request_options["reasoning"] = bundle.params.reasoning
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, (bundle.role, "generator")),
             messages=(Message(role="user", content=user_text),),
@@ -165,12 +174,14 @@ class BackendModelCaller:
             temperature=bundle.params.temperature,
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
+            request_options=request_options,
         )
 
         def _complete() -> str:
             # Re-issues the identical request on a retry: same prompt, same
-            # model/backend, same request_options (none) — so retry never
-            # changes cache/resume identity and never enables reasoning (B1).
+            # model/backend, same request_options (including any pinned
+            # reasoning) — so retry never changes cache/resume identity and
+            # never switches the reasoning budget mid-request (B1).
             try:
                 return self._backend.complete(request).text
             except CompletionError as exc:

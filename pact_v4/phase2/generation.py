@@ -100,9 +100,12 @@ class GenerationParams:
     context, temperature/seed and risk thresholds"). They are still part of
     the bundle identity, so changing them still invalidates the cache.
 
-    ``reasoning`` is fixed to ``0`` for all Phase 2B generation (no
-    reasoning/thinking budget at this stage); this is enforced, not just
-    documented.
+    ``reasoning`` is the Phase 2B reasoning/thinking budget: ``0`` = off
+    (B1 baseline), ``1`` = low, ``2`` = medium, ``3`` = high. The value is
+    transported to backends that support per-request reasoning effort
+    (opencode serve ``reasoningEffort``) and is part of the bundle identity,
+    so changing it invalidates the cache. Other phases (audit/repair/
+    formatting) never receive it.
     """
 
     temperature: float
@@ -111,10 +114,10 @@ class GenerationParams:
     reasoning: int = 0
 
     def __post_init__(self) -> None:
-        if self.reasoning != 0:
+        if self.reasoning not in (0, 1, 2, 3):
             raise ValueError(
-                f"GenerationParams: reasoning must be fixed to 0 for Phase 2B, "
-                f"got {self.reasoning!r}"
+                f"GenerationParams: reasoning must be in {{0, 1, 2, 3}} "
+                f"(0=off, 1=low, 2=medium, 3=high), got {self.reasoning!r}"
             )
         if self.max_tokens <= 0:
             raise ValueError("GenerationParams: max_tokens must be positive")

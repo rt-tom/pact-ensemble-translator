@@ -244,6 +244,18 @@ class StrictRunConfig:
     # scheme (full rollback). It is part of the config identity (see
     # to_config_artifact) so flipping it invalidates resume/cache correctly.
     lazy_balanced: bool = True
+    # V4.1 reasoning transport: Phase 2B generation reasoning budget (0=off,
+    # 1=low, 2=medium, 3=high). Only generation (Phase 2B) consumes it; the
+    # Qwen audit/repair/formatting phases are untouched. Part of the config
+    # identity (to_config_artifact) so a reasoning change invalidates
+    # cache/resume exactly like any other generation setting.
+    reasoning: int = 0
+    # V4.1 early-exit policy: "" runs the full cycle (audit/repair/
+    # formatting); "selection" halts right after Phase 1-2 (generation +
+    # selection), skipping Steps 6/7/8 and recording them as skipped. Part
+    # of the config identity (to_config_artifact) — a run that stops early
+    # is a different run from a full one.
+    stop_after: str = ""
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -259,8 +271,9 @@ class StrictRunConfig:
                     "temperature": self.temperature,
                     "seed": self.seed,
                     "max_tokens": self.max_tokens,
-                    "reasoning": 0,
+                    "reasoning": self.reasoning,
                 },
+                "stop_after": self.stop_after,
                 "formatting": {
                     "required": self.formatting_required,
                     "max_incidents": self.max_formatting_incidents,
@@ -2335,6 +2348,7 @@ def run_chapter_strict(
 
     generation_params = GenerationParams(
         temperature=cfg.temperature, seed=cfg.seed, max_tokens=cfg.max_tokens,
+        reasoning=cfg.reasoning,
     )
     gen_cache = GenerationCache()
     # B5 mixed_script-политика (V4_B5_MIXED_SCRIPT_POLICY_TASK_RU.md):
@@ -2775,214 +2789,232 @@ def run_chapter_strict(
             ),
         ),
     )
-    events_before_step6 = runtime.event_count()
-    step6: Dict[str, Any]
-    phase4_inputs: Optional[Dict[str, Any]] = None
-    try:
-        step6, phase4_inputs = _run_step6_audit(
-            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-            config=config, det_data=det_data_full, selection_records=merged_selection_records,
-            selected_text_by_chunk=selected_text_by_chunk,
-            generation_records=merged_generation_records,
-            qwen_audit_evaluator=qwen_audit_evaluator,
-            gemma_audit_evaluator=gemma_audit_evaluator,
-            backend_identity_hash=cfg.backend.identity_hash,
-            backend_identity_hashes=acceptable_backend_hashes,
-            progress=progress_writer,
-        )
-    except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
-        LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
-        step6 = {"status": "failed", "error": str(exc)}
+    # V4.1 stop_after="selection": halt right after Phase 1-2 (generation +
+    # selection). The chunked translation is already on disk (incremental
+    # translations.json writes); Steps 6/7/8 (audit, repair, formatting) are
+    # intentionally skipped and the record marks them as such. The shared
+    # finalization below still writes every artifact a normal run writes
+    # (generation_outcomes.json, selection_results.json, selection_meta.json,
+    # journal, translations.json), with step6/step7/step8 set to the
+    # "skipped_stop_after_selection" sentinel.
+    if cfg.stop_after == "selection":
+        step6 = {"status": "skipped_stop_after_selection"}
+        step7 = {"status": "skipped_stop_after_selection"}
+        step8 = {"status": "skipped_stop_after_selection"}
+        halted_early = True
+        halt_reason = "stop_after_selection"
         phase4_inputs = None
-    finally:
+        repair_phase_result = None
+    else:
+
+        events_before_step6 = runtime.event_count()
+        step6: Dict[str, Any]
+        phase4_inputs: Optional[Dict[str, Any]] = None
         try:
-            runtime.release()
-        except Exception:  # noqa: BLE001
-            LOG.exception("Failed to release runtime after Step 6 audit")
-
-    # ------------------------------------------------------------------
-    # Step 7/8: Phase 4 repair + convergence + terminal (B2). Runs only
-    # when repair adapters are configured (the CLI always wires them via
-    # ``build_repair_adapters``; test stubs may omit them). Repair model
-    # calls go through the same Backend boundary as Step 6 (never local
-    # lifecycle adapters). A transport failure at a repair call is recorded
-    # as debt/incomplete, never a semantic terminal status.
-    # ------------------------------------------------------------------
-    events_before_step7 = runtime.event_count()
-    step7: Dict[str, Any]
-    step8: Dict[str, Any]
-    # B13: the repair phase result (or None when repair never ran / failed /
-    # was skipped) decides the final translations.json write below.
-    repair_phase_result: Optional[RepairPhaseResult] = None
-    if repair_adapters is not None and phase4_inputs is not None:
-        # Phase 5 formatting (B3): build the formatting step over the source
-        # blocks + the injected formatting caller (a Backend adapter over the
-        # coordinator CompletionBackend), so the model-fallback tier runs
-        # through the backend boundary in local/remote/composite profiles
-        # alike — never a local lifecycle adapter. Applied between Step 7
-        # convergence and Step 8 inside run_repair_phase.
-        #
-        # ``cfg.formatting_required`` is the runtime master switch (§6.1
-        # ``formatting.required=true``): even when formatting adapters are
-        # configured, the step is skipped entirely when the policy says
-        # formatting is not required — adapters alone never trigger it.
-        formatting_step = None
-        if formatting_adapters is not None and cfg.formatting_required:
-            formatting_caller = formatting_adapters[0]
-
-            def _formatting_step(*, translation):
-                return run_formatting_align(
-                    blocks=blocks,
-                    translation=translation,
-                    formatting_caller=formatting_caller,
-                    backend_identity_hash=cfg.backend.identity_hash,
-                    policy_version=cfg.formatting_policy_version,
-                    max_formatting_incidents=cfg.max_formatting_incidents,
-                    pid_batches=[
-                        tuple(chunk.pids) for chunk in chunk_plan.chunks
-                    ],
-                )
-
-            formatting_step = _formatting_step
-        try:
-            step7, repair_phase_result = _run_step7_repair(
+            step6, phase4_inputs = _run_step6_audit(
                 cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-                config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
-                repair_adapters=repair_adapters,
+                config=config, det_data=det_data_full, selection_records=merged_selection_records,
+                selected_text_by_chunk=selected_text_by_chunk,
+                generation_records=merged_generation_records,
+                qwen_audit_evaluator=qwen_audit_evaluator,
+                gemma_audit_evaluator=gemma_audit_evaluator,
                 backend_identity_hash=cfg.backend.identity_hash,
                 backend_identity_hashes=acceptable_backend_hashes,
-                now=now_fn,
-                formatting=formatting_step,
                 progress=progress_writer,
             )
-            step8 = {
-                "status": step7["terminal"],
-                "integrity": step7["integrity"],
-                "debt_trace": None,  # recorded in repair_report.json
-                "formatting": step7.get("formatting"),
-            }
-            # B6: separate bounded quarantined-retry cycle. A quarantined
-            # chunk with repair debt is regenerated with look-ahead context and
-            # re-cascaded; a winner replaces its best-variant, a still-failed
-            # chunk is accepted as final (quarantined_final). A failure here is
-            # recorded in step7, never a crash of the completed run.
-            try:
-                retry_summary = _run_quarantined_retry_cycle(
-                    cfg=cfg,
-                    source=source,
-                    snapshot=snapshot,
-                    chunk_plan=chunk_plan,
-                    config=config,
-                    det_data_base=det_data_base,
-                    det_data_full=det_data_full,
-                    risk_by_chunk=risk_by_chunk,
-                    glossary=glossary,
-                    generation_params=generation_params,
-                    model_caller=model_caller,
-                    gen_cache=gen_cache,
-                    qwen_evaluator=qwen_evaluator,
-                    gemma_selector=gemma_selector,
-                    selected_text_by_chunk=selected_text_by_chunk,
-                    phase4_inputs=phase4_inputs,
-                    repair_phase_result=repair_phase_result,
-                    repair_adapters=repair_adapters,
-                    formatting_step=formatting_step,
-                    backend_identity_hash=cfg.backend.identity_hash,
-                    acceptable_backend_hashes=acceptable_backend_hashes,
-                    now=now_fn,
-                    progress=progress_writer,
-                    existing_generation_records=merged_generation_records,
-                    bible_text=bible_text,
-                )
-            except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
-                LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
-                step7 = dict(step7)
-                step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
-            else:
-                if retry_summary is not None:
-                    merged_generation_records = retry_summary["generation_records"]
-                    retry_block = {
-                        key: value
-                        for key, value in retry_summary.items()
-                        if key != "generation_records"
-                    }
-                    step7 = {**step7, "quarantined_retry": retry_block}
-                    step8 = {
-                        "status": retry_summary["terminal"],
-                        "integrity": retry_summary["integrity"],
-                        "debt_trace": None,  # recorded in repair_report.json
-                        "formatting": (
-                            retry_summary.get("formatting")
-                            if "formatting" in retry_summary
-                            else step7.get("formatting")
-                        ),
-                    }
-        except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
-            LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
-            step7 = {"status": "failed", "error": str(exc)}
-            step8 = {"status": "failed", "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
+            LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
+            step6 = {"status": "failed", "error": str(exc)}
+            phase4_inputs = None
         finally:
             try:
                 runtime.release()
             except Exception:  # noqa: BLE001
-                LOG.exception("Failed to release runtime after Step 7 repair")
-    else:
-        reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
-        step7 = {"status": "skipped", "reason": reason}
-        step8 = {"status": "skipped", "reason": reason}
+                LOG.exception("Failed to release runtime after Step 6 audit")
 
-    step7_events = [
-        event for event in runtime.events_since(events_before_step7)
-        if event.kind == EVENT_KIND_LOCAL_SWITCH
-    ]
-    step7 = dict(step7)
-    step7["switch_count"] = len(step7_events)
-    step7["switches"] = [event.to_payload() for event in step7_events]
+        # ------------------------------------------------------------------
+        # Step 7/8: Phase 4 repair + convergence + terminal (B2). Runs only
+        # when repair adapters are configured (the CLI always wires them via
+        # ``build_repair_adapters``; test stubs may omit them). Repair model
+        # calls go through the same Backend boundary as Step 6 (never local
+        # lifecycle adapters). A transport failure at a repair call is recorded
+        # as debt/incomplete, never a semantic terminal status.
+        # ------------------------------------------------------------------
+        events_before_step7 = runtime.event_count()
+        step7: Dict[str, Any]
+        step8: Dict[str, Any]
+        # B13: the repair phase result (or None when repair never ran / failed /
+        # was skipped) decides the final translations.json write below.
+        repair_phase_result: Optional[RepairPhaseResult] = None
+        if repair_adapters is not None and phase4_inputs is not None:
+            # Phase 5 formatting (B3): build the formatting step over the source
+            # blocks + the injected formatting caller (a Backend adapter over the
+            # coordinator CompletionBackend), so the model-fallback tier runs
+            # through the backend boundary in local/remote/composite profiles
+            # alike — never a local lifecycle adapter. Applied between Step 7
+            # convergence and Step 8 inside run_repair_phase.
+            #
+            # ``cfg.formatting_required`` is the runtime master switch (§6.1
+            # ``formatting.required=true``): even when formatting adapters are
+            # configured, the step is skipped entirely when the policy says
+            # formatting is not required — adapters alone never trigger it.
+            formatting_step = None
+            if formatting_adapters is not None and cfg.formatting_required:
+                formatting_caller = formatting_adapters[0]
 
-    # The audit phase's own lifecycle cost, recorded for run_003-style
-    # validation: batching by detector should keep this at ~1-2 switches
-    # (one Qwen acquire + one Qwen->Gemma switch) regardless of chunk count.
-    # For remote/composite runs the Step 6 "switches" are the local switch
-    # events only (remote call events are aggregated in the runtime block).
-    step6_events = [
-        event for event in runtime.events_since(events_before_step6)
-        if event.kind == EVENT_KIND_LOCAL_SWITCH
-    ]
-    step6 = dict(step6)
-    step6["switch_count"] = len(step6_events)
-    step6["switches"] = [event.to_payload() for event in step6_events]
+                def _formatting_step(*, translation):
+                    return run_formatting_align(
+                        blocks=blocks,
+                        translation=translation,
+                        formatting_caller=formatting_caller,
+                        backend_identity_hash=cfg.backend.identity_hash,
+                        policy_version=cfg.formatting_policy_version,
+                        max_formatting_incidents=cfg.max_formatting_incidents,
+                        pid_batches=[
+                            tuple(chunk.pids) for chunk in chunk_plan.chunks
+                        ],
+                    )
 
-    narrator_gender_findings: list = []
-    if narrator_gender and final_text_by_pid:
-        full_text = " ".join(final_text_by_pid.values())
-        narrator_gender_findings = check_narrator_gender(full_text, narrator_gender)
-    if narrator_gender_findings:
-        # B7 invariant: ``integrity.status`` describes the detailed
-        # check-level state (narrator_gender, formatting, mixed_script,
-        # ...); ``step8.status`` is the chapter terminal state
-        # (complete / accepted_degraded / failed / skipped). They are
-        # NOT the same shape. narrator_gender failure is non-fatal at
-        # chapter level (PID map is structurally valid), so step8 stays
-        # in accepted_degraded; ``integrity.status == "failed"`` records
-        # the specific finding for debugging/dashboards. A failed/skipped
-        # step8 (from a prior failure) is never upgraded by a successful
-        # narrator_gender check here — the check only downgrades an
-        # existing complete to accepted_degraded.
-        step8 = dict(step8)
-        integrity = dict(step8.get("integrity") or {})
-        integrity["narrator_gender"] = {
-            "expected": narrator_gender,
-            "mismatches": narrator_gender_findings,
-        }
-        if integrity.get("status") != "failed":
-            integrity["status"] = "failed"
-            integrity["reason"] = (
-                f"narrator_gender mismatch: expected {narrator_gender}, "
-                f"found {len(narrator_gender_findings)} mismatch(es)"
-            )
-        step8["integrity"] = integrity
-        if step8.get("status") == "complete":
-            step8["status"] = "accepted_degraded"
+                formatting_step = _formatting_step
+            try:
+                step7, repair_phase_result = _run_step7_repair(
+                    cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+                    config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
+                    repair_adapters=repair_adapters,
+                    backend_identity_hash=cfg.backend.identity_hash,
+                    backend_identity_hashes=acceptable_backend_hashes,
+                    now=now_fn,
+                    formatting=formatting_step,
+                    progress=progress_writer,
+                )
+                step8 = {
+                    "status": step7["terminal"],
+                    "integrity": step7["integrity"],
+                    "debt_trace": None,  # recorded in repair_report.json
+                    "formatting": step7.get("formatting"),
+                }
+                # B6: separate bounded quarantined-retry cycle. A quarantined
+                # chunk with repair debt is regenerated with look-ahead context and
+                # re-cascaded; a winner replaces its best-variant, a still-failed
+                # chunk is accepted as final (quarantined_final). A failure here is
+                # recorded in step7, never a crash of the completed run.
+                try:
+                    retry_summary = _run_quarantined_retry_cycle(
+                        cfg=cfg,
+                        source=source,
+                        snapshot=snapshot,
+                        chunk_plan=chunk_plan,
+                        config=config,
+                        det_data_base=det_data_base,
+                        det_data_full=det_data_full,
+                        risk_by_chunk=risk_by_chunk,
+                        glossary=glossary,
+                        generation_params=generation_params,
+                        model_caller=model_caller,
+                        gen_cache=gen_cache,
+                        qwen_evaluator=qwen_evaluator,
+                        gemma_selector=gemma_selector,
+                        selected_text_by_chunk=selected_text_by_chunk,
+                        phase4_inputs=phase4_inputs,
+                        repair_phase_result=repair_phase_result,
+                        repair_adapters=repair_adapters,
+                        formatting_step=formatting_step,
+                        backend_identity_hash=cfg.backend.identity_hash,
+                        acceptable_backend_hashes=acceptable_backend_hashes,
+                        now=now_fn,
+                        progress=progress_writer,
+                        existing_generation_records=merged_generation_records,
+                        bible_text=bible_text,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
+                    LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
+                    step7 = dict(step7)
+                    step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
+                else:
+                    if retry_summary is not None:
+                        merged_generation_records = retry_summary["generation_records"]
+                        retry_block = {
+                            key: value
+                            for key, value in retry_summary.items()
+                            if key != "generation_records"
+                        }
+                        step7 = {**step7, "quarantined_retry": retry_block}
+                        step8 = {
+                            "status": retry_summary["terminal"],
+                            "integrity": retry_summary["integrity"],
+                            "debt_trace": None,  # recorded in repair_report.json
+                            "formatting": (
+                                retry_summary.get("formatting")
+                                if "formatting" in retry_summary
+                                else step7.get("formatting")
+                            ),
+                        }
+            except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
+                LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
+                step7 = {"status": "failed", "error": str(exc)}
+                step8 = {"status": "failed", "error": str(exc)}
+            finally:
+                try:
+                    runtime.release()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("Failed to release runtime after Step 7 repair")
+        else:
+            reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
+            step7 = {"status": "skipped", "reason": reason}
+            step8 = {"status": "skipped", "reason": reason}
+
+        step7_events = [
+            event for event in runtime.events_since(events_before_step7)
+            if event.kind == EVENT_KIND_LOCAL_SWITCH
+        ]
+        step7 = dict(step7)
+        step7["switch_count"] = len(step7_events)
+        step7["switches"] = [event.to_payload() for event in step7_events]
+
+        # The audit phase's own lifecycle cost, recorded for run_003-style
+        # validation: batching by detector should keep this at ~1-2 switches
+        # (one Qwen acquire + one Qwen->Gemma switch) regardless of chunk count.
+        # For remote/composite runs the Step 6 "switches" are the local switch
+        # events only (remote call events are aggregated in the runtime block).
+        step6_events = [
+            event for event in runtime.events_since(events_before_step6)
+            if event.kind == EVENT_KIND_LOCAL_SWITCH
+        ]
+        step6 = dict(step6)
+        step6["switch_count"] = len(step6_events)
+        step6["switches"] = [event.to_payload() for event in step6_events]
+
+        narrator_gender_findings: list = []
+        if narrator_gender and final_text_by_pid:
+            full_text = " ".join(final_text_by_pid.values())
+            narrator_gender_findings = check_narrator_gender(full_text, narrator_gender)
+        if narrator_gender_findings:
+            # B7 invariant: ``integrity.status`` describes the detailed
+            # check-level state (narrator_gender, formatting, mixed_script,
+            # ...); ``step8.status`` is the chapter terminal state
+            # (complete / accepted_degraded / failed / skipped). They are
+            # NOT the same shape. narrator_gender failure is non-fatal at
+            # chapter level (PID map is structurally valid), so step8 stays
+            # in accepted_degraded; ``integrity.status == "failed"`` records
+            # the specific finding for debugging/dashboards. A failed/skipped
+            # step8 (from a prior failure) is never upgraded by a successful
+            # narrator_gender check here — the check only downgrades an
+            # existing complete to accepted_degraded.
+            step8 = dict(step8)
+            integrity = dict(step8.get("integrity") or {})
+            integrity["narrator_gender"] = {
+                "expected": narrator_gender,
+                "mismatches": narrator_gender_findings,
+            }
+            if integrity.get("status") != "failed":
+                integrity["status"] = "failed"
+                integrity["reason"] = (
+                    f"narrator_gender mismatch: expected {narrator_gender}, "
+                    f"found {len(narrator_gender_findings)} mismatch(es)"
+                )
+            step8["integrity"] = integrity
+            if step8.get("status") == "complete":
+                step8["status"] = "accepted_degraded"
 
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
@@ -3092,6 +3124,11 @@ def run_chapter_strict(
         },
         "operational_policy": {
             "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
+            # V4.1: pinned-before-run generation reasoning budget and early-exit
+            # policy — recorded so the owner can verify which experiment variant
+            # produced a run without opening the config artifact.
+            "reasoning": cfg.reasoning,
+            "stop_after": cfg.stop_after,
         },
         "mixed_script_policy": {
             "sources": {

@@ -366,6 +366,57 @@ def test_two_low_risk_chunks_restart_count_matches_2n_minus_1(tmp_path: Path):
     assert result.step6["status"] == "complete"
 
 
+def test_stop_after_selection_halts_after_phase12(tmp_path: Path):
+    # V4.1: stop_after="selection" exits right after Phase 1-2. The chunked
+    # translation is on disk (incremental writes), Step 6/7/8 never run and
+    # are recorded as skipped, and the run record marks the early halt.
+    cfg = replace(_make_cfg(tmp_path, n_paragraphs=24), stop_after="selection")
+    qwen_audit = StubQwenAudit()
+    gemma_audit = StubGemmaAudit()
+    result, router = _run(cfg, qwen_audit=qwen_audit, gemma_audit=gemma_audit)
+    # Phase 1-2 ran to completion: 2 chunks selected.
+    assert result.chunk_count == 2
+    assert result.selected_count == 2
+    assert result.halted_early is True
+    assert result.halt_reason == "stop_after_selection"
+    # Steps 6/7/8 are the skipped sentinel, and no audit model call happened.
+    assert result.step6 == {"status": "skipped_stop_after_selection"}
+    assert result.step7 == {"status": "skipped_stop_after_selection"}
+    assert result.step8 == {"status": "skipped_stop_after_selection"}
+    assert qwen_audit.calls == []
+    assert gemma_audit.calls == []
+    # The audit's lifecycle cost did not occur: only the 4 Phase 1-2 switches.
+    assert len(router.switches) == 4
+    # Chunked translation + the same artifacts as a normal run are written.
+    source, snapshot, chunk_plan, _config = _build_artifacts(cfg)
+    expected_pids = {pid for chunk in chunk_plan.chunks for pid in chunk.pids}
+    translations = json.loads(result.translations_path.read_text(encoding="utf-8"))
+    assert set(translations) == expected_pids
+    assert (cfg.out_dir / "generation_outcomes.json").exists()
+    assert (cfg.out_dir / "selection_results.json").exists()
+    assert (cfg.out_dir / "selection_meta.json").exists()
+    assert (cfg.out_dir / "strict_chapter_trial_record.json").exists()
+    # The record carries the operational-policy markers and the halt reason.
+    assert result.record["operational_policy"]["reasoning"] == 0
+    assert result.record["operational_policy"]["stop_after"] == "selection"
+    assert result.record["halt_reason"] == "stop_after_selection"
+
+
+def test_stop_after_selection_default_is_full_cycle(tmp_path: Path):
+    # V4.1 regression: the default (reasoning=0, stop_after="") keeps the
+    # historical full cycle — Step 6 audit runs, no early halt, and the
+    # config identity records the defaults explicitly.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    assert cfg.reasoning == 0
+    assert cfg.stop_after == ""
+    result, _router = _run(cfg)
+    assert result.halted_early is False
+    assert result.step6["status"] == "complete"
+    artifact = cfg.to_config_artifact(model_profile="test")
+    assert artifact.values["generation"]["reasoning"] == 0
+    assert artifact.values["stop_after"] == ""
+
+
 def test_high_risk_chunk_with_agreeing_candidates_calls_gemma_preference(tmp_path: Path):
     # "You must not open box 7." repeated trips the risk pre-screen into
     # a high-risk band (same trigger content as

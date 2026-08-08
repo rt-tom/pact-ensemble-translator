@@ -758,6 +758,44 @@ def test_request_options_are_rejected_not_silently_dropped():
     assert "not supported" in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [(1, "low"), (2, "medium"), (3, "high")],
+)
+def test_reasoning_request_option_maps_to_reasoning_effort(level, expected):
+    # V4.1: the opencode backend accepts the "reasoning" request option
+    # (unlike every other option) and transports it as the top-level
+    # reasoningEffort field on the message body.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(_request(request_options={"reasoning": level}))
+    body = fake.last_message_body()
+    assert body["reasoningEffort"] == expected
+
+
+def test_reasoning_zero_does_not_add_reasoning_effort():
+    # reasoning=0 means off: the field must NOT appear in the body
+    # (historical baseline body shape preserved).
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(_request(request_options={"reasoning": 0}))
+    assert "reasoningEffort" not in fake.last_message_body()
+
+
+def test_mixed_request_options_with_reasoning_still_reject_others():
+    # The reasoning carve-out is narrow: any OTHER option alongside it is
+    # still refused loudly (no silent drop of e.g. top_p).
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    with pytest.raises(OpenCodeError) as exc_info:
+        backend.complete(_request(request_options={"reasoning": 3, "top_p": 0.9}))
+    assert exc_info.value.error_class == ERROR_REQUEST_NOT_SUPPORTED
+    assert "top_p" in str(exc_info.value)
+
+
 def test_json_schema_mode_requires_response_schema():
     fake = FakeOpenCodeServer()
     backend = _backend(fake, structured_output_mode="json_schema")

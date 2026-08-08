@@ -156,6 +156,21 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Start Pact's own 'opencode serve' for every OpenCode "
                          "backend in the runtime config (server_mode=managed) and "
                          "stop it after the run. Ignored without --runtime-config.")
+    p.add_argument("--reasoning", type=int, choices=(0, 1, 2, 3), default=0,
+                   help="V4.1: Phase 2B generation reasoning budget (0=off, "
+                        "1=low, 2=medium, 3=high). Applied ONLY to generation "
+                        "(opencode serve 'reasoningEffort'); the Qwen audit / "
+                        "repair / formatting phases are untouched. Part of the "
+                        "config identity — a reasoning change invalidates "
+                        "cache/resume, so use a NEW --out-dir.")
+    p.add_argument("--stop-after", choices=("selection",), default="",
+                   metavar="selection",
+                   help="V4.1: early exit after Phase 1-2 (generation + "
+                        "selection). 'selection' halts before Step 6 and "
+                        "records step6/step7/step8 as "
+                        "skipped_stop_after_selection (translations.json keeps "
+                        "the chunked translation). Default: full cycle. Part of "
+                        "the config identity — use a NEW --out-dir.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -307,6 +322,13 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
         run_label=args.run_label,
+        # V4.1: reasoning budget for Phase 2B generation and early exit after
+        # Phase 1-2 selection. Both are part of the config identity
+        # (StrictRunConfig.to_config_artifact), so a run with either set is
+        # NOT resumable from a prior out-dir — the owner must pass a NEW
+        # --out-dir for these experiment runs.
+        reasoning=args.reasoning,
+        stop_after=args.stop_after,
         # V4 Efficiency A2: CLI flag (--lazy-balanced/--no-lazy-balanced)
         # overrides the env var, which defaults to true (lazy mode on).
         lazy_balanced=(
