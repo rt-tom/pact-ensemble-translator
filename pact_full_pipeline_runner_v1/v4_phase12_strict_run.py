@@ -54,6 +54,7 @@ from pact_v4.runtime.runtime_config import (
     build_repair_adapters,
     build_role_adapters,
     load_runtime_config,
+    validate_reasoning_backend,
 )
 from pact_v4.runtime.runtime_coordinator import LocalLifecycleCoordinator
 
@@ -372,6 +373,11 @@ def run_local_default(args: argparse.Namespace) -> int:
         server_args={"gemma": GEMMA_SERVER_ARGS, "qwen": QWEN_SERVER_ARGS},
         port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
     )
+    # V4.1 fail-fast: --reasoning > 0 is OpenCode-only. The local
+    # llama-server transport cannot express a reasoning effort, so reject the
+    # combination here (before the server starts) instead of at the first
+    # generation call.
+    validate_reasoning_backend(args.reasoning, backend)
     cfg = _build_run_config(args, backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir)
@@ -402,6 +408,11 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     backend = _load_runtime_config_file(args.runtime_config)
     if args.managed_server:
         backend = force_managed(backend)
+    # V4.1 fail-fast: --reasoning > 0 needs an OpenCode (remote) generator
+    # backend. A local_llama profile (or a composite routing generator to a
+    # local sub-backend) cannot express a reasoning effort — reject before
+    # the server starts instead of at the first generation call.
+    validate_reasoning_backend(args.reasoning, backend)
     _warn_remote_acknowledgement(backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir)

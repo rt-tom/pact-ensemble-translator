@@ -587,6 +587,66 @@ class CompositeBackendConfig:
 
 
 # ---------------------------------------------------------------------------
+# V4.1 reasoning/backend compatibility policy
+# ---------------------------------------------------------------------------
+
+
+def _generator_backend_cfg(backend: Any) -> Any:
+    """The sub-config that serves the Phase 2B generator role.
+
+    ``None`` when a composite profile declares no generator binding at all
+    (the run itself fails later with a missing model binding — that is not
+    a reasoning-policy error).
+    """
+    if isinstance(backend, CompositeBackendConfig):
+        gen_name = backend.role_backend_map.get(ROLE_GENERATOR)
+        if gen_name is not None:
+            return backend.backends.get(gen_name)
+        # No explicit generator routing: the composite descriptor binds the
+        # generator role to the first sub-backend declaring it (same
+        # first-wins rule as CompositeBackendConfig.build_descriptor).
+        for sub in backend.backends.values():
+            bindings = sub.build_descriptor().model_bindings or {}
+            if ROLE_GENERATOR in bindings or "default" in bindings:
+                return sub
+        return None
+    return backend
+
+
+def validate_reasoning_backend(reasoning: int, backend: Any) -> None:
+    """Fail-fast V4.1 policy: a nonzero reasoning budget needs an OpenCode generator.
+
+    The Phase 2B reasoning budget is transported as
+    ``CompletionRequest.request_options={"reasoning": N}`` and only the
+    OpenCode backend maps it (to the top-level ``reasoningEffort`` field,
+    1=low/2=medium/3=high). The local ``llama-server`` transport has no
+    such field: ``LocalOpenAIBackend`` rejects any request_options, so a
+    local run with ``--reasoning > 0`` would only fail at the first
+    generation call — after the pipeline/server had already started. This
+    helper rejects that combination up front with a clear diagnostic.
+
+    ``reasoning == 0`` (the B1 baseline) is always accepted — it emits no
+    request_options at all. For a composite profile the check follows the
+    ``generator`` role routing; the audit/repair/formatting adapters never
+    carry request_options, so only the generator backend matters.
+
+    Raises ``ValueError`` when the combination is unsupported; returns
+    ``None`` otherwise.
+    """
+    if reasoning == 0:
+        return
+    gen = _generator_backend_cfg(backend)
+    if isinstance(gen, LocalLlamaBackendConfig):
+        raise ValueError(
+            f"--reasoning {reasoning} requires an OpenCode (remote) generator "
+            f"backend: the local llama-server transport cannot express a "
+            f"reasoning effort (LocalOpenAIBackend rejects request_options). "
+            f"Use --reasoning 0 for local runs, or route the generator role "
+            f"to an opencode_server backend."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Role-adapter bridge (PR 4 / C3): build the Phase 1-2 + Step 6 callables
 # over a built runtime's CompletionBackend.
 # ---------------------------------------------------------------------------

@@ -15,10 +15,19 @@ These adapters are kept thin and explicit:
   cross-talk.
 * No caching beyond the per-chapter ``GenerationCache`` the library already
   owns: this layer is dumb and stateless apart from connection reuse.
-* No model-side reasoning budget: Phase 2B forces ``reasoning == 0`` at the
-  library level; we propagate that here by *not* emitting any
-  ``chat_template_kwargs.enable_thinking`` flag unless the caller asks for
-  it explicitly.
+* No model-side reasoning budget on the LOCAL transport: V4.1 adds an
+  optional Phase 2B generation ``reasoning`` budget (0=off baseline,
+  1=low, 2=medium, 3=high) that the generation caller transports via
+  ``CompletionRequest.request_options`` and the OpenCode backend maps to
+  the top-level ``reasoningEffort`` field (opencode serve). The local
+  ``llama-server`` transport has no such field and ``LocalOpenAIBackend``
+  rejects any request_options; the CLI fail-fast
+  (``validate_reasoning_backend``) rejects ``--reasoning > 0`` with a local
+  backend before the pipeline/server starts, and this package propagates
+  the local limit by *not* emitting any ``chat_template_kwargs.enable_thinking``
+  flag unless the caller asks for it explicitly. Other phases
+  (audit/repair/formatting) never receive a reasoning budget on either
+  transport.
 """
 
 from __future__ import annotations

@@ -19,6 +19,7 @@ from pact_v4.runtime.runtime_config import (
     LocalLlamaBackendConfig,
     OpenCodeBackendConfig,
     load_runtime_config,
+    validate_reasoning_backend,
 )
 
 
@@ -504,3 +505,72 @@ def test_local_config_rejects_non_string_server_args():
         assert "server_args must contain only strings" in str(exc)
     else:
         raise AssertionError("expected non-string server_args ValueError")
+
+
+# ---------------------------------------------------------------------------
+# V4.1 reasoning/backend compatibility policy (review commit 301e9df)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_reasoning_backend_zero_is_baseline_for_local():
+    # reasoning=0 (B1 baseline) is always accepted: it emits no
+    # request_options at all, so every backend works unchanged.
+    validate_reasoning_backend(0, _local())
+
+
+def test_validate_reasoning_backend_rejects_nonzero_for_local():
+    # V4.1: the local llama-server transport has no reasoningEffort field
+    # and LocalOpenAIBackend rejects any request_options — a local run with
+    # --reasoning > 0 must fail fast before the pipeline/server starts.
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="requires an OpenCode"):
+            validate_reasoning_backend(level, _local())
+
+
+def test_validate_reasoning_backend_accepts_nonzero_for_opencode():
+    # The OpenCode backend maps 1/2/3 -> reasoningEffort low/medium/high;
+    # nonzero reasoning with a remote generator is the supported path.
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, _remote())
+
+
+def test_validate_reasoning_backend_composite_follows_generator_routing():
+    # The check follows the composite's *generator* role routing: a remote
+    # generator accepts nonzero reasoning, a local generator rejects it.
+    backends = {"remote": _remote(), "local": _local()}
+    remote_gen = CompositeBackendConfig(
+        backends=backends,
+        role_backend_map={"generator": "remote", "fidelity_reviewer": "remote"},
+    )
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, remote_gen)
+
+    local_gen = CompositeBackendConfig(
+        backends=backends,
+        role_backend_map={"generator": "local", "fidelity_reviewer": "remote"},
+    )
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="requires an OpenCode"):
+            validate_reasoning_backend(level, local_gen)
+
+
+def test_validate_reasoning_backend_composite_first_wins_without_generator_route():
+    # Without an explicit generator routing the composite descriptor binds
+    # the generator role to the FIRST sub-backend declaring it — the
+    # reasoning policy must mirror that first-wins rule.
+    remote = _remote()
+    local = _local()
+    remote_first = CompositeBackendConfig(
+        backends={"remote": remote, "local": local},
+        role_backend_map={"fidelity_reviewer": "remote"},  # no generator key
+    )
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, remote_first)
+
+    local_first = CompositeBackendConfig(
+        backends={"local": local, "remote": remote},
+        role_backend_map={"fidelity_reviewer": "remote"},  # no generator key
+    )
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="requires an OpenCode"):
+            validate_reasoning_backend(level, local_first)

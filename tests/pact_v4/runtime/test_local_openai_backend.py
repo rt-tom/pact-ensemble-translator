@@ -243,6 +243,18 @@ def test_complete_rejects_unsupported_request_options():
         backend.complete(_request(request_options={"top_p": 0.9}))
 
 
+def test_complete_rejects_reasoning_with_opencode_only_diagnostic():
+    # V4.1: the local llama-server transport has no reasoningEffort field.
+    # A reasoning request_option must fail loudly with the OpenCode-only
+    # reason (not an opaque transport failure); the CLI fail-fast keeps the
+    # supported paths from ever reaching this branch.
+    backend = LocalOpenAIBackend(api=_client(script=[_ok("ok")]))
+    with pytest.raises(CompletionError, match="only supported by the OpenCode backend"):
+        backend.complete(_request(request_options={"reasoning": 2}))
+    with pytest.raises(CompletionError, match="only supported by the OpenCode backend"):
+        backend.complete(_request(request_options={"reasoning": 1}))
+
+
 def test_close_is_idempotent():
     backend = LocalOpenAIBackend(api=_client(script=[_ok("ok")]))
     backend.close()
