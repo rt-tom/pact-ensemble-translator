@@ -636,3 +636,222 @@ def test_whole_chapter_resume_incomplete_requires_generation_outcomes(tmp_path):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
     assert not gen_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# RV3 (t_27de970d) malformed-generation-record regression coverage.
+#
+# A sole whole_chapter record with a LINKED candidate_id is only a valid
+# resume provenance when the record itself conforms to the writer's
+# serialized GenerationOutcome schema: required record fields/types/status,
+# expected_roles, well-formed candidates/errors, and a selected candidate
+# carrying the fields provenance needs (translation/role/candidate_id/
+# decision_trace) plus raw/provenance consistency with the raw snapshot.
+# Every mutation below keeps the journal linkage intact, so the old weak
+# check (candidates[selected_role].candidate_id matches) alone would have
+# accepted it and rewritten selection/provenance. Each case must fail closed
+# with a Data loss ValueError, zero model calls, and byte-for-byte unchanged
+# artifacts (final alias, raw snapshot, selection results, generation
+# provenance, journal) with no new record.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_artifacts(cfg):
+    names = (
+        "translations.json",
+        "translations_raw.json",
+        "selection_results.json",
+        "generation_outcomes.json",
+        "journal.ndjson",
+    )
+    snap = {}
+    for name in names:
+        path = cfg.out_dir / name
+        snap[name] = None if not path.exists() else path.read_text(encoding="utf-8")
+    return snap
+
+
+def _assert_unchanged(cfg, before):
+    for name, content in before.items():
+        path = cfg.out_dir / name
+        if content is None:
+            assert not path.exists(), f"{name} was created by a rejected resume"
+        else:
+            assert path.read_text(encoding="utf-8") == content, (
+                f"{name} was rewritten by a rejected resume"
+            )
+    # The journal still holds exactly the one whole_chapter entry: no new
+    # record was appended by the failed resume.
+    assert len(_whole_chapter_journal(cfg)) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "remove_record_status",
+        "remove_record_expected_roles",
+        "remove_record_risk_band",
+        "remove_record_candidates",
+        "remove_record_errors",
+        "invalid_record_status",
+        "record_status_incomplete_on_selected",
+        "empty_expected_roles",
+        "empty_candidates",
+        "candidate_not_object",
+        "remove_candidate_translation",
+        "remove_candidate_role",
+        "remove_candidate_candidate_id",
+        "remove_candidate_decision_trace",
+        "candidate_translation_not_dict",
+        "candidate_translation_empty",
+        "mismatched_raw_translation",
+        "error_malformed",
+        "error_for_selected_role",
+        "strip_record_and_candidate",
+        "extra_non_object_entry",
+        "extra_foreign_record",
+    ],
+)
+def test_whole_chapter_resume_rejects_malformed_linked_generation_record(
+    tmp_path, mutation
+):
+    # RV3 finding: a sole whole_chapter record whose linked candidate_id
+    # matches the journal was previously accepted even with record fields
+    # (status/expected_roles) and candidate provenance fields
+    # (translation/role) stripped — resume returned selected_count=1 and
+    # rewrote selection/provenance from damaged data. The record must now
+    # conform to the writer's serialized GenerationOutcome schema, and the
+    # selected candidate must be raw/provenance-consistent, or the resume
+    # fails closed before any artifact write.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    good = json.loads(gen_path.read_text(encoding="utf-8"))
+    rec = good["outcomes"][0]
+    cand = rec["candidates"]["balanced_literary"]
+    raw = json.loads((cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8"))
+
+    if mutation == "remove_record_status":
+        rec.pop("status")
+    elif mutation == "remove_record_expected_roles":
+        rec.pop("expected_roles")
+    elif mutation == "remove_record_risk_band":
+        rec.pop("risk_band")
+    elif mutation == "remove_record_candidates":
+        rec.pop("candidates")
+    elif mutation == "remove_record_errors":
+        rec.pop("errors")
+    elif mutation == "invalid_record_status":
+        rec["status"] = "quarantined"
+    elif mutation == "record_status_incomplete_on_selected":
+        rec["status"] = "incomplete"
+    elif mutation == "empty_expected_roles":
+        rec["expected_roles"] = []
+    elif mutation == "empty_candidates":
+        rec["candidates"] = {}
+    elif mutation == "candidate_not_object":
+        rec["candidates"]["balanced_literary"] = ["not", "an", "object"]
+    elif mutation == "remove_candidate_translation":
+        cand.pop("translation")
+    elif mutation == "remove_candidate_role":
+        cand.pop("role")
+    elif mutation == "remove_candidate_candidate_id":
+        cand.pop("candidate_id")
+    elif mutation == "remove_candidate_decision_trace":
+        cand.pop("decision_trace")
+    elif mutation == "candidate_translation_not_dict":
+        cand["translation"] = "не словарь"
+    elif mutation == "candidate_translation_empty":
+        cand["translation"] = {}
+    elif mutation == "mismatched_raw_translation":
+        # Linked candidate_id kept, but the candidate's serialized translation
+        # no longer equals the raw snapshot the resume would replay.
+        cand["translation"] = dict(raw)
+        first = next(iter(cand["translation"]))
+        cand["translation"][first] = "ДРУГОЙ ПЕРЕВОД"
+    elif mutation == "error_malformed":
+        rec["errors"] = {"balanced_literary": {"code": 42}}
+    elif mutation == "error_for_selected_role":
+        rec["errors"] = {
+            "balanced_literary": {"code": "invalid_json", "detail": "x"}
+        }
+    elif mutation == "strip_record_and_candidate":
+        # The exact RV3 adversarial reproduction: the sole whole_chapter
+        # record keeps chunk_id and the linked candidate_id, but the record
+        # loses status/expected_roles and the candidate loses
+        # translation/role.
+        rec.pop("status")
+        rec.pop("expected_roles")
+        cand.pop("translation")
+        cand.pop("role")
+    elif mutation == "extra_non_object_entry":
+        good["outcomes"].append("junk")
+    elif mutation == "extra_foreign_record":
+        good["outcomes"].append(dict(rec, chunk_id="chunk_0"))
+
+    gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    before = _snapshot_artifacts(cfg)
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    # Fail closed: no generation call, and every artifact (including the
+    # corrupt provenance itself) is byte-for-byte unchanged.
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "record_status_complete_on_incomplete",
+        "candidates_on_incomplete",
+        "no_errors_on_incomplete",
+        "error_malformed_on_incomplete",
+    ],
+)
+def test_whole_chapter_resume_rejects_malformed_incomplete_record(tmp_path, mutation):
+    # The same writer-schema contract holds for an incomplete_generation
+    # resume: the record must say status=incomplete with no candidates and a
+    # well-formed error map. A malformed incomplete record must fail closed
+    # with zero model calls and untouched artifacts.
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _BrokenCaller:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, bundle):
+            self.calls.append(bundle)
+            return "{not json"
+
+    first = _run_whole_chapter(cfg, model_caller=_BrokenCaller())
+    assert first.incomplete_generation_count == 1
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    good = json.loads(gen_path.read_text(encoding="utf-8"))
+    rec = good["outcomes"][0]
+
+    if mutation == "record_status_complete_on_incomplete":
+        rec["status"] = "complete"
+    elif mutation == "candidates_on_incomplete":
+        rec["candidates"] = {
+            "balanced_literary": {
+                "candidate_id": "whole_chapter:balanced_literary:deadbeef",
+                "role": "balanced_literary",
+                "translation": {"p00001": "Текст"},
+                "decision_trace": [],
+            }
+        }
+    elif mutation == "no_errors_on_incomplete":
+        rec["errors"] = {}
+    elif mutation == "error_malformed_on_incomplete":
+        rec["errors"] = {"balanced_literary": {"detail": "нет кода"}}
+
+    gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    before = _snapshot_artifacts(cfg)
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)

@@ -3275,6 +3275,220 @@ WHOLE_CHAPTER_SELECTION_SCHEMA = "pact-v4-whole-chapter-selection/v1"
 WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
 
 
+def _validate_whole_chapter_generation_record(
+    rec: Dict[str, Any],
+    *,
+    outcome: str,
+    selected_role: Optional[str],
+    selected_candidate_id: Optional[str],
+    raw_text_by_pid: Optional[Dict[str, str]],
+) -> None:
+    """Fail closed unless ``rec`` is a writer-produced whole-chapter record.
+
+    RV3 (t_27de970d): resume previously accepted a sole ``whole_chapter``
+    dict as the valid generation record as long as its ``chunk_id`` matched
+    and — for a selected journal entry — ``candidates[selected_role]`` was a
+    dict whose ``candidate_id`` equaled the journal's ``selected_candidate_id``.
+    A record stripped of ``status``/``expected_roles`` and a candidate
+    stripped of ``translation``/``role`` passed, was replayed, and selection/
+    provenance were then rewritten from the damaged data. This validates the
+    record against the exact schema ``_serialize_generation_outcome`` writes
+    before any artifact is touched:
+
+    * required record fields/types: ``chunk_id``, ``risk_band``,
+      ``expected_roles``, ``status``, ``candidates``, ``errors``;
+    * candidate fields used for provenance: ``candidate_id``, ``role``,
+      ``translation`` (a non-empty ``{pid: text}`` map of strings) and the
+      ``decision_trace`` audit trail;
+    * error shape (``{code, detail}`` strings);
+    * journal linkage: a ``selected`` outcome requires ``status ==
+      "complete"``, ``selected_role in expected_roles``, a well-formed
+      candidate for the role whose id/role match the journal's, and no error
+      recorded for the selected role;
+    * raw/provenance consistency: the selected candidate's serialized
+      ``translation`` must equal the raw snapshot being replayed, so a
+      damaged provenance can never seed a different translation;
+    * an ``incomplete_generation`` outcome requires ``status ==
+      "incomplete"`` with no candidates and a non-empty error map.
+
+    Every violation raises a Data loss / provenance ``ValueError`` — the
+    caller never reaches an artifact write.
+    """
+    if not isinstance(rec, dict):
+        raise ValueError(
+            "Data loss: whole_chapter generation record is not an object — "
+            "refusing to resume against malformed provenance."
+        )
+    if rec.get("chunk_id") != WHOLE_CHAPTER_CHUNK_ID:
+        raise ValueError(
+            "Data loss: whole_chapter generation record has chunk_id "
+            f"{rec.get('chunk_id')!r} — refusing to resume against "
+            "malformed provenance."
+        )
+    risk_band = rec.get("risk_band")
+    if not isinstance(risk_band, str) or not risk_band:
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "risk_band — refusing to resume against malformed provenance."
+        )
+    expected_roles = rec.get("expected_roles")
+    if (
+        not isinstance(expected_roles, list)
+        or not expected_roles
+        or not all(isinstance(role, str) and role for role in expected_roles)
+    ):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "expected_roles — refusing to resume against malformed "
+            "provenance."
+        )
+    status = rec.get("status")
+    if status not in ("complete", "incomplete"):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has invalid status "
+            f"{status!r} — refusing to resume against malformed provenance."
+        )
+    candidates = rec.get("candidates")
+    if not isinstance(candidates, dict):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "candidates object — refusing to resume against malformed "
+            "provenance."
+        )
+    errors = rec.get("errors")
+    if not isinstance(errors, dict):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "errors object — refusing to resume against malformed "
+            "provenance."
+        )
+    for role, cand in candidates.items():
+        if not isinstance(cand, dict):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} is not an object — refusing to resume "
+                "against malformed provenance."
+            )
+        cand_id = cand.get("candidate_id")
+        cand_role = cand.get("role")
+        translation = cand.get("translation")
+        trace = cand.get("decision_trace")
+        if not isinstance(cand_id, str) or not cand_id:
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has no valid candidate_id — refusing to "
+                "resume against malformed provenance."
+            )
+        if not isinstance(cand_role, str) or not cand_role or cand_role != role:
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has invalid role {cand_role!r} — refusing "
+                "to resume against malformed provenance."
+            )
+        if (
+            not isinstance(translation, dict)
+            or not translation
+            or not all(
+                isinstance(pid, str) and isinstance(text, str)
+                for pid, text in translation.items()
+            )
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has no valid translation PID map — "
+                "refusing to resume against malformed provenance."
+            )
+        if (
+            not isinstance(trace, list)
+            or not trace
+            or not all(
+                isinstance(gate, dict)
+                and isinstance(gate.get("gate"), str)
+                and isinstance(gate.get("passed"), bool)
+                and isinstance(gate.get("detail"), str)
+                for gate in trace
+            )
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has no valid decision_trace — refusing to "
+                "resume against malformed provenance."
+            )
+    for role, err in errors.items():
+        if (
+            not isinstance(err, dict)
+            or not isinstance(err.get("code"), str)
+            or not err.get("code")
+            or not isinstance(err.get("detail"), str)
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record error for role "
+                f"{role!r} is malformed — refusing to resume against "
+                "malformed provenance."
+            )
+    if outcome == "selected":
+        if status != "complete":
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"selected but the generation record status is {status!r} — "
+                "refusing to resume against malformed provenance."
+            )
+        if selected_role not in expected_roles:
+            raise ValueError(
+                "Data loss: whole_chapter generation record expected_roles "
+                f"{expected_roles!r} does not include selected_role "
+                f"{selected_role!r} — refusing to resume without journal "
+                "linkage."
+            )
+        cand = candidates.get(selected_role)
+        if not isinstance(cand, dict):
+            raise ValueError(
+                "Data loss: whole_chapter generation record has no "
+                f"candidate for selected_role {selected_role!r} — refusing "
+                "to resume without journal linkage."
+            )
+        if cand.get("candidate_id") != selected_candidate_id:
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate "
+                f"{cand.get('candidate_id')!r} does not match the journal's "
+                f"selected_candidate_id {selected_candidate_id!r}."
+            )
+        if selected_role in errors:
+            raise ValueError(
+                "Data loss: whole_chapter generation record records an "
+                f"error for the selected role {selected_role!r} while "
+                "claiming a complete outcome — refusing to resume against "
+                "malformed provenance."
+            )
+        if raw_text_by_pid is not None and cand.get("translation") != dict(
+            raw_text_by_pid
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate "
+                "translation does not match the raw snapshot — refusing to "
+                "resume against inconsistent provenance."
+            )
+    else:  # incomplete_generation
+        if status != "incomplete":
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"incomplete but the generation record status is {status!r} "
+                "-- refusing to resume against malformed provenance."
+            )
+        if candidates:
+            raise ValueError(
+                "Data loss: whole_chapter generation record claims "
+                "incomplete generation but carries candidates — refusing to "
+                "resume against malformed provenance."
+            )
+        if not errors:
+            raise ValueError(
+                "Data loss: whole_chapter generation record claims "
+                "incomplete generation but has no errors — refusing to "
+                "resume against malformed provenance."
+            )
+
+
 def _run_whole_chapter_strict(
     cfg: StrictRunConfig,
     *,
@@ -3523,39 +3737,47 @@ def _run_whole_chapter_strict(
                 "Data loss: journal says whole_chapter generation was "
                 f"{outcome} but {generation_path.name} has no outcomes array."
             )
-        whole_records = [
-            rec
+        # RV3: every entry in outcomes must itself be a well-formed
+        # whole_chapter record object — the whole-chapter writer emits
+        # exactly one whole_chapter record and nothing else, so a malformed
+        # or foreign entry must fail closed rather than be silently ignored
+        # while a sole whole_chapter dict is accepted as the valid record.
+        if not all(
+            isinstance(rec, dict) and rec.get("chunk_id") == WHOLE_CHAPTER_CHUNK_ID
             for rec in outcomes
-            if isinstance(rec, dict) and rec.get("chunk_id") == WHOLE_CHAPTER_CHUNK_ID
-        ]
+        ):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} contains a malformed "
+                "or foreign generation record — refusing to resume against "
+                "damaged provenance."
+            )
+        whole_records = list(outcomes)
         if len(whole_records) != 1:
             raise ValueError(
                 "Data loss: journal says whole_chapter generation was "
                 f"{outcome} but {generation_path.name} must contain exactly "
                 f"one whole_chapter record, found {len(whole_records)}."
             )
+        # RV3: the sole whole_chapter record must conform to the writer's
+        # serialized GenerationOutcome schema AND link to the journal's
+        # selected candidate/role. A record stripped of its required fields
+        # (status/expected_roles/candidates/errors) or a linked candidate
+        # stripped of its provenance fields (translation/role/candidate_id)
+        # is damaged provenance — failing closed here prevents selection/
+        # provenance from being rewritten from data the writer could never
+        # have produced. The selected candidate's serialized translation must
+        # also equal the raw snapshot being replayed (raw/provenance
+        # consistency), so a damaged provenance can never seed a different
+        # translation than the journal selected.
+        _validate_whole_chapter_generation_record(
+            whole_records[0],
+            outcome=outcome,
+            selected_role=selected_role,
+            selected_candidate_id=selected_candidate_id,
+            raw_text_by_pid=final_text_by_pid if outcome == "selected" else None,
+        )
         generation_records = [whole_records[0]]
-        if outcome == "selected":
-            # The generation record must be the one the journal selected:
-            # its candidate for the journal's selected_role must carry the
-            # journal's selected_candidate_id. A record that does not link to
-            # the journal candidate is provenance loss, not a resume.
-            candidates = whole_records[0].get("candidates")
-            if not isinstance(candidates, dict) or not isinstance(
-                candidates.get(selected_role), dict
-            ):
-                raise ValueError(
-                    "Data loss: whole_chapter generation record has no "
-                    f"candidate for selected_role {selected_role!r} — "
-                    "refusing to resume without journal linkage."
-                )
-            if candidates[selected_role].get("candidate_id") != selected_candidate_id:
-                raise ValueError(
-                    "Data loss: whole_chapter generation record candidate "
-                    f"{candidates[selected_role].get('candidate_id')!r} does "
-                    f"not match the journal's selected_candidate_id "
-                    f"{selected_candidate_id!r}."
-                )
     else:
         # ------------------------------------------------------------------
         # Fresh run: one whole-chapter generation call with bounded retry.
