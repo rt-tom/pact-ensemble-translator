@@ -22,12 +22,10 @@ model_names:
   qwen: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 server_args:
   gemma:
-    - --model-draft
-    - C:/llama-cpp/models/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf
-    - --spec-type
-    - draft-mtp
-    - --spec-draft-n-max
-    - "4"
+    # V4.1 (2026-08-09): sycl-edge build, reasoning-budget 2048, контекст 49k.
+    # Бинарь: C:\src\llama-sycl-edge\build\bin\llama-server.exe (env
+    # GGML_SYCL_FA_DECODE_KERNEL=auto, -dev SYCL0 задаются при запуске —
+    # см. план V4_1_WHOLE_CHAPTER_ARCHITECTURE_PLAN_RU.md §3.4).
     - -ngl
     - "99"
     - -ncmoe
@@ -35,14 +33,18 @@ server_args:
     - --load-mode
     - mmap
     - --reasoning-budget
-    - "0"
+    - "2048"
     - -np
     - "1"
     - -c
-    - "32768"
+    - "49152"
     - -fa
     - "on"
     - --jinja
+    - -ctk
+    - q8_0
+    - -ctv
+    - q4_0
     - --cache-ram
     - "0"
     - --ctx-checkpoints
