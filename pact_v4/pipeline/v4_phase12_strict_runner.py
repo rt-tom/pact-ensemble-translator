@@ -90,6 +90,7 @@ from pact_v4.phase2.generation import (
     GenerationParams,
     WholeChapterRetryPolicy,
     _GenerationValidationError,
+    _whole_chapter_risk,
     generate_for_chunk,
     generate_whole_chapter,
     validate_whole_chapter_raw,
@@ -415,6 +416,25 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _pid_diffs(
+    before: Mapping[str, str], after: Mapping[str, str]
+) -> Dict[str, Dict[str, str]]:
+    """``{pid: {before, after}}`` for PIDs whose text changed between stages.
+
+    V4.1 A2 (§7): the translation diff report is split by stage
+    (``raw->repaired`` and ``repaired->final``) so regressions can be
+    attributed to the stage that introduced them. PIDs with identical
+    text are omitted; only actually-changed PIDs appear.
+    """
+    diffs: Dict[str, Dict[str, str]] = {}
+    for pid in sorted(set(before) | set(after)):
+        before_text = before.get(pid)
+        after_text = after.get(pid)
+        if before_text != after_text:
+            diffs[pid] = {"before": before_text or "", "after": after_text or ""}
+    return diffs
 
 
 def _load_journal(journal_path: Path) -> List[Dict[str, Any]]:
@@ -2240,7 +2260,13 @@ def run_chapter_strict(
     )
 
     glossary = _glossary_entries(memory)
-    bible_text = render_bible_section(memory.book_memory)
+    # V4.1 A2 (§5.2): the bible is rendered per chapter from the
+    # deterministic chapter_index (no "first N" caps); when no
+    # chapter_index.json exists the renderer falls back to the legacy
+    # full-memory render, so runs without an index keep working.
+    bible_text = render_bible_section(
+        cfg.chapter_id, memory.chapter_index, memory.book_memory
+    )
     narrator_gender = extract_narrator_gender(memory.book_memory)
     narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
 
@@ -3620,6 +3646,12 @@ def _run_whole_chapter_strict(
     generation_records: List[Dict[str, Any]] = []
     halted_early = False
     halt_reason: Optional[str] = None
+    # V4.1 A2 (§5.3): whole-chapter glossary budget diagnostic row; filled
+    # on a fresh run, left empty on resume (a resumed run re-budgets
+    # nothing and must not clobber the prior session's report).
+    glossary_budget_report_whole: Dict[str, Any] = {
+        "kept": [], "dropped": [], "dropped_count": 0,
+    }
 
     progress.run_started(
         chapter_id=cfg.chapter_id,
@@ -3832,6 +3864,26 @@ def _run_whole_chapter_strict(
             temperature=cfg.temperature, seed=cfg.seed,
             max_tokens=cfg.max_tokens, reasoning=cfg.reasoning,
         )
+        # V4.1 A2 (§5.3): the glossary is filtered with the text of the
+        # WHOLE chapter (not per chunk) — only the chapter's terms + the
+        # always_include set (risk categories / conflicts / narrator)
+        # reach the prompt. Locked-policy variant (a): every established
+        # glossary entry is authoritative (presence + always_include); no
+        # separate locked artifact is introduced.
+        whole_chapter_text = " ".join(text for _, text in source.source)
+        whole_risk = _whole_chapter_risk(source, glossary)
+        chapter_glossary, chapter_dropped = _glossary_entries_for_chunk(
+            glossary,
+            chunk_text=whole_chapter_text,
+            risk_feature_codes=(feature.code for feature in whole_risk.features),
+            narrator_gender=narrator_gender,
+            narrator_source_terms=_narrator_glossary_terms(memory.book_memory),
+        )
+        glossary_budget_report_whole: Dict[str, Any] = {
+            "kept": [entry.source_term for entry in chapter_glossary],
+            "dropped": list(chapter_dropped),
+            "dropped_count": len(chapter_dropped),
+        }
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
         outcome = generate_whole_chapter(
@@ -3840,7 +3892,7 @@ def _run_whole_chapter_strict(
             snapshot=snapshot,
             chunk_plan=chunk_plan,
             pid_map=pid_map,
-            glossary=glossary,
+            glossary=chapter_glossary,
             bible_text=bible_text,
             config=config,
             params=params,
@@ -3913,6 +3965,59 @@ def _run_whole_chapter_strict(
     # equals the raw generator snapshot; the two files remain distinct so a
     # later A2/B stage can diverge them without losing the raw contract.
     _atomic_write_json(translations_path, final_text_by_pid)
+
+    # V4.1 A2 (§7): intermediate snapshots + diff report, written
+    # atomically (write-then-rename) with identity in every snapshot.
+    # `translations.json` remains the FINAL alias — these files are
+    # attribution snapshots, never a competing source of truth. In A2 the
+    # whole-chapter flow has no repair/formatting yet (B/B2/C), so
+    # repaired == raw and the diff stages are empty; the files establish
+    # the mechanism B2/C will populate.
+    if final_text_by_pid:
+        repaired_path = cfg.out_dir / "translations_repaired.json"
+        diffs_path = cfg.out_dir / "translation_diffs.json"
+        snapshot_identity = {
+            "schema": "pact-v4-snapshot-translations-repaired/v1",
+            "chapter_id": cfg.chapter_id,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+        }
+        _atomic_write_json(
+            repaired_path,
+            {**snapshot_identity, "translations": dict(final_text_by_pid)},
+        )
+        _atomic_write_json(
+            diffs_path,
+            {
+                "schema": "pact-v4-translation-diffs/v1",
+                "chapter_id": cfg.chapter_id,
+                "snapshot_hash": snapshot.snapshot_hash,
+                "chunk_plan_hash": chunk_plan.plan_hash,
+                "config_identity": config.config_identity,
+                "diffs": {
+                    "raw->repaired": _pid_diffs(
+                        final_text_by_pid, final_text_by_pid
+                    ),
+                    "repaired->final": _pid_diffs(
+                        final_text_by_pid, final_text_by_pid
+                    ),
+                },
+            },
+        )
+
+    # V4.1 A2 (§5.3): whole-chapter glossary budget diagnostic — kept/dropped
+    # pairs for the full chapter (same A1.1 diagnostic shape, one row).
+    if resumed_from_index == 0:
+        _atomic_write_json(cfg.out_dir / "glossary_budget_report.json", {
+            "schema": GLOSSARY_BUDGET_SCHEMA,
+            "policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
+            "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+            "glossary_total": len(glossary),
+            "narrator_gender": narrator_gender,
+            "chunks": {"whole_chapter": glossary_budget_report_whole},
+        })
 
     generation_record_id = None
     for rec in generation_records:
@@ -3999,7 +4104,10 @@ def _run_whole_chapter_strict(
             "generation_outcomes": str(generation_path),
             "selection_results": str(selection_path),
             "translations_raw": str(raw_translations_path),
+            "translations_repaired": str(cfg.out_dir / "translations_repaired.json"),
+            "translation_diffs": str(cfg.out_dir / "translation_diffs.json"),
             "translations": str(translations_path),
+            "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
             "journal": str(journal_path),
         },
     }

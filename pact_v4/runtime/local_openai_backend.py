@@ -133,13 +133,15 @@ class LocalOpenAIBackend:
             # ApiClient.complete and cannot silently honour transport
             # options that would change the model answer.
             if "reasoning" in request.request_options:
-                # V4.1: the reasoning budget is OpenCode-only (opencode
-                # serve 'reasoningEffort'). The local llama-server
-                # transport has no such field — refuse loudly with a
-                # reason instead of an opaque transport failure. The CLI
-                # fail-fast (validate_reasoning_backend) prevents this from
-                # being reached on the supported paths; this branch guards
-                # direct library-level use.
+                # V4.1 A2: the local generator receives its reasoning budget
+                # from the SERVER ARGS (--reasoning-budget, see plan §3.4),
+                # never from request_options — the OpenCode backend is the
+                # only transport that maps request_options reasoning to
+                # 'reasoningEffort'. The local llama-server transport has no
+                # such per-request field — refuse loudly with a reason
+                # instead of an opaque transport failure. The pipeline local
+                # path never emits reasoning request_options; this branch
+                # guards direct library-level use.
                 raise CompletionError(
                     f"{self._cfg.name}: request option 'reasoning' is only "
                     f"supported by the OpenCode backend (opencode serve "

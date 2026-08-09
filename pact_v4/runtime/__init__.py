@@ -21,11 +21,11 @@ These adapters are kept thin and explicit:
   ``CompletionRequest.request_options`` and the OpenCode backend maps to
   the top-level ``reasoningEffort`` field (opencode serve). The local
   ``llama-server`` transport has no such field and ``LocalOpenAIBackend``
-  rejects any request_options; the CLI fail-fast
-  (``validate_reasoning_backend``) rejects ``--reasoning > 0`` with a local
-  backend before the pipeline/server starts, and this package propagates
-  the local limit by *not* emitting any ``chat_template_kwargs.enable_thinking``
-  flag unless the caller asks for it explicitly. Other phases
+  rejects any request_options; since V4.1 A2 the local generator receives
+  its reasoning budget from the server args instead
+  (``--reasoning-budget``, see plan §3.4 — owner-verified 2026-08-08:
+  ``reasoning-budget 2048`` works), so ``validate_reasoning_backend`` no
+  longer blocks ``--reasoning > 0`` with a local backend. Other phases
   (audit/repair/formatting) never receive a reasoning budget on either
   transport.
 """

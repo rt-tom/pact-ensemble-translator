@@ -65,24 +65,28 @@ GEMMA_PATH = LLAMA_ROOT / "models" / "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
 GEMMA_DRAFT_PATH = LLAMA_ROOT / "models" / "MTP" / "mtp-gemma-4-26B-A4B-it-Q8_0.gguf"
 QWEN_PATH = LLAMA_ROOT / "models" / "Qwen3.6-35B-A3B" / "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 
-# Same validated SYCL profile as Measurement 2
+# V4.1 (2026-08-09): same validated SYCL profile as Measurement 2
 # (docs/plans/V4_SINGLE_RESIDENT_DRIVER_ARCHITECTURE_RU.md, "Результат
 # измерения 2") and the user's optimized production command line, so
 # lifecycle numbers from this real chapter trial are comparable to that
-# synthetic benchmark's.
+# synthetic benchmark's. Gemma context raised 32768 -> 49152 and
+# --reasoning-budget 0 -> 2048 per V4.1 §3.4 (owner-verified 2026-08-08:
+# reasoning-budget 2048 works); MTP draft is OFF in v4.1 (binary
+# C:\src\llama-sycl-edge\build\bin\llama-server.exe, -dev SYCL0 and env
+# GGML_SYCL_FA_DECODE_KERNEL=auto are set at launch — see plan §3.4).
 CONTEXT_SIZE = 32768
+GEMMA_CONTEXT_SIZE = 49152
 GEMMA_SERVER_ARGS = [
-    "--model-draft", str(GEMMA_DRAFT_PATH),
-    "--spec-type", "draft-mtp",
-    "--spec-draft-n-max", "4",
     "-ngl", "99",
     "-ncmoe", "18",
     "--load-mode", "mmap",
-    "--reasoning-budget", "0",
+    "--reasoning-budget", "2048",
     "-np", "1",
-    "-c", str(CONTEXT_SIZE),
+    "-c", str(GEMMA_CONTEXT_SIZE),
     "-fa", "on",
     "--jinja",
+    "-ctk", "q8_0",
+    "-ctv", "q4_0",
     "--cache-ram", "0",
     "--ctx-checkpoints", "0",
 ]
@@ -355,22 +359,24 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
     )
 
 
-def _load_bible_text(memory_dir: Path) -> str:
-    """Render the bible for adapter injection (B7).
+def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
+    """Render the bible for adapter injection (B7, V4.1 A2).
 
-    The strict driver renders the bible from ``book_memory.json`` for the
-    generation prompt itself (see ``run_chapter_strict``), but the audit,
-    fidelity and repair adapters are constructed *before* the driver
-    reloads memory. Loading the bible here and threading it into every
-    adapter at construction time is the only point where the v4 model
-    actually sees narrator gender/characters/facts — everywhere
-    ``run_chapter_strict`` would not re-render the bible.
+    The strict driver renders the bible from the per-chapter
+    ``chapter_index.json`` for the generation prompt itself (see
+    ``run_chapter_strict``), but the audit, fidelity and repair adapters
+    are constructed *before* the driver reloads memory. Loading the bible
+    here and threading it into every adapter at construction time is the
+    only point where the v4 model actually sees narrator
+    gender/characters/facts — everywhere ``run_chapter_strict`` would not
+    re-render the bible. When no ``chapter_index.json`` exists the
+    renderer falls back to the legacy full-memory render.
     """
     from pact_v4.runtime.bible_renderer import render_bible_section
     from pact_v4.runtime.snapshot_factory import ChapterMemory
 
     memory = ChapterMemory.from_directory(memory_dir)
-    return render_bible_section(memory.book_memory)
+    return render_bible_section(chapter_id, memory.chapter_index, memory.book_memory)
 
 
 def run_local_default(args: argparse.Namespace) -> int:
@@ -382,20 +388,21 @@ def run_local_default(args: argparse.Namespace) -> int:
     and remote profiles run the identical Phase 4 algorithm.
     """
     backend = StrictBackendConfig(
-        exe=Path(r"C:\llama-sycl-new\llama-server.exe"), device="SYCL0", host=args.host,
+        # V4.1 §3.4: sycl-edge build (reasoning-budget 2048 works; MTP off).
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
         model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
         model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
         server_args={"gemma": GEMMA_SERVER_ARGS, "qwen": QWEN_SERVER_ARGS},
         port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
     )
-    # V4.1 fail-fast: --reasoning > 0 is OpenCode-only. The local
-    # llama-server transport cannot express a reasoning effort, so reject the
-    # combination here (before the server starts) instead of at the first
-    # generation call.
+    # V4.1 A2: local no longer blocks --reasoning > 0 — the Gemma reasoning
+    # budget is transported via the server args (--reasoning-budget 2048),
+    # not request_options (validate_reasoning_backend accepts local now).
     validate_reasoning_backend(args.reasoning, backend)
     cfg = _build_run_config(args, backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    bible_text = _load_bible_text(args.memory_dir)
+    bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     router, model_caller, qwen_evaluator, gemma_selector, \
         qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
             backend, log_dir=args.out_dir / "server_logs", bible_text=bible_text,
@@ -423,14 +430,13 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     backend = _load_runtime_config_file(args.runtime_config)
     if args.managed_server:
         backend = force_managed(backend)
-    # V4.1 fail-fast: --reasoning > 0 needs an OpenCode (remote) generator
-    # backend. A local_llama profile (or a composite routing generator to a
-    # local sub-backend) cannot express a reasoning effort — reject before
-    # the server starts instead of at the first generation call.
+    # V4.1 A2: local no longer blocks --reasoning > 0 — reasoning for local
+    # is transported via server args (--reasoning-budget), not
+    # request_options; validate_reasoning_backend accepts local now.
     validate_reasoning_backend(args.reasoning, backend)
     _warn_remote_acknowledgement(backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    bible_text = _load_bible_text(args.memory_dir)
+    bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
     model_caller, qwen_evaluator, gemma_selector, \
         qwen_audit_evaluator, gemma_audit_evaluator = build_role_adapters(

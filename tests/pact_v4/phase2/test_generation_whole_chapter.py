@@ -30,7 +30,7 @@ from pact_v4.phase2.generation import (
     WholeChapterRetryPolicy,
     generate_whole_chapter,
 )
-from pact_v4.phase2.prompts import BALANCED_LITERARY_V1
+from pact_v4.phase2.prompts import BALANCED_LITERARY_V3
 from pact_v4.runtime.backend_protocol import CompletionError
 from pact_v4.runtime.snapshot_factory import (
     ChapterMemory,
@@ -160,9 +160,9 @@ def test_whole_chapter_generation_success_full_pid_exact_order(tmp_path):
     assert caller.calls[0].owned_pids == snapshot.pids
     assert caller.calls[0].left_context == ()
     assert caller.calls[0].right_context == ()
-    # The bundle uses the existing balanced_literary template (A1 keeps the
-    # current prompt; prompt v3 is A2).
-    assert caller.calls[0].template is BALANCED_LITERARY_V1
+    # The bundle uses the v3 balanced_literary template (A2: full §4 prompt
+    # with the inline BOOK CONTEXT / LOCKED GLOSSARY / STRICT-JSON contract).
+    assert caller.calls[0].template is BALANCED_LITERARY_V3
 
 
 @pytest.mark.parametrize(

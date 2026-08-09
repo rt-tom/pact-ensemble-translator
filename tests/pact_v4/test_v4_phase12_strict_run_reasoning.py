@@ -1,9 +1,11 @@
-"""V4.1 reasoning/backend CLI wiring tests (review commit 301e9df).
+"""V4.1 reasoning/backend CLI wiring tests (review commit 301e9df, A2 update).
 
-Covers the fail-fast boundary in ``v4_phase12_strict_run``: the CLI must
-reject ``--reasoning > 0`` with a local generator backend BEFORE the
-pipeline/server starts (no out_dir is created, no server is launched),
-while the remote OpenCode path still accepts and forwards the budget.
+Covers the reasoning/backend boundary in ``v4_phase12_strict_run``. Since
+V4.1 A2 (owner-verified 2026-08-08: ``--reasoning-budget 2048`` works) the
+local generator receives its reasoning budget from the SERVER ARGS, not
+from request_options — so ``--reasoning > 0`` is accepted with BOTH local
+and remote backends (no fail-fast), and the budget is forwarded into
+``StrictRunConfig.reasoning`` for every backend.
 
 The remote path is only exercised up to config construction — actually
 running ``run_with_runtime_config`` against a remote profile would hit the
@@ -45,20 +47,28 @@ def _base_args(tmp_path: Path, **extra) -> list:
     return args
 
 
-def test_run_local_default_rejects_reasoning_before_out_dir(tmp_path: Path):
-    # Default local path (StrictBackendConfig = local_llama): --reasoning 1
-    # must fail fast BEFORE out_dir creation / server start.
+@pytest.mark.parametrize("level", [1, 2, 3])
+def test_run_local_default_accepts_reasoning(tmp_path: Path, level: int):
+    # V4.1 A2: local no longer fail-fasts on --reasoning > 0 — the local
+    # generator receives the budget from server args (--reasoning-budget),
+    # so the combination is a supported path.
     args = cli.build_argparser().parse_args(
-        _base_args(tmp_path, reasoning=1)
+        _base_args(tmp_path, reasoning=level)
     )
-    with pytest.raises(ValueError, match="requires an OpenCode"):
-        cli.run_local_default(args)
-    # Fail-fast boundary: nothing was created, no server was started.
-    assert not (tmp_path / "out").exists()
+    cfg = cli._build_run_config(args, cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": cli.QWEN_PATH},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": cli.QWEN_PATH.name},
+        server_args={"gemma": cli.GEMMA_SERVER_ARGS, "qwen": cli.QWEN_SERVER_ARGS},
+        port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
+    ))
+    assert cfg.reasoning == level
 
 
-def test_run_with_runtime_config_local_rejects_reasoning_before_out_dir(tmp_path: Path):
-    # kind: local_llama runtime profile + --reasoning > 0 -> same fail-fast.
+@pytest.mark.parametrize("level", [1, 2, 3])
+def test_run_with_runtime_config_local_accepts_reasoning(tmp_path: Path, level: int):
+    # kind: local_llama runtime profile + --reasoning > 0 -> supported (A2).
     cfg_path = tmp_path / "runtime_local.yaml"
     cfg_path.write_text(
         "kind: local_llama\n"
@@ -78,11 +88,10 @@ def test_run_with_runtime_config_local_rejects_reasoning_before_out_dir(tmp_path
         encoding="utf-8",
     )
     args = cli.build_argparser().parse_args(
-        _base_args(tmp_path, reasoning=2, runtime_config=str(cfg_path))
+        _base_args(tmp_path, reasoning=level, runtime_config=str(cfg_path))
     )
-    with pytest.raises(ValueError, match="requires an OpenCode"):
-        cli.run_with_runtime_config(args)
-    assert not (tmp_path / "out").exists()
+    cfg = cli._build_run_config(args, cli._load_runtime_config_file(cfg_path))
+    assert cfg.reasoning == level
 
 
 @pytest.mark.parametrize("level", [1, 2, 3])

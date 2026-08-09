@@ -99,6 +99,47 @@ def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
     )
 
 
+def _reasoning_transported_via_request_options(
+    backend: CompletionBackend, model_ref: str
+) -> bool:
+    """Whether a reasoning budget for ``model_ref`` travels via request_options.
+
+    V4.1 A2 (plan §0.1/§3.4): the OpenCode backend maps request_options
+    reasoning to ``reasoningEffort`` — the request-level transport. Local
+    llama-server transports (``LocalOpenAIBackend``/``LocalRoutingBackend``
+    and composite profiles whose generator routes to a local sub-backend)
+    receive the reasoning budget from the SERVER ARGS
+    (``--reasoning-budget``), and ``LocalOpenAIBackend`` rejects any
+    request_options as a library-level guard — so the request to a local
+    generator must never carry reasoning request_options.
+
+    Composite backends are resolved down to the sub-backend that actually
+    serves ``model_ref``, so the decision follows the concrete transport.
+    """
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
+
+    if isinstance(backend, LocalOpenAIBackend):
+        return False
+    # LocalRoutingBackend / CompositeCompletionBackend live in runtime_config;
+    # imported lazily to keep the module-import graph acyclic (runtime_config
+    # imports this module inside build_role_adapters).
+    from pact_v4.runtime.runtime_config import (
+        CompositeCompletionBackend,
+        LocalRoutingBackend,
+    )
+
+    if isinstance(backend, LocalRoutingBackend):
+        return False
+    if isinstance(backend, CompositeCompletionBackend):
+        serving = backend.serving_backend(model_ref)
+        if serving is None:
+            # Unknown routing: fall back to request_options transport so the
+            # behaviour matches the historical path for unrecognised backends.
+            return True
+        return _reasoning_transported_via_request_options(serving, model_ref)
+    return True
+
+
 @dataclass(frozen=True)
 class BackendModelCallerConfig:
     """Phase 2B generation call settings.
@@ -161,17 +202,24 @@ class BackendModelCaller:
         # "fidelity_first"/"balanced_literary" to a different model than
         # "generator", this lookup honours the bundle role first and the
         # alias only as a fallback.
+        model_ref = _model_ref_for(self._backend, (bundle.role, "generator"))
         request_options: Dict[str, Any] = {}
-        if bundle.params.reasoning:
+        if bundle.params.reasoning and _reasoning_transported_via_request_options(
+            self._backend, model_ref
+        ):
             # V4.1: Phase 2B generation reasoning budget (0=off, 1=low,
             # 2=medium, 3=high). Transported via request_options so the
             # opencode backend can map it to the top-level ``reasoningEffort``
             # field; 0/absent keeps the historical B1 baseline (no field).
             # Only the generation caller carries it — the Qwen audit / repair
-            # / formatting adapters never set request_options.
+            # / formatting adapters never set request_options. V4.1 A2: local
+            # llama-server transports receive the reasoning budget from their
+            # server args (--reasoning-budget), so the request to them must
+            # NOT carry request_options reasoning (LocalOpenAIBackend rejects
+            # it — a library-level guard, plan §3.4/§0.1).
             request_options["reasoning"] = bundle.params.reasoning
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, (bundle.role, "generator")),
+            model_ref=model_ref,
             messages=(Message(role="user", content=user_text),),
             max_output_tokens=self._max_tokens,
             temperature=bundle.params.temperature,

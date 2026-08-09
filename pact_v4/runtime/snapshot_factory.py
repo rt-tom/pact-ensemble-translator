@@ -72,6 +72,10 @@ class ChapterMemory:
     glossary: Any
     book_memory: Any
     chapter_memory: Any = None
+    # V4.1 A2: deterministic per-chapter bible index (chapter_index.json,
+    # built by pact_full_pipeline_runner_v1/build_chapter_index.py).
+    # {chapter_id: {"characters": [...], "facts": [...], "address": [...]}}.
+    chapter_index: Any = None
     # Optional provenance: where the memory was loaded from. Recorded into
     # the returned ``Snapshot.context`` for human-readable provenance but
     # not part of the identity (the identity is the contents).
@@ -87,6 +91,10 @@ class ChapterMemory:
         """Load glossary/book_memory from ``<base_dir>/glossary.json`` and
         ``<base_dir>/book_memory.json`` (the same on-disk format the v3
         production pipeline uses, via ``MemoryManager``'s file paths).
+
+        ``chapter_index.json`` is loaded too when present (V4.1 A2); when
+        absent it defaults to ``None`` and ``render_bible_section`` falls
+        back to the legacy full-memory render.
         """
         base = Path(base_dir)
         manager = MemoryManager(str(base))
@@ -94,6 +102,7 @@ class ChapterMemory:
             glossary=_load_json(manager.glossary_path, {}),
             book_memory=_load_json(manager.book_memory_path, {}),
             chapter_memory=chapter_memory,
+            chapter_index=_load_json(manager.chapter_index_path, None),
             source_dir=base,
         )
 

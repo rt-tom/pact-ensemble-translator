@@ -465,6 +465,19 @@ class CompositeCompletionBackend:
             )
         return self._sub[name].complete(request)
 
+    def serving_backend(self, model_ref: str) -> Optional[CompletionBackend]:
+        """The sub-backend that would serve ``model_ref`` (or ``None``).
+
+        V4.1 A2: used to decide whether a request's reasoning travels via
+        ``request_options`` (remote/OpenCode) or via the local server args
+        (``--reasoning-budget``) — the decision must follow the concrete
+        transport that will actually execute the call.
+        """
+        name = self._ref_to_name.get(model_ref)
+        if name is None:
+            return None
+        return self._sub[name]
+
     def close(self) -> None:
         for backend in self._sub.values():
             backend.close()
@@ -614,36 +627,34 @@ def _generator_backend_cfg(backend: Any) -> Any:
 
 
 def validate_reasoning_backend(reasoning: int, backend: Any) -> None:
-    """Fail-fast V4.1 policy: a nonzero reasoning budget needs an OpenCode generator.
+    """Validate the Phase 2B reasoning budget against the generator backend.
 
-    The Phase 2B reasoning budget is transported as
-    ``CompletionRequest.request_options={"reasoning": N}`` and only the
-    OpenCode backend maps it (to the top-level ``reasoningEffort`` field,
-    1=low/2=medium/3=high). The local ``llama-server`` transport has no
-    such field: ``LocalOpenAIBackend`` rejects any request_options, so a
-    local run with ``--reasoning > 0`` would only fail at the first
-    generation call — after the pipeline/server had already started. This
-    helper rejects that combination up front with a clear diagnostic.
+    V4.1 A2 principle (owner-verified 2026-08-08: ``reasoning-budget 2048``
+    works): local no longer blocks ``--reasoning > 0``. Reasoning for local
+    ``llama-server`` transports is carried by the **server args**
+    (``--reasoning-budget`` in the profile's ``server_args`` — see §3.4),
+    NOT by ``CompletionRequest.request_options``; ``LocalOpenAIBackend``
+    keeps rejecting any request_options as a library-level guard, so a
+    local run must never send ``request_options`` and the CLI local path
+    never emits them. The OpenCode backend maps 1/2/3 -> ``reasoningEffort``
+    low/medium/high via request_options and remains the request-level
+    transport.
 
-    ``reasoning == 0`` (the B1 baseline) is always accepted — it emits no
-    request_options at all. For a composite profile the check follows the
-    ``generator`` role routing; the audit/repair/formatting adapters never
-    carry request_options, so only the generator backend matters.
+    ``reasoning == 0`` (the B1 baseline) emits no request_options and is
+    accepted on every backend. For a composite profile the check follows
+    the ``generator`` role routing; the audit/repair/formatting adapters
+    never carry request_options, so only the generator backend matters.
 
-    Raises ``ValueError`` when the combination is unsupported; returns
-    ``None`` otherwise.
+    A2: the local reject branch is removed — every backend accepts any
+    reasoning value (local transports it via server args; OpenCode via
+    request_options). The helper is kept as the single documented policy
+    point so future transport changes have one place to update.
     """
     if reasoning == 0:
         return
-    gen = _generator_backend_cfg(backend)
-    if isinstance(gen, LocalLlamaBackendConfig):
-        raise ValueError(
-            f"--reasoning {reasoning} requires an OpenCode (remote) generator "
-            f"backend: the local llama-server transport cannot express a "
-            f"reasoning effort (LocalOpenAIBackend rejects request_options). "
-            f"Use --reasoning 0 for local runs, or route the generator role "
-            f"to an opencode_server backend."
-        )
+    # No backend rejects reasoning any more (A2). Remote OpenCode maps it to
+    # reasoningEffort; local llama-server carries it via --reasoning-budget
+    # server args. Kept as a no-op policy hook for future constraints.
 
 
 # ---------------------------------------------------------------------------

@@ -950,3 +950,70 @@ def test_whole_chapter_resume_rejects_foreign_error_role(tmp_path):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
     _assert_unchanged(cfg, before)
+
+
+# ---------------------------------------------------------------------------
+# V4.1 A2 (§7): translations_repaired.json + translation_diffs.json snapshots
+# ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_writes_snapshots_with_identity_and_empty_diffs(tmp_path):
+    # A2 snapshot contract: translations_repaired.json + translation_diffs.json
+    # are written atomically (write-then-rename) with identity in every
+    # snapshot; the diff stages (raw->repaired, repaired->final) are SEPARATE.
+    # In A2 there is no repair/formatting yet (B/B2/C), so repaired == raw and
+    # both diff stages are empty — the files establish the mechanism B2/C will
+    # populate. translations.json stays the final alias (never a competing
+    # source of truth).
+    cfg = _whole_chapter_cfg(tmp_path)
+    result = _run_whole_chapter(cfg)
+    assert result.selected_count == 1
+
+    repaired_path = cfg.out_dir / "translations_repaired.json"
+    diffs_path = cfg.out_dir / "translation_diffs.json"
+    assert repaired_path.exists()
+    assert diffs_path.exists()
+
+    repaired = json.loads(repaired_path.read_text(encoding="utf-8"))
+    assert repaired["schema"] == "pact-v4-snapshot-translations-repaired/v1"
+    # Identity in every snapshot.
+    assert repaired["chapter_id"] == cfg.chapter_id
+    assert repaired["snapshot_hash"] == result.record["identities"]["snapshot_hash"]
+    assert repaired["chunk_plan_hash"] == result.record["identities"]["chunk_plan_hash"]
+    assert repaired["config_identity"] == result.record["identities"]["config_identity"]
+    # repaired == raw == final in A2 (no repair/formatting yet).
+    raw = json.loads((cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8"))
+    final = json.loads(result.translations_path.read_text(encoding="utf-8"))
+    assert repaired["translations"] == raw == final
+
+    diffs = json.loads(diffs_path.read_text(encoding="utf-8"))
+    assert diffs["schema"] == "pact-v4-translation-diffs/v1"
+    assert diffs["chapter_id"] == cfg.chapter_id
+    assert set(diffs["diffs"]) == {"raw->repaired", "repaired->final"}
+    # No changes between stages in A2 -> both diff maps empty.
+    assert diffs["diffs"]["raw->repaired"] == {}
+    assert diffs["diffs"]["repaired->final"] == {}
+    # Atomic write: write-then-rename, no leftover temp files.
+    assert not list(cfg.out_dir.glob("*.tmp"))
+
+    # The snapshots are attribution artifacts, not a competing final source:
+    # translations.json remains the final alias equal to raw.
+    assert final == raw
+
+
+def test_whole_chapter_writes_glossary_budget_report_whole_chapter(tmp_path):
+    # A2 (§5.3): the whole-chapter path records the full-chapter glossary
+    # budget (kept/dropped pairs) in glossary_budget_report.json.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    report_path = cfg.out_dir / "glossary_budget_report.json"
+    assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["chapter_id"] == cfg.chapter_id
+    assert "whole_chapter" in report["chunks"]
+    row = report["chunks"]["whole_chapter"]
+    assert set(row) == {"kept", "dropped", "dropped_count"}
+    assert row["dropped_count"] == len(row["dropped"])
+    # The kept glossary feeds the whole-chapter bundle: every kept term is
+    # present in the chapter text or always_include.
+    assert not list(cfg.out_dir.glob("*.tmp"))
