@@ -663,6 +663,7 @@ def _snapshot_artifacts(cfg):
         "selection_results.json",
         "generation_outcomes.json",
         "journal.ndjson",
+        "strict_chapter_trial_record.json",
     )
     snap = {}
     for name in names:
@@ -852,6 +853,100 @@ def test_whole_chapter_resume_rejects_malformed_incomplete_record(tmp_path, muta
 
     caller = StubModelCaller()
     with pytest.raises(ValueError, match="Data loss"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)
+
+
+# ---------------------------------------------------------------------------
+# RV4 (t_86913123) whole-chapter role-set consistency regression coverage.
+#
+# The writer emits exactly one expected role ([balanced_literary]) and keys
+# its candidate/error maps exactly to that declared role set. The three
+# bypasses below each keep the journal linkage (and, where relevant, a fully
+# well-formed candidate/error value) intact, so the old per-field checks
+# alone accepted them and resume proceeded with zero model calls and artifact
+# rewrites. Each must now fail closed with a Data loss ValueError, zero model
+# calls, and byte-for-byte unchanged artifacts — including the pre-existing
+# strict_chapter_trial_record.json (no new record).
+# ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_resume_rejects_foreign_candidate_role(tmp_path):
+    # RV4 Finding 1: adding a valid-but-foreign fidelity_first candidate to
+    # the sole record was accepted (set(candidates) vs expected_roles was
+    # never compared). The whole-chapter writer never emits a candidate for
+    # a role outside the exact [balanced_literary] contract.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    good = json.loads(gen_path.read_text(encoding="utf-8"))
+    rec = good["outcomes"][0]
+    bl = rec["candidates"]["balanced_literary"]
+    foreign = {
+        "candidate_id": "whole_chapter:fidelity_first:deadbeef",
+        "role": "fidelity_first",
+        "translation": dict(bl["translation"]),
+        "decision_trace": [{"gate": "gate_1", "passed": True, "detail": "x"}],
+    }
+    rec["candidates"]["fidelity_first"] = foreign
+    gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    before = _snapshot_artifacts(cfg)
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss.*fidelity_first"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)
+
+
+def test_whole_chapter_resume_rejects_extra_expected_role(tmp_path):
+    # RV4 Finding 2: mutating expected_roles to ['balanced_literary',
+    # 'fidelity_first'] while retaining only the selected candidate was
+    # accepted (only selected_role in expected_roles was checked). The
+    # whole-chapter writer declares exactly one expected role.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    good = json.loads(gen_path.read_text(encoding="utf-8"))
+    rec = good["outcomes"][0]
+    rec["expected_roles"] = ["balanced_literary", "fidelity_first"]
+    gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    before = _snapshot_artifacts(cfg)
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss.*expected_roles"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)
+
+
+def test_whole_chapter_resume_rejects_foreign_error_role(tmp_path):
+    # RV4 Finding 3: for an incomplete_generation resume, replacing the
+    # writer's error map with a valid error keyed by foreign_role was
+    # accepted (incomplete_generation_count=1, zero model calls), although
+    # the writer emits errors keyed by the expected role.
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _BrokenCaller:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, bundle):
+            self.calls.append(bundle)
+            return "{not json"
+
+    first = _run_whole_chapter(cfg, model_caller=_BrokenCaller())
+    assert first.incomplete_generation_count == 1
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    good = json.loads(gen_path.read_text(encoding="utf-8"))
+    rec = good["outcomes"][0]
+    rec["errors"] = {"foreign_role": {"code": "invalid_json", "detail": "x"}}
+    gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    before = _snapshot_artifacts(cfg)
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss.*foreign_role"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
     _assert_unchanged(cfg, before)

@@ -3274,6 +3274,12 @@ WHOLE_CHAPTER_SELECTION_SCHEMA = "pact-v4-whole-chapter-selection/v1"
 # the generation record's chunk_id (the whole chapter is one processing unit).
 WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
 
+# The whole-chapter writer contract (V4.1 A1): exactly one candidate role.
+# ``generate_whole_chapter`` is always invoked with this role, so a valid
+# whole-chapter generation record must declare exactly this role in
+# ``expected_roles`` and key its candidate/error maps to it.
+WHOLE_CHAPTER_ROLE = "balanced_literary"
+
 
 def _validate_whole_chapter_generation_record(
     rec: Dict[str, Any],
@@ -3301,6 +3307,12 @@ def _validate_whole_chapter_generation_record(
       ``translation`` (a non-empty ``{pid: text}`` map of strings) and the
       ``decision_trace`` audit trail;
     * error shape (``{code, detail}`` strings);
+    * the exact whole-chapter role-set contract (RV4 t_86913123): the
+      writer emits exactly one expected role, ``[balanced_literary]``, and
+      keys its candidate/error maps exactly to that declared role set — a
+      foreign/extra candidate role, an undeclared/duplicate/unknown expected
+      role, or an error keyed to a foreign role could never have been
+      produced by the writer and fails closed;
     * journal linkage: a ``selected`` outcome requires ``status ==
       "complete"``, ``selected_role in expected_roles``, a well-formed
       candidate for the role whose id/role match the journal's, and no error
@@ -3341,6 +3353,17 @@ def _validate_whole_chapter_generation_record(
             "Data loss: whole_chapter generation record has no valid "
             "expected_roles — refusing to resume against malformed "
             "provenance."
+        )
+    # RV4 (t_86913123): the whole-chapter writer emits exactly one expected
+    # role. An extra/foreign/duplicate/unknown role in expected_roles could
+    # never have been produced by the writer — refusing to replay selection/
+    # provenance from a record whose declared role set is not the exact
+    # writer shape.
+    if expected_roles != [WHOLE_CHAPTER_ROLE]:
+        raise ValueError(
+            "Data loss: whole_chapter generation record expected_roles "
+            f"{expected_roles!r} is not exactly [{WHOLE_CHAPTER_ROLE!r}] — "
+            "refusing to resume against malformed provenance."
         )
     status = rec.get("status")
     if status not in ("complete", "incomplete"):
@@ -3426,6 +3449,29 @@ def _validate_whole_chapter_generation_record(
                 f"{role!r} is malformed — refusing to resume against "
                 "malformed provenance."
             )
+    # RV4 (t_86913123): cross-field role-set consistency. The writer keys
+    # candidates and errors EXACTLY by the declared expected role(s) — a
+    # foreign/extra candidate role (e.g. a lazy-rescue fidelity_first
+    # candidate) or an error keyed to an undeclared role could never have
+    # been produced by the whole-chapter writer and must fail closed before
+    # any artifact write.
+    declared_roles = set(expected_roles)
+    foreign_candidate_roles = set(candidates) - declared_roles
+    if foreign_candidate_roles:
+        raise ValueError(
+            "Data loss: whole_chapter generation record candidate roles "
+            f"{sorted(foreign_candidate_roles)!r} are not declared in "
+            f"expected_roles {expected_roles!r} — refusing to resume "
+            "against malformed provenance."
+        )
+    foreign_error_roles = set(errors) - declared_roles
+    if foreign_error_roles:
+        raise ValueError(
+            "Data loss: whole_chapter generation record error roles "
+            f"{sorted(foreign_error_roles)!r} are not declared in "
+            f"expected_roles {expected_roles!r} — refusing to resume "
+            "against malformed provenance."
+        )
     if outcome == "selected":
         if status != "complete":
             raise ValueError(
