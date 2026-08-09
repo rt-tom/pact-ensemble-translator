@@ -3187,6 +3187,10 @@ def run_chapter_strict(
         "identities": {
             "source_hash": source.source_hash, "snapshot_hash": snapshot.snapshot_hash,
             "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+            # A2 review fix: the chapter_index (bible prompt) record that is
+            # part of the snapshot identity — recorded so a verifiable hash
+            # exists for audits/resume diagnosis.
+            "chapter_index_hash": snapshot.chapter_index_hash,
         },
         "backend": backend_block,
         "runtime": {
@@ -3582,28 +3586,73 @@ def _run_whole_chapter_strict(
 ) -> StrictChapterRunResult:
     """V4.1 A1 whole-chapter generation: one call per chapter.
 
+    V4.1 A2 review fix (RV, commit 4ab250b): resource cleanup (runtime /
+    progress writer / usage writer) is guaranteed on EVERY exit path. The
+    fail-closed resume validation (data-loss / foreign-identity ValueErrors
+    raised after ``progress.run_started``) used to bypass the successful-tail
+    cleanup and leak runtime/progress/usage resources; the impl now runs
+    inside ``try/finally`` so cleanup always happens while the fail-closed
+    error propagates unchanged.
+
+    The generation/provenance contract itself lives in
+    ``_run_whole_chapter_strict_impl``: one generation call per chapter with
+    the strict ``{pid: text}`` JSON contract and bounded retry
+    (``generate_whole_chapter``), plus the whole-chapter provenance contract
+    (journal, ``translations_raw.json``, ``translations.json``,
+    ``selection_results.json``, ``generation_outcomes.json``,
+    ``strict_chapter_trial_record.json``); Steps 6/7/8 are out of A1 scope and
+    recorded as skipped.
+    """
+    try:
+        return _run_whole_chapter_strict_impl(
+            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config, memory=memory, glossary=glossary, bible_text=bible_text,
+            narrator_gender=narrator_gender, model_caller=model_caller,
+            runtime=runtime, now_fn=now_fn, progress=progress,
+            usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+        )
+    finally:
+        # Terminal teardown on EVERY path (success, resume-validation
+        # failure, unexpected error): closes the remote backend / stops a
+        # managed server, releases the local router, closes the progress and
+        # usage writers. close() is idempotent (writers null their handle,
+        # coordinators guard on _closed), so running it here AND at the
+        # successful tail is safe.
+        try:
+            runtime.close()
+        except Exception:  # noqa: BLE001
+            LOG.exception("Failed to close runtime at end of whole-chapter run")
+        progress.close()
+        usage_writer.close()
+
+
+def _run_whole_chapter_strict_impl(
+    cfg: StrictRunConfig,
+    *,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    memory: Any,
+    glossary: Any,
+    bible_text: str,
+    narrator_gender: Optional[str],
+    model_caller: Any,
+    runtime: Any,
+    now_fn: Any,
+    progress: Any,
+    usage_writer: Any,
+    started_at: str,
+    wall_t0: float,
+) -> StrictChapterRunResult:
+    """Whole-chapter generation/provenance body (see the wrapper above).
+
     Derives the full ordered PID map (``WholeChapterPidMap``) from the
-    authoritative multi-chunk ``ChunkPlanArtifact`` (which stays on disk as
-    PID provenance, never replaced by a synthetic one-chunk plan), generates
-    the whole chapter in a single call with the strict ``{pid: text}`` JSON
-    contract and bounded retry (``generate_whole_chapter``), and writes the
-    whole-chapter provenance contract:
-
-    * journal — exactly one ``whole_chapter`` entry;
-    * ``translations_raw.json`` — the validated generator output (the raw
-      snapshot, written before any QA/repair; resume reads THIS file, never
-      the final ``translations.json`` alias);
-    * ``translations.json`` — the final alias (in A1 identical to raw);
-    * ``selection_results.json`` — always written with
-      ``pact-v4-whole-chapter-selection/v1`` (mode=not_applicable,
-      candidate_count=1, selection_performed=false, coverage=full_pid_map,
-      generation_record_id);
-    * ``generation_outcomes.json`` — one whole-chapter record
-      (candidate_id ``whole_chapter:<role>:<hash>``);
-    * ``strict_chapter_trial_record.json`` — the run record.
-
-    Steps 6/7/8 (audit/repair/formatting) are out of A1 scope (A2/B/B2/C) and
-    are recorded as skipped with a distinct reason.
+    authoritative multi-chunk ``ChunkPlanArtifact``, generates the whole
+    chapter in a single call with the strict ``{pid: text}`` JSON contract
+    and bounded retry (``generate_whole_chapter``), and writes the
+    whole-chapter provenance contract. Steps 6/7/8 are out of A1 scope and
+    recorded as skipped.
     """
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
     journal_path = cfg.out_dir / "journal.ndjson"
@@ -4064,6 +4113,10 @@ def _run_whole_chapter_strict(
             "chunk_plan_hash": chunk_plan.plan_hash,
             "config_identity": config.config_identity,
             "whole_chapter_pid_map_hash": pid_map.map_hash,
+            # A2 review fix: the chapter_index (bible prompt) record that is
+            # part of the snapshot identity — recorded so a verifiable hash
+            # exists for audits/resume diagnosis.
+            "chapter_index_hash": snapshot.chapter_index_hash,
         },
         "backend": backend_block,
         "runtime": {
@@ -4113,12 +4166,9 @@ def _run_whole_chapter_strict(
     }
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    try:
-        runtime.close()
-    except Exception:  # noqa: BLE001
-        LOG.exception("Failed to close runtime at end of whole-chapter run")
-    progress.close()
-    usage_writer.close()
+    # Terminal teardown lives in the wrapper's finally (_run_whole_chapter_strict),
+    # which runs on success AND on fail-closed resume-validation errors; nothing
+    # to close here (close() is idempotent, but the wrapper owns it now).
 
     return StrictChapterRunResult(
         chapter_id=cfg.chapter_id, out_dir=cfg.out_dir, chunk_count=1,

@@ -120,6 +120,14 @@ def _validate_identity_context(
             f"Foreign identity: source PID order {source_pids}, "
             f"expected {snapshot.pids}"
         )
+    # A2 review fix: the snapshot binds the canonical source content hash,
+    # so a source whose text changed (same PIDs) is a foreign identity and
+    # must never be validated against a snapshot built from different text.
+    if source.source_hash != snapshot.source_hash:
+        raise ValueError(
+            f"Foreign identity: source_hash={source.source_hash}, "
+            f"expected {snapshot.source_hash}"
+        )
     chunk_plan.validate_against(snapshot)
 
 
@@ -277,6 +285,19 @@ class Snapshot:
     the caller, so two snapshots with the same inputs are guaranteed to
     have the same identity and a tampered/foreign snapshot cannot claim an
     arbitrary hash.
+
+    A2 review fix (RV, commit 4ab250b): the snapshot identity now ALSO
+    binds the canonical ``source_hash`` (the exact source text/PID map the
+    translation is produced from) and the per-chapter bible record
+    (``chapter_index_hash`` — the canonical hash of the selected
+    ``chapter_index`` record, or of ``{}`` when no index exists). Without
+    these, two SourceArtifacts with the same PIDs but different text (or a
+    changed ``chapter_index.json``, which changes the bible prompt) shared
+    the same snapshot identity, so resume could silently replay a stale
+    translation against changed source/prompt content. Both fields are
+    validated hex content hashes and part of ``snapshot_hash``, so a
+    source/index change fails closed on resume (journal/provenance compare
+    ``snapshot_hash``).
     """
 
     chapter_id: str
@@ -285,12 +306,20 @@ class Snapshot:
     glossary_hash: str
     book_memory_hash: str
     chapter_memory_hash: str
+    source_hash: str
+    chapter_index_hash: str
     snapshot_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.chapter_id, "chapter_id")
         _require_unique_pids(self.pids, "Snapshot")
-        for name in ("glossary_hash", "book_memory_hash", "chapter_memory_hash"):
+        for name in (
+            "glossary_hash",
+            "book_memory_hash",
+            "chapter_memory_hash",
+            "source_hash",
+            "chapter_index_hash",
+        ):
             _require_hash(getattr(self, name), name)
         computed = canonical_json_hash({
             "chapter_id": self.chapter_id,
@@ -299,6 +328,8 @@ class Snapshot:
             "glossary_hash": self.glossary_hash,
             "book_memory_hash": self.book_memory_hash,
             "chapter_memory_hash": self.chapter_memory_hash,
+            "source_hash": self.source_hash,
+            "chapter_index_hash": self.chapter_index_hash,
         })
         object.__setattr__(self, "snapshot_hash", computed)
 

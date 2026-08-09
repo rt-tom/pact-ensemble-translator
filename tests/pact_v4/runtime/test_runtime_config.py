@@ -508,25 +508,63 @@ def test_local_config_rejects_non_string_server_args():
 
 
 # ---------------------------------------------------------------------------
-# V4.1 reasoning/backend compatibility policy (review commit 301e9df)
+# V4.1 reasoning/backend compatibility policy (review commit 301e9df; A2 RV
+# fix: local is no longer a no-op — CLI reasoning and local server args must
+# AGREE, so a profile that cannot express the requested value fails closed)
 # ---------------------------------------------------------------------------
+
+
+def _local_with_reasoning(budget: int = 2048) -> LocalLlamaBackendConfig:
+    """A local profile whose Gemma generator pins ``--reasoning-budget``.
+
+    Mirrors the supported A2 profile (plan §3.4: ``--reasoning-budget 2048``)
+    — the only local shape that can truthfully express ``--reasoning > 0``.
+    """
+    from dataclasses import replace
+
+    return replace(
+        _local(),
+        server_args={"gemma": ["-ngl", "99", "--reasoning-budget", str(budget)], "qwen": []},
+    )
 
 
 def test_validate_reasoning_backend_zero_is_baseline_for_local():
     # reasoning=0 (B1 baseline) is always accepted: it emits no
-    # request_options at all, so every backend works unchanged.
-    validate_reasoning_backend(0, _local())
+    # request_options at all, so every backend works unchanged — as long as
+    # the local profile does not pin a NONZERO budget the identity denies.
+    validate_reasoning_backend(0, _local())  # no --reasoning-budget arg
+    validate_reasoning_backend(0, _local_with_reasoning(budget=0))
 
 
 def test_validate_reasoning_backend_accepts_nonzero_for_local():
     # V4.1 A2 (owner-verified 2026-08-08): the local llama-server
     # transport receives the reasoning budget from the SERVER ARGS
     # (--reasoning-budget 2048, plan §3.4), not from request_options —
-    # so --reasoning > 0 with a local generator is a supported path and
-    # must NOT fail fast. LocalOpenAIBackend still rejects request_options
-    # as a library-level guard; the CLI local path never emits them.
+    # so --reasoning > 0 with a local generator whose server args EXPRESS
+    # the budget is the supported path and must NOT fail fast.
+    # LocalOpenAIBackend still rejects request_options as a library-level
+    # guard; the CLI local path never emits them.
     for level in (1, 2, 3):
-        validate_reasoning_backend(level, _local())
+        validate_reasoning_backend(level, _local_with_reasoning())
+
+
+def test_validate_reasoning_backend_rejects_nonzero_local_without_budget():
+    # A2 RV fix (HIGH): an arbitrary local profile with NO --reasoning-budget
+    # server arg cannot express --reasoning > 0 — the old no-op validation
+    # silently accepted it, so the config identity recorded a reasoning value
+    # the server never ran. Fail closed instead.
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="--reasoning-budget"):
+            validate_reasoning_backend(level, _local())
+
+
+def test_validate_reasoning_backend_rejects_zero_local_with_nonzero_budget():
+    # A2 RV fix: the DEFAULT CLI reasoning is 0, so a local profile that pins
+    # --reasoning-budget 2048 would start the server with reasoning the config
+    # identity (reasoning=0) denies. Fail closed; the default local CLI path
+    # derives budget 0 for --reasoning 0 (see _gemma_server_args_for_reasoning).
+    with pytest.raises(ValueError, match="--reasoning 0"):
+        validate_reasoning_backend(0, _local_with_reasoning())
 
 
 def test_validate_reasoning_backend_accepts_nonzero_for_opencode():
@@ -539,8 +577,8 @@ def test_validate_reasoning_backend_accepts_nonzero_for_opencode():
 def test_validate_reasoning_backend_composite_follows_generator_routing():
     # The check follows the composite's *generator* role routing: A2
     # accepts nonzero reasoning on every generator transport (remote via
-    # request_options, local via server args).
-    backends = {"remote": _remote(), "local": _local()}
+    # request_options, local via server args that express the budget).
+    backends = {"remote": _remote(), "local": _local_with_reasoning()}
     remote_gen = CompositeBackendConfig(
         backends=backends,
         role_backend_map={"generator": "remote", "fidelity_reviewer": "remote"},
@@ -556,13 +594,27 @@ def test_validate_reasoning_backend_composite_follows_generator_routing():
         validate_reasoning_backend(level, local_gen)
 
 
+def test_validate_reasoning_backend_composite_rejects_local_generator_without_budget():
+    # A composite whose generator routes to a local sub-backend WITHOUT a
+    # --reasoning-budget arg cannot express nonzero reasoning — fail closed
+    # even though the composite itself looks "remote-capable".
+    local_no_budget = _local()
+    local_gen = CompositeBackendConfig(
+        backends={"remote": _remote(), "local": local_no_budget},
+        role_backend_map={"generator": "local", "fidelity_reviewer": "remote"},
+    )
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="--reasoning-budget"):
+            validate_reasoning_backend(level, local_gen)
+
+
 def test_validate_reasoning_backend_composite_first_wins_without_generator_route():
     # Without an explicit generator routing the composite descriptor binds
     # the generator role to the FIRST sub-backend declaring it — the
     # reasoning policy must mirror that first-wins rule. A2: every
-    # generator transport accepts nonzero reasoning.
+    # generator transport that can express the value accepts nonzero.
     remote = _remote()
-    local = _local()
+    local = _local_with_reasoning()
     remote_first = CompositeBackendConfig(
         backends={"remote": remote, "local": local},
         role_backend_map={"fidelity_reviewer": "remote"},  # no generator key

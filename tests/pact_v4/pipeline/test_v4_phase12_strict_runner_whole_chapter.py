@@ -1017,3 +1017,343 @@ def test_whole_chapter_writes_glossary_budget_report_whole_chapter(tmp_path):
     # The kept glossary feeds the whole-chapter bundle: every kept term is
     # present in the chapter text or always_include.
     assert not list(cfg.out_dir.glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# A2 RV (review of commit 4ab250b): snapshot identity now binds source_hash +
+# chapter_index_hash. Resume against a changed source text (same PIDs) or a
+# changed chapter_index.json must fail closed — never silently replay a stale
+# translation built from different inputs.
+# ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_resume_fails_closed_on_source_text_change(tmp_path):
+    # RV finding 1 (HIGH): two SourceArtifacts with the same PID set but
+    # different text used to share one snapshot_hash, so resume replayed the
+    # old translation against the changed source. The snapshot identity now
+    # includes source_hash: a source text change (same PIDs) must fail closed
+    # on resume with zero generation calls and no artifact rewrite.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    assert len(_whole_chapter_journal(cfg)) == 1
+
+    # Rewrite the chapter HTML with DIFFERENT words but the SAME paragraph
+    # count -> same PIDs, different source text (the resume must fail closed).
+    from pathlib import Path
+
+    def _write_changed_chapter_html(path: Path, n_paragraphs: int) -> None:
+        paragraph_text = " ".join(f"changed{i}" for i in range(35))
+        body = "\n".join(f"<p>{paragraph_text}</p>" for _ in range(n_paragraphs))
+        path.write_text("<html><body>" + body + "</body></html>", encoding="utf-8")
+
+    _write_changed_chapter_html(cfg.chapter_html_path, n_paragraphs=24)
+    assert (cfg.chapter_html_path).exists()
+    assert "changed0" in cfg.chapter_html_path.read_text(encoding="utf-8")
+
+    before = _snapshot_artifacts(cfg)
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Foreign identity.*different snapshot/plan/config"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)
+
+
+def test_whole_chapter_resume_fails_closed_on_chapter_index_change(tmp_path):
+    # RV finding 2 (HIGH): chapter_index.json participates in the bible prompt
+    # but was absent from the snapshot identity, so changing it did not
+    # invalidate resume. The snapshot identity now includes the SELECTED
+    # chapter's index record: a changed record must fail closed on resume.
+    cfg = _whole_chapter_cfg(tmp_path)
+    index_path = cfg.memory_dir / "chapter_index.json"
+    index_path.write_text(json.dumps({
+        cfg.chapter_id: {"characters": ["Blake"], "facts": [], "address": []},
+    }, ensure_ascii=False), encoding="utf-8")
+    _run_whole_chapter(cfg)
+    assert len(_whole_chapter_journal(cfg)) == 1
+
+    # Change the SELECTED chapter's record -> different bible prompt.
+    index_path.write_text(json.dumps({
+        cfg.chapter_id: {"characters": ["Blake", "Duncan"], "facts": [], "address": []},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    before = _snapshot_artifacts(cfg)
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Foreign identity.*different snapshot/plan/config"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    _assert_unchanged(cfg, before)
+
+
+def test_whole_chapter_resume_chapter_index_other_chapter_change_is_noop(tmp_path):
+    # The SELECTED record is the identity input: a change to ANOTHER chapter's
+    # index record must NOT invalidate this chapter's resume (the bible prompt
+    # for this chapter is unchanged).
+    cfg = _whole_chapter_cfg(tmp_path)
+    index_path = cfg.memory_dir / "chapter_index.json"
+    index_path.write_text(json.dumps({
+        cfg.chapter_id: {"characters": ["Blake"], "facts": [], "address": []},
+        "ch999": {"characters": ["Other"], "facts": [], "address": []},
+    }, ensure_ascii=False), encoding="utf-8")
+    _run_whole_chapter(cfg)
+
+    index_path.write_text(json.dumps({
+        cfg.chapter_id: {"characters": ["Blake"], "facts": [], "address": []},
+        "ch999": {"characters": ["Other", "Changed"], "facts": [], "address": []},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    caller = StubModelCaller()
+    resumed = _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    assert resumed.resumed_from_index == 1
+
+
+def test_whole_chapter_record_identities_include_chapter_index_hash(tmp_path):
+    # RV finding 2: the strict_chapter_trial_record.json identities must carry
+    # a verifiable chapter_index_hash (the snapshot identity input).
+    cfg = _whole_chapter_cfg(tmp_path)
+    index_path = cfg.memory_dir / "chapter_index.json"
+    index_path.write_text(json.dumps({
+        cfg.chapter_id: {"characters": ["Blake"], "facts": [], "address": []},
+    }, ensure_ascii=False), encoding="utf-8")
+    result = _run_whole_chapter(cfg)
+    record = json.loads(result.record_path.read_text(encoding="utf-8"))
+    identities = record["identities"]
+    assert "chapter_index_hash" in identities
+    assert len(identities["chapter_index_hash"]) == 64
+    assert identities["snapshot_hash"] == result.record["identities"]["snapshot_hash"]
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 3: whole-chapter empty/truncated model output through the REAL
+# BackendModelCaller must yield a bounded, honest incomplete_generation (no
+# uncaught adapter JSON exception, no partial translation accepted). The
+# adapter retries empty/truncated bodies with its own JsonRetryPolicy budget
+# and re-raises EmptyResponseError/TruncatedJSONError on exhaustion — the
+# whole-chapter generation layer must catch/classify those, not crash.
+# ---------------------------------------------------------------------------
+
+
+def _scripted_model_caller(*scripts: str, adapter_max_retries: int = 0):
+    from tests.pact_v4.runtime.test_backend_role_adapters import (
+        ScriptedBackend,
+        _text_response,
+    )
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendModelCaller,
+        BackendModelCallerConfig,
+    )
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    backend = ScriptedBackend([_text_response(s) for s in scripts])
+    caller = BackendModelCaller(
+        backend,
+        config=BackendModelCallerConfig(
+            max_tokens=32768,
+            # 0 (default here) = the generation layer owns retry (what the CLI
+            # wires for whole-chapter runs); >0 = the adapter's own B4/B10
+            # JSON-retry budget, which on exhaustion re-raises the empty/
+            # truncated exception INTO the generation layer (the crash the A2
+            # RV found).
+            retry=JsonRetryPolicy(max_retries=adapter_max_retries),
+        ),
+    )
+    return caller, backend
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [
+        "",  # empty body
+        "{truncated json",  # truncated / malformed JSON
+    ],
+)
+def test_whole_chapter_empty_or_truncated_output_via_backend_model_caller(
+    tmp_path, bad_output
+):
+    # The whole-chapter retry budget (WholeChapterRetryPolicy.max_attempts=3)
+    # is the SINGLE retry owner (adapter JSON retry disabled, as the CLI wires
+    # for whole-chapter runs); each generation attempt is exactly one backend
+    # call. An always-bad model exhausts the budget honestly:
+    # incomplete_generation, zero selected, no translations_raw written, no
+    # uncaught exception.
+    from pact_v4.phase2.generation import WholeChapterRetryPolicy
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    caller, backend = _scripted_model_caller(*([bad_output] * WholeChapterRetryPolicy().max_attempts))
+    result = _run_whole_chapter(cfg, model_caller=caller)
+
+    assert result.incomplete_generation_count == 1
+    assert result.selected_count == 0
+    assert result.halted_early is True
+    assert "whole_chapter generation incomplete" in (result.halt_reason or "")
+    assert len(backend.requests) == WholeChapterRetryPolicy().max_attempts
+    assert not (cfg.out_dir / "translations_raw.json").exists()
+
+    sel = json.loads((cfg.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+    assert sel["candidate_count"] == 0
+    assert sel["generation_record_id"] is None
+
+    journal = _whole_chapter_journal(cfg)
+    assert journal[0]["outcome"] == "incomplete_generation"
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [
+        "",  # empty body
+        "{truncated json",  # truncated / malformed JSON
+    ],
+)
+def test_whole_chapter_adapter_budget_exhaustion_is_classified_not_crash(
+    tmp_path, bad_output
+):
+    # A2 RV finding 3 reproduction: with the DEFAULT adapter JSON retry budget
+    # (max_retries=2), BackendModelCaller retries the bad body 3 times and then
+    # re-raises EmptyResponseError/TruncatedJSONError. The whole-chapter
+    # generation layer must catch/classify that (INVALID_JSON inside its own
+    # bounded loop) and return an honest incomplete_generation — NOT crash
+    # with an uncaught adapter exception. Total model calls stay bounded:
+    # max_attempts(3) × adapter budget(3) = 9.
+    from pact_v4.phase2.generation import WholeChapterRetryPolicy
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    adapter_calls_per_attempt = JsonRetryPolicy().max_retries + 1  # 3
+    total = WholeChapterRetryPolicy().max_attempts * adapter_calls_per_attempt
+    caller, backend = _scripted_model_caller(
+        *([bad_output] * total), adapter_max_retries=JsonRetryPolicy().max_retries,
+    )
+    result = _run_whole_chapter(cfg, model_caller=caller)
+
+    assert result.incomplete_generation_count == 1
+    assert result.selected_count == 0
+    assert result.halted_early is True
+    assert "whole_chapter generation incomplete" in (result.halt_reason or "")
+    assert len(backend.requests) == total
+    assert not (cfg.out_dir / "translations_raw.json").exists()
+    journal = _whole_chapter_journal(cfg)
+    assert journal[0]["outcome"] == "incomplete_generation"
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 7: resource cleanup must run on EVERY exit path — including
+# fail-closed resume validation errors (which occur after progress.run_started
+# and used to bypass runtime.close()/writers close).
+# ---------------------------------------------------------------------------
+
+
+class _CloseTrackingProgress:
+    def __init__(self):
+        self.closed = False
+        self.started = 0
+
+    def run_started(self, **kwargs):
+        self.started += 1
+
+    def chunk_started(self, **kwargs):
+        pass
+
+    def chunk_done(self, **kwargs):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _CloseTrackingUsageWriter:
+    def __init__(self):
+        self.closed = False
+
+    def write_call(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _CloseTrackingRuntime:
+    def __init__(self):
+        self.closed = False
+        self._events = []
+
+    def set_usage_writer(self, writer):
+        pass
+
+    def event_count(self):
+        return len(self._events)
+
+    def events_since(self, index):
+        return self._events[index:]
+
+    def local_switch_event_indices(self, start):
+        return []
+
+    def release(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def summary(self):
+        return {"local_lifecycle": None, "remote_calls": []}
+
+    @property
+    def backend_descriptor(self):
+        from pact_v4.runtime.backend_protocol import BackendDescriptor
+
+        return BackendDescriptor(
+            kind="local_llama",
+            transport_version="openai-chat-completions/v1",
+            endpoint_family="openai_chat_completions",
+            public_endpoint="http://127.0.0.1:8094",
+            model_bindings={},
+            effective_options={},
+        )
+
+
+def test_whole_chapter_resume_validation_failure_closes_resources(tmp_path):
+    # A malformed whole-chapter resume (missing generation_outcomes.json)
+    # raises a fail-closed Data-loss ValueError AFTER progress.run_started —
+    # runtime/progress/usage writers must still be closed (the wrapper's
+    # finally guarantees cleanup while the error propagates unchanged).
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    (cfg.out_dir / "generation_outcomes.json").unlink()
+
+    runtime = _CloseTrackingRuntime()
+    progress = _CloseTrackingProgress()
+    usage = _CloseTrackingUsageWriter()
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss.*generation_outcomes.json.*missing"):
+        run_chapter_strict(
+            cfg, runtime=runtime, model_caller=caller,
+            qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
+            qwen_audit_evaluator=StubQwenAudit(), gemma_audit_evaluator=StubGemmaAudit(),
+            progress=progress, usage_writer=usage,
+        )
+    assert len(caller.calls) == 0
+    assert progress.started >= 1
+    assert runtime.closed is True
+    assert progress.closed is True
+    assert usage.closed is True
+
+
+def test_whole_chapter_success_closes_resources(tmp_path):
+    # Cleanup also runs on the SUCCESS path (wrapper finally, not just the
+    # old successful-tail close).
+    cfg = _whole_chapter_cfg(tmp_path)
+    runtime = _CloseTrackingRuntime()
+    progress = _CloseTrackingProgress()
+    usage = _CloseTrackingUsageWriter()
+    result = run_chapter_strict(
+        cfg, runtime=runtime, model_caller=_LifecycleAwareModelCaller(
+            _make_router(), StubModelCaller()
+        ),
+        qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
+        qwen_audit_evaluator=StubQwenAudit(), gemma_audit_evaluator=StubGemmaAudit(),
+        progress=progress, usage_writer=usage,
+    )
+    assert result.selected_count == 1
+    assert runtime.closed is True
+    assert progress.closed is True
+    assert usage.closed is True

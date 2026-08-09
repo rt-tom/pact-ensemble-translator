@@ -729,6 +729,27 @@ def _CompletionErrorType() -> type:
     return CompletionError
 
 
+def _JsonResilienceErrorTypes() -> tuple:
+    """The adapter JSON-resilience failure types, imported lazily.
+
+    ``BackendModelCaller`` retries an empty/truncated body up to its own
+    ``JsonRetryPolicy`` budget (``retry_json_call``) and re-raises
+    ``EmptyResponseError`` / ``TruncatedJSONError`` when exhausted. Those are
+    ``ValueError`` subclasses, NOT ``CompletionError``, so without an explicit
+    catch the whole-chapter bounded-retry loop (which catches only
+    ``CompletionError`` as a session abort) would let the adapter's exhaustion
+    exception escape and crash the run instead of returning an honest
+    ``incomplete_generation``. Imported lazily for the same reason as
+    ``_CompletionErrorType`` (runtime package imports this module).
+    """
+    from pact_v4.runtime.json_resilience import (  # noqa: PLC0415
+        EmptyResponseError,
+        TruncatedJSONError,
+    )
+
+    return (EmptyResponseError, TruncatedJSONError)
+
+
 def validate_whole_chapter_raw(
     raw: str, pid_map: WholeChapterPidMap
 ) -> Tuple[Tuple[str, str], ...]:
@@ -840,6 +861,25 @@ def generate_whole_chapter(
             last_error = GenerationError(
                 role,
                 GenerationErrorCode.SESSION_ABORT,
+                f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
+            )
+            if attempt < retry.max_attempts - 1:
+                time.sleep(retry.delay_for(attempt))
+                continue
+            break
+        except _JsonResilienceErrorTypes() as exc:
+            # A2 review fix: ``BackendModelCaller`` re-raises
+            # EmptyResponseError/TruncatedJSONError after ITS OWN bounded JSON
+            # retry budget is exhausted. Those are ValueError subclasses, not
+            # CompletionError, so they used to escape this loop and crash the
+            # run instead of producing an honest incomplete_generation. Now
+            # they are classified as INVALID_JSON (empty/truncated body) inside
+            # the whole-chapter bounded retry: total attempts stay bounded by
+            # retry.max_attempts, no partial translation is accepted, and the
+            # failure is recorded truthfully.
+            last_error = GenerationError(
+                role,
+                GenerationErrorCode.INVALID_JSON,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
             if attempt < retry.max_attempts - 1:

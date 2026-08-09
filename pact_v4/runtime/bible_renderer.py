@@ -198,9 +198,15 @@ def render_bible_section(
     caller omits the section entirely). The output is deterministic for
     the same input — no set iteration without sorting, no randomness.
     """
-    # Legacy call form: render_bible_section(book_memory)
+    # Legacy call form: render_bible_section(book_memory) — a Mapping passed
+    # POSITIONALLY as the first argument. A2 review fix (RV, commit 4ab250b):
+    # the KEYWORD form render_bible_section(book_memory=m) (chapter_id=None)
+    # must preserve the explicit book_memory instead of overwriting it with
+    # chapter_id (None), which used to return an empty string for a valid
+    # memory. Positional Mapping and explicit keyword now behave identically.
     if chapter_id is None or isinstance(chapter_id, Mapping):
-        book_memory = chapter_id
+        if isinstance(chapter_id, Mapping):
+            book_memory = chapter_id
         return _render_legacy_bible(book_memory)
 
     entry = None

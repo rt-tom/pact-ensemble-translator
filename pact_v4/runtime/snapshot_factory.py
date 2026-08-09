@@ -139,6 +139,18 @@ def build_snapshot(
     is a partition of these). The memory hashes are derived from the
     *contents* the driver passes in here, never from file paths, so the
     snapshot identity moves with the data.
+
+    A2 review fix (RV, commit 4ab250b): the snapshot identity now ALSO
+    binds the canonical ``source_hash`` (``SourceArtifact.source_hash`` —
+    the exact PID→text content the translation is produced from) and
+    ``chapter_index_hash`` (the canonical hash of the SELECTED per-chapter
+    bible record, or of ``{}`` when no ``chapter_index.json`` exists).
+    Without this, a changed source text (same PIDs) or a changed
+    ``chapter_index.json`` (which changes ``render_bible_section``/the
+    bible prompt) left ``snapshot_hash`` unchanged, so resume could replay
+    a stale translation against changed inputs. Both hashes flow into
+    ``Snapshot.snapshot_hash``, and journal/generation provenance compare
+    that hash on resume — so a source/index change fails closed.
     """
     pids = tuple(pid for pid, _ in source.source)
     glossary_hash = _hash_canonical_json(memory.glossary)
@@ -146,6 +158,15 @@ def build_snapshot(
     chapter_memory_hash = _hash_canonical_json(
         memory.chapter_memory if memory.chapter_memory is not None else {}
     )
+    # The bible prompt for THIS chapter is rendered from the selected
+    # chapter_index record (render_bible_section(chapter_id, chapter_index,
+    # book_memory) -> chapter_index[chapter_id]); the selected record is the
+    # canonical identity input for this chapter, so changes to another
+    # chapter's record do not invalidate this chapter's snapshot.
+    selected_chapter_index = None
+    if isinstance(memory.chapter_index, Mapping):
+        selected_chapter_index = memory.chapter_index.get(chapter_id)
+    chapter_index_hash = _hash_canonical_json(selected_chapter_index)
     return Snapshot(
         chapter_id=chapter_id,
         pids=pids,
@@ -153,6 +174,8 @@ def build_snapshot(
         glossary_hash=glossary_hash,
         book_memory_hash=book_memory_hash,
         chapter_memory_hash=chapter_memory_hash,
+        source_hash=source.source_hash,
+        chapter_index_hash=chapter_index_hash,
     )
 
 

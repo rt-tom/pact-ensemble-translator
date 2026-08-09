@@ -260,16 +260,40 @@ def build_chapter_index(
 
 
 def load_glossary(memory_dir: str) -> List[GlossaryEntry]:
-    """Load ``glossary.json`` as ``GlossaryEntry`` list (tolerant)."""
+    """Load ``glossary.json`` as ``GlossaryEntry`` list (tolerant).
+
+    Accepts all production shapes:
+
+    * a flat mapping ``{source: target}`` (the current production
+      ``D:/pact/pact_chapters/glossary.json`` — 137 entries, values are
+      plain target strings);
+    * a flat mapping with target LISTS ``{source: [target, ...]}``;
+    * the wrapped list form ``{"entries": [{"source": ..., "targets":
+      [...]}, ...]}``;
+    * a bare list of such entry mappings.
+
+    A2 review fix (RV, commit 4ab250b): the flat production glossary was
+    silently ignored (the loader only accepted a list or a mapping with an
+    ``entries`` list), so locked/conflict entries were absent from
+    ``chapter_index.json``. Every source term in any shape becomes a
+    ``GlossaryEntry``; target values may be a string or a list of strings.
+    """
     manager = MemoryManager(memory_dir)
     glossary = load_json(manager.glossary_path, {})
     entries: List[GlossaryEntry] = []
+    raw_entries: Sequence[Any] = []
     if isinstance(glossary, list):
         raw_entries = glossary
     elif isinstance(glossary, Mapping):
-        raw_entries = glossary.get("entries", []) if isinstance(glossary.get("entries"), list) else []
-    else:
-        raw_entries = []
+        wrapped = glossary.get("entries")
+        if isinstance(wrapped, list):
+            raw_entries = wrapped
+        else:
+            # Flat production glossary {source: target} / {source: [targets]}.
+            raw_entries = [
+                {"source": str(source), "targets": target}
+                for source, target in glossary.items()
+            ]
     for entry in raw_entries:
         if not isinstance(entry, Mapping):
             continue

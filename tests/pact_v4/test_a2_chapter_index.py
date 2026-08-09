@@ -212,3 +212,119 @@ def test_render_bible_section_legacy_form_still_supported():
     assert "Narrator: male" in render_bible_section(memory)
     assert render_bible_section({}) == ""
     assert render_bible_section(None) == ""
+
+
+def test_render_bible_section_keyword_book_memory_compatible():
+    # A2 RV fix (MEDIUM): render_bible_section(book_memory=m) — the KEYWORD
+    # legacy form — used to return an empty string (chapter_id=None clobbered
+    # the explicit book_memory). It must render the legacy bible exactly like
+    # the positional form.
+    memory = {"pov": {"gender": "male"}, "characters": {"Blake": {"gender": "male"}}}
+    positional = render_bible_section(memory)
+    assert "Narrator: male" in positional
+    keyword = render_bible_section(book_memory=memory)
+    assert keyword == positional
+    assert "Narrator: male" in keyword
+
+
+# ---------------------------------------------------------------------------
+# load_glossary: flat production glossary (A2 RV fix)
+# ---------------------------------------------------------------------------
+
+
+def _memory_dir_with_glossary(tmp_path, payload):
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(exist_ok=True)
+    (memory_dir / "glossary.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+    )
+    return str(memory_dir)
+
+
+def test_load_glossary_flat_production_shape(tmp_path):
+    # A2 RV fix (HIGH/MEDIUM): the PRODUCTION D:/pact/pact_chapters/
+    # glossary.json is FLAT {source: target} (137 string-valued entries), but
+    # load_glossary only accepted a list or {'entries': [...]} — so locked/
+    # conflict entries were silently absent from chapter_index.json. A flat
+    # mapping must load every source term.
+    from pact_full_pipeline_runner_v1.build_chapter_index import load_glossary
+
+    memory_dir = _memory_dir_with_glossary(tmp_path, {
+        "Blake": "Блэйк",
+        "Aimon Behaim": "Эймон Бехайм",
+        "Paige": "Пэйдж",
+    })
+    entries = load_glossary(memory_dir)
+    by_source = {e.source_term: e.target_terms for e in entries}
+    assert by_source == {
+        "Blake": ("Блэйк",),
+        "Aimon Behaim": ("Эймон Бехайм",),
+        "Paige": ("Пэйдж",),
+    }
+
+
+def test_load_glossary_flat_shape_with_target_lists(tmp_path):
+    # Flat {source: [target, ...]} values are tolerated too (a target list is
+    # a documented glossary shape).
+    from pact_full_pipeline_runner_v1.build_chapter_index import load_glossary
+
+    memory_dir = _memory_dir_with_glossary(tmp_path, {
+        "Blake": ["Блэйк", "Блейк"],
+        "Aimon": "Эймон",
+    })
+    entries = load_glossary(memory_dir)
+    by_source = {e.source_term: e.target_terms for e in entries}
+    assert by_source["Blake"] == ("Блэйк", "Блейк")
+    assert by_source["Aimon"] == ("Эймон",)
+
+
+def test_load_glossary_wrapped_and_list_shapes_still_work(tmp_path):
+    # Non-regression: the wrapped {'entries': [...]} and bare-list shapes the
+    # A2 loader already accepted keep working.
+    from pact_full_pipeline_runner_v1.build_chapter_index import load_glossary
+
+    wrapped = _memory_dir_with_glossary(tmp_path, {
+        "entries": [
+            {"source": "Blake", "targets": ["Блэйк"]},
+            {"source_term": "June", "target_terms": ["Джун"]},
+        ]
+    })
+    entries = load_glossary(wrapped)
+    assert {e.source_term for e in entries} == {"Blake", "June"}
+
+    listed = _memory_dir_with_glossary(tmp_path, [
+        {"source": "Paige", "targets": "Пэйдж"},
+    ])
+    entries = load_glossary(listed)
+    assert {e.source_term for e in entries} == {"Paige"}
+
+
+def test_build_index_file_includes_locked_terms_from_flat_glossary(tmp_path):
+    # A2 RV fix: with the flat production glossary the locked/conflict policy
+    # reaches the chapter index — a glossary CONFLICT source term (two
+    # distinct targets) absent from the chapter text is still ALWAYS included
+    # (fail-closed). Uses the flat-with-target-list shape to exercise both
+    # the flat parsing and the conflict locking.
+    from pact_full_pipeline_runner_v1.build_chapter_index import build_index_file
+
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "book_memory.json").write_text(
+        json.dumps(_book_memory(), ensure_ascii=False), encoding="utf-8",
+    )
+    (memory_dir / "glossary.json").write_text(
+        json.dumps({"Aimon Behaim": ["Эймон", "Аймон"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    chapter_html = tmp_path / "chapter.html"
+    chapter_html.write_text(
+        "<html><body><p id='p1'>Blake walked alone.</p></body></html>",
+        encoding="utf-8",
+    )
+    entry = build_index_file(
+        memory_dir=str(memory_dir), chapter_html=str(chapter_html),
+        chapter_id="0001", out_path="",
+    )
+    # Aimon Behaim is a glossary conflict -> locked, present even though the
+    # chapter text never mentions him.
+    assert "Aimon Behaim" in entry["characters"]

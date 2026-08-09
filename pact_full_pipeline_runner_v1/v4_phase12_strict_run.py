@@ -46,6 +46,7 @@ from pact_v4.pipeline.v4_phase12_strict_runner import (
     run_chapter_strict,
 )
 from pact_v4.pipeline.phase_progress import PhaseProgressWriter
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
     LocalLlamaBackendConfig,
@@ -108,6 +109,28 @@ QWEN_SERVER_ARGS = [
     "--cache-ram", "0",
     "--ctx-checkpoints", "0",
 ]
+
+
+def _gemma_server_args_for_reasoning(reasoning: int) -> list:
+    """The §3.4 sycl-edge Gemma server args bound to the selected reasoning.
+
+    V4.1 A2 review fix (RV, commit 4ab250b): the local generator's reasoning
+    budget is transported via ``--reasoning-budget`` in the server args, so
+    the args must AGREE with the CLI/config reasoning value or the config
+    identity would record a reasoning level the server does not actually
+    run. ``reasoning > 0`` (the supported A2 profile, §3.4) keeps the fixed
+    ``2048`` budget; ``reasoning == 0`` (the B1 baseline) pins the budget to
+    ``0`` so a default run never silently starts the server with reasoning
+    the identity denies. The base §3.4 args (``GEMMA_SERVER_ARGS``) are
+    unchanged — only the budget value is derived here.
+    """
+    budget = "2048" if reasoning > 0 else "0"
+    args = list(GEMMA_SERVER_ARGS)
+    for index, arg in enumerate(args):
+        if arg == "--reasoning-budget" and index + 1 < len(args):
+            args[index + 1] = budget
+            return args
+    return args + ["--reasoning-budget", budget]
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -393,7 +416,15 @@ def run_local_default(args: argparse.Namespace) -> int:
         device="SYCL0", host=args.host,
         model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
         model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
-        server_args={"gemma": GEMMA_SERVER_ARGS, "qwen": QWEN_SERVER_ARGS},
+        # V4.1 A2 review fix: the Gemma server args are DERIVED from the
+        # selected reasoning (budget 2048 for --reasoning>0 per §3.4, 0 for
+        # the B1 baseline), so CLI/config identity, server args and the
+        # actual transport always agree — a default --reasoning 0 run never
+        # starts the server with a reasoning budget the identity denies.
+        server_args={
+            "gemma": _gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": QWEN_SERVER_ARGS,
+        },
         port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
     )
     # V4.1 A2: local no longer blocks --reasoning > 0 — the Gemma reasoning
@@ -438,9 +469,18 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
+    # A2 review fix (whole-chapter retry ownership): in whole-chapter mode the
+    # GENERATION layer (WholeChapterRetryPolicy) is the single retry owner —
+    # it already retries every failure class (empty/truncated JSON included)
+    # with its own bounded budget. The adapter-level JSON retry
+    # (JsonRetryPolicy) is disabled for the whole run so total model attempts
+    # stay exactly WholeChapterRetryPolicy.max_attempts instead of
+    # max_attempts × adapter-budget, and an adapter-budget exhaustion cannot
+    # re-enter the generation loop as a fresh "attempt 1/3".
+    json_retry = JsonRetryPolicy(max_retries=0) if args.whole_chapter else None
     model_caller, qwen_evaluator, gemma_selector, \
         qwen_audit_evaluator, gemma_audit_evaluator = build_role_adapters(
-            backend, runtime, bible_text=bible_text,
+            backend, runtime, bible_text=bible_text, json_retry_policy=json_retry,
         )
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
     formatting_adapters = build_formatting_adapters(backend, runtime)

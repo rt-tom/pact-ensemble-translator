@@ -23,10 +23,19 @@ model_names:
   qwen: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 server_args:
   gemma:
-    # V4.1 (2026-08-09): sycl-edge build, reasoning-budget 2048, контекст 49k.
+    # V4.1 (2026-08-09): sycl-edge build, контекст 49k.
     # Бинарь: C:\src\llama-sycl-edge\build\bin\llama-server.exe (env
     # GGML_SYCL_FA_DECODE_KERNEL=auto, -dev SYCL0 задаются при запуске —
     # см. план V4_1_WHOLE_CHAPTER_ARCHITECTURE_PLAN_RU.md §3.4).
+    #
+    # V4.1 A2 RV fix: the local generator's reasoning budget travels via
+    # --reasoning-budget in the server args, so the CLI value and this arg
+    # MUST agree. The CLI default path (no --runtime-config) DERIVES the
+    # budget from --reasoning: 2048 (§3.4, the supported A2 profile) for
+    # --reasoning>0 and 0 (B1 baseline) for the default --reasoning 0.
+    # A static profile pins one value: set 0 here for baseline runs, or 2048
+    # for A2 whole-chapter runs (validate_reasoning_backend fails closed on
+    # any mismatch between --reasoning and this arg).
     - -ngl
     - "99"
     - -ncmoe
@@ -34,7 +43,7 @@ server_args:
     - --load-mode
     - mmap
     - --reasoning-budget
-    - "2048"
+    - "0"
     - -np
     - "1"
     - -c
