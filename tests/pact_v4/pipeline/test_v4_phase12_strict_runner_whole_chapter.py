@@ -167,6 +167,84 @@ def test_whole_chapter_resume_reads_raw_snapshot_not_final(tmp_path):
     assert all(v != "TAMPERED" for v in final.values())
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        "missing",
+        "extra",
+        "reordered",
+        "duplicate",
+        "non_string",
+        "invalid_json",
+    ],
+)
+def test_whole_chapter_resume_rejects_corrupt_raw_snapshot(tmp_path, corrupt):
+    # A1 raw-vs-final resume safety: a selected journal entry may resume ONLY
+    # from a raw snapshot that conforms to the strict full-PID {pid: text}
+    # contract (exact PID set, exact source order, string values). Any
+    # corruption — missing/extra/reordered/duplicate PID, non-string value,
+    # invalid JSON — fails closed with a loud Data-loss ValueError, no
+    # generation is attempted, and the final translations.json alias is never
+    # rewritten from a partial raw snapshot.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+    _run_whole_chapter(cfg)
+    raw_path = cfg.out_dir / "translations_raw.json"
+    good = json.loads(raw_path.read_text(encoding="utf-8"))
+    assert len(good) == 24
+
+    pids = list(good)
+    if corrupt == "missing":
+        payload = dict(good)
+        payload.pop(pids[0])
+        raw = json.dumps(payload, ensure_ascii=False)
+    elif corrupt == "extra":
+        payload = dict(good)
+        payload["p_extra"] = "Лишний"
+        raw = json.dumps(payload, ensure_ascii=False)
+    elif corrupt == "reordered":
+        # Re-insert the first PID at the end so the key order differs from
+        # source order.
+        payload = dict(good)
+        payload[pids[0]] = payload.pop(pids[0])
+        raw = json.dumps(payload, ensure_ascii=False)
+    elif corrupt == "duplicate":
+        # Literal duplicate key in the raw JSON text — plain json.loads
+        # would collapse it to last-write-wins before validation can see it.
+        raw = (
+            '{"' + pids[0] + '": "Первый", '
+            '"' + pids[0] + '": "Второй", '
+            + ",".join(
+                f'"{pid}": {json.dumps(good[pid], ensure_ascii=False)}'
+                for pid in pids[1:]
+            )
+            + "}"
+        )
+    elif corrupt == "non_string":
+        payload = dict(good)
+        payload[pids[0]] = 42
+        raw = json.dumps(payload, ensure_ascii=False)
+    else:  # invalid_json
+        raw = "{not json"
+
+    raw_path.write_text(raw, encoding="utf-8")
+    final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    # Fail closed: no generation was attempted and the final alias was never
+    # rewritten from the partial/corrupt raw snapshot.
+    assert len(caller.calls) == 0
+    assert (cfg.out_dir / "translations.json").read_text(encoding="utf-8") == final_before
+    # The raw snapshot itself is not silently repaired either.
+    assert raw_path.read_text(encoding="utf-8") == raw
+
+
 def test_whole_chapter_generation_failure_is_honest_incomplete(tmp_path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
     cfg = type(cfg)(

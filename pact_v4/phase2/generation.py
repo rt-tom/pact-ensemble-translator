@@ -91,6 +91,7 @@ __all__ = [
     "GenerationOutcome",
     "generate_for_chunk",
     "WholeChapterRetryPolicy",
+    "validate_whole_chapter_raw",
     "generate_whole_chapter",
 ]
 
@@ -728,6 +729,26 @@ def _CompletionErrorType() -> type:
     return CompletionError
 
 
+def validate_whole_chapter_raw(
+    raw: str, pid_map: WholeChapterPidMap
+) -> Tuple[Tuple[str, str], ...]:
+    """Strictly validate a whole-chapter raw snapshot against the A1 contract.
+
+    Applies the exact same validation a whole-chapter generation attempt
+    performs (``_parse_ordered_pid_pairs`` + ``_validate_pid_map`` over the
+    full chapter map): the text must be a JSON object whose keys are exactly
+    ``pid_map.pids`` in the same source order, all values strings, with
+    literal duplicate keys rejected. Failure taxonomy matches a generation
+    attempt: ``ValueError`` for truncated/invalid/non-object JSON and
+    ``_GenerationValidationError`` for PID-set/order/type violations — so a
+    damaged or partial raw snapshot can never be mistaken for a complete
+    one, whether it arrives as model output (generation) or as a resume
+    snapshot on disk.
+    """
+    pairs = _parse_ordered_pid_pairs(raw)
+    return _validate_pid_map(pairs, owned_pids=pid_map.pids, context_pids=frozenset())
+
+
 def generate_whole_chapter(
     *,
     role: str = "balanced_literary",
@@ -827,10 +848,7 @@ def generate_whole_chapter(
             break
 
         try:
-            pairs = _parse_ordered_pid_pairs(raw)
-            translation = _validate_pid_map(
-                pairs, owned_pids=pid_map.pids, context_pids=frozenset()
-            )
+            translation = validate_whole_chapter_raw(raw, pid_map)
         except ValueError as exc:
             last_error = GenerationError(
                 role,

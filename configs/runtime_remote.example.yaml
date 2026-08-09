@@ -17,9 +17,9 @@
 #       (0=off baseline, 1=low, 2=medium, 3=high). Sent to the remote
 #       provider as the top-level `reasoningEffort` on each generation
 #       request; the Qwen audit / repair / formatting phases are untouched.
-#   --stop-after selection -- halt right after Phase 1-2 (generation +
+#   --stop-after-generation -- halt right after Phase 1-2 (generation +
 #       selection): the chunked translation lands in translations.json and
-#       step6/step7/step8 are recorded as skipped_stop_after_selection.
+#       step6/step7/step8 are recorded as skipped_stop_after_generation.
 #   Both flags are part of the run's config identity, so such a run needs a
 #   NEW --out-dir (a prior out-base is NOT resumable under the new identity).
 #

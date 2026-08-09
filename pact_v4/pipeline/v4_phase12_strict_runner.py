@@ -89,8 +89,10 @@ from pact_v4.phase2.generation import (
     GenerationCache,
     GenerationParams,
     WholeChapterRetryPolicy,
+    _GenerationValidationError,
     generate_for_chunk,
     generate_whole_chapter,
+    validate_whole_chapter_raw,
 )
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
@@ -3375,9 +3377,29 @@ def _run_whole_chapter_strict(
                     f"selected but {raw_translations_path.name} is missing — "
                     "the raw generator snapshot cannot be reconstructed."
                 )
-            final_text_by_pid = json.loads(
-                raw_translations_path.read_text(encoding="utf-8")
-            )
+            # The raw snapshot must conform to the exact strict {pid: text}
+            # contract the generator enforces (full PID set, exact source
+            # order, string values, no duplicate keys): a damaged or partial
+            # raw file is data loss, never a resume candidate. Fails closed
+            # with the same failure taxonomy as a generation attempt
+            # (ValueError for invalid JSON, _GenerationValidationError for
+            # PID contract violations) — a partial raw can never seed a
+            # partial final translations.json.
+            try:
+                final_text_by_pid = dict(
+                    validate_whole_chapter_raw(
+                        raw_translations_path.read_text(encoding="utf-8"),
+                        pid_map,
+                    )
+                )
+            except (ValueError, _GenerationValidationError) as exc:
+                raise ValueError(
+                    "Data loss: journal says whole_chapter generation was "
+                    f"selected but {raw_translations_path.name} does not "
+                    f"conform to the whole-chapter strict {{pid: text}} "
+                    f"contract ({exc}) — refusing to resume against a corrupt "
+                    "or partial raw snapshot."
+                ) from exc
             selected_role = entry.get("selected_role") or "balanced_literary"
             selected_role_counts[selected_role] = 1
         elif outcome == "incomplete_generation":
