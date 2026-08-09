@@ -334,3 +334,305 @@ def test_whole_chapter_max_tokens_in_identity_and_cli_default(tmp_path):
     assert cfg.max_tokens == 32768
     artifact = cfg.to_config_artifact(model_profile="test")
     assert artifact.values["generation"]["max_tokens"] == 32768
+
+
+# ---------------------------------------------------------------------------
+# A1 provenance fail-closed resume validation (RV2 t_c63205de findings).
+#
+# A selected whole-chapter journal entry may resume ONLY when the generation
+# provenance exists, matches this run's identities, holds exactly one valid
+# whole_chapter record, and that record links to the journal's selected
+# candidate/role. Any violation raises a Data loss/provenance ValueError and
+# never rewrites translations/raw/selection/provenance artifacts. The resume
+# journal itself must contain exactly one well-formed whole_chapter entry.
+# ---------------------------------------------------------------------------
+
+
+def _whole_chapter_cfg(tmp_path):
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    return type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+
+
+def _whole_chapter_journal(cfg):
+    return [
+        json.loads(line)
+        for line in (cfg.out_dir / "journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_whole_chapter_resume_preserves_provenance_linkage(tmp_path):
+    # A clean whole-chapter resume must preserve the exactly-one journal
+    # contract AND the candidate audit trail: generation_outcomes.json keeps
+    # its single whole_chapter record, selection_results.json still links
+    # candidate_count=1 to the journal's selected candidate, no new generation
+    # call fires and no extra journal entry is appended.
+    cfg = _whole_chapter_cfg(tmp_path)
+    first = _run_whole_chapter(cfg)
+    assert first.selected_count == 1
+    assert first.resumed_from_index == 0
+
+    journal = _whole_chapter_journal(cfg)
+    assert len(journal) == 1
+    assert journal[0]["outcome"] == "selected"
+    assert journal[0]["selected_role"] == "balanced_literary"
+    assert journal[0]["selected_candidate_id"].startswith("whole_chapter:balanced_literary:")
+    assert journal[0]["candidate_ids"] == [journal[0]["selected_candidate_id"]]
+
+    outcomes = json.loads((cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8"))
+    assert len(outcomes["outcomes"]) == 1
+    rec_candidate = outcomes["outcomes"][0]["candidates"]["balanced_literary"]["candidate_id"]
+    assert rec_candidate == journal[0]["selected_candidate_id"]
+
+    caller = StubModelCaller()
+    resumed = _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    assert resumed.selected_count == 1
+    assert resumed.resumed_from_index == 1
+    assert resumed.processed_count == 1
+
+    # One whole_chapter generation record survives the resume untouched...
+    outcomes_after = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    assert len(outcomes_after["outcomes"]) == 1
+    assert outcomes_after["outcomes"] == outcomes["outcomes"]
+    # ...and selection_results.json still links candidate_count=1 to the
+    # journal's selected candidate (never an empty candidate_count=0 rewrite).
+    sel = json.loads((cfg.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+    assert sel["schema"] == WHOLE_CHAPTER_SELECTION_SCHEMA
+    assert sel["candidate_count"] == 1
+    assert sel["generation_record_id"] == journal[0]["selected_candidate_id"]
+    # The journal is not extended by the resume.
+    assert len(_whole_chapter_journal(cfg)) == 1
+
+
+def test_whole_chapter_resume_fails_when_generation_outcomes_missing(tmp_path):
+    # RV2 Finding 1: a selected journal entry with NO generation_outcomes.json
+    # must fail closed (Data loss), never silently rewrite empty provenance
+    # and selection_results.json with candidate_count=0 while reporting
+    # selected_count=1. No generation call, no artifact rewrite.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    assert gen_path.exists()
+    gen_path.unlink()
+
+    final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
+    raw_before = (cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8")
+    sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
+    journal_before = (cfg.out_dir / "journal.ndjson").read_text(encoding="utf-8")
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss.*generation_outcomes.json.*missing"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    # Fail closed: nothing is rewritten or recreated.
+    assert (cfg.out_dir / "translations.json").read_text(encoding="utf-8") == final_before
+    assert (cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8") == raw_before
+    assert (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8") == sel_before
+    assert (cfg.out_dir / "journal.ndjson").read_text(encoding="utf-8") == journal_before
+    assert not gen_path.exists()
+
+
+@pytest.mark.parametrize(
+    "corrupt,expect",
+    [
+        ("empty_object", "Data loss"),
+        ("empty_outcomes", "Data loss"),
+        ("no_whole_record", "Data loss"),
+        ("mismatched_identity", "Foreign identity"),
+        ("duplicate_record", "Data loss"),
+        ("invalid_json", "Data loss"),
+        ("not_object", "Data loss"),
+    ],
+)
+def test_whole_chapter_resume_rejects_empty_or_mismatched_generation_outcomes(
+    tmp_path, corrupt, expect
+):
+    # RV2 Finding 1: generation_outcomes.json that is empty, lacks a
+    # whole_chapter record, carries foreign identities, holds duplicate
+    # records, or is unparseable must fail closed with a Data loss /
+    # provenance ValueError — never silently rewritten as empty provenance.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    good = json.loads(gen_path.read_text(encoding="utf-8"))
+
+    if corrupt == "empty_object":
+        payload = {}
+    elif corrupt == "empty_outcomes":
+        payload = {
+            k: good[k]
+            for k in ("chapter_id", "snapshot_hash", "chunk_plan_hash", "config_identity")
+        }
+        payload["outcomes"] = []
+    elif corrupt == "no_whole_record":
+        payload = dict(good)
+        payload["outcomes"] = [dict(good["outcomes"][0], chunk_id="chunk_0")]
+    elif corrupt == "mismatched_identity":
+        payload = dict(good)
+        payload["snapshot_hash"] = "deadbeef" * 4
+    elif corrupt == "duplicate_record":
+        payload = dict(good)
+        payload["outcomes"] = [good["outcomes"][0], good["outcomes"][0]]
+    elif corrupt == "invalid_json":
+        payload = None  # written raw below
+        gen_path.write_text("{not json", encoding="utf-8")
+    else:  # not_object
+        payload = None
+        gen_path.write_text("[1, 2, 3]", encoding="utf-8")
+    if payload is not None:
+        gen_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
+    raw_before = (cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8")
+    sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
+    corrupt_artifact_before = gen_path.read_text(encoding="utf-8")
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match=expect):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    # Fail closed: final alias, raw snapshot and selection results are never
+    # rewritten, and the corrupt provenance artifact is not silently repaired.
+    assert (cfg.out_dir / "translations.json").read_text(encoding="utf-8") == final_before
+    assert (cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8") == raw_before
+    assert (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8") == sel_before
+    assert gen_path.read_text(encoding="utf-8") == corrupt_artifact_before
+
+
+def test_whole_chapter_resume_rejects_duplicate_journal_entry(tmp_path):
+    # RV2 Finding 2: two whole_chapter journal entries break the documented
+    # exactly-one contract. Resume must fail closed (never use the first
+    # entry, never report resumed_from_index=2/processed_count=2 success),
+    # without appending anything to the journal or rewriting artifacts.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    journal_path = cfg.out_dir / "journal.ndjson"
+    lines = journal_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    duplicated = "\n".join(lines + lines) + "\n"
+    journal_path.write_text(duplicated, encoding="utf-8")
+
+    final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
+    sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="exactly one entry, found 2"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    assert journal_path.read_text(encoding="utf-8") == duplicated
+    assert (cfg.out_dir / "translations.json").read_text(encoding="utf-8") == final_before
+    assert (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8") == sel_before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_chunk_id",
+        "invalid_outcome",
+        "selected_without_candidate",
+        "selected_candidate_ids_mismatch",
+        "incomplete_with_candidates",
+        "non_object_entry",
+    ],
+)
+def test_whole_chapter_resume_rejects_malformed_journal_shape(tmp_path, mutation):
+    # RV2 Finding 2: a single journal entry with the wrong chunk_id, an
+    # invalid outcome, missing/inconsistent selected fields, or a non-object
+    # line is a malformed journal and must fail closed with a Data-loss
+    # ValueError — no generation call, no artifact rewrite.
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+    journal_path = cfg.out_dir / "journal.ndjson"
+    entry = json.loads(journal_path.read_text(encoding="utf-8").strip())
+
+    if mutation == "wrong_chunk_id":
+        entry["chunk_id"] = "chunk_0"
+    elif mutation == "invalid_outcome":
+        entry["outcome"] = "quarantined"
+    elif mutation == "selected_without_candidate":
+        entry.pop("selected_candidate_id")
+    elif mutation == "selected_candidate_ids_mismatch":
+        entry["candidate_ids"] = ["whole_chapter:balanced_literary:other"]
+    elif mutation == "incomplete_with_candidates":
+        entry["outcome"] = "incomplete_generation"
+        entry["candidate_ids"] = ["whole_chapter:balanced_literary:other"]
+        entry["selected_candidate_id"] = None
+        entry["selected_role"] = None
+
+    if mutation == "non_object_entry":
+        journal_path.write_text("[1, 2, 3]\n", encoding="utf-8")
+    else:
+        journal_path.write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
+    sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    assert (cfg.out_dir / "translations.json").read_text(encoding="utf-8") == final_before
+    assert (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8") == sel_before
+
+
+def test_whole_chapter_resume_incomplete_replays_honestly(tmp_path):
+    # An incomplete_generation journal entry resumes honestly (halted_early,
+    # selected_count=0, no fabricated candidate) when its generation record
+    # exists — the provenance contract still holds.
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _BrokenCaller:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, bundle):
+            self.calls.append(bundle)
+            return "{not json"
+
+    first = _run_whole_chapter(cfg, model_caller=_BrokenCaller())
+    assert first.incomplete_generation_count == 1
+    journal = _whole_chapter_journal(cfg)
+    assert journal[0]["outcome"] == "incomplete_generation"
+    assert journal[0]["selected_candidate_id"] is None
+    assert journal[0]["candidate_ids"] == []
+
+    caller = StubModelCaller()
+    resumed = _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    assert resumed.incomplete_generation_count == 1
+    assert resumed.selected_count == 0
+    assert resumed.halted_early is True
+    assert len(_whole_chapter_journal(cfg)) == 1
+
+
+def test_whole_chapter_resume_incomplete_requires_generation_outcomes(tmp_path):
+    # The generation provenance is mandatory for ANY whole-chapter resume:
+    # an incomplete journal entry with a deleted generation_outcomes.json must
+    # fail closed instead of silently rewriting empty provenance.
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _BrokenCaller:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, bundle):
+            self.calls.append(bundle)
+            return "{not json"
+
+    first = _run_whole_chapter(cfg, model_caller=_BrokenCaller())
+    assert first.incomplete_generation_count == 1
+    gen_path = cfg.out_dir / "generation_outcomes.json"
+    assert gen_path.exists()
+    gen_path.unlink()
+
+    caller = StubModelCaller()
+    with pytest.raises(ValueError, match="Data loss.*generation_outcomes.json.*missing"):
+        _run_whole_chapter(cfg, model_caller=caller)
+    assert len(caller.calls) == 0
+    assert not gen_path.exists()

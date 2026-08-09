@@ -3334,6 +3334,12 @@ def _run_whole_chapter_strict(
     prior_entries = _load_journal(journal_path)
     acceptable_backend_hashes = list(cfg.backend.acceptable_identity_hashes())
     for entry in prior_entries:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Data loss: malformed whole-chapter journal entry — "
+                f"expected a JSON object, found {type(entry).__name__} — "
+                "refusing to resume against a corrupt journal."
+            )
         if (
             entry.get("snapshot_hash") != snapshot.snapshot_hash
             or entry.get("chunk_plan_hash") != chunk_plan.plan_hash
@@ -3364,8 +3370,65 @@ def _run_whole_chapter_strict(
     )
 
     if resumed_from_index > 0:
+        # Whole-chapter resume journal contract: exactly ONE whole_chapter
+        # entry. A duplicate or malformed journal is a data-integrity failure
+        # and must fail closed — never silently replayed past via
+        # prior_entries[0] with authoritative counts/provenance untrustworthy.
+        if len(prior_entries) != 1:
+            raise ValueError(
+                "Data loss: whole-chapter resume journal must contain "
+                f"exactly one entry, found {len(prior_entries)} — refusing "
+                "to resume against a duplicate or corrupt journal."
+            )
         entry = prior_entries[0]
-        outcome = entry["outcome"]
+        if entry.get("chunk_id") != WHOLE_CHAPTER_CHUNK_ID:
+            raise ValueError(
+                "Data loss: malformed whole-chapter journal entry — expected "
+                f"chunk_id {WHOLE_CHAPTER_CHUNK_ID!r}, found "
+                f"{entry.get('chunk_id')!r} — refusing to resume."
+            )
+        outcome = entry.get("outcome")
+        if outcome == "selected":
+            selected_candidate_id = entry.get("selected_candidate_id")
+            selected_role = entry.get("selected_role")
+            if not isinstance(selected_candidate_id, str) or not selected_candidate_id:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "selected outcome without a selected_candidate_id."
+                )
+            if not isinstance(selected_role, str) or not selected_role:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "selected outcome without a selected_role."
+                )
+            if entry.get("candidate_ids") != [selected_candidate_id]:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "candidate_ids must be exactly [selected_candidate_id]."
+                )
+        elif outcome == "incomplete_generation":
+            selected_candidate_id = None
+            selected_role = None
+            if entry.get("candidate_ids") not in (None, []):
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "incomplete_generation outcome with non-empty candidate_ids."
+                )
+            if (
+                entry.get("selected_candidate_id") is not None
+                or entry.get("selected_role") is not None
+            ):
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "incomplete_generation outcome must not carry a "
+                    "selected_candidate_id/selected_role."
+                )
+        else:
+            raise ValueError(
+                "Data loss: malformed whole-chapter journal entry — invalid "
+                f"outcome {outcome!r}."
+            )
+
         if outcome == "selected":
             # Resume distinguishes the RAW generator snapshot (the exact text
             # the generation contract produced) from the FINAL translations.json
@@ -3400,7 +3463,6 @@ def _run_whole_chapter_strict(
                     f"contract ({exc}) — refusing to resume against a corrupt "
                     "or partial raw snapshot."
                 ) from exc
-            selected_role = entry.get("selected_role") or "balanced_literary"
             selected_role_counts[selected_role] = 1
         elif outcome == "incomplete_generation":
             incomplete_generation_count = 1
@@ -3409,23 +3471,91 @@ def _run_whole_chapter_strict(
                 "whole_chapter generation incomplete (resumed; bounded retry "
                 "budget was exhausted in the prior session)"
             )
-        if generation_path.exists():
+
+        # Generation provenance is mandatory for any whole-chapter resume:
+        # the journal entry may only be replayed when generation_outcomes.json
+        # exists, carries this run's identities, and contains exactly one
+        # valid whole_chapter record. Missing/empty/mismatched provenance is
+        # data loss — never a reason to silently rewrite empty provenance and
+        # selection_results.json with candidate_count=0 while the journal and
+        # translations claim a selected whole-chapter generation.
+        if not generation_path.exists():
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is missing — the "
+                "generation record cannot be reconstructed."
+            )
+        try:
             payload = json.loads(generation_path.read_text(encoding="utf-8"))
-            if (
-                payload.get("snapshot_hash") != snapshot.snapshot_hash
-                or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
-                or payload.get("config_identity") != config.config_identity
+        except ValueError as exc:
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is corrupt JSON — "
+                "refusing to resume against a broken provenance artifact."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is not a JSON object."
+            )
+        if not all(
+            isinstance(payload.get(key), str) and payload.get(key)
+            for key in ("snapshot_hash", "chunk_plan_hash", "config_identity")
+        ):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is missing the run "
+                "identity fields (empty or malformed provenance artifact)."
+            )
+        if (
+            payload.get("snapshot_hash") != snapshot.snapshot_hash
+            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or payload.get("config_identity") != config.config_identity
+        ):
+            raise ValueError(
+                "Foreign identity: generation_outcomes.json was written "
+                "under a different snapshot/plan/config than this run -- "
+                "refusing to mix generation records across runs."
+            )
+        outcomes = payload.get("outcomes")
+        if not isinstance(outcomes, list):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} has no outcomes array."
+            )
+        whole_records = [
+            rec
+            for rec in outcomes
+            if isinstance(rec, dict) and rec.get("chunk_id") == WHOLE_CHAPTER_CHUNK_ID
+        ]
+        if len(whole_records) != 1:
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} must contain exactly "
+                f"one whole_chapter record, found {len(whole_records)}."
+            )
+        generation_records = [whole_records[0]]
+        if outcome == "selected":
+            # The generation record must be the one the journal selected:
+            # its candidate for the journal's selected_role must carry the
+            # journal's selected_candidate_id. A record that does not link to
+            # the journal candidate is provenance loss, not a resume.
+            candidates = whole_records[0].get("candidates")
+            if not isinstance(candidates, dict) or not isinstance(
+                candidates.get(selected_role), dict
             ):
                 raise ValueError(
-                    "Foreign identity: generation_outcomes.json was written "
-                    "under a different snapshot/plan/config than this run -- "
-                    "refusing to mix generation records across runs."
+                    "Data loss: whole_chapter generation record has no "
+                    f"candidate for selected_role {selected_role!r} — "
+                    "refusing to resume without journal linkage."
                 )
-            generation_records = [
-                rec
-                for rec in payload.get("outcomes", [])
-                if rec.get("chunk_id") == WHOLE_CHAPTER_CHUNK_ID
-            ]
+            if candidates[selected_role].get("candidate_id") != selected_candidate_id:
+                raise ValueError(
+                    "Data loss: whole_chapter generation record candidate "
+                    f"{candidates[selected_role].get('candidate_id')!r} does "
+                    f"not match the journal's selected_candidate_id "
+                    f"{selected_candidate_id!r}."
+                )
     else:
         # ------------------------------------------------------------------
         # Fresh run: one whole-chapter generation call with bounded retry.
