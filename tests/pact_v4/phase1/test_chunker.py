@@ -481,6 +481,8 @@ def test_full_pid_ownership_holds_for_every_plan_size(planner):
             glossary_hash=hashlib.sha256(b"g").hexdigest(),
             book_memory_hash=hashlib.sha256(b"b").hexdigest(),
             chapter_memory_hash=hashlib.sha256(b"c").hexdigest(),
+            source_hash=hashlib.sha256(b"source").hexdigest(),
+            chapter_index_hash=hashlib.sha256(b"chapter_index").hexdigest(),
         )
         result = planner.plan(blocks, snapshot_hash=snapshot.snapshot_hash)
         validate_full_pid_ownership(tuple(result), snapshot)

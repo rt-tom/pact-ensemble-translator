@@ -51,7 +51,9 @@ Design rules (plan §5, §7, §10, §12)
 * Per-request ``temperature``/``max_output_tokens`` are recorded in identity
   but *not* sent in the v1.4.7 message body (the server has no per-request
   sampling fields; agent/model defaults apply). Non-empty
-  ``request_options`` are rejected loudly rather than silently ignored.
+  ``request_options`` are rejected loudly rather than silently ignored —
+  except the V4.1 ``reasoning`` option, which maps to the server's
+  top-level ``reasoningEffort`` field (1=low, 2=medium, 3=high).
 * Error normalization per §10; no silent model fallback; semantic
   ``passed=False`` is never retried as a transport error (the backend never
   interprets verdicts — it returns text/structured and the Pact layer gates).
@@ -757,6 +759,23 @@ class OpenCodeServerBackend:
                 "schema": dict(request.response_schema),
                 "retryCount": self._cfg.structured_output_retry_count,
             }
+        reasoning = request.request_options.get("reasoning")
+        if reasoning:
+            # V4.1: opencode serve 1.4.7 honours a top-level
+            # ``reasoningEffort`` on POST /session/{id}/message (empirically
+            # verified 2026-08-08: high -> 23 reasoning tokens, absent -> 0).
+            # The GenerationParams contract restricts reasoning to {0,1,2,3},
+            # so an out-of-range value here is a programming error — fail
+            # loudly instead of silently dropping the budget.
+            effort = {1: "low", 2: "medium", 3: "high"}.get(reasoning)
+            if effort is None:
+                raise OpenCodeError(
+                    ERROR_REQUEST_NOT_SUPPORTED,
+                    "OpenCodeServerBackend: unsupported reasoning level "
+                    f"{reasoning!r} in request_options (allowed: 1=low, "
+                    "2=medium, 3=high)",
+                )
+            body["reasoningEffort"] = effort
         return body
 
     def _post_message(
@@ -914,13 +933,17 @@ class OpenCodeServerBackend:
                 "OpenCodeServerBackend: backend is closed; cannot complete a request"
             )
         if request.request_options:
-            # v1.4.7 has no per-request sampling fields; silently dropping an
-            # option would change behaviour without being honest (plan §5.1).
-            raise OpenCodeError(
-                ERROR_REQUEST_NOT_SUPPORTED,
-                "OpenCodeServerBackend: request_options are not supported by "
-                f"opencode-server-http/v1.4 (got {sorted(request.request_options)})",
-            )
+            # v1.4.7 has no per-request sampling fields except the top-level
+            # ``reasoningEffort`` (V4.1, transported via request_options
+            # key "reasoning"); silently dropping any other option would
+            # change behaviour without being honest (plan §5.1).
+            unsupported = set(request.request_options) - {"reasoning"}
+            if unsupported:
+                raise OpenCodeError(
+                    ERROR_REQUEST_NOT_SUPPORTED,
+                    "OpenCodeServerBackend: request_options are not supported by "
+                    f"opencode-server-http/v1.4 (got {sorted(request.request_options)})",
+                )
         if self._cfg.structured_output_mode == "json_schema" and request.response_schema is None:
             # json_schema mode without a schema would silently ignore a
             # server-returned ``info.structured``; fail loudly instead.

@@ -465,6 +465,19 @@ class CompositeCompletionBackend:
             )
         return self._sub[name].complete(request)
 
+    def serving_backend(self, model_ref: str) -> Optional[CompletionBackend]:
+        """The sub-backend that would serve ``model_ref`` (or ``None``).
+
+        V4.1 A2: used to decide whether a request's reasoning travels via
+        ``request_options`` (remote/OpenCode) or via the local server args
+        (``--reasoning-budget``) — the decision must follow the concrete
+        transport that will actually execute the call.
+        """
+        name = self._ref_to_name.get(model_ref)
+        if name is None:
+            return None
+        return self._sub[name]
+
     def close(self) -> None:
         for backend in self._sub.values():
             backend.close()
@@ -583,6 +596,159 @@ class CompositeBackendConfig:
         composite_backend = CompositeCompletionBackend(sub_backends, descriptor)
         return CompositeRuntimeCoordinator(
             local_coord, remote_coord, descriptor, backend=composite_backend,
+        )
+
+
+# ---------------------------------------------------------------------------
+# V4.1 reasoning/backend compatibility policy
+# ---------------------------------------------------------------------------
+
+
+def _generator_backend_cfg(backend: Any) -> Any:
+    """The sub-config that serves the Phase 2B generator role.
+
+    ``None`` when a composite profile declares no generator binding at all
+    (the run itself fails later with a missing model binding — that is not
+    a reasoning-policy error).
+    """
+    if isinstance(backend, CompositeBackendConfig):
+        gen_name = backend.role_backend_map.get(ROLE_GENERATOR)
+        if gen_name is not None:
+            return backend.backends.get(gen_name)
+        # No explicit generator routing: the composite descriptor binds the
+        # generator role to the first sub-backend declaring it (same
+        # first-wins rule as CompositeBackendConfig.build_descriptor).
+        for sub in backend.backends.values():
+            bindings = sub.build_descriptor().model_bindings or {}
+            if ROLE_GENERATOR in bindings or "default" in bindings:
+                return sub
+        return None
+    return backend
+
+
+def _local_generator_server_args(backend: LocalLlamaBackendConfig) -> list:
+    """The ``server_args`` list of the model that serves the generator role.
+
+    For a local profile the generator role is bound to a model NAME (via
+    ``_role_bindings``), while ``server_args`` is keyed by model KEY; this
+    helper maps the generator binding back to its arg list so the reasoning
+    policy inspects the exact args the generator model would launch with.
+    """
+    gen_name = backend._role_bindings().get(ROLE_GENERATOR)
+    if gen_name is not None:
+        for key, name in backend.model_names.items():
+            if name == gen_name:
+                return list(backend.server_args.get(key, []))
+    # Fallback: first declared model's args (mirrors the local role binding
+    # fallback when no explicit generator binding exists).
+    for args in backend.server_args.values():
+        return list(args)
+    return []
+
+
+def _reasoning_budget_from_server_args(args: Sequence[str]) -> Optional[int]:
+    """The ``--reasoning-budget`` value in a server-args list, or ``None``.
+
+    Returns ``None`` ONLY when the flag is absent (the profile cannot
+    express a numeric reasoning budget). ``0`` means "no reasoning" (the
+    B1 baseline on llama-server).
+
+    A present-but-malformed flag fails closed with ``ValueError`` (A2 RV
+    finding 3): a missing value (flag at the end of the list), a non-int
+    value, or duplicate occurrences are profile-configuration errors and
+    must never be conflated with an absent flag. ``validate_reasoning_backend``
+    treats ``None`` as the accepted ``reasoning=0`` baseline, so silently
+    mapping a malformed profile to ``None`` would let a broken config
+    masquerade as the baseline.
+    """
+    occurrences = [i for i, arg in enumerate(args) if arg == "--reasoning-budget"]
+    if not occurrences:
+        return None
+    if len(occurrences) > 1:
+        raise ValueError(
+            "--reasoning-budget appears more than once in server_args "
+            f"({len(occurrences)} occurrences) — the profile is ambiguous; "
+            "refusing to guess the intended budget."
+        )
+    index = occurrences[0]
+    if index + 1 >= len(args):
+        raise ValueError(
+            "--reasoning-budget in server_args has no value — expected "
+            "--reasoning-budget <int>."
+        )
+    raw = args[index + 1]
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"--reasoning-budget in server_args has a non-integer value "
+            f"{raw!r} — expected --reasoning-budget <int>."
+        ) from None
+
+
+def validate_reasoning_backend(reasoning: int, backend: Any) -> None:
+    """Validate the Phase 2B reasoning budget against the generator backend.
+
+    V4.1 A2 principle (owner-verified 2026-08-08: ``reasoning-budget 2048``
+    works): local no longer blocks ``--reasoning > 0``. Reasoning for local
+    ``llama-server`` transports is carried by the **server args**
+    (``--reasoning-budget`` in the profile's ``server_args`` — see §3.4),
+    NOT by ``CompletionRequest.request_options``; ``LocalOpenAIBackend``
+    keeps rejecting any request_options as a library-level guard, so a
+    local run must never send ``request_options`` and the CLI local path
+    never emits them. The OpenCode backend maps 1/2/3 -> ``reasoningEffort``
+    low/medium/high via request_options and remains the request-level
+    transport.
+
+    ``reasoning == 0`` (the B1 baseline) emits no request_options and is
+    accepted on every backend. For a composite profile the check follows
+    the ``generator`` role routing; the audit/repair/formatting adapters
+    never carry request_options, so only the generator backend matters.
+
+    A2 review fix (RV, commit 4ab250b): the local path is NOT a no-op — it
+    fails closed unless the profile's generator server args can express the
+    requested value, so CLI/config identity, server args and the actual
+    transport always agree:
+
+    * ``reasoning == 0`` with a local generator: the server args must NOT
+      carry a nonzero ``--reasoning-budget`` (a profile that pins 2048
+      would run reasoning the config identity denies — mismatch);
+    * ``reasoning > 0`` with a local generator: the server args MUST carry
+      a nonzero ``--reasoning-budget`` (the profile cannot express the
+      requested reasoning without it — e.g. an arbitrary local profile
+      with no reasoning server arg at all).
+
+    A2 review fix (RV finding 3): a present-but-malformed
+    ``--reasoning-budget`` (missing value, non-integer value, or duplicate
+    occurrences) fails closed for EVERY reasoning level — ``None`` means
+    "flag absent" (the accepted ``reasoning=0`` baseline), never "broken
+    profile", so a malformed server-args profile can no longer masquerade
+    as the baseline.
+
+    Raises ``ValueError`` when the combination is unsupported / the profile
+    cannot express the value; returns ``None`` otherwise.
+    """
+    gen = _generator_backend_cfg(backend)
+    if gen is None or not isinstance(gen, LocalLlamaBackendConfig):
+        # OpenCode / composite-remote: reasoning travels via request_options
+        # (1/2/3 -> reasoningEffort low/medium/high); any value is expressible.
+        return
+    budget = _reasoning_budget_from_server_args(_local_generator_server_args(gen))
+    if reasoning == 0:
+        if budget not in (None, 0):
+            raise ValueError(
+                f"--reasoning 0 (B1 baseline) requested but the local generator "
+                f"server_args pin --reasoning-budget {budget}: the server would "
+                f"run reasoning the config identity denies. Set the profile's "
+                f"--reasoning-budget to 0 (or remove it) for baseline runs."
+            )
+        return
+    if budget is None or budget <= 0:
+        raise ValueError(
+            f"--reasoning {reasoning} requested but the local generator "
+            f"server_args express no nonzero --reasoning-budget (plan §3.4: "
+            f"2048): the profile cannot carry the requested reasoning. Add "
+            f"--reasoning-budget 2048 to the generator model's server_args."
         )
 
 

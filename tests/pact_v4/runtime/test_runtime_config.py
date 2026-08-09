@@ -19,6 +19,7 @@ from pact_v4.runtime.runtime_config import (
     LocalLlamaBackendConfig,
     OpenCodeBackendConfig,
     load_runtime_config,
+    validate_reasoning_backend,
 )
 
 
@@ -504,3 +505,192 @@ def test_local_config_rejects_non_string_server_args():
         assert "server_args must contain only strings" in str(exc)
     else:
         raise AssertionError("expected non-string server_args ValueError")
+
+
+# ---------------------------------------------------------------------------
+# V4.1 reasoning/backend compatibility policy (review commit 301e9df; A2 RV
+# fix: local is no longer a no-op — CLI reasoning and local server args must
+# AGREE, so a profile that cannot express the requested value fails closed)
+# ---------------------------------------------------------------------------
+
+
+def _local_with_reasoning(budget: int = 2048) -> LocalLlamaBackendConfig:
+    """A local profile whose Gemma generator pins ``--reasoning-budget``.
+
+    Mirrors the supported A2 profile (plan §3.4: ``--reasoning-budget 2048``)
+    — the only local shape that can truthfully express ``--reasoning > 0``.
+    """
+    from dataclasses import replace
+
+    return replace(
+        _local(),
+        server_args={"gemma": ["-ngl", "99", "--reasoning-budget", str(budget)], "qwen": []},
+    )
+
+
+def test_validate_reasoning_backend_zero_is_baseline_for_local():
+    # reasoning=0 (B1 baseline) is always accepted: it emits no
+    # request_options at all, so every backend works unchanged — as long as
+    # the local profile does not pin a NONZERO budget the identity denies.
+    validate_reasoning_backend(0, _local())  # no --reasoning-budget arg
+    validate_reasoning_backend(0, _local_with_reasoning(budget=0))
+
+
+def test_validate_reasoning_backend_accepts_nonzero_for_local():
+    # V4.1 A2 (owner-verified 2026-08-08): the local llama-server
+    # transport receives the reasoning budget from the SERVER ARGS
+    # (--reasoning-budget 2048, plan §3.4), not from request_options —
+    # so --reasoning > 0 with a local generator whose server args EXPRESS
+    # the budget is the supported path and must NOT fail fast.
+    # LocalOpenAIBackend still rejects request_options as a library-level
+    # guard; the CLI local path never emits them.
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, _local_with_reasoning())
+
+
+def test_validate_reasoning_backend_rejects_nonzero_local_without_budget():
+    # A2 RV fix (HIGH): an arbitrary local profile with NO --reasoning-budget
+    # server arg cannot express --reasoning > 0 — the old no-op validation
+    # silently accepted it, so the config identity recorded a reasoning value
+    # the server never ran. Fail closed instead.
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="--reasoning-budget"):
+            validate_reasoning_backend(level, _local())
+
+
+def test_validate_reasoning_backend_rejects_zero_local_with_nonzero_budget():
+    # A2 RV fix: the DEFAULT CLI reasoning is 0, so a local profile that pins
+    # --reasoning-budget 2048 would start the server with reasoning the config
+    # identity (reasoning=0) denies. Fail closed; the default local CLI path
+    # derives budget 0 for --reasoning 0 (see _gemma_server_args_for_reasoning).
+    with pytest.raises(ValueError, match="--reasoning 0"):
+        validate_reasoning_backend(0, _local_with_reasoning())
+
+
+def test_validate_reasoning_backend_accepts_nonzero_for_opencode():
+    # The OpenCode backend maps 1/2/3 -> reasoningEffort low/medium/high;
+    # nonzero reasoning with a remote generator is the supported path.
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, _remote())
+
+
+def test_validate_reasoning_backend_composite_follows_generator_routing():
+    # The check follows the composite's *generator* role routing: A2
+    # accepts nonzero reasoning on every generator transport (remote via
+    # request_options, local via server args that express the budget).
+    backends = {"remote": _remote(), "local": _local_with_reasoning()}
+    remote_gen = CompositeBackendConfig(
+        backends=backends,
+        role_backend_map={"generator": "remote", "fidelity_reviewer": "remote"},
+    )
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, remote_gen)
+
+    local_gen = CompositeBackendConfig(
+        backends=backends,
+        role_backend_map={"generator": "local", "fidelity_reviewer": "remote"},
+    )
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, local_gen)
+
+
+def test_validate_reasoning_backend_composite_rejects_local_generator_without_budget():
+    # A composite whose generator routes to a local sub-backend WITHOUT a
+    # --reasoning-budget arg cannot express nonzero reasoning — fail closed
+    # even though the composite itself looks "remote-capable".
+    local_no_budget = _local()
+    local_gen = CompositeBackendConfig(
+        backends={"remote": _remote(), "local": local_no_budget},
+        role_backend_map={"generator": "local", "fidelity_reviewer": "remote"},
+    )
+    for level in (1, 2, 3):
+        with pytest.raises(ValueError, match="--reasoning-budget"):
+            validate_reasoning_backend(level, local_gen)
+
+
+def test_validate_reasoning_backend_composite_first_wins_without_generator_route():
+    # Without an explicit generator routing the composite descriptor binds
+    # the generator role to the FIRST sub-backend declaring it — the
+    # reasoning policy must mirror that first-wins rule. A2: every
+    # generator transport that can express the value accepts nonzero.
+    remote = _remote()
+    local = _local_with_reasoning()
+    remote_first = CompositeBackendConfig(
+        backends={"remote": remote, "local": local},
+        role_backend_map={"fidelity_reviewer": "remote"},  # no generator key
+    )
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, remote_first)
+
+    local_first = CompositeBackendConfig(
+        backends={"local": local, "remote": remote},
+        role_backend_map={"fidelity_reviewer": "remote"},  # no generator key
+    )
+    for level in (1, 2, 3):
+        validate_reasoning_backend(level, local_first)
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 3 (malformed/ambiguous --reasoning-budget): the identity
+# contract must distinguish ABSENT (None — accepted reasoning=0 baseline)
+# from present-but-malformed (missing value, non-integer value, duplicate
+# occurrences — fail closed for EVERY reasoning level). A broken profile
+# must never masquerade as the baseline.
+# ---------------------------------------------------------------------------
+
+
+def _local_with_raw_args(raw: list) -> LocalLlamaBackendConfig:
+    from dataclasses import replace
+
+    return replace(_local(), server_args={"gemma": raw, "qwen": []})
+
+
+def test_reasoning_budget_from_server_args_absent_is_none():
+    from pact_v4.runtime.runtime_config import _reasoning_budget_from_server_args
+
+    assert _reasoning_budget_from_server_args([]) is None
+    assert _reasoning_budget_from_server_args(["-ngl", "99"]) is None
+    # A flag-like token that is NOT the exact flag is still absent.
+    assert _reasoning_budget_from_server_args(["--reasoning-budgetx", "2048"]) is None
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (["--reasoning-budget", "0"], 0),
+    (["--reasoning-budget", "2048"], 2048),
+    (["-ngl", "99", "--reasoning-budget", "0"], 0),
+    (["-ngl", "99", "--reasoning-budget", "2048"], 2048),
+])
+def test_reasoning_budget_from_server_args_valid_values(raw, expected):
+    from pact_v4.runtime.runtime_config import _reasoning_budget_from_server_args
+
+    assert _reasoning_budget_from_server_args(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    ["--reasoning-budget"],                    # missing value (flag at end)
+    ["--reasoning-budget", "not-an-int"],      # non-integer value
+    ["-ngl", "99", "--reasoning-budget"],      # missing value after flag
+    ["--reasoning-budget", "0", "--reasoning-budget", "2048"],  # duplicate
+    ["--reasoning-budget", "2048", "--reasoning-budget", "0"],  # duplicate, reversed
+])
+def test_reasoning_budget_from_server_args_malformed_fails_closed(raw):
+    from pact_v4.runtime.runtime_config import _reasoning_budget_from_server_args
+
+    with pytest.raises(ValueError, match="--reasoning-budget"):
+        _reasoning_budget_from_server_args(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    ["--reasoning-budget"],                    # missing value (flag at end)
+    ["--reasoning-budget", "not-an-int"],      # non-integer value
+    ["--reasoning-budget", "0", "--reasoning-budget", "2048"],  # duplicate
+])
+@pytest.mark.parametrize("reasoning", [0, 1, 2, 3])
+def test_validate_reasoning_backend_rejects_malformed_budget_for_all_levels(
+    raw, reasoning
+):
+    # A2 RV finding 3: malformed/missing/ambiguous --reasoning-budget must
+    # fail closed for EVERY reasoning level — None is only the ABSENT-flag
+    # baseline, never a broken profile's stand-in.
+    with pytest.raises(ValueError, match="--reasoning-budget"):
+        validate_reasoning_backend(reasoning, _local_with_raw_args(raw))

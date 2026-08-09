@@ -52,6 +52,8 @@ def make_snapshot(source: SourceArtifact, context: str = "ctx-v1") -> Snapshot:
         glossary_hash=_hash("glossary"),
         book_memory_hash=_hash("book_memory"),
         chapter_memory_hash=_hash("chapter_memory"),
+        source_hash=source.source_hash,
+        chapter_index_hash=_hash("chapter_index"),
     )
 
 
@@ -559,9 +561,16 @@ def test_changing_generation_params_invalidates_cache():
 # ---------------------------------------------------------------------------
 
 
-def test_reasoning_must_be_zero():
+def test_reasoning_contract():
+    # V4.1: reasoning is a range {0,1,2,3} (0=off, 1=low, 2=medium, 3=high);
+    # the historical hard-zero ban is gone, out-of-range still rejects.
+    for level in (0, 1, 2, 3):
+        params = GenerationParams(temperature=0.2, seed=1, max_tokens=100, reasoning=level)
+        assert params.reasoning == level
     with pytest.raises(ValueError):
-        GenerationParams(temperature=0.2, seed=1, max_tokens=100, reasoning=1)
+        GenerationParams(temperature=0.2, seed=1, max_tokens=100, reasoning=4)
+    with pytest.raises(ValueError):
+        GenerationParams(temperature=0.2, seed=1, max_tokens=100, reasoning=-1)
 
 
 @pytest.mark.parametrize(
@@ -806,10 +815,10 @@ def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
     # Recompute the exact bundle_hash our victim call will use, then poison
     # the shared cache at that key with the foreign candidate.
     from pact_v4.phase2.generation import PromptBundle
-    from pact_v4.phase2.prompts import BALANCED_LITERARY_V1
+    from pact_v4.phase2.prompts import BALANCED_LITERARY_V3
 
     victim_bundle = PromptBundle(
-        template=BALANCED_LITERARY_V1,
+        template=BALANCED_LITERARY_V3,
         role="balanced_literary",
         risk_band="low",
         risk_policy_version=make_risk(RiskBand.LOW).policy_version,
@@ -863,7 +872,7 @@ def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
     """The instructions must not tell the model to look for an 'OWNED_PIDS'
     section that render_prompt never emits (it emits 'OWNED_SOURCE')."""
     from pact_v4.phase2.prompts import (
-        BALANCED_LITERARY_V1,
+        BALANCED_LITERARY_V3,
         FIDELITY_FIRST_V1,
         render_prompt,
     )
@@ -877,9 +886,12 @@ def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
     )
     assert outcome.status == "complete"
 
-    for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V1):
+    for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V3):
         assert "OWNED_PIDS" not in template.instructions
-        assert "OWNED_SOURCE" in template.instructions
+    # v1/v2 templates name the block explicitly; the v3 literary template
+    # refers to the same rendered section as "the SOURCE map".
+    assert "OWNED_SOURCE" in FIDELITY_FIRST_V1.instructions
+    assert "SOURCE map" in BALANCED_LITERARY_V3.instructions
 
     for bundle in generator.calls:
         rendered = render_prompt(bundle)

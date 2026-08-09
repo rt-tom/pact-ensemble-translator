@@ -41,7 +41,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from pact_v4.phase2.prompts import BALANCED_LITERARY_V1, FIDELITY_FIRST_V1, render_prompt
+from pact_v4.phase2.prompts import BALANCED_LITERARY_V3, FIDELITY_FIRST_V1, render_prompt
 from pact_v4.phase2.risk import REQUIRED_RISK_CATEGORIES, assess_source_risk
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
@@ -59,7 +59,7 @@ CHARS_PER_TOKEN = 4.0
 
 _TEMPLATES = {
     "fidelity_first": FIDELITY_FIRST_V1,
-    "balanced_literary": BALANCED_LITERARY_V1,
+    "balanced_literary": BALANCED_LITERARY_V3,
 }
 
 
@@ -134,7 +134,11 @@ def build_dry_run_report(
     source_map = dict(source.source)
     memory = ChapterMemory.from_directory(memory_dir)
     glossary = _glossary_entries(memory)
-    bible_text = render_bible_section(memory.book_memory)
+    # V4.1 A2: per-chapter bible from chapter_index.json (legacy full-memory
+    # fallback when the index is absent).
+    bible_text = render_bible_section(
+        generation_payload["chapter_id"], memory.chapter_index, memory.book_memory
+    )
     narrator_gender = extract_narrator_gender(memory.book_memory)
     narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
 

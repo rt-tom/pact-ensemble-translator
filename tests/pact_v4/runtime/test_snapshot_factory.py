@@ -91,6 +91,66 @@ def test_build_snapshot_changes_identity_when_memory_changes():
     assert snap_a.snapshot_hash != snap_b.snapshot_hash
 
 
+def test_build_snapshot_identity_binds_source_content_hash():
+    # A2 RV fix (HIGH): two SourceArtifacts with the SAME PIDs but DIFFERENT
+    # text produce different source_hash — the snapshot identity must follow,
+    # or resume would replay a stale translation against changed source.
+    blocks_a = [_block("p00001", "First sentence.", index=0)]
+    blocks_b = [_block("p00001", "Completely different text.", index=0)]
+    source_a = build_source_artifact(chapter_id="ch046", blocks=blocks_a)
+    source_b = build_source_artifact(chapter_id="ch046", blocks=blocks_b)
+    assert source_a.source_hash != source_b.source_hash
+    memory = ChapterMemory(glossary={}, book_memory={})
+    snap_a = build_snapshot(chapter_id="ch046", source=source_a, memory=memory)
+    snap_b = build_snapshot(chapter_id="ch046", source=source_b, memory=memory)
+    # Same PIDs, same memory — only the source TEXT changed.
+    assert snap_a.pids == snap_b.pids
+    assert snap_a.glossary_hash == snap_b.glossary_hash
+    assert snap_a.book_memory_hash == snap_b.book_memory_hash
+    assert snap_a.snapshot_hash != snap_b.snapshot_hash
+    assert snap_a.source_hash == source_a.source_hash
+    assert snap_b.source_hash == source_b.source_hash
+
+
+def test_build_snapshot_identity_binds_selected_chapter_index_record():
+    # A2 RV fix (HIGH): chapter_index.json changes render_bible_section/the
+    # bible prompt — the snapshot identity must change with the SELECTED
+    # record so resume cannot reuse a translation against a different prompt.
+    blocks = [_block("p00001", "Only.", index=0)]
+    source = build_source_artifact(chapter_id="ch046", blocks=blocks)
+    base_memory = ChapterMemory(glossary={}, book_memory={})
+    snap_no_index = build_snapshot(
+        chapter_id="ch046", source=source, memory=base_memory,
+    )
+    snap_with_index = build_snapshot(
+        chapter_id="ch046", source=source,
+        memory=ChapterMemory(
+            glossary={}, book_memory={},
+            chapter_index={"ch046": {"characters": ["Blake"], "facts": [], "address": []}},
+        ),
+    )
+    assert snap_no_index.snapshot_hash != snap_with_index.snapshot_hash
+    # Only the SELECTED record matters: another chapter's record must not
+    # invalidate this chapter's snapshot identity.
+    snap_other_chapter = build_snapshot(
+        chapter_id="ch046", source=source,
+        memory=ChapterMemory(
+            glossary={}, book_memory={},
+            chapter_index={"ch999": {"characters": ["Other"], "facts": [], "address": []}},
+        ),
+    )
+    assert snap_other_chapter.snapshot_hash == snap_no_index.snapshot_hash
+    # A changed selected record changes the identity.
+    snap_changed = build_snapshot(
+        chapter_id="ch046", source=source,
+        memory=ChapterMemory(
+            glossary={}, book_memory={},
+            chapter_index={"ch046": {"characters": ["Blake", "Duncan"], "facts": [], "address": []}},
+        ),
+    )
+    assert snap_changed.snapshot_hash != snap_with_index.snapshot_hash
+
+
 def test_build_config_artifact_records_runtime_values():
     config = build_config_artifact(
         version="pact-v4-driver/phase12/draft/v1",

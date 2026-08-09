@@ -36,6 +36,7 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendQwenAuditEvaluatorConfig,
 )
 from pact_v4.runtime.gemma_selector import HttpGemmaSelector, HttpGemmaSelectorConfig
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 from pact_v4.runtime.model_caller import HttpModelCaller, HttpModelCallerConfig
 from pact_v4.runtime.model_lifecycle import ModelRouter
@@ -49,7 +50,8 @@ class LifecycleModelCaller:
     """``ModelCaller`` that ensures Gemma is resident before every call."""
 
     def __init__(self, router: ModelRouter, *, model_name: str,
-                 config: Optional[HttpModelCallerConfig] = None):
+                 config: Optional[HttpModelCallerConfig] = None,
+                 json_retry_policy: Optional[JsonRetryPolicy] = None):
         self._router = router
         api_config = (config.api if config else ApiClientConfig()).__class__(
             chat_url=f"{router.base_url}/v1/chat/completions",
@@ -58,10 +60,19 @@ class LifecycleModelCaller:
             context_size=(config.api.context_size if config else 32768),
             temperature=(config.api.temperature if config else 0.2),
         )
+        # A2 review fix (whole-chapter retry ownership): the generation-layer
+        # policy (WholeChapterRetryPolicy) is the single retry owner in
+        # whole-chapter mode, so the adapter-level JSON retry budget must be
+        # disabled there (max_retries=0), exactly like the runtime-config
+        # path does for build_role_adapters. When no policy is given the
+        # historical default (JsonRetryPolicy(), max_retries=2) is kept, so
+        # the chunked path keeps its current retry budget.
+        retry = json_retry_policy if json_retry_policy is not None else JsonRetryPolicy()
         inner_config = HttpModelCallerConfig(
             api=api_config,
             max_tokens=(config.max_tokens if config else HttpModelCallerConfig().max_tokens),
             label=(config.label if config else HttpModelCallerConfig().label),
+            retry=retry,
         )
         self._caller = HttpModelCaller(config=inner_config)
 

@@ -479,7 +479,7 @@ def run_chapter(
             "risk_policy": "pact-v4-risk-source-en/v1",
             "risk_thresholds": {"medium": 3, "high": 7},
             "prompt_fidelity_first": "pact-v4-prompt-fidelity-first/v2",
-            "prompt_balanced_literary": "pact-v4-prompt-balanced-literary/v2",
+            "prompt_balanced_literary": "pact-v4-prompt-balanced-literary/v3",
             "reviewer_qwen_fidelity": "pact-v4-reviewer-qwen-fidelity/v1",
             "reviewer_gemma_russian_preference": "pact-v4-reviewer-gemma-russian-preference/v1",
         },

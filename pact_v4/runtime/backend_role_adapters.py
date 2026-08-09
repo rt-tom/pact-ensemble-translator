@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import ModelCaller, PromptBundle
@@ -68,11 +68,14 @@ from pact_v4.runtime.qwen_evaluator import (
 LOG = logging.getLogger(__name__)
 
 
-# Phase 2B calls are JSON-object output with chunk-sized max_tokens. The
-# upper bound is generous (8k is well above what a single 20-PID chunk
-# needs at the provisional temperatures) but leaves headroom for any
-# future A/B template that may need to emit more verbose JSON.
-DEFAULT_MAX_TOKENS = 8192
+# Phase 2B generation calls produce JSON-object output. The output budget is
+# 32768 tokens (V4.1 A1, owner decision 2026-08-08): whole-chapter generation
+# emits the full chapter in one call (chapter 0001 ~12-19k tokens, the longest
+# chapter 0077 ~21k). For chunked calls the bound is still generous; the
+# OpenCode transport does not send max_output_tokens in the POST body (Gate 0
+# §2.4), so this value lives in the request/identity, not the transport wire.
+# Qwen-role budgets stay capped by MAX_TOKENS_CEILING (untouched).
+DEFAULT_MAX_TOKENS = 32768
 
 
 def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
@@ -94,6 +97,47 @@ def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
         f"no model binding for role(s) {list(roles)!r}; "
         f"backend model_bindings={dict(bindings)!r}"
     )
+
+
+def _reasoning_transported_via_request_options(
+    backend: CompletionBackend, model_ref: str
+) -> bool:
+    """Whether a reasoning budget for ``model_ref`` travels via request_options.
+
+    V4.1 A2 (plan §0.1/§3.4): the OpenCode backend maps request_options
+    reasoning to ``reasoningEffort`` — the request-level transport. Local
+    llama-server transports (``LocalOpenAIBackend``/``LocalRoutingBackend``
+    and composite profiles whose generator routes to a local sub-backend)
+    receive the reasoning budget from the SERVER ARGS
+    (``--reasoning-budget``), and ``LocalOpenAIBackend`` rejects any
+    request_options as a library-level guard — so the request to a local
+    generator must never carry reasoning request_options.
+
+    Composite backends are resolved down to the sub-backend that actually
+    serves ``model_ref``, so the decision follows the concrete transport.
+    """
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
+
+    if isinstance(backend, LocalOpenAIBackend):
+        return False
+    # LocalRoutingBackend / CompositeCompletionBackend live in runtime_config;
+    # imported lazily to keep the module-import graph acyclic (runtime_config
+    # imports this module inside build_role_adapters).
+    from pact_v4.runtime.runtime_config import (
+        CompositeCompletionBackend,
+        LocalRoutingBackend,
+    )
+
+    if isinstance(backend, LocalRoutingBackend):
+        return False
+    if isinstance(backend, CompositeCompletionBackend):
+        serving = backend.serving_backend(model_ref)
+        if serving is None:
+            # Unknown routing: fall back to request_options transport so the
+            # behaviour matches the historical path for unrecognised backends.
+            return True
+        return _reasoning_transported_via_request_options(serving, model_ref)
+    return True
 
 
 @dataclass(frozen=True)
@@ -158,19 +202,37 @@ class BackendModelCaller:
         # "fidelity_first"/"balanced_literary" to a different model than
         # "generator", this lookup honours the bundle role first and the
         # alias only as a fallback.
+        model_ref = _model_ref_for(self._backend, (bundle.role, "generator"))
+        request_options: Dict[str, Any] = {}
+        if bundle.params.reasoning and _reasoning_transported_via_request_options(
+            self._backend, model_ref
+        ):
+            # V4.1: Phase 2B generation reasoning budget (0=off, 1=low,
+            # 2=medium, 3=high). Transported via request_options so the
+            # opencode backend can map it to the top-level ``reasoningEffort``
+            # field; 0/absent keeps the historical B1 baseline (no field).
+            # Only the generation caller carries it — the Qwen audit / repair
+            # / formatting adapters never set request_options. V4.1 A2: local
+            # llama-server transports receive the reasoning budget from their
+            # server args (--reasoning-budget), so the request to them must
+            # NOT carry request_options reasoning (LocalOpenAIBackend rejects
+            # it — a library-level guard, plan §3.4/§0.1).
+            request_options["reasoning"] = bundle.params.reasoning
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, (bundle.role, "generator")),
+            model_ref=model_ref,
             messages=(Message(role="user", content=user_text),),
             max_output_tokens=self._max_tokens,
             temperature=bundle.params.temperature,
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
+            request_options=request_options,
         )
 
         def _complete() -> str:
             # Re-issues the identical request on a retry: same prompt, same
-            # model/backend, same request_options (none) — so retry never
-            # changes cache/resume identity and never enables reasoning (B1).
+            # model/backend, same request_options (including any pinned
+            # reasoning) — so retry never changes cache/resume identity and
+            # never switches the reasoning budget mid-request (B1).
             try:
                 return self._backend.complete(request).text
             except CompletionError as exc:

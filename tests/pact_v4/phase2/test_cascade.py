@@ -69,6 +69,8 @@ def make_candidate(
         glossary_hash=_hash("glossary"),
         book_memory_hash=_hash("book"),
         chapter_memory_hash=_hash("chapter"),
+        source_hash=source.source_hash,
+        chapter_index_hash=_hash("chapter_index"),
     )
     pids = tuple(pid for pid, _ in translation)
     # 100 words/PID keeps a handful of PIDs comfortably inside ChunkPlan's
@@ -404,6 +406,8 @@ def _make_two_chunk_plan(source: SourceArtifact):
         glossary_hash=_hash("glossary"),
         book_memory_hash=_hash("book"),
         chapter_memory_hash=_hash("chapter"),
+        source_hash=source.source_hash,
+        chapter_index_hash=_hash("chapter_index"),
     )
     chunk_plan = ChunkPlanArtifact.create(
         snapshot,
