@@ -17,6 +17,7 @@ from pact_v4.phase1.models import WholeChapterPidMap
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     WHOLE_CHAPTER_CHUNK_ID,
     WHOLE_CHAPTER_SELECTION_SCHEMA,
+    build_strict_lifecycle,
     run_chapter_strict,
 )
 from pact_v4.runtime.model_lifecycle import ModelRouter
@@ -1357,3 +1358,165 @@ def test_whole_chapter_success_closes_resources(tmp_path):
     assert runtime.closed is True
     assert progress.closed is True
     assert usage.closed is True
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 2 (pre-dispatch cleanup): runtime/progress/usage are created
+# and the usage writer is attached BEFORE source/snapshot/planner rebuild.
+# A failure there (e.g. empty/malformed source -> "no source blocks parsed")
+# used to leak all three because the whole-chapter wrapper's finally only
+# covers failures once dispatch has started. The outer guard in
+# run_chapter_strict must close them and re-raise the ORIGINAL exception
+# (a cleanup error must never mask it).
+# ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_pre_dispatch_source_failure_closes_resources(tmp_path):
+    # Empty/malformed chapter html -> load_source parses no blocks -> the
+    # pre-dispatch ValueError must close runtime/progress/usage and propagate
+    # unchanged.
+    cfg = _whole_chapter_cfg(tmp_path)
+    cfg.chapter_html_path.write_text("<html><body></body></html>", encoding="utf-8")
+
+    runtime = _CloseTrackingRuntime()
+    progress = _CloseTrackingProgress()
+    usage = _CloseTrackingUsageWriter()
+    with pytest.raises(ValueError, match="no source blocks parsed"):
+        run_chapter_strict(
+            cfg, runtime=runtime, model_caller=StubModelCaller(),
+            qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
+            qwen_audit_evaluator=StubQwenAudit(), gemma_audit_evaluator=StubGemmaAudit(),
+            progress=progress, usage_writer=usage,
+        )
+    assert runtime.closed is True
+    assert progress.closed is True
+    assert usage.closed is True
+
+
+def test_whole_chapter_pre_dispatch_planner_failure_closes_resources(tmp_path):
+    # A planner failure ("planner returned no chunks") is also pre-dispatch:
+    # resources must close and the original ValueError must propagate. The
+    # planner is patched to return no plans while load_source still parses
+    # valid blocks, so the failure is exactly the planner branch.
+    import pact_v4.pipeline.v4_phase12_strict_runner as runner
+
+    orig_planner = runner.ChunkPlanner
+
+    class _EmptyPlanner:
+        def __init__(self, **kwargs):
+            pass
+
+        def plan(self, blocks, *, snapshot_hash, following_blocks):
+            return []
+
+    runner.ChunkPlanner = _EmptyPlanner
+    try:
+        runtime = _CloseTrackingRuntime()
+        progress = _CloseTrackingProgress()
+        usage = _CloseTrackingUsageWriter()
+        with pytest.raises(ValueError, match="planner returned no chunks"):
+            run_chapter_strict(
+                _whole_chapter_cfg(tmp_path), runtime=runtime,
+                model_caller=StubModelCaller(),
+                qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
+                qwen_audit_evaluator=StubQwenAudit(),
+                gemma_audit_evaluator=StubGemmaAudit(),
+                progress=progress, usage_writer=usage,
+            )
+        assert runtime.closed is True
+        assert progress.closed is True
+        assert usage.closed is True
+    finally:
+        runner.ChunkPlanner = orig_planner
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 1 (whole-chapter retry ownership): the default-local CLI path
+# (run_local_default -> build_strict_lifecycle -> LifecycleModelCaller ->
+# HttpModelCaller -> BackendModelCallerConfig) must disable the adapter-level
+# JsonRetryPolicy for whole-chapter runs (max_retries=0), so total model calls
+# == WholeChapterRetryPolicy.max_attempts (single retry owner) — never
+# max_attempts × adapter budget (9). The chunked path keeps the default
+# max_retries=2.
+# ---------------------------------------------------------------------------
+
+
+class _URLAdapter(FakeLifecycleAdapter):
+    """Fake lifecycle adapter with a base_url (ModelRouter.base_url needs it)."""
+
+    base_url = "http://127.0.0.1:1"  # never contacted (backend swapped in test)
+
+
+class _FakeLifecycleBackend:
+    """Stand-in for the default-local StrictBackendConfig: fake runtime+router."""
+
+    model_names = {"gemma": "gemma-fake", "qwen": "qwen-fake"}
+
+    def build_runtime(self, log_dir=None):
+        class _Runtime:
+            pass
+
+        runtime = _Runtime()
+        runtime.router = ModelRouter(
+            _URLAdapter(),
+            role_profile_names={"gemma": "Gemma", "qwen": "Qwen"},
+            role_args={"gemma": [], "qwen": []},
+        )
+        return runtime
+
+
+def test_build_strict_lifecycle_wires_retry_policy_through_caller(tmp_path):
+    # The lifecycle/default-local boundary must thread json_retry_policy into
+    # the generation caller's BackendModelCallerConfig.retry: max_retries=0
+    # for whole-chapter (adapter budget disabled), default max_retries=2 when
+    # no policy is given (chunked path unchanged).
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    backend = _FakeLifecycleBackend()
+    _, wc_caller, *_ = build_strict_lifecycle(
+        backend, log_dir=tmp_path / "logs",
+        json_retry_policy=JsonRetryPolicy(max_retries=0),
+    )
+    assert wc_caller._caller._impl._config.retry.max_retries == 0
+
+    _, chunked_caller, *_ = build_strict_lifecycle(backend, log_dir=tmp_path / "logs")
+    assert chunked_caller._caller._impl._config.retry.max_retries == JsonRetryPolicy().max_retries
+
+
+def test_whole_chapter_default_local_lifecycle_bounds_calls_to_max_attempts(tmp_path):
+    # Through the real default-local lifecycle (build_strict_lifecycle with
+    # the same wiring run_local_default uses for --whole-chapter) an
+    # always-bad model must cost exactly WholeChapterRetryPolicy.max_attempts
+    # backend calls — the adapter-level JSON retry is disabled, so the
+    # generation layer is the single retry owner (3 calls, not 3×3=9).
+    from pact_v4.phase2.generation import WholeChapterRetryPolicy
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+    from tests.pact_v4.runtime.test_backend_role_adapters import (
+        ScriptedBackend,
+        _text_response,
+    )
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _FakeLifecycleBackend()
+    router, model_caller, *_ = build_strict_lifecycle(
+        backend, log_dir=tmp_path / "logs",
+        json_retry_policy=JsonRetryPolicy(max_retries=0),
+    )
+    # Swap the HTTP transport for a scripted always-bad backend: the
+    # lifecycle caller still performs the router.ensure_resident + request
+    # construction, only the final transport is scripted.
+    scripted = ScriptedBackend(
+        [_text_response("")] * WholeChapterRetryPolicy().max_attempts
+    )
+    model_caller._caller._impl._backend = scripted
+
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
+        qwen_audit_evaluator=StubQwenAudit(), gemma_audit_evaluator=StubGemmaAudit(),
+    )
+
+    assert result.incomplete_generation_count == 1
+    assert result.selected_count == 0
+    assert len(scripted.requests) == WholeChapterRetryPolicy().max_attempts
+    assert not (cfg.out_dir / "translations_raw.json").exists()

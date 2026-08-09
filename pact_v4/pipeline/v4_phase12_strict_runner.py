@@ -140,6 +140,7 @@ from pact_v4.pipeline._shared_runner_helpers import (
 from pact_v4.pipeline.phase_progress import PhaseProgressWriter
 from pact_v4.pipeline.usage_record import UsageRecordWriter
 from pact_v4.runtime.model_lifecycle import ModelRouter
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
     QWEN_MODEL_KEY,
@@ -333,6 +334,7 @@ class StrictRunConfig:
 
 def build_strict_lifecycle(
     backend: StrictBackendConfig, *, log_dir: Path, bible_text: str = "",
+    json_retry_policy: Optional[JsonRetryPolicy] = None,
 ) -> Tuple[ModelRouter, Any, Any, Any, Any, Any]:
     """Wire up the real ``llama-server``-backed lifecycle for a live run.
 
@@ -345,6 +347,15 @@ def build_strict_lifecycle(
     ``llama-server``. The router is built once here and handed to the
     coordinator; the runner adapters are the lifecycle-aware wrappers over
     that same router.
+
+    ``json_retry_policy`` (A2 review fix, whole-chapter retry ownership) is
+    the adapter-level JSON retry policy for the generation caller. In
+    whole-chapter mode the CLI passes ``JsonRetryPolicy(max_retries=0)`` so
+    the generation layer (``WholeChapterRetryPolicy``) is the single retry
+    owner — total model attempts stay exactly ``max_attempts`` instead of
+    ``max_attempts × adapter-budget``. When ``None`` (the default; chunked
+    runs and test stubs) the historical ``JsonRetryPolicy()`` (max_retries=2)
+    is preserved, so the chunked path keeps its current retry budget.
     """
     from pact_v4.runtime.qwen_evaluator import HttpQwenEvaluatorConfig
     from pact_v4.runtime.backend_role_adapters import (
@@ -353,7 +364,10 @@ def build_strict_lifecycle(
     )
     runtime = backend.build_runtime(log_dir=log_dir)
     router = runtime.router
-    model_caller = LifecycleModelCaller(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
+    model_caller = LifecycleModelCaller(
+        router, model_name=backend.model_names[GEMMA_MODEL_KEY],
+        json_retry_policy=json_retry_policy,
+    )
     qwen_evaluator = LifecycleQwenEvaluator(
         router, model_name=backend.model_names[QWEN_MODEL_KEY],
         config=HttpQwenEvaluatorConfig(bible_text=bible_text),
@@ -2147,6 +2161,32 @@ def _run_quarantined_retry_cycle(
 # ---------------------------------------------------------------------------
 
 
+def _close_run_resources(runtime: Any, progress_writer: Any, usage_writer: Any) -> None:
+    """Idempotently close the runtime / progress writer / usage writer.
+
+    A2 review fix (pre-dispatch cleanup): the whole-chapter wrapper's
+    ``finally`` already closes these on every path once dispatch has
+    started, but failures BEFORE dispatch (source/snapshot/planner) used to
+    leak them. This helper is the single guarded close routine: each close
+    is individually guarded so a cleanup error is logged and NEVER masks the
+    original exception the caller is propagating. ``close()`` is idempotent
+    (writers null their handle, coordinators guard on ``_closed``), so
+    calling this both here and in the wrapper's ``finally`` is safe.
+    """
+    try:
+        runtime.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close runtime during pre-dispatch cleanup")
+    try:
+        progress_writer.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close progress writer during pre-dispatch cleanup")
+    try:
+        usage_writer.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close usage writer during pre-dispatch cleanup")
+
+
 def run_chapter_strict(
     cfg: StrictRunConfig,
     *,
@@ -2234,41 +2274,52 @@ def run_chapter_strict(
 
     # ------------------------------------------------------------------
     # Rebuild source/snapshot/plan -- identical to run_chapter/run_generate.
+    # A2 review fix (pre-dispatch cleanup): the resources above are created /
+    # attached BEFORE this setup, so a failure here (empty/malformed source,
+    # snapshot construction, planner) must not leak them. The whole-chapter
+    # wrapper's own finally only covers failures once dispatch has started;
+    # this outer guard closes the resources on ANY pre-dispatch failure and
+    # re-raises the ORIGINAL exception — a cleanup error never masks it
+    # (_close_run_resources guards each close), and close() is idempotent.
     # ------------------------------------------------------------------
-    blocks, _raw_sha = load_source(cfg.chapter_html_path)
-    if not blocks:
-        raise ValueError(f"Chapter {cfg.chapter_id}: no source blocks parsed")
-    source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
-    memory = ChapterMemory.from_directory(cfg.memory_dir)
-    snapshot = build_snapshot(
-        chapter_id=cfg.chapter_id, source=source, memory=memory,
-        context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
-    )
-    config = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
-    planner = ChunkPlanner(
-        target_words=cfg.target_chunk_words, min_words=cfg.min_chunk_words,
-        max_words=cfg.max_chunk_words,
-    )
-    plans = planner.plan(blocks, snapshot_hash=snapshot.snapshot_hash,
-                          following_blocks=cfg.right_context_pids)
-    if not plans:
-        raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
-    chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
-    chunk_plan_path = cfg.out_dir / "chunk_plan.json"
-    chunk_plan_path.write_text(
-        json.dumps(chunk_plan.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+    try:
+        blocks, _raw_sha = load_source(cfg.chapter_html_path)
+        if not blocks:
+            raise ValueError(f"Chapter {cfg.chapter_id}: no source blocks parsed")
+        source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
+        memory = ChapterMemory.from_directory(cfg.memory_dir)
+        snapshot = build_snapshot(
+            chapter_id=cfg.chapter_id, source=source, memory=memory,
+            context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
+        )
+        config = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
+        planner = ChunkPlanner(
+            target_words=cfg.target_chunk_words, min_words=cfg.min_chunk_words,
+            max_words=cfg.max_chunk_words,
+        )
+        plans = planner.plan(blocks, snapshot_hash=snapshot.snapshot_hash,
+                              following_blocks=cfg.right_context_pids)
+        if not plans:
+            raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
+        chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+        chunk_plan_path = cfg.out_dir / "chunk_plan.json"
+        chunk_plan_path.write_text(
+            json.dumps(chunk_plan.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8",
+        )
 
-    glossary = _glossary_entries(memory)
-    # V4.1 A2 (§5.2): the bible is rendered per chapter from the
-    # deterministic chapter_index (no "first N" caps); when no
-    # chapter_index.json exists the renderer falls back to the legacy
-    # full-memory render, so runs without an index keep working.
-    bible_text = render_bible_section(
-        cfg.chapter_id, memory.chapter_index, memory.book_memory
-    )
-    narrator_gender = extract_narrator_gender(memory.book_memory)
-    narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
+        glossary = _glossary_entries(memory)
+        # V4.1 A2 (§5.2): the bible is rendered per chapter from the
+        # deterministic chapter_index (no "first N" caps); when no
+        # chapter_index.json exists the renderer falls back to the legacy
+        # full-memory render, so runs without an index keep working.
+        bible_text = render_bible_section(
+            cfg.chapter_id, memory.chapter_index, memory.book_memory
+        )
+        narrator_gender = extract_narrator_gender(memory.book_memory)
+        narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
+    except BaseException:
+        _close_run_resources(runtime, progress_writer, usage_writer)
+        raise
 
     # V4.1 A1 whole-chapter mode: one generation call per chapter against the
     # full ordered PID map. This is a fundamentally different flow from the
@@ -3617,13 +3668,9 @@ def _run_whole_chapter_strict(
         # managed server, releases the local router, closes the progress and
         # usage writers. close() is idempotent (writers null their handle,
         # coordinators guard on _closed), so running it here AND at the
-        # successful tail is safe.
-        try:
-            runtime.close()
-        except Exception:  # noqa: BLE001
-            LOG.exception("Failed to close runtime at end of whole-chapter run")
-        progress.close()
-        usage_writer.close()
+        # successful tail is safe. _close_run_resources guards each close so
+        # a cleanup error is logged and never masks the original exception.
+        _close_run_resources(runtime, progress, usage_writer)
 
 
 def _run_whole_chapter_strict_impl(

@@ -434,9 +434,17 @@ def run_local_default(args: argparse.Namespace) -> int:
     cfg = _build_run_config(args, backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
+    # A2 review fix (whole-chapter retry ownership): in whole-chapter mode
+    # the GENERATION layer (WholeChapterRetryPolicy) is the single retry
+    # owner — the adapter-level JSON retry (JsonRetryPolicy) is disabled for
+    # the run so total model attempts stay exactly
+    # WholeChapterRetryPolicy.max_attempts (see build_strict_lifecycle).
+    # The chunked path keeps the default adapter budget (None -> max_retries=2).
+    json_retry = JsonRetryPolicy(max_retries=0) if args.whole_chapter else None
     router, model_caller, qwen_evaluator, gemma_selector, \
         qwen_audit_evaluator, gemma_audit_evaluator = build_strict_lifecycle(
             backend, log_dir=args.out_dir / "server_logs", bible_text=bible_text,
+            json_retry_policy=json_retry,
         )
     runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)

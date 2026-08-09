@@ -202,3 +202,37 @@ def test_remote_config_reasoning_zero_is_baseline(tmp_path: Path):
     assert args.reasoning == 0
     cfg = cli._build_run_config(args, _remote_cfg())
     assert cfg.reasoning == 0
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 1 (whole-chapter retry ownership): run_local_default must pass
+# JsonRetryPolicy(max_retries=0) to build_strict_lifecycle when --whole-chapter
+# (the generation layer WholeChapterRetryPolicy is the single retry owner) and
+# None for the chunked path (default adapter budget max_retries=2 preserved).
+# ---------------------------------------------------------------------------
+
+
+def test_run_local_default_whole_chapter_wires_single_retry_owner(
+    tmp_path: Path, monkeypatch
+):
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    captured = {}
+
+    def _fake_lifecycle(backend, *, log_dir, bible_text="", json_retry_policy=None):
+        captured["json_retry_policy"] = json_retry_policy
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(cli, "build_strict_lifecycle", _fake_lifecycle)
+
+    args_wc = cli.build_argparser().parse_args(_base_args(tmp_path) + ["--whole-chapter"])
+    with pytest.raises(RuntimeError, match="captured"):
+        cli.run_local_default(args_wc)
+    assert captured["json_retry_policy"] is not None
+    assert captured["json_retry_policy"].max_retries == 0
+
+    captured.clear()
+    args_chunked = cli.build_argparser().parse_args(_base_args(tmp_path))
+    with pytest.raises(RuntimeError, match="captured"):
+        cli.run_local_default(args_chunked)
+    assert captured["json_retry_policy"] is None

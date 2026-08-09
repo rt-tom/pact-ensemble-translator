@@ -20,6 +20,7 @@ from pact_v4.phase2.generation import PromptBundle
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig, ApiClientError
 from pact_v4.runtime.backend_protocol import CompletionError
 from pact_v4.runtime.backend_role_adapters import BackendModelCaller, BackendModelCallerConfig
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 
 
@@ -37,6 +38,11 @@ class HttpModelCallerConfig:
     api: ApiClientConfig = field(default_factory=ApiClientConfig)
     max_tokens: int = DEFAULT_MAX_TOKENS
     label: str = "phase2b-generation"
+    # B4/B10 JSON-resilience policy for the generation adapter (default
+    # ``JsonRetryPolicy()``, max_retries=2). The lifecycle wrapper passes an
+    # explicit policy through here so whole-chapter runs can disable the
+    # adapter-level budget (single retry owner = WholeChapterRetryPolicy).
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class HttpModelCaller:
@@ -71,7 +77,7 @@ class HttpModelCaller:
         self._backend = LocalOpenAIBackend(api=api)
         self._impl = BackendModelCaller(
             self._backend,
-            config=BackendModelCallerConfig(max_tokens=self._max_tokens),
+            config=BackendModelCallerConfig(max_tokens=self._max_tokens, retry=self._config.retry),
         )
 
     @property

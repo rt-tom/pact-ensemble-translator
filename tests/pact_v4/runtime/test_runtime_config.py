@@ -628,3 +628,69 @@ def test_validate_reasoning_backend_composite_first_wins_without_generator_route
     )
     for level in (1, 2, 3):
         validate_reasoning_backend(level, local_first)
+
+
+# ---------------------------------------------------------------------------
+# A2 RV finding 3 (malformed/ambiguous --reasoning-budget): the identity
+# contract must distinguish ABSENT (None — accepted reasoning=0 baseline)
+# from present-but-malformed (missing value, non-integer value, duplicate
+# occurrences — fail closed for EVERY reasoning level). A broken profile
+# must never masquerade as the baseline.
+# ---------------------------------------------------------------------------
+
+
+def _local_with_raw_args(raw: list) -> LocalLlamaBackendConfig:
+    from dataclasses import replace
+
+    return replace(_local(), server_args={"gemma": raw, "qwen": []})
+
+
+def test_reasoning_budget_from_server_args_absent_is_none():
+    from pact_v4.runtime.runtime_config import _reasoning_budget_from_server_args
+
+    assert _reasoning_budget_from_server_args([]) is None
+    assert _reasoning_budget_from_server_args(["-ngl", "99"]) is None
+    # A flag-like token that is NOT the exact flag is still absent.
+    assert _reasoning_budget_from_server_args(["--reasoning-budgetx", "2048"]) is None
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (["--reasoning-budget", "0"], 0),
+    (["--reasoning-budget", "2048"], 2048),
+    (["-ngl", "99", "--reasoning-budget", "0"], 0),
+    (["-ngl", "99", "--reasoning-budget", "2048"], 2048),
+])
+def test_reasoning_budget_from_server_args_valid_values(raw, expected):
+    from pact_v4.runtime.runtime_config import _reasoning_budget_from_server_args
+
+    assert _reasoning_budget_from_server_args(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    ["--reasoning-budget"],                    # missing value (flag at end)
+    ["--reasoning-budget", "not-an-int"],      # non-integer value
+    ["-ngl", "99", "--reasoning-budget"],      # missing value after flag
+    ["--reasoning-budget", "0", "--reasoning-budget", "2048"],  # duplicate
+    ["--reasoning-budget", "2048", "--reasoning-budget", "0"],  # duplicate, reversed
+])
+def test_reasoning_budget_from_server_args_malformed_fails_closed(raw):
+    from pact_v4.runtime.runtime_config import _reasoning_budget_from_server_args
+
+    with pytest.raises(ValueError, match="--reasoning-budget"):
+        _reasoning_budget_from_server_args(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    ["--reasoning-budget"],                    # missing value (flag at end)
+    ["--reasoning-budget", "not-an-int"],      # non-integer value
+    ["--reasoning-budget", "0", "--reasoning-budget", "2048"],  # duplicate
+])
+@pytest.mark.parametrize("reasoning", [0, 1, 2, 3])
+def test_validate_reasoning_backend_rejects_malformed_budget_for_all_levels(
+    raw, reasoning
+):
+    # A2 RV finding 3: malformed/missing/ambiguous --reasoning-budget must
+    # fail closed for EVERY reasoning level — None is only the ABSENT-flag
+    # baseline, never a broken profile's stand-in.
+    with pytest.raises(ValueError, match="--reasoning-budget"):
+        validate_reasoning_backend(reasoning, _local_with_raw_args(raw))

@@ -649,17 +649,41 @@ def _local_generator_server_args(backend: LocalLlamaBackendConfig) -> list:
 def _reasoning_budget_from_server_args(args: Sequence[str]) -> Optional[int]:
     """The ``--reasoning-budget`` value in a server-args list, or ``None``.
 
-    Returns ``None`` when the flag is absent or its value is not an int
-    (the profile cannot express a numeric reasoning budget). ``0`` means
-    "no reasoning" (the B1 baseline on llama-server).
+    Returns ``None`` ONLY when the flag is absent (the profile cannot
+    express a numeric reasoning budget). ``0`` means "no reasoning" (the
+    B1 baseline on llama-server).
+
+    A present-but-malformed flag fails closed with ``ValueError`` (A2 RV
+    finding 3): a missing value (flag at the end of the list), a non-int
+    value, or duplicate occurrences are profile-configuration errors and
+    must never be conflated with an absent flag. ``validate_reasoning_backend``
+    treats ``None`` as the accepted ``reasoning=0`` baseline, so silently
+    mapping a malformed profile to ``None`` would let a broken config
+    masquerade as the baseline.
     """
-    for index, arg in enumerate(args):
-        if arg == "--reasoning-budget" and index + 1 < len(args):
-            try:
-                return int(args[index + 1])
-            except (TypeError, ValueError):
-                return None
-    return None
+    occurrences = [i for i, arg in enumerate(args) if arg == "--reasoning-budget"]
+    if not occurrences:
+        return None
+    if len(occurrences) > 1:
+        raise ValueError(
+            "--reasoning-budget appears more than once in server_args "
+            f"({len(occurrences)} occurrences) — the profile is ambiguous; "
+            "refusing to guess the intended budget."
+        )
+    index = occurrences[0]
+    if index + 1 >= len(args):
+        raise ValueError(
+            "--reasoning-budget in server_args has no value — expected "
+            "--reasoning-budget <int>."
+        )
+    raw = args[index + 1]
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"--reasoning-budget in server_args has a non-integer value "
+            f"{raw!r} — expected --reasoning-budget <int>."
+        ) from None
 
 
 def validate_reasoning_backend(reasoning: int, backend: Any) -> None:
@@ -693,6 +717,13 @@ def validate_reasoning_backend(reasoning: int, backend: Any) -> None:
       a nonzero ``--reasoning-budget`` (the profile cannot express the
       requested reasoning without it — e.g. an arbitrary local profile
       with no reasoning server arg at all).
+
+    A2 review fix (RV finding 3): a present-but-malformed
+    ``--reasoning-budget`` (missing value, non-integer value, or duplicate
+    occurrences) fails closed for EVERY reasoning level — ``None`` means
+    "flag absent" (the accepted ``reasoning=0`` baseline), never "broken
+    profile", so a malformed server-args profile can no longer masquerade
+    as the baseline.
 
     Raises ``ValueError`` when the combination is unsupported / the profile
     cannot express the value; returns ``None`` otherwise.
