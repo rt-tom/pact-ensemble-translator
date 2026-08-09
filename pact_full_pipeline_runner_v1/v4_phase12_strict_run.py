@@ -164,14 +164,27 @@ def build_argparser() -> argparse.ArgumentParser:
                         "repair / formatting phases are untouched. Part of the "
                         "config identity — a reasoning change invalidates "
                         "cache/resume, so use a NEW --out-dir.")
-    p.add_argument("--stop-after", choices=("selection",), default="",
-                   metavar="selection",
-                   help="V4.1: early exit after Phase 1-2 (generation + "
-                        "selection). 'selection' halts before Step 6 and "
-                        "records step6/step7/step8 as "
-                        "skipped_stop_after_selection (translations.json keeps "
-                        "the chunked translation). Default: full cycle. Part of "
-                        "the config identity — use a NEW --out-dir.")
+    p.add_argument("--stop-after-generation", action="store_true",
+                   help="V4.1 A1: early exit right after Phase 1-2 generation "
+                        "(chunked runs: generation + per-chunk selection). "
+                        "Steps 6/7/8 are skipped and recorded as "
+                        "skipped_stop_after_generation (translations.json keeps "
+                        "the translation). Default: full cycle. Part of the "
+                        "config identity — use a NEW --out-dir. "
+                        "Renamed from --stop-after selection (A1).")
+    p.add_argument("--whole-chapter", action="store_true",
+                   help="V4.1 A1: whole-chapter generation — ONE model call "
+                        "per chapter against the full ordered PID map "
+                        "(WholeChapterPidMap derived from the chunk plan), "
+                        "strict {pid: text} JSON contract, bounded retry on "
+                        "malformed/missing/extra/reordered PID, empty/"
+                        "truncated JSON and session aborts. No chunking, no "
+                        "selection (selection_results.json is always written "
+                        "with schema pact-v4-whole-chapter-selection/v1, "
+                        "mode=not_applicable); translations_raw.json is the "
+                        "validated generator snapshot; Steps 6/7/8 are out of "
+                        "A1 scope and recorded as skipped. Part of the config "
+                        "identity — use a NEW --out-dir.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -324,12 +337,14 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
         run_label=args.run_label,
         # V4.1: reasoning budget for Phase 2B generation and early exit after
-        # Phase 1-2 selection. Both are part of the config identity
+        # Phase 1-2 generation. Both are part of the config identity
         # (StrictRunConfig.to_config_artifact), so a run with either set is
         # NOT resumable from a prior out-dir — the owner must pass a NEW
         # --out-dir for these experiment runs.
         reasoning=args.reasoning,
-        stop_after=args.stop_after,
+        stop_after=("generation" if args.stop_after_generation else ""),
+        # V4.1 A1: whole-chapter mode (one generation call per chapter).
+        whole_chapter=args.whole_chapter,
         # V4 Efficiency A2: CLI flag (--lazy-balanced/--no-lazy-balanced)
         # overrides the env var, which defaults to true (lazy mode on).
         lazy_balanced=(

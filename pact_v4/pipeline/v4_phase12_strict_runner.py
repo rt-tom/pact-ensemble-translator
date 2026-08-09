@@ -81,10 +81,17 @@ from pact_v4.phase1.models import (
     ConfigArtifact,
     GateResult,
     Provenance,
+    WholeChapterPidMap,
     canonical_json_hash,
 )
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
-from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
+from pact_v4.phase2.generation import (
+    GenerationCache,
+    GenerationParams,
+    WholeChapterRetryPolicy,
+    generate_for_chunk,
+    generate_whole_chapter,
+)
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
 from pact_v4.phase4.quarantined_retry import (
@@ -219,7 +226,15 @@ class StrictRunConfig:
     right_context_pids: int = 0
     temperature: float = 0.2
     seed: int = 7
-    max_tokens: int = 8192
+    # V4.1 A1 (owner decision 2026-08-08): the generator's output budget is
+    # 32768 tokens (whole-chapter output of chapter 0001 is ~12-19k tokens,
+    # the longest chapter 0077 ~21k; Gate 0 §8.5). The value is part of the
+    # config identity (generation.max_tokens below), so changing it
+    # invalidates cache/resume exactly like any other generation setting.
+    # The OpenCode transport does not send it in the POST body (Gate 0 §2.4),
+    # so this is an identity/record value, not a transport constraint; the
+    # Qwen-role ceiling MAX_TOKENS_CEILING=24576 is untouched.
+    max_tokens: int = 32768
     deterministic_glossary_terms: Tuple[Tuple[str, str], ...] = ()
     deterministic_names: Tuple[Tuple[str, str], ...] = ()
     deterministic_mixed_script_allow: Tuple[str, ...] = ()
@@ -251,11 +266,20 @@ class StrictRunConfig:
     # cache/resume exactly like any other generation setting.
     reasoning: int = 0
     # V4.1 early-exit policy: "" runs the full cycle (audit/repair/
-    # formatting); "selection" halts right after Phase 1-2 (generation +
-    # selection), skipping Steps 6/7/8 and recording them as skipped. Part
-    # of the config identity (to_config_artifact) — a run that stops early
-    # is a different run from a full one.
+    # formatting); "generation" halts right after Phase 1-2 generation
+    # (whole-chapter mode is generation-only in A1, so the whole-chapter path
+    # records Steps 6/7/8 as skipped regardless). Part of the config identity
+    # (to_config_artifact) — a run that stops early is a different run from a
+    # full one. Renamed from "selection" (V4.1 A1: the CLI flag is now
+    # --stop-after-generation; chunked runs keep the same halt point).
     stop_after: str = ""
+    # V4.1 A1: whole-chapter mode — one generation call per chapter against
+    # the full ordered PID map (WholeChapterPidMap), no chunking/selection.
+    # Steps 6/7/8 (audit/repair/formatting) are NOT part of A1 (they are
+    # A2/B/B2/C) and are recorded as skipped. Part of the config identity:
+    # a whole-chapter run is not resumable from a chunked run's out-dir and
+    # vice versa.
+    whole_chapter: bool = False
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -274,6 +298,7 @@ class StrictRunConfig:
                     "reasoning": self.reasoning,
                 },
                 "stop_after": self.stop_after,
+                "whole_chapter": self.whole_chapter,
                 "formatting": {
                     "required": self.formatting_required,
                     "max_incidents": self.max_formatting_incidents,
@@ -2216,6 +2241,23 @@ def run_chapter_strict(
     bible_text = render_bible_section(memory.book_memory)
     narrator_gender = extract_narrator_gender(memory.book_memory)
     narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
+
+    # V4.1 A1 whole-chapter mode: one generation call per chapter against the
+    # full ordered PID map. This is a fundamentally different flow from the
+    # per-chunk loop below (no chunking, no selection cascade, Steps 6/7/8 are
+    # out of A1 scope and recorded as skipped), so it gets its own dedicated
+    # path that still writes the same artifacts (journal, generation_outcomes,
+    # selection_results with the v1 not_applicable schema, translations_raw,
+    # translations, strict_chapter_trial_record).
+    if cfg.whole_chapter:
+        return _run_whole_chapter_strict(
+            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config, memory=memory, glossary=glossary, bible_text=bible_text,
+            narrator_gender=narrator_gender, model_caller=model_caller,
+            runtime=runtime, now_fn=now_fn, progress=progress_writer,
+            usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+        )
+
     source_map = dict(source.source)
     risk_by_chunk = {
         pc.chunk_id: _risk_for_chunk(chunk=pc, source_map=source_map, glossary=glossary)
@@ -2789,20 +2831,21 @@ def run_chapter_strict(
             ),
         ),
     )
-    # V4.1 stop_after="selection": halt right after Phase 1-2 (generation +
-    # selection). The chunked translation is already on disk (incremental
-    # translations.json writes); Steps 6/7/8 (audit, repair, formatting) are
-    # intentionally skipped and the record marks them as such. The shared
-    # finalization below still writes every artifact a normal run writes
-    # (generation_outcomes.json, selection_results.json, selection_meta.json,
-    # journal, translations.json), with step6/step7/step8 set to the
-    # "skipped_stop_after_selection" sentinel.
-    if cfg.stop_after == "selection":
-        step6 = {"status": "skipped_stop_after_selection"}
-        step7 = {"status": "skipped_stop_after_selection"}
-        step8 = {"status": "skipped_stop_after_selection"}
+    # V4.1 stop_after="generation" (renamed from "selection", A1): halt right
+    # after Phase 1-2 (generation + per-chunk selection). The chunked
+    # translation is already on disk (incremental translations.json writes);
+    # Steps 6/7/8 (audit, repair, formatting) are intentionally skipped and
+    # the record marks them as such. The shared finalization below still
+    # writes every artifact a normal run writes (generation_outcomes.json,
+    # selection_results.json, selection_meta.json, journal,
+    # translations.json), with step6/step7/step8 set to the
+    # "skipped_stop_after_generation" sentinel.
+    if cfg.stop_after == "generation":
+        step6 = {"status": "skipped_stop_after_generation"}
+        step7 = {"status": "skipped_stop_after_generation"}
+        step8 = {"status": "skipped_stop_after_generation"}
         halted_early = True
-        halt_reason = "stop_after_selection"
+        halt_reason = "stop_after_generation"
         phase4_inputs = None
         repair_phase_result = None
     else:
@@ -3214,3 +3257,352 @@ def run_chapter_strict(
 
 def translations_path_exists(out_dir: Path) -> bool:
     return (out_dir / "translations.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# V4.1 A1 whole-chapter mode: one generation call per chapter.
+# ---------------------------------------------------------------------------
+
+# Schema of the always-written whole-chapter selection artifact. Written even
+# when no A/B selection exists, so resume/diagnostics/B9 never have to guess
+# whether the artifact is missing or selection simply did not run.
+WHOLE_CHAPTER_SELECTION_SCHEMA = "pact-v4-whole-chapter-selection/v1"
+
+# Whole-chapter journal/count marker: the single journal entry's chunk_id and
+# the generation record's chunk_id (the whole chapter is one processing unit).
+WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
+
+
+def _run_whole_chapter_strict(
+    cfg: StrictRunConfig,
+    *,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    memory: Any,
+    glossary: Any,
+    bible_text: str,
+    narrator_gender: Optional[str],
+    model_caller: Any,
+    runtime: Any,
+    now_fn: Any,
+    progress: Any,
+    usage_writer: Any,
+    started_at: str,
+    wall_t0: float,
+) -> StrictChapterRunResult:
+    """V4.1 A1 whole-chapter generation: one call per chapter.
+
+    Derives the full ordered PID map (``WholeChapterPidMap``) from the
+    authoritative multi-chunk ``ChunkPlanArtifact`` (which stays on disk as
+    PID provenance, never replaced by a synthetic one-chunk plan), generates
+    the whole chapter in a single call with the strict ``{pid: text}`` JSON
+    contract and bounded retry (``generate_whole_chapter``), and writes the
+    whole-chapter provenance contract:
+
+    * journal — exactly one ``whole_chapter`` entry;
+    * ``translations_raw.json`` — the validated generator output (the raw
+      snapshot, written before any QA/repair; resume reads THIS file, never
+      the final ``translations.json`` alias);
+    * ``translations.json`` — the final alias (in A1 identical to raw);
+    * ``selection_results.json`` — always written with
+      ``pact-v4-whole-chapter-selection/v1`` (mode=not_applicable,
+      candidate_count=1, selection_performed=false, coverage=full_pid_map,
+      generation_record_id);
+    * ``generation_outcomes.json`` — one whole-chapter record
+      (candidate_id ``whole_chapter:<role>:<hash>``);
+    * ``strict_chapter_trial_record.json`` — the run record.
+
+    Steps 6/7/8 (audit/repair/formatting) are out of A1 scope (A2/B/B2/C) and
+    are recorded as skipped with a distinct reason.
+    """
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    journal_path = cfg.out_dir / "journal.ndjson"
+    translations_path = cfg.out_dir / "translations.json"
+    raw_translations_path = cfg.out_dir / "translations_raw.json"
+    selection_path = cfg.out_dir / "selection_results.json"
+    generation_path = _generation_outcomes_path(cfg.out_dir)
+    record_path = cfg.out_dir / "strict_chapter_trial_record.json"
+
+    # ------------------------------------------------------------------
+    # Resume: replay the single whole-chapter journal entry and verify
+    # identities exactly like the chunked path.
+    # ------------------------------------------------------------------
+    prior_entries = _load_journal(journal_path)
+    acceptable_backend_hashes = list(cfg.backend.acceptable_identity_hashes())
+    for entry in prior_entries:
+        if (
+            entry.get("snapshot_hash") != snapshot.snapshot_hash
+            or entry.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or entry.get("config_identity") != config.config_identity
+            or entry.get("backend_identity_hash") not in acceptable_backend_hashes
+        ):
+            raise ValueError(
+                "Foreign identity: journal entry for "
+                f"{entry.get('chunk_id')} was written under a different "
+                "snapshot/plan/config than this run -- refusing to resume "
+                "against a stale journal."
+            )
+    resumed_from_index = len(prior_entries)
+
+    final_text_by_pid: Dict[str, str] = {}
+    selected_role_counts: Dict[str, int] = {}
+    incomplete_generation_count = 0
+    generation_records: List[Dict[str, Any]] = []
+    halted_early = False
+    halt_reason: Optional[str] = None
+
+    progress.run_started(
+        chapter_id=cfg.chapter_id,
+        out_dir=cfg.out_dir,
+        started_at=started_at,
+        backend_identity_hash=cfg.backend.identity_hash,
+        resumed_from_index=resumed_from_index,
+    )
+
+    if resumed_from_index > 0:
+        entry = prior_entries[0]
+        outcome = entry["outcome"]
+        if outcome == "selected":
+            # Resume distinguishes the RAW generator snapshot (the exact text
+            # the generation contract produced) from the FINAL translations.json
+            # alias (which after A2/B repair may diverge). Only the raw file may
+            # seed a resumed whole-chapter run.
+            if not raw_translations_path.exists():
+                raise ValueError(
+                    "Data loss: journal says whole_chapter generation was "
+                    f"selected but {raw_translations_path.name} is missing — "
+                    "the raw generator snapshot cannot be reconstructed."
+                )
+            final_text_by_pid = json.loads(
+                raw_translations_path.read_text(encoding="utf-8")
+            )
+            selected_role = entry.get("selected_role") or "balanced_literary"
+            selected_role_counts[selected_role] = 1
+        elif outcome == "incomplete_generation":
+            incomplete_generation_count = 1
+            halted_early = True
+            halt_reason = (
+                "whole_chapter generation incomplete (resumed; bounded retry "
+                "budget was exhausted in the prior session)"
+            )
+        if generation_path.exists():
+            payload = json.loads(generation_path.read_text(encoding="utf-8"))
+            if (
+                payload.get("snapshot_hash") != snapshot.snapshot_hash
+                or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+                or payload.get("config_identity") != config.config_identity
+            ):
+                raise ValueError(
+                    "Foreign identity: generation_outcomes.json was written "
+                    "under a different snapshot/plan/config than this run -- "
+                    "refusing to mix generation records across runs."
+                )
+            generation_records = [
+                rec
+                for rec in payload.get("outcomes", [])
+                if rec.get("chunk_id") == WHOLE_CHAPTER_CHUNK_ID
+            ]
+    else:
+        # ------------------------------------------------------------------
+        # Fresh run: one whole-chapter generation call with bounded retry.
+        # ------------------------------------------------------------------
+        params = GenerationParams(
+            temperature=cfg.temperature, seed=cfg.seed,
+            max_tokens=cfg.max_tokens, reasoning=cfg.reasoning,
+        )
+        events_before = runtime.event_count()
+        progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
+        outcome = generate_whole_chapter(
+            role="balanced_literary",
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            pid_map=pid_map,
+            glossary=glossary,
+            bible_text=bible_text,
+            config=config,
+            params=params,
+            model_caller=model_caller,
+            cache=GenerationCache(),
+            retry=WholeChapterRetryPolicy(),
+        )
+        generation_records.append(_serialize_generation_outcome(outcome))
+
+        if outcome.status == "complete":
+            candidate = outcome.candidates["balanced_literary"]
+            final_text_by_pid = dict(candidate.as_pid_map())
+            selected_role_counts["balanced_literary"] = 1
+            # Raw snapshot: the validated generator output, BEFORE QA/repair.
+            # Resume reads this file (never translations.json), so the raw
+            # generator contract survives even after later stages diverge it
+            # from the final alias.
+            _atomic_write_json(raw_translations_path, final_text_by_pid)
+            journal_outcome = "selected"
+            selected_candidate_id = candidate.candidate_id
+            candidate_ids = [candidate.candidate_id]
+        else:
+            incomplete_generation_count = 1
+            halted_early = True
+            halt_reason = (
+                "whole_chapter generation incomplete: "
+                + ", ".join(
+                    f"{role}={err.detail}" for role, err in outcome.errors.items()
+                )
+            )
+            journal_outcome = "incomplete_generation"
+            selected_candidate_id = None
+            candidate_ids = []
+
+        entry = JournalEntry(
+            chunk_index=0,
+            chunk_id=WHOLE_CHAPTER_CHUNK_ID,
+            parent_chunk_id=None,
+            parent_context_state_hash=_left_context_hash(()),
+            left_context_kind=WHOLE_CHAPTER_CHUNK_ID,
+            left_context_hash=_left_context_hash(()),
+            snapshot_hash=snapshot.snapshot_hash,
+            chunk_plan_hash=chunk_plan.plan_hash,
+            config_identity=config.config_identity,
+            backend_identity_hash=cfg.backend.identity_hash,
+            candidate_ids=candidate_ids,
+            gate_trace=[],
+            outcome=journal_outcome,
+            selected_candidate_id=selected_candidate_id,
+            selected_role=("balanced_literary" if journal_outcome == "selected" else None),
+            switch_indices=runtime.local_switch_event_indices(events_before),
+            backend_event_indices=list(range(events_before, runtime.event_count())),
+        )
+        with open(journal_path, "a", encoding="utf-8") as journal_file:
+            journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
+            journal_file.flush()
+        progress.chunk_done(chunk_id=WHOLE_CHAPTER_CHUNK_ID, outcome=journal_outcome)
+
+    # ------------------------------------------------------------------
+    # Provenance artifacts (always written, same lifecycle as the chunked run).
+    # ------------------------------------------------------------------
+    generation_path.write_text(json.dumps({
+        "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "outcomes": generation_records,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Final alias. In A1 there is no repair/formatting, so the final chapter
+    # equals the raw generator snapshot; the two files remain distinct so a
+    # later A2/B stage can diverge them without losing the raw contract.
+    _atomic_write_json(translations_path, final_text_by_pid)
+
+    generation_record_id = None
+    for rec in generation_records:
+        for _role, cand in (rec.get("candidates") or {}).items():
+            generation_record_id = cand.get("candidate_id")
+            break
+        if generation_record_id:
+            break
+    selection_path.write_text(json.dumps({
+        "schema": WHOLE_CHAPTER_SELECTION_SCHEMA,
+        "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "mode": "not_applicable",
+        "candidate_count": 1 if generation_record_id else 0,
+        "selection_performed": False,
+        "coverage": "full_pid_map",
+        "generation_record_id": generation_record_id,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    step6 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+    step7 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+    step8 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+
+    wall_clock_seconds = time.monotonic() - wall_t0
+    processed_count = len(_load_journal(journal_path))
+    finished_at = now_fn().isoformat(timespec="seconds")
+
+    runtime_summary = dict(runtime.summary())
+    local_lifecycle = runtime_summary.get("local_lifecycle")
+    remote_calls = runtime_summary.get("remote_calls")
+    backend_block = dict(runtime.backend_descriptor.public_record())
+    backend_block["config_identity_hash"] = cfg.backend.identity_hash
+    record: Dict[str, Any] = {
+        "schema": RECORD_SCHEMA,
+        "run_label": cfg.run_label,
+        "chapter_id": cfg.chapter_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "wall_clock_seconds": wall_clock_seconds,
+        "identities": {
+            "source_hash": source.source_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+            "whole_chapter_pid_map_hash": pid_map.map_hash,
+        },
+        "backend": backend_block,
+        "runtime": {
+            "local_lifecycle": local_lifecycle,
+            "remote_calls": remote_calls,
+        },
+        "operational_policy": {
+            "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
+            "reasoning": cfg.reasoning,
+            "stop_after": cfg.stop_after,
+            "whole_chapter": True,
+            "generation_max_tokens": cfg.max_tokens,
+            "whole_chapter_retry": {
+                "max_attempts": WholeChapterRetryPolicy().max_attempts,
+            },
+        },
+        "resumed_from_index": resumed_from_index,
+        "halted_early": halted_early,
+        "halt_reason": halt_reason,
+        "counts": {
+            "chunks_total": 1,
+            "chunks_processed": processed_count,
+            "selected": sum(selected_role_counts.values()),
+            "quarantined": 0,
+            "needs_synthesis": 0,
+            "incomplete_generation": incomplete_generation_count,
+            "selected_role_counts": dict(selected_role_counts),
+        },
+        "step6": step6,
+        "step7": step7,
+        "step8": step8,
+        "lifecycle": local_lifecycle or {
+            "startup_count": 0, "restart_count": 0,
+            "switches": [], "aggregates_by_model": {},
+        },
+        "artefacts": {
+            "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
+            "generation_outcomes": str(generation_path),
+            "selection_results": str(selection_path),
+            "translations_raw": str(raw_translations_path),
+            "translations": str(translations_path),
+            "journal": str(journal_path),
+        },
+    }
+    record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    try:
+        runtime.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close runtime at end of whole-chapter run")
+    progress.close()
+    usage_writer.close()
+
+    return StrictChapterRunResult(
+        chapter_id=cfg.chapter_id, out_dir=cfg.out_dir, chunk_count=1,
+        processed_count=processed_count,
+        selected_count=sum(selected_role_counts.values()),
+        quarantined_count=0, needs_synthesis_count=0,
+        incomplete_generation_count=incomplete_generation_count,
+        selected_role_counts=dict(selected_role_counts),
+        halted_early=halted_early, halt_reason=halt_reason,
+        resumed_from_index=resumed_from_index,
+        switches=((local_lifecycle or {}).get("switches") or []),
+        translations_path=translations_path, journal_path=journal_path,
+        record_path=record_path, record=record,
+        step6=step6, step7=step7, step8=step8,
+    )

@@ -68,11 +68,14 @@ from pact_v4.runtime.qwen_evaluator import (
 LOG = logging.getLogger(__name__)
 
 
-# Phase 2B calls are JSON-object output with chunk-sized max_tokens. The
-# upper bound is generous (8k is well above what a single 20-PID chunk
-# needs at the provisional temperatures) but leaves headroom for any
-# future A/B template that may need to emit more verbose JSON.
-DEFAULT_MAX_TOKENS = 8192
+# Phase 2B generation calls produce JSON-object output. The output budget is
+# 32768 tokens (V4.1 A1, owner decision 2026-08-08): whole-chapter generation
+# emits the full chapter in one call (chapter 0001 ~12-19k tokens, the longest
+# chapter 0077 ~21k). For chunked calls the bound is still generous; the
+# OpenCode transport does not send max_output_tokens in the POST body (Gate 0
+# §2.4), so this value lives in the request/identity, not the transport wire.
+# Qwen-role budgets stay capped by MAX_TOKENS_CEILING (untouched).
+DEFAULT_MAX_TOKENS = 32768
 
 
 def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:

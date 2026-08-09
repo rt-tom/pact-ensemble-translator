@@ -234,6 +234,49 @@ class RunLabelCliTest(unittest.TestCase):
         )
 
 
+class WholeChapterCliTest(unittest.TestCase):
+    """V4.1 A1 CLI: --whole-chapter and the --stop-after-generation rename."""
+
+    def test_whole_chapter_flag_parses_and_reaches_config(self):
+        args = m.build_argparser().parse_args(BASE_ARGS + ["--whole-chapter"])
+        self.assertTrue(args.whole_chapter)
+        cfg = m._build_run_config(args, backend=None)
+        self.assertTrue(cfg.whole_chapter)
+        artifact = cfg.to_config_artifact(model_profile="test")
+        self.assertIs(artifact.values["whole_chapter"], True)
+
+    def test_default_is_chunked_mode(self):
+        args = m.build_argparser().parse_args(BASE_ARGS)
+        self.assertFalse(args.whole_chapter)
+        cfg = m._build_run_config(args, backend=None)
+        self.assertFalse(cfg.whole_chapter)
+        artifact = cfg.to_config_artifact(model_profile="test")
+        self.assertIs(artifact.values["whole_chapter"], False)
+
+    def test_stop_after_generation_flag_sets_stop_after_generation(self):
+        args = m.build_argparser().parse_args(BASE_ARGS + ["--stop-after-generation"])
+        self.assertTrue(args.stop_after_generation)
+        cfg = m._build_run_config(args, backend=None)
+        self.assertEqual(cfg.stop_after, "generation")
+        artifact = cfg.to_config_artifact(model_profile="test")
+        self.assertEqual(artifact.values["stop_after"], "generation")
+
+    def test_stop_after_generation_default_is_full_cycle(self):
+        args = m.build_argparser().parse_args(BASE_ARGS)
+        self.assertFalse(args.stop_after_generation)
+        cfg = m._build_run_config(args, backend=None)
+        self.assertEqual(cfg.stop_after, "")
+        artifact = cfg.to_config_artifact(model_profile="test")
+        self.assertEqual(artifact.values["stop_after"], "")
+
+    def test_generation_max_tokens_default_is_32768(self):
+        args = m.build_argparser().parse_args(BASE_ARGS)
+        cfg = m._build_run_config(args, backend=None)
+        self.assertEqual(cfg.max_tokens, 32768)
+        artifact = cfg.to_config_artifact(model_profile="test")
+        self.assertEqual(artifact.values["generation"]["max_tokens"], 32768)
+
+
 if __name__ == "__main__":
     unittest.main()
 

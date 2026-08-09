@@ -378,6 +378,81 @@ class ChunkPlan:
             )
 
 
+@dataclass(frozen=True)
+class WholeChapterPidMap:
+    """Full ordered PID map of a whole chapter, derived from the ChunkPlanArtifact.
+
+    Deliberately NOT a ``ChunkPlan``: the whole chapter exceeds
+    ``ChunkPlan.MAX_WORDS`` (640 hard cap enforced in ``__post_init__``),
+    so whole-chapter generation works with this derived contract instead of
+    a synthetic one-chunk plan. Derivation is authoritative: the map's PIDs
+    are exactly the chapter's full source-order PID list (``snapshot.pids``),
+    which ``ChunkPlanArtifact`` guarantees is fully owned across its chunks.
+
+    The identity (``map_hash``) is content-derived from the PID list plus the
+    snapshot/plan hashes it was derived from, so a change in any of them
+    invalidates the map identity exactly like the source artifacts.
+    """
+
+    pids: Tuple[str, ...]
+    snapshot_hash: str
+    chunk_plan_hash: str
+    map_hash: str = field(init=False)
+
+    @classmethod
+    def derive(
+        cls, chunk_plan: "ChunkPlanArtifact", snapshot: "Snapshot"
+    ) -> "WholeChapterPidMap":
+        """Derive the full ordered PID map from an authoritative chunk plan.
+
+        The plan's chunks are source-ordered (the planner emits them in
+        source order), so concatenating each chunk's PIDs in chunk order
+        yields the chapter's full source-order PID list. Validation is
+        defensive: the derived list must equal ``snapshot.pids`` exactly.
+        """
+        pids = tuple(pid for chunk in chunk_plan.chunks for pid in chunk.pids)
+        if pids != snapshot.pids:
+            raise ValueError(
+                "WholeChapterPidMap: derived PID order "
+                f"{pids} does not match snapshot source order {snapshot.pids}"
+            )
+        return cls(
+            pids=pids,
+            snapshot_hash=snapshot.snapshot_hash,
+            chunk_plan_hash=chunk_plan.plan_hash,
+        )
+
+    def __post_init__(self) -> None:
+        _require_unique_pids(self.pids, "WholeChapterPidMap")
+        _require_hash(self.snapshot_hash, "snapshot_hash")
+        _require_hash(self.chunk_plan_hash, "chunk_plan_hash")
+        object.__setattr__(
+            self,
+            "map_hash",
+            canonical_json_hash(
+                {
+                    "artifact": "pact-v4-whole-chapter-pid-map/v1",
+                    "snapshot_hash": self.snapshot_hash,
+                    "chunk_plan_hash": self.chunk_plan_hash,
+                    "pids": list(self.pids),
+                }
+            ),
+        )
+
+    def validate_against(self, snapshot: "Snapshot") -> None:
+        """Bind the map to the authoritative snapshot (defense in depth)."""
+        if self.snapshot_hash != snapshot.snapshot_hash:
+            raise ValueError(
+                f"Foreign identity: snapshot_hash={self.snapshot_hash}, "
+                f"expected {snapshot.snapshot_hash}"
+            )
+        if self.pids != snapshot.pids:
+            raise ValueError(
+                f"WholeChapterPidMap: PID order {self.pids} "
+                f"does not match snapshot source order {snapshot.pids}"
+            )
+
+
 def validate_full_pid_ownership(plans: Tuple[ChunkPlan, ...], snapshot: Snapshot) -> None:
     """Cross-chunk invariant: every snapshot PID is owned by exactly one chunk.
 
@@ -599,8 +674,17 @@ class Candidate:
         chunk_plan: ChunkPlanArtifact,
         config: ConfigArtifact,
         decision_trace: Tuple[GateResult, ...] = (),
+        whole_chapter_pid_map: Optional["WholeChapterPidMap"] = None,
     ) -> "Candidate":
-        """Create a candidate whose identities cannot be caller-fabricated."""
+        """Create a candidate whose identities cannot be caller-fabricated.
+
+        ``whole_chapter_pid_map`` (V4.1 A1) switches the ownership check from
+        the per-chunk plan lookup to the derived whole-chapter PID map: the
+        candidate owns the entire chapter (chunk_id="whole_chapter"), whose
+        ordered PID list is not a ``ChunkPlan`` (the whole chapter exceeds
+        ``ChunkPlan.MAX_WORDS``). Only used by whole-chapter generation; the
+        per-chunk path passes ``None`` and keeps the historical validation.
+        """
         candidate = cls(
             candidate_id=candidate_id,
             chunk_id=chunk_id,
@@ -613,7 +697,8 @@ class Candidate:
             decision_trace=decision_trace,
         )
         candidate.validate_against(
-            source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config
+            source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+            whole_chapter_pid_map=whole_chapter_pid_map,
         )
         return candidate
 
@@ -624,6 +709,7 @@ class Candidate:
         snapshot: Snapshot,
         chunk_plan: ChunkPlanArtifact,
         config: ConfigArtifact,
+        whole_chapter_pid_map: Optional["WholeChapterPidMap"] = None,
     ) -> None:
         """Semantic identity validation required at persistence/cache boundaries."""
         _validate_identity_context(source, snapshot, chunk_plan)
@@ -633,6 +719,22 @@ class Candidate:
             "chunk_plan_hash": chunk_plan.plan_hash,
             "config_identity": config.config_identity,
         })
+        if whole_chapter_pid_map is not None:
+            # Whole-chapter candidate: the derived full-chapter PID map is the
+            # authoritative ownership contract (not a per-chunk plan lookup —
+            # chunk_id="whole_chapter" is deliberately absent from the plan).
+            if self.chunk_id != "whole_chapter":
+                raise ValueError(
+                    f"Candidate {self.candidate_id}: whole_chapter_pid_map given "
+                    f"but chunk_id={self.chunk_id!r} != 'whole_chapter'"
+                )
+            whole_chapter_pid_map.validate_against(snapshot)
+            if self.pid_order() != whole_chapter_pid_map.pids:
+                raise ValueError(
+                    f"Candidate {self.candidate_id} PID order {self.pid_order()} "
+                    f"does not match whole-chapter map {whole_chapter_pid_map.pids}"
+                )
+            return
         validate_candidate_ownership(self, chunk_plan.chunk(self.chunk_id))
 
     def pid_order(self) -> Tuple[str, ...]:

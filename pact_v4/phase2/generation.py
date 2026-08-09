@@ -46,6 +46,7 @@ imported here.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -58,6 +59,7 @@ from pact_v4.phase1.models import (
     GateResult,
     Snapshot,
     SourceArtifact,
+    WholeChapterPidMap,
     canonical_json_hash,
 )
 from pact_v4.phase2.prompts import (
@@ -65,11 +67,18 @@ from pact_v4.phase2.prompts import (
     FIDELITY_FIRST_V1,
     PromptTemplate,
 )
+# NOTE: the transport-boundary failure type (CompletionError) is NOT imported
+# at module level on purpose: `pact_v4.runtime.backend_protocol` is reached
+# through `pact_v4.runtime`, whose package __init__ imports
+# `backend_role_adapters`, which imports this module — a top-level import here
+# would create a circular import at module load. `generate_whole_chapter`
+# imports it lazily (see there) to classify session aborts honestly.
 from pact_v4.phase2.risk import (
     REQUIRED_RISK_CATEGORIES,
     GlossaryEntry,
     RiskAssessment,
     RiskBand,
+    assess_source_risk,
 )
 
 __all__ = [
@@ -81,6 +90,8 @@ __all__ = [
     "GenerationError",
     "GenerationOutcome",
     "generate_for_chunk",
+    "WholeChapterRetryPolicy",
+    "generate_whole_chapter",
 ]
 
 
@@ -265,6 +276,11 @@ class GenerationErrorCode(str, Enum):
     INVALID_JSON = "invalid_json"
     PID_MISMATCH = "pid_mismatch"
     CONTEXT_LEAKAGE = "context_leakage"
+    # V4.1 A1: the model call itself failed (transport error / session abort
+    # finish=other|error). Distinguished from JSON/PID failures because the
+    # whole-chapter contract retries these boundedly and must record *why* a
+    # chapter could not be generated when the retry budget is exhausted.
+    SESSION_ABORT = "session_abort"
 
 
 class _GenerationValidationError(Exception):
@@ -632,4 +648,257 @@ def generate_for_chunk(
         candidates=candidates,
         errors=errors,
         status=status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Whole-chapter generation (V4.1 A1): one call per chapter, strict full-PID
+# JSON contract, bounded retry on every failure class including session abort.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WholeChapterRetryPolicy:
+    """Bounded retry policy for whole-chapter generation (V4.1 A1).
+
+    Unlike per-chunk generation (whose adapter retries only empty/truncated
+    JSON at the transport level), the whole-chapter contract retries EVERY
+    failure class at the generation layer — malformed/missing/extra/reordered
+    PID, empty/truncated JSON, and session aborts (Gate 0: 2/5 calls aborted
+    with finish=other/error) — because one call produces the entire chapter
+    and a transient failure must not silently degrade it. Retries re-issue
+    the identical bundle (same identity), so they never change cache/resume
+    identity.
+
+    ``max_attempts`` is the total number of model calls (1 initial + retries).
+    ``base_delay_seconds`` is the exponential-backoff base: the k-th retry
+    waits ``base * 2**k`` seconds.
+    """
+
+    max_attempts: int = 3
+    base_delay_seconds: float = 1.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or self.max_attempts < 1
+        ):
+            raise ValueError("WholeChapterRetryPolicy: max_attempts must be a positive int")
+        if self.base_delay_seconds < 0:
+            raise ValueError(
+                "WholeChapterRetryPolicy: base_delay_seconds must be >= 0"
+            )
+
+    def delay_for(self, attempt: int) -> float:
+        """Backoff delay before the attempt-th retry (0-based)."""
+        return self.base_delay_seconds * (2 ** int(attempt))
+
+
+def _whole_chapter_risk(
+    source: SourceArtifact, glossary: Tuple[GlossaryEntry, ...]
+) -> RiskAssessment:
+    """Chapter-level risk pre-screen for the whole-chapter prompt bundle.
+
+    Whole-chapter generation has no per-chunk risk routing, but the bundle
+    identity still carries ``risk_band``/``required_risk_feature_codes``, so
+    the full chapter is screened as one unit (deterministic, zero model
+    calls) and the bundle's risk identity reflects the whole source.
+    """
+    return assess_source_risk(
+        tuple((pid, text) for pid, text in source.source),
+        glossary=glossary,
+        source_complete=True,
+    )
+
+
+def _CompletionErrorType() -> type:
+    """The transport-boundary failure type, imported lazily (no import cycle).
+
+    ``pact_v4.runtime.backend_protocol`` is reached through
+    ``pact_v4.runtime``, whose package ``__init__`` imports
+    ``backend_role_adapters``, which imports this module — so a module-level
+    import of ``CompletionError`` here would create a circular import at load
+    time. Importing it on first use (after all modules are loaded) is safe and
+    keeps the whole-chapter retry contract honest: session aborts are
+    classified as ``SESSION_ABORT`` rather than guessed.
+    """
+    from pact_v4.runtime.backend_protocol import CompletionError  # noqa: PLC0415
+
+    return CompletionError
+
+
+def generate_whole_chapter(
+    *,
+    role: str = "balanced_literary",
+    source: SourceArtifact,
+    snapshot: Snapshot,
+    chunk_plan: ChunkPlanArtifact,
+    pid_map: WholeChapterPidMap,
+    glossary: Tuple[GlossaryEntry, ...],
+    bible_text: str,
+    config: ConfigArtifact,
+    params: GenerationParams,
+    model_caller: ModelCaller,
+    cache: Optional[GenerationCache] = None,
+    retry: WholeChapterRetryPolicy = WholeChapterRetryPolicy(),
+) -> GenerationOutcome:
+    """Generate the whole chapter in ONE model call (V4.1 A1).
+
+    The prompt bundle carries the chapter's full ordered PID map
+    (``chunk_id="whole_chapter"``, ``owned_pids``/``owned_source`` = every
+    PID in source order, no left/right context). Output must be a strict JSON
+    object mapping EVERY PID to its Russian text, in exact source order — the
+    same ``_validate_pid_map`` contract as chunked generation, applied to the
+    full chapter map. Validation failures (malformed/missing/extra/reordered
+    PID, empty/truncated JSON) and transport/session aborts are retried
+    boundedly per ``retry``; after the budget the last error is returned with
+    ``status="incomplete"`` — never a partial PID map.
+
+    The returned ``GenerationOutcome`` uses ``chunk_id="whole_chapter"`` and
+    exactly one candidate role, so the strict runner serializes the chapter's
+    generation record with the standard ``_serialize_generation_outcome``
+    shape (candidate_id ``whole_chapter:<role>:<hash>``).
+    """
+    if cache is None:
+        cache = GenerationCache()
+
+    template = _TEMPLATES[role]
+    risk = _whole_chapter_risk(source, glossary)
+    required_risk_feature_codes = tuple(
+        sorted({feature.code for feature in risk.features} & REQUIRED_RISK_CATEGORIES)
+    )
+
+    bundle = PromptBundle(
+        template=template,
+        role=role,
+        risk_band=risk.band.value,
+        risk_policy_version=risk.policy_version,
+        required_risk_feature_codes=required_risk_feature_codes,
+        snapshot_hash=snapshot.snapshot_hash,
+        source_hash=source.source_hash,
+        chunk_id="whole_chapter",
+        owned_pids=pid_map.pids,
+        owned_source=_owned_source_for(source, pid_map.pids),
+        left_context=(),
+        right_context=(),
+        glossary=_glossary_identity(glossary),
+        style_constraints=(),
+        bible_text=bible_text,
+        config_identity=config.config_identity,
+        params=params,
+    )
+
+    cached = cache.get(bundle.bundle_hash)
+    if cached is not None:
+        if cached.candidate is not None:
+            # Defense in depth, mirroring the chunked cache-hit re-verification:
+            # a poisoned cache entry for the wrong identity must never be handed
+            # back as the chapter's candidate.
+            if cached.candidate.chunk_id != "whole_chapter" or cached.candidate.role != role:
+                raise _CachePoisoned(
+                    f"Cache identity corruption: bundle_hash {bundle.bundle_hash} "
+                    f"resolved to chunk_id={cached.candidate.chunk_id!r} "
+                    f"role={cached.candidate.role!r}, expected whole_chapter/{role}"
+                )
+            cached.candidate.validate_against(
+                source=source, snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+                whole_chapter_pid_map=pid_map,
+            )
+        return _whole_chapter_outcome(role=role, risk=risk, result=cached)
+
+    last_error: Optional[GenerationError] = None
+    for attempt in range(retry.max_attempts):
+        try:
+            raw = model_caller(bundle)
+        except _CompletionErrorType() as exc:
+            # Transport/session abort (Gate 0: finish=other/error). Retried
+            # boundedly like every other failure class. Imported lazily: the
+            # runtime package's __init__ pulls in backend_role_adapters, which
+            # imports this module, so a top-level import would be circular.
+            last_error = GenerationError(
+                role,
+                GenerationErrorCode.SESSION_ABORT,
+                f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
+            )
+            if attempt < retry.max_attempts - 1:
+                time.sleep(retry.delay_for(attempt))
+                continue
+            break
+
+        try:
+            pairs = _parse_ordered_pid_pairs(raw)
+            translation = _validate_pid_map(
+                pairs, owned_pids=pid_map.pids, context_pids=frozenset()
+            )
+        except ValueError as exc:
+            last_error = GenerationError(
+                role,
+                GenerationErrorCode.INVALID_JSON,
+                f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
+            )
+        except _GenerationValidationError as exc:
+            last_error = GenerationError(
+                role,
+                exc.code,
+                f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc.detail}",
+            )
+        else:
+            candidate = Candidate.create(
+                candidate_id=f"whole_chapter:{role}:{bundle.bundle_hash[:16]}",
+                chunk_id="whole_chapter",
+                role=role,
+                translation=translation,
+                source=source,
+                snapshot=snapshot,
+                chunk_plan=chunk_plan,
+                config=config,
+                decision_trace=(
+                    GateResult(
+                        gate="phase2b_prompt_bundle",
+                        passed=True,
+                        detail=bundle.bundle_hash,
+                    ),
+                ),
+                whole_chapter_pid_map=pid_map,
+            )
+            result = GenerationCandidateResult(candidate=candidate, error=None)
+            cache.put(bundle.bundle_hash, result)
+            return _whole_chapter_outcome(role=role, risk=risk, result=result)
+
+        if attempt < retry.max_attempts - 1:
+            time.sleep(retry.delay_for(attempt))
+            continue
+        break
+
+    assert last_error is not None
+    result = GenerationCandidateResult(candidate=None, error=last_error)
+    cache.put(bundle.bundle_hash, result)
+    return _whole_chapter_outcome(role=role, risk=risk, result=result)
+
+
+def _whole_chapter_outcome(
+    *,
+    role: str,
+    risk: RiskAssessment,
+    result: GenerationCandidateResult,
+) -> GenerationOutcome:
+    """Render one whole-chapter generation result as a ``GenerationOutcome``."""
+    if result.candidate is not None:
+        return GenerationOutcome(
+            chunk_id="whole_chapter",
+            risk_band=risk.band.value,
+            expected_roles=(role,),
+            candidates={role: result.candidate},
+            errors={},
+            status="complete",
+        )
+    assert result.error is not None
+    return GenerationOutcome(
+        chunk_id="whole_chapter",
+        risk_band=risk.band.value,
+        expected_roles=(role,),
+        candidates={},
+        errors={role: result.error},
+        status="incomplete",
     )
