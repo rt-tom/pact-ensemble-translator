@@ -1,3 +1,6 @@
+<<<<<<< HEAD
+"""B1: chunked Qwen fidelity audit (production port of audit_v4.ps1)."""
+=======
 """B1.2 ChapterEntityContext extraction (source-only Qwen prepass)."""
 
 from pact_v4.audit.entity_extractor import (
@@ -41,3 +44,4 @@ __all__ = [
     "validate_entity_context",
     "with_entity_context_metadata",
 ]
+>>>>>>> origin/dev/v4.1-reasoning-transport
