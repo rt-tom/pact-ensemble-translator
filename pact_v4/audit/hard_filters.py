@@ -45,13 +45,17 @@ Deterministic contracts (RV t_ac2fb507 fixes, 2026-08-10):
    pronoun is accepted and documented; full resolution is B1.2 scope.
 
 3. **Explicit strings (§5.1 names/strings): REJECT-only, verbatim
-   preservation.** If the current source pair contains an explicitly quoted
-   string (double quotes or guillemets) and that exact string appears
+   preservation, issue-scoped (RV t_a926d0d6 fix).** The issue must itself
+   cite an explicitly quoted string — matched quote pairs in its
+   note/excerpt; a prose apostrophe such as ``character's`` is NOT a quote
+   hint — and that quoted content must provably match a string quoted in
+   the CURRENT source pair. Only then, if that exact string appears
    verbatim in the translation, a changed_fact/addition/omission claim
    about it is a deterministic FP -> ``REJECTED``. A translated,
    transliterated or absent variant is NEVER ``CONFIRMED`` (that would be a
-   semantic edge) — it stays ``TIER_B``, as do unquoted names/objects
-   (they need entity resolution).
+   semantic edge) — it stays ``TIER_B``. Without the provable match
+   (unrelated quoted content, prose apostrophes, unquoted names/objects)
+   the issue fails safe to ``TIER_B`` (they need entity resolution).
 
 CRITICAL (§5.3, card rule 5): ``chapter_entity_context`` is NEVER Tier A.
 An issue whose PID participates in the chapter entity context (anchor/alias
@@ -448,15 +452,19 @@ def _quoted_strings(text: str) -> frozenset:
     return frozenset(result)
 
 
-def _note_has_string_hint(issue: Mapping[str, Any]) -> bool:
-    """True when the issue's note/excerpt itself references a quoted string.
+def _note_quoted_strings(issue: Mapping[str, Any]) -> frozenset:
+    """Explicitly quoted strings found in the issue's note/excerpt.
 
-    Mirrors ``_note_has_numeric_hint``: a string-fact verdict is only
-    attempted when the auditor explicitly quoted the content, so a
-    coincidental quote in another finding never triggers the filter.
+    Returns the case-folded quoted contents (matched quote pairs only —
+    double/single quotes or RU guillemets), so a prose apostrophe such as
+    ``character's`` never yields a hint. Unlike a raw quote-character scan,
+    this links the issue to concrete quoted content; the explicit-string
+    filter then requires that content to provably match a string quoted in
+    the current source (RV t_a926d0d6 fix). An empty result means the
+    issue cites no quoted string -> the filter must fail safe to TIER_B.
     """
     text = " ".join(str(issue.get(key, "")) for key in ("note", "excerpt"))
-    return any(char in text for char in ('"', "'", "\u00ab", "\u00bb"))
+    return _quoted_strings(text)
 
 
 def _source_gender(text: str) -> str | None:
@@ -586,22 +594,30 @@ def _filter_one(
             )
 
     # 5. Direct current-source explicit string fact (§5.1 names/strings,
-    #    card scope item 3). Narrow deterministic contract: an explicitly
-    #    quoted string in the CURRENT source pair that is preserved verbatim
-    #    in the translation refutes a changed_fact/addition/omission claim
-    #    about that string (REJECTED). A quoted string that is NOT preserved
-    #    verbatim is a semantic edge (the translator may legitimately
-    #    translate or transliterate it) -> TIER_B, never CONFIRMED. Unquoted
-    #    names/objects are out of contract (need entity/lexicon knowledge).
-    if category in _STRING_CATEGORIES and _note_has_string_hint(issue):
+    #    card scope item 3). Narrow deterministic contract: the issue must
+    #    itself cite an explicitly quoted string (matched quote pairs in
+    #    its note/excerpt — a prose apostrophe such as "character's" is NOT
+    #    a hint), that quoted content must provably match a string quoted
+    #    in the CURRENT source pair, and only then does verbatim
+    #    preservation in the translation refute a changed_fact/addition/
+    #    omission claim about that string (REJECTED). A quoted string that
+    #    is NOT preserved verbatim is a semantic edge (the translator may
+    #    legitimately translate or transliterate it) -> TIER_B, never
+    #    CONFIRMED. Without the provable match (unrelated quoted content,
+    #    prose apostrophes, unquoted names/objects) the issue fails safe to
+    #    TIER_B (§5.1 fail-safe).
+    if category in _STRING_CATEGORIES:
+        note_strings = _note_quoted_strings(issue)
         src_strings = _quoted_strings(source_text)
-        if src_strings and src_strings <= _quoted_strings(translation_text):
-            return FilteredIssue(
-                issue,
-                REJECTED,
-                "explicit_string",
-                "every explicitly quoted source string is preserved verbatim in the translation",
-            )
+        if note_strings and src_strings:
+            matched = note_strings & src_strings
+            if matched and matched <= _quoted_strings(translation_text):
+                return FilteredIssue(
+                    issue,
+                    REJECTED,
+                    "explicit_string",
+                    "the quoted source string the finding cites is preserved verbatim in the translation",
+                )
 
     # 6. Direct current-source gender fact (card scope item 3, acceptance:
     #    nurse-issue with explicit source fact "Rich male" -> REJECTED).
@@ -643,10 +659,13 @@ def apply_hard_filters(
     chapter (or current chunk). ``chunk_pids`` restricts valid PIDs when the
     caller audits one chunk at a time. ``entity_context`` is the §8.3
     chapter entity context (list of ``{"entity": ..., "claims": [...]}``
-    dicts, or a raw collection of PIDs) — any issue whose PID is an
-    anchor/alias PID of any claim is forced to TIER_B. Returns one
-    ``FilteredIssue`` per input issue, in input order. Pure: no model calls,
-    no disk I/O.
+    dicts, or a raw collection of PIDs); claim evidence is read in its
+    actual B1.2 shape — ``evidence`` entries are ``{"pid": ..., "span":
+    ...}`` dicts, ``evidence_windows`` are PID ranges, and raw PID string
+    forms are also accepted. Any issue whose PID participates in the
+    context (anchor/alias/evidence of any claim) is forced to TIER_B.
+    Returns one ``FilteredIssue`` per input issue, in input order. Pure:
+    no model calls, no disk I/O.
     """
     entity_pids: set = set()
     if entity_context is not None:
@@ -664,9 +683,17 @@ def apply_hard_filters(
                     value = claim.get(key, ())
                     if isinstance(value, (list, tuple)):
                         for item in value:
-                            if isinstance(item, (list, tuple)):
+                            if isinstance(item, Mapping):
+                                # Actual B1.2 schema: evidence entries are
+                                # {"pid": ..., "span": ...} dicts — extract
+                                # the pid; a dict must never be stringified
+                                # into a fake PID (RV t_a926d0d6 fix).
+                                pid = item.get("pid")
+                                if pid:
+                                    entity_pids.add(str(pid))
+                            elif isinstance(item, (list, tuple)):
                                 entity_pids.update(str(p) for p in item)
-                            else:
+                            elif item:
                                 entity_pids.add(str(item))
                     elif value:
                         entity_pids.add(str(value))

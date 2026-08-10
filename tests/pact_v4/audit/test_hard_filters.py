@@ -482,3 +482,145 @@ def test_unquoted_name_change_stays_tier_b():
         translation={"p00198": "Рич вошёл."},
     )
     assert result["p00198"].verdict == TIER_B
+
+
+# --- RV2 fixes (t_e9815310): issue-scoped explicit strings --------------------
+
+
+def test_prose_apostrophe_does_not_trigger_string_filter():
+    # Finding 1 reproduction: the note's only quote is a prose apostrophe
+    # (character's) — that is NOT an explicit quoted string. The unrelated
+    # source string "STOP" is preserved in the translation, but the finding
+    # does not cite it, so the explicit-string filter must not fire and the
+    # issue fails safe to TIER_B (previously REJECTED/explicit_string).
+    issue = _issue(
+        "p00199", "changed_fact",
+        note="character's name changed",
+        excerpt="имя персонажа",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00199": 'The sign read "STOP"; Rich entered.'},
+        translation={"p00199": 'На табличке было написано "STOP"; Рич вошёл.'},
+    )
+    assert result["p00199"].verdict == TIER_B
+
+
+def test_unrelated_quoted_content_does_not_reject():
+    # Finding 1: the finding quotes "GO", but the source's only quoted string
+    # is the unrelated preserved "STOP". There is no provable match between
+    # the issue's quoted content and a current-source quoted string -> the
+    # issue fails safe to TIER_B, never REJECTED (previously REJECTED because
+    # "STOP" happened to be preserved).
+    issue = _issue(
+        "p00200", "changed_fact",
+        note='the sign text "GO" was supposedly changed',
+        excerpt='"GO"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00200": 'The sign read "STOP".'},
+        translation={"p00200": 'На табличке было написано "STOP".'},
+    )
+    assert result["p00200"].verdict == TIER_B
+
+
+def test_explicit_string_reject_requires_issue_to_cite_source_string():
+    # The reject path still works when the issue DOES cite the preserved
+    # source string, and stays TIER_B when the cited string is translated
+    # (matched -> not preserved verbatim -> semantic edge, never CONFIRMED).
+    issue = _issue(
+        "p00202", "changed_fact",
+        note='the sign text "STOP" was supposedly changed',
+        excerpt='"STOP"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00202": 'The sign read "STOP".'},
+        translation={"p00202": 'На табличке было написано "STOP".'},
+    )
+    assert result["p00202"].verdict == REJECTED
+    assert result["p00202"].filter_name == "explicit_string"
+
+    translated = _issue(
+        "p00203", "changed_fact",
+        note='the sign text "STOP" was supposedly changed',
+        excerpt='"STOP"',
+    )
+    result = _verdicts(
+        [translated],
+        source={"p00203": 'The sign read "STOP".'},
+        translation={"p00203": "На табличке было написано «СТОП»."},
+    )
+    assert result["p00203"].verdict == TIER_B
+
+
+# --- RV2 fixes (t_e9815310): B1.2 evidence dict PIDs -------------------------
+
+
+def test_entity_context_evidence_dict_pid_forces_tier_b():
+    # Finding 2: the actual B1.2 schema carries claim evidence as
+    # [{"pid": ..., "span": ...}] dicts. A PID that appears ONLY in evidence
+    # (no evidence_windows) must still force entity_context/TIER_B — the
+    # dict must not be stringified into a fake PID (previously the issue
+    # slipped through to Tier A).
+    issue = _issue(
+        "p00204", "changed_fact",
+        note="object identity differs",
+        excerpt="велосипед",
+    )
+    entity_context = [
+        {
+            "entity": "Blake",
+            "claims": [
+                {
+                    "kind": "object_identity",
+                    "value": "bike = motorcycle",
+                    "status": "candidate",
+                    "evidence": [{"pid": "p00204", "span": "He looked at the bike."}],
+                }
+            ],
+        }
+    ]
+    result = _verdicts(
+        [issue],
+        source={"p00204": "He looked at the bike."},
+        translation={"p00204": "Он посмотрел на велосипед."},
+        entity_context=entity_context,
+    )
+    assert result["p00204"].verdict == TIER_B
+    assert result["p00204"].filter_name == "entity_context"
+
+
+def test_entity_context_evidence_dict_and_windows_combined():
+    # Both actual B1.2 evidence forms in one claim: dict evidence PIDs and
+    # evidence_windows PID ranges force TIER_B together; a span-only dict
+    # (no pid) contributes nothing.
+    issues = [
+        _issue("p00205", "changed_fact", note="alias relation", excerpt="велосипед"),
+        _issue("p00206", "changed_fact", note="alias relation", excerpt="велосипед"),
+        _issue("p00207", "changed_fact", note="alias relation", excerpt="велосипед"),
+    ]
+    entity_context = [
+        {
+            "entity": "Blake",
+            "claims": [
+                {
+                    "kind": "alias_relation",
+                    "value": "bike = motorcycle",
+                    "status": "candidate",
+                    "evidence": [
+                        {"pid": "p00205", "span": "He looked at the bike."},
+                        {"span": "no pid here"},
+                    ],
+                    "evidence_windows": [["p00206", "p00207"]],
+                }
+            ],
+        }
+    ]
+    source = {p: "He looked at the bike." for p in ("p00205", "p00206", "p00207")}
+    translation = {p: "Он посмотрел на велосипед." for p in ("p00205", "p00206", "p00207")}
+    result = _verdicts(issues, source=source, translation=translation, entity_context=entity_context)
+    for pid in ("p00205", "p00206", "p00207"):
+        assert result[pid].verdict == TIER_B
+        assert result[pid].filter_name == "entity_context"
