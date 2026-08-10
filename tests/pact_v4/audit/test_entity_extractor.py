@@ -18,6 +18,7 @@ from pact_v4.audit.entity_extractor import (
     BackendEntityExtractorConfig,
     ENTITY_CONTEXT_SCHEMA,
     EXTRACTOR_VERSION,
+    ChapterEntityContext,
     EntityContextCache,
     entity_context_cache_key,
     extract_entity_context,
@@ -668,6 +669,110 @@ def test_cache_hit_ignores_foreign_metadata_and_recomputes():
     assert result.context.chapter_id == source.chapter_id
 
 
+def test_cache_hit_rejects_tampered_anchor_span_and_recomputes():
+    """RV2 HIGH regression: a cached context whose SPAN content no longer
+    exists in the current source (same metadata, same key) must never be
+    returned from_cache=True — fail closed and recompute."""
+    source = _source_0001()
+    extractor = _RecordingExtractor(_gold_payload_0001(source))
+    cache = EntityContextCache()
+
+    context, _ = _validate(_gold_payload_0001(source), source)
+    tampered_payload = context.to_payload()
+    # Same metadata/key; the anchor span is changed motorcycle -> bike,
+    # and "bike" is absent from the anchor PID p00007.
+    tampered_payload["entities"][0]["anchor"]["span"] = "bike"
+    tampered_ctx = ChapterEntityContext.from_payload(tampered_payload)
+
+    key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    cache._store[key] = tampered_ctx  # bypass put() guard to simulate tamper
+
+    result = extract_entity_context(
+        source_artifact=source, extractor=extractor, cache=cache
+    )
+    assert extractor.calls == 1  # model was called again
+    assert result.from_cache is False
+    # The recomputed context is the fully validated one, not the tampered.
+    assert result.context.entities[0].anchor.span == "motorcycle"
+
+
+def test_cache_payload_round_trip_does_not_bypass_tamper_check():
+    """RV2 HIGH regression (persistent path): a tampered context with intact
+    metadata and key survives from_payload (key identity only), but the
+    NEXT hit must still detect the content mismatch and recompute — the
+    persistent round-trip is not an escape hatch from the check."""
+    source = _source_0001()
+    extractor = _RecordingExtractor(_gold_payload_0001(source))
+
+    context, _ = _validate(_gold_payload_0001(source), source)
+    tampered_payload = context.to_payload()
+    # Same metadata/key; the alias span no longer exists in its own PID
+    # p00097 ("bike" -> "motorcycle").
+    tampered_payload["entities"][0]["aliases"][0]["span"] = "motorcycle"
+    tampered_ctx = ChapterEntityContext.from_payload(tampered_payload)
+
+    key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    cache_payload = {
+        "schema": "pact-v4-entity-context-cache/v1",
+        "entries": [{"key": key, "context": tampered_ctx.to_payload()}],
+    }
+    # Key identity is computed from the context's own (intact) metadata, so
+    # the restore itself succeeds — only the source-bound content check at
+    # the reuse boundary can detect the tamper.
+    restored = EntityContextCache.from_payload(cache_payload)
+
+    result = extract_entity_context(
+        source_artifact=source, extractor=extractor, cache=restored
+    )
+    assert extractor.calls == 1  # model was called again
+    assert result.from_cache is False
+    assert result.context.entities[0].aliases[0].span == "bike"
+
+
+def test_cache_hit_preserves_legitimate_claim_downgrades():
+    """A legitimately validated context containing downgraded claims (gender
+    without a verifiable referent link) must still be a valid cache hit —
+    the downgrade is preserved, not re-judged away or rejected."""
+    source = _source_0001()
+    payload = _gold_payload_0001(source)
+    # Break the referent link for Rich's gender claim: evidence points at an
+    # unrelated PID without a gendered pronoun matching "male" -> the code
+    # downgrades the claim to candidate during validation.
+    payload["entities"][1]["claims"][0]["evidence"] = [
+        {"pid": "p00097", "span": "A bike"}
+    ]
+    extractor = _RecordingExtractor(payload)
+    cache = EntityContextCache()
+
+    first = extract_entity_context(
+        source_artifact=source, extractor=extractor, cache=cache
+    )
+    assert first.context.entities[1].claims[0].status == "candidate"
+
+    second = extract_entity_context(
+        source_artifact=source, extractor=extractor, cache=cache
+    )
+    assert extractor.calls == 1
+    assert second.from_cache is True
+    assert second.context.to_payload() == first.context.to_payload()
+    assert second.context.entities[1].claims[0].status == "candidate"
+
+
+def test_cache_from_payload_rejects_malformed_entry():
+    """A structurally malformed cache entry (not an object {key, context})
+    is rejected loudly — never silently accepted."""
+    payload = {
+        "schema": "pact-v4-entity-context-cache/v1",
+        "entries": [["not", "an", "object"]],
+    }
+    with pytest.raises(ValueError, match="cache payload entry"):
+        EntityContextCache.from_payload(payload)
+
+
 # F3 (MEDIUM): anchor/alias status is CODE-derived — only spans that pass
 # the §8.3 checks are verified; a model-supplied invalid status is rejected.
 
@@ -797,3 +902,15 @@ def test_canonical_type_in_anchor_span_passes():
     assert report.is_clean()
     assert len(context.entities) == 1
     assert context.entities[0].canonical_type == "motorcycle"
+
+
+def test_extractor_max_tokens_covers_reasoning_budget():
+    """Regression (2026-08-10): max_tokens must cover the server reasoning
+    budget + content headroom. llama-server counts reasoning AND content
+    together against max_tokens; the old 4096 < 8192 budget let the model
+    spend everything on reasoning and return empty content
+    (EmptyResponseError after retries on the real Qwen server)."""
+    cfg = BackendEntityExtractorConfig()
+    assert cfg.max_tokens == 12000
+    assert cfg.max_tokens > 8192  # server --reasoning-budget
+    assert cfg.max_tokens >= 8192 + 3000  # budget + content headroom
