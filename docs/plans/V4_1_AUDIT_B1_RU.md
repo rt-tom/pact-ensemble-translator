@@ -352,6 +352,41 @@ B3 ──→ owner-run валидация на новых главах
 - **Remote-аудит тестирование** (контракт в B3, тестирование после B-фазы — решение владельца)
 - **PR #145 dev→main** — мерж только когда вся 4.1 готова (draft до этого)
 
+## 13. Карточка M — монитор прогресса для 4.1 (ДО прогона 2 новых глав)
+
+> Обнаружено при тестировании A-части (2026-08-10, run_006_local_gemma): `v4_phase_progress` рассчитан на chunked-поток (chunk_started/chunk_done, Step 6-8), в whole-chapter показывает почти ничего (один «chunk» + skipped 6/7/8). Для прогона новых глав нужен монитор, понимающий whole-chapter.
+
+**Объём:**
+- `v4_phase_progress.py` + `PhaseProgressWriter`: whole-chapter-события
+  - `wc_generation_started` (pid_count, reasoning_budget, model)
+  - `wc_retry_attempt` (attempt, reason: malformed/missing_pid/truncated/abort)
+  - `wc_generation_done` (finish_reason, pid_count, duration)
+  - `wc_validated` (json_ok, pids_ok, order_ok)
+- Показывать: текущую retry-попытку и её причину, live-duration, статус валидации PID-контракта
+- Сохранить диагностическую природу (read-only, не gate, crash-safe append-only)
+- Для chunked-режима (B1-аудит) — существующие события остаются; добавить `audit_chunk_started/done` (8 чанков аудита) — монитор после B1 показывает и их
+
+**Acceptance:** во время whole-chapter прогона монитор показывает ≥1 событие на каждую retry-попытку; после прогона — финальный статус с PID-валидацией; полный suite проходит
+
+**Non-goals:** изменение pipeline-логики, resume, journal schema, terminal-политики
+
+**Когда:** ДО прогона второй/третьей главы (§12). Может идти параллельно B-фазе (не зависит от B1).
+
+## 14. Карточка W — whole-chapter артефакты (chunk_plan.json)
+
+> Обнаружено при тестировании A-части (2026-08-10): `chunk_plan.json` пишется безусловно (runner:2305-2308), хотя в whole-chapter реальные границы чанков не используются — важен только упорядоченный PID-список (`WholeChapterPidMap.derive`). Файл в текущей форме вводит в заблуждение.
+
+**Объём:**
+- В whole-chapter режиме: писать `whole_chapter_pid_map.json` (schema: pid, order, snapshot_hash, source_hash) ВМЕСТО/ВДОБАВОК к chunk_plan.json
+- chunk_plan.json в whole-chapter — либо не писать (источник истины = whole_chapter_pid_map.json), либо явно пометить `"mode": "whole-chapter-derived"` + `"note": "chunk boundaries not used"`
+- Обратная совместимость: resume-логика не должна зависеть от наличия/отсутствия chunk_plan.json (проверить `_load_journal`/resume path)
+
+**Acceptance:** whole-chapter прогон пишет whole_chapter_pid_map.json (400 PID, порядок exact); chunk_plan.json либо отсутствует, либо явно помечен; resume из нового формата работает; полный suite проходит
+
+**Non-goals:** изменение генерации/PID-контракта, удаление chunk_plan из chunked-режима (он там нужен)
+
+**Когда:** до/вместе с B3 (production-сборка) — чтобы артефакты нового пайплайна были честными с первого прогона
+
 ---
 
 ## 8. Обновление 2026-08-09: audit_v4 — новый harness + промпт v4
