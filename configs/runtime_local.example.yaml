@@ -28,7 +28,7 @@ startup_timeout: 240.0
 unload_timeout: 30.0
 model_paths:
   gemma: C:/llama-cpp/models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
-  qwen: C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+  qwen: C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 model_names:
   gemma: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
   qwen: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf

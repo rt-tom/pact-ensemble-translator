@@ -24,8 +24,10 @@ Provenance / cache contract:
 
 * ``audit_journal.ndjson`` (schema ``pact-v4-b3-audit-journal/v1``) —
   append-only events ``audit_started`` / ``audit_chunk_started`` /
-  ``audit_chunk_done`` / ``audit_complete`` / ``finding`` /
-  ``repair_round`` / ``reaudit_scope`` / ``gate``. This is a SEPARATE
+  ``audit_chunk_done`` / ``audit_complete`` / ``audit_failed`` (terminal
+  pre/model-call evaluator failure — always followed by a fail-closed
+  ``gate``) / ``finding`` / ``repair_round`` / ``reaudit_scope`` /
+  ``gate``. This is a SEPARATE
   file from the generation ``journal.ndjson``: the whole-chapter resume
   contract requires exactly one generation entry, so audit events can
   never share that file.
@@ -806,52 +808,81 @@ class B3AuditRepair:
         # ------------------------------------------------------------------
         # 3. Chunked audit (B1).
         # ------------------------------------------------------------------
-        pairs = pairs_from_maps(source_map, translation_map)
-        narrator_context = build_narrator_context(
-            book_memory, " ".join(source_map.values())
-        )
-        def _journal_chunk_event(kind: str, fields: Dict[str, Any]) -> None:
-            # F7: journal causality — the started event is emitted BEFORE the
-            # model call (inside ChunkedAuditEvaluator._run_one_chunk) and the
-            # terminal done/failed after it, so a crash during a chunk leaves
-            # item-start evidence in the append-only journal instead of nothing.
-            if kind == "started":
-                journal.emit(
-                    "audit_chunk_started",
-                    chunk=fields.get("chunk"),
-                    total=fields.get("total"),
-                    sub=fields.get("sub") or "",
-                )
-            else:
-                journal.emit(
-                    "audit_chunk_done",
-                    chunk=fields.get("chunk"),
-                    total=fields.get("total"),
-                    status=fields.get("status"),
-                    issue_count=fields.get("issue_count", 0),
-                    error=fields.get("error"),
-                )
+        # F2 (RV2): the audit stage is wrapped so a pre/model-call evaluator
+        # failure (CoverageError/empty input, BudgetOverflowError, missing
+        # role, …) writes a TERMINAL audit failure event and a fail-closed
+        # gate into the append-only journal BEFORE the exception propagates
+        # to the strict runner — the journal must never end on
+        # audit_started/started alone. Per-chunk TRANSPORT_ERROR failures
+        # are handled inside the evaluator (failed chunks -> audit_complete
+        # False -> the fail-closed gate below); that transport path is
+        # preserved unchanged.
+        try:
+            pairs = pairs_from_maps(source_map, translation_map)
+            narrator_context = build_narrator_context(
+                book_memory, " ".join(source_map.values())
+            )
+            def _journal_chunk_event(kind: str, fields: Dict[str, Any]) -> None:
+                # F7: journal causality — the started event is emitted BEFORE the
+                # model call (inside ChunkedAuditEvaluator._run_one_chunk) and the
+                # terminal done/failed after it, so a crash during a chunk leaves
+                # item-start evidence in the append-only journal instead of nothing.
+                if kind == "started":
+                    journal.emit(
+                        "audit_chunk_started",
+                        chunk=fields.get("chunk"),
+                        total=fields.get("total"),
+                        sub=fields.get("sub") or "",
+                    )
+                else:
+                    journal.emit(
+                        "audit_chunk_done",
+                        chunk=fields.get("chunk"),
+                        total=fields.get("total"),
+                        status=fields.get("status"),
+                        issue_count=fields.get("issue_count", 0),
+                        error=fields.get("error"),
+                    )
 
-        evaluator = ChunkedAuditEvaluator(
-            self._audit_backend,
-            config=ChunkedAuditConfig(
-                max_input_tokens=cfg.max_input_tokens,
-                max_tokens=cfg.max_tokens,
-                overlap_tokens=cfg.overlap_tokens,
-                reasoning_budget=cfg.reasoning_budget,
-                harness_version=cfg.harness_version,
-                prompt_version=cfg.prompt_version,
-            ),
-            on_chunk_event=_journal_chunk_event,
-        )
-        outcome = evaluator(
-            chapter_id=chapter_id,
-            pairs=pairs,
-            narrator_context=narrator_context,
-            entity_context=entity_context,
-            out_dir=out_dir,
-            out_base="b3_audit",
-        )
+            evaluator = ChunkedAuditEvaluator(
+                self._audit_backend,
+                config=ChunkedAuditConfig(
+                    max_input_tokens=cfg.max_input_tokens,
+                    max_tokens=cfg.max_tokens,
+                    overlap_tokens=cfg.overlap_tokens,
+                    reasoning_budget=cfg.reasoning_budget,
+                    harness_version=cfg.harness_version,
+                    prompt_version=cfg.prompt_version,
+                ),
+                on_chunk_event=_journal_chunk_event,
+            )
+            outcome = evaluator(
+                chapter_id=chapter_id,
+                pairs=pairs,
+                narrator_context=narrator_context,
+                entity_context=entity_context,
+                out_dir=out_dir,
+                out_base="b3_audit",
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed: a pre/model-call
+            # audit failure is TERMINAL. The strict runner records the failed
+            # step fields, but the B3 journal must carry its own terminal
+            # failure event + fail-closed gate/provenance too — recorded
+            # BEFORE the exception is re-raised.
+            LOG.exception("B3: chunked audit evaluator failed for %s", chapter_id)
+            error = f"{type(exc).__name__}: {exc}"
+            journal.emit(
+                "audit_failed",
+                error=error,
+                audit_complete=False,
+            )
+            journal.emit(
+                "gate",
+                audit_complete=False,
+                released_as_audited=False,
+                error=error,
+            )
+            raise
         journal.emit(
             "audit_complete",
             audit_complete=outcome.audit_complete,

@@ -19,7 +19,10 @@ import pytest
 
 from pact_full_pipeline_runner_v1 import v4_phase12_strict_run as cli
 from pact_v4.runtime.opencode_backend import OpenCodeServerBackendConfig
-from pact_v4.runtime.runtime_config import OpenCodeBackendConfig
+from pact_v4.runtime.runtime_config import (
+    LocalLlamaBackendConfig,
+    OpenCodeBackendConfig,
+)
 
 
 def _remote_cfg() -> OpenCodeBackendConfig:
@@ -405,3 +408,100 @@ def test_default_local_qwen_transport_in_backend_identity(tmp_path: Path):
     record = base.build_descriptor().public_record()
     qwen_args = record["effective_options"]["server_args"]["qwen"]
     assert qwen_args[qwen_args.index("--reasoning-budget") + 1] == "8192"
+
+
+# ---------------------------------------------------------------------------
+# F1 (RV2 B3 review): configs/runtime_local.example.yaml must be internally
+# consistent — the qwen model path/name is the MTP variant when the server
+# args declare MTP draft transport, and _validate_b3_qwen_profile rejects a
+# non-MTP model path with MTP flags instead of silently accepting it.
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> Path:
+    return Path(__file__).parents[2]
+
+
+def _example_local_backend():
+    """Load configs/runtime_local.example.yaml through the CLI loader."""
+    yaml = pytest.importorskip("yaml")
+    path = _repo_root() / "configs" / "runtime_local.example.yaml"
+    return cli._load_runtime_config_file(path)
+
+
+def test_example_local_profile_qwen_is_mtp_consistent(tmp_path: Path):
+    # F1: the shipped example local profile must be self-consistent — the
+    # qwen model path points at the MTP variant (…/Qwen3.6-35B-A3B-MTP/…)
+    # while the server args declare MTP draft transport. A real
+    # --runtime-config configs/runtime_local.example.yaml --whole-chapter
+    # run must pass B3 profile validation, not silently start a non-MTP
+    # server with MTP flags.
+    backend = _example_local_backend()
+    assert isinstance(backend, LocalLlamaBackendConfig)
+    qwen_path = str(backend.model_paths["qwen"])
+    assert "MTP" in qwen_path, qwen_path
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    # No exception: the example profile is B3-capable and self-consistent.
+    cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_non_mtp_model_path_with_mtp_flags_fails_loudly(tmp_path: Path):
+    # F1: a local profile whose qwen server args declare MTP draft but whose
+    # model_paths.qwen points at the NON-MTP variant is an unsupported
+    # mismatch — validation must fail loudly (never launch non-MTP with MTP
+    # flags). This is the exact regression the example config used to have
+    # before the F1 fix.
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={
+            "gemma": cli.GEMMA_PATH,
+            # non-MTP Qwen variant (the F1 mismatch)
+            "qwen": Path(r"C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+        },
+        model_names={
+            "gemma": cli.GEMMA_PATH.name,
+            "qwen": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        },
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": cli.QWEN_SERVER_ARGS,  # MTP draft, reasoning 8192, 49k
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+    with pytest.raises(ValueError, match="MTP variant"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_non_mtp_model_path_with_mtp_flags_ok_when_skip_audit(tmp_path: Path):
+    # F1: the MTP-path consistency check applies only when the B3 audit will
+    # actually run — with --skip-audit the non-MTP profile is allowed (the
+    # audit never starts a Qwen server).
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter", "--skip-audit"]
+    )
+    backend = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={
+            "gemma": cli.GEMMA_PATH,
+            "qwen": Path(r"C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+        },
+        model_names={
+            "gemma": cli.GEMMA_PATH.name,
+            "qwen": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        },
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": cli.QWEN_SERVER_ARGS,
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+    cli._validate_b3_qwen_profile(args, backend)  # no exception

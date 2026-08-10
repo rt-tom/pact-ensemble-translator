@@ -206,13 +206,18 @@ def _run_with_b3(
     *,
     caller: Optional[StubModelCaller] = None,
     entity_context_enabled: bool = True,
+    config_override: Optional[B3AuditRepairConfig] = None,
 ) -> Any:
     router = _make_router()
     model_caller = _LifecycleAwareModelCaller(router, caller or _DefectiveWholeChapterCaller())
     bundle = B3AuditRepair(
         audit_backend=backend,
         repair_backend=backend,
-        config=B3AuditRepairConfig(entity_context_enabled=entity_context_enabled),
+        config=(
+            config_override
+            if config_override is not None
+            else B3AuditRepairConfig(entity_context_enabled=entity_context_enabled)
+        ),
     )
     result = run_chapter_strict(
         cfg, router=router, model_caller=model_caller,
@@ -1033,3 +1038,111 @@ def test_b8_manifest_lists_b3_when_full_flow(tmp_path: Path) -> None:
     # The advertised files actually exist.
     for key in ("b3_audit_journal", "b3_audit_cache", "b3_entity_context_cache"):
         assert Path(artefacts[key]).exists(), key
+
+
+# ---------------------------------------------------------------------------
+# F2 (RV2 B3 review): a NON-transport evaluator exception (pre/model-call
+# failure — CoverageError/empty input, BudgetOverflowError, missing role)
+# must leave a TERMINAL audit_failed event + fail-closed gate in the B3
+# journal BEFORE the exception propagates. Previously the journal ended on
+# audit_started/started with no terminal failure event.
+# ---------------------------------------------------------------------------
+
+
+def test_b3_evaluator_budget_overflow_writes_terminal_failure_event(
+    tmp_path: Path,
+) -> None:
+    # F2 adversarial: a BudgetOverflowError raised INSIDE the evaluator
+    # (before any model call — the audit input budget cannot fit the
+    # chapter) propagates out of ChunkedAuditEvaluator. The B3 journal must
+    # still record a terminal audit_failed event with the error AND a
+    # fail-closed gate (audit_complete=False, released_as_audited=False)
+    # before the exception is re-raised to the strict runner.
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            entity_context_enabled=False,
+            # Zero input budget -> validate_input_budget computes
+            # pair_budget = min(0, …) = 0 < 1 and raises BudgetOverflowError
+            # inside the evaluator before any model call.
+            max_input_tokens=0,
+        ),
+    )
+
+    # The strict runner records the failed B3 step (never a crash).
+    assert result.step6["status"] == "failed"
+    assert result.step7["status"] == "failed"
+    assert result.step8["status"] == "failed"
+
+    # The B3 journal has a TERMINAL failure event + fail-closed gate.
+    events = _journal_events(cfg.out_dir)
+    names = [e["event"] for e in events]
+    assert "audit_started" in names
+    assert "audit_failed" in names
+    assert "gate" in names
+    failed = next(e for e in events if e["event"] == "audit_failed")
+    assert "BudgetOverflowError" in failed["error"]
+    assert failed["audit_complete"] is False
+    gate = next(e for e in events if e["event"] == "gate")
+    assert gate["audit_complete"] is False
+    assert gate["released_as_audited"] is False
+    assert "BudgetOverflowError" in gate["error"]
+    # The terminal gate is the LAST event (nothing appended after it).
+    assert names[-1] == "gate"
+
+
+def test_b3_evaluator_coverage_error_writes_terminal_failure_event(
+    tmp_path: Path,
+) -> None:
+    # F2 adversarial (CoverageError/empty input): a translation map missing
+    # source PIDs raises CoverageError from pairs_from_maps BEFORE any model
+    # call. The journal must terminate with audit_failed + fail-closed gate,
+    # never end on audit_started alone.
+    from pact_v4.audit.chunked_audit import CoverageError
+    from pact_v4.phase1.models import SourceArtifact
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    bundle = B3AuditRepair(
+        audit_backend=backend,
+        repair_backend=backend,
+        config=B3AuditRepairConfig(
+            entity_context_enabled=False,
+            max_input_tokens=3600,
+        ),
+    )
+    source = SourceArtifact(
+        chapter_id=cfg.chapter_id,
+        source=(("p00001", "Source one"), ("p00002", "Source two")),
+    )
+    with pytest.raises(CoverageError):
+        bundle.run(
+            chapter_id=cfg.chapter_id,
+            source=source,
+            snapshot_hash="snap-hash",
+            # p00002 missing -> pairs_from_maps raises CoverageError.
+            translation={"p00001": "Перевод один"},
+            book_memory={},
+            out_dir=cfg.out_dir,
+            config_identity="cid",
+            backend_identity_hash="bid",
+        )
+
+    # The B3 journal has a TERMINAL failure event + fail-closed gate even
+    # though the exception propagated to the caller.
+    events = _journal_events(cfg.out_dir)
+    names = [e["event"] for e in events]
+    assert "audit_started" in names
+    assert "audit_failed" in names
+    assert "gate" in names
+    failed = next(e for e in events if e["event"] == "audit_failed")
+    assert "CoverageError" in failed["error"]
+    assert failed["audit_complete"] is False
+    gate = next(e for e in events if e["event"] == "gate")
+    assert gate["audit_complete"] is False
+    assert gate["released_as_audited"] is False
+    assert "CoverageError" in gate["error"]
+    # The terminal gate is the LAST event (nothing appended after it).
+    assert names[-1] == "gate"

@@ -565,9 +565,27 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
     spec_type = _arg_value("--spec-type")
     reasoning_budget = _arg_value("--reasoning-budget")
     context = _arg_value("-c") or _arg_value("--ctx-size")
+    # F1 (RV2): the qwen MODEL must itself be the MTP variant when the
+    # server args declare MTP draft transport. The B3 contract binds the
+    # Qwen audit to the MTP build (…/Qwen3.6-35B-A3B-MTP/…); a non-MTP
+    # model path with MTP flags is an unsupported mismatch (the draft spec
+    # is a property of the model build, not just the server args), so it
+    # must fail loudly here instead of silently starting a non-MTP server.
+    qwen_path = (backend.model_paths or {}).get("qwen")
+    qwen_name = (backend.model_names or {}).get("qwen")
+    path_str = str(qwen_path) if qwen_path is not None else ""
+    name_str = str(qwen_name) if qwen_name is not None else ""
     problems: list = []
     if spec_type != "draft-mtp":
         problems.append("--spec-type draft-mtp (MTP draft)")
+    if spec_type == "draft-mtp":
+        # MTP transport declared -> the model path must be the MTP variant.
+        if "mtp" not in path_str.lower() and "mtp" not in name_str.lower():
+            problems.append(
+                "qwen model_paths.qwen/model_names.qwen must be the MTP "
+                "variant (…/Qwen3.6-35B-A3B-MTP/…) when --spec-type "
+                f"draft-mtp is set (got path={path_str!r}, name={name_str!r})"
+            )
     try:
         budget_ok = reasoning_budget is not None and int(reasoning_budget) >= 8192
     except ValueError:
