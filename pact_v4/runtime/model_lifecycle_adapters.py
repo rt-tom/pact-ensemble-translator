@@ -24,8 +24,15 @@ this module only decides *when to swap*, never *what the model is asked*.
 """
 from __future__ import annotations
 
-from typing import Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from pact_v4.audit.chunked_audit import (
+    AuditPair,
+    ChunkedAuditConfig,
+    ChunkedAuditEvaluator,
+    ChunkedAuditOutcome,
+)
 from pact_v4.audit.entity_extractor import (
     BackendEntityExtractor,
     BackendEntityExtractorConfig,
@@ -151,6 +158,16 @@ class LifecycleQwenAuditEvaluator:
     driver's audit phase pays the batching benefit of
     ``run_chapter_audit``'s detector-outer loop: one acquire for all Qwen
     units, then one switch to Gemma for all Gemma units.
+
+    B1 (v4.1 chunked audit): ``context_size`` was raised 32768 → 49152 to
+    match the Qwen server's ``-c 49152`` (``runtime_local.example.yaml``,
+    V4.1 §3.4) — the chunked audit's full input budget
+    (fixed_prompt + narrator + entity + CONTEXT_ONLY + AUDIT_PAIRS) must fit
+    the real server context. ``__call__`` is extended to accept the chunked
+    inputs (``pairs`` + ``narrator_context``/``entity_context``) and returns
+    a ``ChunkedAuditOutcome``; the legacy single-chunk call
+    (``chunk_id``/``source``/``translation`` → raw text) is preserved for
+    ``run_chapter_audit``'s per-chunk units.
     """
 
     def __init__(self, router: ModelRouter, *, model_name: str,
@@ -165,22 +182,60 @@ class LifecycleQwenAuditEvaluator:
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
             timeout_seconds=1800.0,
-            context_size=32768,
+            context_size=49152,
             temperature=0.0,
         )
-        backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
+        self._backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
         self._evaluator = BackendQwenAuditEvaluator(
-            backend,
+            self._backend,
             config=BackendQwenAuditEvaluatorConfig(
                 max_tokens=cfg.max_tokens, template=cfg.template, label=cfg.label,
                 bible_text=cfg.bible_text,
             ),
         )
+        self._chunked = ChunkedAuditEvaluator(
+            self._backend,
+            config=ChunkedAuditConfig(label=cfg.label),
+        )
 
     def __call__(
-        self, *, chunk_id: str, source: Mapping[str, str], translation: Mapping[str, str]
-    ) -> str:
+        self,
+        *,
+        chunk_id: str,
+        source: Optional[Mapping[str, str]] = None,
+        translation: Optional[Mapping[str, str]] = None,
+        pairs: Optional[Sequence[AuditPair]] = None,
+        narrator_context: str = "",
+        entity_context: str = "",
+        out_dir: Optional[Path] = None,
+        out_base: str = "audit",
+    ) -> Any:
+        """Single-resident Qwen audit call.
+
+        Legacy form (``source``+``translation``): returns the raw assistant
+        text for one chunk (used by ``run_chapter_audit``).
+
+        B1 chunked form (``pairs`` given): returns a ``ChunkedAuditOutcome``
+        for the whole chapter — greedy chunking, CONTEXT_ONLY overlap,
+        RetryShrink and fail-closed aggregation (``pact_v4.audit.
+        chunked_audit``). ``out_dir``/``out_base`` persist per-chunk
+        raw/reasoning artifacts (harness-compatible names).
+        """
         self._router.ensure_resident(QWEN_MODEL_KEY)
+        if pairs is not None:
+            return self._chunked(
+                chapter_id=chunk_id,
+                pairs=pairs,
+                narrator_context=narrator_context,
+                entity_context=entity_context,
+                out_dir=out_dir,
+                out_base=out_base,
+            )
+        if source is None or translation is None:
+            raise TypeError(
+                "LifecycleQwenAuditEvaluator: either source+translation "
+                "(legacy single chunk) or pairs (B1 chunked) must be given"
+            )
         return self._evaluator(chunk_id=chunk_id, source=source, translation=translation)
 
 

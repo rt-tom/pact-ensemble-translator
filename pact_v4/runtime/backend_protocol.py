@@ -177,6 +177,15 @@ class CompletionRequest:
     response_schema: Mapping[str, Any] | None
     label: str
     request_options: Mapping[str, Any] = field(default_factory=dict)
+    # OpenCode transport body shape: when True, the neutral system prompt
+    # and the all-disabled tools map are omitted from the message body
+    # (serve 1.4.7 applies a default ~32k output budget to requests that
+    # carry system/tools, truncating whole-chapter generation reasoning at
+    # 32000 tokens with finish=length). Generation-only by design — audit/
+    # repair/formatting keep the historical system+tools body. No-op for
+    # every other transport (local llama-server never reads it). Defaults
+    # to False so the historical body shape is preserved.
+    omit_system_tools: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_ref, str) or not self.model_ref:
@@ -189,6 +198,10 @@ class CompletionRequest:
             raise ValueError("CompletionRequest: max_output_tokens must be positive")
         if not isinstance(self.label, str) or not self.label:
             raise ValueError("CompletionRequest: label must be a non-empty string")
+        if not isinstance(self.omit_system_tools, bool):
+            raise ValueError(
+                "CompletionRequest: omit_system_tools must be a bool"
+            )
         unknown = set(self.request_options) - ALLOWED_REQUEST_OPTIONS
         if unknown:
             raise ValueError(
