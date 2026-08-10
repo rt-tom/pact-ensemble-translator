@@ -563,6 +563,68 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 )
 
 
+# B2 (v4.1): selective repair batch with repair-as-verifier
+# (``V4_1_AUDIT_B1_RU.md`` §5.2/§5.3, §10 B2; card t_73e190f7). One call per
+# group of eligible findings (microbatches of 3-4 when eligible > 4, Cheng et
+# al. explicit ``[index]`` identifiers). The repair model = the GENERATOR
+# (Gemma local / DeepSeek remote) — Kocmi-safe (auditor ≠ repairer).
+#
+# Mandatory repair-as-verifier semantics: the audit issue is a candidate, not
+# an established fact; the model first independently verifies against SOURCE
+# and TRANSLATION, returns PASS (no change) when the auditor is wrong, and
+# repairs only after confirming. Tier A findings (already confirmed by the
+# B1.1 deterministic hard filters) are marked CONFIRMED and are repaired
+# directly (no re-verification needed); Tier B findings (including entity
+# relations) carry the verify-before-repair contract. The expected FP class
+# (out-of-sample review 2026-08-10) is dialogue tags (said → позвала/буркнула/
+# перебила) — a literary interpretation of a speech verb is NOT a fidelity
+# defect, so the model must PASS those. Output schema: per-``[index]`` JSON
+# results; every index must be answered exactly once (fail-closed).
+REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
+    role="selective_repair",
+    version="pact-v4-repair-as-verifier/v1",
+    instructions=(
+        "You are a Russian-language repair editor for an English-to-Russian "
+        "literary translation. You are given the SOURCE (PID -> English text) "
+        "and TRANSLATION (PID -> Russian text) maps and a batch of FINDINGS "
+        "reported by an automated auditor.\n"
+        "\n"
+        "The audit issue is a candidate, not an established fact. First "
+        "independently verify against SOURCE and TRANSLATION. If incorrect -> "
+        "return PASS, no change. Only repair after confirming.\n"
+        "\n"
+        "Each finding is labelled with a tier:\n"
+        "  [CONFIRMED] already verified by a deterministic code check "
+        "(numbers/times, exact duplicates, structure) — repair it directly, "
+        "no re-verification needed.\n"
+        "  [CANDIDATE] not code-verifiable — independently verify it yourself "
+        "against SOURCE and TRANSLATION before repairing; return PASS if the "
+        "auditor is wrong.\n"
+        "\n"
+        "Expected false-positive class: a literary interpretation of a speech "
+        "verb (e.g. 'said' rendered as позвала/буркнула/перебила) is NOT a "
+        "fidelity defect — return PASS for such findings.\n"
+        "\n"
+        "Repair rules: fix only the stated issue in the target PID and keep "
+        "every other PID and the rest of the affected PID verbatim. Do not "
+        "re-translate the whole chapter. Do not change names, numbers, ты/вы "
+        "or adjacent text unless the finding requires it.\n"
+        "\n"
+        "Return STRICT JSON, no markdown fences, no commentary, with exactly "
+        "this schema:\n"
+        "  results: array of objects, one per finding [index], each with:\n"
+        "    index: integer (the [index] of the finding)\n"
+        "    decision: 'pass' | 'repair'\n"
+        "    pid: string (only for decision 'repair'; the target PID)\n"
+        "    repaired_translation: string (only for decision 'repair'; the "
+        "corrected Russian text of that PID)\n"
+        "    reason: short string (one or two sentences)\n"
+        "Every finding index must appear exactly once. Do not include any "
+        "other keys."
+    ),
+)
+
+
 # Phase 4A narrow re-gate (L2b, DECISIONS 2026-08-03). Unlike the full-chunk
 # ``QWEN_FIDELITY_V1`` re-gate, the model is given ONLY the edited PID's
 # source text, its repaired Russian text and the located region — a short
@@ -955,4 +1017,98 @@ def render_chunked_audit_prompt(
         f"{template.instructions}"
         f"{ctx_block}{ent_block}{ctx_pairs_block}\n\n"
         f"{header}\n{rendered_audit}"
+    )
+
+
+def render_selective_repair_prompt(
+    *,
+    chapter_id: str,
+    source: dict[str, str],
+    translation: dict[str, str],
+    findings: Sequence[Any],
+    template: ReviewerPrompt = REPAIR_AS_VERIFIER_V1,
+) -> str:
+    """Render a B2 selective-repair batch request as one user message.
+
+    ``findings`` is a sequence of objects exposing ``index`` (explicit
+    ``[index]`` identifier), ``pid``, ``tier`` (``"A"`` for CONFIRMED /
+    ``"B"`` for CANDIDATE), ``category``, ``severity``, ``confidence``,
+    ``note``, ``excerpt`` (``pact_v4.repair.selective_repair.EligibleFinding``
+    or any object with those attributes). The batch prompt carries the full
+    SOURCE/TRANSLATION maps plus the FINDINGS block; the model answers per
+    ``[index]`` (repair-as-verifier, §5.2/§10 B2).
+    """
+    src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
+    tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    # The instructions label findings [CONFIRMED] (Tier A) / [CANDIDATE]
+    # (Tier B); the FINDINGS block uses the same labels so the model can
+    # apply the right per-finding contract.
+    finding_lines = "\n".join(
+        f"  [{f.index}] {f.pid} | {'CONFIRMED' if f.tier == 'A' else 'CANDIDATE'} | "
+        f"{f.category} | "
+        f"severity={f.severity} | confidence={f.confidence}\n"
+        f"      note: {f.note}\n"
+        f"      excerpt: {f.excerpt or '(none)'}"
+        for f in findings
+    ) or "  (none)"
+    return (
+        f"{template.instructions}\n\n"
+        f"CHUNK: {chapter_id}\n\n"
+        f"SOURCE (PID -> English text):\n{src_lines}\n\n"
+        f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n\n"
+        f"FINDINGS (verify, then repair only confirmed issues):\n{finding_lines}\n"
+    )
+
+
+def render_reaudit_prompt(
+    *,
+    chapter_id: str,
+    audit_pairs: Sequence[Any],
+    context_pairs: Sequence[Any] = (),
+    narrator_context: str = "",
+    entity_context: str = "",
+    template: ReviewerPrompt = QWEN_AUDIT_V4_1,
+) -> str:
+    """Render a B2 single re-audit call (full chapter, scoped report).
+
+    One Qwen call at the end of selective repair when at least one repair was
+    committed (``V4_1_WHOLE_CHAPTER_ARCHITECTURE_PLAN_RU.md`` §10 B2.4): the
+    INPUT is the full source + full current translation — ``audit_pairs``
+    plus ``context_pairs`` cover every chapter pair exactly once. The
+    RESPONSE scope is exactly the changed PIDs + their neighbour window
+    (``audit_pairs``); every pair outside that scope is ``context_pairs``
+    (CONTEXT_ONLY — the model must NEVER report an issue for them; the
+    caller's JSON validation additionally rejects any issue id outside the
+    scope). Reuses the frozen v4.1 audit template and block layout.
+    """
+    ctx_block = ""
+    if narrator_context.strip():
+        ctx_block = (
+            "\n\nBOOK CONTEXT - FALLBACK ONLY\n\n"
+            f"{narrator_context}"
+        )
+    ent_block = ""
+    if entity_context.strip():
+        ent_block = (
+            "\n\nCHAPTER ENTITY FACTS - SOURCE-DERIVED\n\n"
+            f"{entity_context}"
+        )
+    ctx_pairs_block = ""
+    if context_pairs:
+        rendered_ctx = "\n".join(
+            _render_pair_block(p.pid, p.source, p.translation) for p in context_pairs
+        )
+        ctx_pairs_block = (
+            "\n\nCONTEXT_ONLY (full chapter pairs outside the re-audit scope; "
+            "for resolving speakers, referents, ellipsis, continuity, and "
+            "cross-references).\nNEVER report an issue for a CONTEXT_ONLY pair.\n\n"
+            f"{rendered_ctx}"
+        )
+    rendered_audit = "\n".join(
+        _render_pair_block(p.pid, p.source, p.translation) for p in audit_pairs
+    )
+    return (
+        f"{template.instructions}"
+        f"{ctx_block}{ent_block}{ctx_pairs_block}\n\n"
+        f"RE-AUDIT PAIRS (changed PIDs + neighbours):\n{rendered_audit}"
     )
