@@ -18,6 +18,7 @@ from pact_v4.audit.entity_extractor import (
     parse_model_output,
     render_entity_extraction_prompt,
     validate_entity_context,
+    with_entity_context_metadata,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "parse_model_output",
     "render_entity_extraction_prompt",
     "validate_entity_context",
+    "with_entity_context_metadata",
 ]

@@ -24,6 +24,7 @@ from pact_v4.audit.entity_extractor import (
     parse_model_output,
     render_entity_extraction_prompt,
     validate_entity_context,
+    with_entity_context_metadata,
 )
 from pact_v4.phase1.models import SourceArtifact, canonical_json_hash
 from pact_v4.runtime.backend_protocol import (
@@ -272,7 +273,7 @@ def test_point5_canonical_type_not_in_anchor_drops_entity():
     payload["entities"][0]["canonical_type"] = "moped"
     context, report = _validate(payload, source)
     assert report.entries[0].action == "dropped"
-    assert "not in anchor evidence" in report.entries[0].reason
+    assert "not in anchor span" in report.entries[0].reason
     assert [e.entity for e in context.entities] == ["Rich"]
 
 
@@ -522,3 +523,277 @@ def test_lifecycle_extractor_ensures_qwen_resident_then_calls_backend(
     assert called["chapter_id"] == "0001"
     assert called["source"] == dict(source.source)
     assert raw == canned
+
+
+# ---------------------------------------------------------------------------
+# RV t_7e9ab408 regression tests (fix commit follows eb85d86)
+# ---------------------------------------------------------------------------
+#
+# F1 (HIGH): prompt/parser/validator metadata contract — the real model
+# body (entities only) must flow through BackendEntityExtractor -> stamp ->
+# validate for BOTH the prompt's empty contract {"entities": []} and a
+# non-empty entities array; the harness owns schema/extractor_version/
+# chapter_id/source_hash (no provenance substitution by the model).
+
+
+def test_integration_backend_path_empty_and_nonempty_outputs():
+    source = _source_0001()
+
+    # Empty chapter: the prompt's own explicit contract {"entities": []}.
+    empty_body = '{"entities": []}'
+    backend = ScriptedBackend([_text_response(empty_body)])
+    extractor = BackendEntityExtractor(backend)
+    result = extract_entity_context(source_artifact=source, extractor=extractor)
+    assert result.from_cache is False
+    assert result.validation.is_clean()
+    assert result.context.entities == ()
+    assert result.context.schema == ENTITY_CONTEXT_SCHEMA
+    assert result.context.chapter_id == source.chapter_id
+    assert result.context.source_hash == source.source_hash
+    assert result.context.extractor_version == EXTRACTOR_VERSION
+    # The prompt really was the rendered source-only whole-chapter prompt.
+    request = backend.requests[0]
+    assert request.messages[0].content == render_entity_extraction_prompt(
+        chapter_id=source.chapter_id, source=dict(source.source)
+    )
+
+    # Non-empty: the model body carries ONLY entities — top-level metadata
+    # is stamped by the harness, so a real model response passes validation.
+    gold = _gold_payload_0001(source)
+    model_body = json.dumps({"entities": gold["entities"]}, ensure_ascii=False)
+    backend2 = ScriptedBackend([_text_response(model_body)])
+    result2 = extract_entity_context(
+        source_artifact=source, extractor=BackendEntityExtractor(backend2)
+    )
+    assert result2.from_cache is False
+    assert result2.validation.is_clean()
+    assert len(result2.context.entities) == 2
+    assert result2.context.chapter_id == "0001"
+    assert result2.context.source_hash == source.source_hash
+
+
+def test_with_entity_context_metadata_overrides_model_provenance():
+    # A model that (wrongly) emits provenance must never substitute it:
+    # the harness stamps the real values over whatever the model returned.
+    payload = {
+        "schema": "forged/schema",
+        "extractor_version": "forged/v9",
+        "chapter_id": "9999",
+        "source_hash": "f" * 64,
+        "entities": [],
+    }
+    stamped = with_entity_context_metadata(
+        payload,
+        chapter_id="0001",
+        source_hash="0" * 64,
+        extractor_version=EXTRACTOR_VERSION,
+    )
+    assert stamped["schema"] == ENTITY_CONTEXT_SCHEMA
+    assert stamped["extractor_version"] == EXTRACTOR_VERSION
+    assert stamped["chapter_id"] == "0001"
+    assert stamped["source_hash"] == "0" * 64
+    assert stamped["entities"] == []
+
+
+def test_validate_accepts_stamped_metadata_but_requires_entities():
+    source = _source_0001()
+    # Metadata alone (no entities) must fail closed — not become a clean
+    # empty context (finding 4).
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": source.chapter_id,
+        "source_hash": source.source_hash,
+    }
+    with pytest.raises(ValueError, match="entities"):
+        _validate(payload, source)
+
+
+# F2 (HIGH): cache provenance — a foreign/tampered context can never be
+# stored under the expected key, restored from a persistent payload, or
+# reused on a cache hit against the current SourceArtifact.
+
+
+def test_cache_put_rejects_foreign_context_under_expected_key():
+    source = _source_0001()
+    foreign = SourceArtifact(chapter_id="0001", source=CHAPTER_0001_PIDS[:-1])
+    foreign_ctx, _ = _validate(_gold_payload_0001(foreign), foreign)
+    expected_key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    cache = EntityContextCache()
+    with pytest.raises(ValueError, match="identity is"):
+        cache.put(expected_key, foreign_ctx)
+
+
+def test_cache_from_payload_rejects_tampered_entry():
+    source = _source_0001()
+    context, _ = _validate(_gold_payload_0001(source), source)
+    key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    payload = {
+        "schema": "pact-v4-entity-context-cache/v1",
+        "entries": [{"key": key, "context": context.to_payload()}],
+    }
+    # Tamper: swap the stored context for a foreign one under the SAME key.
+    foreign = SourceArtifact(chapter_id="0001", source=CHAPTER_0001_PIDS[:-1])
+    foreign_ctx, _ = _validate(_gold_payload_0001(foreign), foreign)
+    tampered = dict(payload)
+    tampered["entries"] = [
+        {"key": key, "context": foreign_ctx.to_payload()}
+    ]
+    with pytest.raises(ValueError, match="does not match context identity"):
+        EntityContextCache.from_payload(tampered)
+
+
+def test_cache_hit_ignores_foreign_metadata_and_recomputes():
+    source = _source_0001()
+    extractor = _RecordingExtractor(_gold_payload_0001(source))
+    cache = EntityContextCache()
+    # A cache entry whose metadata does NOT match the current SourceArtifact
+    # (foreign chapter/source) must not be reused from_cache=True.
+    foreign = SourceArtifact(chapter_id="0001", source=CHAPTER_0001_PIDS[:-1])
+    foreign_ctx, _ = _validate(_gold_payload_0001(foreign), foreign)
+    key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    cache._store[key] = foreign_ctx  # bypass put() guard to simulate tamper
+    result = extract_entity_context(
+        source_artifact=source, extractor=extractor, cache=cache
+    )
+    assert extractor.calls == 1  # model was called again
+    assert result.from_cache is False
+    assert result.context.source_hash == source.source_hash
+    assert result.context.chapter_id == source.chapter_id
+
+
+# F3 (MEDIUM): anchor/alias status is CODE-derived — only spans that pass
+# the §8.3 checks are verified; a model-supplied invalid status is rejected.
+
+
+def test_anchor_alias_status_code_derived_not_model_claimed():
+    source = _source_0001()
+    payload = _gold_payload_0001(source)
+    # Model claims candidate for a span that passes every code check — the
+    # code must still assign verified (code checks are the verification).
+    payload["entities"][0]["anchor"]["status"] = "candidate"
+    payload["entities"][0]["aliases"][0]["status"] = "candidate"
+    context, report = _validate(payload, source)
+    assert report.is_clean()
+    assert context.entities[0].anchor.status == "verified"
+    assert context.entities[0].aliases[0].status == "verified"
+
+
+def test_invalid_anchor_alias_status_rejected():
+    source = _source_0001()
+    payload = _gold_payload_0001(source)
+    payload["entities"][0]["anchor"]["status"] = "confirmed"
+    with pytest.raises(ValueError, match="anchor status"):
+        _validate(payload, source)
+
+    payload = _gold_payload_0001(source)
+    payload["entities"][0]["aliases"][0]["status"] = "maybe"
+    with pytest.raises(ValueError, match="alias status"):
+        _validate(payload, source)
+
+
+# F4 (MEDIUM): top-level entities is REQUIRED and must be an array —
+# missing/wrong-type payload fails closed; an explicit empty array stays
+# a valid clean empty context.
+
+
+def test_missing_entities_field_fails_closed():
+    source = _source_0001()
+    payload = _gold_payload_0001(source)
+    del payload["entities"]
+    with pytest.raises(ValueError, match="entities"):
+        _validate(payload, source)
+
+
+def test_wrong_type_entities_fails_closed():
+    source = _source_0001()
+    for bad in (None, {}, {"a": 1}, "entities"):
+        payload = _gold_payload_0001(source)
+        payload["entities"] = bad
+        with pytest.raises(ValueError, match="entities"):
+            _validate(payload, source)
+
+
+def test_explicit_empty_entities_array_is_valid():
+    source = _source_0001()
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": source.chapter_id,
+        "source_hash": source.source_hash,
+        "entities": [],
+    }
+    context, report = _validate(payload, source)
+    assert report.is_clean()
+    assert context.entities == ()
+
+
+# F5 (MEDIUM): canonical_type must appear in the QUOTED anchor span, not
+# merely somewhere in the whole anchor PID.
+
+
+def test_canonical_type_checked_in_anchor_span_not_whole_pid():
+    # The PID contains both 'motorcycle' and 'vehicle'; the quoted anchor
+    # span is only 'motorcycle'. canonical_type='vehicle' must be dropped —
+    # checking the whole PID would let it pass clean (RV repro).
+    source = SourceArtifact(
+        chapter_id="0001",
+        source=(
+            ("p00007", "A motorcycle is a kind of vehicle. I pushed my "
+                       "motorcycle."),
+        ),
+    )
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": source.chapter_id,
+        "source_hash": source.source_hash,
+        "entities": [
+            {
+                "entity": "Blake's vehicle",
+                "canonical_type": "vehicle",
+                "anchor": {"pid": "p00007", "span": "motorcycle"},
+                "aliases": [],
+                "claims": [],
+            },
+        ],
+    }
+    context, report = _validate(payload, source)
+    assert report.entries[0].action == "dropped"
+    assert "not in anchor span" in report.entries[0].reason
+    assert context.entities == ()
+
+
+def test_canonical_type_in_anchor_span_passes():
+    source = SourceArtifact(
+        chapter_id="0001",
+        source=(
+            ("p00007", "A motorcycle is a kind of vehicle. I pushed my "
+                       "motorcycle."),
+        ),
+    )
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": source.chapter_id,
+        "source_hash": source.source_hash,
+        "entities": [
+            {
+                "entity": "Blake's vehicle",
+                "canonical_type": "motorcycle",
+                "anchor": {"pid": "p00007", "span": "motorcycle"},
+                "aliases": [],
+                "claims": [],
+            },
+        ],
+    }
+    context, report = _validate(payload, source)
+    assert report.is_clean()
+    assert len(context.entities) == 1
+    assert context.entities[0].canonical_type == "motorcycle"

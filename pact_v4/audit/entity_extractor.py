@@ -95,7 +95,10 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "PID map (PID -> English text). Extract persistent long-range "
         "entities and per-claim facts about them that the source itself "
         "establishes. Return STRICT JSON, no markdown fences, no commentary, "
-        "with exactly this schema:\n"
+        "with exactly this schema. The response body is ONLY the top-level "
+        "entities array — do not add schema, extractor_version, chapter_id, "
+        "or source_hash; the harness stamps these from the actual chapter. "
+        "Schema:\n"
         "  entities: array of objects, each with:\n"
         "    entity: short canonical display name for the entity\n"
         "    canonical_type: the noun phrase the source uses as the "
@@ -130,7 +133,7 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "not in the source. Never use the translation, book memory, or "
         "outside knowledge.\n"
         "2. Anchor facts: the canonical_type must be explicitly named in "
-        "the anchor PID.\n"
+        "the quoted anchor span.\n"
         "3. Alias facts: each alias surface must appear verbatim in its own "
         "PID.\n"
         "4. Gender facts: state gender only where the source shows it "
@@ -249,9 +252,13 @@ class ChapterEntityContext:
             raise ValueError(
                 f"Foreign identity: entity-context schema={payload.get('schema')!r}"
             )
-        entities = tuple(
-            _entity_from_payload(item) for item in payload.get("entities", [])
-        )
+        entities_raw = payload.get("entities")
+        if not isinstance(entities_raw, list):
+            raise ValueError(
+                "entity-context payload must contain a top-level 'entities' "
+                f"array, got {type(entities_raw).__name__}"
+            )
+        entities = tuple(_entity_from_payload(item) for item in entities_raw)
         return cls(
             schema=payload["schema"],
             extractor_version=str(payload["extractor_version"]),
@@ -359,6 +366,30 @@ def parse_model_output(raw: str) -> Dict[str, Any]:
     return payload
 
 
+def with_entity_context_metadata(
+    payload: Mapping[str, Any],
+    *,
+    chapter_id: str,
+    source_hash: str,
+    extractor_version: str = EXTRACTOR_VERSION,
+) -> Dict[str, Any]:
+    """Deterministically stamp the top-level identity onto a model body.
+
+    The model returns ONLY ``entities`` (see ``ENTITY_EXTRACTION_V1``);
+    the top-level ``schema``/``extractor_version``/``chapter_id``/
+    ``source_hash`` are provenance the harness owns — they are stamped
+    here from the caller's real ``SourceArtifact``, never taken from the
+    model (a model-supplied value would be a provenance substitution).
+    Any model-supplied top-level keys are overwritten by the real values.
+    """
+    stamped = dict(payload)
+    stamped["schema"] = ENTITY_CONTEXT_SCHEMA
+    stamped["extractor_version"] = extractor_version
+    stamped["chapter_id"] = chapter_id
+    stamped["source_hash"] = source_hash
+    return stamped
+
+
 # ---------------------------------------------------------------------------
 # 8-point code validation (§8.3)
 # ---------------------------------------------------------------------------
@@ -367,6 +398,21 @@ def parse_model_output(raw: str) -> Dict[str, Any]:
 def _require(cond: bool, message: str) -> None:
     if not cond:
         raise ValueError(message)
+
+
+def _ref_status(value: Any, *, what: str, default: str = STATUS_VERIFIED) -> str:
+    """Model-supplied ref status: legal values only, fail-closed.
+
+    Anchor/alias status is CODE-derived (verified after the §8.3 checks
+    pass); the model is not asked for it at all. A supplied value must
+    still be one of the legal statuses — anything else is rejected, never
+    stored verbatim.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, str) or value not in STATUSES:
+        raise ValueError(f"{what} status must be one of {STATUSES}, got {value!r}")
+    return value
 
 
 def _entity_from_payload(item: Any) -> EntityRecord:
@@ -378,7 +424,7 @@ def _entity_from_payload(item: Any) -> EntityRecord:
     aliases = tuple(
         AliasRef(
             surface=str(a["surface"]), pid=str(a["pid"]), span=str(a["span"]),
-            status=str(a.get("status", STATUS_VERIFIED)),
+            status=_ref_status(a.get("status"), what="alias"),
         )
         for a in item.get("aliases", [])
     )
@@ -386,7 +432,9 @@ def _entity_from_payload(item: Any) -> EntityRecord:
         EntityClaim(
             kind=str(c["kind"]),
             value=str(c.get("value", "")),
-            status=str(c.get("status", STATUS_CANDIDATE)),
+            status=_ref_status(
+                c.get("status"), what="claim", default=STATUS_CANDIDATE,
+            ),
             evidence=tuple(
                 EvidenceRef(pid=str(e["pid"]), span=str(e["span"]))
                 for e in c.get("evidence", [])
@@ -402,7 +450,7 @@ def _entity_from_payload(item: Any) -> EntityRecord:
         canonical_type=str(item["canonical_type"]),
         anchor=AnchorRef(
             pid=str(anchor["pid"]), span=str(anchor["span"]),
-            status=str(anchor.get("status", STATUS_VERIFIED)),
+            status=_ref_status(anchor.get("status"), what="anchor"),
         ),
         aliases=aliases,
         claims=claims,
@@ -549,9 +597,15 @@ def validate_entity_context(
     ))
 
     source_map = dict(source)
+    entities_raw = payload.get("entities")
+    if not isinstance(entities_raw, list):
+        raise ValueError(
+            "entity-context payload must contain a top-level 'entities' "
+            f"array, got {type(entities_raw).__name__}"
+        )
     entries: List[ValidationEntry] = []
     records: List[EntityRecord] = []
-    for item in payload.get("entities", []):
+    for item in entities_raw:
         record = _entity_from_payload(item)
         label = f"entity {record.entity!r}"
 
@@ -581,14 +635,17 @@ def validate_entity_context(
                 reason=f"translation-derived anchor span {record.anchor.span!r}",
             ))
             continue
-        # Point 5: canonical type explicitly in anchor evidence.
-        if record.canonical_type.lower() not in anchor_text.lower():
+        # Point 5: canonical type explicitly in the quoted anchor span
+        # (normalized), not merely somewhere in the whole anchor PID.
+        anchor_span_norm = " ".join(record.anchor.span.lower().split())
+        canonical_norm = " ".join(record.canonical_type.lower().split())
+        if canonical_norm not in anchor_span_norm:
             entries.append(ValidationEntry(
                 entity=record.entity, claim="canonical_type",
                 action="dropped",
                 reason=(
                     f"canonical type {record.canonical_type!r} not in anchor "
-                    f"evidence {record.anchor.pid}"
+                    f"span {record.anchor.span!r}"
                 ),
             ))
             continue
@@ -643,9 +700,23 @@ def validate_entity_context(
             if accepted is not None:
                 kept_claims.append(accepted)
 
+        # F3: anchor/alias status is CODE-derived. The model is not asked for
+        # a status at all; a span that passed every §8.3 code check IS verified.
+        # Any model-supplied status is overridden here (never stored verbatim).
+        verified_anchor = AnchorRef(
+            pid=record.anchor.pid, span=record.anchor.span,
+            status=STATUS_VERIFIED,
+        )
         records.append(EntityRecord(
             entity=record.entity, canonical_type=record.canonical_type,
-            anchor=record.anchor, aliases=tuple(kept_aliases),
+            anchor=verified_anchor,
+            aliases=tuple(
+                AliasRef(
+                    surface=a.surface, pid=a.pid, span=a.span,
+                    status=STATUS_VERIFIED,
+                )
+                for a in kept_aliases
+            ),
             claims=tuple(kept_claims),
         ))
 
@@ -680,6 +751,13 @@ class EntityContextCache:
     persistence across restarts is the caller's job via
     ``to_payload``/``from_payload``. A cache hit returns the validated
     context without another model call.
+
+    Fail-closed provenance (RV t_7e9ab408 finding 2): every entry is
+    stored/restored ONLY under its own identity key
+    (``source_hash + extractor_version``). ``put`` and ``from_payload``
+    reject a key/context mismatch with ``ValueError`` — a foreign or
+    tampered context is never stored under the expected key, and a
+    tampered persistent payload is never silently accepted.
     """
 
     def __init__(self) -> None:
@@ -689,6 +767,16 @@ class EntityContextCache:
         return self._store.get(key)
 
     def put(self, key: str, context: ChapterEntityContext) -> None:
+        expected = entity_context_cache_key(
+            source_hash=context.source_hash,
+            extractor_version=context.extractor_version,
+        )
+        if key != expected:
+            raise ValueError(
+                f"refusing to store context under key {key!r}: identity is "
+                f"{expected!r} (source_hash/extractor_version mismatch — "
+                f"foreign/tampered context)"
+            )
         self._store[key] = context
 
     def to_payload(self) -> Dict[str, Any]:
@@ -709,7 +797,21 @@ class EntityContextCache:
             )
         cache = cls()
         for item in payload.get("entries", []):
-            cache.put(str(item["key"]), ChapterEntityContext.from_payload(item["context"]))
+            key = str(item["key"])
+            context = ChapterEntityContext.from_payload(item["context"])
+            # Fail-closed restore: the stored key must be the identity of
+            # the context itself — a tampered/foreign entry is rejected,
+            # never silently accepted.
+            expected = entity_context_cache_key(
+                source_hash=context.source_hash,
+                extractor_version=context.extractor_version,
+            )
+            if key != expected:
+                raise ValueError(
+                    f"cache payload entry key {key!r} does not match context "
+                    f"identity {expected!r} — tampered/foreign entry rejected"
+                )
+            cache.put(key, context)
         return cache
 
 
@@ -820,6 +922,14 @@ def extract_entity_context(
     is called ONCE per chapter when the cache misses; the validated result
     is stored under ``source_hash + extractor_version`` so resume never
     repeats the call.
+
+    Fail-closed (RV t_7e9ab408 findings 1+2): the model body is stamped
+    with the harness-owned top-level metadata (``schema``/
+    ``extractor_version``/``chapter_id``/``source_hash``) BEFORE validation
+    — the real model output can pass without the model fabricating
+    provenance. A cache hit is trusted only when the cached context's
+    ``chapter_id``/``source_hash``/``extractor_version`` match the current
+    ``SourceArtifact``; a foreign/tampered entry is ignored and recomputed.
     """
     source_map = dict(source_artifact.source)
     key = entity_context_cache_key(
@@ -829,17 +939,33 @@ def extract_entity_context(
     if cache is not None:
         cached = cache.get(key)
         if cached is not None:
-            LOG.info("entity_extractor: cache hit for %s", key[:12])
-            return EntityExtractionResult(
-                context=cached, validation=ValidationReport(), from_cache=True
+            if (
+                cached.schema == ENTITY_CONTEXT_SCHEMA
+                and cached.chapter_id == source_artifact.chapter_id
+                and cached.source_hash == source_artifact.source_hash
+                and cached.extractor_version == extractor_version
+            ):
+                LOG.info("entity_extractor: cache hit for %s", key[:12])
+                return EntityExtractionResult(
+                    context=cached, validation=ValidationReport(), from_cache=True
+                )
+            LOG.warning(
+                "entity_extractor: cache entry %s has foreign/tampered "
+                "metadata; recomputing", key[:12],
             )
 
     raw = extractor(
         chapter_id=source_artifact.chapter_id, source=source_map
     )
     payload = parse_model_output(raw)
-    context, report = validate_entity_context(
+    stamped = with_entity_context_metadata(
         payload,
+        chapter_id=source_artifact.chapter_id,
+        source_hash=source_artifact.source_hash,
+        extractor_version=extractor_version,
+    )
+    context, report = validate_entity_context(
+        stamped,
         chapter_id=source_artifact.chapter_id,
         source_hash=source_artifact.source_hash,
         source=source_map,
@@ -872,4 +998,5 @@ __all__ = [
     "parse_model_output",
     "render_entity_extraction_prompt",
     "validate_entity_context",
+    "with_entity_context_metadata",
 ]
