@@ -555,6 +555,86 @@ def test_explicit_string_reject_requires_issue_to_cite_source_string():
     assert result["p00203"].verdict == TIER_B
 
 
+# --- RV3 fixes (t_2829fb4c): fail-safe complete-set explicit strings ---------
+
+
+def test_mixed_unmatched_issue_quotes_stay_tier_b():
+    # HIGH finding 1: the issue cites TWO quoted strings, but only one
+    # ("STOP") exists in the current source. The cited set is not complete
+    # in the source ("GO" is unmatched), so even though "STOP" is preserved
+    # in the translation the claim is not fully provable -> TIER_B
+    # (previously REJECTED/explicit_string on the subset match).
+    issue = _issue(
+        "p00208", "changed_fact",
+        note='the sign texts "STOP" and "GO" changed',
+        excerpt='"STOP" and "GO"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00208": 'The sign read "STOP".'},
+        translation={"p00208": 'На табличке было написано "STOP".'},
+    )
+    assert result["p00208"].verdict == TIER_B
+    assert result["p00208"].filter_name == "semantic"
+
+
+def test_mixed_translated_issue_quotes_stay_tier_b():
+    # HIGH finding 1: the issue cites "STOP" and "GO", both exist in the
+    # source, but the translation preserves only "STOP" ("GO" is translated).
+    # The cited set is not preserved verbatim -> TIER_B (previously
+    # REJECTED on the preserved subset).
+    issue = _issue(
+        "p00209", "changed_fact",
+        note='the sign texts "STOP" and "GO" changed',
+        excerpt='"STOP" and "GO"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00209": 'The signs read "STOP" and "GO".'},
+        translation={"p00209": 'На табличках было написано "STOP" и «ГО».'},
+    )
+    assert result["p00209"].verdict == TIER_B
+    assert result["p00209"].filter_name == "semantic"
+
+
+def test_unrelated_source_quote_does_not_block_valid_rejection():
+    # HIGH finding 1 acceptance: the source may carry OTHER quoted strings
+    # the issue does not cite; a valid complete single-string rejection must
+    # still fire (the cited set is complete in source and preserved).
+    issue = _issue(
+        "p00210", "changed_fact",
+        note='the sign text "STOP" was supposedly changed',
+        excerpt='"STOP"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00210": 'The sign read "STOP"; the door said "EXIT".'},
+        translation={"p00210": 'На табличке было написано "STOP"; на двери — "EXIT".'},
+    )
+    assert result["p00210"].verdict == REJECTED
+    assert result["p00210"].filter_name == "explicit_string"
+
+
+def test_single_quoted_source_string_after_prose_apostrophe_rejected():
+    # MEDIUM finding 2: a prose apostrophe (character's) in the note must
+    # not be paired with the later single-quoted 'STOP'. The note cites
+    # 'STOP', the current source quotes 'STOP' and the translation preserves
+    # it -> REJECTED/explicit_string (previously TIER_B/semantic because the
+    # apostrophe swallowed the quote pair).
+    issue = _issue(
+        "p00211", "changed_fact",
+        note="character's name changed; source text 'STOP' was changed",
+        excerpt="'STOP'",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00211": "The sign read 'STOP'."},
+        translation={"p00211": "На табличке было написано 'STOP'."},
+    )
+    assert result["p00211"].verdict == REJECTED
+    assert result["p00211"].filter_name == "explicit_string"
+
+
 # --- RV2 fixes (t_e9815310): B1.2 evidence dict PIDs -------------------------
 
 

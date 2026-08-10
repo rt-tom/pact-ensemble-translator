@@ -431,7 +431,7 @@ def _note_has_numeric_hint(issue: Mapping[str, Any]) -> bool:
 
 _QUOTED_STRING_RES = (
     re.compile(r'"([^"\n]{1,120})"'),          # "..."
-    re.compile(r"'([^'\n]{1,120})'"),          # '...'
+    re.compile(r"(?<!\w)'([^'\n]{1,120})'(?!\w)"),  # '...' (prose apostrophes are not openers)
     re.compile(r"\u00ab([^\u00bb\n]{1,120})\u00bb"),  # «...»
 )
 
@@ -442,6 +442,10 @@ def _quoted_strings(text: str) -> frozenset:
     Only explicitly quoted spans count (double/single quotes or RU
     guillemets); the surrounding quote characters are stripped and the
     content is case-folded for the verbatim-preservation comparison.
+    A single-quote opener must not be preceded by a word character and a
+    single-quote closer must not be followed by one, so a prose
+    apostrophe (``character's``) is never mistaken for a quote pair
+    (RV t_2829fb4c fix).
     """
     result: set = set()
     for res in _QUOTED_STRING_RES:
@@ -597,26 +601,26 @@ def _filter_one(
     #    card scope item 3). Narrow deterministic contract: the issue must
     #    itself cite an explicitly quoted string (matched quote pairs in
     #    its note/excerpt — a prose apostrophe such as "character's" is NOT
-    #    a hint), that quoted content must provably match a string quoted
-    #    in the CURRENT source pair, and only then does verbatim
-    #    preservation in the translation refute a changed_fact/addition/
-    #    omission claim about that string (REJECTED). A quoted string that
-    #    is NOT preserved verbatim is a semantic edge (the translator may
-    #    legitimately translate or transliterate it) -> TIER_B, never
-    #    CONFIRMED. Without the provable match (unrelated quoted content,
-    #    prose apostrophes, unquoted names/objects) the issue fails safe to
-    #    TIER_B (§5.1 fail-safe).
+    #    a hint), and the COMPLETE non-empty set of quoted content it cites
+    #    must provably be present in the CURRENT source pair; only then
+    #    does verbatim preservation of that whole set in the translation
+    #    refute a changed_fact/addition/omission claim about those strings
+    #    (REJECTED). Any cited string that is unmatched in the source or
+    #    NOT preserved verbatim (translated/transliterated) is a semantic
+    #    edge -> TIER_B, never REJECTED and never CONFIRMED; a subset match
+    #    is not enough. Unrelated source-only quoted strings do not affect
+    #    the cited set. Without the provable complete match (unrelated
+    #    quoted content, prose apostrophes, unquoted names/objects) the
+    #    issue fails safe to TIER_B (§5.1 fail-safe).
     if category in _STRING_CATEGORIES:
         note_strings = _note_quoted_strings(issue)
-        src_strings = _quoted_strings(source_text)
-        if note_strings and src_strings:
-            matched = note_strings & src_strings
-            if matched and matched <= _quoted_strings(translation_text):
+        if note_strings:
+            if note_strings <= _quoted_strings(source_text) and note_strings <= _quoted_strings(translation_text):
                 return FilteredIssue(
                     issue,
                     REJECTED,
                     "explicit_string",
-                    "the quoted source string the finding cites is preserved verbatim in the translation",
+                    "every quoted source string the finding cites is preserved verbatim in the translation",
                 )
 
     # 6. Direct current-source gender fact (card scope item 3, acceptance:
