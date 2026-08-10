@@ -37,8 +37,14 @@ from pact_v4.audit.entity_extractor import (
     BackendEntityExtractor,
     BackendEntityExtractorConfig,
 )
+from pact_v4.audit.hard_filters import FilteredIssue
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import PromptBundle
+from pact_v4.repair.selective_repair import (
+    SelectiveRepairConfig,
+    SelectiveRepairEvaluator,
+    SelectiveRepairOutcome,
+)
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
 from pact_v4.runtime.backend_role_adapters import (
     BackendGemmaAuditEvaluator,
@@ -309,3 +315,88 @@ class LifecycleQwenEntityExtractor:
     def __call__(self, *, chapter_id: str, source: Mapping[str, str]) -> str:
         self._router.ensure_resident(QWEN_MODEL_KEY)
         return self._extractor(chapter_id=chapter_id, source=source)
+
+
+class LifecycleSelectiveRepairEvaluator:
+    """B2 selective repair over the router's generator + auditor.
+
+    Same single-resident contract as the other ``Lifecycle*`` wrappers: the
+    B2 repair evaluator (``pact_v4.repair.selective_repair``) is
+    transport-neutral, so this wrapper supplies the local ``llama-server``
+    transports and ensures the right model is resident per phase:
+
+    * ``repair`` phase (generator — Gemma local / DeepSeek remote,
+      Kocmi-safe: auditor ≠ repairer) via ``GEMMA_MODEL_KEY``;
+    * ``reaudit`` phase (single Qwen call over the changed PIDs + neighbour
+      window) via ``QWEN_MODEL_KEY``.
+
+    ``repair_model_name`` is the generator binding behind the router
+    (``model_bindings["generator"]``); ``reaudit_model_name`` is the Qwen
+    binding (falls back to ``repair_model_name`` when the same object serves
+    both, e.g. in tests). ``context_size=49152`` matches the Qwen server's
+    ``-c 49152``; the repair prompt carries the full chapter maps, so the
+    generator context follows the same server profile.
+    """
+
+    def __init__(
+        self,
+        router: ModelRouter,
+        *,
+        repair_model_name: str,
+        reaudit_model_name: Optional[str] = None,
+        config: Optional[SelectiveRepairConfig] = None,
+    ):
+        self._router = router
+        repair_api = ApiClientConfig(
+            chat_url=f"{router.base_url}/v1/chat/completions",
+            model=repair_model_name,
+            timeout_seconds=1800.0,
+            context_size=49152,
+            temperature=0.0,
+        )
+        repair_backend = LocalOpenAIBackend(
+            api=ApiClient(repair_api, name="b2_selective_repair")
+        )
+        reaudit_model = reaudit_model_name or repair_model_name
+        reaudit_api = ApiClientConfig(
+            chat_url=f"{router.base_url}/v1/chat/completions",
+            model=reaudit_model,
+            timeout_seconds=1800.0,
+            context_size=49152,
+            temperature=0.0,
+        )
+        reaudit_backend = LocalOpenAIBackend(
+            api=ApiClient(reaudit_api, name="b2_reaudit_scope")
+        )
+        self._evaluator = SelectiveRepairEvaluator(
+            repair_backend,
+            reaudit_backend=reaudit_backend,
+            config=config,
+        )
+
+    def __call__(
+        self,
+        *,
+        chapter_id: str,
+        source: Mapping[str, str],
+        translation: Mapping[str, str],
+        filtered: Sequence[FilteredIssue],
+        entity_context: str = "",
+        narrator_context: str = "",
+    ) -> SelectiveRepairOutcome:
+        """Selective repair with per-phase residency (generator -> auditor)."""
+        return self._evaluator(
+            chapter_id=chapter_id,
+            source=source,
+            translation=translation,
+            filtered=filtered,
+            entity_context=entity_context,
+            narrator_context=narrator_context,
+            on_phase=self._ensure_phase,
+        )
+
+    def _ensure_phase(self, phase: str) -> None:
+        if phase == "reaudit":
+            self._router.ensure_resident(QWEN_MODEL_KEY)
+        else:
+            self._router.ensure_resident(GEMMA_MODEL_KEY)
