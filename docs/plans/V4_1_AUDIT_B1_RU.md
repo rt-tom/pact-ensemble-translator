@@ -534,3 +534,35 @@ B3 ──→ owner-run валидация на новых главах
 ### 9.3. Test leakage (критично, убрать ДО прогонов)
 
 В audit_v4.ps1 пример `Blake's bike / vehicle = motorcycle, evidence p00007` (строки ~469/484) **зашит в промпт** — Qwen ссылалась на него в reasoning и после этого репортила p00097/p00098. Текущий результат доказывает только «применение подсказки», не «извлечение». **Пример в промпте заменить на нейтральный (не из Pact-главы 0001); контекст — только через `-EntityContext`.**
+
+## 16. Карточка AF — A-fix: reasoning-cap 32k в whole-chapter генерации (remote)
+
+> **Обнаружено 2026-08-10** (диагностика по run_007_remote_deepseek): 2 из 3 попыток генерации упёрлись в **reasoning=32 000, finish=length, output=0** (пустой вызов, retry спасал). Причину установили эмпирически.
+
+### 16.1. Диагноз (решающий тест replay)
+
+| Запрос | Дата | Тело (техническая часть) | reasoning | finish |
+|---|---|---|---|---|
+| Gate 0 no_bible (curl) | 08-08 | `model` + `parts` + `reasoningEffort` (**без system/tools**) | 84 933 | stop |
+| **replay (тот же файл тела, curl)** | **10-08** | `model` + `parts` + `reasoningEffort` (**без system/tools**) | **55 915** | stop ✅ |
+| run_007 попытка 1 | 10-08 | `model` + `parts` + **`system`** + **`tools`** + `reasoningEffort` | 32 000 | length |
+| run_007 попытка 2 | 10-08 | то же | 32 000 | length |
+| Прямой API (без serve, «думай долго») | 10-08 | OpenAI-формат, `reasoning_effort: high` | **41 272** | stop ✅ |
+
+**Выводы (факты, не предположения):**
+1. **Relay и модель лимита 32k НЕ имеют** (прямой API 41k+; models.dev: output 384k; replay 55.9k через тот же serve 1.4.7)
+2. **Лимит 32k создаёт наличие `system` + `tools` в теле запроса** через serve 1.4.7: при их присутствии serve применяет дефолтный бюджет вывода модели (~32k), reasoning считается внутри него; при «голом» теле (model+parts+reasoningEffort) — лимита нет
+3. `--reasoning 3` → `reasoningEffort: "high"` (подтверждено кодом, opencode_backend.py:770)
+
+### 16.2. Что чинить (A-fix, remote-путь)
+
+- `opencode_backend._build_message_body` (opencode_backend.py:744-779) добавляет `system` (pact-v4-neutral/v1: «Follow the user's instructions exactly...») и `tools` (все disabled) — из-за них serve ставит 32k-бюджет
+- **Варианты:** (а) не слать `system`/`tools` в генераторном запросе (нейтральный system не влияет на качество перевода; tools all-disabled и так безвредны — но их наличие включает cap); (б) проверить, принимает ли serve поле для явного бюджета >32k; (в) `--reasoning 2` (medium) — но Gate 0 medium = 74k reasoning > 32k, тоже упрётся
+- **Retry уже спасает** (run_007: попытка 3 — reasoning 153, полный перевод), но 2 пустых вызова на главу = ~$0.01 и +9 мин времени — для production неприемлемо
+- **Не менять:** промпт v4.1 (заморожен), reasoning-budget локального Gemma (server_args, §3.4)
+
+**Acceptance:** whole-chapter remote-прогон (--reasoning 3) даёт finish=stop с 1-й попытки в ≥2 из 3 прогонов; reasoning >32k возможен без обрыва; полный suite проходит
+
+**Non-goals:** изменение литературного промпта, локального Gemma-пути, аудит/repair
+
+**Когда:** до production-прогонов на новых главах (§12); не блокирует B-фазу (B-фаза — local Qwen)
