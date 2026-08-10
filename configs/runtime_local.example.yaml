@@ -30,12 +30,7 @@ server_args:
     #
     # V4.1 A2 RV fix: the local generator's reasoning budget travels via
     # --reasoning-budget in the server args, so the CLI value and this arg
-    # MUST agree. The CLI default path (no --runtime-config) DERIVES the
-    # budget from --reasoning: 2048 (§3.4, the supported A2 profile) for
-    # --reasoning>0 and 0 (B1 baseline) for the default --reasoning 0.
-    # A static profile pins one value: set 0 here for baseline runs, or 2048
-    # for A2 whole-chapter runs (validate_reasoning_backend fails closed on
-    # any mismatch between --reasoning and this arg).
+    # MUST agree. A2 whole-chapter profile (§3.4): 2048.
     - -ngl
     - "99"
     - -ncmoe
@@ -43,7 +38,7 @@ server_args:
     - --load-mode
     - mmap
     - --reasoning-budget
-    - "0"
+    - "2048"
     - -np
     - "1"
     - -c
