@@ -349,11 +349,16 @@ def _load_entity_cache(out_dir: Path) -> EntityContextCache:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         return EntityContextCache.from_payload(payload)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001
+        # F6 (B3 review): a structurally corrupt dependent cache (JSON
+        # list/object with missing keys, wrong entry shape, foreign schema)
+        # can raise KeyError/TypeError/AttributeError deep inside
+        # from_payload — NOT just OSError/ValueError. Any such failure is a
+        # cache MISS (fail-closed): discard and recompute, never abort B3.
         LOG.warning(
-            "B3: entity_context_cache.json unreadable/foreign (%s); "
+            "B3: entity_context_cache.json unreadable/foreign (%s: %s); "
             "starting a fresh cache",
-            exc,
+            type(exc).__name__, exc,
         )
         return EntityContextCache()
 
@@ -391,6 +396,7 @@ class B3AuditCache:
         harness_version: str,
         entity_context_hash: Optional[str],
         entity_context_enabled: bool,
+        expected_pids: Optional[Sequence[str]] = None,
     ) -> Optional["B3AuditCache"]:
         if not Path(path).exists():
             return None
@@ -430,6 +436,44 @@ class B3AuditCache:
                 payload.get("audit_complete"),
             )
             return None
+        # F4 (B3 review): the cached repaired map is validated before it can
+        # ever be reused/publicized. A structurally tampered cache (extra /
+        # missing / reordered PIDs, non-string values, or a repaired-map hash
+        # that does not bind to the stored map) is a MISS — the audit re-runs
+        # and the tampered map is never published. Old-schema caches (no
+        # ``translations_repaired_hash`` field) also miss.
+        repaired = payload.get("translations_repaired")
+        if not isinstance(repaired, dict):
+            LOG.warning(
+                "B3: audit cache translations_repaired is not an object; "
+                "re-running audit"
+            )
+            return None
+        if expected_pids is not None:
+            stored_pids = list(repaired.keys())
+            if stored_pids != list(expected_pids):
+                LOG.warning(
+                    "B3: audit cache translations_repaired PID set mismatch "
+                    "(stored=%r expected=%r); re-running audit",
+                    stored_pids, list(expected_pids),
+                )
+                return None
+        if any(not isinstance(value, str) for value in repaired.values()):
+            LOG.warning(
+                "B3: audit cache translations_repaired contains non-string "
+                "values; re-running audit"
+            )
+            return None
+        stored_hash = payload.get("translations_repaired_hash")
+        computed_hash = canonical_json_hash(dict(sorted(repaired.items())))
+        if not isinstance(stored_hash, str) or stored_hash != computed_hash:
+            LOG.warning(
+                "B3: audit cache translations_repaired hash mismatch "
+                "(stored=%r computed=%r) — old schema or tampered cache; "
+                "re-running audit",
+                stored_hash, computed_hash,
+            )
+            return None
         return cls(path, payload)
 
     def is_hit(self) -> bool:
@@ -465,9 +509,12 @@ class B3AuditCache:
         if not self._payload:
             return None
         value = self._payload.get("translations_repaired")
+        # F4: values are validated at load() (non-string values reject the
+        # cache), so no stringification is applied here — a tampered non-
+        # string value must never be silently coerced into publication.
         if not isinstance(value, dict):
             return None
-        return {str(k): str(v) for k, v in value.items()}
+        return dict(value)
 
     def save(
         self,
@@ -508,6 +555,13 @@ class B3AuditCache:
             ],
             "repair": repair.to_payload() if repair is not None else None,
             "translations_repaired": dict(translations_repaired),
+            # F4: canonical hash of the repaired map binds the map to this
+            # cache record. load() recomputes it and rejects a mismatch (old
+            # schema / tampered map), so a structurally tampered
+            # translations_repaired can never be replayed or publicized.
+            "translations_repaired_hash": canonical_json_hash(
+                dict(sorted(translations_repaired.items()))
+            ),
         }
         _atomic_write_json(self.path, payload)
         self._payload = payload
@@ -684,6 +738,9 @@ class B3AuditRepair:
             harness_version=cfg.harness_version,
             entity_context_hash=entity_hash,
             entity_context_enabled=cfg.entity_context_enabled,
+            # F4: exact PID set/order validation — a cache whose
+            # translations_repaired has missing/extra/reordered PIDs is a miss.
+            expected_pids=tuple(translation_map),
         )
         if cache is not None and cache.is_hit():
             repaired = cache.stored_translations_repaired()
@@ -692,6 +749,9 @@ class B3AuditRepair:
             repair_payload = cache.stored_repair()
             step6, step7, step8 = _reports_from_cache(
                 cache=cache, issue_count=len(issues),
+            )
+            cache_repair_complete = bool(
+                repair_payload and repair_payload.get("repair_complete") is True
             )
             LOG.info(
                 "B3: audit cache full hit for %s (0 model calls)", chapter_id
@@ -713,7 +773,11 @@ class B3AuditRepair:
             journal.emit(
                 "gate",
                 audit_complete=True,
-                released_as_audited=True,
+                # F1: a cached repair with repair_complete=False (failed
+                # batch / failed re-audit) is replayed as NOT released — the
+                # cache hit must never upgrade debt into an audited release.
+                released_as_audited=cache_repair_complete,
+                repair_complete=cache_repair_complete,
                 from_cache=True,
             )
             return B3AuditRepairResult(
@@ -746,6 +810,28 @@ class B3AuditRepair:
         narrator_context = build_narrator_context(
             book_memory, " ".join(source_map.values())
         )
+        def _journal_chunk_event(kind: str, fields: Dict[str, Any]) -> None:
+            # F7: journal causality — the started event is emitted BEFORE the
+            # model call (inside ChunkedAuditEvaluator._run_one_chunk) and the
+            # terminal done/failed after it, so a crash during a chunk leaves
+            # item-start evidence in the append-only journal instead of nothing.
+            if kind == "started":
+                journal.emit(
+                    "audit_chunk_started",
+                    chunk=fields.get("chunk"),
+                    total=fields.get("total"),
+                    sub=fields.get("sub") or "",
+                )
+            else:
+                journal.emit(
+                    "audit_chunk_done",
+                    chunk=fields.get("chunk"),
+                    total=fields.get("total"),
+                    status=fields.get("status"),
+                    issue_count=fields.get("issue_count", 0),
+                    error=fields.get("error"),
+                )
+
         evaluator = ChunkedAuditEvaluator(
             self._audit_backend,
             config=ChunkedAuditConfig(
@@ -756,6 +842,7 @@ class B3AuditRepair:
                 harness_version=cfg.harness_version,
                 prompt_version=cfg.prompt_version,
             ),
+            on_chunk_event=_journal_chunk_event,
         )
         outcome = evaluator(
             chapter_id=chapter_id,
@@ -765,18 +852,6 @@ class B3AuditRepair:
             out_dir=out_dir,
             out_base="b3_audit",
         )
-        for chunk in outcome.chunks:
-            journal.emit(
-                "audit_chunk_started",
-                chunk=chunk["chunk"],
-                total=outcome.chunk_count,
-            )
-            journal.emit(
-                "audit_chunk_done",
-                chunk=chunk["chunk"],
-                status=chunk["status"],
-                issue_count=chunk["issue_count"],
-            )
         journal.emit(
             "audit_complete",
             audit_complete=outcome.audit_complete,
@@ -962,7 +1037,11 @@ class B3AuditRepair:
             "from_cache": False,
         }
         step7 = {
-            "status": "complete" if repair_outcome is not None else "failed",
+            "status": (
+                "complete" if repair_complete else (
+                    "failed" if repair_outcome is None else "incomplete"
+                )
+            ),
             "repair_complete": repair_complete,
             "eligible_count": (
                 repair_outcome.eligible_count if repair_outcome is not None else 0
@@ -975,15 +1054,33 @@ class B3AuditRepair:
                 list(repair_outcome.debt_trace) if repair_outcome is not None else []
             ),
         }
-        step8 = {
-            "status": "complete",
-            "audit_complete": True,
-            "released_as_audited": True,
-        }
+        # F1 (B3 review): the terminal gate is honest about repair debt. The
+        # chapter is released as audited ONLY when the audit completed AND
+        # the repair completed (every batch GOOD and the post-repair re-audit
+        # succeeded). repair_complete=False (failed batch / failed re-audit /
+        # repair exception) degrades the release to accepted_degraded with
+        # released_as_audited=False — never a silent complete/PASS.
+        if repair_complete:
+            step8 = {
+                "status": "complete",
+                "audit_complete": True,
+                "released_as_audited": True,
+            }
+        else:
+            step8 = {
+                "status": "accepted_degraded",
+                "audit_complete": True,
+                "released_as_audited": False,
+                "repair_complete": False,
+                "reason": (
+                    "repair_failed" if repair_outcome is None else "repair_incomplete"
+                ),
+                "debt_trace": step7["debt_trace"],
+            }
         journal.emit(
             "gate",
             audit_complete=True,
-            released_as_audited=True,
+            released_as_audited=repair_complete,
             repair_complete=repair_complete,
         )
         self._emit_progress(
@@ -1042,19 +1139,39 @@ def _reports_from_cache(
         "from_cache": True,
     }
     step7 = {
-        "status": "complete",
+        "status": (
+            "complete"
+            if repair_complete
+            else ("incomplete" if repair_payload else "failed")
+        ),
         "repair_complete": repair_complete,
         "committed_pids": committed_pids,
         "passed_pids": passed_pids,
         "debt_trace": debt_trace,
         "from_cache": True,
     }
-    step8 = {
-        "status": "complete",
-        "audit_complete": True,
-        "released_as_audited": True,
-        "from_cache": True,
-    }
+    # F1: the cache replay honors the same terminal gate as a live run — a
+    # cached repair that did not complete is replayed as accepted_degraded /
+    # NOT released, never silently upgraded to complete/released_as_audited.
+    if repair_complete:
+        step8 = {
+            "status": "complete",
+            "audit_complete": True,
+            "released_as_audited": True,
+            "from_cache": True,
+        }
+    else:
+        step8 = {
+            "status": "accepted_degraded",
+            "audit_complete": True,
+            "released_as_audited": False,
+            "repair_complete": False,
+            "reason": (
+                "repair_failed" if repair_payload is None else "repair_incomplete"
+            ),
+            "debt_trace": debt_trace,
+            "from_cache": True,
+        }
     return step6, step7, step8
 
 

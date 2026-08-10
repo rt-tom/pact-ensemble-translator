@@ -68,6 +68,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from pact_v4.audit.chunked_audit import (
+    DEFAULT_REASONING_BUDGET,
+    HARNESS_VERSION,
+    PROMPT_VERSION,
+)
+from pact_v4.audit.entity_extractor import EXTRACTOR_VERSION
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
     DEFAULT_MAX_WORDS,
@@ -127,6 +133,13 @@ from pact_v4.phase4.repair import (
 from pact_v4.phase5.formatting import (
     FORMATTING_REPORT_SCHEMA,
     run_formatting_align,
+)
+from pact_v4.repair.selective_repair import (
+    DEFAULT_REAUDIT_FULL_THRESHOLD,
+    DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
+    MICROBATCH_TARGET,
+    MICROBATCH_TRIGGER,
+    REPAIR_FINDINGS_CAP,
 )
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
@@ -306,6 +319,22 @@ class StrictRunConfig:
     audit_max_input_tokens: int = 3600
     audit_max_tokens: int = 12000
     audit_overlap_tokens: int = 400
+    # V4.1 B3 (review fix F5): EVERY authoritative B3 repair-policy knob and
+    # prompt/extractor version participates in the config identity and is
+    # wired into B3AuditRepairConfig by _build_b3_audit_repair. Before this
+    # fix the identity carried only the audit budgets and the repair policy
+    # silently used module defaults — flipping a repair knob could then
+    # reuse a stale cached repaired map. Values mirror the module defaults
+    # (pact_v4.audit.chunked_audit / entity_extractor / repair.selective_repair).
+    audit_reasoning_budget: int = DEFAULT_REASONING_BUDGET
+    audit_repair_findings_cap: int = REPAIR_FINDINGS_CAP
+    audit_repair_microbatch_trigger: int = MICROBATCH_TRIGGER
+    audit_repair_microbatch_target: int = MICROBATCH_TARGET
+    audit_repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
+    audit_repair_reaudit_full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD
+    audit_prompt_version: str = PROMPT_VERSION
+    audit_harness_version: str = HARNESS_VERSION
+    audit_extractor_version: str = EXTRACTOR_VERSION
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -354,12 +383,24 @@ class StrictRunConfig:
                 # run's config identity — flipping run_audit /
                 # entity_context_enabled / audit budget invalidates
                 # cache/resume exactly like any other generation setting.
+                # F5: every repair-policy knob and prompt/extractor/harness
+                # version is included, so changing the repair policy can
+                # never silently reuse a stale cached repaired map.
                 "audit": {
                     "run": self.run_audit,
                     "entity_context_enabled": self.entity_context_enabled,
                     "max_input_tokens": self.audit_max_input_tokens,
                     "max_tokens": self.audit_max_tokens,
                     "overlap_tokens": self.audit_overlap_tokens,
+                    "reasoning_budget": self.audit_reasoning_budget,
+                    "repair_findings_cap": self.audit_repair_findings_cap,
+                    "repair_microbatch_trigger": self.audit_repair_microbatch_trigger,
+                    "repair_microbatch_target": self.audit_repair_microbatch_target,
+                    "repair_reaudit_neighbour_window": self.audit_repair_reaudit_neighbour_window,
+                    "repair_reaudit_full_threshold": self.audit_repair_reaudit_full_threshold,
+                    "prompt_version": self.audit_prompt_version,
+                    "harness_version": self.audit_harness_version,
+                    "extractor_version": self.audit_extractor_version,
                 },
             },
         )
@@ -4246,6 +4287,29 @@ def _run_whole_chapter_strict_impl(
     remote_calls = runtime_summary.get("remote_calls")
     backend_block = dict(runtime.backend_descriptor.public_record())
     backend_block["config_identity_hash"] = cfg.backend.identity_hash
+    artefacts: Dict[str, Any] = {
+        "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
+        "generation_outcomes": str(generation_path),
+        "selection_results": str(selection_path),
+        "translations_raw": str(raw_translations_path),
+        "translations_repaired": str(cfg.out_dir / "translations_repaired.json"),
+        "translation_diffs": str(cfg.out_dir / "translation_diffs.json"),
+        "translations": str(translations_path),
+        "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
+        "journal": str(journal_path),
+    }
+    # F8 (B3 review): the manifest advertises ONLY artifacts that were
+    # actually created. When the B3 stage is skipped or failed, the B3
+    # journal/cache/entity files do not exist — advertising their paths
+    # would claim provenance/state the run never produced.
+    for key, name in (
+        ("b3_audit_journal", "audit_journal.ndjson"),
+        ("b3_audit_cache", "audit_cache_b3.json"),
+        ("b3_entity_context_cache", "entity_context_cache.json"),
+    ):
+        candidate = cfg.out_dir / name
+        if candidate.exists():
+            artefacts[key] = str(candidate)
     record: Dict[str, Any] = {
         "schema": RECORD_SCHEMA,
         "run_label": cfg.run_label,
@@ -4279,13 +4343,25 @@ def _run_whole_chapter_strict_impl(
                 "max_attempts": WholeChapterRetryPolicy().max_attempts,
             },
             # V4.1 B3: the production audit/repair stage policy (the audit
-            # input budget is part of the config identity too).
+            # input budget is part of the config identity too). F5: the
+            # repair-policy knobs and prompt/extractor versions are recorded
+            # alongside the identity so the record reflects what the stage
+            # actually ran with.
             "audit": {
                 "run": cfg.run_audit,
                 "entity_context_enabled": cfg.entity_context_enabled,
                 "max_input_tokens": cfg.audit_max_input_tokens,
                 "max_tokens": cfg.audit_max_tokens,
                 "overlap_tokens": cfg.audit_overlap_tokens,
+                "reasoning_budget": cfg.audit_reasoning_budget,
+                "repair_findings_cap": cfg.audit_repair_findings_cap,
+                "repair_microbatch_trigger": cfg.audit_repair_microbatch_trigger,
+                "repair_microbatch_target": cfg.audit_repair_microbatch_target,
+                "repair_reaudit_neighbour_window": cfg.audit_repair_reaudit_neighbour_window,
+                "repair_reaudit_full_threshold": cfg.audit_repair_reaudit_full_threshold,
+                "prompt_version": cfg.audit_prompt_version,
+                "harness_version": cfg.audit_harness_version,
+                "extractor_version": cfg.audit_extractor_version,
             },
         },
         "resumed_from_index": resumed_from_index,
@@ -4307,22 +4383,7 @@ def _run_whole_chapter_strict_impl(
             "startup_count": 0, "restart_count": 0,
             "switches": [], "aggregates_by_model": {},
         },
-        "artefacts": {
-            "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
-            "generation_outcomes": str(generation_path),
-            "selection_results": str(selection_path),
-            "translations_raw": str(raw_translations_path),
-            "translations_repaired": str(cfg.out_dir / "translations_repaired.json"),
-            "translation_diffs": str(cfg.out_dir / "translation_diffs.json"),
-            "translations": str(translations_path),
-            "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
-            "journal": str(journal_path),
-            # V4.1 B3: audit/repair provenance + resume cache (present when
-            # the production audit stage ran).
-            "b3_audit_journal": str(cfg.out_dir / "audit_journal.ndjson"),
-            "b3_audit_cache": str(cfg.out_dir / "audit_cache_b3.json"),
-            "b3_entity_context_cache": str(cfg.out_dir / "entity_context_cache.json"),
-        },
+        "artefacts": artefacts,
     }
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 

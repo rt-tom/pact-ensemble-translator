@@ -65,7 +65,14 @@ LOG = logging.getLogger("v4_phase12_strict_run")
 LLAMA_ROOT = Path(r"C:\llama-cpp")
 GEMMA_PATH = LLAMA_ROOT / "models" / "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
 GEMMA_DRAFT_PATH = LLAMA_ROOT / "models" / "MTP" / "mtp-gemma-4-26B-A4B-it-Q8_0.gguf"
-QWEN_PATH = LLAMA_ROOT / "models" / "Qwen3.6-35B-A3B" / "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+# V4.1 B3 (review fix F3): the default local Qwen AUDIT model is the MTP
+# variant (C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\...) — the B3 contract
+# declares the Qwen audit as MTP draft, reasoning 8192, context 49k. The
+# historical non-MTP path ran the audit with --reasoning-budget 0 and no
+# draft spec, which the server profile and the config identity must agree
+# on. Effective transport is part of the backend identity (server_args in
+# effective_options), so this change invalidates old B3 caches.
+QWEN_PATH = LLAMA_ROOT / "models" / "Qwen3.6-35B-A3B-MTP" / "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 
 # V4.1 (2026-08-09): same validated SYCL profile as Measurement 2
 # (docs/plans/V4_SINGLE_RESIDENT_DRIVER_ARCHITECTURE_RU.md, "Результат
@@ -92,19 +99,28 @@ GEMMA_SERVER_ARGS = [
     "--cache-ram", "0",
     "--ctx-checkpoints", "0",
 ]
+# V4.1 B3 (review fix F3): the Qwen audit server args ARE the B3 profile —
+# MTP draft spec, --reasoning on, --reasoning-budget 8192, context 49152
+# (runtime_local.example.yaml qwen block, plan §3.4 / B1 49k contract).
+# Keeping a stale reasoning-budget 0 / 32k profile here would silently run
+# the audit server differently than the B3 config identity declares.
 QWEN_SERVER_ARGS = [
+    "--spec-type", "draft-mtp",
+    "--spec-draft-n-max", "3",
+    "--device", "SYCL0",
     "-fit", "on",
     "-fitt", "1280",
     "-b", "2048",
     "-ub", "512",
     "-ctk", "q8_0",
-    "-ctv", "q8_0",
+    "-ctv", "q4_0",
     "-t", "6",
     "-tb", "12",
     "--load-mode", "mmap",
-    "--reasoning-budget", "0",
+    "--reasoning", "on",
+    "--reasoning-budget", "8192",
     "-np", "1",
-    "-c", str(CONTEXT_SIZE),
+    "-c", "49152",
     "-fa", "on",
     "--jinja",
     "--cache-ram", "0",
@@ -362,6 +378,36 @@ def _log_result(result: Any) -> None:
     )
 
 
+def _cli_exit_code(result: Any) -> int:
+    """CLI exit semantics (F2, B3 review): a run is a FAILURE when the
+    chapter was not released as audited.
+
+    * 0 — success: generation-only / intentional ``--skip-audit`` /
+      ``--stop-after-generation`` runs, or a chapter that completed and was
+      released as audited.
+    * 2 — halted early (existing lifecycle contract).
+    * 3 — B3 fail-closed (audit incomplete) or B3 failed (exception):
+      the runner recorded step6/7/8 failed / fail_closed_audit_incomplete
+      and the chapter was NOT released as audited. Before this fix the CLI
+      returned 0 for these, silently reporting success on a failed audit.
+
+    ``--skip-audit`` / generation-only stays 0 because the audit stage is
+    intentionally off — the steps are recorded as ``skipped``, never
+    fabricated as complete.
+    """
+    if result.halted_early:
+        return 2
+    step8 = result.step8 or {}
+    status = step8.get("status")
+    if status in ("failed", "fail_closed_audit_incomplete"):
+        return 3
+    if step8.get("released_as_audited") is False:
+        # F1: a repair-debt terminal (accepted_degraded) is not an audited
+        # release — the run did not achieve its publication gate.
+        return 3
+    return 0
+
+
 def _env_flag(name: str, *, default: bool) -> bool:
     """Parse a boolean env-var override (e.g. ``PACT_EFFICIENCY_LAZY_BALANCED``).
 
@@ -447,6 +493,19 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             max_input_tokens=cfg.audit_max_input_tokens,
             max_tokens=cfg.audit_max_tokens,
             overlap_tokens=cfg.audit_overlap_tokens,
+            # F5 (B3 review): every repair-policy knob and prompt/extractor/
+            # harness version is WIRED from the run config (not silently left
+            # at module defaults), and it is part of the config identity — a
+            # policy change invalidates the cached repaired map.
+            reasoning_budget=cfg.audit_reasoning_budget,
+            repair_findings_cap=cfg.audit_repair_findings_cap,
+            repair_microbatch_trigger=cfg.audit_repair_microbatch_trigger,
+            repair_microbatch_target=cfg.audit_repair_microbatch_target,
+            repair_reaudit_neighbour_window=cfg.audit_repair_reaudit_neighbour_window,
+            repair_reaudit_full_threshold=cfg.audit_repair_reaudit_full_threshold,
+            prompt_version=cfg.audit_prompt_version,
+            harness_version=cfg.audit_harness_version,
+            extractor_version=cfg.audit_extractor_version,
         ),
     )
 
@@ -469,6 +528,66 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
 
     memory = ChapterMemory.from_directory(memory_dir)
     return render_bible_section(chapter_id, memory.chapter_index, memory.book_memory)
+
+
+def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
+    """Fail loudly when a local profile cannot serve the B3 Qwen audit.
+
+    F3 (B3 review): the B3 contract declares the Qwen audit server as MTP
+    draft, reasoning 8192, context 49k. The historical default local
+    profile launched the audit with ``--reasoning-budget 0`` and no MTP
+    spec — the actual server then disagreed with the B3 config identity.
+    The default local path now carries the B3 profile (QWEN_PATH /
+    QWEN_SERVER_ARGS); this validation fails closed when a runtime-config
+    profile that WILL run the B3 audit (whole-chapter + run_audit) cannot
+    express the B3 profile. Remote/composite profiles are the provider's
+    transport (contract, not testable here) — left to the remote audit
+    contract.
+    """
+    if not (args.whole_chapter and not args.skip_audit):
+        return
+    if args.stop_after_generation:
+        return
+    from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig
+
+    if not isinstance(backend, LocalLlamaBackendConfig):
+        # Remote/composite audit transport is provider-side; the remote
+        # audit is a CONTRACT not tested yet (owner decision).
+        return
+    qwen_args = list((backend.server_args or {}).get("qwen") or [])
+
+    def _arg_value(flag: str) -> Optional[str]:
+        for index, arg in enumerate(qwen_args):
+            if arg == flag and index + 1 < len(qwen_args):
+                return qwen_args[index + 1]
+        return None
+
+    spec_type = _arg_value("--spec-type")
+    reasoning_budget = _arg_value("--reasoning-budget")
+    context = _arg_value("-c") or _arg_value("--ctx-size")
+    problems: list = []
+    if spec_type != "draft-mtp":
+        problems.append("--spec-type draft-mtp (MTP draft)")
+    try:
+        budget_ok = reasoning_budget is not None and int(reasoning_budget) >= 8192
+    except ValueError:
+        budget_ok = False
+    if not budget_ok:
+        problems.append("--reasoning-budget >= 8192")
+    try:
+        context_ok = context is not None and int(context) >= 49152
+    except ValueError:
+        context_ok = False
+    if not context_ok:
+        problems.append("context -c >= 49152")
+    if problems:
+        raise ValueError(
+            "B3 audit requires a Qwen server profile that is B3-capable "
+            "(missing: " + "; ".join(problems) + "). The Qwen audit server "
+            "args and the B3 config identity must agree — add the B3 profile "
+            "to the runtime config's qwen server_args "
+            "(see configs/runtime_local.example.yaml), or pass --skip-audit."
+        )
 
 
 def run_local_default(args: argparse.Namespace) -> int:
@@ -500,6 +619,10 @@ def run_local_default(args: argparse.Namespace) -> int:
     # budget is transported via the server args (--reasoning-budget 2048),
     # not request_options (validate_reasoning_backend accepts local now).
     validate_reasoning_backend(args.reasoning, backend)
+    # F3 (B3 review): when the B3 audit will run, the local Qwen profile
+    # must be B3-capable (MTP draft, reasoning 8192, context 49k) or the
+    # run fails loudly — never silently audits with a non-B3 server.
+    _validate_b3_qwen_profile(args, backend)
     cfg = _build_run_config(args, backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
@@ -532,7 +655,7 @@ def run_local_default(args: argparse.Namespace) -> int:
     )
     progress.close()
     _log_result(result)
-    return 0 if not result.halted_early else 2
+    return _cli_exit_code(result)
 
 
 def run_with_runtime_config(args: argparse.Namespace) -> int:
@@ -544,6 +667,10 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # is transported via server args (--reasoning-budget), not
     # request_options; validate_reasoning_backend accepts local now.
     validate_reasoning_backend(args.reasoning, backend)
+    # F3 (B3 review): a local runtime profile that will run the B3 audit
+    # must be B3-capable (MTP draft, reasoning 8192, context 49k) — fail
+    # loudly instead of silently auditing with a non-B3 server profile.
+    _validate_b3_qwen_profile(args, backend)
     _warn_remote_acknowledgement(backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
@@ -578,7 +705,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     )
     progress.close()
     _log_result(result)
-    return 0 if not result.halted_early else 2
+    return _cli_exit_code(result)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

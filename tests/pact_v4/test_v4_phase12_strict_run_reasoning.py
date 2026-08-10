@@ -236,3 +236,172 @@ def test_run_local_default_whole_chapter_wires_single_retry_owner(
     with pytest.raises(RuntimeError, match="captured"):
         cli.run_local_default(args_chunked)
     assert captured["json_retry_policy"] is None
+
+
+# ---------------------------------------------------------------------------
+# F2 (B3 review): CLI exit semantics — B3 fail-closed/failed must exit
+# non-zero; intentional --skip-audit / generation-only stays successful.
+# ---------------------------------------------------------------------------
+
+
+def _fake_result(*, step8: dict, halted_early: bool = False) -> Any:
+    class _R:
+        pass
+
+    r = _R()
+    r.halted_early = halted_early
+    r.step8 = step8
+    return r
+
+
+def test_cli_exit_code_zero_on_success_and_skip():
+    # complete/released -> 0
+    assert cli._cli_exit_code(_fake_result(step8={
+        "status": "complete", "released_as_audited": True,
+    })) == 0
+    # intentional --skip-audit / generation-only -> 0
+    assert cli._cli_exit_code(_fake_result(step8={
+        "status": "skipped", "reason": "whole_chapter_generation_only",
+    })) == 0
+    assert cli._cli_exit_code(_fake_result(step8={
+        "status": "skipped_stop_after_generation",
+    })) == 0
+
+
+def test_cli_exit_code_nonzero_on_b3_fail_closed_and_failed():
+    # B3 fail-closed (audit incomplete) -> 3
+    assert cli._cli_exit_code(_fake_result(step8={
+        "status": "fail_closed_audit_incomplete",
+        "released_as_audited": False,
+    })) == 3
+    # B3 exception (runner records step6/7/8 failed) -> 3
+    assert cli._cli_exit_code(_fake_result(step8={
+        "status": "failed", "error": "boom",
+    })) == 3
+    # F1 repair debt (accepted_degraded, released_as_audited=False) -> 3
+    assert cli._cli_exit_code(_fake_result(step8={
+        "status": "accepted_degraded", "released_as_audited": False,
+    })) == 3
+
+
+def test_cli_exit_code_halted_early_stays_2():
+    assert cli._cli_exit_code(_fake_result(
+        step8={"status": "complete", "released_as_audited": True},
+        halted_early=True,
+    )) == 2
+
+
+# ---------------------------------------------------------------------------
+# F3 (B3 review): the default local Qwen audit transport is B3-capable (MTP
+# draft, reasoning 8192, context 49k) and a non-B3 local profile fails loudly
+# when the B3 audit would run.
+# ---------------------------------------------------------------------------
+
+
+def test_default_local_qwen_profile_is_b3_capable():
+    # QWEN_PATH points at the MTP model variant.
+    assert "Qwen3.6-35B-A3B-MTP" in str(cli.QWEN_PATH)
+    # Server args express the B3 audit contract: MTP draft, reasoning on,
+    # reasoning-budget 8192, context 49152.
+    args = cli.QWEN_SERVER_ARGS
+    assert args[args.index("--spec-type") + 1] == "draft-mtp"
+    assert args[args.index("--reasoning-budget") + 1] == "8192"
+    assert args[args.index("-c") + 1] == "49152"
+    assert "--reasoning" in args
+
+
+def test_default_local_backend_passes_b3_profile_validation(tmp_path: Path):
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": cli.QWEN_PATH},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": cli.QWEN_PATH.name},
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": cli.QWEN_SERVER_ARGS,
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+    # The B3-capable default profile passes validation (no exception).
+    cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_non_b3_local_profile_fails_loudly(tmp_path: Path):
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": cli.QWEN_PATH},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": cli.QWEN_PATH.name},
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            # historical non-B3 Qwen profile: reasoning-budget 0, no MTP, 32k
+            "qwen": [
+                "--load-mode", "mmap",
+                "--reasoning-budget", "0",
+                "-c", "32768",
+            ],
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+    with pytest.raises(ValueError, match="B3-capable"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_non_b3_local_profile_ok_when_skip_audit(tmp_path: Path):
+    # --skip-audit turns the B3 stage off -> the non-B3 profile is fine.
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter", "--skip-audit"]
+    )
+    backend = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": cli.QWEN_PATH},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": cli.QWEN_PATH.name},
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": [
+                "--load-mode", "mmap",
+                "--reasoning-budget", "0",
+                "-c", "32768",
+            ],
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+    cli._validate_b3_qwen_profile(args, backend)  # no exception
+
+
+def test_default_local_qwen_transport_in_backend_identity(tmp_path: Path):
+    # The effective transport (server_args) is part of the backend identity
+    # hash — changing the Qwen profile invalidates old B3 caches/resume.
+    base = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host="127.0.0.1",
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": cli.QWEN_PATH},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": cli.QWEN_PATH.name},
+        server_args={"gemma": cli.GEMMA_SERVER_ARGS, "qwen": cli.QWEN_SERVER_ARGS},
+        port=8094, startup_timeout=240.0, unload_timeout=30.0,
+    )
+    other = cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host="127.0.0.1",
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": cli.QWEN_PATH},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": cli.QWEN_PATH.name},
+        server_args={
+            "gemma": cli.GEMMA_SERVER_ARGS,
+            "qwen": list(cli.QWEN_SERVER_ARGS[:-2]) + ["--reasoning-budget", "0", "-c", "32768"],
+        },
+        port=8094, startup_timeout=240.0, unload_timeout=30.0,
+    )
+    assert base.identity_hash != other.identity_hash
+    record = base.build_descriptor().public_record()
+    qwen_args = record["effective_options"]["server_args"]["qwen"]
+    assert qwen_args[qwen_args.index("--reasoning-budget") + 1] == "8192"

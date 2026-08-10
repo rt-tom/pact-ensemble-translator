@@ -506,12 +506,25 @@ def test_b3_stop_after_generation_skips_audit(tmp_path: Path) -> None:
 def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
     base = _whole_chapter_cfg(tmp_path)
     a = base.to_config_artifact(model_profile="test")
+    # F5: the audit identity block carries EVERY authoritative B3 knob —
+    # repair policy, prompt/harness/extractor versions — so changing any of
+    # them invalidates cache/resume (a stale cached repaired map can never
+    # be reused under a different repair policy).
     assert a.values["audit"] == {
         "run": True,
         "entity_context_enabled": True,
         "max_input_tokens": 3600,
         "max_tokens": 12000,
         "overlap_tokens": 400,
+        "reasoning_budget": 8192,
+        "repair_findings_cap": 10,
+        "repair_microbatch_trigger": 4,
+        "repair_microbatch_target": 4,
+        "repair_reaudit_neighbour_window": 2,
+        "repair_reaudit_full_threshold": 8,
+        "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
+        "harness_version": "4.1",
+        "extractor_version": "pact-v4-entity-extractor/v1",
     }
     on = _whole_chapter_cfg(tmp_path)
     off = _whole_chapter_cfg(tmp_path, run_audit=False)
@@ -526,6 +539,29 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
     assert ids["off"] != ids["on"]
     assert ids["no_entity"] != ids["on"]
     assert ids["budget"] != ids["on"]
+
+
+def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
+    # F5 mutation test: every repair-policy knob and prompt/extractor
+    # version participates in the config identity — a policy change can
+    # never silently reuse a stale cached repaired map.
+    base = _whole_chapter_cfg(tmp_path)
+    base_id = base.to_config_artifact(model_profile="test").config_identity
+    mutations = {
+        "repair_findings_cap": dict(audit_repair_findings_cap=7),
+        "microbatch_trigger": dict(audit_repair_microbatch_trigger=6),
+        "microbatch_target": dict(audit_repair_microbatch_target=2),
+        "reaudit_neighbour_window": dict(audit_repair_reaudit_neighbour_window=4),
+        "reaudit_full_threshold": dict(audit_repair_reaudit_full_threshold=12),
+        "reasoning_budget": dict(audit_reasoning_budget=4096),
+        "prompt_version": dict(audit_prompt_version="pact-v4-reviewer-qwen-audit/v9.9"),
+        "harness_version": dict(audit_harness_version="9.9"),
+        "extractor_version": dict(audit_extractor_version="pact-v4-entity-extractor/v9.9"),
+    }
+    for label, overrides in mutations.items():
+        mutated = _whole_chapter_cfg(tmp_path, **overrides)
+        mutated_id = mutated.to_config_artifact(model_profile="test").config_identity
+        assert mutated_id != base_id, f"{label} mutation did not change identity"
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +606,430 @@ def test_b3_cli_flags_parse(tmp_path: Path) -> None:
     # --run-audit and --skip-audit are mutually exclusive at parse time.
     with pytest.raises(SystemExit):
         build_argparser().parse_args(base_args + ["--run-audit", "--skip-audit"])
+
+
+# ---------------------------------------------------------------------------
+# F1 (B3 review): publication gate — repair_complete=False / failed re-audit
+# must NEVER produce step8 complete/released_as_audited=True, including a
+# cache replay of a failed repair.
+# ---------------------------------------------------------------------------
+
+
+def test_b3_repair_failed_never_released(tmp_path: Path) -> None:
+    # Audit finds a real issue, but the repair response is empty/invalid ->
+    # batch FAILED -> repair_complete=False. The chapter must NOT be
+    # released as audited (debt explicit, not PASS).
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        repair_results=[],  # empty repair response -> batch FAILED (missing answers)
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+
+    assert result.step6["audit_complete"] is True
+    assert result.step7["repair_complete"] is False
+    assert result.step7["status"] == "incomplete"
+    assert result.step8["status"] == "accepted_degraded"
+    assert result.step8["released_as_audited"] is False
+    assert result.step8["repair_complete"] is False
+    # Debt is explicit and NOT a PASS: no repair was committed.
+    assert result.step7["committed_pids"] == []
+
+    # Journal gate agrees: not released.
+    journal = [
+        json.loads(line)
+        for line in (cfg.out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    gate = next(e for e in journal if e["event"] == "gate")
+    assert gate["released_as_audited"] is False
+    assert gate["repair_complete"] is False
+
+    # The repaired map stays the raw translation (no commit), but the
+    # terminal state is honest.
+    repaired = _read_json(cfg.out_dir / "translations_repaired.json")
+    assert repaired["translations"]["p00001"] == "Перевод номер1 номер1"
+
+
+def test_b3_reaudit_failed_never_released(tmp_path: Path) -> None:
+    # Repair commits, but the post-repair re-audit FAILS (transport) ->
+    # repair_complete=False (selective_repair fail-closed). The chapter
+    # must NOT be released as audited.
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _ReauditFailingBackend(_B3MockBackend):
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            if "reaudit" in (request.label or ""):
+                raise CompletionError("simulated re-audit transport failure")
+            return super().complete(request)
+
+    backend = _ReauditFailingBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        repair_results=[{
+            "index": 1, "decision": "repair", "pid": "p00001",
+            "repaired_translation": "Перевод номер1",
+            "reason": "убрал дубль",
+        }],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+
+    assert result.step6["audit_complete"] is True
+    assert result.step7["repair_complete"] is False
+    assert result.step8["status"] == "accepted_degraded"
+    assert result.step8["released_as_audited"] is False
+    assert "failed re-audit" in result.step8["debt_trace"] or any(
+        "re-audit" in d for d in result.step8["debt_trace"]
+    )
+
+
+def test_b3_cache_replay_of_failed_repair_not_released(tmp_path: Path) -> None:
+    # F1 cache replay: a cache written with repair_complete=False must be
+    # replayed as NOT released — the cache hit must never upgrade debt into
+    # an audited release.
+    cfg = _whole_chapter_cfg(tmp_path)
+    first = _B3MockBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        repair_results=[],  # empty -> repair fails
+        reaudit_issues=[],
+    )
+    first_result = _run_with_b3(cfg, first)
+    assert first_result.step8["released_as_audited"] is False
+
+    # Resume: full cache hit (identity matches), but the cached repair is
+    # incomplete -> replayed as accepted_degraded / NOT released.
+    second = _B3MockBackend(
+        audit_issues=[],
+        repair_results=[],
+        reaudit_issues=[],
+    )
+    second_result = _run_with_b3(cfg, second)
+    assert second_result.step6["from_cache"] is True
+    assert second_backend_calls(second) == 0
+    assert second_result.step8["status"] == "accepted_degraded"
+    assert second_result.step8["released_as_audited"] is False
+    assert second_result.step8["from_cache"] is True
+
+    journal = [
+        json.loads(line)
+        for line in (cfg.out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    gates = [e for e in journal if e["event"] == "gate"]
+    assert gates[-1]["released_as_audited"] is False
+    assert gates[-1]["from_cache"] is True
+
+
+def second_backend_calls(backend: _B3MockBackend) -> int:
+    return backend.entity_calls() + backend.audit_calls() + backend.repair_calls() + backend.reaudit_calls()
+
+
+# ---------------------------------------------------------------------------
+# F4 (B3 review): cache integrity — tampered translations_repaired (extra /
+# missing / reordered PIDs, non-string values, hash mismatch) is a cache
+# MISS: the audit re-runs and the tampered map is never published.
+# ---------------------------------------------------------------------------
+
+
+def _tamper_cache(cfg: StrictRunConfig, *, mutate: Any) -> None:
+    path = cfg.out_dir / "audit_cache_b3.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_b4_cache_tamper_extra_pid_is_miss(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    def _factory() -> _B3MockBackend:
+        return _B3MockBackend(
+            audit_issues=[{
+                "id": "p00001", "category": "addition", "severity": "major",
+                "confidence": "high", "note": "дублирование слова",
+                "excerpt": "номер1 номер1",
+            }],
+            repair_results=[{
+                "index": 1, "decision": "repair", "pid": "p00001",
+                "repaired_translation": "Перевод номер1",
+                "reason": "убрал дубль",
+            }],
+            reaudit_issues=[],
+        )
+
+    _run_with_b3(cfg, _factory())
+    # Tamper: extra foreign PID + TAMPERED value on p00001, identity intact.
+    def _tamper(payload: dict) -> None:
+        repaired = dict(payload["translations_repaired"])
+        repaired["foreign_PID_999"] = "TAMPERED"
+        repaired["p00001"] = "TAMPERED"
+        payload["translations_repaired"] = repaired
+
+    _tamper_cache(cfg, mutate=_tamper)
+
+    resume = _B3MockBackend(
+        audit_issues=[],
+        repair_results=[],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, resume)
+    # Tampered cache rejected -> full re-run (0 from_cache), audit re-ran.
+    assert result.step6["from_cache"] is False
+    assert resume.audit_calls() == 1
+    # The tampered map was NOT published.
+    final = _read_json(result.translations_path)
+    assert "foreign_PID_999" not in final
+    assert final["p00001"] != "TAMPERED"
+
+
+def test_b4_cache_tamper_missing_pid_is_miss(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    def _factory() -> _B3MockBackend:
+        return _B3MockBackend(audit_issues=[], reaudit_issues=[])
+
+    _run_with_b3(cfg, _factory())
+
+    def _tamper(payload: dict) -> None:
+        repaired = dict(payload["translations_repaired"])
+        repaired.pop("p00001", None)
+        payload["translations_repaired"] = repaired
+
+    _tamper_cache(cfg, mutate=_tamper)
+    resume = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, resume)
+    assert result.step6["from_cache"] is False
+    assert resume.audit_calls() == 1
+
+
+def test_b4_cache_tamper_reordered_pids_is_miss(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    def _factory() -> _B3MockBackend:
+        return _B3MockBackend(audit_issues=[], reaudit_issues=[])
+
+    _run_with_b3(cfg, _factory())
+
+    def _tamper(payload: dict) -> None:
+        repaired = dict(payload["translations_repaired"])
+        keys = list(repaired)
+        keys.reverse()
+        payload["translations_repaired"] = {k: repaired[k] for k in keys}
+
+    _tamper_cache(cfg, mutate=_tamper)
+    resume = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, resume)
+    assert result.step6["from_cache"] is False
+    assert resume.audit_calls() == 1
+
+
+def test_b4_cache_tamper_non_string_value_is_miss(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    def _factory() -> _B3MockBackend:
+        return _B3MockBackend(audit_issues=[], reaudit_issues=[])
+
+    _run_with_b3(cfg, _factory())
+
+    def _tamper(payload: dict) -> None:
+        repaired = dict(payload["translations_repaired"])
+        repaired["p00001"] = {"not": "a string"}
+        payload["translations_repaired"] = repaired
+
+    _tamper_cache(cfg, mutate=_tamper)
+    resume = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, resume)
+    assert result.step6["from_cache"] is False
+    assert resume.audit_calls() == 1
+
+
+def test_b4_cache_hash_mismatch_old_schema_is_miss(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    def _factory() -> _B3MockBackend:
+        return _B3MockBackend(audit_issues=[], reaudit_issues=[])
+
+    _run_with_b3(cfg, _factory())
+
+    def _tamper(payload: dict) -> None:
+        # Old schema: drop the canonical repaired-map hash -> must miss.
+        payload.pop("translations_repaired_hash", None)
+
+    _tamper_cache(cfg, mutate=_tamper)
+    resume = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, resume)
+    assert result.step6["from_cache"] is False
+    assert resume.audit_calls() == 1
+
+
+def test_b4_cache_hash_mismatch_tampered_value_is_miss(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    def _factory() -> _B3MockBackend:
+        return _B3MockBackend(audit_issues=[], reaudit_issues=[])
+
+    _run_with_b3(cfg, _factory())
+
+    def _tamper(payload: dict) -> None:
+        # Value tampered but hash NOT updated -> recomputed hash mismatch.
+        payload["translations_repaired"]["p00001"] = "TAMPERED"
+
+    _tamper_cache(cfg, mutate=_tamper)
+    resume = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, resume)
+    assert result.step6["from_cache"] is False
+    assert resume.audit_calls() == 1
+
+
+# ---------------------------------------------------------------------------
+# F6 (B3 review): a structurally corrupt entity cache is a MISS, never an
+# abort — B3 must recompute instead of raising inside EntityContextCache.
+# ---------------------------------------------------------------------------
+
+
+def test_b6_malformed_entity_cache_is_miss_not_abort(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    # JSON list (not an object) — AttributeError path in from_payload.
+    (cfg.out_dir / "entity_context_cache.json").write_text(
+        "[1, 2, 3]", encoding="utf-8"
+    )
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, backend)
+    # No abort: entity prepass re-ran (1 call), audit completed and released.
+    assert backend.entity_calls() == 1
+    assert result.step6["audit_complete"] is True
+    assert result.step8["released_as_audited"] is True
+
+
+def test_b6_malformed_entity_cache_missing_key_is_miss_not_abort(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    # Object with an entry missing the 'context' key — KeyError path.
+    (cfg.out_dir / "entity_context_cache.json").write_text(
+        json.dumps({
+            "schema": "pact-v4-entity-context-cache/v1",
+            "entries": [{"key": "abc"}],
+        }),
+        encoding="utf-8",
+    )
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, backend)
+    assert backend.entity_calls() == 1
+    assert result.step8["released_as_audited"] is True
+
+
+def test_b6_malformed_entity_cache_type_error_is_miss_not_abort(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    # 'entries' is a string, not a list — TypeError path in from_payload.
+    (cfg.out_dir / "entity_context_cache.json").write_text(
+        json.dumps({
+            "schema": "pact-v4-entity-context-cache/v1",
+            "entries": "not-a-list",
+        }),
+        encoding="utf-8",
+    )
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, backend)
+    assert backend.entity_calls() == 1
+    assert result.step8["released_as_audited"] is True
+
+
+# ---------------------------------------------------------------------------
+# F7 (B3 review): journal causality — audit_chunk_started is emitted BEFORE
+# the model call and a terminal audit_chunk_done (incl. failures) after it.
+# ---------------------------------------------------------------------------
+
+
+def _journal_events(out_dir: Path) -> list:
+    return [
+        json.loads(line)
+        for line in (out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_b7_journal_started_before_done_success(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    _run_with_b3(cfg, backend)
+    events = _journal_events(cfg.out_dir)
+    started = [e for e in events if e["event"] == "audit_chunk_started"]
+    done = [e for e in events if e["event"] == "audit_chunk_done"]
+    assert started and done
+    # The FIRST started must precede the FIRST done (causality).
+    assert events.index(started[0]) < events.index(done[0])
+    for e in done:
+        assert e["status"] in ("GOOD", "GOOD_RETRIED")
+
+
+def test_b7_journal_started_before_failed_done_transport_error(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(fail_audit=True)
+    _run_with_b3(cfg, backend)
+    events = _journal_events(cfg.out_dir)
+    started = [e for e in events if e["event"] == "audit_chunk_started"]
+    done = [e for e in events if e["event"] == "audit_chunk_done"]
+    assert started, "started event must exist even when the chunk fails"
+    assert done, "terminal done event must exist after a failed chunk"
+    assert events.index(started[0]) < events.index(done[0])
+    failed = [e for e in done if e["status"] == "TRANSPORT_ERROR"]
+    assert failed, "terminal TRANSPORT_ERROR done must be recorded"
+    assert failed[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# F8 (B3 review): the artifact manifest advertises only artifacts that were
+# actually created — skip/fail runs must not list nonexistent B3 outputs.
+# ---------------------------------------------------------------------------
+
+
+def test_b8_manifest_omits_b3_when_skipped(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path, run_audit=False)
+    backend = _B3MockBackend()
+    result = _run_with_b3(cfg, backend)
+    artefacts = result.record["artefacts"]
+    assert "b3_audit_journal" not in artefacts
+    assert "b3_audit_cache" not in artefacts
+    assert "b3_entity_context_cache" not in artefacts
+
+
+def test_b8_manifest_omits_b3_when_no_machinery(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    router = _make_router()
+    model_caller = _LifecycleAwareModelCaller(router, _DefectiveWholeChapterCaller())
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=model_caller,
+        qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+        # b3_audit_repair omitted
+    )
+    artefacts = result.record["artefacts"]
+    assert "b3_audit_journal" not in artefacts
+    assert "b3_audit_cache" not in artefacts
+    assert "b3_entity_context_cache" not in artefacts
+
+
+def test_b8_manifest_lists_b3_when_full_flow(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    result = _run_with_b3(cfg, backend)
+    artefacts = result.record["artefacts"]
+    assert artefacts["b3_audit_journal"].endswith("audit_journal.ndjson")
+    assert artefacts["b3_audit_cache"].endswith("audit_cache_b3.json")
+    assert artefacts["b3_entity_context_cache"].endswith("entity_context_cache.json")
+    # The advertised files actually exist.
+    for key in ("b3_audit_journal", "b3_audit_cache", "b3_entity_context_cache"):
+        assert Path(artefacts[key]).exists(), key

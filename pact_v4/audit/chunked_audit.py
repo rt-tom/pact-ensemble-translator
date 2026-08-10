@@ -644,13 +644,32 @@ class ChunkedAuditEvaluator:
         backend: CompletionBackend,
         *,
         config: Optional[ChunkedAuditConfig] = None,
+        on_chunk_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         self._backend = backend
         self._config = config or ChunkedAuditConfig()
+        # V4.1 B3 review fix (F7): an optional per-model-call event hook so
+        # the caller (b3_audit_repair's append-only journal) can record
+        # ``audit_chunk_started`` BEFORE the model call and a terminal
+        # ``audit_chunk_done`` after it — a crash during a chunk leaves the
+        # started event as evidence instead of nothing. Invoked as
+        # ``on_chunk_event("started"|"done", {chunk, total, status,
+        # issue_count, ...})``.
+        self._on_chunk_event = on_chunk_event
 
     @property
     def backend(self) -> CompletionBackend:
         return self._backend
+
+    def _emit_chunk_event(self, kind: str, **fields: Any) -> None:
+        if self._on_chunk_event is not None:
+            try:
+                self._on_chunk_event(kind, fields)
+            except Exception:  # noqa: BLE001 — a journal hook must never break the audit
+                LOG.debug(
+                    "chunked audit on_chunk_event(%r) failed", kind, exc_info=True
+                )
+
 
     def __call__(
         self,
@@ -828,6 +847,13 @@ class ChunkedAuditEvaluator:
             if suffix else f"{out_base}_chunk{chunk_index}"
         )
         try:
+            self._emit_chunk_event(
+                "started",
+                chunk=chunk_index,
+                total=chunk_total,
+                pids=chunk_pids,
+                sub=suffix or "",
+            )
             response = self._backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
             LOG.error(
@@ -839,7 +865,7 @@ class ChunkedAuditEvaluator:
                 content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
                 reasoning="",
             )
-            return ChunkMeta(
+            meta = ChunkMeta(
                 chunk=chunk_index,
                 first_pid=chunk_pids[0],
                 last_pid=chunk_pids[-1],
@@ -854,6 +880,15 @@ class ChunkedAuditEvaluator:
                 reasoning_file=f"{file_stem}_reasoning.txt",
                 issues=(),
             )
+            self._emit_chunk_event(
+                "done",
+                chunk=chunk_index,
+                total=chunk_total,
+                status=meta.status,
+                issue_count=0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return meta
         content = response.text or ""
         reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
 
@@ -888,6 +923,13 @@ class ChunkedAuditEvaluator:
             validation_errors=validation.errors,
             reasoning_file=reason_file,
             issues=validation.issues,
+        )
+        self._emit_chunk_event(
+            "done",
+            chunk=chunk_index,
+            total=chunk_total,
+            status=meta.status,
+            issue_count=len(validation.issues),
         )
         LOG.debug(
             "audit chunk %s: %s | finish=%s | issues=%d",
