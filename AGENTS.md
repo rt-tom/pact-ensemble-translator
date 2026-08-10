@@ -135,7 +135,9 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   пока PR нет, диспетчерский guard `active_pr` не висит, и developer может
   возвращаться на свою I сколько угодно раз (фикс-циклы на той же карточке).
   Flow:
-  1. Developer работает → коммит(ы) в ветку (БЕЗ PR) → I → `block`
+  1. Developer работает → коммит(ы) в ветку (БЕЗ PR) → **push в origin: коммит
+     обязан быть достижимым в remote** (урок A2 2026-08-10 — 4ab250b был только
+     в worktree, ревью заблокировалось delivery-проблемой и начался дрейф) → I → `block`
      `ready_for_review` → **developer сам создаёт RV** (ready, без --parent) →
      диспетчер клеймит.
   2. Ревьюер ревьюит ВЕТКУ (`git diff origin/main..branch`), вердикт и
@@ -156,6 +158,10 @@ When a change reverses a prior decision, abandons a branch, or resolves a non-ob
   ту же I (урок A1 2026-08-06: ревьюер создал fix + RV2; watcher ловит как
   PROTOCOL-DRIFT). Воркер, заклеймлённый ДО обновления протокола, работает по
   старому плейбуку — при разъезде не достраивать цепочку, а пересаживать на I.
+  Дрейф-карточку с живой работой можно дать доработать (правило владельца
+  2026-08-07), но после фикса её отменяют (result «PROTOCOL-DRIFT: работа в
+  ветке @ sha»), RV к ней НЕ привязывается, ревью-цикл остаётся на корневой I
+  (урок A2 2026-08-10).
   Архитектор: только создаёт I и вмешивается при тупиках/застреваниях. RV
   создаётся БЕЗ --parent (claim-гейт `claim_rejected parents_not_done`,
   урок B14); RV не создаётся заранее (dependency_wait-цикл = переклеймы и
