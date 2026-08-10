@@ -25,7 +25,11 @@ Design rules (konspekt §8.3 + B1.1 review, PROPOSAL reply §1.2/§1.4/§1.5):
   link (not just "he/him"); unconfirmed coreference -> ``candidate``, never
   silently accepted as ``verified``.
 * **Cache per-chapter**: identity = ``source_hash + extractor_version``;
-  a cache hit resumes without another model call.
+  a cache hit resumes without another model call, but every hit
+  re-validates the cached content against the current chapter source
+  (anchor/alias/evidence PIDs and spans, alias surfaces,
+  canonical-type-in-anchor-span) — tampered/foreign entries fail closed
+  and are recomputed, never returned ``from_cache=True``.
 * **Never authorizes repair**: this context is a hint for the auditor
   (fallback evidence level 3); any finding that relies on a semantic
   relation stays Tier B (rule §5.3).
@@ -730,6 +734,86 @@ def validate_entity_context(
     return context, ValidationReport(entries=tuple(entries))
 
 
+def cached_context_source_valid(
+    context: ChapterEntityContext,
+    *,
+    source: Mapping[str, str],
+) -> Optional[str]:
+    """Source-bound content check for a cache-hit context.
+
+    Returns ``None`` when the cached context is still fully source-bound
+    valid: every PID exists in the current source, every quoted span
+    (anchor/alias/evidence) is verbatim in its PID and not
+    translation-derived, the canonical type is inside the anchor span, and
+    every alias surface appears in its own PID. Returns a human-readable
+    reason for the first violation otherwise.
+
+    Unlike ``validate_entity_context`` this is all-or-nothing and does NOT
+    re-apply drop/downgrade judgment: the stored context is already
+    post-validation (drops/downgrades applied), and the cache key's
+    ``source_hash`` guarantees the same chapter source text — so any
+    span/PID that fails the source-bound invariants here means the entry
+    was tampered/foreign AFTER validation. The caller must fail closed
+    (ignore the entry and recompute), never reuse the altered content.
+    Statuses are intentionally not re-checked: they are already
+    code-derived and legal (``_entity_from_payload``/``from_payload``
+    enforce that), and legitimate downgrades (gender/coreference ->
+    ``candidate``) must survive a cache hit.
+    """
+    source_map = dict(source)
+    for record in context.entities:
+        anchor = record.anchor
+        anchor_text = source_map.get(anchor.pid)
+        if anchor_text is None:
+            return f"anchor PID {anchor.pid} absent from current source"
+        if _is_translation_derived(anchor.span):
+            return f"translation-derived anchor span {anchor.span!r}"
+        if not _span_verbatim_in_pid(anchor.span, anchor_text):
+            return f"anchor span {anchor.span!r} not verbatim in {anchor.pid}"
+        canonical_norm = " ".join(record.canonical_type.lower().split())
+        anchor_span_norm = " ".join(anchor.span.lower().split())
+        if canonical_norm not in anchor_span_norm:
+            return (
+                f"canonical type {record.canonical_type!r} not in "
+                f"anchor span {anchor.span!r}"
+            )
+        for alias in record.aliases:
+            alias_text = source_map.get(alias.pid)
+            if alias_text is None:
+                return f"alias PID {alias.pid} absent from current source"
+            if _is_translation_derived(alias.span) or not _span_verbatim_in_pid(
+                alias.span, alias_text
+            ):
+                return (
+                    f"alias surface {alias.surface!r} not verbatim in "
+                    f"{alias.pid}"
+                )
+            if alias.surface.lower() not in alias_text.lower():
+                return (
+                    f"alias surface {alias.surface!r} not present in "
+                    f"its own PID {alias.pid}"
+                )
+        for claim in record.claims:
+            if claim.kind not in CLAIM_KINDS:
+                return f"unknown claim kind {claim.kind!r}"
+            for window in claim.evidence_windows:
+                for pid in window:
+                    if pid not in source_map:
+                        return (
+                            f"evidence window PID {pid} absent from "
+                            f"current source"
+                        )
+            for ev in claim.evidence:
+                ev_text = source_map.get(ev.pid)
+                if ev_text is None:
+                    return f"evidence PID {ev.pid} absent from current source"
+                if _is_translation_derived(ev.span) or not _span_verbatim_in_pid(
+                    ev.span, ev_text
+                ):
+                    return f"evidence span {ev.span!r} not verbatim in {ev.pid}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-chapter cache (identity = source_hash + extractor_version)
 # ---------------------------------------------------------------------------
@@ -752,12 +836,17 @@ class EntityContextCache:
     ``to_payload``/``from_payload``. A cache hit returns the validated
     context without another model call.
 
-    Fail-closed provenance (RV t_7e9ab408 finding 2): every entry is
-    stored/restored ONLY under its own identity key
+    Fail-closed provenance (RV t_7e9ab408 finding 2, RV2 fix): every entry
+    is stored/restored ONLY under its own identity key
     (``source_hash + extractor_version``). ``put`` and ``from_payload``
     reject a key/context mismatch with ``ValueError`` — a foreign or
     tampered context is never stored under the expected key, and a
-    tampered persistent payload is never silently accepted.
+    tampered persistent payload is never silently accepted. Structural
+    shape is enforced too: a malformed entry (not an object) is rejected
+    loudly. Content-vs-source validation happens at the reuse boundary in
+    ``extract_entity_context`` (``cached_context_source_valid``), where
+    the current ``SourceArtifact`` is available — a persistent round-trip
+    cannot bypass it.
     """
 
     def __init__(self) -> None:
@@ -797,6 +886,11 @@ class EntityContextCache:
             )
         cache = cls()
         for item in payload.get("entries", []):
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "cache payload entry must be an object {key, context}, "
+                    f"got {type(item).__name__}"
+                )
             key = str(item["key"])
             context = ChapterEntityContext.from_payload(item["context"])
             # Fail-closed restore: the stored key must be the identity of
@@ -822,9 +916,18 @@ class EntityContextCache:
 
 @dataclass(frozen=True)
 class BackendEntityExtractorConfig:
-    """Extraction call settings (source-only, temp=0, deterministic)."""
+    """Extraction call settings (source-only, temp=0, deterministic).
 
-    max_tokens: int = 4096
+    ``max_tokens`` must cover the server's reasoning budget PLUS content
+    headroom — the llama-server counts reasoning and content TOGETHER
+    against ``max_tokens`` (same contract as the audit's
+    ``DEFAULT_MAX_TOKENS = 12000`` = reasoning 8192 + ~3500 headroom).
+    The previous 4096 value was pre-reasoning: with ``--reasoning-budget
+    8192`` the model spent the whole budget on reasoning and emitted zero
+    content tokens (EmptyResponseError after retries).
+    """
+
+    max_tokens: int = 12000
     label: str = "b1.2/entity_extractor"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
@@ -923,13 +1026,17 @@ def extract_entity_context(
     is stored under ``source_hash + extractor_version`` so resume never
     repeats the call.
 
-    Fail-closed (RV t_7e9ab408 findings 1+2): the model body is stamped
-    with the harness-owned top-level metadata (``schema``/
+    Fail-closed (RV t_7e9ab408 findings 1+2, RV2 fix): the model body is
+    stamped with the harness-owned top-level metadata (``schema``/
     ``extractor_version``/``chapter_id``/``source_hash``) BEFORE validation
     — the real model output can pass without the model fabricating
     provenance. A cache hit is trusted only when the cached context's
     ``chapter_id``/``source_hash``/``extractor_version`` match the current
-    ``SourceArtifact``; a foreign/tampered entry is ignored and recomputed.
+    ``SourceArtifact`` AND its content is still fully source-bound
+    (``cached_context_source_valid``: anchor/alias/evidence PIDs and
+    spans, alias surfaces, canonical-type-in-anchor-span); a
+    foreign/tampered entry — even with intact metadata and key — is
+    ignored and recomputed, never returned ``from_cache=True``.
     """
     source_map = dict(source_artifact.source)
     key = entity_context_cache_key(
@@ -945,14 +1052,29 @@ def extract_entity_context(
                 and cached.source_hash == source_artifact.source_hash
                 and cached.extractor_version == extractor_version
             ):
-                LOG.info("entity_extractor: cache hit for %s", key[:12])
-                return EntityExtractionResult(
-                    context=cached, validation=ValidationReport(), from_cache=True
+                # RV2 HIGH fix: metadata/key identity is NOT enough — the
+                # cached content itself must still be source-bound (same
+                # source_hash guarantees the same chapter text, so any span
+                # that is not verbatim / any dead PID is tampering). Fail
+                # closed: ignore and recompute, never from_cache=True.
+                content_problem = cached_context_source_valid(
+                    cached, source=source_map
                 )
-            LOG.warning(
-                "entity_extractor: cache entry %s has foreign/tampered "
-                "metadata; recomputing", key[:12],
-            )
+                if content_problem is None:
+                    LOG.info("entity_extractor: cache hit for %s", key[:12])
+                    return EntityExtractionResult(
+                        context=cached, validation=ValidationReport(),
+                        from_cache=True,
+                    )
+                LOG.warning(
+                    "entity_extractor: cache entry %s has tampered/foreign "
+                    "content (%s); recomputing", key[:12], content_problem,
+                )
+            else:
+                LOG.warning(
+                    "entity_extractor: cache entry %s has foreign/tampered "
+                    "metadata; recomputing", key[:12],
+                )
 
     raw = extractor(
         chapter_id=source_artifact.chapter_id, source=source_map
@@ -998,5 +1120,6 @@ __all__ = [
     "parse_model_output",
     "render_entity_extraction_prompt",
     "validate_entity_context",
+    "cached_context_source_valid",
     "with_entity_context_metadata",
 ]

@@ -234,6 +234,20 @@ def test_request_rejects_non_positive_max_tokens():
         _request(max_output_tokens=0)
 
 
+def test_request_rejects_non_bool_omit_system_tools():
+    # AF: the omit_system_tools field is a strict bool — anything else is a
+    # programming error (mirrors the other type-validated fields).
+    with pytest.raises(ValueError, match="omit_system_tools"):
+        _request(omit_system_tools="yes")
+
+
+def test_request_defaults_omit_system_tools_to_false():
+    # Historical body shape preserved: without the flag the request is
+    # identical to the pre-AF contract.
+    assert _request().omit_system_tools is False
+    assert _request(omit_system_tools=True).omit_system_tools is True
+
+
 def test_request_rejects_empty_label():
     with pytest.raises(ValueError, match="label"):
         _request(label="")

@@ -531,6 +531,64 @@ B3 ──→ owner-run валидация на новых главах
 3. 8 кейсов выше
 4. Только после приемлемой precision — entity-context в production (B1.1)
 
+### 9.4. Production-схема потока entity-context (если gate PASS, решение 2026-08-10)
+
+> Независимый ревьюер подтвердил необходимость entity-context (p00236-класс: chunked-аудит не видит long-range entity без него). Код уже влит (B1.2 extractor, B1 приём entity_context, B1.1 фильтр), B3 останется только связать в runner.
+
+```
+Глава (source)
+   │
+   ▼
+1. ChapterEntityExtractor (B1.2) — Qwen, 1 вызов/главу, temp=0
+   вход: source целиком (детерминированный)
+   выход: chapter_entity_context.json
+   ├─ 8-пунктовая валидация кодом (§8.3), fail-closed
+   ├─ кэш per-chapter: source_hash + extractor_version (hit → 0 вызовов)
+   └─ schema per-claim: anchor span → verified, alias span → verified,
+        same_entity relation → candidate (ВСЕГДА, семантическая гипотеза)
+   │
+   ▼
+2. ChunkedAuditEvaluator (B1) — 8 чанков × Qwen R8192
+   каждый чанк: pairs + narrator_context + entity_context + CONTEXT_ONLY overlap
+   в промпте блок «CHAPTER ENTITY FACTS — SOURCE-DERIVED» (evidence level 3:
+   source > adjacent > chapter facts > bible > inference)
+   → issues[] (id/category/severity/confidence/note/_debug)
+   │
+   ▼
+3. apply_hard_filters (B1.1) — Tier A классификация
+   ⚠️ КЛЮЧЕВОЕ: issue, чей PID участвует в entity-контексте
+      (anchor/alias/evidence любого claim) → принудительно TIER_B
+      (код не может доказать coreference; presence span'ов ≠ отношение)
+   → CONFIRMED / REJECTED / TIER_B
+   │
+   ▼
+4. Repair (B2) — verify-before-repair
+   Tier A CONFIRMED → repair напрямую
+   Tier B (включая ВСЕ entity-relations) → repair-модель (генератор)
+     читает raw source windows → подтверждает → FIX; иначе PASS
+   entity-context НИКОГДА сам по себе не авторизует repair (§5.3)
+```
+
+**Что entity-context даёт по слоям:**
+- **Аудитору**: закрывает long-range слепую зону (p00236 bike→велосипед: факт `Blake's vehicle = motorcycle, evidence p00007` в чанке 5 → Qwen репортит changed_fact)
+- **Hard filters**: защита от самообмана — entity-PID issues принудительно TIER_B (не CONFIRMED кодом)
+- **Repair**: последний барьер — relation всегда candidate, repair может отклонить
+
+**Что entity-context НЕ делает:**
+- НЕ авторизует repair (relation = candidate, семантическая гипотеза)
+- НЕ попадает в Tier A (код не доказывает coreference)
+- НЕ заменяет source (evidence level 3, source всегда выше)
+- НЕ строится из book_memory (только source-derived, урок «The Nurse: female»)
+- НЕ тюнит промпт (это данные, не инструкции)
+
+**Стоимость в production:** +1 вызов Qwen на главу (~13k вход / ~500 выход, ~$0.01-0.02); кэш: повторный прогон — 0 вызовов; аудит без изменений (8 вызовов).
+
+**Примеры:**
+- p00236 (bike→велосипед): extractor anchor `motorcycle` verified (p00007), alias `bike` verified (p00097), relation → candidate; audit → changed_fact; hard filters → TIER_B; repair: Gemma читает p00007+p00097 → FIX «мотоцикл»
+- p00080 (у картины плечо — parsing FP): картина не в entity-контексте (не persistent); audit → referent FP; hard filters → обычная классификация; repair → PASS, без правки
+
+**B3-интеграция (когда gate PASS):** pre-audit stage `build_entity_context(source) → cache → entity_context` → передаётся в `ChunkedAuditEvaluator` и `apply_hard_filters` (всё готово в коде B1/B1.1/B1.2).
+
 ### 9.3. Test leakage (критично, убрать ДО прогонов)
 
 В audit_v4.ps1 пример `Blake's bike / vehicle = motorcycle, evidence p00007` (строки ~469/484) **зашит в промпт** — Qwen ссылалась на него в reasoning и после этого репортила p00097/p00098. Текущий результат доказывает только «применение подсказки», не «извлечение». **Пример в промпте заменить на нейтральный (не из Pact-главы 0001); контекст — только через `-EntityContext`.**

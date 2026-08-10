@@ -27,6 +27,14 @@ Pinned facts used here:
 * ``DELETE /session/{id}`` -> ``boolean``;
 * ``POST /session/{id}/message`` ``{model?, agent?, system?, tools?,
   format?, parts}`` -> ``{info: AssistantMessage, parts: Part[]}``;
+* **output-budget quirk (AF, 2026-08-10)**: a message body that carries
+  ``system`` and/or ``tools`` is served with a default ~32k output budget,
+  truncating whole-chapter generation reasoning at 32000 tokens
+  (``finish=length``, empty output). A body with only ``model``+``parts``
+  (+``reasoningEffort``) — the verbatim Gate 0 shape — is not capped
+  (measured 55915 reasoning tokens with ``finish=stop``). The generation
+  caller therefore sets ``CompletionRequest.omit_system_tools``; audit /
+  repair / formatting keep ``system``+``tools`` (out of scope).
 * ``GET /experimental/tool/ids`` -> ``string[]`` (used to build the
   all-tools-disabled map).
 
@@ -42,7 +50,10 @@ Design rules (plan §5, §7, §10, §12)
   provider connected, model exists, tool IDs for the disabled-tools map.
 * One isolated session per work unit: ``session_scope=per_request``,
   ``context_reuse=false``, every message carries an explicit
-  ``provider/model`` and ``tools`` (all disabled); ``close()`` deletes only
+  ``provider/model`` and ``tools`` (all disabled) — except generation
+  requests (``omit_system_tools``), which drop ``system``/``tools`` from
+  the body to escape the serve output-budget cap (see quirk above);
+  ``close()`` deletes only
   sessions this backend created, and only when the session policy allows.
 * ``BackendDescriptor`` includes everything that can change the model answer
   (model bindings, adapter/server contract version, endpoint family,
@@ -743,15 +754,16 @@ class OpenCodeServerBackend:
     ) -> dict:
         body: dict = {
             "model": {"providerID": provider_id, "modelID": model_id},
-            "system": self._cfg.system_prompt,
             "parts": [
                 {"type": "text", "text": msg.content}
                 for msg in request.messages
             ],
         }
+        if not request.omit_system_tools:
+            body["system"] = self._cfg.system_prompt
         if self._cfg.agent:
             body["agent"] = self._cfg.agent
-        if self._cfg.tools_disabled:
+        if self._cfg.tools_disabled and not request.omit_system_tools:
             body["tools"] = {tool_id: False for tool_id in self._tool_ids}
         if self._cfg.structured_output_mode == "json_schema" and request.response_schema is not None:
             body["format"] = {
