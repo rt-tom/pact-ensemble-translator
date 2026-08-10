@@ -203,12 +203,128 @@ gold TP recall | gold negative rejection | new unknown issues (вручную �
 
 ## 7. Открытые вопросы / будущие карточки
 
-1. **Qwen с промптом v4** — тест идёт (A/B): подтвердить recall p00032/35/93 без роста FP → финальная валидация пары Gemma→Qwen (решение по моделям уже принято: §1.3)
+1. **Qwen с промптом v4** — тест завершён: v4.2 вернул p00010, но породил FP-пачку (p00285/p00221/p00379/p00182); p00032 так и не пойман. **Решение 2026-08-10 (ревьюер+владелец): production = prompt v4.1 + harness v4.2 infra; заморозить тюнинг на главе 0001.**
 2. ~~Same-model Gemma-аудит~~ — **закрыто решением владельца 2026-08-09**: Gemma переводит, Qwen аудитит (Kocmi-safe); same-model только diagnostic
-3. **Chapter entity extraction** — отдельный этап (entity map с evidence PID, gender, aliases) → для long-range consistency (motorcycle) и Tier B invented_gender; можно кэшировать per-chapter
-4. **Speaker attribution** (metadata per PAIR) — только когда уверенно; иначе не аннотировать (wrong speaker = poison)
+3. **Chapter entity extraction** — карточка B1.2 (см. §10): Qwen source-only prepass, schema per-claim, валидация кодом, кэш per-chapter
+4. **Speaker attribution** (metadata per PAIR) — только когда уверенно; иначе не аннотировать (wrong speaker = poison) — в B1 НЕ входит, fallback = overlap
 5. ~~Параметры Qwen server~~ — **получены владельцем 2026-08-09**, зафиксированы в §3.4 основного плана и runtime_local.example.yaml
-6. Harness audit_v4.ps1 → production-интеграция в B1: переносить логику (K-балансировка, RetryShrink, overlap, fail-closed) в Python-код pipeline
+6. **Production audit v1** — замороженная конфигурация: prompt v4.1 (семантика) + harness v4.2 infra (debug fix, version metadata) + entity context + overlap (см. §10)
+
+---
+
+## 10. План фазы B — разделение на задачи (утверждён 2026-08-10)
+
+> **Принцип:** B1 разделён на B1 (core) + B1.1 (Tier A) + B1.2/B1.3 (entity context отдельным треком после baseline). Lifecycle (запуск/остановка Qwen, swap, VRAM, reasoning-валидация) — **уже реализован в A1** (`model_lifecycle.py` + `build_strict_lifecycle`), B-карточки подключаются к нему, не переписывают.
+>
+> **Production audit v1 = prompt v4.1 (НЕ v4.2) + harness v4.2 infra + overlap + entity context (после B1.3).**
+
+### B1 — ChunkedAuditEvaluator (core) [I+RV]
+
+Перенос harness `audit_v4.ps1` в Python (`pact_v4/audit/chunked_audit.py`):
+
+- **Chunking**: greedy по входным токенам (НЕ K-balance — переименовать честно), `max_input = 3600`, `max_tokens = 12000`, формулы из §2
+- **Overlap (CONTEXT_ONLY)**: предшествующие пары из ОРИГИНАЛЬНОЙ главы, ~400 токенов (мин 2, макс 6 пар), модель не аудитит CONTEXT_ONLY
+- **RetryShrink**: по входу (lvl1 = max_input/2, lvl2 = /3), каждый sub с уникальным суффиксом, overlap subs из оригинальной главы
+- **Строгая валидация**: категории/severity/confidence/PID-в-чанке, fail-closed (failed chunk ≠ issues=[])
+- **Dedup**: id+category, high-confidence wins
+- **Debug metadata**: `_debug {chunk, reasoning_file}` прикрепляется к issue в момент сбора (фикс 4.2)
+- **Версионирование**: `schema: pact-audit/v4` + `harness_version` + `prompt_version` раздельно
+- **Промпт v4.1** в `render_qwen_audit_prompt` (замена QWEN_AUDIT_V1): зафиксированный текст из audit_v4.ps1 (v4.1 семантика — БЕЗ procedural gender check v4.2)
+- **Интеграция с lifecycle**: расширить `LifecycleQwenAuditEvaluator.__call__` — принимает чанки+overlap+context, `context_size ≥ 49152` (сейчас 32768 — проверить!)
+- **Полный input budget**: `fixed_prompt + narrator + entity + CONTEXT_ONLY + AUDIT_PAIRS ≤ calibrated_total` (soft 500 / hard 800 для entity)
+- **Контекст 3 уровней**: narrator context (канонические имена, generic исключены) + BOOK CONTEXT fallback + CHAPTER ENTITY FACTS (схема §8.3)
+- **Regression suite** (§6 gold set): 8 must-find + 6 must-not-find → pytest-контракты (mock backend, 0 реальных вызовов)
+
+**Acceptance:** suite 8/8 gold TP + 6/6 gold negative rejection; chunking ровно 8 чанков на главу 0001; fail-closed проверен (mock LENGTH/INVALID_JSON → audit_complete=false)
+
+**Non-goals:** repair (B2), Tier A (B1.1), entity extraction (B1.2), remote-аудит (B3)
+
+### B1.1 — Tier A hard filters (код, 0 модельных вызовов) [I+RV]
+
+`pact_v4/audit/hard_filters.py` — детерминированная фильтрация findings до repair:
+
+- **Дубли**: «в гости в гости» — exact adjacent duplicate
+- **Числа/время**: нормализация (Two past twelve = 00:02, девяти/десяти)
+- **Direct current-source fact**: явное число/имя/объект в source → сверка
+- **PID/category**: вне чанка / invalid → reject
+- **`chapter_entity_context` НИКОГДА не Tier A** (всегда Tier B, §5.3)
+
+**Acceptance:** p00132 → CONFIRMED (Tier A), «1:02»-FP → REJECTED, nurse-issue с source-фактом → REJECTED
+
+**Non-goals:** semantic verification (Tier B — B2)
+
+### B1.2 — ChapterEntityContext extractor (Qwen prepass) [I+RV]
+
+`pact_v4/audit/entity_extractor.py` — source-only prepass (1 вызов на главу):
+
+- **Экстрактор: Qwen** (решение ревьюера: не Gemma — коррелированный blind spot с переводом)
+- **Вход**: source главы целиком (детерминированный, temp=0)
+- **Выход**: schema per-claim (§8.3) — anchor span `verified` / alias mention `verified` / same_entity relation `candidate`
+- **Валидация кодом (8 пунктов §8.3)**: PID существует, span дословно в source, нет translation-derived, canonical type в anchor, alias в своём PID, gender-evidence с referent-связью; неподтверждённое → candidate
+- **Кэш per-chapter**: identity = source_hash + extractor_version
+- **НЕ авторизует repair** (всегда Tier B)
+
+**Acceptance:** глава 0001 → 2 сущности (Blake's vehicle, Rich) с корректными status
+
+### B1.3 — Entity-context A/B + 8 кейсов (spike, не production) [I+RV]
+
+Изолированный эксперимент, не влияет на production-путь:
+
+- **A/B на одинаковых чанках**: без context / ручной gold / авто-extracted
+- **8 кейсов §9.1**: 2 positive (recall), 4 negative (precision/FP), 2 provenance (poisoned, false validation)
+- **Test leakage убран** (примеры в промпте — нейтральные, §9.3)
+
+**Decision gate:** приемлемая precision (определяемо по 8 кейсам) → entity-context в production (B3); иначе — known limitation (p00236-класс остаётся ручным)
+
+**Non-goals:** изменение промпта v4.1 (заморожен)
+
+### B2 — Selective repair (batch) + repair-as-verifier [I+RV]
+
+`pact_v4/repair/` — пост-аудит ремонт:
+
+- **Repair-модель = генератор (Gemma local / DeepSeek remote)** — Kocmi-safe (аудитор ≠ ремонтник)
+- **Repair-as-verifier**: «The audit issue is a candidate, not an established fact. First independently verify against SOURCE and TRANSLATION. If incorrect → return PASS, no change. Only repair after confirming.»
+- **Tier A findings** → repair напрямую; **Tier B** (включая entity relations) → verify-before-repair
+- **Batch**: один вызов на группу findings (как старый repair), потом контекстный re-audit затронутых PID
+- **Fail-closed**: failed repair chunk → debt, никогда не молчаливый PASS
+- **НЕ ремонтирует**: minor/medium/low confidence → debt/diagnostic
+
+**Acceptance:** p00010/p00193-тип → repair после verify; p00106-тип (FP) → PASS без изменений; регресс: 1324+ suite
+
+### B3 — Production-интеграция + remote-путь [I+RV]
+
+- **Вставка ChunkedAuditEvaluator** в strict runner (замена gemma_russian_review/qwen_fidelity gate)
+- **Journal/provenance**: audit chunk результаты, switch_records (уже в A1), entity context hash
+- **Cache/resume identity**: source_hash + translation + audit prompt version + backend + reasoning
+- **Gates**: audit_complete=false → debt/accepted_degraded (уже fail-closed)
+- **Local**: Qwen R8192 через существующий lifecycle (вариант A — бесплатно)
+- **Remote-путь (контракт, НЕ тестирован)**: opencode + Qwen-аудит через request_options; reasoningEffort high/medium — **пометить «не протестирован, тестировать после B-фазы»** (решение владельца)
+- **Config**: runtime_local.example.yaml → qwen audit server_args (MTP, R8192, 49k) + max_input/max_tokens/overlap в config
+
+**Acceptance:** полный локальный прогон главы: Gemma translate → Qwen audit → issues → verifier → repair; journal + resume работают; audit_complete честный
+
+**Non-goals:** remote-аудит тестирование, tuning промпта
+
+### Зависимости
+
+```
+B1 ──→ B1.1 (нужны findings из B1)
+B1 ──→ B2 (repair опирается на findings + Tier A)
+B1.2 ──→ B1.3 (extractor → A/B)
+B1.3 ──→ B3 (только если A/B PASS; иначе B3 без entity)
+B1 + B1.1 + B2 ──→ B3 (production сборка)
+```
+
+### Порядок реализации
+
+1. **B1** (core, самый большой — developer, эталон: audit_v4.ps1)
+2. **B1.1** (Tier A, независим после B1)
+3. **B1.2** (entity extractor, может идти параллельно B1.1)
+4. **B1.3** (A/B spike → decision gate)
+5. **B2** (repair, после B1 + B1.1)
+6. **B3** (production сборка, после B1+B1.1+B2 [+B1.3 если PASS])
+
+**Параллельно можно:** B1.2 с B1.1; B1.3 с B2 (изолированный spike)
 
 ---
 
