@@ -54,6 +54,7 @@ from pact_v4.runtime.runtime_config import (
     build_formatting_adapters,
     build_repair_adapters,
     build_role_adapters,
+    build_role_backend,
     load_runtime_config,
     validate_reasoning_backend,
 )
@@ -209,9 +210,34 @@ def build_argparser() -> argparse.ArgumentParser:
                         "selection (selection_results.json is always written "
                         "with schema pact-v4-whole-chapter-selection/v1, "
                         "mode=not_applicable); translations_raw.json is the "
-                        "validated generator snapshot; Steps 6/7/8 are out of "
-                        "A1 scope and recorded as skipped. Part of the config "
+                        "validated generator snapshot. Part of the config "
                         "identity — use a NEW --out-dir.")
+    audit_group = p.add_mutually_exclusive_group()
+    audit_group.add_argument("--run-audit", action="store_true",
+                   help="V4.1 B3 (production default): after whole-chapter "
+                        "generation run the production audit/repair stage "
+                        "(ChunkedAuditEvaluator -> hard filters -> selective "
+                        "repair -> re-audit) and rewrite "
+                        "translations_repaired.json / translations.json with "
+                        "the repaired map. The stage is skipped when "
+                        "--skip-audit is given or no audit machinery is "
+                        "wired (A1 generation-only behavior). Part of the "
+                        "config identity — use a NEW --out-dir when flipping "
+                        "it against an existing run.")
+    audit_group.add_argument("--skip-audit", action="store_true",
+                   help="V4.1 B3: disable the production audit/repair stage "
+                        "after whole-chapter generation (A1 behavior: steps "
+                        "6/7/8 recorded as skipped). Mutually exclusive with "
+                        "--run-audit; default is to run the audit.")
+    p.add_argument("--entity-context", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="V4.1 B3 (owner decision 2026-08-10, B1.3 gate "
+                        "pending): enable the source-only entity prepass "
+                        "(B1.2) feeding the auditor and the hard filters "
+                        "(entity-PID issues forced to TIER_B). Default true; "
+                        "--no-entity-context audits without the entity block. "
+                        "Part of the config identity — use a NEW --out-dir "
+                        "when flipping it against an existing run.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -372,12 +398,55 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         stop_after=("generation" if args.stop_after_generation else ""),
         # V4.1 A1: whole-chapter mode (one generation call per chapter).
         whole_chapter=args.whole_chapter,
+        # V4.1 B3: production audit/repair after whole-chapter generation.
+        # Default = run (production); --skip-audit turns the stage off.
+        # Both flags together are a contradiction and rejected at parse.
+        run_audit=not args.skip_audit or args.run_audit,
+        # V4.1 B3 (owner decision 2026-08-10): entity prepass default true;
+        # --no-entity-context disables it (audit without the entity block).
+        entity_context_enabled=(
+            True if args.entity_context is None else args.entity_context
+        ),
         # V4 Efficiency A2: CLI flag (--lazy-balanced/--no-lazy-balanced)
         # overrides the env var, which defaults to true (lazy mode on).
         lazy_balanced=(
             args.lazy_balanced
             if args.lazy_balanced is not None
             else _env_flag("PACT_EFFICIENCY_LAZY_BALANCED", default=True)
+        ),
+    )
+
+
+def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
+    """Build the V4.1 B3 audit/repair bundle for whole-chapter runs.
+
+    Whole-chapter + ``run_audit`` only: the production audit/repair stage
+    (ChunkedAuditEvaluator -> hard filters -> selective repair -> re-audit)
+    runs over the coordinator ``CompletionBackend`` (local/remote/composite
+    alike — the same backend routes the Qwen audit ref and the generator
+    repair ref). Returns ``None`` for chunked runs, ``--skip-audit`` runs,
+    or when the audit machinery would have nothing to do (generation-only).
+
+    Remote audit through ``opencode serve`` is a CONTRACT, NOT tested yet
+    (owner decision: test remote audit after the B-phase); the evaluators
+    never emit ``request_options`` — the reasoning budget is a server arg.
+    """
+    from pact_v4.pipeline.b3_audit_repair import (
+        B3AuditRepair,
+        B3AuditRepairConfig,
+    )
+
+    if not cfg.whole_chapter or not cfg.run_audit:
+        return None
+    completion_backend = build_role_backend(backend, runtime)
+    return B3AuditRepair(
+        audit_backend=completion_backend,
+        repair_backend=completion_backend,
+        config=B3AuditRepairConfig(
+            entity_context_enabled=cfg.entity_context_enabled,
+            max_input_tokens=cfg.audit_max_input_tokens,
+            max_tokens=cfg.audit_max_tokens,
+            overlap_tokens=cfg.audit_overlap_tokens,
         ),
     )
 
@@ -449,6 +518,7 @@ def run_local_default(args: argparse.Namespace) -> int:
     runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
     formatting_adapters = build_formatting_adapters(backend, runtime)
+    b3_audit_repair = _build_b3_audit_repair(cfg, backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
@@ -457,6 +527,7 @@ def run_local_default(args: argparse.Namespace) -> int:
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
         formatting_adapters=formatting_adapters,
+        b3_audit_repair=b3_audit_repair,
         progress=progress,
     )
     progress.close()
@@ -493,6 +564,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
     formatting_adapters = build_formatting_adapters(backend, runtime)
     cfg = _build_run_config(args, backend)
+    b3_audit_repair = _build_b3_audit_repair(cfg, backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=model_caller,
@@ -501,6 +573,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
         formatting_adapters=formatting_adapters,
+        b3_audit_repair=b3_audit_repair,
         progress=progress,
     )
     progress.close()

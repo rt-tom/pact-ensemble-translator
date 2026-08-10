@@ -284,6 +284,28 @@ class StrictRunConfig:
     # a whole-chapter run is not resumable from a chunked run's out-dir and
     # vice versa.
     whole_chapter: bool = False
+    # V4.1 B3 (concept §10 B3, §9.4): production audit/repair after
+    # whole-chapter generation. When True (production default) AND the B3
+    # machinery is injected (``b3_audit_repair``), the whole-chapter path
+    # runs ChunkedAuditEvaluator -> apply_hard_filters -> selective repair
+    # -> re-audit and rewrites translations_repaired.json/translations.json
+    # with the repaired map; ``--skip-audit`` turns the stage off (the
+    # steps are then recorded as skipped, A1 behavior). Part of the config
+    # identity — flipping it invalidates cache/resume exactly like any
+    # other run setting.
+    run_audit: bool = True
+    # V4.1 B3 (owner decision 2026-08-10, B1.3 gate pending): the source-only
+    # entity prepass (B1.2) feeds both the auditor and the hard filters
+    # (entity-PID issues forced to TIER_B). Runtime config; default true;
+    # false audits without the entity block. Part of the config identity.
+    entity_context_enabled: bool = True
+    # V4.1 B3 audit input budget (card §10 B3 "max_input/max_tokens/overlap
+    # в config"); the Qwen audit server profile (MTP, reasoning 8192, 49k)
+    # lives in the runtime config server_args. Part of the config identity
+    # so a budget change invalidates cache/resume.
+    audit_max_input_tokens: int = 3600
+    audit_max_tokens: int = 12000
+    audit_overlap_tokens: int = 400
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -328,6 +350,17 @@ class StrictRunConfig:
                 # journal written under the other scheme must be refused on
                 # resume (same reasoning as glossary_budget_policy_version).
                 "efficiency": {"lazy_balanced": self.lazy_balanced},
+                # V4.1 B3: the production audit/repair stage is part of the
+                # run's config identity — flipping run_audit /
+                # entity_context_enabled / audit budget invalidates
+                # cache/resume exactly like any other generation setting.
+                "audit": {
+                    "run": self.run_audit,
+                    "entity_context_enabled": self.entity_context_enabled,
+                    "max_input_tokens": self.audit_max_input_tokens,
+                    "max_tokens": self.audit_max_tokens,
+                    "overlap_tokens": self.audit_overlap_tokens,
+                },
             },
         )
 
@@ -2199,6 +2232,7 @@ def run_chapter_strict(
     gemma_audit_evaluator: Any,
     repair_adapters: Optional[Sequence[Any]] = None,
     formatting_adapters: Optional[Sequence[Any]] = None,
+    b3_audit_repair: Optional[Any] = None,
     now: Optional[Any] = None,
     progress: Optional[Any] = None,
     usage_writer: Optional[Any] = None,
@@ -2247,6 +2281,15 @@ def run_chapter_strict(
     over the coordinator ``CompletionBackend`` — never a local lifecycle
     adapter. The formatted text is what the Step 8 integrity check and the
     terminal transition see.
+
+    V4.1 B3 (concept §10 B3): in whole-chapter mode, when ``cfg.run_audit``
+    AND ``b3_audit_repair`` (``pact_v4.pipeline.b3_audit_repair.B3AuditRepair``)
+    is injected, the generation is followed by the production audit/repair
+    stage (ChunkedAuditEvaluator -> apply_hard_filters -> selective repair ->
+    re-audit) and ``translations_repaired.json`` / ``translations.json`` are
+    rewritten with the repaired map. Without the injected machinery the
+    steps stay recorded as skipped (A1 behavior) even when ``run_audit`` is
+    True — the runner never fabricates an audit.
     """
     if runtime is None:
         if router is None:
@@ -2335,6 +2378,7 @@ def run_chapter_strict(
             narrator_gender=narrator_gender, model_caller=model_caller,
             runtime=runtime, now_fn=now_fn, progress=progress_writer,
             usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+            b3_audit_repair=b3_audit_repair,
         )
 
     source_map = dict(source.source)
@@ -3634,6 +3678,7 @@ def _run_whole_chapter_strict(
     usage_writer: Any,
     started_at: str,
     wall_t0: float,
+    b3_audit_repair: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """V4.1 A1 whole-chapter generation: one call per chapter.
 
@@ -3661,6 +3706,7 @@ def _run_whole_chapter_strict(
             narrator_gender=narrator_gender, model_caller=model_caller,
             runtime=runtime, now_fn=now_fn, progress=progress,
             usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+            b3_audit_repair=b3_audit_repair,
         )
     finally:
         # Terminal teardown on EVERY path (success, resume-validation
@@ -3691,6 +3737,7 @@ def _run_whole_chapter_strict_impl(
     usage_writer: Any,
     started_at: str,
     wall_t0: float,
+    b3_audit_repair: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Whole-chapter generation/provenance body (see the wrapper above).
 
@@ -4057,6 +4104,42 @@ def _run_whole_chapter_strict_impl(
         "outcomes": generation_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # ------------------------------------------------------------------
+    # V4.1 B3 (concept §10 B3, §9.4): production audit/repair after
+    # whole-chapter generation. Runs when ``cfg.run_audit`` AND the B3
+    # machinery is injected; the repaired map becomes the final
+    # translations.json alias and the raw->repaired diff stage becomes
+    # real. Without the injected machinery the steps stay recorded as
+    # skipped (A1 behavior) — the runner never fabricates an audit.
+    # A B3 failure is recorded (step6/7/8 status "failed"), never a
+    # crash of the completed generation run.
+    # ------------------------------------------------------------------
+    raw_final_text_by_pid = dict(final_text_by_pid)
+    b3_audit_result: Optional[Any] = None
+    b3_failed: Optional[str] = None
+    if (
+        cfg.run_audit
+        and cfg.stop_after != "generation"
+        and b3_audit_repair is not None
+        and raw_final_text_by_pid
+    ):
+        try:
+            b3_audit_result = b3_audit_repair.run(
+                chapter_id=cfg.chapter_id,
+                source=source,
+                snapshot_hash=snapshot.snapshot_hash,
+                translation=raw_final_text_by_pid,
+                book_memory=memory.book_memory,
+                out_dir=cfg.out_dir,
+                config_identity=config.config_identity,
+                backend_identity_hash=cfg.backend.identity_hash,
+            )
+        except Exception as exc:  # noqa: BLE001 — a B3 failure is a record, not a crash
+            LOG.exception("B3 audit/repair failed for %s", cfg.chapter_id)
+            b3_failed = str(exc)
+        if b3_audit_result is not None:
+            final_text_by_pid = dict(b3_audit_result.translations_repaired)
+
     # Final alias. In A1 there is no repair/formatting, so the final chapter
     # equals the raw generator snapshot; the two files remain distinct so a
     # later A2/B stage can diverge them without losing the raw contract.
@@ -4067,8 +4150,8 @@ def _run_whole_chapter_strict_impl(
     # `translations.json` remains the FINAL alias — these files are
     # attribution snapshots, never a competing source of truth. In A2 the
     # whole-chapter flow has no repair/formatting yet (B/B2/C), so
-    # repaired == raw and the diff stages are empty; the files establish
-    # the mechanism B2/C will populate.
+    # repaired == raw and the diff stages are empty; B3 makes the
+    # raw->repaired stage real when the production audit/repair ran.
     if final_text_by_pid:
         repaired_path = cfg.out_dir / "translations_repaired.json"
         diffs_path = cfg.out_dir / "translation_diffs.json"
@@ -4093,7 +4176,7 @@ def _run_whole_chapter_strict_impl(
                 "config_identity": config.config_identity,
                 "diffs": {
                     "raw->repaired": _pid_diffs(
-                        final_text_by_pid, final_text_by_pid
+                        raw_final_text_by_pid, final_text_by_pid
                     ),
                     "repaired->final": _pid_diffs(
                         final_text_by_pid, final_text_by_pid
@@ -4134,9 +4217,25 @@ def _run_whole_chapter_strict_impl(
         "generation_record_id": generation_record_id,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    step6 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
-    step7 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
-    step8 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+    if b3_audit_result is not None:
+        step6 = b3_audit_result.step6
+        step7 = b3_audit_result.step7
+        step8 = b3_audit_result.step8
+    elif b3_failed is not None:
+        # The B3 machinery was configured but crashed — recorded honestly
+        # as failed, never silently downgraded to "skipped".
+        step6 = {"status": "failed", "error": b3_failed}
+        step7 = {"status": "failed", "error": b3_failed}
+        step8 = {"status": "failed", "error": b3_failed}
+    else:
+        # No B3 machinery was injected (or run_audit=False / generation
+        # incomplete) — the steps are recorded as skipped (A1 behavior),
+        # never fabricated as complete. Without machinery the run IS
+        # generation-only, so the A1 reason stays accurate even when the
+        # run_audit flag is on.
+        step6 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+        step7 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+        step8 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
 
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
@@ -4179,6 +4278,15 @@ def _run_whole_chapter_strict_impl(
             "whole_chapter_retry": {
                 "max_attempts": WholeChapterRetryPolicy().max_attempts,
             },
+            # V4.1 B3: the production audit/repair stage policy (the audit
+            # input budget is part of the config identity too).
+            "audit": {
+                "run": cfg.run_audit,
+                "entity_context_enabled": cfg.entity_context_enabled,
+                "max_input_tokens": cfg.audit_max_input_tokens,
+                "max_tokens": cfg.audit_max_tokens,
+                "overlap_tokens": cfg.audit_overlap_tokens,
+            },
         },
         "resumed_from_index": resumed_from_index,
         "halted_early": halted_early,
@@ -4209,6 +4317,11 @@ def _run_whole_chapter_strict_impl(
             "translations": str(translations_path),
             "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
             "journal": str(journal_path),
+            # V4.1 B3: audit/repair provenance + resume cache (present when
+            # the production audit stage ran).
+            "b3_audit_journal": str(cfg.out_dir / "audit_journal.ndjson"),
+            "b3_audit_cache": str(cfg.out_dir / "audit_cache_b3.json"),
+            "b3_entity_context_cache": str(cfg.out_dir / "entity_context_cache.json"),
         },
     }
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
