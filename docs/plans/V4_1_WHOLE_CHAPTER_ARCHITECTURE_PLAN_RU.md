@@ -263,7 +263,53 @@ $env:GGML_SYCL_FA_DECODE_KERNEL = "auto"
 | `-fa on`, `--jinja`, `--cache-ram 0`, `--ctx-checkpoints 0`, `-np 1`, `-ngl 99`, `-ncmoe 18`, `--load-mode mmap` | те же | без изменений |
 | Порт | 8094 | 8094 (без изменений) |
 
-**Qwen (аудитор):** параметры обновятся отдельно (владелец предоставит; текущее: `-c 49152`, `-ctk q8_0 -ctv q8_0`, `--reasoning-budget 0` для аудита — reasoning аудитора low/2048, см. §0.1/§6).
+### Qwen (аудитор; sycl-edge build, MTP-версия)
+
+**Решение владельца 2026-08-09:** локальный режим — **Gemma = переводчик, Qwen = аудитор** (независимые модели, соответствие Kocmi «аудитор ≠ генератор»). Полное соответствие литературе по независимости моделей.
+
+Актуальная команда запуска (проверено владельцем 2026-08-09; бинарь — `C:\src\llama-sycl-edge\build\bin\llama-server.exe`):
+
+```powershell
+cd C:\src\llama-sycl-edge\build\bin
+$Model = "C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+$env:GGML_SYCL_FA_DECODE_KERNEL = "auto"
+
+.\llama-server.exe `
+  -m $Model `
+  --spec-type draft-mtp `
+  --spec-draft-n-max 3 `
+  --device SYCL0 `
+  --host 127.0.0.1 `
+  --port 8094 `
+  -fit on `
+  -fitt 1280 `
+  -b 2048 `
+  -ub 512 `
+  -ctk q8_0 `
+  -ctv q4_0 `
+  -t 6 `
+  -tb 12 `
+  --load-mode mmap `
+  --reasoning on `
+  --reasoning-budget 8192 `
+  -np 1 `
+  -c 49152 `
+  -fa on `
+  --jinja `
+  --cache-ram 0 `
+  --ctx-checkpoints 0
+```
+
+Ключевые параметры Qwen (аудитор):
+
+| Параметр | Значение | Примечание |
+|---|---|---|
+| Модель | `Qwen3.6-35B-A3B-MTP\...-UD-Q4_K_XL.gguf` | **MTP-версия** (draft-mtp активен, `--spec-draft-n-max 3`) |
+| `--reasoning` | `on` | reasoning включён |
+| `--reasoning-budget` | **`8192`** | аудит chunked, фиксированный бюджет (см. §6/конспект B1) |
+| `-c` (контекст) | `49152` (49k) | как и у Gemma |
+| `-ctk` / `-ctv` | `q8_0` / `q4_0` | сжатый KV-cache |
+| Порт | 8094 | **тот же, что у Gemma** — серверы запускаются по очереди (генерация → остановка → аудит), не одновременно |
 
 **Влияние на identity/resume:** смена `server_args` (бинарь, `-c`, `-ctk/-ctv`, `--reasoning-budget`) входит в identity → старые out-dir'ы не resumable; `validate_reasoning_backend()` больше НЕ должен блокировать `--reasoning>0` для local (проверено владельцем: reasoning-budget 2048 работает).
 
@@ -358,47 +404,39 @@ B9 (`v4_book_run.py` → `glossary_candidates` → `_auto_promote_glossary`, с�
 
 ---
 
-## 6. Промпт аудита Qwen (новый, versioned)
+## 6. Промпт аудита (новый, versioned) — ОБНОВЛЕНО 2026-08-09
 
-Заменяет `QWEN_AUDIT_V1` (prompts_runtime.py). Категории расширены, добавлена консервативность.
+> **ВНИМАНИЕ:** решения этого раздела пересмотрены по результатам эмпирических тестов аудитора
+> (глава 0001, 2026-08-09). **Полный актуальный конспект — `docs/plans/V4_1_AUDIT_B1_RU.md`.**
+> Ниже — сводка изменений; детали (промпт v4 целиком, контекст, verifier, gold set) — в конспекте.
 
-```text
-You are a strict but conservative fidelity auditor for a Russian literary
-translation of an English fiction chapter. You are given the full chapter
-as two ordered PID maps: SOURCE (PID -> English) and TRANSLATION (PID ->
-Russian). Judge fidelity ONLY on these classes of errors:
+### Что изменилось vs первоначальный §6
 
-- omission: a source element (word, clause, name, number, idiom) is missing
-- addition: content not present in the source was introduced
-- referent: a pronoun/referent/named entity is wrong or ambiguous
-- invented gender: the source does not specify gender but the translation
-  assumes one (e.g. "a wannabe-architect" -> "архитекторша")
-- changed_fact: a number, time, quantity, or factual detail changed
-  ("Two past twelve" must stay 00:02, never "две минуты двенадцатого")
-- negation: the scope of a negation changed
+| Аспект | Было (устарело) | Стало (по тестам) |
+|---|---|---|
+| Форма вызова | whole-chapter одним вызовом | **chunked, K-балансировка по входу** (max_input 3600 @ R8192) |
+| Reasoning | low (remote) / 2048 (local) | **фиксированный 8192 на сервере** (не per-request; смена = identity-change) |
+| Промпт | короткий («when uncertain PASS») | **v4, 15 правил**: морфология invented_gender, negation/temporal, character state, multiple errors per PID, эллипсис, синкретизм, generic≠canonical, source precedence (§4 конспекта) |
+| Контекст | (не было) | **narrator/entity context (fallback-only, канонические имена БЕЗ generic)** + иерархия evidence |
+| Валидация | — | fail-closed: failed chunk ≠ «0 findings», `audit_complete=false` |
+| Post-audit | Qwen finding = кандидат | **двухуровневый verifier**: Tier A (hard, код) → Tier B (repair-as-verifier, Kocmi-safe) |
 
-Do NOT report: a different but valid synonym; a free idiomatic rephrasing;
-a construction that merely differs from the English syntax. A stylistically
-imperfect but semantically faithful translation is PASS. When uncertain,
-PASS — do not guess.
+### Модель аудита
 
-Return STRICT JSON, no markdown, no commentary:
-  issues: array of objects, each with:
-    pid: string
-    category: exactly one of 'omission' | 'addition' | 'referent' |
-              'invented_gender' | 'changed_fact' | 'negation'
-    severity: 'major' | 'minor'
-    confidence: 'high' | 'medium' | 'low'
-    note: short string describing the problem
-    excerpt: optional short quoted fragment from the translation
-If the chapter is faithful, return {"issues": []}.
+- **Gemma 4 26B A4B Q4_K_XL (local)** — основная: 4TP/3FP (57% precision), stable, no spill при R8192+MaxTokens 12000.
+- **Qwen — не подходит** (старый промпт: 20-25% precision, «Two past twelve = 1:02»); **открытый вопрос**: тест с промптом v4 (закрывает локальный Kocmi-safe режим Gemma→Qwen).
+- Same-model Gemma→Gemma: нарушение Kocmi; только diagnostic или с жёстким verifier.
+
+### Параметры
+
+```
+reasoning_budget = 8192 (сервер, --reasoning-budget)
+max_input_tokens = 3600 (= budget/2 × 0.88)  → K-балансировка чанков
+max_tokens       = 12000 (= reasoning + ~3500 content; llama считает вместе)
+RetryShrink      = по входу: lvl1 = /2, lvl2 = /3; subs с уникальными именами
 ```
 
-Механика:
-- Парсер категорий расширяется (`audit.py` QWEN_AUDIT_CATEGORIES): omission/addition/referent/invented_gender/changed_fact/negation; **`scene` НЕ входит в автоматический repair contract — допускается только diagnostic-only observation в будущем** (решение 2026-08-08).
-- **Schema дополнена `severity` (major/minor) + `confidence` (high/medium/low)** — данные для repair eligibility (B2): только major + high-confidence ремонтируются автоматически; minor/medium/low → diagnostic/debt.
-- Reasoning для Qwen-аудита: **low (remote) / 2048 (local)** — отдельный параметр от генерации (проверочная задача, high даёт переинтерпретацию).
-- Аудит whole-chapter одним вызовом: источник + перевод ~28k токенов → влезает в Qwen remote (1M) и Qwen local (49k после правки `-c`).
+
 
 ---
 
@@ -472,13 +510,17 @@ If the chapter is faithful, return {"issues": []}.
    **Locked-политика (решение владельца 2026-08-08, вариант «а»):** все существующие записи glossary считаются authoritative (presence-фильтр + always_include: конфликты/narrator/risk); отдельный locked-artifact/metadata НЕ вводится в этой версии (признак locked — будущее улучшение, если дрейф на не-locked парах станет проблемой). Фраза «+ locked» в промпте означает «весь established glossary, отфильтрованный по главе».
 4. Снапшоты `translations_repaired` + `translation_diffs.json` (§7): atomic write, identity в каждом, diff раздельно raw→repaired и repaired→final; `translations.json` остаётся финальным алиасом (не конкурентный источник).
 
-### B — single Qwen whole-chapter audit (новый контракт)
-1. `prompts_runtime.py`: `QWEN_AUDIT_V1` → v2 (§6; категории без scene; «when uncertain, PASS»).
-2. `audit.py`: `WholeChapterAuditEvaluator` (не per-chunk), chapter-level cache/resume identity (source + raw translation + audit template/policy + backend + reasoning); строгая валидация returned PID; категории + invented_gender/changed_fact/negation.
-3. **Fail-closed policy** (§3.2-аналогия): malformed/empty audit JSON или transport failure → debt/`accepted_degraded`, НИКОГДА не «0 findings»; Qwen finding = кандидат на repair, не доказательство.
-4. Reasoning Qwen-аудита: low (remote) / 2048 (local) — отдельный параметр.
-5. `runtime_local.example.yaml`: qwen `-c 49152` (+ **нагрузочный тест памяти ДО прогона**: запуск сервера вручную, проверка OOM/KV-cache — решение владельца 2026-08-08; иначе блокер на проде).
-6. Выпил Gemma-детектора (gemma_russian_review) и Qwen-fidelity-gate.
+### B — chunked audit + двухуровневый verifier (новый контракт, ОБНОВЛЕНО 2026-08-09)
+
+> Конспект решений: `docs/plans/V4_1_AUDIT_B1_RU.md`. Перенос логики harness `audit_v3.ps1` (K-балансировка, RetryShrink, fail-closed) в Python-код pipeline.
+
+1. `prompts_runtime.py`: `QWEN_AUDIT_V1` → **промпт v4** (15 правил, §4 конспекта; категории без scene; «when uncertain PASS» + узкие high-risk правила 5/6/7; multiple errors per PID).
+2. `audit.py`: `WholeChapterAuditEvaluator` → **ChunkedAuditEvaluator**: K-балансировка чанков (max_input = budget/2 × 0.88), RetryShrink по входу (lvl1=/2, lvl2=/3), fail-closed per-chunk (`audit_complete=false` при любом failed chunk), строгая валидация PID/категорий/severity/confidence, dedup по id+category (high confidence wins). Chapter-level cache/resume identity (source + raw translation + audit template/policy + backend + reasoning).
+3. **Контекст аудита**: narrator/entity context (канонические имена БЕЗ generic, fallback-only) + иерархия evidence (source > adjacent > chapter > bible > inference).
+4. **Двухуровневый verifier**: Tier A — HARD filters кодом (дубли, числа/время, entity-факты, PID/category) → repair напрямую; Tier B — семантические (referent/invented_gender без явных следов/negation scope) → **repair-as-verifier** (repair-модель = генератор, сначала верифицирует issue, PASS если аудитор неправ; Kocmi-safe).
+5. Reasoning: **фиксированный 8192 на сервере** (не per-request); `max_tokens = 12000` (llama считает reasoning+content вместе).
+6. Выпил Gemma-детектора (gemma_russian_review) и Qwen-fidelity-gate (заменены ChunkedAuditEvaluator).
+7. Fail-closed policy: failed/пустой audit chunk или transport failure → debt/`accepted_degraded`, НИКОГДА не «0 findings»; finding = кандидат, не доказательство (см. verifier).
 
 ### B2 — selective repair (batch) + контекстный re-audit
 1. Repair: **один batch-вызов на все eligible findings** (не per-finding, не per-region как в v4): промпт получает полный source + полную translation + список findings (каждый с PID/category/severity/confidence), модель возвращает правки только для явно разрешённых target PID, каждый фикс «fix only this, preserve all». Экономия: findings обычно 0–5 → 1 вызов вместо N.

@@ -60,6 +60,15 @@ server_args:
     - --ctx-checkpoints
     - "0"
   qwen:
+    # V4.1 (2026-08-09): аудитор, MTP-версия, reasoning 8192, контекст 49k.
+    # Модель: C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+    # Бинарь sycl-edge + env GGML_SYCL_FA_DECODE_KERNEL=auto (см. план §3.4).
+    - --spec-type
+    - draft-mtp
+    - --spec-draft-n-max
+    - "3"
+    - --device
+    - SYCL0
     - -fit
     - "on"
     - -fitt
@@ -71,19 +80,21 @@ server_args:
     - -ctk
     - q8_0
     - -ctv
-    - q8_0
+    - q4_0
     - -t
     - "6"
     - -tb
     - "12"
     - --load-mode
     - mmap
+    - --reasoning
+    - "on"
     - --reasoning-budget
-    - "0"
+    - "8192"
     - -np
     - "1"
     - -c
-    - "32768"
+    - "49152"
     - -fa
     - "on"
     - --jinja
