@@ -76,6 +76,26 @@ def _ok_text_response(text: str) -> _FakeResponse:
     )
 
 
+def _ok_reasoning_response(text: str, reasoning: str) -> _FakeResponse:
+    """llama-server style response: reasoning stream in ``reasoning_content``."""
+    return _FakeResponse(
+        status_code=200, text=text,
+        json_payload={
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": text,
+                        "reasoning_content": reasoning,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Basic happy path
 # ---------------------------------------------------------------------------
@@ -97,6 +117,22 @@ def test_complete_returns_assistant_text_and_records_call():
     assert record.http_status == 200
     assert record.finish_reason == "stop"
     assert record.wall_seconds >= 0
+    assert record.reasoning == ""
+
+
+def test_complete_records_reasoning_content():
+    """Regression (2026-08-10): llama-server returns the reasoning stream in
+    ``message.reasoning_content``; it must be captured in the call record so
+    audit ``_reasoning.txt`` artifacts are not empty."""
+    session = _FakeSession([_ok_reasoning_response("{\"ok\": true}", "thinking...")])
+    client = ApiClient(ApiClientConfig(), session=session)
+    out = client.complete(
+        [{"role": "user", "content": "ping"}],
+        max_tokens=64,
+        label="unit",
+    )
+    assert out == "{\"ok\": true}"
+    assert client.calls[0].reasoning == "thinking..."
 
 
 def test_complete_emits_json_object_response_format_by_default():
