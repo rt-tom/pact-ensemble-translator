@@ -19,8 +19,8 @@
 | Gemma R2048 chunk50 (v2) | 8 | 10 | 2 | 8 | 0 | 20% | низкий |
 | Gemma R8192 chunk50 (Тест 2) | 1 | 2 | 2 | 0 | 0 | 100% | — |
 | **Gemma R8192 chunk50 ctxfix (v3)** | 8 | **7** | **4** | 3 | 0 | **57%** | 50% |
-| **Qwen R8192 chunk50 ctxfix (v3)** | 8 | (идет прогон) | — | — | — | — | — |
-| Qwen R8192 prompt v4 | 8 | (следующий A/B) | — | — | — | — | — |
+| **Qwen R8192 chunk50 ctxfix (v3)** | 8 | 6 | 4 | 2 | 0 | 67% | ~50% |
+| **Qwen R8192 prompt v4.1 (out-of-sample, Gemma-перевод run_006)** | 8 | 40 | ~24-27 | ~13-16 | 0 | **60-70%** | ~66% критических |
 
 ### 1.2. Ключевые выводы
 
@@ -30,6 +30,10 @@
 4. **Спилл (reasoning → content)**: стохастичен, лечится адекватным `max_tokens` (llama считает reasoning+content ВМЕСТЕ) + RetryShrink.
 5. **Потерянные TP**: p00032 (youngest→младшему), p00035 (preoccupied→поглощена собой), motorcycle→велосипед (long-range entity) — лечатся промптом v4 (правила 5/6/7) и chapter entity memory (скриптом, НЕ промптом).
 6. **Стабильные FP (blind spots Gemma)**: русский эллипсис (p00075), морфологический синкретизм (p00151), локальная кореференция (p00309 он=кот/она=бабушка) — guardrails в промпте v4 (правила 9/10), кореференция НЕ лечится промптом (риск overfitting) → в verifier/entity layer.
+7. **OUT-OF-SAMPLE (2026-08-10, Qwen v4.1 аудит Gemma-перевода run_006, НЕ тот перевод, на котором тюнили промпт)**: 40 findings, precision ~60-70% (24-27 TP / 13-16 FP), recall ~2/3 критических ошибок. **Промпт НЕ выучил конкретные PID** — Qwen нашла новые классы ошибок вне dev-набора (p00322 scene, p00338, p00371, p00117 идиома, p00244). Подтверждает решение НЕ тюнить промпт дальше.
+   - **Новый FP-класс: dialogue tags** (said→позвала/буркнула/перебила: p00106/116/118/124/200) — литературная интерпретация speech verb ≠ fidelity defect; репортить в repair-промпт как expected-reject
+   - **Систематические пропуски Qwen**: русский gender agreement (p00132, p00189), implicit modality (p00201 «I could see you handing»→«Я видел, как ты»), p00333 (slip→тихо уйдёт) — известные слабости, НЕ лечим промптом (риск overfit), полагаемся на verify-before-repair и повторные прогоны
+   - **Severity у Qwen некалибрована** (реальные TP идут minor, стилистика major) → severity НЕ eligibility-фильтр для repair (см. §10 B2)
 
 ### 1.3. Решение владельца 2026-08-09: пары моделей локального режима
 
@@ -284,10 +288,12 @@ gold TP recall | gold negative rejection | new unknown issues (вручную �
 
 - **Repair-модель = генератор (Gemma local / DeepSeek remote)** — Kocmi-safe (аудитор ≠ ремонтник)
 - **Repair-as-verifier**: «The audit issue is a candidate, not an established fact. First independently verify against SOURCE and TRANSLATION. If incorrect → return PASS, no change. Only repair after confirming.»
+- **Eligibility (2026-08-10, out-of-sample ревью):** НЕ фильтровать по `severity` — у Qwen severity некалибрована (реальные TP идут minor, стилистика major). Eligible = `confidence=high` + allowed semantic categories; severity только в journal, не в eligibility. `changed_fact`/числовые — детерминированная проверка кодом (Tier A)
+- **Ожидаемый FP-класс: dialogue tags** (said → позвала/буркнула/перебила, p00116/118/124/200) — repair должен отклонять: литературная интерпретация speech verb ≠ fidelity defect
 - **Tier A findings** → repair напрямую; **Tier B** (включая entity relations) → verify-before-repair
 - **Batch**: один вызов на группу findings (как старый repair), потом контекстный re-audit затронутых PID
 - **Fail-closed**: failed repair chunk → debt, никогда не молчаливый PASS
-- **НЕ ремонтирует**: minor/medium/low confidence → debt/diagnostic
+- **НЕ ремонтирует**: low confidence / semantic вне allowed categories → debt/diagnostic
 
 **Acceptance:** p00010/p00193-тип → repair после verify; p00106-тип (FP) → PASS без изменений; регресс: 1324+ suite
 
