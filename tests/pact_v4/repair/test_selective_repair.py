@@ -372,7 +372,61 @@ def test_parse_repair_repair_pid_not_in_batch_fails_closed():
                      "repaired_translation": "x"}]
     })
     _, errors = parse_repair_batch(text, findings, {})
-    assert errors and "not a batch target" in errors[0]
+    assert errors and "does not match finding pid" in errors[0]
+
+
+def test_parse_repair_index_pid_mismatch_fails_closed():
+    # HIGH review finding (fea68de): a repair may name a batch target PID of
+    # a DIFFERENT index (index=1, pid of finding 2) — both are batch targets,
+    # so the old "is a batch target" check passed and committed the fix to
+    # the wrong paragraph. The index/PID contract requires the exact PID.
+    findings = (_eligible("p00193", 1), _eligible("p00106", 2))
+    text = json.dumps({
+        "results": [{
+            "index": 1, "decision": "repair", "pid": "p00106",
+            "repaired_translation": "fix for the other paragraph",
+            "reason": "oops",
+        }]
+    }, ensure_ascii=False)
+    results, errors = parse_repair_batch(
+        text, findings, {"p00193": "внучка", "p00106": "поправил я"}
+    )
+    assert not results
+    assert errors and "does not match finding pid" in errors[0]
+
+
+def test_parse_repair_multiple_findings_same_pid_each_index_must_match():
+    # Several findings may share one PID (e.g. invented_gender + omission on
+    # the same paragraph). Each index is still validated against its own
+    # finding's PID — a shared-PID group answers per index like distinct PIDs.
+    findings = (_eligible("p00193", 1), _eligible("p00193", 2))
+    text = json.dumps({
+        "results": [
+            {"index": 1, "decision": "repair", "pid": "p00193",
+             "repaired_translation": "первый фикс", "reason": "a"},
+            {"index": 2, "decision": "repair", "pid": "p00193",
+             "repaired_translation": "второй фикс", "reason": "b"},
+        ]
+    }, ensure_ascii=False)
+    results, errors = parse_repair_batch(
+        text, findings, {"p00193": "внучка"}
+    )
+    assert not errors
+    assert [r.pid for r in results] == ["p00193", "p00193"]
+
+
+def test_parse_repair_same_pid_wrong_index_fails_closed():
+    # Same-PID group: index=1 answering with index=2's pid is a mismatch
+    # even though the PID is a batch target.
+    findings = (_eligible("p00193", 1), _eligible("p00193", 2))
+    text = json.dumps({
+        "results": [{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "x", "reason": "a",
+        }]
+    })
+    _, errors = parse_repair_batch(text, findings, {"p00193": "внучка"})
+    assert errors and "missing" in errors[0]  # index 2 unanswered
 
 
 def test_parse_repair_noop_repair_fails_closed():
@@ -594,6 +648,44 @@ def test_cap_10_policy_limit_debt():
     assert any(POLICY_LIMIT_TAG in d for d in outcome.debt_trace)
     assert len(backend.requests) == 3  # 4+3+3 microbatches, no re-audit
     assert outcome.repair_complete is True
+    # MEDIUM review finding (fea68de): each microbatch outcome carries its
+    # ACTUAL batch index from the loop, never a hardcoded 1.
+    assert [b.batch_index for b in outcome.batches] == [1, 2, 3]
+
+
+def test_microbatch_outcomes_carry_unique_batch_indexes():
+    """Two microbatches (7 eligible > trigger 4) -> outcomes indexed 1, 2;
+    a FAILED second batch keeps its own index (regression for the hardcoded
+    ``batch_index=1`` bug)."""
+    issues = [
+        _issue(f"p{i:05d}", "invented_gender", note="n", confidence="high")
+        for i in range(1, 8)
+    ]
+    source = {f"p{i:05d}": f"source {i}" for i in range(1, 8)}
+    translation = {f"p{i:05d}": f"translation {i}" for i in range(1, 8)}
+    filtered = [
+        FilteredIssue(issue=iss, verdict=TIER_B, filter_name="semantic", reason="test")
+        for iss in issues
+    ]
+    backend = _TransportFailingBackend(
+        [
+            _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
+                              for i in range(1, 5)]),
+            _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
+                              for i in range(1, 4)]),
+        ],
+        fail_on=(2,),  # second microbatch transport failure
+    )
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert [len(b.findings) for b in outcome.batches] == [4, 3]
+    assert [b.batch_index for b in outcome.batches] == [1, 2]
+    assert outcome.batches[1].status == "FAILED"
+    assert outcome.repair_complete is False
+    assert any("failed repair batch 2" in d for d in outcome.debt_trace)
 
 
 def test_tear_zero_eligible_findings_skips_repair():
@@ -651,6 +743,50 @@ def test_invalid_batch_response_debt():
     assert outcome.batches[0].status == "FAILED"
     assert outcome.repair_complete is False
     assert outcome.committed == ()
+
+
+def test_mismatched_index_pid_debt_no_commit():
+    """HIGH review finding (fea68de): response index must match its finding
+    PID. ``index=1, pid=<finding-2's pid>`` must fail closed: the batch goes
+    to debt and NOTHING is committed (no repair on the wrong paragraph)."""
+    issues = [
+        _issue("p00193", "invented_gender", note="n", confidence="high"),
+        _issue("p00106", "addition", note="n", confidence="high"),
+    ]
+    source = {
+        "p00193": "Then you say it has to be a grandchild-",
+        "p00106": "\u201cTen,\u201d I said.",
+    }
+    translation = {
+        "p00193": "А потом заявила, что это должна быть внучка-",
+        "p00106": "\u2014 Десять, \u2014 поправил я.",
+    }
+    filtered = _hard_filtered(issues, source, translation)
+    assert all(f.verdict == TIER_B for f in filtered)
+
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {
+                # index 1 is finding p00193, but the model names p00106 — a
+                # batch target, yet the WRONG one for this index.
+                "index": 1, "decision": "repair", "pid": "p00106",
+                "repaired_translation": "— Десять, — сказал я.",
+                "reason": "confirmed",
+            },
+            {"index": 2, "decision": "pass", "reason": "dialogue tag, literary"},
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.batches[0].status == "FAILED"
+    assert outcome.repair_complete is False
+    assert outcome.committed == ()  # nothing committed despite a 'repair'
+    assert outcome.reaudit is None  # no committed repair -> no re-audit
+    assert any("failed repair batch" in d for d in outcome.debt_trace)
+    assert "does not match finding pid" in outcome.batches[0].error
 
 
 def test_failed_reaudit_debt_never_zero_findings():
@@ -751,6 +887,53 @@ def test_reaudit_scope_uses_changed_pids_and_neighbours():
     assert len(backend.requests) == 2  # one repair call + ONE re-audit
 
 
+def test_reaudit_request_carries_full_chapter_context_only():
+    """HIGH review finding (fea68de): the actual re-audit call must include
+    the FULL source + FULL current translation. Distant PIDs (far outside the
+    reportable scope) appear in the request as CONTEXT_ONLY; the scope PIDs
+    are the only reportable RE-AUDIT PAIRS."""
+    issue = _issue("p00005", "invented_gender", note="n", confidence="high")
+    source = {f"p{i:05d}": f"Source paragraph {i}." for i in range(1, 11)}
+    translation = {f"p{i:05d}": f"Перевод абзаца {i}." for i in range(1, 11)}
+    filtered = _hard_filtered([issue], source, translation)
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+        _reaudit_response([]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(reaudit_neighbour_window=2)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.committed != ()
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    assert outcome.reaudit.scope == ("p00003", "p00004", "p00005", "p00006", "p00007")
+    assert len(backend.requests) == 2
+    reaudit_prompt = backend.requests[1].messages[0].content
+    assert "CONTEXT_ONLY" in reaudit_prompt
+    # distant pairs (before AND after the scope) are present in the prompt
+    assert "Перевод абзаца 1." in reaudit_prompt
+    assert "Перевод абзаца 10." in reaudit_prompt
+    assert 'id="p00001"' in reaudit_prompt
+    assert 'id="p00010"' in reaudit_prompt
+    # only the scope is reportable
+    reaudit_section = reaudit_prompt.split(
+        "RE-AUDIT PAIRS (changed PIDs + neighbours)"
+    )[1]
+    assert 'id="p00005"' in reaudit_section
+    assert 'id="p00001"' not in reaudit_section
+    assert 'id="p00010"' not in reaudit_section
+    # the committed text is what the re-audit sees for the changed PID
+    assert "Исправленный перевод абзаца 5." in reaudit_prompt
+
+
 # ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------
@@ -805,6 +988,53 @@ def test_reaudit_prompt_marks_context_pairs_context_only():
     assert 'id="p00009"' in prompt
     assert "CONTEXT_ONLY" in prompt
     assert "NEVER report an issue for a CONTEXT_ONLY pair" in prompt
+
+
+def test_reaudit_prompt_includes_distant_pairs_as_context_only():
+    """HIGH review finding (fea68de): the re-audit input must be the FULL
+    source + FULL translation — distant pairs (far before/after the scope)
+    are present as CONTEXT_ONLY, and only the scope pairs are reportable
+    (RE-AUDIT PAIRS)."""
+    from pact_v4.audit.chunked_audit import AuditPair
+    pairs = [
+        AuditPair(pid=f"p{i:05d}", source=f"Source {i}.",
+                  translation=f"Перевод {i}.")
+        for i in range(1, 21)
+    ]
+    scope_pids = {f"p{i:05d}" for i in range(8, 13)}  # p00008..p00012
+    audit = [p for p in pairs if p.pid in scope_pids]
+    context = [p for p in pairs if p.pid not in scope_pids]
+    prompt = render_reaudit_prompt(
+        chapter_id="0001", audit_pairs=audit, context_pairs=context,
+    )
+    # distant pairs are in the prompt, marked CONTEXT_ONLY
+    assert 'id="p00001"' in prompt  # far before the scope
+    assert 'id="p00020"' in prompt  # far after the scope
+    assert "Перевод 1." in prompt
+    assert "Перевод 20." in prompt
+    assert "CONTEXT_ONLY" in prompt
+    # only the scope pairs are reportable
+    reaudit_section = prompt.split("RE-AUDIT PAIRS (changed PIDs + neighbours)")[1]
+    assert 'id="p00008"' in reaudit_section
+    assert 'id="p00012"' in reaudit_section
+    assert 'id="p00007"' not in reaudit_section
+    assert 'id="p00013"' not in reaudit_section
+
+
+def test_reaudit_prompt_full_scope_has_no_context_only():
+    """When the changed-PID count exceeds the full threshold, the whole
+    chapter is reportable — no pair is demoted to CONTEXT_ONLY."""
+    from pact_v4.audit.chunked_audit import AuditPair
+    pairs = [
+        AuditPair(pid=f"p{i:05d}", source=f"S{i}", translation=f"T{i}")
+        for i in range(1, 6)
+    ]
+    prompt = render_reaudit_prompt(chapter_id="0001", audit_pairs=pairs)
+    # No CONTEXT_ONLY section is rendered (the frozen template's own wording
+    # about CONTEXT_ONLY is fine; the block header must be absent).
+    assert "CONTEXT_ONLY (full chapter pairs" not in prompt
+    assert 'id="p00001"' in prompt
+    assert 'id="p00005"' in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -924,3 +1154,40 @@ def test_lifecycle_selective_repair_skips_reaudit_residency_when_nothing_committ
     evaluator(chapter_id="0001", source={"p00106": "Ten, I said."},
               translation={"p00106": "— Десять, — поправил я."}, filtered=filtered)
     assert router.resident_calls == ["gemma"]  # no re-audit -> no qwen
+
+
+def test_lifecycle_selective_repair_missing_reaudit_name_fails_closed():
+    """HIGH review finding (fea68de): a missing re-audit (Qwen) binding must
+    fail closed at construction with an explicit error — never a silent
+    fallback to the generator model (residency=Qwen vs HTTP model=Gemma)."""
+    from pact_v4.runtime.model_lifecycle_adapters import (
+        LifecycleSelectiveRepairEvaluator,
+    )
+
+    router = _FakeRouter()
+    with pytest.raises(ValueError, match="reaudit_model_name is required"):
+        LifecycleSelectiveRepairEvaluator(
+            router, repair_model_name="gemma-4-26b"  # no reaudit name
+        )
+
+
+def test_lifecycle_selective_repair_bindings_match_residency():
+    """The repair backend must name the generator (Gemma) and the re-audit
+    backend the auditor (Qwen) — residency and HTTP model agree."""
+    from pact_v4.runtime.model_lifecycle_adapters import (
+        LifecycleSelectiveRepairEvaluator,
+    )
+
+    router = _FakeRouter()
+    evaluator = LifecycleSelectiveRepairEvaluator(
+        router, repair_model_name="gemma-4-26b", reaudit_model_name="qwen-3.6-35b"
+    )
+    inner = evaluator._evaluator  # type: ignore[attr-defined]
+    assert inner._repair_backend.api.config.model == "gemma-4-26b"
+    assert inner._reaudit_backend.api.config.model == "qwen-3.6-35b"
+    assert inner._repair_backend.api.config.chat_url == (
+        f"{router.base_url}/v1/chat/completions"
+    )
+    assert inner._reaudit_backend.api.config.chat_url == (
+        f"{router.base_url}/v1/chat/completions"
+    )

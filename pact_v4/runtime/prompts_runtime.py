@@ -1069,14 +1069,17 @@ def render_reaudit_prompt(
     entity_context: str = "",
     template: ReviewerPrompt = QWEN_AUDIT_V4_1,
 ) -> str:
-    """Render a B2 single re-audit call (changed PIDs + neighbour window).
+    """Render a B2 single re-audit call (full chapter, scoped report).
 
     One Qwen call at the end of selective repair when at least one repair was
     committed (``V4_1_WHOLE_CHAPTER_ARCHITECTURE_PLAN_RU.md`` §10 B2.4): the
-    response scope is exactly the changed PIDs + their neighbour window
-    (``audit_pairs``); preceding pairs of the original chapter are supplied
-    as ``context_pairs`` (CONTEXT_ONLY — the model must NEVER report an issue
-    for them). Reuses the frozen v4.1 audit template and block layout.
+    INPUT is the full source + full current translation — ``audit_pairs``
+    plus ``context_pairs`` cover every chapter pair exactly once. The
+    RESPONSE scope is exactly the changed PIDs + their neighbour window
+    (``audit_pairs``); every pair outside that scope is ``context_pairs``
+    (CONTEXT_ONLY — the model must NEVER report an issue for them; the
+    caller's JSON validation additionally rejects any issue id outside the
+    scope). Reuses the frozen v4.1 audit template and block layout.
     """
     ctx_block = ""
     if narrator_context.strip():
@@ -1096,8 +1099,9 @@ def render_reaudit_prompt(
             _render_pair_block(p.pid, p.source, p.translation) for p in context_pairs
         )
         ctx_pairs_block = (
-            "\n\nCONTEXT_ONLY (for resolving speakers, referents, ellipsis, "
-            "continuity).\nNEVER report an issue for a CONTEXT_ONLY pair.\n\n"
+            "\n\nCONTEXT_ONLY (full chapter pairs outside the re-audit scope; "
+            "for resolving speakers, referents, ellipsis, continuity, and "
+            "cross-references).\nNEVER report an issue for a CONTEXT_ONLY pair.\n\n"
             f"{rendered_ctx}"
         )
     rendered_audit = "\n".join(

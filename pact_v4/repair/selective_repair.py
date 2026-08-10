@@ -36,9 +36,10 @@ review):
 * **TEaR** — 0 eligible findings -> repair is skipped entirely (no model
   calls, ``skipped=True``, ``repair_complete=True``).
 * **Single re-audit** — when at least one repair was committed, ONE Qwen call
-  re-audits the changed PIDs + their neighbour window (CONTEXT_ONLY pairs for
-  the preceding chapter context, frozen v4.1 template); when the number of
-  changed PIDs exceeds a threshold the re-audit covers the full chapter.
+  re-audits the changed PIDs + their neighbour window; the input is the FULL
+  source + FULL current translation (every pair outside the reportable scope
+  is marked CONTEXT_ONLY, frozen v4.1 template); when the number of changed
+  PIDs exceeds a threshold the re-audit covers the full chapter.
 
 Transport: the evaluator is backend-neutral over ``CompletionBackend`` (the
 same boundary the B1 chunked audit uses). The lifecycle wrapper
@@ -61,7 +62,6 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 from pact_v4.audit.chunked_audit import (
     AuditPair,
     audit_model_ref,
-    get_overlap_context,
     pairs_from_maps,
     validate_chunk_json,
 )
@@ -465,10 +465,14 @@ def parse_repair_batch(
     Fail-closed contract: the response must be a JSON object with a
     ``results`` array; every finding ``[index]`` must be answered exactly
     once; each result must carry ``decision`` ``pass``|``repair``; a repair
-    must name a PID that is a batch target and a NON-EMPTY
-    ``repaired_translation`` that actually differs from the current text
-    (a no-op "repair" is a contract violation -> error). ANY error -> the
-    whole batch is failed (debt), never a silent PASS.
+    must name the EXACT PID of the finding that ``index`` refers to (the
+    index/PID contract — a repair naming any other batch target would commit
+    the fix to the wrong paragraph) and a NON-EMPTY ``repaired_translation``
+    that actually differs from the current text (a no-op "repair" is a
+    contract violation -> error). When several findings share one PID each
+    index is still validated against its own finding's PID, so a shared-PID
+    group is answered per index exactly like a distinct-PID one. ANY error
+    -> the whole batch is failed (debt), never a silent PASS.
     """
     errors: list = []
     try:
@@ -481,7 +485,7 @@ def parse_repair_batch(
     if not isinstance(results, list):
         return (), ("'results' is not an array",)
     expected = {f.index for f in findings}
-    target_pids = {f.pid for f in findings}
+    finding_by_index = {f.index: f for f in findings}
     seen: set = set()
     out: list = []
     for item in results:
@@ -510,8 +514,12 @@ def parse_repair_batch(
             continue
         pid = item.get("pid")
         repaired = item.get("repaired_translation")
-        if not isinstance(pid, str) or pid not in target_pids:
-            errors.append(f"index {index}: repair pid {pid!r} is not a batch target")
+        expected_pid = finding_by_index[index].pid
+        if not isinstance(pid, str) or pid != expected_pid:
+            errors.append(
+                f"index {index}: repair pid {pid!r} does not match finding "
+                f"pid {expected_pid!r} (index/PID contract)"
+            )
             continue
         if not isinstance(repaired, str) or not repaired.strip():
             errors.append(f"index {index}: repair has empty repaired_translation")
@@ -683,6 +691,7 @@ class SelectiveRepairEvaluator:
                 source=source,
                 translation=translation,
                 findings=batch,
+                batch_index=batch_index,
             )
             batch_outcomes.append(outcome)
             finding_by_index = {f.index: f for f in batch}
@@ -750,6 +759,7 @@ class SelectiveRepairEvaluator:
         source: Mapping[str, str],
         translation: Mapping[str, str],
         findings: Sequence[EligibleFinding],
+        batch_index: int,
     ) -> RepairBatchOutcome:
         cfg = self._config
         prompt = render_selective_repair_prompt(
@@ -774,7 +784,7 @@ class SelectiveRepairEvaluator:
         except Exception as exc:  # CompletionError and any transport-level failure
             LOG.error("repair batch transport failure (%s): %s", type(exc).__name__, exc)
             return RepairBatchOutcome(
-                batch_index=1,
+                batch_index=batch_index,
                 status="FAILED",
                 findings=tuple(findings),
                 error=f"{type(exc).__name__}: {exc}",
@@ -784,14 +794,14 @@ class SelectiveRepairEvaluator:
         )
         if errors:
             return RepairBatchOutcome(
-                batch_index=1,
+                batch_index=batch_index,
                 status="FAILED",
                 findings=tuple(findings),
                 results=results,
                 error="; ".join(errors),
             )
         return RepairBatchOutcome(
-            batch_index=1,
+            batch_index=batch_index,
             status="GOOD",
             findings=tuple(findings),
             results=results,
@@ -826,13 +836,12 @@ class SelectiveRepairEvaluator:
             context_pairs: Tuple[AuditPair, ...] = ()
         else:
             audit_pairs = tuple(by_pid[pid] for pid in scope_pids if pid in by_pid)
-            context_pairs = get_overlap_context(
-                pairs,
-                audit_pairs[0].pid if audit_pairs else None,
-                max_tokens=400,
-                min_pairs=2,
-                max_pairs=6,
-            ) if audit_pairs else ()
+            # Full-chapter input (architecture plan §10 B2.4: "вход = полный
+            # source + полная translation"): every pair OUTSIDE the reportable
+            # scope is supplied as CONTEXT_ONLY so the model can resolve
+            # distant speakers/referents/continuity; validation still rejects
+            # any issue reported outside ``scope_pids`` (fail-closed scope).
+            context_pairs = tuple(p for p in pairs if p.pid not in scope_pids)
         prompt = render_reaudit_prompt(
             chapter_id=chapter_id,
             audit_pairs=audit_pairs,

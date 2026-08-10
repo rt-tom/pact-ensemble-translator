@@ -332,10 +332,14 @@ class LifecycleSelectiveRepairEvaluator:
 
     ``repair_model_name`` is the generator binding behind the router
     (``model_bindings["generator"]``); ``reaudit_model_name`` is the Qwen
-    binding (falls back to ``repair_model_name`` when the same object serves
-    both, e.g. in tests). ``context_size=49152`` matches the Qwen server's
-    ``-c 49152``; the repair prompt carries the full chapter maps, so the
-    generator context follows the same server profile.
+    binding — REQUIRED. There is deliberately NO fallback to
+    ``repair_model_name``: the re-audit is an auditor role (Kocmi-safe:
+    auditor ≠ repairer), so silently sending it to the generator would leave
+    residency saying Qwen while the HTTP request names Gemma. A missing
+    ``reaudit_model_name`` fails closed at construction, before any model
+    call. ``context_size=49152`` matches the Qwen server's ``-c 49152``;
+    the repair prompt carries the full chapter maps, so the generator
+    context follows the same server profile.
     """
 
     def __init__(
@@ -346,6 +350,13 @@ class LifecycleSelectiveRepairEvaluator:
         reaudit_model_name: Optional[str] = None,
         config: Optional[SelectiveRepairConfig] = None,
     ):
+        if not reaudit_model_name:
+            raise ValueError(
+                "reaudit_model_name is required: the B2 re-audit must run on "
+                "the Qwen auditor, never silently on the generator model "
+                "(Kocmi-safe contract); refusing to fall back to "
+                f"repair_model_name={repair_model_name!r}"
+            )
         self._router = router
         repair_api = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
@@ -357,10 +368,9 @@ class LifecycleSelectiveRepairEvaluator:
         repair_backend = LocalOpenAIBackend(
             api=ApiClient(repair_api, name="b2_selective_repair")
         )
-        reaudit_model = reaudit_model_name or repair_model_name
         reaudit_api = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
-            model=reaudit_model,
+            model=reaudit_model_name,
             timeout_seconds=1800.0,
             context_size=49152,
             temperature=0.0,
