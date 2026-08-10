@@ -1,8 +1,8 @@
 # B1 — Аудит перевода: решения и измерения (конспект 2026-08-09)
 
-> **Статус:** черновик для карточки B1. Основан на эмпирических тестах audit_v2/audit_v3 (скрипты в `D:\test folder\`).
+> **Статус:** черновик для карточки B1. Основан на эмпирических тестах audit_v2/audit_v3/audit_v4 (скрипты в `D:\test folder\`).
 > Обновляет устаревшие §6 (промпт аудита) и §8-B (single whole-chapter audit) основного плана.
-> Хранение контекста/промпта: **скрипт `audit_v3.ps1`** — единственный источник правды текущей версии промпта.
+> Хранение контекста/промпта: **скрипт `audit_v4.ps1`** — единственный source of truth промпта v4 (audit_v3 — архив, НЕ использовать для production-переноса).
 
 ---
 
@@ -49,11 +49,12 @@
 
 | Параметр | Значение | Основание |
 |---|---|---|
-| Модель аудита | **Gemma 4 26B A4B Q4_K_XL** (local, sycl-edge) | единственная стабильная; Qwen — открытый вопрос |
+| Модель аудита | **Qwen3.6-35B-A3B MTP Q4_K_XL** (local) | **финальное решение 2026-08-09**: независимая от Gemma (Kocmi); Gemma-audit — diagnostic-only |
 | Reasoning | **фиксированный 8192** на сервере (`--reasoning-budget 8192`) | reasoning — параметр СЕРВЕРА, не запроса; смена = перезапуск + identity-change |
 | Chunking | **K-балансировка по входу**: `K = ceil(total/max_input)`, `target = total/K`, жадный добор без превышения лимита | нет короткого «хвоста» (урок: greedy по лимиту дал chunk из 4 пар) |
 | `max_input_tokens` | **3600** = `reasoning_budget/2 × 0.88` (запас 12%) | формула «вход×2 = reasoning» подтверждена: R8192=8128 сработал, R4096=4096 нет |
 | `max_tokens` | **12000** = reasoning + ~3500 на content | llama считает reasoning+content вместе; 3000 при R8192 → LENGTH с 0 content |
+| **Полный input budget** | `fixed_prompt + narrator + entity + CONTEXT_ONLY + AUDIT_PAIRS ≤ calibrated_total` | ⚠️ `MaxInputTokens=3600` учитывает только pairs; entity-context (soft 500 / hard 800 токенов) вычитается из бюджета audit pairs или chunker учитывает полный prompt; overflow не обрезать молча — фиксировать невошедшие claims |
 | RetryShrink | **по входу, не по парам**: level 1 = MaxInputTokens/2, level 2 = /3; каждый sub с уникальным суффиксом `_lvlN_subM` | исправлен баг одинаковых имён; K-балансировка subs |
 | Результат chunk | `GOOD / LENGTH / SPILL / INVALID_JSON / EMPTY / FAILED_RETRIED` | failed chunk НИКОГДА ≠ issues=[] |
 | `audit_complete` | false при любом failed chunk | честное покрытие главы |
@@ -134,17 +135,20 @@
 - точные числа/время (нормализация: «Two past twelve» = 00:02)
 - явные дубли («в гости в гости»)
 - имена/строки
-- конфликт issue с явным source/entity фактом (nurse=Rich male)
+- **direct current-source fact** (явное число, явно названный объект — без semantic edge)
 - PID вне чанка / invalid category
+
+> ⚠️ **НЕ входит в Tier A:** chapter entity relations (включая `bike = motorcycle`). presence проверенных anchor/alias spans НЕ превращает отношение в Tier A.
 
 **Tier B — LLM semantic claim** — НЕ подтверждается «regex ничего не опроверг»:
 - referent, invented_gender без явных следов, idiom omission, negation scope, cross-paragraph
+- **chapter entity relations (всегда Tier B)**
 - → второй semantic confirmation (см. repair-as-verifier) ИЛИ diagnostic/debt
 
 ### 5.2. Repair-as-verifier (Kocmi-safe: repair-модель = генератор, аудитор ≠ генератор)
 
 ```
-Gemma auditor → HARD filters (Tier A) → repair/confirmation (Tier B)
+Qwen auditor → HARD filters (Tier A) → repair/confirmation (Tier B)
 ```
 Repair-промпт: «You are given a proposed fidelity issue. First verify the issue
 against SOURCE and TRANSLATION. If the auditor is wrong, return PASS and make no
@@ -152,12 +156,15 @@ change. Only if confirmed, return the corrected translation.»
 
 - бесплатный второй semantic decision (repair и так вызывается)
 - две независимые semantic оценки, без третьей модели/фазы
-- **НЕ нарушает Kocmi** при repair = генератор (DeepSeek/Gemma) и аудитор = другая модель (Gemma/Qwen)
+- **НЕ нарушает Kocmi**: repair = Gemma (генератор), аудитор = Qwen
+
+**Tier B должен получать:** полный current source PID, current translation PID, anchor evidence, alias evidence, достаточное окно между ними (или отдельные source windows) — но НЕ готовую формулировку как авторитетный факт.
 
 ### 5.3. Repair eligibility
 
-- Tier A (кодом подтверждённые) → repair напрямую
-- Tier B → через repair-as-verifier
+- Tier A (кодом подтверждённые, direct source fact) → repair напрямую
+- Tier B → через repair-as-verifier (включая все entity relations)
+- **`chapter_entity_context` никогда не является самостоятельным repair evidence** — finding, зависящий от semantic entity relation, всегда проходит Tier B
 - НЕ авто-ремонт: minor/medium/low confidence → debt/diagnostic
 - failed audit chunk → debt, никогда «0 findings» (fail-closed)
 
@@ -233,18 +240,34 @@ gold TP recall | gold negative rejection | new unknown issues (вручную �
 - **Правило 16: conservative ≠ ignore proven difference** — «не отбрасывай доказанную разницу как small/nuance»
 - Усилены правила 5 (морфология: vnuk/vnuchka, сын/дочь), 6 (asserted fact → perception/belief = семантическое изменение: "was right" != "thought I was right")
 
-### 8.3. Chapter entity context (файл chapter_entity_context_0001.txt)
+### 8.3. Chapter entity context — schema per-claim (v2, после ревью)
 
+**Статусы:** проверяется не вся запись, а её части: anchor span — `verified`; alias mention span — `verified`; `same_entity` relation — `candidate`.
+
+```yaml
+- entity: Rich
+  claims:
+    - kind: gender
+      value: male
+      status: verified                  # source-подтверждено (he/him в evidence)
+      evidence: [p00197]
+    - kind: alias_relation
+      value: man_in_scrubs = nurse = Rich
+      status: candidate                 # модельная гипотеза, НЕ авто-repair
+      evidence_windows: [[p00177, p00180], [p00197, p00208]]
 ```
-- entity: Blake's vehicle
-  aliases: motorcycle, bike
-  established_type: motorcycle
-  evidence: p00007, p00011
-- entity: Rich (the nurse / man in scrubs)
-  gender: male
-  aliases: the nurse, Rich, Nurse Rich
-  evidence: p00197, p00208, p00264, p00285
-```
+
+**Минимальная валидация кодом:**
+1. Schema/version/source hash/chapter ID
+2. Каждый PID существует
+3. Каждый quoted span дословно существует в source
+4. Ни одного translation-derived span
+5. Canonical type явно присутствует в anchor evidence
+6. Alias surface присутствует в своём PID
+7. Gender evidence содержит проверяемую связь с нужным referent (не просто he/him где-то)
+8. Неподтверждённая semantic coreference → `candidate`, не `verified`
+
+**Правило:** `chapter_entity_context` никогда не авторизует repair самостоятельно; finding, зависящий от semantic relation, всегда Tier B.
 
 ### 8.4. Regression-цели A/B (v3.1-old vs v4)
 
@@ -266,7 +289,40 @@ gold TP recall | gold negative rejection | new unknown issues (вручную �
 
 ## 8. Ссылки
 
-- Harness: `D:\test folder\audit_v3.ps1` (промпт v4 внутри, единственный источник правды)
+- Harness: `D:\test folder\audit_v4.ps1` (промпт v4 внутри, единственный source of truth; audit_v3 — архив)
 - Контекст полов: `D:\test folder\narrator_context_0001.txt` (канонические имена только)
-- Результаты: `D:\test folder\audit_v3_gemma_r8192.json`, `audit_v3_gemma_r8192_ctxfix.json` (+_review_and_recommendations.md)
+- Entity context (ручной пример): `D:\test folder\chapter_entity_context_0001.txt`
+- Результаты: `D:\test folder\audit_v3_gemma_r8192.json`, `audit_v3_gemma_r8192_ctxfix.json`, `audit_v4_qwen_r8192*.json` (+_review_and_recommendations.md)
 - Разборы ревьюера: в чате 2026-08-09
+
+---
+
+## 9. B1.1 — entity-context: тест-набор (утверждён 2026-08-09)
+
+> Экстрактор: **Qwen** (source-only prepass, 1 вызов на главу). Включение: **после** baseline B и чистого A/B. Entity-context никогда не авторизует repair (всегда Tier B).
+
+### 9.1. 8 кейсов
+
+| # | Тип | Кейс | Что измеряет |
+|---|---|---|---|
+| 1 | Positive | один объект, разные названия: motorcycle→bike | extraction recall |
+| 2 | Positive | один человек, разные обозначения: man in scrubs→nurse→Rich | extraction recall |
+| 3 | Negative | motorcycle и отдельный bicycle/bike в одной главе | FP: ложная связь |
+| 4 | Negative | два разных nurse | FP |
+| 5 | Negative | generic role совпадает с именем/ролью из book memory, но это другой персонаж | FP: poisoned |
+| 6 | Negative | один повторяющийся термин = два разных объекта | FP |
+| 7 | Provenance | book memory: неправильный gender, source опровергает | poisoned context |
+| 8 | Provenance | все spans существуют, но evidence window не доказывает same_entity edge | ложная «валидация по наличию слов» |
+
+**Кейс №8 ключевой** — отделяет проверку spans от проверки семантической связи.
+
+### 9.2. Порядок
+
+1. Baseline B: чистый chunked аудит Qwen БЕЗ entity-context (после удаления test leakage из audit_v4.ps1)
+2. A/B: без контекста / ручной gold / авто-extraction (Qwen, 1 вызов на главу)
+3. 8 кейсов выше
+4. Только после приемлемой precision — entity-context в production (B1.1)
+
+### 9.3. Test leakage (критично, убрать ДО прогонов)
+
+В audit_v4.ps1 пример `Blake's bike / vehicle = motorcycle, evidence p00007` (строки ~469/484) **зашит в промпт** — Qwen ссылалась на него в reasoning и после этого репортила p00097/p00098. Текущий результат доказывает только «применение подсказки», не «извлечение». **Пример в промпте заменить на нейтральный (не из Pact-главы 0001); контекст — только через `-EntityContext`.**

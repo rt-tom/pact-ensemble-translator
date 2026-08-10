@@ -410,6 +410,8 @@ B9 (`v4_book_run.py` → `glossary_candidates` → `_auto_promote_glossary`, с�
 > (глава 0001, 2026-08-09). **Полный актуальный конспект — `docs/plans/V4_1_AUDIT_B1_RU.md`.**
 > Ниже — сводка изменений; детали (промпт v4 целиком, контекст, verifier, gold set) — в конспекте.
 
+> **ВАЖНО (2026-08-09): whole-chapter single-call аудит ЗАМЕНЁН chunked** (эмпирически: спилл reasoning→content на длинных чанках, бюджет 8192 не покрывает 28k входа одним вызовом; решение зафиксировано в §8-B и конспекте B1).
+
 ### Что изменилось vs первоначальный §6
 
 | Аспект | Было (устарело) | Стало (по тестам) |
@@ -423,9 +425,12 @@ B9 (`v4_book_run.py` → `glossary_candidates` → `_auto_promote_glossary`, с�
 
 ### Модель аудита
 
-- **Gemma 4 26B A4B Q4_K_XL (local)** — основная: 4TP/3FP (57% precision), stable, no spill при R8192+MaxTokens 12000.
-- **Qwen — не подходит** (старый промпт: 20-25% precision, «Two past twelve = 1:02»); **открытый вопрос**: тест с промптом v4 (закрывает локальный Kocmi-safe режим Gemma→Qwen).
-- Same-model Gemma→Gemma: нарушение Kocmi; только diagnostic или с жёстким verifier.
+**Production local (финальное, 2026-08-09): Gemma = translator/repair-verifier; Qwen = extractor/auditor. Gemma-audit — diagnostic-only.**
+
+- **Qwen3.6-35B-A3B MTP (local)** — аудитор: независимая модель от Gemma (Kocmi «аудитор ≠ генератор»); контекст 49k, reasoning 8192, промпт v4.
+- **Gemma 4 26B A4B (local)** — переводчик (генератор) и repair-verifier (Tier B).
+- **Gemma-audit — только diagnostic** (same-model с переводчиком нарушает Kocmi; не используется в production).
+- Qwen-аудит с промптом v4 — в процессе тестирования (результаты дополнят матрицу конспекта §1.1).
 
 ### Параметры
 
@@ -517,7 +522,7 @@ RetryShrink      = по входу: lvl1 = /2, lvl2 = /3; subs с уникаль
 1. `prompts_runtime.py`: `QWEN_AUDIT_V1` → **промпт v4** (15 правил, §4 конспекта; категории без scene; «when uncertain PASS» + узкие high-risk правила 5/6/7; multiple errors per PID).
 2. `audit.py`: `WholeChapterAuditEvaluator` → **ChunkedAuditEvaluator**: K-балансировка чанков (max_input = budget/2 × 0.88), RetryShrink по входу (lvl1=/2, lvl2=/3), fail-closed per-chunk (`audit_complete=false` при любом failed chunk), строгая валидация PID/категорий/severity/confidence, dedup по id+category (high confidence wins). Chapter-level cache/resume identity (source + raw translation + audit template/policy + backend + reasoning).
 3. **Контекст аудита**: narrator/entity context (канонические имена БЕЗ generic, fallback-only) + иерархия evidence (source > adjacent > chapter > bible > inference).
-4. **Двухуровневый verifier**: Tier A — HARD filters кодом (дубли, числа/время, entity-факты, PID/category) → repair напрямую; Tier B — семантические (referent/invented_gender без явных следов/negation scope) → **repair-as-verifier** (repair-модель = генератор, сначала верифицирует issue, PASS если аудитор неправ; Kocmi-safe).
+4. **Двухуровневый verifier**: Tier A — HARD filters кодом (дубли, числа/время, direct current-source факты, PID/category) → repair напрямую; Tier B — семантические (referent/invented_gender без явных следов/negation scope/**chapter entity relations**) → **repair-as-verifier** (repair-модель = генератор, сначала верифицирует issue, PASS если аудитор неправ; Kocmi-safe).
 5. Reasoning: **фиксированный 8192 на сервере** (не per-request); `max_tokens = 12000` (llama считает reasoning+content вместе).
 6. Выпил Gemma-детектора (gemma_russian_review) и Qwen-fidelity-gate (заменены ChunkedAuditEvaluator).
 7. Fail-closed policy: failed/пустой audit chunk или transport failure → debt/`accepted_degraded`, НИКОГДА не «0 findings»; finding = кандидат, не доказательство (см. verifier).
