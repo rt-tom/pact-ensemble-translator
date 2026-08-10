@@ -26,6 +26,10 @@ from __future__ import annotations
 
 from typing import Mapping, Optional, Sequence, Tuple
 
+from pact_v4.audit.entity_extractor import (
+    BackendEntityExtractor,
+    BackendEntityExtractorConfig,
+)
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import PromptBundle
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
@@ -210,3 +214,43 @@ class LifecycleGemmaAuditEvaluator:
     def __call__(self, *, chunk_id: str, translation: Mapping[str, str]) -> str:
         self._router.ensure_resident(GEMMA_MODEL_KEY)
         return self._evaluator(chunk_id=chunk_id, translation=translation)
+
+
+class LifecycleQwenEntityExtractor:
+    """B1.2 ChapterEntityContext extractor over the router's Qwen.
+
+    Same single-resident contract as the other ``Lifecycle*`` wrappers: the
+    source-only entity extractor (``pact_v4.audit.entity_extractor``) is
+    transport-neutral, so this wrapper supplies the local ``llama-server``
+    transport (``LocalOpenAIBackend`` over an ``ApiClient`` pointed at the
+    router's base URL) and ensures Qwen is resident before every call.
+    temperature=0.0: the extraction input is the whole chapter source and
+    the output feeds a per-chapter cache, so determinism is required
+    (konspekt V4_1_AUDIT_B1_RU.md §10 B1.2).
+
+    The extractor NEVER authorizes repair — its output is a hint for the
+    auditor (Tier B rule, §5.3), so this call never gates anything.
+    """
+
+    def __init__(self, router: ModelRouter, *, model_name: str,
+                 config: Optional[BackendEntityExtractorConfig] = None):
+        self._router = router
+        cfg = config or BackendEntityExtractorConfig()
+        api_config = ApiClientConfig(
+            chat_url=f"{router.base_url}/v1/chat/completions",
+            model=model_name,
+            timeout_seconds=1800.0,
+            context_size=32768,
+            temperature=0.0,
+        )
+        backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
+        self._extractor = BackendEntityExtractor(
+            backend,
+            config=BackendEntityExtractorConfig(
+                max_tokens=cfg.max_tokens, label=cfg.label, retry=cfg.retry,
+            ),
+        )
+
+    def __call__(self, *, chapter_id: str, source: Mapping[str, str]) -> str:
+        self._router.ensure_resident(QWEN_MODEL_KEY)
+        return self._extractor(chapter_id=chapter_id, source=source)
