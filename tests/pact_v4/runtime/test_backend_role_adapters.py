@@ -162,6 +162,10 @@ def test_model_caller_returns_text_and_sends_rendered_prompt():
     assert request.response_schema is not None
     # Default reasoning=0 keeps the baseline: no request_options at all.
     assert request.request_options == {}
+    # AF: the generation request omits the neutral system prompt and the
+    # all-disabled tools map (serve 1.4.7 output-budget quirk — see
+    # CompletionRequest.omit_system_tools).
+    assert request.omit_system_tools is True
 
 
 def test_model_caller_transports_reasoning_via_request_options():
@@ -237,6 +241,9 @@ def test_qwen_evaluator_parses_verdict_and_sends_review_prompt():
     assert request.label == "phase2c/qwen_fidelity"
     # max_tokens scales with chunk size on top of the floor.
     assert request.max_output_tokens >= 16384
+    # AF: the omit_system_tools carve-out is generation-only — the Qwen
+    # fidelity gate keeps the historical system+tools body (default False).
+    assert request.omit_system_tools is False
 
 
 def test_qwen_evaluator_returns_failed_gate_on_completion_error():
