@@ -22,6 +22,15 @@ logic:
   severity ``major/minor``, confidence ``high/medium/low``, ``id`` must be a
   PID of the CURRENT chunk; a failed chunk is never silently read as
   ``issues=[]`` — ``audit_complete`` is false whenever any chunk failed;
+* fail-closed transport: a ``CompletionBackend.complete`` exception (e.g.
+  ``CompletionError``) becomes a failed ``TRANSPORT_ERROR`` chunk with the
+  diagnostic + artifact mapping instead of escaping the evaluator;
+  RetryShrink is an input-size strategy and never re-dispatches transport
+  failures;
+* fail-closed coverage: a source PID missing from the translation map raises
+  ``CoverageError`` before any model call (never a silent partial audit);
+  an empty pair set is rejected the same way (never ``audit_complete=True``
+  with 0 chunks);
 * deterministic dedup by ``id+category`` (higher confidence wins);
 * per-issue debug metadata ``_debug: {chunk, reasoning_file}`` attached at
   collection time (sub-chunks carry their own ``reasoning_file``).
@@ -105,22 +114,35 @@ class AuditPair:
     translation: str
 
 
+class CoverageError(ValueError):
+    """Source PIDs missing from the translation map (rejected before any
+    model call — a partial map must never silently claim a full-chapter
+    audit, concept §5.3: failure → debt, never silent success)."""
+
+
 def pairs_from_maps(
     source: Mapping[str, str], translation: Mapping[str, str]
 ) -> Tuple[AuditPair, ...]:
     """Build ordered ``AuditPair``s from parallel PID maps (source order).
 
-    PIDs present in ``source`` but missing from ``translation`` are skipped
-    (the harness does the same ``ContainsKey`` guard), so a partial
-    translation is audited for the pairs that exist.
+    Fail-closed coverage: a source PID missing from ``translation`` raises
+    ``CoverageError`` listing the missing PIDs instead of being silently
+    skipped (the harness's ``ContainsKey`` guard could make a 400-PID
+    chapter claim ``audit_complete=True`` while whole PIDs were never
+    audited). PIDs are emitted in SOURCE insertion order (not ``sorted`` —
+    ``sorted`` breaks the declared "source order" for non-zero-padded /
+    non-lexical PID maps).
     """
-    pairs: List[AuditPair] = []
-    for pid in sorted(source):
-        tr = translation.get(pid)
-        if tr is None:
-            continue
-        pairs.append(AuditPair(pid=pid, source=source[pid], translation=tr))
-    return tuple(pairs)
+    missing = [pid for pid in source if translation.get(pid) is None]
+    if missing:
+        raise CoverageError(
+            f"translation map missing {len(missing)} source PID(s): "
+            f"{missing}"
+        )
+    return tuple(
+        AuditPair(pid=pid, source=source[pid], translation=translation[pid])
+        for pid in source
+    )
 
 
 # Roles that may serve the audit call, in priority order (same fallback
@@ -191,6 +213,24 @@ def _canonical_name(name: str) -> bool:
     return any(ch.isupper() for ch in name)
 
 
+def _name_present_in_source(name: str, source_text: str) -> bool:
+    """True when the canonical name appears as a whole token/phrase in source.
+
+    Word-boundary matching (``\\b`` around the escaped name, whitespace runs
+    collapsed to ``\\s+`` between the words of a multi-word name) — a
+    substring like ``Ann`` never matches inside ``announced`` and ``Rich``
+    never matches inside ``richness`` (review finding: plain ``in``-matching
+    poisoned the narrator context with false positives). Python's ``re`` is
+    Unicode-aware for ``str`` patterns, so Cyrillic / other-script names get
+    correct word boundaries too.
+    """
+    words = [w for w in re.split(r"\s+", name.strip()) if w]
+    if not words:
+        return False
+    pattern = r"\b" + r"\s+".join(re.escape(w) for w in words) + r"\b"
+    return re.search(pattern, source_text, re.IGNORECASE) is not None
+
+
 def build_narrator_context(
     book_memory: Mapping[str, Any],
     source_text: str,
@@ -244,11 +284,10 @@ def build_narrator_context(
                 if name and gender:
                     lookup[name] = gender
 
-    lower_source = source_text.lower()
     for name in sorted(lookup):
         if not _canonical_name(name):
             continue
-        if name.lower() not in lower_source:
+        if not _name_present_in_source(name, source_text):
             continue
         lines.append(f"{name}: {lookup[name]}")
 
@@ -626,6 +665,13 @@ class ChunkedAuditEvaluator:
         cfg = self._config
         model_ref = audit_model_ref(self._backend)
 
+        if not pairs:
+            raise CoverageError(
+                f"no audit pairs for chapter {chapter_id!r}: empty "
+                f"source/translation input rejected before any model call "
+                f"(fail-closed — never audit_complete with 0 chunks)"
+            )
+
         pair_budget = validate_input_budget(
             template=cfg.template,
             pairs=pairs,
@@ -659,7 +705,10 @@ class ChunkedAuditEvaluator:
                 out_base=out_base,
                 suffix="",
             )
-            if cfg.retry_shrink and meta.status != "GOOD":
+            # RetryShrink is an INPUT-SIZE strategy (LENGTH / INVALID_JSON /
+            # EMPTY / SPILL): a TRANSPORT_ERROR cannot be fixed by shrinking
+            # the chunk, so it is recorded as failed as-is (fail-closed).
+            if cfg.retry_shrink and meta.status != "GOOD" and meta.status != "TRANSPORT_ERROR":
                 meta = self._retry_shrink(
                     chapter_id=chapter_id,
                     chunk_index=chunk_index,
@@ -773,19 +822,45 @@ class ChunkedAuditEvaluator:
             template=cfg.template,
         )
         request = self._request(chapter_id=chapter_id, prompt=prompt, model_ref=model_ref)
-        response = self._backend.complete(request)
-        content = response.text or ""
-        reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
-
+        chunk_pids = [p.pid for p in chunk_pairs]
         file_stem = (
             f"{out_base}_{suffix}_chunk{chunk_index}"
             if suffix else f"{out_base}_chunk{chunk_index}"
         )
+        try:
+            response = self._backend.complete(request)
+        except Exception as exc:  # CompletionError and any transport-level failure
+            LOG.error(
+                "audit chunk %s transport failure (%s): %s",
+                chunk_index, type(exc).__name__, exc,
+            )
+            self._write_artifacts(
+                out_dir=out_dir, file_stem=file_stem,
+                content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                reasoning="",
+            )
+            return ChunkMeta(
+                chunk=chunk_index,
+                first_pid=chunk_pids[0],
+                last_pid=chunk_pids[-1],
+                pair_count=len(chunk_pairs),
+                context_count=len(context_pairs),
+                status="TRANSPORT_ERROR",
+                finish_reason=None,
+                content_chars=0,
+                reasoning_chars=0,
+                json_parse="transport_error",
+                validation_errors=(f"{type(exc).__name__}: {exc}",),
+                reasoning_file=f"{file_stem}_reasoning.txt",
+                issues=(),
+            )
+        content = response.text or ""
+        reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+
         reason_file = self._write_artifacts(
             out_dir=out_dir, file_stem=file_stem, content=content, reasoning=reasoning,
         )
 
-        chunk_pids = [p.pid for p in chunk_pairs]
         clean_json = re.sub(r"```json|```", "", content).strip()
         parsed = None
         try:
@@ -878,6 +953,12 @@ class ChunkedAuditEvaluator:
                     out_base=out_base,
                     suffix=f"lvl{level}_sub{sub_index}",
                 )
+                if sub_meta.status == "TRANSPORT_ERROR":
+                    # transport failure is not input-size: re-queueing would
+                    # just multiply dead calls; record the sub as failed and
+                    # stop shrinking it.
+                    level_ok = False
+                    continue
                 if sub_meta.status not in ("GOOD", "GOOD_RETRIED"):
                     level_ok = False
                     new_pending.extend(sub_pairs)
@@ -966,6 +1047,7 @@ __all__ = [
     "ChunkedAuditEvaluator",
     "ChunkedAuditOutcome",
     "ChunkMeta",
+    "CoverageError",
     "GENERIC_DESCRIPTIONS",
     "HARNESS_VERSION",
     "PROMPT_VERSION",

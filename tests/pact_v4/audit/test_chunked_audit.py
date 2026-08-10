@@ -27,6 +27,7 @@ from pact_v4.audit.chunked_audit import (
     ChunkedAuditConfig,
     ChunkedAuditEvaluator,
     ChunkedAuditOutcome,
+    CoverageError,
     build_greedy_chunks,
     build_narrator_context,
     classify_chunk,
@@ -41,6 +42,7 @@ from pact_v4.runtime.backend_protocol import (
     BackendCallRecord,
     BackendDescriptor,
     CompletionBackend,
+    CompletionError,
     CompletionRequest,
     CompletionResponse,
 )
@@ -90,6 +92,35 @@ class ScriptedBackend(CompletionBackend):
 
     def call_records(self) -> Sequence[BackendCallRecord]:
         return []
+
+
+class _TransportFailingBackend(ScriptedBackend):
+    """ScriptedBackend that raises ``CompletionError`` on selected calls.
+
+    ``fail_on`` is a set of 1-based call indices to fail with a transport
+    error; the remaining calls consume the script normally. Used to pin the
+    fail-closed transport contract: a ``CompletionError`` from ``complete``
+    must become a failed ``TRANSPORT_ERROR`` chunk (audit_complete=false),
+    never escape the evaluator.
+    """
+
+    def __init__(
+        self,
+        script: Sequence[CompletionResponse],
+        fail_on: Sequence[int] = (1,),
+    ) -> None:
+        super().__init__(script)
+        self._fail_on = set(fail_on)
+        self._call_index = 0
+
+    def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self._call_index += 1
+        self.requests.append(request)
+        if self._call_index in self._fail_on:
+            raise CompletionError(f"simulated transport failure (call {self._call_index})")
+        if not self._script:
+            raise AssertionError("ScriptedBackend: script exhausted")
+        return self._script.pop(0)
 
 
 def _ok_response(issues: Sequence[Mapping[str, str]], finish: Optional[str] = "stop") -> CompletionResponse:
@@ -190,6 +221,39 @@ def test_overlap_context_from_original_chapter() -> None:
     # min 2 pairs even for a tiny budget
     tiny = get_overlap_context(pairs, "p00003", max_tokens=1)
     assert len(tiny) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed coverage: missing PIDs / empty input (RV fix)
+# ---------------------------------------------------------------------------
+
+
+def test_pairs_from_maps_missing_translation_raises_coverage_error() -> None:
+    """A source PID without a translation must raise (never a silent
+    partial audit that claims audit_complete=True)."""
+    with pytest.raises(CoverageError) as excinfo:
+        pairs_from_maps({"p1": "s1", "p2": "s2"}, {"p1": "t1"})
+    assert "p2" in str(excinfo.value)
+
+
+def test_pairs_from_maps_preserves_source_insertion_order() -> None:
+    """PIDs are emitted in SOURCE insertion order, not sorted() — the
+    declared "source order" must hold for non-zero-padded / non-lexical
+    PID maps."""
+    source = {"ch7": "a", "ch2": "b", "ch10": "c"}
+    translation = {"ch7": "x", "ch2": "y", "ch10": "z"}
+    pairs = pairs_from_maps(source, translation)
+    assert [p.pid for p in pairs] == ["ch7", "ch2", "ch10"]
+
+
+def test_evaluator_rejects_empty_pairs_before_model_call() -> None:
+    """Empty input is rejected before any model call (never
+    audit_complete=True with 0 chunks)."""
+    backend = ScriptedBackend([])
+    evaluator = ChunkedAuditEvaluator(backend)
+    with pytest.raises(CoverageError):
+        evaluator(chapter_id="0001", pairs=[])
+    assert backend.requests == []
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +506,88 @@ def test_fail_closed_on_validation_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed transport: CompletionError -> TRANSPORT_ERROR chunk (RV fix)
+# ---------------------------------------------------------------------------
+
+
+def test_transport_failure_is_fail_closed_not_escaped() -> None:
+    """A ``CompletionError`` from ``complete`` must become a failed chunk
+    (audit_complete=false), never escape the evaluator."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    backend = _TransportFailingBackend(
+        script=[_ok_response([])],  # consumed by chunk 2
+        fail_on=(1,),               # chunk 1 transport failure
+    )
+    evaluator = ChunkedAuditEvaluator(backend)
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert not outcome.audit_complete
+    assert outcome.failed_chunks == (1,)
+    assert outcome.successful_chunks == 1
+    assert outcome.chunks[0]["status"] == "TRANSPORT_ERROR"
+    assert outcome.issue_count == 0  # failed chunk is never issues=[]
+    # the diagnostic is recorded on the failed chunk meta
+    assert outcome.chunks[0]["reasoning_file"].endswith("_reasoning.txt")
+
+
+def test_transport_failure_continues_other_chunks() -> None:
+    """Transport failure on chunk 2 must not abort chunk 1's findings."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    backend = _TransportFailingBackend(
+        script=[_ok_response([_issue("p00001", category="omission")])],
+        fail_on=(2,),
+    )
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(retry_shrink=False),
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert not outcome.audit_complete
+    assert outcome.failed_chunks == (2,)
+    # chunk 1's finding is still collected (with its own _debug)
+    assert outcome.issue_count == 1
+    assert outcome.issues[0]["id"] == "p00001"
+    assert outcome.issues[0]["_debug"]["chunk"] == 1
+
+
+def test_transport_failure_skips_retry_shrink() -> None:
+    """RetryShrink is an input-size strategy: a TRANSPORT_ERROR chunk is
+    recorded as failed as-is (no dead sub-chunk calls)."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    backend = _TransportFailingBackend(
+        script=[_ok_response([])],
+        fail_on=(1,),
+    )
+    evaluator = ChunkedAuditEvaluator(backend)  # retry_shrink=True default
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert not outcome.audit_complete
+    assert outcome.chunks[0]["status"] == "TRANSPORT_ERROR"
+    # exactly one call per chunk: no shrink sub-chunks against a dead transport
+    assert len(backend.requests) == 2
+
+
+def test_transport_failure_during_retry_shrink_is_fail_closed() -> None:
+    """A transport error inside RetryShrink marks the chunk failed and does
+    not re-queue the sub (no dead sub-chunk call multiplication)."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 26)]  # 1 chunk (25 pairs)
+    # parent LENGTH -> shrink level 1: sub1 (p00001..18) transport-fails,
+    # sub2 (p00019..25) GOOD -> chunk still failed (sub1 not audited)
+    backend = _TransportFailingBackend(
+        script=[
+            _ok_response([], finish="length"),               # parent LENGTH
+            _ok_response([_issue("p00019", category="omission")]),  # lvl1 sub2 GOOD
+        ],
+        fail_on=(2,),  # lvl1 sub1 transport failure
+    )
+    evaluator = ChunkedAuditEvaluator(backend)
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert not outcome.audit_complete
+    assert outcome.failed_chunks == (1,)
+    assert outcome.chunks[0]["status"] == "FAILED_RETRIED"
+    # the audited sub's issue is kept, the failed sub contributes nothing
+    assert outcome.issue_count == 1
+    assert outcome.issues[0]["id"] == "p00019"
+
+
+# ---------------------------------------------------------------------------
 # RetryShrink (by input: /2 then /3; overlap from ORIGINAL chapter)
 # ---------------------------------------------------------------------------
 
@@ -537,6 +683,61 @@ def test_build_narrator_context_canonical_only_generic_excluded() -> None:
 
 def test_build_narrator_context_empty_without_memory() -> None:
     assert build_narrator_context({}, "some text") == ""
+
+
+def test_build_narrator_context_word_boundary_no_substring_false_matches() -> None:
+    """Canonical names match as whole words, never as substrings: ``Ann``
+    must not match inside ``announced``, ``Rich`` must not match inside
+    ``richness`` (poisoned-context regression)."""
+    book_memory = {
+        "pov": {"source_name": "Blake Thorburn", "gender": "male"},
+        "characters": {
+            "Ann": {"gender": "female"},
+            "Rich": {"gender": "male"},
+            "Blake Thorburn": {"gender": "male"},
+        },
+    }
+    # "Ann" appears only inside "announced", "Rich" only inside "richness"
+    source_text = "The man announced a plan about the richness of the soil."
+    context = build_narrator_context(book_memory, source_text)
+    # narrator is added unconditionally (the narrator IS present by definition)
+    assert "narrator: Blake Thorburn (gender male)" in context
+    assert "Ann" not in context
+    assert "Rich" not in context
+
+
+def test_build_narrator_context_word_boundary_standalone_matches() -> None:
+    """The same names DO match as standalone words (true positives kept)."""
+    book_memory = {
+        "pov": {"source_name": "Blake Thorburn", "gender": "male"},
+        "characters": {
+            "Ann": {"gender": "female"},
+            "Rich": {"gender": "male"},
+            "Molly Walker": {"gender": "female"},
+        },
+    }
+    source_text = "Ann called Rich, and Molly Walker followed."
+    context = build_narrator_context(book_memory, source_text)
+    assert "Ann: female" in context
+    assert "Rich: male" in context
+    assert "Molly Walker: female" in context
+
+
+def test_build_narrator_context_multiworld_and_unicode_boundaries() -> None:
+    """Multi-word names and non-ASCII names respect word boundaries."""
+    book_memory = {
+        "pov": {"source_name": "Blake Thorburn", "gender": "male"},
+        "characters": {
+            "Jean-Luc": {"gender": "male"},
+            "Марина": {"gender": "female"},
+        },
+    }
+    source_text = "Jean-Luc answered; Марина laughed. Jean-Lucasse was not here."
+    context = build_narrator_context(book_memory, source_text)
+    assert "Jean-Luc: male" in context
+    assert "Марина: female" in context
+    # "Jean-Lucasse" must not match "Jean-Luc" as a substring
+    assert "Jean-Lucasse" not in context
 
 
 # ---------------------------------------------------------------------------
