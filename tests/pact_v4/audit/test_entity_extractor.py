@@ -902,3 +902,15 @@ def test_canonical_type_in_anchor_span_passes():
     assert report.is_clean()
     assert len(context.entities) == 1
     assert context.entities[0].canonical_type == "motorcycle"
+
+
+def test_extractor_max_tokens_covers_reasoning_budget():
+    """Regression (2026-08-10): max_tokens must cover the server reasoning
+    budget + content headroom. llama-server counts reasoning AND content
+    together against max_tokens; the old 4096 < 8192 budget let the model
+    spend everything on reasoning and return empty content
+    (EmptyResponseError after retries on the real Qwen server)."""
+    cfg = BackendEntityExtractorConfig()
+    assert cfg.max_tokens == 12000
+    assert cfg.max_tokens > 8192  # server --reasoning-budget
+    assert cfg.max_tokens >= 8192 + 3000  # budget + content headroom

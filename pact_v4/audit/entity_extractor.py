@@ -916,9 +916,18 @@ class EntityContextCache:
 
 @dataclass(frozen=True)
 class BackendEntityExtractorConfig:
-    """Extraction call settings (source-only, temp=0, deterministic)."""
+    """Extraction call settings (source-only, temp=0, deterministic).
 
-    max_tokens: int = 4096
+    ``max_tokens`` must cover the server's reasoning budget PLUS content
+    headroom — the llama-server counts reasoning and content TOGETHER
+    against ``max_tokens`` (same contract as the audit's
+    ``DEFAULT_MAX_TOKENS = 12000`` = reasoning 8192 + ~3500 headroom).
+    The previous 4096 value was pre-reasoning: with ``--reasoning-budget
+    8192`` the model spent the whole budget on reasoning and emitted zero
+    content tokens (EmptyResponseError after retries).
+    """
+
+    max_tokens: int = 12000
     label: str = "b1.2/entity_extractor"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
