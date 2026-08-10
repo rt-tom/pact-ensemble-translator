@@ -635,6 +635,65 @@ def test_single_quoted_source_string_after_prose_apostrophe_rejected():
     assert result["p00211"].filter_name == "explicit_string"
 
 
+# --- RV3.1 fixes (t_bc65b9c7): unmatched/ambiguous delimiter fail-safe -------
+
+
+def test_unmatched_single_quote_in_note_fails_safe_to_tier_b():
+    # HIGH finding: the note cites a valid preserved 'STOP' pair AND carries
+    # a stray unmatched single quote ("malformed quote '"). The extracted
+    # set may be incomplete, so explicit_string must NOT reject — the
+    # representative claim fails safe to TIER_B (previously
+    # REJECTED/explicit_string on the valid subset).
+    issue = _issue(
+        "p00212", "changed_fact",
+        note="the sign text 'STOP' changed; malformed quote '",
+        excerpt="'STOP'",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00212": "The sign read 'STOP'."},
+        translation={"p00212": "На табличке было написано 'STOP'."},
+    )
+    assert result["p00212"].verdict == TIER_B
+    assert result["p00212"].filter_name == "semantic"
+
+
+def test_unmatched_double_quote_in_note_fails_safe_to_tier_b():
+    # The double-quote equivalent of the HIGH finding: a valid preserved
+    # "STOP" pair plus a stray unmatched double quote in the note. Same
+    # fail-safe contract -> TIER_B, never REJECTED/explicit_string.
+    issue = _issue(
+        "p00213", "changed_fact",
+        note='the sign text "STOP" changed; malformed quote "',
+        excerpt='"STOP"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00213": 'The sign read "STOP".'},
+        translation={"p00213": 'На табличке было написано "STOP".'},
+    )
+    assert result["p00213"].verdict == TIER_B
+    assert result["p00213"].filter_name == "semantic"
+
+
+def test_valid_single_quote_pair_still_rejects_without_stray_quote():
+    # Guard: the fail-safe must not weaken the valid rejection path — a
+    # clean single-quoted citation of a preserved current-source string is
+    # still REJECTED/explicit_string (no stray delimiter in the note).
+    issue = _issue(
+        "p00214", "changed_fact",
+        note="the sign text 'STOP' was supposedly changed",
+        excerpt="'STOP'",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00214": "The sign read 'STOP'."},
+        translation={"p00214": "На табличке было написано 'STOP'."},
+    )
+    assert result["p00214"].verdict == REJECTED
+    assert result["p00214"].filter_name == "explicit_string"
+
+
 # --- RV2 fixes (t_e9815310): B1.2 evidence dict PIDs -------------------------
 
 

@@ -45,8 +45,9 @@ Deterministic contracts (RV t_ac2fb507 fixes, 2026-08-10):
    pronoun is accepted and documented; full resolution is B1.2 scope.
 
 3. **Explicit strings (§5.1 names/strings): REJECT-only, verbatim
-   preservation, issue-scoped (RV t_a926d0d6 fix).** The issue must itself
-   cite an explicitly quoted string — matched quote pairs in its
+   preservation, issue-scoped (RV t_a926d0d6 fix), fail-safe on
+   unmatched/ambiguous delimiters (RV t_bc65b9c7 fix).** The issue must
+   itself cite an explicitly quoted string — matched quote pairs in its
    note/excerpt; a prose apostrophe such as ``character's`` is NOT a quote
    hint — and that quoted content must provably match a string quoted in
    the CURRENT source pair. Only then, if that exact string appears
@@ -55,7 +56,11 @@ Deterministic contracts (RV t_ac2fb507 fixes, 2026-08-10):
    transliterated or absent variant is NEVER ``CONFIRMED`` (that would be a
    semantic edge) — it stays ``TIER_B``. Without the provable match
    (unrelated quoted content, prose apostrophes, unquoted names/objects)
-   the issue fails safe to ``TIER_B`` (they need entity resolution).
+   the issue fails safe to ``TIER_B`` (they need entity resolution). If
+   the note/excerpt contains ANY unmatched or ambiguous quote delimiter
+   (e.g. ``... malformed quote '`` next to a valid ``'STOP'`` pair), the
+   extracted set may be incomplete, so ``explicit_string`` must NOT reject
+   — the representative claim fails safe to ``TIER_B``.
 
 CRITICAL (§5.3, card rule 5): ``chapter_entity_context`` is NEVER Tier A.
 An issue whose PID participates in the chapter entity context (anchor/alias
@@ -445,7 +450,9 @@ def _quoted_strings(text: str) -> frozenset:
     A single-quote opener must not be preceded by a word character and a
     single-quote closer must not be followed by one, so a prose
     apostrophe (``character's``) is never mistaken for a quote pair
-    (RV t_2829fb4c fix).
+    (RV t_2829fb4c fix). Stray/unmatched delimiters are ignored here —
+    callers that need fail-safe semantics must also consult
+    ``_unmatched_quote_delimiter``.
     """
     result: set = set()
     for res in _QUOTED_STRING_RES:
@@ -454,6 +461,47 @@ def _quoted_strings(text: str) -> frozenset:
             if value:
                 result.add(value)
     return frozenset(result)
+
+
+_WORD_CHAR_RE = re.compile(r"\w")
+
+
+def _unmatched_quote_delimiter(text: str) -> bool:
+    """True if ``text`` carries an unmatched or ambiguous quote delimiter.
+
+    A quote character is unmatched when it is not part of any matched
+    double/single-quote pair or RU guillemet span. Single quotes are only
+    ever delimiters when NOT preceded by a word character, so prose
+    apostrophes (``character's``, ``James'``) never count; a stray opener
+    with no closer (e.g. ``... malformed quote '`` or ``... malformed
+    quote "``) is flagged. This is the fail-safe signal for the
+    explicit-string filter: if the note/excerpt contains ANY quoted
+    content the parser cannot fully pair, the filter must not reject.
+    """
+    if not text:
+        return False
+    covered = [False] * len(text)
+    for res in _QUOTED_STRING_RES:
+        for match in res.finditer(text):
+            for i in range(match.start(), match.end()):
+                covered[i] = True
+    for i, ch in enumerate(text):
+        if covered[i]:
+            continue
+        if ch in ('"', "\u00ab", "\u00bb"):
+            # double quotes / guillemets have no prose form: any delimiter
+            # outside a matched pair is unmatched/ambiguous
+            return True
+        if ch == "'" and not (i > 0 and _WORD_CHAR_RE.match(text[i - 1])):
+            # a single quote NOT preceded by a word char is a real delimiter
+            # candidate; if it did not pair, the quoted content is ambiguous
+            return True
+    return False
+
+
+def _note_text(issue: Mapping[str, Any]) -> str:
+    """Joined note/excerpt text of an issue (the quoted-content probe)."""
+    return " ".join(str(issue.get(key, "")) for key in ("note", "excerpt"))
 
 
 def _note_quoted_strings(issue: Mapping[str, Any]) -> frozenset:
@@ -467,8 +515,17 @@ def _note_quoted_strings(issue: Mapping[str, Any]) -> frozenset:
     the current source (RV t_a926d0d6 fix). An empty result means the
     issue cites no quoted string -> the filter must fail safe to TIER_B.
     """
-    text = " ".join(str(issue.get(key, "")) for key in ("note", "excerpt"))
-    return _quoted_strings(text)
+    return _quoted_strings(_note_text(issue))
+
+
+def _note_has_unmatched_quotes(issue: Mapping[str, Any]) -> bool:
+    """True if the issue's note/excerpt carries unmatched/ambiguous quoted
+    content (RV t_bc65b9c7 fail-safe): a stray quote delimiter that is not
+    part of a valid pair (e.g. ``... malformed quote '``). When this fires
+    the explicit-string filter must NOT reject — the cited quoted set may
+    be incomplete, so the representative claim fails safe to TIER_B.
+    """
+    return _unmatched_quote_delimiter(_note_text(issue))
 
 
 def _source_gender(text: str) -> str | None:
@@ -610,11 +667,13 @@ def _filter_one(
     #    edge -> TIER_B, never REJECTED and never CONFIRMED; a subset match
     #    is not enough. Unrelated source-only quoted strings do not affect
     #    the cited set. Without the provable complete match (unrelated
-    #    quoted content, prose apostrophes, unquoted names/objects) the
-    #    issue fails safe to TIER_B (§5.1 fail-safe).
+    #    quoted content, prose apostrophes, unquoted names/objects,
+    #    UNMATCHED/AMBIGUOUS quote delimiters — RV t_bc65b9c7 fail-safe:
+    #    a stray quote in the note/excerpt means the cited set may be
+    #    incomplete) the issue fails safe to TIER_B (§5.1 fail-safe).
     if category in _STRING_CATEGORIES:
         note_strings = _note_quoted_strings(issue)
-        if note_strings:
+        if note_strings and not _note_has_unmatched_quotes(issue):
             if note_strings <= _quoted_strings(source_text) and note_strings <= _quoted_strings(translation_text):
                 return FilteredIssue(
                     issue,
