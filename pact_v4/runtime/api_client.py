@@ -72,6 +72,10 @@ class CallRecord:
     # grammar-reject fallback and transient retries each count). Used to
     # derive an honest ``retry_count`` in backend provenance.
     attempt_count: int = 1
+    # llama-server reasoning stream (``message.reasoning_content``), kept for
+    # provenance / debug artifacts (audit ``_reasoning.txt``). Best-effort:
+    # may be empty when the server returns no reasoning block.
+    reasoning: str = ""
 
 
 class ApiClient:
@@ -168,7 +172,7 @@ class ApiClient:
         finally:
             wall = time.perf_counter() - started
 
-        text, finish_reason, usage = self._extract_message(data)
+        text, finish_reason, usage, reasoning = self._extract_message(data)
         self.calls.append(CallRecord(
             label=label,
             model=self._cfg.model,
@@ -180,6 +184,7 @@ class ApiClient:
             usage=usage or {},
             wall_seconds=round(wall, 3),
             attempt_count=attempts,
+            reasoning=reasoning or "",
         ))
         return text
 
@@ -321,7 +326,7 @@ class ApiClient:
     @staticmethod
     def _extract_message(
         data: Mapping[str, Any]
-    ) -> tuple[str, Optional[str], Dict[str, Any]]:
+    ) -> tuple[str, Optional[str], Dict[str, Any], str]:
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -332,4 +337,7 @@ class ApiClient:
             ) from exc
         finish_reason = choice.get("finish_reason") if isinstance(choice, Mapping) else None
         usage = data.get("usage") if isinstance(data, Mapping) else None
-        return content, finish_reason, usage if isinstance(usage, dict) else {}
+        # llama-server returns the reasoning stream in
+        # ``message.reasoning_content`` (kept separate from ``content``).
+        reasoning = message.get("reasoning_content") or ""
+        return content, finish_reason, usage if isinstance(usage, dict) else {}, reasoning
