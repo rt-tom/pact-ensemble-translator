@@ -1,1 +1,47 @@
+<<<<<<< HEAD
 """B1: chunked Qwen fidelity audit (production port of audit_v4.ps1)."""
+=======
+"""B1.2 ChapterEntityContext extraction (source-only Qwen prepass)."""
+
+from pact_v4.audit.entity_extractor import (
+    BackendEntityExtractor,
+    BackendEntityExtractorConfig,
+    ChapterEntityContext,
+    ENTITY_CONTEXT_SCHEMA,
+    ENTITY_EXTRACTION_V1,
+    EXTRACTOR_VERSION,
+    EntityClaim,
+    EntityContextCache,
+    EntityExtractionResult,
+    EntityRecord,
+    ValidationEntry,
+    ValidationReport,
+    entity_context_cache_key,
+    extract_entity_context,
+    parse_model_output,
+    render_entity_extraction_prompt,
+    validate_entity_context,
+    with_entity_context_metadata,
+)
+
+__all__ = [
+    "BackendEntityExtractor",
+    "BackendEntityExtractorConfig",
+    "ChapterEntityContext",
+    "ENTITY_CONTEXT_SCHEMA",
+    "ENTITY_EXTRACTION_V1",
+    "EXTRACTOR_VERSION",
+    "EntityClaim",
+    "EntityContextCache",
+    "EntityExtractionResult",
+    "EntityRecord",
+    "ValidationEntry",
+    "ValidationReport",
+    "entity_context_cache_key",
+    "extract_entity_context",
+    "parse_model_output",
+    "render_entity_extraction_prompt",
+    "validate_entity_context",
+    "with_entity_context_metadata",
+]
+>>>>>>> origin/dev/v4.1-reasoning-transport
