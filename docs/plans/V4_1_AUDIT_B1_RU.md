@@ -201,7 +201,66 @@ gold TP recall | gold negative rejection | new unknown issues (вручную �
 3. **Chapter entity extraction** — отдельный этап (entity map с evidence PID, gender, aliases) → для long-range consistency (motorcycle) и Tier B invented_gender; можно кэшировать per-chapter
 4. **Speaker attribution** (metadata per PAIR) — только когда уверенно; иначе не аннотировать (wrong speaker = poison)
 5. ~~Параметры Qwen server~~ — **получены владельцем 2026-08-09**, зафиксированы в §3.4 основного плана и runtime_local.example.yaml
-6. Harness audit_v3.ps1 → production-интеграция в B1: переносить логику (K-балансировка, RetryShrink, fail-closed) в Python-код pipeline
+6. Harness audit_v4.ps1 → production-интеграция в B1: переносить логику (K-балансировка, RetryShrink, overlap, fail-closed) в Python-код pipeline
+
+---
+
+## 8. Обновление 2026-08-09: audit_v4 — новый harness + промпт v4
+
+> Реализовано в `D:\test folder\audit_v4.ps1` (синтаксис проверен). Основание — разбор полного Qwen-run и reasoning по проблемным PID (p00035, p00093, p00136, p00138, p00163, p00184/186, p00236).
+
+### 8.1. Что добавил ревьюер (10 пунктов) и как реализовано
+
+| # | Рекомендация | Реализация в audit_v4.ps1 |
+|---|---|---|
+| 1 | **CONTEXT_ONLY left-overlap** между чанками | `Get-OverlapContext`: предыдущие пары из ОРИГИНАЛЬНОЙ главы до ~400 токенов (мин 2, макс 6 пар); блок «CONTEXT_ONLY — NEVER report issue»; валидация не пропускает context id |
+| 2 | Overlap сохраняется при retry/split | под-чанки получают контекст из **оригинального pairList**, не из разрезанного child |
+| 3 | **ChapterEntityContext** (source-derived) | `-EntityContext` + блок «CHAPTER ENTITY FACTS — SOURCE-DERIVED» (правило 9 промпта) |
+| 4 | Entity facts один раз на главу | готовый файл `chapter_entity_context_0001.txt` (Blake's vehicle + Rich/nurse, evidence PID) |
+| 5 | Bible ≠ Entity раздельно | два отдельных блока: BOOK CONTEXT (fallback) / CHAPTER ENTITY FACTS (source-derived); иерархия: current source > overlap > chapter facts > Bible > inference |
+| 6 | Speaker/addressee не кодом | правило 4 промпта: speaker/addressee/referent — три роли; «Слышала?» = адресат (female), не говорящий |
+| 7 | **Debug mapping** issue→chunk→reasoning | `_debug: {chunk, reasoning_file}` в каждом issue + `reasoning_file` в chunk-мета |
+| 8 | Чанки НЕ уменьшать | MaxInputTokens 3600, K-балансировка без изменений (8 вызовов на главу) |
+| 9 | Retry не плодит вызовы | только LENGTH/invalid JSON → split; нормальный путь = 1 вызов/чанк |
+| 10 | Менять prompt+context, не модель | Qwen R8192, тот же перевод, те же бюджеты |
+
+### 8.2. Новые элементы промпта v4 (vs v3.1)
+
+- **CONTEXT_ONLY-пары** (передаются, но НЕ аудируются) — лечит p00136 (Молли-говорит, но под-чанк начинался с её реплики → модель решила, что это Blake)
+- **CHAPTER ENTITY FACTS** — лечит p00236 (bike→велосипед: факт `motorcycle` установлен в p00007, вне чанка)
+- **Правило 4: speaker/addressee/referent — разные роли** — лечит p00163 («Слышала?» — женская форма описывает АДРЕСАТА, не говорящего Питера)
+- **Правило 8: object identity** (cart/trolley != table, motorcycle != bicycle)
+- **Правило 16: conservative ≠ ignore proven difference** — «не отбрасывай доказанную разницу как small/nuance»
+- Усилены правила 5 (морфология: vnuk/vnuchka, сын/дочь), 6 (asserted fact → perception/belief = семантическое изменение: "was right" != "thought I was right")
+
+### 8.3. Chapter entity context (файл chapter_entity_context_0001.txt)
+
+```
+- entity: Blake's vehicle
+  aliases: motorcycle, bike
+  established_type: motorcycle
+  evidence: p00007, p00011
+- entity: Rich (the nurse / man in scrubs)
+  gender: male
+  aliases: the nurse, Rich, Nurse Rich
+  evidence: p00197, p00208, p00264, p00285
+```
+
+### 8.4. Regression-цели A/B (v3.1-old vs v4)
+
+**Должен начать ловить:** p00032 (youngest→младшему), p00035 (preoccupied), p00093 (уже не знал), p00138 (was right→казалось), p00184/186 (trolley→столик), p00236 (bike→велосипед, через entity fact)
+
+**Должен продолжать:** p00010, p00013, p00132, p00193
+
+**Не должен повторить:** p00136 (Molly→narrator), p00163 (Слышала), p00106 (Десяти), p00075 (её [руки]), p00151 (тётей), nurse-male формы
+
+### 8.5. Исправлен баг retry-shrink (из Qwen-run)
+
+**Баг:** при успешном shrink `$pending` не очищался → условие `$pending.Count -eq 0` проваливалось → **ложный FAILED_RETRIED** при фактически полном покрытии (issues из под-чанков при этом собирались корректно — врал только статус/`audit_complete`).
+
+**Фикс:** `$pending = @()` при `$okAllSubs` → `GOOD_RETRIED` + честный `audit_complete`.
+
+**Урок:** issues из под-чанков не терялись, но статус чанка и `audit_complete` могли врать — проверять оба при разборе результатов.
 
 ---
 
