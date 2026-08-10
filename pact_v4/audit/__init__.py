@@ -1,7 +1,14 @@
-<<<<<<< HEAD
-"""B1: chunked Qwen fidelity audit (production port of audit_v4.ps1)."""
-=======
-"""B1.2 ChapterEntityContext extraction (source-only Qwen prepass)."""
+"""Pact v4.1 audit package (B-phase).
+
+Submodules (task cards in docs/plans/V4_1_AUDIT_B1_RU.md §10):
+
+* ``chunked_audit`` — B1: ChunkedAuditEvaluator (chunked Qwen audit, prompt
+  v4.1, overlap, RetryShrink, fail-closed validation).
+* ``hard_filters`` — B1.1: Tier A hard deterministic filters applied to
+  findings BEFORE repair (0 model calls).
+* ``entity_extractor`` — B1.2: ChapterEntityContext extractor (Qwen
+  source-only prepass).
+"""
 
 from pact_v4.audit.entity_extractor import (
     BackendEntityExtractor,
@@ -44,4 +51,3 @@ __all__ = [
     "validate_entity_context",
     "with_entity_context_metadata",
 ]
->>>>>>> origin/dev/v4.1-reasoning-transport
