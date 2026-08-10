@@ -20,14 +20,17 @@ from pact_v4.phase2.generation import PromptBundle
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig, ApiClientError
 from pact_v4.runtime.backend_protocol import CompletionError
 from pact_v4.runtime.backend_role_adapters import BackendModelCaller, BackendModelCallerConfig
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 
 
-# Phase 2B calls are JSON-object output with chunk-sized max_tokens. The
-# upper bound is generous (8k is well above what a single 20-PID chunk
-# needs at the provisional temperatures) but leaves headroom for any
-# future A/B template that may need to emit more verbose JSON.
-DEFAULT_MAX_TOKENS = 8192
+# Phase 2B generation calls produce JSON-object output. The output budget is
+# 32768 tokens (V4.1 A1, owner decision 2026-08-08): whole-chapter generation
+# emits the full chapter in one call (chapter 0001 ~12-19k tokens, the longest
+# chapter 0077 ~21k). For chunked calls the bound is still generous; the
+# OpenCode transport does not send max_output_tokens in the POST body (Gate 0
+# §2.4), so this value lives in the request/identity, not the transport wire.
+DEFAULT_MAX_TOKENS = 32768
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,11 @@ class HttpModelCallerConfig:
     api: ApiClientConfig = field(default_factory=ApiClientConfig)
     max_tokens: int = DEFAULT_MAX_TOKENS
     label: str = "phase2b-generation"
+    # B4/B10 JSON-resilience policy for the generation adapter (default
+    # ``JsonRetryPolicy()``, max_retries=2). The lifecycle wrapper passes an
+    # explicit policy through here so whole-chapter runs can disable the
+    # adapter-level budget (single retry owner = WholeChapterRetryPolicy).
+    retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
 
 class HttpModelCaller:
@@ -69,7 +77,7 @@ class HttpModelCaller:
         self._backend = LocalOpenAIBackend(api=api)
         self._impl = BackendModelCaller(
             self._backend,
-            config=BackendModelCallerConfig(max_tokens=self._max_tokens),
+            config=BackendModelCallerConfig(max_tokens=self._max_tokens, retry=self._config.retry),
         )
 
     @property

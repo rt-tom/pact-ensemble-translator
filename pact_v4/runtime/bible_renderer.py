@@ -11,7 +11,7 @@ and passes the parsed structure in.
 """
 from __future__ import annotations
 
-from typing import Any, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 __all__ = ["render_bible_section", "extract_narrator_gender"]
 
@@ -173,21 +173,125 @@ def _count_address(book_memory: Mapping) -> int:
     return 0
 
 
-def render_bible_section(book_memory: Any) -> str:
+def render_bible_section(
+    chapter_id: Any = None,
+    chapter_index: Any = None,
+    book_memory: Any = None,
+) -> str:
     """Render the book memory into a ``BIBLE:`` text block for prompts.
 
-    Returns an empty string when the book memory is empty or has no
-    renderable content (the caller omits the section entirely). The
-    output is deterministic for the same input — no set iteration without
-    sorting, no randomness.
+    V4.1 A2 (plan §5.2): the primary API is chapter-based —
+    ``render_bible_section(chapter_id, chapter_index, book_memory)``. The
+    bible is rendered from the deterministic per-chapter entry
+    (``chapter_index.json``: ``{characters, facts, address}``) instead of
+    the legacy full-memory dump with "first N" caps — the index is already
+    chapter-filtered, so no caps apply. The narrator (gender) is always
+    included (fail-closed).
 
-    Each section is capped (``_MAX_CHARACTERS``/``_MAX_FACTS``/
-    ``_MAX_ADDRESS``). When the cap truncates, the last line of the
-    affected section is replaced with ``(showing first N of M)`` so the
-    model knows the bible had more content that was dropped for budget
-    reasons — without this hint the model would assume the list was
-    complete.
+    Backward compatibility: ``render_bible_section(book_memory)`` (a
+    Mapping first argument, or ``None``) keeps the legacy full-memory
+    render with caps; when a chapter has no index entry the same legacy
+    fallback is used, so runs without a built ``chapter_index.json`` keep
+    the old behaviour.
+
+    Returns an empty string when there is no renderable content (the
+    caller omits the section entirely). The output is deterministic for
+    the same input — no set iteration without sorting, no randomness.
     """
+    # Legacy call form: render_bible_section(book_memory) — a Mapping passed
+    # POSITIONALLY as the first argument. A2 review fix (RV, commit 4ab250b):
+    # the KEYWORD form render_bible_section(book_memory=m) (chapter_id=None)
+    # must preserve the explicit book_memory instead of overwriting it with
+    # chapter_id (None), which used to return an empty string for a valid
+    # memory. Positional Mapping and explicit keyword now behave identically.
+    if chapter_id is None or isinstance(chapter_id, Mapping):
+        if isinstance(chapter_id, Mapping):
+            book_memory = chapter_id
+        return _render_legacy_bible(book_memory)
+
+    entry = None
+    if isinstance(chapter_index, Mapping):
+        entry = chapter_index.get(chapter_id)
+    if entry is None or not isinstance(entry, Mapping):
+        # No per-chapter index for this chapter: fail-soft to the legacy
+        # full-memory render so existing runs keep working.
+        return _render_legacy_bible(book_memory)
+
+    return _render_chapter_entry(entry, book_memory)
+
+
+def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
+    """Render a per-chapter index entry (narrator always; no caps)."""
+    if not isinstance(book_memory, Mapping):
+        book_memory = {}
+    narrator = extract_narrator_gender(book_memory)
+
+    characters = entry.get("characters") or []
+    facts = entry.get("facts") or []
+    address = entry.get("address") or []
+
+    if not narrator and not characters and not facts and not address:
+        return ""
+
+    char_lookup = _character_lookup(book_memory)
+
+    parts: List[str] = ["BIBLE:"]
+    if narrator:
+        parts.append(f"  - Narrator: {narrator}")
+    if characters:
+        parts.append("  - Characters:")
+        for name in characters:
+            parts.append(_render_character_line(str(name), char_lookup))
+    if facts:
+        parts.append("  - Facts:")
+        for fact in facts:
+            parts.append(f"  * {fact}")
+    if address:
+        parts.append("  - Address register:")
+        for item in address:
+            parts.append(f"  * {item}")
+    return "\n".join(parts) + "\n"
+
+
+def _character_lookup(book_memory: Mapping) -> Dict[str, Mapping]:
+    """name -> attrs for characters/entities (both dict and list shapes)."""
+    lookup: Dict[str, Mapping] = {}
+    for section in ("characters", "entities"):
+        data = book_memory.get(section)
+        if isinstance(data, Mapping):
+            for name, attrs in data.items():
+                if isinstance(attrs, Mapping):
+                    lookup.setdefault(str(name), attrs)
+        elif isinstance(data, list):
+            for entry in data:
+                if not isinstance(entry, Mapping):
+                    continue
+                name = (
+                    _norm_str(entry.get("name", ""))
+                    or _norm_str(entry.get("source", ""))
+                    or _norm_str(entry.get("english", ""))
+                )
+                if name:
+                    lookup.setdefault(name, entry)
+    return lookup
+
+
+def _render_character_line(name: str, lookup: Mapping[str, Mapping]) -> str:
+    attrs = lookup.get(name)
+    if isinstance(attrs, Mapping):
+        gender = _norm_str(attrs.get("gender", ""))
+        role = _norm_str(attrs.get("role", "")) or _norm_str(attrs.get("description", ""))
+        parts = [name]
+        if gender:
+            parts.append(gender)
+        if role:
+            parts.append(role)
+        return f"  * {', '.join(parts)}"
+    return f"  * {name}"
+
+
+def _render_legacy_bible(book_memory: Any) -> str:
+    """Legacy full-memory render with caps (pre-A2 behaviour)."""
     if not isinstance(book_memory, Mapping):
         return ""
 

@@ -86,6 +86,8 @@ def _snapshot(source: SourceArtifact) -> Snapshot:
         glossary_hash=_hash("glossary"),
         book_memory_hash=_hash("book_memory"),
         chapter_memory_hash=_hash("chapter_memory"),
+        source_hash=source.source_hash,
+        chapter_index_hash=_hash("chapter_index"),
     )
 
 

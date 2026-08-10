@@ -58,6 +58,14 @@ def _provenance(**overrides) -> Provenance:
 
 
 def _snapshot(pids=("p00001", "p00002", "p00003", "p00004", "p00005", "p00006", "p00007", "p00008")) -> Snapshot:
+    # A2 review fix: the snapshot identity now binds source_hash — the
+    # fixture snapshot must carry the hash of the same SourceArtifact
+    # _identity_context() builds (en-{pid} text) or every identity-context
+    # validation in this file would fail as foreign.
+    source = SourceArtifact(
+        chapter_id="ch044",
+        source=tuple((pid, f"en-{pid}") for pid in pids),
+    )
     return Snapshot(
         chapter_id="ch044",
         pids=pids,
@@ -65,6 +73,8 @@ def _snapshot(pids=("p00001", "p00002", "p00003", "p00004", "p00005", "p00006", 
         glossary_hash=_hash("glossary"),
         book_memory_hash=_hash("book_memory"),
         chapter_memory_hash=_hash("chapter_memory"),
+        source_hash=source.source_hash,
+        chapter_index_hash=_hash("chapter_index"),
     )
 
 
@@ -206,6 +216,7 @@ def test_snapshot_duplicate_pids_rejected():
             chapter_id="ch044", pids=("p1", "p1"), context="ctx",
             glossary_hash=_hash("g"), book_memory_hash=_hash("b"),
             chapter_memory_hash=_hash("c"),
+            source_hash=_hash("source"), chapter_index_hash=_hash("chapter_index"),
         )
 
 
@@ -223,6 +234,7 @@ def test_snapshot_rejects_bad_hash_reference():
             chapter_id="ch044", pids=("p1",), context="ctx",
             glossary_hash="bad", book_memory_hash=_hash("b"),
             chapter_memory_hash=_hash("c"),
+            source_hash=_hash("source"), chapter_index_hash=_hash("chapter_index"),
         )
 
 

@@ -81,10 +81,20 @@ from pact_v4.phase1.models import (
     ConfigArtifact,
     GateResult,
     Provenance,
+    WholeChapterPidMap,
     canonical_json_hash,
 )
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
-from pact_v4.phase2.generation import GenerationCache, GenerationParams, generate_for_chunk
+from pact_v4.phase2.generation import (
+    GenerationCache,
+    GenerationParams,
+    WholeChapterRetryPolicy,
+    _GenerationValidationError,
+    _whole_chapter_risk,
+    generate_for_chunk,
+    generate_whole_chapter,
+    validate_whole_chapter_raw,
+)
 from pact_v4.phase3.assembly import AssembledChapter
 from pact_v4.phase3.audit import AuditCache, run_chapter_audit
 from pact_v4.phase4.quarantined_retry import (
@@ -130,6 +140,7 @@ from pact_v4.pipeline._shared_runner_helpers import (
 from pact_v4.pipeline.phase_progress import PhaseProgressWriter
 from pact_v4.pipeline.usage_record import UsageRecordWriter
 from pact_v4.runtime.model_lifecycle import ModelRouter
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
     QWEN_MODEL_KEY,
@@ -219,7 +230,15 @@ class StrictRunConfig:
     right_context_pids: int = 0
     temperature: float = 0.2
     seed: int = 7
-    max_tokens: int = 8192
+    # V4.1 A1 (owner decision 2026-08-08): the generator's output budget is
+    # 32768 tokens (whole-chapter output of chapter 0001 is ~12-19k tokens,
+    # the longest chapter 0077 ~21k; Gate 0 §8.5). The value is part of the
+    # config identity (generation.max_tokens below), so changing it
+    # invalidates cache/resume exactly like any other generation setting.
+    # The OpenCode transport does not send it in the POST body (Gate 0 §2.4),
+    # so this is an identity/record value, not a transport constraint; the
+    # Qwen-role ceiling MAX_TOKENS_CEILING=24576 is untouched.
+    max_tokens: int = 32768
     deterministic_glossary_terms: Tuple[Tuple[str, str], ...] = ()
     deterministic_names: Tuple[Tuple[str, str], ...] = ()
     deterministic_mixed_script_allow: Tuple[str, ...] = ()
@@ -244,6 +263,27 @@ class StrictRunConfig:
     # scheme (full rollback). It is part of the config identity (see
     # to_config_artifact) so flipping it invalidates resume/cache correctly.
     lazy_balanced: bool = True
+    # V4.1 reasoning transport: Phase 2B generation reasoning budget (0=off,
+    # 1=low, 2=medium, 3=high). Only generation (Phase 2B) consumes it; the
+    # Qwen audit/repair/formatting phases are untouched. Part of the config
+    # identity (to_config_artifact) so a reasoning change invalidates
+    # cache/resume exactly like any other generation setting.
+    reasoning: int = 0
+    # V4.1 early-exit policy: "" runs the full cycle (audit/repair/
+    # formatting); "generation" halts right after Phase 1-2 generation
+    # (whole-chapter mode is generation-only in A1, so the whole-chapter path
+    # records Steps 6/7/8 as skipped regardless). Part of the config identity
+    # (to_config_artifact) — a run that stops early is a different run from a
+    # full one. Renamed from "selection" (V4.1 A1: the CLI flag is now
+    # --stop-after-generation; chunked runs keep the same halt point).
+    stop_after: str = ""
+    # V4.1 A1: whole-chapter mode — one generation call per chapter against
+    # the full ordered PID map (WholeChapterPidMap), no chunking/selection.
+    # Steps 6/7/8 (audit/repair/formatting) are NOT part of A1 (they are
+    # A2/B/B2/C) and are recorded as skipped. Part of the config identity:
+    # a whole-chapter run is not resumable from a chunked run's out-dir and
+    # vice versa.
+    whole_chapter: bool = False
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -259,8 +299,10 @@ class StrictRunConfig:
                     "temperature": self.temperature,
                     "seed": self.seed,
                     "max_tokens": self.max_tokens,
-                    "reasoning": 0,
+                    "reasoning": self.reasoning,
                 },
+                "stop_after": self.stop_after,
+                "whole_chapter": self.whole_chapter,
                 "formatting": {
                     "required": self.formatting_required,
                     "max_incidents": self.max_formatting_incidents,
@@ -292,6 +334,7 @@ class StrictRunConfig:
 
 def build_strict_lifecycle(
     backend: StrictBackendConfig, *, log_dir: Path, bible_text: str = "",
+    json_retry_policy: Optional[JsonRetryPolicy] = None,
 ) -> Tuple[ModelRouter, Any, Any, Any, Any, Any]:
     """Wire up the real ``llama-server``-backed lifecycle for a live run.
 
@@ -304,6 +347,15 @@ def build_strict_lifecycle(
     ``llama-server``. The router is built once here and handed to the
     coordinator; the runner adapters are the lifecycle-aware wrappers over
     that same router.
+
+    ``json_retry_policy`` (A2 review fix, whole-chapter retry ownership) is
+    the adapter-level JSON retry policy for the generation caller. In
+    whole-chapter mode the CLI passes ``JsonRetryPolicy(max_retries=0)`` so
+    the generation layer (``WholeChapterRetryPolicy``) is the single retry
+    owner — total model attempts stay exactly ``max_attempts`` instead of
+    ``max_attempts × adapter-budget``. When ``None`` (the default; chunked
+    runs and test stubs) the historical ``JsonRetryPolicy()`` (max_retries=2)
+    is preserved, so the chunked path keeps its current retry budget.
     """
     from pact_v4.runtime.qwen_evaluator import HttpQwenEvaluatorConfig
     from pact_v4.runtime.backend_role_adapters import (
@@ -312,7 +364,10 @@ def build_strict_lifecycle(
     )
     runtime = backend.build_runtime(log_dir=log_dir)
     router = runtime.router
-    model_caller = LifecycleModelCaller(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
+    model_caller = LifecycleModelCaller(
+        router, model_name=backend.model_names[GEMMA_MODEL_KEY],
+        json_retry_policy=json_retry_policy,
+    )
     qwen_evaluator = LifecycleQwenEvaluator(
         router, model_name=backend.model_names[QWEN_MODEL_KEY],
         config=HttpQwenEvaluatorConfig(bible_text=bible_text),
@@ -375,6 +430,25 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _pid_diffs(
+    before: Mapping[str, str], after: Mapping[str, str]
+) -> Dict[str, Dict[str, str]]:
+    """``{pid: {before, after}}`` for PIDs whose text changed between stages.
+
+    V4.1 A2 (§7): the translation diff report is split by stage
+    (``raw->repaired`` and ``repaired->final``) so regressions can be
+    attributed to the stage that introduced them. PIDs with identical
+    text are omitted; only actually-changed PIDs appear.
+    """
+    diffs: Dict[str, Dict[str, str]] = {}
+    for pid in sorted(set(before) | set(after)):
+        before_text = before.get(pid)
+        after_text = after.get(pid)
+        if before_text != after_text:
+            diffs[pid] = {"before": before_text or "", "after": after_text or ""}
+    return diffs
 
 
 def _load_journal(journal_path: Path) -> List[Dict[str, Any]]:
@@ -2087,6 +2161,32 @@ def _run_quarantined_retry_cycle(
 # ---------------------------------------------------------------------------
 
 
+def _close_run_resources(runtime: Any, progress_writer: Any, usage_writer: Any) -> None:
+    """Idempotently close the runtime / progress writer / usage writer.
+
+    A2 review fix (pre-dispatch cleanup): the whole-chapter wrapper's
+    ``finally`` already closes these on every path once dispatch has
+    started, but failures BEFORE dispatch (source/snapshot/planner) used to
+    leak them. This helper is the single guarded close routine: each close
+    is individually guarded so a cleanup error is logged and NEVER masks the
+    original exception the caller is propagating. ``close()`` is idempotent
+    (writers null their handle, coordinators guard on ``_closed``), so
+    calling this both here and in the wrapper's ``finally`` is safe.
+    """
+    try:
+        runtime.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close runtime during pre-dispatch cleanup")
+    try:
+        progress_writer.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close progress writer during pre-dispatch cleanup")
+    try:
+        usage_writer.close()
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to close usage writer during pre-dispatch cleanup")
+
+
 def run_chapter_strict(
     cfg: StrictRunConfig,
     *,
@@ -2174,35 +2274,69 @@ def run_chapter_strict(
 
     # ------------------------------------------------------------------
     # Rebuild source/snapshot/plan -- identical to run_chapter/run_generate.
+    # A2 review fix (pre-dispatch cleanup): the resources above are created /
+    # attached BEFORE this setup, so a failure here (empty/malformed source,
+    # snapshot construction, planner) must not leak them. The whole-chapter
+    # wrapper's own finally only covers failures once dispatch has started;
+    # this outer guard closes the resources on ANY pre-dispatch failure and
+    # re-raises the ORIGINAL exception — a cleanup error never masks it
+    # (_close_run_resources guards each close), and close() is idempotent.
     # ------------------------------------------------------------------
-    blocks, _raw_sha = load_source(cfg.chapter_html_path)
-    if not blocks:
-        raise ValueError(f"Chapter {cfg.chapter_id}: no source blocks parsed")
-    source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
-    memory = ChapterMemory.from_directory(cfg.memory_dir)
-    snapshot = build_snapshot(
-        chapter_id=cfg.chapter_id, source=source, memory=memory,
-        context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
-    )
-    config = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
-    planner = ChunkPlanner(
-        target_words=cfg.target_chunk_words, min_words=cfg.min_chunk_words,
-        max_words=cfg.max_chunk_words,
-    )
-    plans = planner.plan(blocks, snapshot_hash=snapshot.snapshot_hash,
-                          following_blocks=cfg.right_context_pids)
-    if not plans:
-        raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
-    chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
-    chunk_plan_path = cfg.out_dir / "chunk_plan.json"
-    chunk_plan_path.write_text(
-        json.dumps(chunk_plan.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+    try:
+        blocks, _raw_sha = load_source(cfg.chapter_html_path)
+        if not blocks:
+            raise ValueError(f"Chapter {cfg.chapter_id}: no source blocks parsed")
+        source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
+        memory = ChapterMemory.from_directory(cfg.memory_dir)
+        snapshot = build_snapshot(
+            chapter_id=cfg.chapter_id, source=source, memory=memory,
+            context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
+        )
+        config = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
+        planner = ChunkPlanner(
+            target_words=cfg.target_chunk_words, min_words=cfg.min_chunk_words,
+            max_words=cfg.max_chunk_words,
+        )
+        plans = planner.plan(blocks, snapshot_hash=snapshot.snapshot_hash,
+                              following_blocks=cfg.right_context_pids)
+        if not plans:
+            raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
+        chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+        chunk_plan_path = cfg.out_dir / "chunk_plan.json"
+        chunk_plan_path.write_text(
+            json.dumps(chunk_plan.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8",
+        )
 
-    glossary = _glossary_entries(memory)
-    bible_text = render_bible_section(memory.book_memory)
-    narrator_gender = extract_narrator_gender(memory.book_memory)
-    narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
+        glossary = _glossary_entries(memory)
+        # V4.1 A2 (§5.2): the bible is rendered per chapter from the
+        # deterministic chapter_index (no "first N" caps); when no
+        # chapter_index.json exists the renderer falls back to the legacy
+        # full-memory render, so runs without an index keep working.
+        bible_text = render_bible_section(
+            cfg.chapter_id, memory.chapter_index, memory.book_memory
+        )
+        narrator_gender = extract_narrator_gender(memory.book_memory)
+        narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
+    except BaseException:
+        _close_run_resources(runtime, progress_writer, usage_writer)
+        raise
+
+    # V4.1 A1 whole-chapter mode: one generation call per chapter against the
+    # full ordered PID map. This is a fundamentally different flow from the
+    # per-chunk loop below (no chunking, no selection cascade, Steps 6/7/8 are
+    # out of A1 scope and recorded as skipped), so it gets its own dedicated
+    # path that still writes the same artifacts (journal, generation_outcomes,
+    # selection_results with the v1 not_applicable schema, translations_raw,
+    # translations, strict_chapter_trial_record).
+    if cfg.whole_chapter:
+        return _run_whole_chapter_strict(
+            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config, memory=memory, glossary=glossary, bible_text=bible_text,
+            narrator_gender=narrator_gender, model_caller=model_caller,
+            runtime=runtime, now_fn=now_fn, progress=progress_writer,
+            usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+        )
+
     source_map = dict(source.source)
     risk_by_chunk = {
         pc.chunk_id: _risk_for_chunk(chunk=pc, source_map=source_map, glossary=glossary)
@@ -2335,6 +2469,7 @@ def run_chapter_strict(
 
     generation_params = GenerationParams(
         temperature=cfg.temperature, seed=cfg.seed, max_tokens=cfg.max_tokens,
+        reasoning=cfg.reasoning,
     )
     gen_cache = GenerationCache()
     # B5 mixed_script-политика (V4_B5_MIXED_SCRIPT_POLICY_TASK_RU.md):
@@ -2775,214 +2910,233 @@ def run_chapter_strict(
             ),
         ),
     )
-    events_before_step6 = runtime.event_count()
-    step6: Dict[str, Any]
-    phase4_inputs: Optional[Dict[str, Any]] = None
-    try:
-        step6, phase4_inputs = _run_step6_audit(
-            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-            config=config, det_data=det_data_full, selection_records=merged_selection_records,
-            selected_text_by_chunk=selected_text_by_chunk,
-            generation_records=merged_generation_records,
-            qwen_audit_evaluator=qwen_audit_evaluator,
-            gemma_audit_evaluator=gemma_audit_evaluator,
-            backend_identity_hash=cfg.backend.identity_hash,
-            backend_identity_hashes=acceptable_backend_hashes,
-            progress=progress_writer,
-        )
-    except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
-        LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
-        step6 = {"status": "failed", "error": str(exc)}
+    # V4.1 stop_after="generation" (renamed from "selection", A1): halt right
+    # after Phase 1-2 (generation + per-chunk selection). The chunked
+    # translation is already on disk (incremental translations.json writes);
+    # Steps 6/7/8 (audit, repair, formatting) are intentionally skipped and
+    # the record marks them as such. The shared finalization below still
+    # writes every artifact a normal run writes (generation_outcomes.json,
+    # selection_results.json, selection_meta.json, journal,
+    # translations.json), with step6/step7/step8 set to the
+    # "skipped_stop_after_generation" sentinel.
+    if cfg.stop_after == "generation":
+        step6 = {"status": "skipped_stop_after_generation"}
+        step7 = {"status": "skipped_stop_after_generation"}
+        step8 = {"status": "skipped_stop_after_generation"}
+        halted_early = True
+        halt_reason = "stop_after_generation"
         phase4_inputs = None
-    finally:
+        repair_phase_result = None
+    else:
+
+        events_before_step6 = runtime.event_count()
+        step6: Dict[str, Any]
+        phase4_inputs: Optional[Dict[str, Any]] = None
         try:
-            runtime.release()
-        except Exception:  # noqa: BLE001
-            LOG.exception("Failed to release runtime after Step 6 audit")
-
-    # ------------------------------------------------------------------
-    # Step 7/8: Phase 4 repair + convergence + terminal (B2). Runs only
-    # when repair adapters are configured (the CLI always wires them via
-    # ``build_repair_adapters``; test stubs may omit them). Repair model
-    # calls go through the same Backend boundary as Step 6 (never local
-    # lifecycle adapters). A transport failure at a repair call is recorded
-    # as debt/incomplete, never a semantic terminal status.
-    # ------------------------------------------------------------------
-    events_before_step7 = runtime.event_count()
-    step7: Dict[str, Any]
-    step8: Dict[str, Any]
-    # B13: the repair phase result (or None when repair never ran / failed /
-    # was skipped) decides the final translations.json write below.
-    repair_phase_result: Optional[RepairPhaseResult] = None
-    if repair_adapters is not None and phase4_inputs is not None:
-        # Phase 5 formatting (B3): build the formatting step over the source
-        # blocks + the injected formatting caller (a Backend adapter over the
-        # coordinator CompletionBackend), so the model-fallback tier runs
-        # through the backend boundary in local/remote/composite profiles
-        # alike — never a local lifecycle adapter. Applied between Step 7
-        # convergence and Step 8 inside run_repair_phase.
-        #
-        # ``cfg.formatting_required`` is the runtime master switch (§6.1
-        # ``formatting.required=true``): even when formatting adapters are
-        # configured, the step is skipped entirely when the policy says
-        # formatting is not required — adapters alone never trigger it.
-        formatting_step = None
-        if formatting_adapters is not None and cfg.formatting_required:
-            formatting_caller = formatting_adapters[0]
-
-            def _formatting_step(*, translation):
-                return run_formatting_align(
-                    blocks=blocks,
-                    translation=translation,
-                    formatting_caller=formatting_caller,
-                    backend_identity_hash=cfg.backend.identity_hash,
-                    policy_version=cfg.formatting_policy_version,
-                    max_formatting_incidents=cfg.max_formatting_incidents,
-                    pid_batches=[
-                        tuple(chunk.pids) for chunk in chunk_plan.chunks
-                    ],
-                )
-
-            formatting_step = _formatting_step
-        try:
-            step7, repair_phase_result = _run_step7_repair(
+            step6, phase4_inputs = _run_step6_audit(
                 cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-                config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
-                repair_adapters=repair_adapters,
+                config=config, det_data=det_data_full, selection_records=merged_selection_records,
+                selected_text_by_chunk=selected_text_by_chunk,
+                generation_records=merged_generation_records,
+                qwen_audit_evaluator=qwen_audit_evaluator,
+                gemma_audit_evaluator=gemma_audit_evaluator,
                 backend_identity_hash=cfg.backend.identity_hash,
                 backend_identity_hashes=acceptable_backend_hashes,
-                now=now_fn,
-                formatting=formatting_step,
                 progress=progress_writer,
             )
-            step8 = {
-                "status": step7["terminal"],
-                "integrity": step7["integrity"],
-                "debt_trace": None,  # recorded in repair_report.json
-                "formatting": step7.get("formatting"),
-            }
-            # B6: separate bounded quarantined-retry cycle. A quarantined
-            # chunk with repair debt is regenerated with look-ahead context and
-            # re-cascaded; a winner replaces its best-variant, a still-failed
-            # chunk is accepted as final (quarantined_final). A failure here is
-            # recorded in step7, never a crash of the completed run.
-            try:
-                retry_summary = _run_quarantined_retry_cycle(
-                    cfg=cfg,
-                    source=source,
-                    snapshot=snapshot,
-                    chunk_plan=chunk_plan,
-                    config=config,
-                    det_data_base=det_data_base,
-                    det_data_full=det_data_full,
-                    risk_by_chunk=risk_by_chunk,
-                    glossary=glossary,
-                    generation_params=generation_params,
-                    model_caller=model_caller,
-                    gen_cache=gen_cache,
-                    qwen_evaluator=qwen_evaluator,
-                    gemma_selector=gemma_selector,
-                    selected_text_by_chunk=selected_text_by_chunk,
-                    phase4_inputs=phase4_inputs,
-                    repair_phase_result=repair_phase_result,
-                    repair_adapters=repair_adapters,
-                    formatting_step=formatting_step,
-                    backend_identity_hash=cfg.backend.identity_hash,
-                    acceptable_backend_hashes=acceptable_backend_hashes,
-                    now=now_fn,
-                    progress=progress_writer,
-                    existing_generation_records=merged_generation_records,
-                    bible_text=bible_text,
-                )
-            except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
-                LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
-                step7 = dict(step7)
-                step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
-            else:
-                if retry_summary is not None:
-                    merged_generation_records = retry_summary["generation_records"]
-                    retry_block = {
-                        key: value
-                        for key, value in retry_summary.items()
-                        if key != "generation_records"
-                    }
-                    step7 = {**step7, "quarantined_retry": retry_block}
-                    step8 = {
-                        "status": retry_summary["terminal"],
-                        "integrity": retry_summary["integrity"],
-                        "debt_trace": None,  # recorded in repair_report.json
-                        "formatting": (
-                            retry_summary.get("formatting")
-                            if "formatting" in retry_summary
-                            else step7.get("formatting")
-                        ),
-                    }
-        except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
-            LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
-            step7 = {"status": "failed", "error": str(exc)}
-            step8 = {"status": "failed", "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
+            LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
+            step6 = {"status": "failed", "error": str(exc)}
+            phase4_inputs = None
         finally:
             try:
                 runtime.release()
             except Exception:  # noqa: BLE001
-                LOG.exception("Failed to release runtime after Step 7 repair")
-    else:
-        reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
-        step7 = {"status": "skipped", "reason": reason}
-        step8 = {"status": "skipped", "reason": reason}
+                LOG.exception("Failed to release runtime after Step 6 audit")
 
-    step7_events = [
-        event for event in runtime.events_since(events_before_step7)
-        if event.kind == EVENT_KIND_LOCAL_SWITCH
-    ]
-    step7 = dict(step7)
-    step7["switch_count"] = len(step7_events)
-    step7["switches"] = [event.to_payload() for event in step7_events]
+        # ------------------------------------------------------------------
+        # Step 7/8: Phase 4 repair + convergence + terminal (B2). Runs only
+        # when repair adapters are configured (the CLI always wires them via
+        # ``build_repair_adapters``; test stubs may omit them). Repair model
+        # calls go through the same Backend boundary as Step 6 (never local
+        # lifecycle adapters). A transport failure at a repair call is recorded
+        # as debt/incomplete, never a semantic terminal status.
+        # ------------------------------------------------------------------
+        events_before_step7 = runtime.event_count()
+        step7: Dict[str, Any]
+        step8: Dict[str, Any]
+        # B13: the repair phase result (or None when repair never ran / failed /
+        # was skipped) decides the final translations.json write below.
+        repair_phase_result: Optional[RepairPhaseResult] = None
+        if repair_adapters is not None and phase4_inputs is not None:
+            # Phase 5 formatting (B3): build the formatting step over the source
+            # blocks + the injected formatting caller (a Backend adapter over the
+            # coordinator CompletionBackend), so the model-fallback tier runs
+            # through the backend boundary in local/remote/composite profiles
+            # alike — never a local lifecycle adapter. Applied between Step 7
+            # convergence and Step 8 inside run_repair_phase.
+            #
+            # ``cfg.formatting_required`` is the runtime master switch (§6.1
+            # ``formatting.required=true``): even when formatting adapters are
+            # configured, the step is skipped entirely when the policy says
+            # formatting is not required — adapters alone never trigger it.
+            formatting_step = None
+            if formatting_adapters is not None and cfg.formatting_required:
+                formatting_caller = formatting_adapters[0]
 
-    # The audit phase's own lifecycle cost, recorded for run_003-style
-    # validation: batching by detector should keep this at ~1-2 switches
-    # (one Qwen acquire + one Qwen->Gemma switch) regardless of chunk count.
-    # For remote/composite runs the Step 6 "switches" are the local switch
-    # events only (remote call events are aggregated in the runtime block).
-    step6_events = [
-        event for event in runtime.events_since(events_before_step6)
-        if event.kind == EVENT_KIND_LOCAL_SWITCH
-    ]
-    step6 = dict(step6)
-    step6["switch_count"] = len(step6_events)
-    step6["switches"] = [event.to_payload() for event in step6_events]
+                def _formatting_step(*, translation):
+                    return run_formatting_align(
+                        blocks=blocks,
+                        translation=translation,
+                        formatting_caller=formatting_caller,
+                        backend_identity_hash=cfg.backend.identity_hash,
+                        policy_version=cfg.formatting_policy_version,
+                        max_formatting_incidents=cfg.max_formatting_incidents,
+                        pid_batches=[
+                            tuple(chunk.pids) for chunk in chunk_plan.chunks
+                        ],
+                    )
 
-    narrator_gender_findings: list = []
-    if narrator_gender and final_text_by_pid:
-        full_text = " ".join(final_text_by_pid.values())
-        narrator_gender_findings = check_narrator_gender(full_text, narrator_gender)
-    if narrator_gender_findings:
-        # B7 invariant: ``integrity.status`` describes the detailed
-        # check-level state (narrator_gender, formatting, mixed_script,
-        # ...); ``step8.status`` is the chapter terminal state
-        # (complete / accepted_degraded / failed / skipped). They are
-        # NOT the same shape. narrator_gender failure is non-fatal at
-        # chapter level (PID map is structurally valid), so step8 stays
-        # in accepted_degraded; ``integrity.status == "failed"`` records
-        # the specific finding for debugging/dashboards. A failed/skipped
-        # step8 (from a prior failure) is never upgraded by a successful
-        # narrator_gender check here — the check only downgrades an
-        # existing complete to accepted_degraded.
-        step8 = dict(step8)
-        integrity = dict(step8.get("integrity") or {})
-        integrity["narrator_gender"] = {
-            "expected": narrator_gender,
-            "mismatches": narrator_gender_findings,
-        }
-        if integrity.get("status") != "failed":
-            integrity["status"] = "failed"
-            integrity["reason"] = (
-                f"narrator_gender mismatch: expected {narrator_gender}, "
-                f"found {len(narrator_gender_findings)} mismatch(es)"
-            )
-        step8["integrity"] = integrity
-        if step8.get("status") == "complete":
-            step8["status"] = "accepted_degraded"
+                formatting_step = _formatting_step
+            try:
+                step7, repair_phase_result = _run_step7_repair(
+                    cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+                    config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
+                    repair_adapters=repair_adapters,
+                    backend_identity_hash=cfg.backend.identity_hash,
+                    backend_identity_hashes=acceptable_backend_hashes,
+                    now=now_fn,
+                    formatting=formatting_step,
+                    progress=progress_writer,
+                )
+                step8 = {
+                    "status": step7["terminal"],
+                    "integrity": step7["integrity"],
+                    "debt_trace": None,  # recorded in repair_report.json
+                    "formatting": step7.get("formatting"),
+                }
+                # B6: separate bounded quarantined-retry cycle. A quarantined
+                # chunk with repair debt is regenerated with look-ahead context and
+                # re-cascaded; a winner replaces its best-variant, a still-failed
+                # chunk is accepted as final (quarantined_final). A failure here is
+                # recorded in step7, never a crash of the completed run.
+                try:
+                    retry_summary = _run_quarantined_retry_cycle(
+                        cfg=cfg,
+                        source=source,
+                        snapshot=snapshot,
+                        chunk_plan=chunk_plan,
+                        config=config,
+                        det_data_base=det_data_base,
+                        det_data_full=det_data_full,
+                        risk_by_chunk=risk_by_chunk,
+                        glossary=glossary,
+                        generation_params=generation_params,
+                        model_caller=model_caller,
+                        gen_cache=gen_cache,
+                        qwen_evaluator=qwen_evaluator,
+                        gemma_selector=gemma_selector,
+                        selected_text_by_chunk=selected_text_by_chunk,
+                        phase4_inputs=phase4_inputs,
+                        repair_phase_result=repair_phase_result,
+                        repair_adapters=repair_adapters,
+                        formatting_step=formatting_step,
+                        backend_identity_hash=cfg.backend.identity_hash,
+                        acceptable_backend_hashes=acceptable_backend_hashes,
+                        now=now_fn,
+                        progress=progress_writer,
+                        existing_generation_records=merged_generation_records,
+                        bible_text=bible_text,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
+                    LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
+                    step7 = dict(step7)
+                    step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
+                else:
+                    if retry_summary is not None:
+                        merged_generation_records = retry_summary["generation_records"]
+                        retry_block = {
+                            key: value
+                            for key, value in retry_summary.items()
+                            if key != "generation_records"
+                        }
+                        step7 = {**step7, "quarantined_retry": retry_block}
+                        step8 = {
+                            "status": retry_summary["terminal"],
+                            "integrity": retry_summary["integrity"],
+                            "debt_trace": None,  # recorded in repair_report.json
+                            "formatting": (
+                                retry_summary.get("formatting")
+                                if "formatting" in retry_summary
+                                else step7.get("formatting")
+                            ),
+                        }
+            except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
+                LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
+                step7 = {"status": "failed", "error": str(exc)}
+                step8 = {"status": "failed", "error": str(exc)}
+            finally:
+                try:
+                    runtime.release()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("Failed to release runtime after Step 7 repair")
+        else:
+            reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
+            step7 = {"status": "skipped", "reason": reason}
+            step8 = {"status": "skipped", "reason": reason}
+
+        step7_events = [
+            event for event in runtime.events_since(events_before_step7)
+            if event.kind == EVENT_KIND_LOCAL_SWITCH
+        ]
+        step7 = dict(step7)
+        step7["switch_count"] = len(step7_events)
+        step7["switches"] = [event.to_payload() for event in step7_events]
+
+        # The audit phase's own lifecycle cost, recorded for run_003-style
+        # validation: batching by detector should keep this at ~1-2 switches
+        # (one Qwen acquire + one Qwen->Gemma switch) regardless of chunk count.
+        # For remote/composite runs the Step 6 "switches" are the local switch
+        # events only (remote call events are aggregated in the runtime block).
+        step6_events = [
+            event for event in runtime.events_since(events_before_step6)
+            if event.kind == EVENT_KIND_LOCAL_SWITCH
+        ]
+        step6 = dict(step6)
+        step6["switch_count"] = len(step6_events)
+        step6["switches"] = [event.to_payload() for event in step6_events]
+
+        narrator_gender_findings: list = []
+        if narrator_gender and final_text_by_pid:
+            full_text = " ".join(final_text_by_pid.values())
+            narrator_gender_findings = check_narrator_gender(full_text, narrator_gender)
+        if narrator_gender_findings:
+            # B7 invariant: ``integrity.status`` describes the detailed
+            # check-level state (narrator_gender, formatting, mixed_script,
+            # ...); ``step8.status`` is the chapter terminal state
+            # (complete / accepted_degraded / failed / skipped). They are
+            # NOT the same shape. narrator_gender failure is non-fatal at
+            # chapter level (PID map is structurally valid), so step8 stays
+            # in accepted_degraded; ``integrity.status == "failed"`` records
+            # the specific finding for debugging/dashboards. A failed/skipped
+            # step8 (from a prior failure) is never upgraded by a successful
+            # narrator_gender check here — the check only downgrades an
+            # existing complete to accepted_degraded.
+            step8 = dict(step8)
+            integrity = dict(step8.get("integrity") or {})
+            integrity["narrator_gender"] = {
+                "expected": narrator_gender,
+                "mismatches": narrator_gender_findings,
+            }
+            if integrity.get("status") != "failed":
+                integrity["status"] = "failed"
+                integrity["reason"] = (
+                    f"narrator_gender mismatch: expected {narrator_gender}, "
+                    f"found {len(narrator_gender_findings)} mismatch(es)"
+                )
+            step8["integrity"] = integrity
+            if step8.get("status") == "complete":
+                step8["status"] = "accepted_degraded"
 
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
@@ -3084,6 +3238,10 @@ def run_chapter_strict(
         "identities": {
             "source_hash": source.source_hash, "snapshot_hash": snapshot.snapshot_hash,
             "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+            # A2 review fix: the chapter_index (bible prompt) record that is
+            # part of the snapshot identity — recorded so a verifiable hash
+            # exists for audits/resume diagnosis.
+            "chapter_index_hash": snapshot.chapter_index_hash,
         },
         "backend": backend_block,
         "runtime": {
@@ -3092,6 +3250,11 @@ def run_chapter_strict(
         },
         "operational_policy": {
             "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
+            # V4.1: pinned-before-run generation reasoning budget and early-exit
+            # policy — recorded so the owner can verify which experiment variant
+            # produced a run without opening the config artifact.
+            "reasoning": cfg.reasoning,
+            "stop_after": cfg.stop_after,
         },
         "mixed_script_policy": {
             "sources": {
@@ -3177,3 +3340,894 @@ def run_chapter_strict(
 
 def translations_path_exists(out_dir: Path) -> bool:
     return (out_dir / "translations.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# V4.1 A1 whole-chapter mode: one generation call per chapter.
+# ---------------------------------------------------------------------------
+
+# Schema of the always-written whole-chapter selection artifact. Written even
+# when no A/B selection exists, so resume/diagnostics/B9 never have to guess
+# whether the artifact is missing or selection simply did not run.
+WHOLE_CHAPTER_SELECTION_SCHEMA = "pact-v4-whole-chapter-selection/v1"
+
+# Whole-chapter journal/count marker: the single journal entry's chunk_id and
+# the generation record's chunk_id (the whole chapter is one processing unit).
+WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
+
+# The whole-chapter writer contract (V4.1 A1): exactly one candidate role.
+# ``generate_whole_chapter`` is always invoked with this role, so a valid
+# whole-chapter generation record must declare exactly this role in
+# ``expected_roles`` and key its candidate/error maps to it.
+WHOLE_CHAPTER_ROLE = "balanced_literary"
+
+
+def _validate_whole_chapter_generation_record(
+    rec: Dict[str, Any],
+    *,
+    outcome: str,
+    selected_role: Optional[str],
+    selected_candidate_id: Optional[str],
+    raw_text_by_pid: Optional[Dict[str, str]],
+) -> None:
+    """Fail closed unless ``rec`` is a writer-produced whole-chapter record.
+
+    RV3 (t_27de970d): resume previously accepted a sole ``whole_chapter``
+    dict as the valid generation record as long as its ``chunk_id`` matched
+    and — for a selected journal entry — ``candidates[selected_role]`` was a
+    dict whose ``candidate_id`` equaled the journal's ``selected_candidate_id``.
+    A record stripped of ``status``/``expected_roles`` and a candidate
+    stripped of ``translation``/``role`` passed, was replayed, and selection/
+    provenance were then rewritten from the damaged data. This validates the
+    record against the exact schema ``_serialize_generation_outcome`` writes
+    before any artifact is touched:
+
+    * required record fields/types: ``chunk_id``, ``risk_band``,
+      ``expected_roles``, ``status``, ``candidates``, ``errors``;
+    * candidate fields used for provenance: ``candidate_id``, ``role``,
+      ``translation`` (a non-empty ``{pid: text}`` map of strings) and the
+      ``decision_trace`` audit trail;
+    * error shape (``{code, detail}`` strings);
+    * the exact whole-chapter role-set contract (RV4 t_86913123): the
+      writer emits exactly one expected role, ``[balanced_literary]``, and
+      keys its candidate/error maps exactly to that declared role set — a
+      foreign/extra candidate role, an undeclared/duplicate/unknown expected
+      role, or an error keyed to a foreign role could never have been
+      produced by the writer and fails closed;
+    * journal linkage: a ``selected`` outcome requires ``status ==
+      "complete"``, ``selected_role in expected_roles``, a well-formed
+      candidate for the role whose id/role match the journal's, and no error
+      recorded for the selected role;
+    * raw/provenance consistency: the selected candidate's serialized
+      ``translation`` must equal the raw snapshot being replayed, so a
+      damaged provenance can never seed a different translation;
+    * an ``incomplete_generation`` outcome requires ``status ==
+      "incomplete"`` with no candidates and a non-empty error map.
+
+    Every violation raises a Data loss / provenance ``ValueError`` — the
+    caller never reaches an artifact write.
+    """
+    if not isinstance(rec, dict):
+        raise ValueError(
+            "Data loss: whole_chapter generation record is not an object — "
+            "refusing to resume against malformed provenance."
+        )
+    if rec.get("chunk_id") != WHOLE_CHAPTER_CHUNK_ID:
+        raise ValueError(
+            "Data loss: whole_chapter generation record has chunk_id "
+            f"{rec.get('chunk_id')!r} — refusing to resume against "
+            "malformed provenance."
+        )
+    risk_band = rec.get("risk_band")
+    if not isinstance(risk_band, str) or not risk_band:
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "risk_band — refusing to resume against malformed provenance."
+        )
+    expected_roles = rec.get("expected_roles")
+    if (
+        not isinstance(expected_roles, list)
+        or not expected_roles
+        or not all(isinstance(role, str) and role for role in expected_roles)
+    ):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "expected_roles — refusing to resume against malformed "
+            "provenance."
+        )
+    # RV4 (t_86913123): the whole-chapter writer emits exactly one expected
+    # role. An extra/foreign/duplicate/unknown role in expected_roles could
+    # never have been produced by the writer — refusing to replay selection/
+    # provenance from a record whose declared role set is not the exact
+    # writer shape.
+    if expected_roles != [WHOLE_CHAPTER_ROLE]:
+        raise ValueError(
+            "Data loss: whole_chapter generation record expected_roles "
+            f"{expected_roles!r} is not exactly [{WHOLE_CHAPTER_ROLE!r}] — "
+            "refusing to resume against malformed provenance."
+        )
+    status = rec.get("status")
+    if status not in ("complete", "incomplete"):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has invalid status "
+            f"{status!r} — refusing to resume against malformed provenance."
+        )
+    candidates = rec.get("candidates")
+    if not isinstance(candidates, dict):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "candidates object — refusing to resume against malformed "
+            "provenance."
+        )
+    errors = rec.get("errors")
+    if not isinstance(errors, dict):
+        raise ValueError(
+            "Data loss: whole_chapter generation record has no valid "
+            "errors object — refusing to resume against malformed "
+            "provenance."
+        )
+    for role, cand in candidates.items():
+        if not isinstance(cand, dict):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} is not an object — refusing to resume "
+                "against malformed provenance."
+            )
+        cand_id = cand.get("candidate_id")
+        cand_role = cand.get("role")
+        translation = cand.get("translation")
+        trace = cand.get("decision_trace")
+        if not isinstance(cand_id, str) or not cand_id:
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has no valid candidate_id — refusing to "
+                "resume against malformed provenance."
+            )
+        if not isinstance(cand_role, str) or not cand_role or cand_role != role:
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has invalid role {cand_role!r} — refusing "
+                "to resume against malformed provenance."
+            )
+        if (
+            not isinstance(translation, dict)
+            or not translation
+            or not all(
+                isinstance(pid, str) and isinstance(text, str)
+                for pid, text in translation.items()
+            )
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has no valid translation PID map — "
+                "refusing to resume against malformed provenance."
+            )
+        if (
+            not isinstance(trace, list)
+            or not trace
+            or not all(
+                isinstance(gate, dict)
+                and isinstance(gate.get("gate"), str)
+                and isinstance(gate.get("passed"), bool)
+                and isinstance(gate.get("detail"), str)
+                for gate in trace
+            )
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate for "
+                f"role {role!r} has no valid decision_trace — refusing to "
+                "resume against malformed provenance."
+            )
+    for role, err in errors.items():
+        if (
+            not isinstance(err, dict)
+            or not isinstance(err.get("code"), str)
+            or not err.get("code")
+            or not isinstance(err.get("detail"), str)
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record error for role "
+                f"{role!r} is malformed — refusing to resume against "
+                "malformed provenance."
+            )
+    # RV4 (t_86913123): cross-field role-set consistency. The writer keys
+    # candidates and errors EXACTLY by the declared expected role(s) — a
+    # foreign/extra candidate role (e.g. a lazy-rescue fidelity_first
+    # candidate) or an error keyed to an undeclared role could never have
+    # been produced by the whole-chapter writer and must fail closed before
+    # any artifact write.
+    declared_roles = set(expected_roles)
+    foreign_candidate_roles = set(candidates) - declared_roles
+    if foreign_candidate_roles:
+        raise ValueError(
+            "Data loss: whole_chapter generation record candidate roles "
+            f"{sorted(foreign_candidate_roles)!r} are not declared in "
+            f"expected_roles {expected_roles!r} — refusing to resume "
+            "against malformed provenance."
+        )
+    foreign_error_roles = set(errors) - declared_roles
+    if foreign_error_roles:
+        raise ValueError(
+            "Data loss: whole_chapter generation record error roles "
+            f"{sorted(foreign_error_roles)!r} are not declared in "
+            f"expected_roles {expected_roles!r} — refusing to resume "
+            "against malformed provenance."
+        )
+    if outcome == "selected":
+        if status != "complete":
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"selected but the generation record status is {status!r} — "
+                "refusing to resume against malformed provenance."
+            )
+        if selected_role not in expected_roles:
+            raise ValueError(
+                "Data loss: whole_chapter generation record expected_roles "
+                f"{expected_roles!r} does not include selected_role "
+                f"{selected_role!r} — refusing to resume without journal "
+                "linkage."
+            )
+        cand = candidates.get(selected_role)
+        if not isinstance(cand, dict):
+            raise ValueError(
+                "Data loss: whole_chapter generation record has no "
+                f"candidate for selected_role {selected_role!r} — refusing "
+                "to resume without journal linkage."
+            )
+        if cand.get("candidate_id") != selected_candidate_id:
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate "
+                f"{cand.get('candidate_id')!r} does not match the journal's "
+                f"selected_candidate_id {selected_candidate_id!r}."
+            )
+        if selected_role in errors:
+            raise ValueError(
+                "Data loss: whole_chapter generation record records an "
+                f"error for the selected role {selected_role!r} while "
+                "claiming a complete outcome — refusing to resume against "
+                "malformed provenance."
+            )
+        if raw_text_by_pid is not None and cand.get("translation") != dict(
+            raw_text_by_pid
+        ):
+            raise ValueError(
+                "Data loss: whole_chapter generation record candidate "
+                "translation does not match the raw snapshot — refusing to "
+                "resume against inconsistent provenance."
+            )
+    else:  # incomplete_generation
+        if status != "incomplete":
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"incomplete but the generation record status is {status!r} "
+                "-- refusing to resume against malformed provenance."
+            )
+        if candidates:
+            raise ValueError(
+                "Data loss: whole_chapter generation record claims "
+                "incomplete generation but carries candidates — refusing to "
+                "resume against malformed provenance."
+            )
+        if not errors:
+            raise ValueError(
+                "Data loss: whole_chapter generation record claims "
+                "incomplete generation but has no errors — refusing to "
+                "resume against malformed provenance."
+            )
+
+
+def _run_whole_chapter_strict(
+    cfg: StrictRunConfig,
+    *,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    memory: Any,
+    glossary: Any,
+    bible_text: str,
+    narrator_gender: Optional[str],
+    model_caller: Any,
+    runtime: Any,
+    now_fn: Any,
+    progress: Any,
+    usage_writer: Any,
+    started_at: str,
+    wall_t0: float,
+) -> StrictChapterRunResult:
+    """V4.1 A1 whole-chapter generation: one call per chapter.
+
+    V4.1 A2 review fix (RV, commit 4ab250b): resource cleanup (runtime /
+    progress writer / usage writer) is guaranteed on EVERY exit path. The
+    fail-closed resume validation (data-loss / foreign-identity ValueErrors
+    raised after ``progress.run_started``) used to bypass the successful-tail
+    cleanup and leak runtime/progress/usage resources; the impl now runs
+    inside ``try/finally`` so cleanup always happens while the fail-closed
+    error propagates unchanged.
+
+    The generation/provenance contract itself lives in
+    ``_run_whole_chapter_strict_impl``: one generation call per chapter with
+    the strict ``{pid: text}`` JSON contract and bounded retry
+    (``generate_whole_chapter``), plus the whole-chapter provenance contract
+    (journal, ``translations_raw.json``, ``translations.json``,
+    ``selection_results.json``, ``generation_outcomes.json``,
+    ``strict_chapter_trial_record.json``); Steps 6/7/8 are out of A1 scope and
+    recorded as skipped.
+    """
+    try:
+        return _run_whole_chapter_strict_impl(
+            cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config, memory=memory, glossary=glossary, bible_text=bible_text,
+            narrator_gender=narrator_gender, model_caller=model_caller,
+            runtime=runtime, now_fn=now_fn, progress=progress,
+            usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+        )
+    finally:
+        # Terminal teardown on EVERY path (success, resume-validation
+        # failure, unexpected error): closes the remote backend / stops a
+        # managed server, releases the local router, closes the progress and
+        # usage writers. close() is idempotent (writers null their handle,
+        # coordinators guard on _closed), so running it here AND at the
+        # successful tail is safe. _close_run_resources guards each close so
+        # a cleanup error is logged and never masks the original exception.
+        _close_run_resources(runtime, progress, usage_writer)
+
+
+def _run_whole_chapter_strict_impl(
+    cfg: StrictRunConfig,
+    *,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    memory: Any,
+    glossary: Any,
+    bible_text: str,
+    narrator_gender: Optional[str],
+    model_caller: Any,
+    runtime: Any,
+    now_fn: Any,
+    progress: Any,
+    usage_writer: Any,
+    started_at: str,
+    wall_t0: float,
+) -> StrictChapterRunResult:
+    """Whole-chapter generation/provenance body (see the wrapper above).
+
+    Derives the full ordered PID map (``WholeChapterPidMap``) from the
+    authoritative multi-chunk ``ChunkPlanArtifact``, generates the whole
+    chapter in a single call with the strict ``{pid: text}`` JSON contract
+    and bounded retry (``generate_whole_chapter``), and writes the
+    whole-chapter provenance contract. Steps 6/7/8 are out of A1 scope and
+    recorded as skipped.
+    """
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    journal_path = cfg.out_dir / "journal.ndjson"
+    translations_path = cfg.out_dir / "translations.json"
+    raw_translations_path = cfg.out_dir / "translations_raw.json"
+    selection_path = cfg.out_dir / "selection_results.json"
+    generation_path = _generation_outcomes_path(cfg.out_dir)
+    record_path = cfg.out_dir / "strict_chapter_trial_record.json"
+
+    # ------------------------------------------------------------------
+    # Resume: replay the single whole-chapter journal entry and verify
+    # identities exactly like the chunked path.
+    # ------------------------------------------------------------------
+    prior_entries = _load_journal(journal_path)
+    acceptable_backend_hashes = list(cfg.backend.acceptable_identity_hashes())
+    for entry in prior_entries:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Data loss: malformed whole-chapter journal entry — "
+                f"expected a JSON object, found {type(entry).__name__} — "
+                "refusing to resume against a corrupt journal."
+            )
+        if (
+            entry.get("snapshot_hash") != snapshot.snapshot_hash
+            or entry.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or entry.get("config_identity") != config.config_identity
+            or entry.get("backend_identity_hash") not in acceptable_backend_hashes
+        ):
+            raise ValueError(
+                "Foreign identity: journal entry for "
+                f"{entry.get('chunk_id')} was written under a different "
+                "snapshot/plan/config than this run -- refusing to resume "
+                "against a stale journal."
+            )
+    resumed_from_index = len(prior_entries)
+
+    final_text_by_pid: Dict[str, str] = {}
+    selected_role_counts: Dict[str, int] = {}
+    incomplete_generation_count = 0
+    generation_records: List[Dict[str, Any]] = []
+    halted_early = False
+    halt_reason: Optional[str] = None
+    # V4.1 A2 (§5.3): whole-chapter glossary budget diagnostic row; filled
+    # on a fresh run, left empty on resume (a resumed run re-budgets
+    # nothing and must not clobber the prior session's report).
+    glossary_budget_report_whole: Dict[str, Any] = {
+        "kept": [], "dropped": [], "dropped_count": 0,
+    }
+
+    progress.run_started(
+        chapter_id=cfg.chapter_id,
+        out_dir=cfg.out_dir,
+        started_at=started_at,
+        backend_identity_hash=cfg.backend.identity_hash,
+        resumed_from_index=resumed_from_index,
+    )
+
+    if resumed_from_index > 0:
+        # Whole-chapter resume journal contract: exactly ONE whole_chapter
+        # entry. A duplicate or malformed journal is a data-integrity failure
+        # and must fail closed — never silently replayed past via
+        # prior_entries[0] with authoritative counts/provenance untrustworthy.
+        if len(prior_entries) != 1:
+            raise ValueError(
+                "Data loss: whole-chapter resume journal must contain "
+                f"exactly one entry, found {len(prior_entries)} — refusing "
+                "to resume against a duplicate or corrupt journal."
+            )
+        entry = prior_entries[0]
+        if entry.get("chunk_id") != WHOLE_CHAPTER_CHUNK_ID:
+            raise ValueError(
+                "Data loss: malformed whole-chapter journal entry — expected "
+                f"chunk_id {WHOLE_CHAPTER_CHUNK_ID!r}, found "
+                f"{entry.get('chunk_id')!r} — refusing to resume."
+            )
+        outcome = entry.get("outcome")
+        if outcome == "selected":
+            selected_candidate_id = entry.get("selected_candidate_id")
+            selected_role = entry.get("selected_role")
+            if not isinstance(selected_candidate_id, str) or not selected_candidate_id:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "selected outcome without a selected_candidate_id."
+                )
+            if not isinstance(selected_role, str) or not selected_role:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "selected outcome without a selected_role."
+                )
+            if entry.get("candidate_ids") != [selected_candidate_id]:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "candidate_ids must be exactly [selected_candidate_id]."
+                )
+        elif outcome == "incomplete_generation":
+            selected_candidate_id = None
+            selected_role = None
+            if entry.get("candidate_ids") not in (None, []):
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "incomplete_generation outcome with non-empty candidate_ids."
+                )
+            if (
+                entry.get("selected_candidate_id") is not None
+                or entry.get("selected_role") is not None
+            ):
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — "
+                    "incomplete_generation outcome must not carry a "
+                    "selected_candidate_id/selected_role."
+                )
+        else:
+            raise ValueError(
+                "Data loss: malformed whole-chapter journal entry — invalid "
+                f"outcome {outcome!r}."
+            )
+
+        if outcome == "selected":
+            # Resume distinguishes the RAW generator snapshot (the exact text
+            # the generation contract produced) from the FINAL translations.json
+            # alias (which after A2/B repair may diverge). Only the raw file may
+            # seed a resumed whole-chapter run.
+            if not raw_translations_path.exists():
+                raise ValueError(
+                    "Data loss: journal says whole_chapter generation was "
+                    f"selected but {raw_translations_path.name} is missing — "
+                    "the raw generator snapshot cannot be reconstructed."
+                )
+            # The raw snapshot must conform to the exact strict {pid: text}
+            # contract the generator enforces (full PID set, exact source
+            # order, string values, no duplicate keys): a damaged or partial
+            # raw file is data loss, never a resume candidate. Fails closed
+            # with the same failure taxonomy as a generation attempt
+            # (ValueError for invalid JSON, _GenerationValidationError for
+            # PID contract violations) — a partial raw can never seed a
+            # partial final translations.json.
+            try:
+                final_text_by_pid = dict(
+                    validate_whole_chapter_raw(
+                        raw_translations_path.read_text(encoding="utf-8"),
+                        pid_map,
+                    )
+                )
+            except (ValueError, _GenerationValidationError) as exc:
+                raise ValueError(
+                    "Data loss: journal says whole_chapter generation was "
+                    f"selected but {raw_translations_path.name} does not "
+                    f"conform to the whole-chapter strict {{pid: text}} "
+                    f"contract ({exc}) — refusing to resume against a corrupt "
+                    "or partial raw snapshot."
+                ) from exc
+            selected_role_counts[selected_role] = 1
+        elif outcome == "incomplete_generation":
+            incomplete_generation_count = 1
+            halted_early = True
+            halt_reason = (
+                "whole_chapter generation incomplete (resumed; bounded retry "
+                "budget was exhausted in the prior session)"
+            )
+
+        # Generation provenance is mandatory for any whole-chapter resume:
+        # the journal entry may only be replayed when generation_outcomes.json
+        # exists, carries this run's identities, and contains exactly one
+        # valid whole_chapter record. Missing/empty/mismatched provenance is
+        # data loss — never a reason to silently rewrite empty provenance and
+        # selection_results.json with candidate_count=0 while the journal and
+        # translations claim a selected whole-chapter generation.
+        if not generation_path.exists():
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is missing — the "
+                "generation record cannot be reconstructed."
+            )
+        try:
+            payload = json.loads(generation_path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is corrupt JSON — "
+                "refusing to resume against a broken provenance artifact."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is not a JSON object."
+            )
+        if not all(
+            isinstance(payload.get(key), str) and payload.get(key)
+            for key in ("snapshot_hash", "chunk_plan_hash", "config_identity")
+        ):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} is missing the run "
+                "identity fields (empty or malformed provenance artifact)."
+            )
+        if (
+            payload.get("snapshot_hash") != snapshot.snapshot_hash
+            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            or payload.get("config_identity") != config.config_identity
+        ):
+            raise ValueError(
+                "Foreign identity: generation_outcomes.json was written "
+                "under a different snapshot/plan/config than this run -- "
+                "refusing to mix generation records across runs."
+            )
+        outcomes = payload.get("outcomes")
+        if not isinstance(outcomes, list):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} has no outcomes array."
+            )
+        # RV3: every entry in outcomes must itself be a well-formed
+        # whole_chapter record object — the whole-chapter writer emits
+        # exactly one whole_chapter record and nothing else, so a malformed
+        # or foreign entry must fail closed rather than be silently ignored
+        # while a sole whole_chapter dict is accepted as the valid record.
+        if not all(
+            isinstance(rec, dict) and rec.get("chunk_id") == WHOLE_CHAPTER_CHUNK_ID
+            for rec in outcomes
+        ):
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} contains a malformed "
+                "or foreign generation record — refusing to resume against "
+                "damaged provenance."
+            )
+        whole_records = list(outcomes)
+        if len(whole_records) != 1:
+            raise ValueError(
+                "Data loss: journal says whole_chapter generation was "
+                f"{outcome} but {generation_path.name} must contain exactly "
+                f"one whole_chapter record, found {len(whole_records)}."
+            )
+        # RV3: the sole whole_chapter record must conform to the writer's
+        # serialized GenerationOutcome schema AND link to the journal's
+        # selected candidate/role. A record stripped of its required fields
+        # (status/expected_roles/candidates/errors) or a linked candidate
+        # stripped of its provenance fields (translation/role/candidate_id)
+        # is damaged provenance — failing closed here prevents selection/
+        # provenance from being rewritten from data the writer could never
+        # have produced. The selected candidate's serialized translation must
+        # also equal the raw snapshot being replayed (raw/provenance
+        # consistency), so a damaged provenance can never seed a different
+        # translation than the journal selected.
+        _validate_whole_chapter_generation_record(
+            whole_records[0],
+            outcome=outcome,
+            selected_role=selected_role,
+            selected_candidate_id=selected_candidate_id,
+            raw_text_by_pid=final_text_by_pid if outcome == "selected" else None,
+        )
+        generation_records = [whole_records[0]]
+    else:
+        # ------------------------------------------------------------------
+        # Fresh run: one whole-chapter generation call with bounded retry.
+        # ------------------------------------------------------------------
+        params = GenerationParams(
+            temperature=cfg.temperature, seed=cfg.seed,
+            max_tokens=cfg.max_tokens, reasoning=cfg.reasoning,
+        )
+        # V4.1 A2 (§5.3): the glossary is filtered with the text of the
+        # WHOLE chapter (not per chunk) — only the chapter's terms + the
+        # always_include set (risk categories / conflicts / narrator)
+        # reach the prompt. Locked-policy variant (a): every established
+        # glossary entry is authoritative (presence + always_include); no
+        # separate locked artifact is introduced.
+        whole_chapter_text = " ".join(text for _, text in source.source)
+        whole_risk = _whole_chapter_risk(source, glossary)
+        chapter_glossary, chapter_dropped = _glossary_entries_for_chunk(
+            glossary,
+            chunk_text=whole_chapter_text,
+            risk_feature_codes=(feature.code for feature in whole_risk.features),
+            narrator_gender=narrator_gender,
+            narrator_source_terms=_narrator_glossary_terms(memory.book_memory),
+        )
+        glossary_budget_report_whole: Dict[str, Any] = {
+            "kept": [entry.source_term for entry in chapter_glossary],
+            "dropped": list(chapter_dropped),
+            "dropped_count": len(chapter_dropped),
+        }
+        events_before = runtime.event_count()
+        progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
+        outcome = generate_whole_chapter(
+            role="balanced_literary",
+            source=source,
+            snapshot=snapshot,
+            chunk_plan=chunk_plan,
+            pid_map=pid_map,
+            glossary=chapter_glossary,
+            bible_text=bible_text,
+            config=config,
+            params=params,
+            model_caller=model_caller,
+            cache=GenerationCache(),
+            retry=WholeChapterRetryPolicy(),
+        )
+        generation_records.append(_serialize_generation_outcome(outcome))
+
+        if outcome.status == "complete":
+            candidate = outcome.candidates["balanced_literary"]
+            final_text_by_pid = dict(candidate.as_pid_map())
+            selected_role_counts["balanced_literary"] = 1
+            # Raw snapshot: the validated generator output, BEFORE QA/repair.
+            # Resume reads this file (never translations.json), so the raw
+            # generator contract survives even after later stages diverge it
+            # from the final alias.
+            _atomic_write_json(raw_translations_path, final_text_by_pid)
+            journal_outcome = "selected"
+            selected_candidate_id = candidate.candidate_id
+            candidate_ids = [candidate.candidate_id]
+        else:
+            incomplete_generation_count = 1
+            halted_early = True
+            halt_reason = (
+                "whole_chapter generation incomplete: "
+                + ", ".join(
+                    f"{role}={err.detail}" for role, err in outcome.errors.items()
+                )
+            )
+            journal_outcome = "incomplete_generation"
+            selected_candidate_id = None
+            candidate_ids = []
+
+        entry = JournalEntry(
+            chunk_index=0,
+            chunk_id=WHOLE_CHAPTER_CHUNK_ID,
+            parent_chunk_id=None,
+            parent_context_state_hash=_left_context_hash(()),
+            left_context_kind=WHOLE_CHAPTER_CHUNK_ID,
+            left_context_hash=_left_context_hash(()),
+            snapshot_hash=snapshot.snapshot_hash,
+            chunk_plan_hash=chunk_plan.plan_hash,
+            config_identity=config.config_identity,
+            backend_identity_hash=cfg.backend.identity_hash,
+            candidate_ids=candidate_ids,
+            gate_trace=[],
+            outcome=journal_outcome,
+            selected_candidate_id=selected_candidate_id,
+            selected_role=("balanced_literary" if journal_outcome == "selected" else None),
+            switch_indices=runtime.local_switch_event_indices(events_before),
+            backend_event_indices=list(range(events_before, runtime.event_count())),
+        )
+        with open(journal_path, "a", encoding="utf-8") as journal_file:
+            journal_file.write(json.dumps(entry.to_json(), ensure_ascii=False) + "\n")
+            journal_file.flush()
+        progress.chunk_done(chunk_id=WHOLE_CHAPTER_CHUNK_ID, outcome=journal_outcome)
+
+    # ------------------------------------------------------------------
+    # Provenance artifacts (always written, same lifecycle as the chunked run).
+    # ------------------------------------------------------------------
+    generation_path.write_text(json.dumps({
+        "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "outcomes": generation_records,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Final alias. In A1 there is no repair/formatting, so the final chapter
+    # equals the raw generator snapshot; the two files remain distinct so a
+    # later A2/B stage can diverge them without losing the raw contract.
+    _atomic_write_json(translations_path, final_text_by_pid)
+
+    # V4.1 A2 (§7): intermediate snapshots + diff report, written
+    # atomically (write-then-rename) with identity in every snapshot.
+    # `translations.json` remains the FINAL alias — these files are
+    # attribution snapshots, never a competing source of truth. In A2 the
+    # whole-chapter flow has no repair/formatting yet (B/B2/C), so
+    # repaired == raw and the diff stages are empty; the files establish
+    # the mechanism B2/C will populate.
+    if final_text_by_pid:
+        repaired_path = cfg.out_dir / "translations_repaired.json"
+        diffs_path = cfg.out_dir / "translation_diffs.json"
+        snapshot_identity = {
+            "schema": "pact-v4-snapshot-translations-repaired/v1",
+            "chapter_id": cfg.chapter_id,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+        }
+        _atomic_write_json(
+            repaired_path,
+            {**snapshot_identity, "translations": dict(final_text_by_pid)},
+        )
+        _atomic_write_json(
+            diffs_path,
+            {
+                "schema": "pact-v4-translation-diffs/v1",
+                "chapter_id": cfg.chapter_id,
+                "snapshot_hash": snapshot.snapshot_hash,
+                "chunk_plan_hash": chunk_plan.plan_hash,
+                "config_identity": config.config_identity,
+                "diffs": {
+                    "raw->repaired": _pid_diffs(
+                        final_text_by_pid, final_text_by_pid
+                    ),
+                    "repaired->final": _pid_diffs(
+                        final_text_by_pid, final_text_by_pid
+                    ),
+                },
+            },
+        )
+
+    # V4.1 A2 (§5.3): whole-chapter glossary budget diagnostic — kept/dropped
+    # pairs for the full chapter (same A1.1 diagnostic shape, one row).
+    if resumed_from_index == 0:
+        _atomic_write_json(cfg.out_dir / "glossary_budget_report.json", {
+            "schema": GLOSSARY_BUDGET_SCHEMA,
+            "policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
+            "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash, "config_identity": config.config_identity,
+            "glossary_total": len(glossary),
+            "narrator_gender": narrator_gender,
+            "chunks": {"whole_chapter": glossary_budget_report_whole},
+        })
+
+    generation_record_id = None
+    for rec in generation_records:
+        for _role, cand in (rec.get("candidates") or {}).items():
+            generation_record_id = cand.get("candidate_id")
+            break
+        if generation_record_id:
+            break
+    selection_path.write_text(json.dumps({
+        "schema": WHOLE_CHAPTER_SELECTION_SCHEMA,
+        "chapter_id": cfg.chapter_id, "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "mode": "not_applicable",
+        "candidate_count": 1 if generation_record_id else 0,
+        "selection_performed": False,
+        "coverage": "full_pid_map",
+        "generation_record_id": generation_record_id,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    step6 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+    step7 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+    step8 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+
+    wall_clock_seconds = time.monotonic() - wall_t0
+    processed_count = len(_load_journal(journal_path))
+    finished_at = now_fn().isoformat(timespec="seconds")
+
+    runtime_summary = dict(runtime.summary())
+    local_lifecycle = runtime_summary.get("local_lifecycle")
+    remote_calls = runtime_summary.get("remote_calls")
+    backend_block = dict(runtime.backend_descriptor.public_record())
+    backend_block["config_identity_hash"] = cfg.backend.identity_hash
+    record: Dict[str, Any] = {
+        "schema": RECORD_SCHEMA,
+        "run_label": cfg.run_label,
+        "chapter_id": cfg.chapter_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "wall_clock_seconds": wall_clock_seconds,
+        "identities": {
+            "source_hash": source.source_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "chunk_plan_hash": chunk_plan.plan_hash,
+            "config_identity": config.config_identity,
+            "whole_chapter_pid_map_hash": pid_map.map_hash,
+            # A2 review fix: the chapter_index (bible prompt) record that is
+            # part of the snapshot identity — recorded so a verifiable hash
+            # exists for audits/resume diagnosis.
+            "chapter_index_hash": snapshot.chapter_index_hash,
+        },
+        "backend": backend_block,
+        "runtime": {
+            "local_lifecycle": local_lifecycle,
+            "remote_calls": remote_calls,
+        },
+        "operational_policy": {
+            "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
+            "reasoning": cfg.reasoning,
+            "stop_after": cfg.stop_after,
+            "whole_chapter": True,
+            "generation_max_tokens": cfg.max_tokens,
+            "whole_chapter_retry": {
+                "max_attempts": WholeChapterRetryPolicy().max_attempts,
+            },
+        },
+        "resumed_from_index": resumed_from_index,
+        "halted_early": halted_early,
+        "halt_reason": halt_reason,
+        "counts": {
+            "chunks_total": 1,
+            "chunks_processed": processed_count,
+            "selected": sum(selected_role_counts.values()),
+            "quarantined": 0,
+            "needs_synthesis": 0,
+            "incomplete_generation": incomplete_generation_count,
+            "selected_role_counts": dict(selected_role_counts),
+        },
+        "step6": step6,
+        "step7": step7,
+        "step8": step8,
+        "lifecycle": local_lifecycle or {
+            "startup_count": 0, "restart_count": 0,
+            "switches": [], "aggregates_by_model": {},
+        },
+        "artefacts": {
+            "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
+            "generation_outcomes": str(generation_path),
+            "selection_results": str(selection_path),
+            "translations_raw": str(raw_translations_path),
+            "translations_repaired": str(cfg.out_dir / "translations_repaired.json"),
+            "translation_diffs": str(cfg.out_dir / "translation_diffs.json"),
+            "translations": str(translations_path),
+            "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
+            "journal": str(journal_path),
+        },
+    }
+    record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Terminal teardown lives in the wrapper's finally (_run_whole_chapter_strict),
+    # which runs on success AND on fail-closed resume-validation errors; nothing
+    # to close here (close() is idempotent, but the wrapper owns it now).
+
+    return StrictChapterRunResult(
+        chapter_id=cfg.chapter_id, out_dir=cfg.out_dir, chunk_count=1,
+        processed_count=processed_count,
+        selected_count=sum(selected_role_counts.values()),
+        quarantined_count=0, needs_synthesis_count=0,
+        incomplete_generation_count=incomplete_generation_count,
+        selected_role_counts=dict(selected_role_counts),
+        halted_early=halted_early, halt_reason=halt_reason,
+        resumed_from_index=resumed_from_index,
+        switches=((local_lifecycle or {}).get("switches") or []),
+        translations_path=translations_path, journal_path=journal_path,
+        record_path=record_path, record=record,
+        step6=step6, step7=step7, step8=step8,
+    )

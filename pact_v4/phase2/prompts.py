@@ -73,17 +73,37 @@ FIDELITY_FIRST_V1 = PromptTemplate(
     ),
 )
 
-BALANCED_LITERARY_V1 = PromptTemplate(
+BALANCED_LITERARY_V3 = PromptTemplate(
     role="balanced_literary",
-    version="pact-v4-prompt-balanced-literary/v2",
+    version="pact-v4-prompt-balanced-literary/v3",
     instructions=(
-        "You are translating English fiction into natural, idiomatic "
-        "literary Russian. Balance fidelity to the source with fluency and "
-        "voice: prefer the more natural-sounding rendering when a strictly "
-        "literal one would read as awkward or foreign, provided meaning, "
-        "negation scope, numbers, named entities and glossary terms are "
-        "still preserved. Respect the glossary and character/style/voice "
-        "constraints in the frozen snapshot. " + _OWNERSHIP_GUARD
+        "You are a professional literary translator rendering an English fiction\n"
+        "chapter into natural, polished Russian. You have already read the whole\n"
+        "chapter: use that context to hold each character's voice, the emotional\n"
+        "register of every scene, and consistent decisions from the first to the\n"
+        "last paragraph.\n\n"
+        "BOOK CONTEXT (locked, authoritative — do not contradict):\n"
+        "{book_context}\n\n"
+        "LOCKED GLOSSARY (use these translations consistently, do not vary):\n"
+        "{glossary_entries}\n\n"
+        "Translate by EFFECT, not by dictionary match:\n"
+        "- profanity: match the source's strength and register exactly. Never\n"
+        "  soften or intensify it. \"Jesus fuck\" -> \"Господи блядь\", \"fuck off\" ->\n"
+        "  \"отъебись\", \"I don't give a flying fuck\" -> \"мне до одного хуя\".\n"
+        "  Mild substitutes (drat, darn) stay mild (\"чертовщина\", \"чёрт\").\n"
+        "- sarcasm, humor, anger: preserve the character's voice, not the words.\n"
+        "- formal/archaic address stays archaic (\"Master Blake\" -> \"мастер Блейк\").\n\n"
+        "Avoid calques: rebuild the sentence under Russian syntax and intonation\n"
+        "(\"wannabe-architect\" -> \"недоархитектор\", \"two-theater podunk town\" ->\n"
+        "\"городишко с двумя кинотеатрами\"). Do not keep English word order.\n\n"
+        "Preserve exact details: numbers, times, names, quantities (\"Two past\n"
+        "twelve\" = 00:02 -> \"две минуты первого\").\n\n"
+        "Do not omit, summarize, or add anything. Do not output any HTML or\n"
+        "markup — plain Russian text only.\n\n"
+        "Return STRICT JSON: an object mapping every PID from the SOURCE map to\n"
+        "its Russian translation, keys in exactly the same order as the source,\n"
+        "no missing keys, no extra keys, no duplicate keys. Do not wrap the JSON\n"
+        "in markdown fences or add commentary."
     ),
 )
 
@@ -165,6 +185,23 @@ def render_prompt(bundle: "Any") -> str:
         else ""
     )
     bible_block = bundle.bible_text if bundle.bible_text else ""
+    # V4.1 A2: the v3 balanced_literary template declares BOOK CONTEXT and
+    # LOCKED GLOSSARY inline via {book_context}/{glossary_entries} tokens.
+    # When the template uses these tokens the dynamic blocks are substituted
+    # in place and NOT appended again below; older templates keep the
+    # append-only layout.
+    template_instructions = bundle.template.instructions
+    inline_book_context = "{book_context}" in template_instructions
+    inline_glossary = "{glossary_entries}" in template_instructions
+    if inline_book_context:
+        template_instructions = template_instructions.replace(
+            "{book_context}", bible_block.strip() or "(none)"
+        )
+        bible_block = ""
+    if inline_glossary:
+        template_instructions = template_instructions.replace(
+            "{glossary_entries}", glossary.strip() or "(none)"
+        )
     # V4 Efficiency A1.2 (provider cache): the static blocks (template
     # instructions, the full bible, style/policy constants) are placed at
     # the START of the message so they form a common prefix across chunks
@@ -177,8 +214,9 @@ def render_prompt(bundle: "Any") -> str:
     # glues onto the bible's last line (reproduced "...maleSTYLE_VOICE_..."
     # when the bible ended in "male" with no newline).
     bible_sep = "\n" if bible_block and not bible_block.endswith("\n") else ""
+    glossary_block = "" if inline_glossary else f"GLOSSARY:\n{glossary}\n"
     return (
-        f"{bundle.template.instructions}\n\n"
+        f"{template_instructions}\n\n"
         f"{bible_block}{bible_sep}"
         f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
@@ -186,6 +224,6 @@ def render_prompt(bundle: "Any") -> str:
         f"OWNED_SOURCE (translate exactly these PIDs, in this order):\n{owned_source}\n"
         f"left_context (read-only, already-committed Russian): {left_context}\n"
         f"right_context (read-only English source): {right_context}\n"
-        f"GLOSSARY:\n{glossary}\n"
+        f"{glossary_block}"
         f"{required_category_block}"
     )

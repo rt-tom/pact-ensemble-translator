@@ -12,6 +12,17 @@
 #   managed  -- Pact starts its own `opencode serve` (pinned version) and
 #               stops it after the run. Equivalent to `--managed-server`.
 #
+# V4.1 experiment flags (CLI, not this file):
+#   --reasoning {0,1,2,3}  -- Phase 2B generation reasoning budget only
+#       (0=off baseline, 1=low, 2=medium, 3=high). Sent to the remote
+#       provider as the top-level `reasoningEffort` on each generation
+#       request; the Qwen audit / repair / formatting phases are untouched.
+#   --stop-after-generation -- halt right after Phase 1-2 (generation +
+#       selection): the chunked translation lands in translations.json and
+#       step6/step7/step8 are recorded as skipped_stop_after_generation.
+#   Both flags are part of the run's config identity, so such a run needs a
+#   NEW --out-dir (a prior out-base is NOT resumable under the new identity).
+#
 # Running this profile sends the chapter text to the remote provider(s)
 # referenced by the model_bindings (plan §12 acknowledgement).
 kind: opencode_server

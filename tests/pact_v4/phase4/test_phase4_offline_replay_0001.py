@@ -94,6 +94,8 @@ def _reconstruct_env() -> Tuple[Dict[str, Any], ...]:
         glossary_hash=canonical_json_hash({"replay": "glossary"}),
         book_memory_hash=canonical_json_hash({"replay": "book"}),
         chapter_memory_hash=canonical_json_hash({"replay": "chapter"}),
+        source_hash=source.source_hash,
+        chapter_index_hash=canonical_json_hash({"replay": "chapter_index"}),
     )
     chunks = []
     for item in chunk_plan_payload["chunks"]:

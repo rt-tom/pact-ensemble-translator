@@ -24,6 +24,8 @@ class MemoryManager:
         self.glossary_path = os.path.join(base_dir, 'glossary.json')
         self.book_memory_path = os.path.join(base_dir, 'book_memory.json')
         self.chapter_memory_path = os.path.join(base_dir, 'chapter_memory.json')
+        # V4.1 A2: deterministic per-chapter bible index (build_chapter_index.py).
+        self.chapter_index_path = os.path.join(base_dir, 'chapter_index.json')
         self.observations_path = os.path.join(base_dir, 'observations.json')
 
     def create_snapshot(self):
