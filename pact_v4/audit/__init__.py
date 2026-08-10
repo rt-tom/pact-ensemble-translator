@@ -8,9 +8,46 @@ Submodules (task cards in docs/plans/V4_1_AUDIT_B1_RU.md §10):
   findings BEFORE repair (0 model calls).
 * ``entity_extractor`` — B1.2: ChapterEntityContext extractor (Qwen
   source-only prepass).
-
-This package deliberately imports nothing at package import time: the
-submodules are wired by the pipeline, not by ``import pact_v4.audit``, so a
-partially-landed B-phase (e.g. only B1.1 merged) never breaks unrelated
-imports.
 """
+
+from pact_v4.audit.entity_extractor import (
+    BackendEntityExtractor,
+    BackendEntityExtractorConfig,
+    ChapterEntityContext,
+    ENTITY_CONTEXT_SCHEMA,
+    ENTITY_EXTRACTION_V1,
+    EXTRACTOR_VERSION,
+    EntityClaim,
+    EntityContextCache,
+    EntityExtractionResult,
+    EntityRecord,
+    ValidationEntry,
+    ValidationReport,
+    entity_context_cache_key,
+    extract_entity_context,
+    parse_model_output,
+    render_entity_extraction_prompt,
+    validate_entity_context,
+    with_entity_context_metadata,
+)
+
+__all__ = [
+    "BackendEntityExtractor",
+    "BackendEntityExtractorConfig",
+    "ChapterEntityContext",
+    "ENTITY_CONTEXT_SCHEMA",
+    "ENTITY_EXTRACTION_V1",
+    "EXTRACTOR_VERSION",
+    "EntityClaim",
+    "EntityContextCache",
+    "EntityExtractionResult",
+    "EntityRecord",
+    "ValidationEntry",
+    "ValidationReport",
+    "entity_context_cache_key",
+    "extract_entity_context",
+    "parse_model_output",
+    "render_entity_extraction_prompt",
+    "validate_entity_context",
+    "with_entity_context_metadata",
+]
