@@ -530,6 +530,45 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
     return render_bible_section(chapter_id, memory.chapter_index, memory.book_memory)
 
 
+# The B3 contract binds the Qwen audit server to the MTP build of the model:
+# C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf.
+# The MTP marker is the model-variant DIRECTORY (…\Qwen3.6-35B-A3B-MTP\…); the
+# file stem itself carries no MTP marker (configs/runtime_local.example.yaml
+# model_names.qwen is the plain file name). Identity is therefore verified as an
+# EXACT whole path-component (or file-stem) match against the canonical variant
+# name — a substring test would admit lookalikes (Qwen-non-MTP.gguf,
+# …/MTP-disabled/…, forged model_names.qwen=Qwen-MTP.gguf) as MTP.
+_B3_QWEN_MTP_VARIANT = "Qwen3.6-35B-A3B-MTP"
+# A model NAME that explicitly negates MTP contradicts a valid MTP path —
+# name/path coherence guard (the name must never override the path verdict).
+_B3_QWEN_MTP_NEGATION_MARKERS = (
+    "non-mtp",
+    "no-mtp",
+    "mtp-disabled",
+    "mtp-off",
+    "mtp-free",
+    "without-mtp",
+)
+
+
+def _is_b3_qwen_mtp_identity(value: str) -> bool:
+    """Exact MTP-variant identity: a path component or the file stem EQUALS
+    the canonical MTP build name (case-insensitive). Substring lookalikes
+    never match."""
+    if not value:
+        return False
+    path = Path(value)
+    return any(
+        part.lower() == _B3_QWEN_MTP_VARIANT.lower()
+        for part in path.parts
+    ) or path.stem.lower() == _B3_QWEN_MTP_VARIANT.lower()
+
+
+def _name_negates_b3_qwen_mtp(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _B3_QWEN_MTP_NEGATION_MARKERS)
+
+
 def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
     """Fail loudly when a local profile cannot serve the B3 Qwen audit.
 
@@ -579,12 +618,26 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
     if spec_type != "draft-mtp":
         problems.append("--spec-type draft-mtp (MTP draft)")
     if spec_type == "draft-mtp":
-        # MTP transport declared -> the model path must be the MTP variant.
-        if "mtp" not in path_str.lower() and "mtp" not in name_str.lower():
+        # MTP transport declared -> the ACTUAL model PATH must carry the
+        # exact MTP-variant identity (…/Qwen3.6-35B-A3B-MTP/…). The check is
+        # exact (whole path component / file stem equal to the canonical MTP
+        # build name), so a substring lookalike (Qwen-non-MTP.gguf,
+        # …/MTP-disabled/…) can never pass, and a misleading model NAME can
+        # never override a non-MTP path. A name that explicitly negates MTP
+        # also contradicts a valid MTP path (name/path coherence).
+        if not _is_b3_qwen_mtp_identity(path_str):
             problems.append(
-                "qwen model_paths.qwen/model_names.qwen must be the MTP "
-                "variant (…/Qwen3.6-35B-A3B-MTP/…) when --spec-type "
-                f"draft-mtp is set (got path={path_str!r}, name={name_str!r})"
+                "qwen model_paths.qwen must be the exact MTP variant build "
+                f"({_B3_QWEN_MTP_VARIANT!r}, e.g. …/Qwen3.6-35B-A3B-MTP/…) — "
+                "substring lookalikes and misleading model_names cannot "
+                "satisfy the B3 MTP identity when --spec-type draft-mtp is "
+                f"set (got path={path_str!r}, name={name_str!r})"
+            )
+        elif name_str and _name_negates_b3_qwen_mtp(name_str):
+            problems.append(
+                "qwen model_names.qwen contradicts the exact MTP model path "
+                f"({_B3_QWEN_MTP_VARIANT!r}) — the name must not negate MTP "
+                f"(got name={name_str!r}, path={path_str!r})"
             )
     try:
         budget_ok = reasoning_budget is not None and int(reasoning_budget) >= 8192

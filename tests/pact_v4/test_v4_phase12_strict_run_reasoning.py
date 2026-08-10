@@ -505,3 +505,65 @@ def test_non_mtp_model_path_with_mtp_flags_ok_when_skip_audit(tmp_path: Path):
         unload_timeout=args.unload_timeout,
     )
     cli._validate_b3_qwen_profile(args, backend)  # no exception
+
+
+# ---------------------------------------------------------------------------
+# RV3 (HIGH, t_a0500b7e): _validate_b3_qwen_profile must enforce an EXACT
+# MTP-variant identity on the ACTUAL qwen model path — a substring match
+# (…/Qwen-non-MTP.gguf, …/MTP-disabled/…) or a forged model_names.qwen can
+# never satisfy the B3 MTP requirement, and a misleading name cannot override
+# a non-MTP path.
+# ---------------------------------------------------------------------------
+
+
+def _b3_local_backend(args, qwen_path: Path, qwen_name: str):
+    return cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={"gemma": cli.GEMMA_PATH, "qwen": qwen_path},
+        model_names={"gemma": cli.GEMMA_PATH.name, "qwen": qwen_name},
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": cli.QWEN_SERVER_ARGS,  # MTP draft, reasoning 8192, 49k
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+
+
+@pytest.mark.parametrize(
+    "qwen_path, qwen_name",
+    [
+        # substring false positive: "MTP" inside a non-MTP file name
+        (Path(r"C:/llama-cpp/models/Qwen-non-MTP.gguf"), "Qwen-non-MTP.gguf"),
+        # substring false positive: "MTP" as a prefix of a disabled dir
+        (Path(r"C:/llama-cpp/models/MTP-disabled/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+         "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+        # forged MTP name must NOT override a non-MTP path (BYPASS probe)
+        (Path(r"C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+         "Qwen-MTP.gguf"),
+        # clearly non-MTP path and name
+        (Path(r"C:/llama-cpp/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+         "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+    ],
+)
+def test_mtp_identity_adversarial_paths_fail_loudly(
+    tmp_path: Path, qwen_path: Path, qwen_name: str
+):
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _b3_local_backend(args, qwen_path, qwen_name)
+    with pytest.raises(ValueError, match="MTP variant"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_mtp_identity_valid_path_but_name_negates_mtp_fails_loudly(tmp_path: Path):
+    # Name/path coherence: the path IS the exact MTP variant, but a name that
+    # explicitly negates MTP contradicts it — must fail loudly too.
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _b3_local_backend(args, cli.QWEN_PATH, "Qwen-non-MTP.gguf")
+    with pytest.raises(ValueError, match="contradicts"):
+        cli._validate_b3_qwen_profile(args, backend)
