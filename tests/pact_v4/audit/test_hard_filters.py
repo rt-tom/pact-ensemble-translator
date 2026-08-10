@@ -301,3 +301,184 @@ def test_result_order_preserves_input_order():
     )
     assert [r.issue["id"] for r in results] == ["p00001", "p00002"]
     assert results[1].verdict == CONFIRMED
+
+
+# --- RV fixes (t_6c4d53f6): entity-aware/fail-safe source gender ------------
+
+
+def test_unrelated_object_pronoun_does_not_reject_nurse():
+    # `him` in "The nurse spoke to him." refers to a DIFFERENT participant,
+    # so the current source does not establish the nurse's gender — the
+    # invented_gender finding must NOT be rejected by the source_gender
+    # filter (fail-safe TIER_B, §5.1).
+    issue = _issue(
+        "p00190", "invented_gender",
+        note="the nurse is referred to with masculine forms but the source does not establish the nurse's gender",
+        excerpt="медбрат",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00190": "The nurse spoke to him."},
+        translation={"p00190": "Медбрат поговорил с ним."},
+    )
+    assert result["p00190"].verdict == TIER_B
+
+
+def test_unrelated_role_marker_does_not_reject_nurse():
+    # Role/status markers (man, brother, mr, ...) are not provably the
+    # target entity without entity resolution (B1.2) — "The man" is a
+    # different character, so the nurse's gender stays unproven -> TIER_B.
+    issue = _issue(
+        "p00191", "invented_gender",
+        note="the nurse is referred to with masculine forms but the source only mentions a man who is not the nurse",
+        excerpt="медбрат",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00191": "The man next door saw the nurse."},
+        translation={"p00191": "Соседний мужчина увидел медбрата."},
+    )
+    assert result["p00191"].verdict == TIER_B
+
+
+def test_unrelated_possessive_pronoun_does_not_reject():
+    # "His brother" — `his` is the sibling's possessor, not the nurse.
+    issue = _issue(
+        "p00192", "invented_gender",
+        note="the nurse is referred to with masculine forms but the source does not establish the nurse's gender",
+        excerpt="медбрат",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00192": "His brother was a nurse."},
+        translation={"p00192": "Его брат был медбратом."},
+    )
+    assert result["p00192"].verdict == TIER_B
+
+
+def test_explicit_source_subject_pronoun_still_rejects():
+    # Subject pronoun `he` grammatically binds to the clause subject (Rich,
+    # the nurse) — the deterministic case from the acceptance set must keep
+    # REJECTING even with the narrowed evidence.
+    issue = _issue(
+        "p00184", "invented_gender",
+        note="the nurse is referred to with masculine forms but should be female",
+        excerpt="медбрат",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00184": "Rich was a nurse. He had trained at the city hospital. "
+                          "His hands were steady."},
+        translation={"p00184": "Рич был медбратом. Он учился в городской больнице. "
+                               "Его руки не дрожали."},
+    )
+    assert result["p00184"].verdict == REJECTED
+    assert result["p00184"].filter_name == "source_gender"
+
+
+# --- RV fixes (t_6c4d53f6): positional numeric comparison --------------------
+
+
+def test_reordered_quantities_are_not_rejected():
+    # Two cats and three dogs vs Три кошки и две собаки: the same multiset
+    # (2,3) but the quantities are attached to DIFFERENT facts. The
+    # correspondence is not deterministically provable -> TIER_B, never
+    # REJECTED (and never CONFIRMED).
+    issue = _issue(
+        "p00193", "changed_fact",
+        note="source says 2 cats and 3 dogs but translation has 3 cats and 2 dogs",
+        excerpt="Три кошки и две собаки",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00193": "Two cats and three dogs."},
+        translation={"p00193": "Три кошки и две собаки."},
+    )
+    assert result["p00193"].verdict == TIER_B
+    assert result["p00193"].filter_name == "number_time"
+
+
+def test_same_order_quantities_still_rejected():
+    # Same values in the SAME order = faithful translation of the numeric
+    # content -> deterministic FP (REJECTED), unchanged by the fix.
+    issue = _issue(
+        "p00194", "changed_fact",
+        note="source says 2 cats and 3 dogs",
+        excerpt="Две кошки и три собаки",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00194": "Two cats and three dogs."},
+        translation={"p00194": "Две кошки и три собаки."},
+    )
+    assert result["p00194"].verdict == REJECTED
+    assert result["p00194"].filter_name == "number_time"
+
+
+def test_genuine_numeric_mismatch_still_confirmed():
+    # 12 vs 10 is a real difference — CONFIRMED, unchanged by the fix.
+    issue = _issue(
+        "p00195", "changed_fact",
+        note="source says 12 chairs but translation says 10",
+        excerpt="десять стульев",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00195": "There were twelve chairs in the hall."},
+        translation={"p00195": "В зале стояло десять стульев."},
+    )
+    assert result["p00195"].verdict == CONFIRMED
+    assert result["p00195"].filter_name == "number_time"
+
+
+# --- RV fixes (t_6c4d53f6): explicit name/string/object contract ------------
+
+
+def test_explicit_quoted_string_preserved_rejected():
+    # An explicitly quoted string in the CURRENT source pair preserved
+    # verbatim in the translation refutes the changed-string claim
+    # deterministically (REJECTED).
+    issue = _issue(
+        "p00196", "changed_fact",
+        note='the sign text "STOP" was supposedly changed',
+        excerpt='"STOP"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00196": 'The sign read "STOP".'},
+        translation={"p00196": 'На табличке было написано "STOP".'},
+    )
+    assert result["p00196"].verdict == REJECTED
+    assert result["p00196"].filter_name == "explicit_string"
+
+
+def test_translated_quoted_string_stays_tier_b():
+    # The quoted string is NOT preserved verbatim (translated) — that is a
+    # semantic edge, never CONFIRMED by the hard filter -> TIER_B.
+    issue = _issue(
+        "p00197", "changed_fact",
+        note='the sign text "STOP" was changed',
+        excerpt='"STOP"',
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00197": 'The sign read "STOP".'},
+        translation={"p00197": "На табличке было написано «СТОП»."},
+    )
+    assert result["p00197"].verdict == TIER_B
+
+
+def test_unquoted_name_change_stays_tier_b():
+    # Unquoted proper names are OUT of the deterministic contract (they need
+    # transliteration/entity knowledge) -> TIER_B, never guessed.
+    issue = _issue(
+        "p00198", "changed_fact",
+        note="the character name was changed",
+        excerpt="Рич",
+    )
+    result = _verdicts(
+        [issue],
+        source={"p00198": "Rich walked in."},
+        translation={"p00198": "Рич вошёл."},
+    )
+    assert result["p00198"].verdict == TIER_B

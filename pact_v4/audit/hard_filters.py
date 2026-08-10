@@ -9,9 +9,9 @@ _debug``) BEFORE repair, and decides for every issue exactly one of:
   adjacent duplicate, explicit number/time mismatch against the source).
   §5.3: Tier A findings repair directly.
 * ``REJECTED`` — Tier A false positive: deterministically refuted (numbers/
-  times normalize to the same values in source and translation; the
-  translation follows an explicit current-source gender fact). Dropped,
-  never repaired.
+  times match the source *in text order*; a source quoted string is
+  preserved verbatim in the translation; the translation follows an
+  explicit current-source gender fact). Dropped, never repaired.
 * ``TIER_B`` — needs semantic verification (B2 repair-as-verifier). This is
   the default for anything the hard filters cannot decide, and it is
   *forced* for chapter entity relations.
@@ -22,6 +22,36 @@ Russian ``девяти/десяти`` word forms), exact adjacent duplicates
 (``в гости в гости``), explicit names/strings, and direct current-source
 facts (an explicit number/name/object in the *current* source pair — no
 semantic edge).
+
+Deterministic contracts (RV t_ac2fb507 fixes, 2026-08-10):
+
+1. **Numbers/time are compared POSITIONALLY (text order), never as a
+   sorted multiset.** Identical values in identical order -> ``REJECTED``
+   (FP). The *same multiset in a different order* (e.g. ``Two cats and
+   three dogs`` vs ``Три кошки и две собаки``) -> ``TIER_B``: which number
+   belongs to which fact cannot be proven without semantics, so it is never
+   ``REJECTED`` (and never ``CONFIRMED``). Only a genuinely different
+   multiset -> ``CONFIRMED``.
+
+2. **Source gender evidence is fail-safe and deliberately narrow.** Only
+   EN subject pronouns (``he``/``she``) and reflexive pronouns
+   (``himself``/``herself``) count as source evidence. Object pronouns
+   (``him``/``her``), possessive forms (``his``/``hers``) and role/status
+   nouns (``man``, ``male``, ``brother``, ``mr``, ...) are NOT evidence:
+   they can name a *different* participant (``The nurse spoke to him`` —
+   ``him`` is not the nurse; ``His brother was a nurse``). Without entity
+   resolution (B1.2) their attachment to the target entity is unproven, so
+   the issue stays ``TIER_B``. Residual coreference ambiguity of a subject
+   pronoun is accepted and documented; full resolution is B1.2 scope.
+
+3. **Explicit strings (§5.1 names/strings): REJECT-only, verbatim
+   preservation.** If the current source pair contains an explicitly quoted
+   string (double quotes or guillemets) and that exact string appears
+   verbatim in the translation, a changed_fact/addition/omission claim
+   about it is a deterministic FP -> ``REJECTED``. A translated,
+   transliterated or absent variant is NEVER ``CONFIRMED`` (that would be a
+   semantic edge) — it stays ``TIER_B``, as do unquoted names/objects
+   (they need entity resolution).
 
 CRITICAL (§5.3, card rule 5): ``chapter_entity_context`` is NEVER Tier A.
 An issue whose PID participates in the chapter entity context (anchor/alias
@@ -74,6 +104,10 @@ _NUMERIC_CATEGORIES = frozenset({"changed_fact", "addition", "omission", "negati
 # Categories where an explicit current-source gender fact can refute the
 # finding deterministically.
 _GENDER_CATEGORIES = frozenset({"invented_gender", "referent"})
+# Categories where an explicit quoted-string fact can refute the finding
+# deterministically (a string/name/object was claimed changed, added or
+# omitted). Negation and referent/invented_gender are not string claims.
+_STRING_CATEGORIES = frozenset({"changed_fact", "addition", "omission"})
 
 # --- number words (plain values; time-only words live in the time tables) ---
 
@@ -127,17 +161,20 @@ _EN_TIME_WORDS: dict = dict(_EN_PLAIN_NUMBERS, half=30, quarter=15)
 _RU_TIME_WORDS: dict = dict(_RU_PLAIN_NUMBERS, половина=30, четверть=15, четверти=15)
 
 # --- explicit gender markers (current-source facts only, no semantics) ---
-
-_EN_MALE_RE = re.compile(
-    r"\b(?:he|him|his|himself|man|male|boy|brother|father|son|uncle|"
-    r"grandfather|mr)\b",
-    re.I,
-)
-_EN_FEMALE_RE = re.compile(
-    r"\b(?:she|her|hers|herself|woman|female|girl|sister|mother|daughter|"
-    r"aunt|grandmother|mrs|ms|miss)\b",
-    re.I,
-)
+#
+# EN SOURCE evidence — FAIL-SAFE contract (RV t_ac2fb507 fix): only
+# subject pronouns (he/she) and reflexive pronouns (himself/herself) count.
+# These are grammatically bound to the clause subject — the entity being
+# described. Object pronouns (him/her), possessive forms (his/hers) and
+# role/status nouns (man, male, boy, brother, father, ..., mr / woman,
+# female, girl, sister, mother, ..., mrs/ms/miss) are NOT source evidence:
+# without entity resolution (B1.2) they cannot be proven to refer to the
+# target entity (``The nurse spoke to him`` — ``him`` is another
+# participant; ``His brother was a nurse`` — ``his`` is the sibling's).
+# When only such markers are present the source gender is "unknown" and the
+# issue stays TIER_B (§5.1 fail-safe).
+_EN_MALE_RE = re.compile(r"\b(?:he|himself)\b", re.I)
+_EN_FEMALE_RE = re.compile(r"\b(?:she|herself)\b", re.I)
 _RU_MALE_RE = re.compile(
     r"\b(?:он|медбрат|медбрата|мужчина|мужчины|мужчин|брат|брата|отец|"
     r"сын|парень|юноша|дед)\b",
@@ -246,14 +283,15 @@ def _blanked(text: str, spans: Collection[Tuple[int, int]]) -> str:
 def _extract_times(text: str, lang: str) -> Tuple[Tuple[int, ...], str]:
     """Extract normalized minute-of-day values from time expressions.
 
-    Returns ``(values, remaining_text)`` where every matched time
+    Returns ``(values, remaining_text)`` where ``values`` are in **text
+    order** (sorted by match position, not by value) and every matched time
     expression has been blanked out of ``remaining_text`` so plain-number
     extraction does not double-count its words/digits. Patterns run on a
     working copy that is blanked after each pattern, so overlapping matches
     (e.g. ``half past ten o'clock``) never count twice.
     """
     patterns = _EN_TIME_PATTERNS if lang == "en" else _RU_TIME_PATTERNS
-    values: list = []
+    found: list = []  # (match_start, value) — text-order tracking
     working = text
     for pattern, kind in patterns:
         spans: list = []
@@ -286,22 +324,22 @@ def _extract_times(text: str, lang: str) -> Tuple[Tuple[int, ...], str]:
                 if hour is not None:
                     value = _hour_24(hour) * 60
             if value is not None:
-                values.append(value)
+                found.append((match.start(), value))
                 spans.append(match.span())
         if spans:
             working = _blanked(working, spans)
-    return tuple(sorted(values)), working
+    found.sort(key=lambda item: item[0])
+    return tuple(value for _, value in found), working
 
 
-def normalized_numeric_values(text: str, lang: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Canonical numeric content of ``text``: ``(times, plain_numbers)``.
+def _ordered_numeric_values(text: str, lang: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Numeric content of ``text`` in **text order**: ``(times, numbers)``.
 
-    ``times`` are minute-of-day values from recognized time expressions
-    (``Two past twelve`` = (2,), ``две минуты первого`` = (2,),
-    ``половина одиннадцатого`` = (630,)); ``plain_numbers`` are the digits
-    and number words *outside* time expressions (``десяти`` -> 10,
-    ``двадцать`` -> 20). Deterministic and language-tagged (``"en"`` for
-    the source, ``"ru"`` for the translation).
+    Unlike :func:`normalized_numeric_values` (which returns sorted canonical
+    multisets), this preserves the order in which the values appear, so the
+    comparison can detect that ``Two cats and three dogs`` and ``Три кошки
+    и две собаки`` carry the *same* quantities but attached to *different*
+    facts — a correspondence the sorted multiset comparison cannot see.
     """
     times, remaining = _extract_times(text, lang)
     table = _EN_PLAIN_NUMBERS if lang == "en" else _RU_PLAIN_NUMBERS
@@ -313,7 +351,24 @@ def normalized_numeric_values(text: str, lang: str) -> Tuple[Tuple[int, ...], Tu
         value = table.get(token.lower())
         if value is not None:
             numbers.append(value)
-    return times, tuple(sorted(numbers))
+    return times, tuple(numbers)
+
+
+def normalized_numeric_values(text: str, lang: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Canonical numeric content of ``text``: ``(times, plain_numbers)``.
+
+    ``times`` are minute-of-day values from recognized time expressions
+    (``Two past twelve`` = (2,), ``две минуты первого`` = (2,),
+    ``половина одиннадцатого`` = (630,)); ``plain_numbers`` are the digits
+    and number words *outside* time expressions (``десяти`` -> 10,
+    ``двадцать`` -> 20). Both tuples are returned as sorted canonical
+    multisets (order-insensitive); use :func:`_ordered_numeric_values` when
+    the *positional* correspondence between source and translation matters.
+    Deterministic and language-tagged (``"en"`` for the source, ``"ru"``
+    for the translation).
+    """
+    times, numbers = _ordered_numeric_values(text, lang)
+    return tuple(sorted(times)), tuple(sorted(numbers))
 
 
 def find_adjacent_duplicate(text: str) -> Tuple[str, ...] | None:
@@ -356,6 +411,52 @@ def _is_entity_context_issue(issue: Mapping[str, Any], entity_pids: Collection[s
 def _note_has_numeric_hint(issue: Mapping[str, Any]) -> bool:
     text = " ".join(str(issue.get(key, "")) for key in ("note", "excerpt"))
     return bool(_NOTE_NUMERIC_HINT_RE.search(text))
+
+
+# --- explicit quoted strings (current-source name/string/object facts) ---
+#
+# Narrow deterministic contract (RV t_ac2fb507 fix): an explicit quoted
+# string in the CURRENT source pair (double/single quotes or RU guillemets)
+# that is preserved verbatim in the translation refutes a
+# changed_fact/addition/omission claim about that string. A quoted string
+# that is NOT preserved verbatim is a semantic edge (the translator may
+# legitimately translate or transliterate it — e.g. "STOP" -> «СТОП»), so it
+# is never CONFIRMED; unquoted names/objects are out of contract entirely
+# (they need entity/lexicon knowledge — B1.2/B2). When no quoted string
+# fact is provable the issue stays TIER_B (§5.1 fail-safe).
+
+_QUOTED_STRING_RES = (
+    re.compile(r'"([^"\n]{1,120})"'),          # "..."
+    re.compile(r"'([^'\n]{1,120})'"),          # '...'
+    re.compile(r"\u00ab([^\u00bb\n]{1,120})\u00bb"),  # «...»
+)
+
+
+def _quoted_strings(text: str) -> frozenset:
+    """Case-folded quoted-string contents found in ``text`` (deduplicated).
+
+    Only explicitly quoted spans count (double/single quotes or RU
+    guillemets); the surrounding quote characters are stripped and the
+    content is case-folded for the verbatim-preservation comparison.
+    """
+    result: set = set()
+    for res in _QUOTED_STRING_RES:
+        for match in res.finditer(text or ""):
+            value = re.sub(r"\s+", " ", match.group(1)).strip().casefold()
+            if value:
+                result.add(value)
+    return frozenset(result)
+
+
+def _note_has_string_hint(issue: Mapping[str, Any]) -> bool:
+    """True when the issue's note/excerpt itself references a quoted string.
+
+    Mirrors ``_note_has_numeric_hint``: a string-fact verdict is only
+    attempted when the auditor explicitly quoted the content, so a
+    coincidental quote in another finding never triggers the filter.
+    """
+    text = " ".join(str(issue.get(key, "")) for key in ("note", "excerpt"))
+    return any(char in text for char in ('"', "'", "\u00ab", "\u00bb"))
 
 
 def _source_gender(text: str) -> str | None:
@@ -444,32 +545,65 @@ def _filter_one(
                 f"exact adjacent duplicate in translation: '{phrase}'",
             )
 
-    # 4. Numbers/time normalization vs the source (card scope items 2-3).
-    #    Only for categories where a numeric claim is plausible, and only
-    #    when the issue itself references numeric content (so a coincidental
-    #    digit in a note never rejects a genuine semantic finding).
+    # 4. Numbers/time vs the source (card scope items 2-3). POSITIONAL
+    #    comparison in text order (RV t_ac2fb507 fix): identical values in
+    #    identical order -> REJECTED (FP); the same values in a different
+    #    order -> TIER_B (which value belongs to which fact cannot be proven
+    #    deterministically — never REJECTED, never CONFIRMED); genuinely
+    #    different values -> CONFIRMED. Only for categories where a numeric
+    #    claim is plausible, and only when the issue itself references
+    #    numeric content (so a coincidental digit in a note never rejects a
+    #    genuine semantic finding).
     if category in _NUMERIC_CATEGORIES and _note_has_numeric_hint(issue):
-        src_times, src_numbers = normalized_numeric_values(source_text, "en")
-        trn_times, trn_numbers = normalized_numeric_values(translation_text, "ru")
+        src_times, src_numbers = _ordered_numeric_values(source_text, "en")
+        trn_times, trn_numbers = _ordered_numeric_values(translation_text, "ru")
         src_has = bool(src_times or src_numbers)
         trn_has = bool(trn_times or trn_numbers)
         if src_has or trn_has:
-            equal = src_times == trn_times and src_numbers == trn_numbers
-            if equal:
+            if src_times == trn_times and src_numbers == trn_numbers:
                 return FilteredIssue(
                     issue,
                     REJECTED,
                     "number_time",
-                    "source and translation normalize to the same numeric/time values",
+                    "source and translation carry the same numeric/time values in the same order",
+                )
+            if (
+                sorted(src_times) == sorted(trn_times)
+                and sorted(src_numbers) == sorted(trn_numbers)
+            ):
+                return FilteredIssue(
+                    issue,
+                    TIER_B,
+                    "number_time",
+                    "same numeric/time values in a different order — "
+                    "per-fact correspondence is not deterministically provable",
                 )
             return FilteredIssue(
                 issue,
                 CONFIRMED,
                 "number_time",
-                "source and translation normalize to different numeric/time values",
+                "source and translation carry different numeric/time values",
             )
 
-    # 5. Direct current-source gender fact (card scope item 3, acceptance:
+    # 5. Direct current-source explicit string fact (§5.1 names/strings,
+    #    card scope item 3). Narrow deterministic contract: an explicitly
+    #    quoted string in the CURRENT source pair that is preserved verbatim
+    #    in the translation refutes a changed_fact/addition/omission claim
+    #    about that string (REJECTED). A quoted string that is NOT preserved
+    #    verbatim is a semantic edge (the translator may legitimately
+    #    translate or transliterate it) -> TIER_B, never CONFIRMED. Unquoted
+    #    names/objects are out of contract (need entity/lexicon knowledge).
+    if category in _STRING_CATEGORIES and _note_has_string_hint(issue):
+        src_strings = _quoted_strings(source_text)
+        if src_strings and src_strings <= _quoted_strings(translation_text):
+            return FilteredIssue(
+                issue,
+                REJECTED,
+                "explicit_string",
+                "every explicitly quoted source string is preserved verbatim in the translation",
+            )
+
+    # 6. Direct current-source gender fact (card scope item 3, acceptance:
     #    nurse-issue with explicit source fact "Rich male" -> REJECTED).
     #    Only refutes; never confirms gender from heuristics (invented
     #    gender without explicit traces stays Tier B, §5.1).
@@ -484,7 +618,7 @@ def _filter_one(
                 f"translation follows the explicit current-source gender fact ({src_gender})",
             )
 
-    # 6. Default: semantic verification required.
+    # 7. Default: semantic verification required.
     return FilteredIssue(
         issue,
         TIER_B,
