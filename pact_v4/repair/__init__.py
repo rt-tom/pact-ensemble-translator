@@ -2,8 +2,9 @@
 
 ``selective_repair`` — B2: selective repair (batch) + repair-as-verifier
 over the generator (Gemma local / DeepSeek remote), with Tier A direct
-repair, Tier B verify-before-repair, cap 10 per chapter, microbatches of
-3-4, and a single post-repair re-audit. Transport-neutral over
+repair, Tier B verify-before-repair, cap 100 per chapter (configurable),
+microbatches of 3-4, and a single post-repair re-audit with bounded JSON
+retry. Transport-neutral over
 ``CompletionBackend``; the lifecycle wrapper lives in
 ``pact_v4.runtime.model_lifecycle_adapters.LifecycleSelectiveRepairEvaluator``.
 """

@@ -5,7 +5,7 @@ Acceptance (card t_73e190f7):
 - p00106-type (FP dialogue tag: said -> поправил я) -> PASS, no change
 - p00080-type (FP parsing) -> PASS, no change
 - p00240-type (time TP) -> Tier A CONFIRMED -> repair напрямую
-- cap 10 findings per chapter (policy_limit: repair_findings_cap_10)
+- cap 100 findings per chapter (policy_limit: repair_findings_cap_100)
 - микробатчи (microbatches) when eligible > 4 (Cheng et al., [index] ids)
 - TEaR: 0 eligible findings -> repair skipped entirely
 - fail-closed: failed repair chunk -> debt, never silent PASS
@@ -58,6 +58,7 @@ from pact_v4.runtime.backend_protocol import (
     CompletionRequest,
     CompletionResponse,
 )
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.prompts_runtime import (
     REPAIR_AS_VERIFIER_V1,
     render_reaudit_prompt,
@@ -231,7 +232,7 @@ def test_eligible_confidence_high_medium_categories():
 
 
 # ---------------------------------------------------------------------------
-# Cap 10 + microbatches
+# Cap + microbatches
 # ---------------------------------------------------------------------------
 
 
@@ -241,10 +242,23 @@ def test_cap_10_keeps_first_ten_and_tags_rest():
         for i in range(1, 13)
     ]
     eligible, _, _ = select_eligible(issues)
-    kept, capped = apply_findings_cap(eligible, cap=REPAIR_FINDINGS_CAP)
+    # Explicit small cap to exercise the boundary (the DEFAULT cap is 100).
+    kept, capped = apply_findings_cap(eligible, cap=10)
     assert len(kept) == 10
     assert len(capped) == 2
     assert [f.pid for f in capped] == ["p00011", "p00012"]
+
+
+def test_default_cap_100_keeps_all_37():
+    issues = [
+        _issue_with(f"p{i:05d}", category="invented_gender", confidence="high", _verdict=TIER_B)
+        for i in range(1, 38)
+    ]
+    eligible, _, _ = select_eligible(issues)
+    kept, capped = apply_findings_cap(eligible, cap=REPAIR_FINDINGS_CAP)
+    assert REPAIR_FINDINGS_CAP >= 100
+    assert len(kept) == 37
+    assert not capped
 
 
 def test_cap_keeps_tier_a_before_tier_b():
@@ -638,7 +652,12 @@ def test_cap_10_policy_limit_debt():
         _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
                           for i in range(1, 4)]),
     ])
-    evaluator = SelectiveRepairEvaluator(backend)
+    # Explicit small cap to exercise the policy-limit debt path (the DEFAULT
+    # cap is 100 — a run with 37 eligible repairs all of them, see
+    # test_default_cap_100_repairs_all_37_eligible).
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered,
@@ -651,6 +670,43 @@ def test_cap_10_policy_limit_debt():
     # MEDIUM review finding (fea68de): each microbatch outcome carries its
     # ACTUAL batch index from the loop, never a hardcoded 1.
     assert [b.batch_index for b in outcome.batches] == [1, 2, 3]
+
+
+def test_default_cap_100_repairs_all_37_eligible():
+    """run_010 acceptance: 37 eligible findings must ALL be repaired via
+    microbatches — 0 debt by policy_limit (the old cap of 10 cut 27 real
+    findings into debt)."""
+    n = 37
+    issues = [
+        _issue(f"p{i:05d}", "invented_gender", note="n", confidence="high")
+        for i in range(1, n + 1)
+    ]
+    source = {f"p{i:05d}": f"source {i}" for i in range(1, n + 1)}
+    translation = {f"p{i:05d}": f"translation {i}" for i in range(1, n + 1)}
+    filtered = [
+        FilteredIssue(issue=iss, verdict=TIER_B, filter_name="semantic", reason="test")
+        for iss in issues
+    ]
+    # 37 eligible -> ceil(37/4) = 10 microbatches of 4/4/4/4/4/4/4/3/3/3
+    # (base = n//n_batches, remainder spread evenly). All PASS -> no re-audit.
+    sizes = [4] * 7 + [3] * 3
+    script = [_repair_response(
+        [{"index": i, "decision": "pass", "reason": "ok"}
+         for i in range(1, size + 1)]
+    ) for size in sizes]
+    backend = ScriptedRepairBackend(script)
+    evaluator = SelectiveRepairEvaluator(backend)  # DEFAULT config
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.eligible_count == 37
+    assert outcome.capped == ()  # default cap 100: nothing beyond the cap
+    assert not any(POLICY_LIMIT_TAG in d for d in outcome.debt_trace)
+    assert len(outcome.batches) == 10  # microbatches, one call per group
+    assert [len(b.findings) for b in outcome.batches] == [4] * 7 + [3] * 3
+    assert outcome.repair_complete is True
+    assert len(backend.requests) == 10
 
 
 def test_microbatch_outcomes_carry_unique_batch_indexes():
@@ -814,6 +870,85 @@ def test_failed_reaudit_debt_never_zero_findings():
     assert outcome.reaudit is not None and outcome.reaudit.failed
     assert outcome.repair_complete is False
     assert any("failed re-audit" in d for d in outcome.debt_trace)
+
+
+def test_reaudit_empty_then_valid_retries():
+    """run_010 acceptance (FIX 1a): a re-audit whose first attempt returns an
+    EMPTY content (Qwen reasoning-only answer on the full input) must be
+    retried — the second attempt's valid JSON completes the re-audit, instead
+    of failing the chapter closed on the single call."""
+    issue = _issue("p00193", "invented_gender", note="n", confidence="high")
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "А потом заявила, что это должен быть внук-",
+            "reason": "confirmed",
+        }]),
+        CompletionResponse(text="", model="qwen-3.6-35b", finish_reason="stop"),  # empty (run_010)
+        _reaudit_response([]),  # valid on retry
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(
+            reaudit_retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0),
+        )
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.committed != ()
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    assert outcome.repair_complete is True
+    assert not any("failed re-audit" in d for d in outcome.debt_trace)
+    assert len(backend.requests) == 3  # 1 repair + 2 re-audit attempts
+
+
+def test_reaudit_invalid_json_three_attempts_then_debt():
+    """run_010 acceptance (FIX 1a): invalid JSON is retried up to 3 attempts;
+    only after the budget is exhausted does the re-audit become debt."""
+    issue = _issue("p00193", "invented_gender", note="n", confidence="high")
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "А потом заявила, что это должен быть внук-",
+            "reason": "confirmed",
+        }]),
+        CompletionResponse(text="not json", model="qwen-3.6-35b", finish_reason="stop"),
+        CompletionResponse(text="also not json", model="qwen-3.6-35b", finish_reason="stop"),
+        CompletionResponse(text="still not json", model="qwen-3.6-35b", finish_reason="stop"),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(
+            reaudit_retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0),
+        )
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.committed != ()
+    assert outcome.reaudit is not None and outcome.reaudit.failed
+    assert "re-audit response invalid after 3 attempt(s)" in outcome.reaudit.reason
+    assert outcome.repair_complete is False
+    assert any("failed re-audit" in d for d in outcome.debt_trace)
+    assert len(backend.requests) == 4  # 1 repair + 3 re-audit attempts
+
+
+def test_reaudit_max_tokens_default_is_20000():
+    """run_010 acceptance (FIX 1b): the re-audit output budget default must
+    be >= 20000 (same input profile as the extractor: full source +
+    translation; reasoning can exhaust 12000 on the full input)."""
+    from pact_v4.repair.selective_repair import DEFAULT_REAUDIT_MAX_TOKENS
+    assert DEFAULT_REAUDIT_MAX_TOKENS >= 20000
+    assert SelectiveRepairConfig().reaudit_max_tokens >= 20000
 
 
 def test_reaudit_finds_residual_issues_debt():
