@@ -115,6 +115,13 @@ _CURVE_QUOTES = str.maketrans({
 # restored" for the preserved tier (same set as ``source_html``).
 _INLINE_TAG_OPEN_RE = re.compile(r"<(em|strong|i|b|a)\b[^>]*>")
 
+# All inline open/close tokens (``<em>``, ``</em>``, ``<strong …>`` …) — the
+# preserved tier must detect ANY unbalanced/orphaned/malformed token, not
+# only balanced pairs (RV2 finding: an unclosed opening tag or an orphan
+# closing tag must become ``preserved_tag_mismatch`` debt, never fall
+# through to the text tiers and double-wrap the verbatim fragment).
+_INLINE_TAG_TOKEN_RE = re.compile(r"</?(em|strong|i|b|a)\b[^>]*>")
+
 
 def _fold(text: str) -> str:
     """Conservative normalization used for grouping and fuzzy matching.
@@ -346,17 +353,57 @@ def _fuzzy_pattern(needle: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _malformed_inline_markup(text: str) -> List[Tuple[str, int, int]]:
+    """Locate any unbalanced/orphaned/malformed inline token in ``text``.
+
+    Scans ALL inline open/close tokens (``<em>``, ``</em>``, ``<strong …>``
+    …) and returns ``(token_text, start, end)`` for every token that is not
+    part of a balanced pair:
+
+    * an opening tag with no matching closing tag (``<em>world``);
+    * an orphan closing tag with no opening tag before it (``world</em>``);
+    * a closing tag that does not close the innermost open tag
+      (``<em>…</strong>``), i.e. mismatched nesting.
+
+    Balanced markup — even with an inner/outer nesting mismatch vs the
+    source span sequence — is NOT reported here (the preserved tier's 1:1
+    sequence check handles count/order mismatch separately); this helper
+    only flags genuinely broken HTML structure that would otherwise be
+    silently ignored (RV2 finding: such markup must become
+    ``preserved_tag_mismatch`` debt, never fall through to the text tiers).
+    """
+    malformed: List[Tuple[str, int, int]] = []
+    stack: List[Tuple[str, int, int]] = []  # (tag, start, end) of open tokens
+    for match in _INLINE_TAG_TOKEN_RE.finditer(text):
+        token = match.group(0)
+        start, end = match.start(), match.end()
+        is_closing = token.startswith("</")
+        if not is_closing:
+            stack.append((match.group(1), start, end))
+            continue
+        if not stack or stack[-1][0] != match.group(1):
+            # Orphan / mismatched closing tag.
+            malformed.append((token, start, end))
+            continue
+        stack.pop()
+    # Any opening tag left on the stack has no matching close.
+    malformed.extend((token, start, end) for _tag, start, end in stack)
+    return malformed
+
+
 def _existing_inline_tags(
     text: str,
 ) -> List[Tuple[str, int, int]]:
-    """Scan a translated PID text for already-present inline tags.
+    """Scan a translated PID text for already-present balanced inline tags.
 
     Returns ``(tag, inner_start, inner_end)`` in document order (the same
     order ``parse_source_html``'s ``find_all`` produces: nested tags are
     reported by opening-tag order). ``inner_start`` points just after the
     opening tag and ``inner_end`` just before the closing tag, so the inner
     range is the already-wrapped fragment. Unbalanced tags are ignored (a
-    broken tag must not claim a span).
+    broken tag must not claim a span); the caller detects malformed markup
+    separately via ``_malformed_inline_markup`` before the balanced-pair
+    sequence is trusted.
     """
     results: List[Tuple[str, int, int]] = []
     for match in _INLINE_TAG_OPEN_RE.finditer(text):
@@ -382,8 +429,8 @@ def _resolve_preserved(
     already restored by the translator — each source span maps 1:1 (in
     order) to the existing ``<tag>…</tag>`` range with tier
     ``TIER_PRESERVED`` and ``preserved=True`` (no re-wrap). This is the
-    whole-chapter case (§11: "whole-chapter перевод держит ``<em>``
-    101/101"), resolved with 0 model calls.
+    whole-chapter case (§11: "whole-chapter перевод держит ``<em>``"
+    101/101), resolved with 0 model calls.
 
     Returns ``(resolved, remaining, mismatched)``:
 
@@ -393,17 +440,27 @@ def _resolve_preserved(
       translation carries no inline markup at all (the valid exact path,
       e.g. source ``<em>1947</em>`` with a tag-free translation);
     * ``mismatched`` — spans whose translation ALREADY carries inline
-      markup that does not match the source span sequence (count or order
-      mismatch). A count/order mismatch (the translation added, dropped or
-      reordered an emphasis) is NOT guessed and must NOT fall through to
-      the text tiers: the source text often survives verbatim *inside* the
-      existing markup, and an ``exact`` claim there would double-wrap the
-      fragment with no incident. These spans become blocking incidents
-      (debt) directly.
+      markup that is malformed (unbalanced/orphaned token) or whose
+      balanced sequence does not match the source span sequence (count or
+      order mismatch). A malformed or mismatched translation is NOT
+      guessed and must NOT fall through to the text tiers: the source text
+      often survives verbatim *inside* the existing markup, and an
+      ``exact`` claim there would double-wrap the fragment with no
+      incident. These spans become blocking incidents (debt) directly.
     """
     if not spans:
         return [], [], []
     src_seq = [span.tag for span in spans]
+    malformed = _malformed_inline_markup(translation)
+    if malformed:
+        # The translation carries an unbalanced/orphaned/malformed inline
+        # token (``<em>world`` or ``world</em>``). Such markup is NOT "no
+        # markup" and NOT a claimable preserved pair: it must never fall
+        # through to the text tiers (the verbatim fragment inside/beside it
+        # would be double-wrapped or get an extra generated closing tag with
+        # incident_count == 0). The spans are blocking debt and the
+        # translation's own markup stays untouched.
+        return [], [], list(spans)
     existing = _existing_inline_tags(translation)
     if not existing:
         # No inline markup in the translation at all — the valid exact path.
@@ -470,13 +527,15 @@ def _resolve_deterministic(
       contract ("occurrence неоднозначен"), these become blocking incidents,
       never guessed by re-running the exact string search.
     * ``preserved_mismatch`` — spans whose translation ALREADY carries
-      inline markup whose sequence (count or order) differs from the source
-      span sequence. These must become blocking incidents (debt) directly
-      and must NOT run the text tiers: the source text often survives
+      inline markup that is malformed (unbalanced/orphaned token) or whose
+      balanced tag sequence (count or order) differs from the source span
+      sequence. These must become blocking incidents (debt) directly and
+      must NOT run the text tiers: the source text often survives
       verbatim *inside* the existing markup, and an ``exact`` claim there
-      would double-wrap the fragment with no incident. ``preserved_mismatch``
-      is mutually exclusive with ``fuzzy_candidates``/``ambiguous`` — when it
-      is non-empty the text tiers are skipped entirely for the PID.
+      would double-wrap the fragment with no incident.
+      ``preserved_mismatch`` is mutually exclusive with
+      ``fuzzy_candidates``/``ambiguous`` — when it is non-empty the text
+      tiers are skipped entirely for the PID.
 
     Group rule ("occurrence однозначен"): a group of ``M`` source spans with
     the same folded text resolves deterministically only when the translation
@@ -649,10 +708,11 @@ def run_formatting_align(
     formatting = 0 model calls):
 
       1. ``preserved`` — the translation already carries the inline tags
-         (whole-chapter case: "whole-chapter перевод держит ``<em>``
-         101/101"): the span's markup is already restored, resolved with no
+         (whole-chapter case: "whole-chapter перевод держит ``<em>``"
+         101/101): the span's markup is already restored, resolved with no
          re-wrap. The preserved tier verifies the translation's tag sequence
          against the source spans (same tags, same order, same count); a
+         malformed/unbalanced token (``<em>world``, ``world</em>``) or a
          count/order mismatch is NOT guessed and does NOT fall through to
          the text tiers — those spans become blocking incidents (debt)
          directly, because the source text often survives verbatim *inside*
@@ -715,10 +775,11 @@ def run_formatting_align(
         def _detail(span: SourceSpan) -> str:
             if span.span_id in mismatch_ids:
                 return (
-                    "translation already carries inline markup whose tag "
-                    "sequence (count/order) does not match the source spans; "
-                    "never claimed, never re-wrapped (formatting is model-free "
-                    "by rule — unresolved spans are debt)"
+                    "translation already carries inline markup that is "
+                    "malformed (unbalanced/orphaned tag) or whose tag "
+                    "sequence (count/order) does not match the source "
+                    "spans; never claimed, never re-wrapped (formatting is "
+                    "model-free by rule — unresolved spans are debt)"
                 )
             return (
                 "no deterministic fragment found (formatting is "

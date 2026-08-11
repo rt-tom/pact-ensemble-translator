@@ -281,6 +281,69 @@ def test_preserved_unbalanced_tag_amid_matching_sequence_is_debt():
     assert out.model_call_count == 0
 
 
+def test_preserved_unclosed_open_tag_is_mismatch_not_double_wrap():
+    # RV2 finding (HIGH): source <em>world</em> + translation <em>world
+    # (unclosed opening tag). The old scanner saw the open <em>, found no
+    # closing tag, and silently dropped it — the PID looked "tag-free", the
+    # exact tier claimed the verbatim "world", and the output became
+    # <em><em>world</em> (double wrap) with incident_count == 0. The
+    # unclosed tag is malformed markup: it must be blocking
+    # preserved_tag_mismatch debt, never claimed, never re-wrapped.
+    out = _align(
+        "<html><body><p><em>world</em></p></body></html>",
+        {"p00001": "<em>world"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    incident = out.incidents[0]
+    assert incident.reason == "preserved_tag_mismatch"
+    assert incident.tier == TIER_PRESERVED
+    assert incident.required
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<em>world", (
+        "translation's own (broken) markup untouched, got {formatted!r}"
+    )
+    assert "<em><em>" not in formatted
+    assert formatted.count("<em>") == 1
+    assert formatted.count("</em>") == 0, (
+        "no generated closing tag may be added, got {formatted!r}"
+    )
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+
+
+def test_preserved_orphan_close_tag_is_mismatch_no_extra_close():
+    # RV2 finding (HIGH): source <em>world</em> + translation world</em>
+    # (orphan closing tag). The old scanner only looked for opening tags,
+    # never saw the orphan </em>, treated the PID as "tag-free", and the
+    # exact tier added its own wrap: <em>world</em></em> — an extra
+    # generated closing tag — with incident_count == 0. The orphan close is
+    # malformed markup: blocking preserved_tag_mismatch debt, translation
+    # untouched, no generated close.
+    out = _align(
+        "<html><body><p><em>world</em></p></body></html>",
+        {"p00001": "world</em>"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    incident = out.incidents[0]
+    assert incident.reason == "preserved_tag_mismatch"
+    assert incident.tier == TIER_PRESERVED
+    assert incident.required
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "world</em>", (
+        "translation's own (broken) markup untouched, got {formatted!r}"
+    )
+    assert formatted.count("<em>") == 0
+    assert formatted.count("</em>") == 1, (
+        "no extra generated closing tag may appear, got {formatted!r}"
+    )
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Tier selection
 # ---------------------------------------------------------------------------
