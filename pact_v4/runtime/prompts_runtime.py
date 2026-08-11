@@ -682,6 +682,111 @@ REGION_FIDELITY_GATE_BATCH_V1 = ReviewerPrompt(
 # ---------------------------------------------------------------------------
 
 
+# V4.2 R (card t_4707e6e5, R1): Russian-only editor stage. Qwen edits the
+# RUSSIAN translation WITHOUT the English source, right after whole-chapter
+# generation and BEFORE the audit (owner decision 2026-08-11; Qwen already
+# resident — 0 restarts). Edits-only JSON contract v4.2-R1:
+# ``{edits: [{pid, original, rewritten, reason, class}]}``. Each edit is
+# tagged with exactly one class:
+#   SAFE (auto-apply with a diff-gate rewritten != original):
+#     typo | grammar | duplicate | preposition
+#   REVIEW (written to edit_candidates.json, NEVER auto-applied; verified
+#     later by the B2 repair-as-verifier against the ORIGINAL):
+#     calque | logic | ambiguity | unnatural | register
+# The chunked input (50 PIDs + CONTEXT_ONLY preceding pairs) mirrors the
+# gemma_rewrite_v4.py test pattern — the model must never propose an edit
+# for a CONTEXT_ONLY pid.
+RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
+    role="russian_editor",
+    version="pact-v4.2-russian-editor/v1",
+    instructions=(
+        "You are a Russian-language editor for a Russian literary "
+        "translation. You are given the RUSSIAN text of a chapter as a map "
+        "(PID -> Russian text). The English source is NOT provided — work "
+        "only with the Russian text.\n"
+        "\n"
+        "Find only genuine defects in the Russian text and propose minimal "
+        "edits. Classify each edit into exactly one class:\n"
+        "\n"
+        "SAFE classes (mechanical, safe to apply automatically):\n"
+        "- typo: spelling or punctuation error\n"
+        "- grammar: agreement, case, verb form, word order\n"
+        "- duplicate: an accidentally repeated word or phrase\n"
+        "- preposition: wrong, missing, or extra preposition\n"
+        "\n"
+        "REVIEW classes (need verification, do NOT apply automatically):\n"
+        "- calque: a construction copied literally from English\n"
+        "- logic: a logical inconsistency (pronoun/referent/number/tense)\n"
+        "- ambiguity: a phrase that can be read in two ways\n"
+        "- unnatural: an unidiomatic or awkward Russian phrasing\n"
+        "- register: a stylistic register mismatch\n"
+        "\n"
+        "Rules:\n"
+        "- Only edit the target PID; keep every other PID verbatim.\n"
+        "- Fix only the stated defect; do not rewrite the whole paragraph.\n"
+        "- rewritten must actually differ from original (no-op edits are "
+        "invalid).\n"
+        "- Do not change names, numbers, or already-correct text.\n"
+        "- Never propose an edit for a CONTEXT_ONLY pid.\n"
+        "\n"
+        "Return STRICT JSON, no markdown fences, no commentary, with exactly "
+        "this schema:\n"
+        "  edits: array of objects, one per proposed edit, each with:\n"
+        "    pid: string (the target PID)\n"
+        "    original: string (the exact current Russian text of that PID)\n"
+        "    rewritten: string (the corrected Russian text of that PID)\n"
+        "    reason: short string (one or two sentences)\n"
+        "    class: one of typo|grammar|duplicate|preposition|calque|logic|"
+        "ambiguity|unnatural|register\n"
+        "Do not include any other keys."
+    ),
+)
+
+
+def render_russian_editor_prompt(
+    *,
+    chunk_id: str,
+    edit_pairs: Sequence[Any],
+    context_pairs: Sequence[Any] = (),
+    chunk_index: int = 0,
+    chunk_total: int = 1,
+    template: ReviewerPrompt = RUSSIAN_EDITOR_V4_2_R1,
+) -> str:
+    """Render the v4.2-R1 Russian-editor request for one chunk.
+
+    ``edit_pairs``/``context_pairs`` are sequences of objects exposing
+    ``pid`` and ``text`` (``pact_v4.audit.russian_editor.TranslationPair``).
+    Blocks in order:
+
+    1. fixed instructions (``template.instructions``);
+    2. ``CONTEXT_ONLY`` preceding pairs (model must NEVER propose an edit
+       for them — the gemma_rewrite_v4.py pattern);
+    3. ``EDIT_PAIRS (chunk X of Y):`` + the pairs to edit.
+
+    Input is the RUSSIAN translation ONLY — no English source anywhere.
+    """
+    ctx_block = ""
+    if context_pairs:
+        rendered_ctx = "\n".join(
+            f"  {p.pid}: {p.text}" for p in context_pairs
+        )
+        ctx_block = (
+            "\n\nCONTEXT_ONLY (preceding Russian text; for continuity).\n"
+            "NEVER propose an edit for a CONTEXT_ONLY pid.\n\n"
+            f"{rendered_ctx}"
+        )
+    header = (
+        f"EDIT_PAIRS (chunk {chunk_index} of {chunk_total}):"
+        if chunk_total > 1 else "EDIT_PAIRS:"
+    )
+    rendered_edits = "\n".join(f"  {p.pid}: {p.text}" for p in edit_pairs)
+    return (
+        f"{template.instructions}"
+        f"{ctx_block}\n\n"
+        f"{header}\n{rendered_edits}"
+    )
+
+
 def render_qwen_review_prompt(
     *,
     source: dict[str, str],

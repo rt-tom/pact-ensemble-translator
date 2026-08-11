@@ -74,6 +74,14 @@ from pact_v4.audit.chunked_audit import (
     PROMPT_VERSION,
 )
 from pact_v4.audit.entity_extractor import EXTRACTOR_VERSION
+from pact_v4.audit.russian_editor import (
+    RUSSIAN_EDITOR_HARNESS_VERSION,
+    RUSSIAN_EDITOR_PROMPT_VERSION,
+    SAFE_CLASSES as RUSSIAN_EDITOR_SAFE_CLASSES,
+    DEFAULT_CHUNK_SIZE as RUSSIAN_EDITOR_CHUNK_SIZE,
+    DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_MAX_TOKENS,
+    DEFAULT_OVERLAP_PAIRS as RUSSIAN_EDITOR_OVERLAP_PAIRS,
+)
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
     DEFAULT_MAX_WORDS,
@@ -352,6 +360,22 @@ class StrictRunConfig:
     audit_prompt_version: str = PROMPT_VERSION
     audit_harness_version: str = HARNESS_VERSION
     audit_extractor_version: str = EXTRACTOR_VERSION
+    # V4.2 R (card t_4707e6e5): Russian-only editor stage BEFORE the audit.
+    # On by default (owner decision 2026-08-11 — R is production-default);
+    # ``--no-russian-editor`` turns it off (scheme 4.1, backward compatible).
+    # Every knob below participates in the config identity (F5 lesson): the
+    # editor version, the chunk settings and the class threshold are all
+    # part of to_config_artifact, so flipping any of them invalidates the
+    # repaired cache — a repaired map produced under a different R policy
+    # never replays.
+    russian_editor_enabled: bool = True
+    russian_editor_version: str = RUSSIAN_EDITOR_PROMPT_VERSION
+    russian_editor_harness_version: str = RUSSIAN_EDITOR_HARNESS_VERSION
+    russian_editor_chunk_size: int = RUSSIAN_EDITOR_CHUNK_SIZE
+    russian_editor_overlap_pairs: int = RUSSIAN_EDITOR_OVERLAP_PAIRS
+    russian_editor_max_tokens: int = RUSSIAN_EDITOR_MAX_TOKENS
+    # Class threshold: SAFE classes (auto-applied with the diff-gate).
+    russian_editor_safe_classes: tuple = tuple(sorted(RUSSIAN_EDITOR_SAFE_CLASSES))
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -427,6 +451,22 @@ class StrictRunConfig:
                     "prompt_version": self.audit_prompt_version,
                     "harness_version": self.audit_harness_version,
                     "extractor_version": self.audit_extractor_version,
+                },
+                # V4.2 R (card t_4707e6e5, F5 lesson): the Russian-only
+                # editor stage is part of the run's config identity — its
+                # version, chunk settings and class threshold are included,
+                # so a cache written under a different R policy can never
+                # replay the repaired map (same reasoning as the audit
+                # block). ``--no-russian-editor`` flips ``enabled`` and thus
+                # invalidates cache/resume (scheme 4.1 is a different run).
+                "russian_editor": {
+                    "enabled": self.russian_editor_enabled,
+                    "version": self.russian_editor_version,
+                    "harness_version": self.russian_editor_harness_version,
+                    "chunk_size": self.russian_editor_chunk_size,
+                    "overlap_pairs": self.russian_editor_overlap_pairs,
+                    "max_tokens": self.russian_editor_max_tokens,
+                    "safe_classes": list(self.russian_editor_safe_classes),
                 },
             },
         )
@@ -4430,6 +4470,11 @@ def _run_whole_chapter_strict_impl(
         ("b3_audit_cache", "audit_cache_b3.json"),
         ("b3_entity_context_cache", "entity_context_cache.json"),
         ("b3_entity_validation_report", "entity_context_validation_report.json"),
+        # V4.2 R: the Russian-editor artifacts are advertised only when the
+        # stage actually produced them (a full cache hit / disabled stage
+        # leaves them absent — F8: never advertise nonexistent provenance).
+        ("translations_edited", "translations_edited.json"),
+        ("edit_candidates", "edit_candidates.json"),
     ):
         candidate = cfg.out_dir / name
         if candidate.exists():
@@ -4492,6 +4537,17 @@ def _run_whole_chapter_strict_impl(
                 "harness_version": cfg.audit_harness_version,
                 "extractor_version": cfg.audit_extractor_version,
             },
+            # V4.2 R: the Russian-editor stage policy is recorded alongside
+            # the identity (the config artifact carries the same keys).
+            "russian_editor": {
+                "enabled": cfg.russian_editor_enabled,
+                "version": cfg.russian_editor_version,
+                "harness_version": cfg.russian_editor_harness_version,
+                "chunk_size": cfg.russian_editor_chunk_size,
+                "overlap_pairs": cfg.russian_editor_overlap_pairs,
+                "max_tokens": cfg.russian_editor_max_tokens,
+                "safe_classes": list(cfg.russian_editor_safe_classes),
+            },
         },
         "resumed_from_index": resumed_from_index,
         "halted_early": halted_early,
@@ -4508,6 +4564,12 @@ def _run_whole_chapter_strict_impl(
         "step6": step6,
         "step7": step7,
         "step8": step8,
+        # V4.2 R: the Russian-editor stage report (edit_candidates +
+        # accept/reject journal) recorded in the trial record; absent when
+        # the R stage is disabled (4.1 scheme).
+        "russian_editor": (
+            b3_audit_result.r_editor if b3_audit_result is not None else None
+        ),
         "lifecycle": local_lifecycle or {
             "startup_count": 0, "restart_count": 0,
             "switches": [], "aggregates_by_model": {},
