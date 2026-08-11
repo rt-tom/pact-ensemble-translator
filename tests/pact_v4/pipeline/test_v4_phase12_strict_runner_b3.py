@@ -1584,6 +1584,59 @@ def test_b3_r_editor_incomplete_applies_nothing(tmp_path: Path) -> None:
     assert result.step8["released_as_audited"] is True  # audit still protects
 
 
+def test_b3_r_editor_evaluator_exception_status_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RV fd7ee8e: an ENABLED R stage whose evaluator RAISES must be
+    reported as ``status='failed'`` — never ``disabled`` (the old code
+    recorded ``disabled`` when ``enabled=True``, erasing the failed/debt
+    state). No R edits are applied, no R artifacts are written, and the
+    audit still protects the chapter (fail-closed debt, like a failed
+    repair batch)."""
+    from pact_v4.pipeline import b3_audit_repair as b3_mod
+    from pact_v4.audit.russian_editor import (
+        RussianEditorEvaluator as _RealREditorEvaluator,
+    )
+
+    class _ExplodingREditorEvaluator(_RealREditorEvaluator):
+        """Evaluator that raises on the FIRST chunk call (transport-level
+        crash outside the per-chunk handling, e.g. a broken prompt render or
+        model-ref resolution)."""
+
+        def __call__(self, **kwargs: Any) -> Any:
+            raise RuntimeError("simulated r_editor evaluator crash")
+
+    monkeypatch.setattr(
+        b3_mod, "RussianEditorEvaluator", _ExplodingREditorEvaluator
+    )
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(audit_issues=[], repair_results=[], reaudit_issues=[])
+    result = _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            entity_context_enabled=False,
+            russian_editor_enabled=True,
+        ),
+    )
+    r_report = result.record["russian_editor"]
+    assert r_report is not None
+    assert r_report["enabled"] is True
+    assert r_report["status"] == "failed"
+    assert r_report["outcome"] is None
+    # No R edits applied; the audit proceeded on the RAW map.
+    repaired = _read_json(cfg.out_dir / "translations_repaired.json")
+    assert repaired["translations"]["p00001"] == "Перевод номер1 номер1"
+    assert not (cfg.out_dir / "translations_edited.json").exists()
+    assert not (cfg.out_dir / "edit_candidates.json").exists()
+    # The append-only journal records the failure as debt.
+    events = _journal_events(cfg.out_dir)
+    done = [e for e in events if e["event"] == "r_editor_done"]
+    assert done and done[-1]["status"] == "failed"
+    assert "error" in done[-1] and "simulated" in done[-1]["error"]
+    # The audit still protects the chapter (fail-closed, never a crash).
+    assert result.step8["released_as_audited"] is True
+
+
 def test_b3_r_editor_config_part_of_identity(tmp_path: Path) -> None:
     """F5 lesson: russian_editor_version + chunk settings + class threshold
     participate in the config identity — flipping any invalidates the

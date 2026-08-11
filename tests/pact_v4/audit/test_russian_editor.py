@@ -201,6 +201,49 @@ def test_parse_rejects_original_mismatch() -> None:
     assert any("original does not match" in e for e in errors)
 
 
+def test_parse_rejects_original_leading_trailing_whitespace() -> None:
+    # RV fd7ee8e: strict exact-echo — ' текст А ' must NOT match 'текст А'.
+    # The old strip()-based comparison silently accepted a whitespace-wrapped
+    # original; strict equality fails the WHOLE chunk.
+    current = {"p00001": "текст А"}
+    edits, errors = parse_editor_edits(
+        _ok([_edit("p00001", " текст А ", "текст Б", "r", "typo")]),
+        ["p00001"], current,
+    )
+    assert edits == ()
+    assert any("original does not match" in e for e in errors)
+
+
+def test_parse_rejects_original_trailing_whitespace() -> None:
+    # Even a single trailing space is a mismatch under strict equality.
+    current = {"p00001": "текст А"}
+    edits, errors = parse_editor_edits(
+        _ok([_edit("p00001", "текст А ", "текст Б", "r", "typo")]),
+        ["p00001"], current,
+    )
+    assert edits == ()
+    assert any("original does not match" in e for e in errors)
+
+
+def test_parse_preserves_exact_rewritten_no_strip() -> None:
+    # RV fd7ee8e: an accepted SAFE edit's rewritten is preserved VERBATIM —
+    # ' изменён ' must NOT be silently stripped to 'изменён' before
+    # auto-apply; route returns the exact rewritten string.
+    current = {"p00001": "текст А"}
+    edits, errors = parse_editor_edits(
+        _ok([_edit("p00001", "текст А", " изменён ", "r", "typo")]),
+        ["p00001"], current,
+    )
+    assert errors == ()
+    assert len(edits) == 1
+    assert edits[0].original == "текст А"
+    assert edits[0].rewritten == " изменён "
+    applied, candidates, dropped = route_edits(edits)
+    assert applied == (("p00001", " изменён "),)
+    assert candidates == ()
+    assert dropped == 0
+
+
 def test_parse_rejects_unknown_class() -> None:
     current = {"p00001": "текст"}
     edits, errors = parse_editor_edits(

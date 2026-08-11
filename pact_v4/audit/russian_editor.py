@@ -332,13 +332,14 @@ def parse_editor_edits(
             errors.append(f"duplicate edit pid {pid}")
             continue
         seen.add(pid)
-        if not isinstance(original, str) or original.strip() == "":
+        if not isinstance(original, str) or original == "":
             errors.append(f"pid {pid}: original is missing or not a string")
             continue
-        if original.strip() != str(current_by_pid.get(pid, "")).strip():
+        if original != str(current_by_pid.get(pid, "")):
             errors.append(
                 f"pid {pid}: original does not match the current text "
-                f"(model must echo the exact current Russian text)"
+                f"(model must echo the exact current Russian text, "
+                f"including leading/trailing whitespace)"
             )
             continue
         if not isinstance(rewritten, str) or not rewritten.strip():
@@ -356,8 +357,12 @@ def parse_editor_edits(
         out.append(
             EditorEdit(
                 pid=pid,
-                original=original.strip(),
-                rewritten=rewritten.strip(),
+                # RV fd7ee8e: strict exact-echo — original and rewritten are
+                # preserved VERBATIM (no strip). A leading/trailing-whitespace
+                # mismatch in original fails the chunk; an accepted SAFE edit
+                # returns the exact rewritten, never a normalized one.
+                original=original,
+                rewritten=rewritten,
                 reason=reason.strip(),
                 klass=klass,
             )

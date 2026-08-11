@@ -1452,12 +1452,18 @@ def _build_r_editor_report(
     """
     status = "disabled"
     outcome_payload: Optional[Dict[str, Any]] = None
-    if outcome is not None:
-        outcome_payload = outcome.to_payload()
-        if outcome.complete:
-            status = "complete"
+    if cfg.russian_editor_enabled:
+        if outcome is None:
+            # RV fd7ee8e: enabled but the evaluator raised (transport or
+            # evaluator error) — the stage FAILED, never "disabled". The
+            # audit still protects the chapter; R edits were not applied.
+            status = "failed"
         else:
-            status = "incomplete"
+            outcome_payload = outcome.to_payload()
+            if outcome.complete:
+                status = "complete"
+            else:
+                status = "incomplete"
     report = {
         "enabled": cfg.russian_editor_enabled,
         "status": status,
