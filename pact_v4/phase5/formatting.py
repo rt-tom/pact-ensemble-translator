@@ -374,7 +374,7 @@ def _resolve_preserved(
     pid: str,
     translation: str,
     spans: Sequence[SourceSpan],
-) -> Tuple[List[SpanMappingRecord], List[SourceSpan]]:
+) -> Tuple[List[SpanMappingRecord], List[SourceSpan], List[SourceSpan]]:
     """Resolve spans whose markup is ALREADY present in the translation.
 
     When the translation's inline tag sequence matches the source span tag
@@ -385,19 +385,37 @@ def _resolve_preserved(
     whole-chapter case (§11: "whole-chapter перевод держит ``<em>``
     101/101"), resolved with 0 model calls.
 
-    A count/order mismatch (the translation added or dropped an emphasis) is
-    NOT guessed: the spans fall through to the text tiers (``exact`` ->
-    ``occurrence_aware`` -> ``fuzzy``), and if those cannot locate the
-    fragment either, the span becomes a blocking incident (debt).
+    Returns ``(resolved, remaining, mismatched)``:
+
+    * ``resolved`` — the 1:1 preserved records;
+    * ``remaining`` — spans to try in the text tiers (``exact`` ->
+      ``occurrence_aware`` -> ``fuzzy``). This happens ONLY when the
+      translation carries no inline markup at all (the valid exact path,
+      e.g. source ``<em>1947</em>`` with a tag-free translation);
+    * ``mismatched`` — spans whose translation ALREADY carries inline
+      markup that does not match the source span sequence (count or order
+      mismatch). A count/order mismatch (the translation added, dropped or
+      reordered an emphasis) is NOT guessed and must NOT fall through to
+      the text tiers: the source text often survives verbatim *inside* the
+      existing markup, and an ``exact`` claim there would double-wrap the
+      fragment with no incident. These spans become blocking incidents
+      (debt) directly.
     """
     if not spans:
-        return [], []
+        return [], [], []
     src_seq = [span.tag for span in spans]
     existing = _existing_inline_tags(translation)
-    if len(existing) != len(src_seq):
-        return [], list(spans)
-    if any(tag != expected for (tag, _s, _e), expected in zip(existing, src_seq)):
-        return [], list(spans)
+    if not existing:
+        # No inline markup in the translation at all — the valid exact path.
+        return [], list(spans), []
+    if len(existing) != len(src_seq) or any(
+        tag != expected for (tag, _s, _e), expected in zip(existing, src_seq)
+    ):
+        # Existing markup sequence mismatches the source span sequence:
+        # never claim it and never fall through to the text tiers (a
+        # verbatim fragment inside the existing markup would be
+        # double-wrapped). The spans are blocking debt.
+        return [], [], list(spans)
     resolved: List[SpanMappingRecord] = []
     for span, (tag, start, end) in zip(spans, existing):
         resolved.append(SpanMappingRecord(
@@ -413,7 +431,7 @@ def _resolve_preserved(
             attrs=dict(span.attrs),
             preserved=True,
         ))
-    return resolved, []
+    return resolved, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -435,10 +453,10 @@ def _resolve_deterministic(
     translation: str,
     spans: Sequence[SourceSpan],
     occupied: List[Tuple[int, int]],
-) -> Tuple[List[SpanMappingRecord], List[SourceSpan], List[SourceSpan]]:
+) -> Tuple[List[SpanMappingRecord], List[SourceSpan], List[SourceSpan], List[SourceSpan]]:
     """Apply the preserved -> exact -> occurrence-aware -> fuzzy tiers.
 
-    Returns ``(resolved, fuzzy_candidates, ambiguous)``.
+    Returns ``(resolved, fuzzy_candidates, ambiguous, preserved_mismatch)``.
 
     * ``resolved`` — spans already wrapped in the translation (tier
       ``preserved``) or located verbatim (tier ``exact`` for a single
@@ -451,6 +469,14 @@ def _resolve_deterministic(
       occurrences collide with an earlier span's claimed range. Per the
       contract ("occurrence неоднозначен"), these become blocking incidents,
       never guessed by re-running the exact string search.
+    * ``preserved_mismatch`` — spans whose translation ALREADY carries
+      inline markup whose sequence (count or order) differs from the source
+      span sequence. These must become blocking incidents (debt) directly
+      and must NOT run the text tiers: the source text often survives
+      verbatim *inside* the existing markup, and an ``exact`` claim there
+      would double-wrap the fragment with no incident. ``preserved_mismatch``
+      is mutually exclusive with ``fuzzy_candidates``/``ambiguous`` — when it
+      is non-empty the text tiers are skipped entirely for the PID.
 
     Group rule ("occurrence однозначен"): a group of ``M`` source spans with
     the same folded text resolves deterministically only when the translation
@@ -459,12 +485,18 @@ def _resolve_deterministic(
     "No No" — wrapping the first would be a guess), so the group falls
     through to the next tier.
     """
-    preserved, preserved_remaining = _resolve_preserved(
+    preserved, preserved_remaining, preserved_mismatch = _resolve_preserved(
         pid=pid, translation=translation, spans=spans,
     )
     resolved: List[SpanMappingRecord] = list(preserved)
+    if preserved_mismatch:
+        # The translation already carries inline markup whose sequence does
+        # not match the source spans: the spans are blocking debt (never
+        # claimed, never run through the text tiers — a verbatim fragment
+        # inside the existing markup would be double-wrapped).
+        return resolved, [], [], preserved_mismatch
     if not preserved_remaining:
-        return resolved, [], []
+        return resolved, [], [], []
     spans = preserved_remaining
 
     fuzzy_candidates: List[SourceSpan] = []
@@ -502,7 +534,7 @@ def _resolve_deterministic(
             ))
 
     if not fuzzy_candidates:
-        return resolved, fuzzy_candidates, ambiguous
+        return resolved, fuzzy_candidates, ambiguous, []
 
     # Fuzzy tier: only for the spans whose source text never appears
     # verbatim. A conservative normalization match (case/ё-е/quotes/
@@ -534,7 +566,7 @@ def _resolve_deterministic(
             end=end,
             attrs=dict(span.attrs),
         ))
-    return resolved, still_unresolved, ambiguous
+    return resolved, still_unresolved, ambiguous, []
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +651,15 @@ def run_formatting_align(
       1. ``preserved`` — the translation already carries the inline tags
          (whole-chapter case: "whole-chapter перевод держит ``<em>``
          101/101"): the span's markup is already restored, resolved with no
-         re-wrap;
-      2. ``exact`` — the source text survives verbatim, a single occurrence;
+         re-wrap. The preserved tier verifies the translation's tag sequence
+         against the source spans (same tags, same order, same count); a
+         count/order mismatch is NOT guessed and does NOT fall through to
+         the text tiers — those spans become blocking incidents (debt)
+         directly, because the source text often survives verbatim *inside*
+         the existing markup and an ``exact`` claim would double-wrap it;
+      2. ``exact`` — the source text survives verbatim, a single occurrence
+         (only reached when the translation carries no inline markup at
+         all);
       3. ``occurrence_aware`` — ``M`` identical source spans map 1:1 to ``M``
          occurrences (duplicate-``No``-style recovery);
       4. ``fuzzy`` — conservative normalization match (case/ё-е/quotes/
@@ -651,30 +690,47 @@ def run_formatting_align(
         if not text:
             continue
         occupied: List[Tuple[int, int]] = []
-        resolved, fuzzy_candidates, ambiguous = _resolve_deterministic(
+        resolved, fuzzy_candidates, ambiguous, preserved_mismatch = _resolve_deterministic(
             pid=pid, translation=text, spans=spans, occupied=occupied,
         )
         span_mapping.extend(resolved)
-        unresolved = fuzzy_candidates + ambiguous
+        unresolved = fuzzy_candidates + ambiguous + preserved_mismatch
         fuzzy_ids = {span.span_id for span in fuzzy_candidates}
+        mismatch_ids = {span.span_id for span in preserved_mismatch}
 
         def _last_tier(span: SourceSpan) -> str:
-            return TIER_FUZZY if span.span_id in fuzzy_ids else TIER_OCCURRENCE
+            if span.span_id in mismatch_ids:
+                return TIER_PRESERVED
+            if span.span_id in fuzzy_ids:
+                return TIER_FUZZY
+            return TIER_OCCURRENCE
 
         def _reason(span: SourceSpan) -> str:
+            if span.span_id in mismatch_ids:
+                return "preserved_tag_mismatch"
             if span.span_id in fuzzy_ids:
                 return "target_not_found"
             return "ambiguous_occurrence"
+
+        def _detail(span: SourceSpan) -> str:
+            if span.span_id in mismatch_ids:
+                return (
+                    "translation already carries inline markup whose tag "
+                    "sequence (count/order) does not match the source spans; "
+                    "never claimed, never re-wrapped (formatting is model-free "
+                    "by rule — unresolved spans are debt)"
+                )
+            return (
+                "no deterministic fragment found (formatting is "
+                "model-free by rule — unresolved spans are debt)"
+            )
 
         if unresolved:
             incidents.extend(
                 FormattingIncident(
                     pid=pid, span_id=span.span_id, tier=_last_tier(span),
                     reason=_reason(span),
-                    detail=(
-                        "no deterministic fragment found (formatting is "
-                        "model-free by rule — unresolved spans are debt)"
-                    ),
+                    detail=_detail(span),
                 )
                 for span in unresolved
             )
