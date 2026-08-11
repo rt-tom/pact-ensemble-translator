@@ -647,7 +647,7 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "max_tokens": 12000,
         "overlap_tokens": 400,
         "reasoning_budget": 8192,
-        "repair_findings_cap": 10,
+        "repair_findings_cap": 100,
         "repair_microbatch_trigger": 4,
         "repair_microbatch_target": 4,
         "repair_reaudit_neighbour_window": 2,

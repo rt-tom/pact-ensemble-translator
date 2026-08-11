@@ -56,3 +56,4 @@ deployment_backups/
 # curated records). Local only — never commit these.
 /golden_sets/
 /pact_v4/**/_out/
+.pytest_basetmp*

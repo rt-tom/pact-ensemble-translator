@@ -27,19 +27,25 @@ review):
   finding carrying an explicit ``[index]`` identifier; when eligible > 4 the
   group is split into microbatches of 3-4 (Cheng et al., Batch Prompting:
   quality degrades with batch size).
-* **Cap** — max 10 eligible findings per chapter are repaired; beyond the cap
-  the findings go to debt tagged ``policy_limit: repair_findings_cap_10``
-  (owner decision 2026-08-08, analog of remote_budget).
+* **Cap** — max 100 eligible findings per chapter are repaired (configurable
+  via ``findings_cap``, owner decision 2026-08-11 replacing the run_010
+  10-finding cap that cut 73% of real findings); beyond the cap the findings
+  go to debt tagged ``POLICY_LIMIT_TAG`` (analog of remote_budget).
 * **Fail-closed** — a failed repair batch (transport error, invalid JSON,
   unknown/duplicate/missing index, invalid decision, no-op repair) is debt,
   NEVER a silent PASS. A failed re-audit is debt, never ``0 findings``.
 * **TEaR** — 0 eligible findings -> repair is skipped entirely (no model
   calls, ``skipped=True``, ``repair_complete=True``).
-* **Single re-audit** — when at least one repair was committed, ONE Qwen call
-  re-audits the changed PIDs + their neighbour window; the input is the FULL
-  source + FULL current translation (every pair outside the reportable scope
-  is marked CONTEXT_ONLY, frozen v4.1 template); when the number of changed
-  PIDs exceeds a threshold the re-audit covers the full chapter.
+* **Single re-audit with bounded retry** — when at least one repair was
+  committed, ONE Qwen call re-audits the changed PIDs + their neighbour
+  window; the input is the FULL source + FULL current translation (every
+  pair outside the reportable scope is marked CONTEXT_ONLY, frozen v4.1
+  template); when the number of changed PIDs exceeds a threshold the re-audit
+  covers the full chapter. The call is wrapped in a bounded B4 JSON retry
+  (``reaudit_retry``, default 3 attempts): an empty/truncated body (run_010:
+  Qwen returned 8265 tokens with ``content`` empty — reasoning-only answer)
+  re-issues the identical request before the chapter is declared debt;
+  transport failures are never retried here (B4 §1/§3).
 
 Transport: the evaluator is backend-neutral over ``CompletionBackend`` (the
 same boundary the B1 chunked audit uses). The lifecycle wrapper
@@ -56,7 +62,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
@@ -79,6 +85,12 @@ from pact_v4.runtime.backend_protocol import (
     CompletionRequest,
     Message,
 )
+from pact_v4.runtime.json_resilience import (
+    EmptyResponseError,
+    JsonRetryPolicy,
+    TruncatedJSONError,
+    retry_json_call,
+)
 from pact_v4.runtime.prompts_runtime import (
     REPAIR_AS_VERIFIER_V1,
     ReviewerPrompt,
@@ -96,10 +108,12 @@ REPAIR_SCHEMA = "pact-repair/v1"
 REPAIR_HARNESS_VERSION = "1.0"
 REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v1"
 
-# Cap on eligible findings repaired per chapter (owner decision 2026-08-08:
-# cap on FINDINGS, not on calls). Beyond the cap -> debt with the policy tag.
-REPAIR_FINDINGS_CAP = 10
-POLICY_LIMIT_TAG = "policy_limit: repair_findings_cap_10"
+# Cap on eligible findings repaired per chapter (owner decision 2026-08-11:
+# run_010 showed the 10-finding cap cut 73% of real findings — cap on
+# FINDINGS, not on calls; default raised 10->100, still configurable). Beyond
+# the cap -> debt with the policy tag.
+REPAIR_FINDINGS_CAP = 100
+POLICY_LIMIT_TAG = "policy_limit: repair_findings_cap_100"
 
 # Cheng et al. (Batch Prompting): batch quality degrades with size. Up to 4
 # eligible findings -> one call; more -> microbatches of 3-4.
@@ -112,10 +126,13 @@ MICROBATCH_TARGET = 4
 DEFAULT_REAUDIT_NEIGHBOUR_WINDOW = 2
 DEFAULT_REAUDIT_FULL_THRESHOLD = 8
 
-# Repair output budget (per batch call) and re-audit output budget (the
-# re-audit reuses the v4.1 audit's 12000-token budget: 8192 reasoning + head).
+# Repair output budget (per batch call) and re-audit output budget. The
+# re-audit input profile is the SAME as the extractor (full source + full
+# current translation), so it shares the extractor's 20000-token budget
+# (8192 reasoning + content headroom; 12000 was exhausted by reasoning on
+# the full input in run_010-style chapters — owner decision 2026-08-11).
 DEFAULT_REPAIR_MAX_TOKENS = 4000
-DEFAULT_REAUDIT_MAX_TOKENS = 12000
+DEFAULT_REAUDIT_MAX_TOKENS = 20000
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +157,11 @@ class SelectiveRepairConfig:
     reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     reaudit_full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD
     reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
+    # Bounded B4 JSON retry for the re-audit call (owner decision 2026-08-11,
+    # run_010: a single empty content on the full-input re-audit failed the
+    # chapter closed). Default 3 attempts; transport failures are never
+    # retried here (B4 §1/§3) — they surface as failed re-audit debt.
+    reaudit_retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
     reaudit_label: str = "phase3/reaudit_scope_v4"
 
 
@@ -858,10 +880,35 @@ class SelectiveRepairEvaluator:
             response_schema=JSON_OBJECT_SCHEMA,
             label=cfg.reaudit_label,
         )
+
+        def _complete() -> str:
+            # Re-issues the IDENTICAL request on a retry (same prompt, same
+            # max_output_tokens, same model_ref, same backend — B4 §4), so a
+            # retry never changes cache/resume identity. A transport failure
+            # (CompletionError or any subclass) propagates immediately and is
+            # never retried as a JSON problem (B4 §1/§3).
+            try:
+                return self._reaudit_backend.complete(request).text or ""
+            except CompletionError as exc:
+                LOG.error("re-audit transport failure (%s): %s", type(exc).__name__, exc)
+                raise
+
         try:
-            response = self._reaudit_backend.complete(request)
-        except Exception as exc:
-            LOG.error("re-audit transport failure (%s): %s", type(exc).__name__, exc)
+            content = retry_json_call(
+                _complete, cfg.reaudit_retry, label=cfg.reaudit_label,
+            )
+        except (EmptyResponseError, TruncatedJSONError) as exc:
+            # Budget exhausted: the last attempt still returned an
+            # empty/truncated body. Fail-closed debt — never "0 findings".
+            return ReauditOutcome(
+                complete=False,
+                failed=True,
+                scope=scope_pids,
+                full=full,
+                reason=f"re-audit response invalid after "
+                       f"{cfg.reaudit_retry.max_retries + 1} attempt(s): {exc}",
+            )
+        except CompletionError as exc:
             return ReauditOutcome(
                 complete=False,
                 failed=True,
@@ -869,7 +916,15 @@ class SelectiveRepairEvaluator:
                 full=full,
                 reason=f"{type(exc).__name__}: {exc}",
             )
-        content = response.text or ""
+        except Exception as exc:  # noqa: BLE001 — any transport-level failure is debt, never a crash
+            LOG.error("re-audit unexpected failure (%s): %s", type(exc).__name__, exc)
+            return ReauditOutcome(
+                complete=False,
+                failed=True,
+                scope=scope_pids,
+                full=full,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
         try:
             parsed = json.loads(content)
         except Exception as exc:
@@ -905,6 +960,7 @@ __all__ = [
     "REPAIR_PROMPT_VERSION",
     "REPAIR_FINDINGS_CAP",
     "POLICY_LIMIT_TAG",
+    "DEFAULT_REAUDIT_MAX_TOKENS",
     "MICROBATCH_TRIGGER",
     "MICROBATCH_TARGET",
     "SelectiveRepairConfig",
