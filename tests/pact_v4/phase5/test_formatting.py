@@ -208,6 +208,79 @@ def test_preserved_tier_unbalanced_translation_tag_not_claimed():
     assert out.incident_count == 1
 
 
+def test_preserved_count_mismatch_exact_text_is_debt_no_double_wrap():
+    # Reviewer finding 1: the translation holds an EXTRA inline tag while the
+    # source span text survives verbatim inside the existing markup. The
+    # preserved tier sees a count mismatch; the span must NOT fall through to
+    # the exact tier (which would claim the verbatim fragment inside the
+    # existing markup and add a second wrap with incident_count=0). It is
+    # blocking debt, and the translation's own markup stays untouched.
+    out = _align(
+        "<html><body><p><em>world</em></p></body></html>",
+        {"p00001": "<em>world</em> <em>x</em>"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    incident = out.incidents[0]
+    assert incident.reason == "preserved_tag_mismatch"
+    assert incident.tier == TIER_PRESERVED
+    assert incident.required
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<em>world</em> <em>x</em>", (
+        "no double wrap: the translation's existing markup is never claimed "
+        f"or re-wrapped, got {formatted!r}"
+    )
+    assert "<em><em>" not in formatted
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+
+
+def test_preserved_order_mismatch_exact_text_is_debt_no_double_wrap():
+    # Reviewer finding 1 (order mismatch): same tag count but the translation
+    # REORDERED the emphasis (strong before em). The preserved tier's
+    # order-based 1:1 cannot apply; the spans must NOT fall through to exact
+    # (which would double-wrap the verbatim fragments) — blocking debt, no
+    # re-wrap.
+    out = _align(
+        "<html><body><p><em>world</em> <strong>good</strong></p></body></html>",
+        {"p00001": "<strong>world</strong> <em>good</em>"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 2
+    assert {i.reason for i in out.incidents} == {"preserved_tag_mismatch"}
+    assert all(i.tier == TIER_PRESERVED for i in out.incidents)
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<strong>world</strong> <em>good</em>", (
+        "no double wrap on order mismatch, got {formatted!r}"
+    )
+    assert "<strong><em>" not in formatted
+    assert "<em><strong>" not in formatted
+    assert out.model_call_count == 0
+
+
+def test_preserved_unbalanced_tag_amid_matching_sequence_is_debt():
+    # Unbalanced edge: one tag is balanced and matches the source, but the
+    # translation also carries an unbalanced tag. The unbalanced tag must not
+    # be claimed and must not silently drop out of the sequence comparison —
+    # the count still mismatches (source 2 spans vs 1 balanced + 1 broken
+    # tag), so both spans are blocking debt with no claim.
+    out = _align(
+        "<html><body><p><em>world</em> <strong>good</strong></p></body></html>",
+        {"p00001": "<em>мир</em> <strong>важно"},  # second tag unbalanced
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 2
+    assert {i.reason for i in out.incidents} == {"preserved_tag_mismatch"}
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<em>мир</em> <strong>важно", (
+        "translation's own markup untouched, got {formatted!r}"
+    )
+    assert out.model_call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Tier selection
 # ---------------------------------------------------------------------------

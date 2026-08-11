@@ -13,13 +13,13 @@
 - model_call_count: **0**
 - model_fallback_count: **0**
 - тиры: `{'preserved': 100}`
-- причины инцидентов: `{'target_not_found': 2}`
+- причины инцидентов: `{'preserved_tag_mismatch': 1, 'target_not_found': 1}`
 
 ## Инциденты (unresolved → debt, не тихая потеря)
 
 | PID | span | tier | reason | перевод (фрагмент) |
 |---|---|---|---|---|
-| p00162 | em01 | fuzzy | target_not_found | Она вместо этого отступила. Теперь она плакала. — Я думала,  |
+| p00162 | em01 | preserved | preserved_tag_mismatch | Она вместо этого отступила. Теперь она плакала. — Я думала,  |
 | p00183 | em01 | fuzzy | target_not_found | — При всём должном уважении, — сказал я, тщательно подбирая  |
 
 ## Вывод
