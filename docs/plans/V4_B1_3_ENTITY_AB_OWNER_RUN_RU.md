@@ -116,49 +116,58 @@ C:\Python314\python.exe -m pact_v4.audit.b13_ab `
 
 ## 4. Таблицы результатов (заполняются после прогона)
 
-### 4.1 A/B главы 0001 (реальные цифры — TBD после прогона владельца)
+### 4.1 A/B главы 0001 (реальные цифры — прогон владельца 2026-08-10)
 
-| Конфиг | audit_complete | issue_count | gold TP recall | neg rejection | new unknown |
+> **ВАЖНО:** `metrics_real.json` невалиден (gold в харнессе зашит из
+> dev-перевода, p00236 — а в run_006 ошибка в p00097). Метрики пересчитаны
+> вручную по фактическим TP run_006 (конспект §9.5.1): recall 8/10 во всех
+> трёх конфигурациях.
+
+| Конфиг | gold TP recall | neg rejection | new unknown (факт) |
+|---|---|---|---|
+| none | 8/10 | 0.5 (p00075/p00136/p00184) | p00016/p00322 |
+| gold | 8/10 | 0.5 | p00016/p00322 |
+| auto | 8/10 | **0.667** (лучший) | p00016/p00322 |
+
+**Вывод:** recall одинаков, но entity-context МЕНЯЕТ профиль ошибок
+(помогает p00035/p00240, мешает p00016/p00322); auto НЕ добавляет FP на
+реальной главе (rejection лучший).
+
+### 4.2 8 кейсов §9.1 — реальный Qwen (прогон владельца 2026-08-10)
+
+| Кейс | Тип | TP | Neg rej | Unknown | Вердикт |
 |---|---|---|---|---|---|
-| none |  |  |  |  |  |
-| gold |  |  |  |  |  |
-| auto |  |  |  |  |  |
+| 1 positive (motorcycle→bike) | recall | 1.0 | 1.0 | 0 | ✅ |
+| 2 positive (scrubs→nurse→Rich) | recall | 1.0 | 1.0 | 1 (p00002 — см. §5) | ⚠️→✅ |
+| 3 negative (два разных bike) | FP | — | 1.0 | 0 | ✅ |
+| 4 negative (два nurse) | FP | — | 1.0 | 0 | ✅ |
+| 5 negative (generic role poisoned) | FP | — | **0.0** | 0 | ❌ (не блокер) |
+| 6 negative (термин=2 объекта) | FP | — | 1.0 | 0 | ✅ |
+| 7 provenance (poisoned gender) | poisoned | — | 1.0 | 0 | ✅ |
+| 8 provenance (same_entity не доказан) | false validation | — | **0.0** | 1 | ❌ (фикс §5) |
 
-### 4.2 8 кейсов §9.1 (mock-валидация харнесса, 0 Qwen — уже получено)
+Mock-прогон (0 Qwen) доказывает: харнесс работает, метрики считаются,
+чанки идентичны. Реальные цифры — таблица выше.
 
-| Кейс | Тип | gold TP recall | neg rejection | new unknown |
-|---|---|---|---|---|
-| 1 positive (motorcycle→bike) | recall | 1.0 | 1.0 | 0 |
-| 2 positive (scrubs→nurse→Rich) | recall | 1.0 | 1.0 | 0 |
-| 3 negative (два разных bike) | FP | — | 1.0 | 0 |
-| 4 negative (два nurse) | FP | — | 1.0 | 0 |
-| 5 negative (generic role poisoned) | FP | — | 1.0 | 0 |
-| 6 negative (термин=2 объекта) | FP | — | 1.0 | 0 |
-| 7 provenance (poisoned gender) | poisoned | — | 1.0 | 0 |
-| 8 provenance (same_entity не доказан) | false validation | — | 1.0 | 0 |
+## 5. Decision gate (§9.2) — рекомендация (владелец + архитектор 2026-08-10)
 
-Mock-прогон доказывает: харнесс работает, метрики считаются, чанки
-идентичны. Реальные precision/recall даёт только прогон Qwen (§3).
+**РЕЗУЛЬТАТ: entity-context в production — ДА, с ограничением** (конспект
+§9.5.3):
 
-## 5. Decision gate (§9.2) — рекомендация
+1. **Verified-факты (anchor/alias) рендерятся в аудит-промпт** — recall-выгода
+   подтверждена (p00035/p00240, кейсы 1/2);
+2. **Candidate-relations (same_entity) НЕ рендерятся в аудит-промпт** — кейс 8:
+   Qwen принял rendered candidate за факт (changed_fact FP). Остаются для hard
+   filters (TIER_B) и repair. **Реализовано (Fix 2):** `render_entity_context_text`
+   и production `render_entity_context_block` фильтруют `status=candidate`;
+3. **Generic-роли не выдаются** — обеспечено extractor'ом (кейс 5 — не блокер);
+4. **B3**: `entity_context_enabled=true`, контекст = только verified.
 
-Правило карточки:
-
-* приемлемая precision на 8 кейсах (negative rejection высокий, TP
-  сохранены) → **entity-context в production (B3)**;
-* иначе → **known limitation (p00236-класс остаётся ручным), B3 без
-  entity**.
-
-Рекомендация формулируется ПОСЛЕ прогона владельца по таблицам §4.1/§4.2.
-Особое внимание:
-
-* `auto` vs `gold`: если auto не дотягивает до gold по recall/unknown —
-  extractor теряет/плодит факты, нужна доработка B1.2 до B3;
-* кейс 8 (candidate) — если с auto-контекстом аудит стал репортить
-  changed_fact по кандидатным связям — precision падает, это аргумент
-  против включения;
-* кейс 7 (poisoned gender) — если auto-контекст принёс gender из book
-  memory (не из source) и аудит сделал FP — extractor нарушает source-only.
+**Кейс 2 (Fix 3):** p00002 «Медсестра» — НЕ unknown, а РЕАЛЬНЫЙ TP: в этом
+синтетическом кейсе nurse = Rich (male) (контекст кейса), поэтому женский
+«медсестра подала» — настоящий invented_gender (реальная «The Nurse» главы
+0001 — female generic, НЕ Rich — к синтетическому кейсу неприменима).
+Gold дополнен: (p00002, invented_gender) + (p00004, invented_gender).
 
 ## 6. Состав артефактов
 

@@ -651,6 +651,28 @@ Negative rejection: none 0.5 (p00075/p00136/p00184) · gold 0.5 · **auto 0.667*
 
 **Стоимость в production:** +1 вызов extractor на главу (кэш source_hash+extractor_version); аудит без изменений (8 чанков).
 
+#### 9.5.4. Closure B1.3 (developer, 2026-08-10) — фиксы по gate
+
+- **Fix 1 (отменён владельцем, §9.5.3):** gold-пересчёт в харнессе не нужен —
+  b13_ab.py это spike; корректные метрики зафиксированы вручную в §9.5.1.
+- **Fix 2 (candidate-claims не в аудит-промпт) — реализован:** `render_entity_context_text`
+  (spike) и production `render_entity_context_block` (B3, `b3_audit_repair.py`)
+  фильтруют `status=candidate` — в аудит-промпт попадают только verified-claims.
+  Кейс 8 переведён на post-fix форму (контекст без candidate-relations); mock
+  re-run: rejection 1.0, unknown 0. Регрессионные тесты: render (spike + B3),
+  фикстура кейса 8.
+- **Fix 3 (кейс 2, p00002 «Медсестра») — это TP, не unknown:** в синтетическом
+  кейсе 2 nurse = Rich (male) — сам контекст кейса это устанавливает, поэтому
+  женское «медсестра подала» (p00002) — реальный invented_gender. Реальная
+  «The Nurse» главы 0001 — female GENERIC (не Rich) — к синтетическому кейсу
+  неприменима. Gold кейса 2 дополнен: (p00002, invented_gender) +
+  (p00004, invented_gender); mock re-run: recall 2/2, unknown 0.
+
+Ветка `b1-3-entity-ab` (spike B1.3), коммит-фиксы после owner-run; карточка
+t_97556aa7 закрывается с рекомендацией §9.5.3 (entity в production ДА с
+ограничением: контекст = только verified).
+
+
 ## 16. Карточка AF — A-fix: reasoning-cap 32k в whole-chapter генерации (remote)
 
 > **Обнаружено 2026-08-10** (диагностика по run_007_remote_deepseek): 2 из 3 попыток генерации упёрлись в **reasoning=32 000, finish=length, output=0** (пустой вызов, retry спасал). Причину установили эмпирически.

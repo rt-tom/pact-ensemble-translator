@@ -386,6 +386,58 @@ def test_b3_entity_disabled_skips_prepass(tmp_path: Path) -> None:
     assert not (cfg.out_dir / "entity_context_cache.json").exists()
 
 
+def test_b3_render_entity_context_block_drops_candidate_claims() -> None:
+    """§9.5.3 decision gate (production fix B1.2): the audit-prompt block
+    renders ONLY verified claims; candidate same_entity relations are
+    dropped (real Qwen run: auditor accepted a rendered candidate as fact —
+    case 8 FP). Candidates stay in the structured context for hard filters
+    (TIER_B) and repair, but never reach the auditor."""
+    from pact_v4.audit.entity_extractor import (
+        AnchorRef,
+        ChapterEntityContext,
+        EntityClaim,
+        EntityRecord,
+        EvidenceRef,
+    )
+    from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
+
+    context = ChapterEntityContext(
+        schema="pact-v4-chapter-entity-context/v1",
+        extractor_version="pact-v4-entity-extractor/v1",
+        chapter_id="0001",
+        source_hash="h" * 64,
+        entities=(
+            EntityRecord(
+                entity="Blake's vehicle",
+                canonical_type="motorcycle",
+                anchor=AnchorRef(pid="p00001", span="motorcycle"),
+                aliases=(),
+                claims=(
+                    EntityClaim(
+                        kind="object_identity", value="bike = motorcycle?",
+                        status="candidate",
+                        evidence=(EvidenceRef(pid="p00003", span="bike"),),
+                        evidence_windows=(("p00003", "p00003"),),
+                    ),
+                    EntityClaim(
+                        kind="gender", value="male", status="verified",
+                        evidence=(EvidenceRef(pid="p00004", span="him"),),
+                        evidence_windows=(("p00004", "p00004"),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    text = render_entity_context_block(context)
+    assert "object_identity" not in text
+    assert "bike" not in text
+    assert "candidate" not in text
+    # verified claims still render
+    assert "claim: gender='male' (verified)" in text
+    assert "verified" in text
+    assert 'anchor: "motorcycle"' in text
+
+
 # ---------------------------------------------------------------------------
 # Acceptance 4: cache/resume — full hit skips the audit (0 calls); an
 # incomplete audit re-runs.

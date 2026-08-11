@@ -13,7 +13,8 @@ Pinned contracts:
 * Metrics: gold TP recall / gold negative rejection / NEW unknown issues
   (list, not the raw issue count).
 * ``render_entity_context_text``: structured context -> etalon-style text
-  block (verified spans / candidate relations stay distinguishable).
+  block; per decision gate §9.5.3 ONLY verified claims render (candidate
+  same_entity relations are dropped from the audit prompt — case 8).
 * A/B on the SAME chunks: chunk layout identical across the three configs
   (none/gold/auto) — any outcome difference is caused only by the
   entity-context block; the mock run validates the wiring (prompts contain
@@ -104,6 +105,33 @@ def test_b13_negative_and_provenance_cases_carry_gold_negative() -> None:
     for case_id in ("3", "4", "5", "6", "7", "8"):
         case = case_by_id(case_id)
         assert case.gold_negative, case_id
+
+
+def test_b13_case2_gold_includes_p00002_invented_gender_canon() -> None:
+    """§9.5.3 Fix 3: p00002 'Медсестра' IS a real gender error.
+
+    The real Qwen run flagged p00002 as invented_gender and the harness
+    counted it as 'unknown' — the gold set was incomplete. Canon check: in
+    this SYNTHETIC case the nurse IS Rich (male) — the entity context says
+    so — so the feminine 'медсестра подала' is a genuine invented_gender
+    (the real chapter-0001 'The Nurse' is a female GENERIC, not Rich, and
+    does not apply to this case). The gold must include it.
+    """
+    case = case_by_id("2")
+    assert ("p00002", "invented_gender") in case.gold_tp
+    assert ("p00004", "invented_gender") in case.gold_tp
+    assert "male" in case.entity_context  # the case's own canon: Rich male
+    assert "Rich" in case.entity_context
+
+
+def test_b13_case8_context_is_post_fix_verified_only() -> None:
+    """§9.5.3 Fix 2: case-8 fixture context is the POST-FIX form — no
+    candidate claim reaches the audit prompt, only verified anchor facts."""
+    case = case_by_id("8")
+    assert "candidate" not in case.entity_context.lower()
+    assert "not verified" not in case.entity_context.lower()
+    assert "motorcycle" in case.entity_context
+    assert case.gold_negative == ("p00003",)
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +250,14 @@ def test_render_entity_context_text_mirrors_etalon_format() -> None:
     assert "- entity: Blake's vehicle" in text
     assert "established_type: motorcycle" in text
     assert "gender: male (verified)" in text
-    assert "object_identity: bike = motorcycle (candidate)" in text
+    # Decision gate §9.5.3: candidate claims are DROPPED from the audit
+    # prompt (the real Qwen run accepted a rendered candidate as fact —
+    # case 8). Only verified claims render.
+    assert "object_identity" not in text
+    assert "(candidate)" not in text
     assert "evidence: p00007 (\"motorcycle\")" in text
-    # verified vs candidate must stay distinguishable (provenance §9.1 #8)
-    assert "(verified)" in text and "(candidate)" in text
+    # verified claims stay
+    assert "(verified)" in text
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +353,11 @@ def test_build_source_artifact_and_auto_context_render() -> None:
 
 
 def test_case_8_candidate_relation_never_verified_via_render() -> None:
-    """§9.1 #8 provenance: candidate status must survive the render so the
-    auditor sees an hypothesis, not an established fact."""
+    """§9.1 #8 provenance, post-decision-gate (§9.5.3): a candidate same_entity
+    relation must NOT appear in the audit prompt AT ALL — the real Qwen run
+    showed the auditor accepts a rendered candidate as fact (changed_fact FP).
+    The renderer drops candidate claims; the audit sees only the verified
+    anchor facts."""
     context = ChapterEntityContext(
         schema="pact-v4-chapter-entity-context/v1",
         extractor_version="pact-v4-entity-extractor/v1",
@@ -346,8 +381,13 @@ def test_case_8_candidate_relation_never_verified_via_render() -> None:
         ),
     )
     text = render_entity_context_text(context)
-    assert "candidate" in text
-    assert "verified" not in text
+    assert "candidate" not in text
+    assert "object_identity" not in text
+    assert "bike" not in text
+    # the verified anchor facts still render
+    assert "- entity: Blake's vehicle" in text
+    assert "established_type: motorcycle" in text
+    assert "evidence: p00001 (\"motorcycle\")" in text
 
 
 # ---------------------------------------------------------------------------

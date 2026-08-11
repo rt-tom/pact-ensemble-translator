@@ -75,6 +75,7 @@ from pact_v4.audit.chunked_audit import (
 )
 from pact_v4.audit.entity_extractor import (
     EXTRACTOR_VERSION,
+    STATUS_CANDIDATE,
     BackendEntityExtractor,
     BackendEntityExtractorConfig,
     ChapterEntityContext,
@@ -135,6 +136,14 @@ def render_entity_context_block(context: ChapterEntityContext) -> str:
     auditor (evidence level 3: source > adjacent > chapter facts), never
     an instruction. Empty context -> empty string (caller omits the
     block).
+
+    DECISION GATE (§9.5.3, owner+architect 2026-08-10): ONLY verified
+    claims are rendered. Candidate claims (``same_entity`` relations —
+    B1.2 always marks them candidate) are DROPPED: the real Qwen run
+    showed the auditor accepts a rendered candidate as fact (case 8:
+    changed_fact FP on an unproven relation). Candidates stay in the
+    structured context for hard filters (forced TIER_B) and repair, but
+    never reach the auditor as facts.
     """
     if not context.entities:
         return ""
@@ -151,6 +160,8 @@ def render_entity_context_block(context: ChapterEntityContext) -> str:
                 f"  alias: \"{alias.surface}\" (pid {alias.pid}, {alias.status})"
             )
         for claim in record.claims:
+            if claim.status == STATUS_CANDIDATE:
+                continue
             evidence = ", ".join(
                 f"{ev.pid} \"{ev.span}\"" for ev in claim.evidence
             )

@@ -58,6 +58,8 @@ from pact_v4.audit.entity_extractor import (
     BackendEntityExtractorConfig,
     ChapterEntityContext,
     EntityRecord,
+    STATUS_CANDIDATE,
+    STATUS_VERIFIED,
     extract_entity_context,
 )
 from pact_v4.phase1.models import SourceArtifact
@@ -152,17 +154,23 @@ B13_CASES: Tuple[B13Case, ...] = (
         },
         entity_context=(
             "- entity: Rich (the nurse / man in scrubs)\n"
-            "  gender: male\n"
+            "  gender: male (verified)\n"
             "  aliases in source: the nurse, the man in scrubs, Rich, Nurse Rich\n"
             "  evidence: p00002 (\"The nurse\"), p00004 (\"Nurse Rich\"), "
             "p00003 (\"him\")\n"
             "  note: the nurse in this chapter is Rich, male; do NOT map to "
             "any other nurse entity\n"
         ),
-        gold_tp=(("p00004", "invented_gender"),),
-        note="gold TP: 'Nurse Rich looked at his watch' -> feminine "
-             "медсестра Рич взглянула (invented_gender; entity context "
-             "establishes Rich is male).",
+        gold_tp=(
+            ("p00002", "invented_gender"),
+            ("p00004", "invented_gender"),
+        ),
+        note="gold TPs (canon §9.5.3 Fix 3): in this synthetic chapter the "
+             "nurse IS Rich (male), so BOTH 'The nurse ...' (p00002 -> feminine "
+             "медсестра подала) and 'Nurse Rich ... his watch' (p00004 -> "
+             "feminine медсестра Рич взглянула) are invented_gender. The real "
+             "chapter-0001 'The Nurse' (female, generic, NOT Rich) does not "
+             "apply here — the case's own context makes Rich the nurse.",
     ),
     # -- 4 negative (FP rejection) ----------------------------------------
     B13Case(
@@ -316,14 +324,14 @@ B13_CASES: Tuple[B13Case, ...] = (
             "  aliases in source: motorcycle\n"
             "  established_type: motorcycle\n"
             "  evidence: p00001 (\"motorcycle\")\n"
-            "  note: 'bike' (p00003) MAY refer to the motorcycle, but the "
-            "source never proves it (no shared evidence window); the "
-            "relation is CANDIDATE, not verified\n"
         ),
         gold_negative=("p00003",),
-        note="provenance: the alias span exists but the evidence window does "
-             "not establish same_entity; the audit must NOT treat the "
-             "candidate relation as a fact (no changed_fact on p00003).",
+        note="provenance (post-fix §9.5.3): the extractor DID produce a "
+             "candidate same_entity relation (bike p00003 = motorcycle?), but "
+             "the renderer drops candidate claims — the auditor sees only the "
+             "verified anchor, so it must NOT treat the unproven relation as "
+             "a fact (no changed_fact on p00003). The audit must not invent "
+             "the link from span presence alone.",
     ),
 )
 
@@ -450,15 +458,22 @@ def render_entity_context_text(context: ChapterEntityContext) -> str:
 
     Format mirrors ``chapter_entity_context_0001.txt`` (the etalon):
     per entity: ``- entity: <name>``, ``gender:``, ``aliases in source:``,
-    ``established_type:``, ``evidence:``, ``note:`` (claims). Statuses are
-    shown inline (``(verified)`` / ``(candidate)``) so the auditor can
-    distinguish established facts from hypotheses (§8.3 statuses).
+    ``established_type:``, ``evidence:``, ``note:`` (claims).
+
+    DECISION GATE (§9.5.3, owner+architect 2026-08-10): ONLY verified
+    claims are rendered. Candidate claims (``same_entity`` relations, which
+    B1.2 always marks candidate) are DROPPED from the audit prompt — the
+    real Qwen run showed the auditor accepts a rendered candidate as fact
+    (case 8: changed_fact FP on an unproven relation). Candidates remain in
+    the structured context for hard filters (forced TIER_B) and repair, but
+    never reach the auditor as facts. Anchor/alias spans are code-verified
+    by the extractor and always render.
     """
     blocks: List[str] = []
     for record in context.entities:
         lines = [f"- entity: {record.entity}"]
         for claim in record.claims:
-            if claim.kind == "gender":
+            if claim.kind == "gender" and claim.status == STATUS_VERIFIED:
                 lines.append(f"  gender: {claim.value} ({claim.status})")
         if record.canonical_type:
             lines.append(f"  established_type: {record.canonical_type}")
@@ -473,7 +488,7 @@ def render_entity_context_text(context: ChapterEntityContext) -> str:
         claims_note = [
             f"{c.kind}: {c.value} ({c.status})"
             for c in record.claims
-            if c.kind != "gender"
+            if c.kind != "gender" and c.status == STATUS_VERIFIED
         ]
         if claims_note:
             lines.append("  note: " + "; ".join(claims_note))
