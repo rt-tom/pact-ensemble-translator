@@ -51,7 +51,6 @@ from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
     LocalLlamaBackendConfig,
     OpenCodeBackendConfig,
-    build_formatting_adapters,
     build_repair_adapters,
     build_role_adapters,
     build_role_backend,
@@ -723,7 +722,6 @@ def run_local_default(args: argparse.Namespace) -> int:
         )
     runtime = LocalLifecycleCoordinator(router, descriptor=backend.build_descriptor())
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
-    formatting_adapters = build_formatting_adapters(backend, runtime)
     b3_audit_repair = _build_b3_audit_repair(cfg, backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
@@ -732,7 +730,6 @@ def run_local_default(args: argparse.Namespace) -> int:
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
-        formatting_adapters=formatting_adapters,
         b3_audit_repair=b3_audit_repair,
         progress=progress,
     )
@@ -772,7 +769,6 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
             backend, runtime, bible_text=bible_text, json_retry_policy=json_retry,
         )
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
-    formatting_adapters = build_formatting_adapters(backend, runtime)
     cfg = _build_run_config(args, backend)
     b3_audit_repair = _build_b3_audit_repair(cfg, backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
@@ -782,7 +778,6 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
-        formatting_adapters=formatting_adapters,
         b3_audit_repair=b3_audit_repair,
         progress=progress,
     )

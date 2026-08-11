@@ -129,7 +129,7 @@ def test_writer_write_failure_never_raises(tmp_path: Path, monkeypatch):
 
 
 def _run(cfg, *, router=None, qwen=None, gemma=None, qwen_audit=None, gemma_audit=None,
-         repair_adapters=None, formatting_adapters=None):
+         repair_adapters=None):
     router = router or _make_router()
     model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
     qwen_evaluator = _LifecycleAwareQwen(router, qwen or StubQwen())
@@ -142,7 +142,6 @@ def _run(cfg, *, router=None, qwen=None, gemma=None, qwen_audit=None, gemma_audi
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=repair_adapters,
-        formatting_adapters=formatting_adapters,
     )
 
 

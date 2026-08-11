@@ -48,7 +48,6 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
 from tests.pact_v4.pipeline.test_v4_phase12_strict_runner_retry import (
     _make_cfg,
     _run_with_retry,
-    CannedFormattingCaller,
     ContentAudit,
     ContentQwen,
     LookaheadChunkCaller,
