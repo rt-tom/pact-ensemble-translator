@@ -236,6 +236,36 @@ def test_tools_really_disabled():
     assert "grep" in tools and "webfetch" in tools and "task" in tools
 
 
+def test_omit_system_tools_drops_system_and_tools_from_body():
+    # AF: serve 1.4.7 serves a body carrying system/tools with a default
+    # ~32k output budget, truncating whole-chapter generation reasoning.
+    # Generation requests omit both (verbatim Gate 0 body shape); the
+    # default keeps the historical system+tools body.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(_request(omit_system_tools=True))
+    body = fake.last_message_body()
+    assert "system" not in body
+    assert "tools" not in body
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"}
+    assert body["parts"] == [{"type": "text", "text": "Translate: Hello."}]
+
+
+def test_omit_system_tools_keeps_reasoning_effort():
+    # AF: reasoningEffort still travels on an omit_system_tools body — the
+    # whole-chapter wire shape is model+parts+reasoningEffort only.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(
+        _request(request_options={"reasoning": 3}, omit_system_tools=True)
+    )
+    body = fake.last_message_body()
+    assert "system" not in body and "tools" not in body
+    assert body["reasoningEffort"] == "high"
+
+
 def test_malformed_session_response_raises_transport_network():
     fake = FakeOpenCodeServer()
     fake.session_create_response = ["not-an-object"]
