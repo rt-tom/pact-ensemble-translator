@@ -138,7 +138,10 @@ from pact_v4.phase5.formatting import (
     run_formatting_align,
 )
 from pact_v4.repair.selective_repair import (
+    DEFAULT_REAUDIT_BASE_DELAY_SECONDS,
     DEFAULT_REAUDIT_FULL_THRESHOLD,
+    DEFAULT_REAUDIT_MAX_RETRIES,
+    DEFAULT_REAUDIT_MAX_TOKENS,
     DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
@@ -335,6 +338,17 @@ class StrictRunConfig:
     audit_repair_microbatch_target: int = MICROBATCH_TARGET
     audit_repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     audit_repair_reaudit_full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD
+    # V4.1 B3 (RV fix for 71b7cbc): the re-audit output budget and its
+    # bounded B4 JSON retry policy are identity-bearing like every other
+    # repair-policy knob (F5). The selective repair code sends the budget
+    # as max_output_tokens and retries empty/truncated re-audit JSON per
+    # the policy; WITHOUT these fields a cache produced under the old
+    # 12000-token re-audit could be replayed under the 20000-token policy.
+    # Defaults mirror the selective-repair module (20000 tokens; JsonRetryPolicy
+    # max_retries=2 -> 3 attempts, base_delay_seconds=1.0).
+    audit_repair_reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
+    audit_repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
+    audit_repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
     audit_prompt_version: str = PROMPT_VERSION
     audit_harness_version: str = HARNESS_VERSION
     audit_extractor_version: str = EXTRACTOR_VERSION
@@ -401,6 +415,15 @@ class StrictRunConfig:
                     "repair_microbatch_target": self.audit_repair_microbatch_target,
                     "repair_reaudit_neighbour_window": self.audit_repair_reaudit_neighbour_window,
                     "repair_reaudit_full_threshold": self.audit_repair_reaudit_full_threshold,
+                    # F5: the re-audit output budget and bounded retry policy
+                    # are identity-bearing — a cache written under the old
+                    # 12000-token re-audit must never replay under the
+                    # 20000-token policy (RV 71b7cbc finding).
+                    "repair_reaudit_max_tokens": self.audit_repair_reaudit_max_tokens,
+                    "repair_reaudit_retry": {
+                        "max_retries": self.audit_repair_reaudit_max_retries,
+                        "base_delay_seconds": self.audit_repair_reaudit_base_delay_seconds,
+                    },
                     "prompt_version": self.audit_prompt_version,
                     "harness_version": self.audit_harness_version,
                     "extractor_version": self.audit_extractor_version,
@@ -4460,6 +4483,11 @@ def _run_whole_chapter_strict_impl(
                 "repair_microbatch_target": cfg.audit_repair_microbatch_target,
                 "repair_reaudit_neighbour_window": cfg.audit_repair_reaudit_neighbour_window,
                 "repair_reaudit_full_threshold": cfg.audit_repair_reaudit_full_threshold,
+                "repair_reaudit_max_tokens": cfg.audit_repair_reaudit_max_tokens,
+                "repair_reaudit_retry": {
+                    "max_retries": cfg.audit_repair_reaudit_max_retries,
+                    "base_delay_seconds": cfg.audit_repair_reaudit_base_delay_seconds,
+                },
                 "prompt_version": cfg.audit_prompt_version,
                 "harness_version": cfg.audit_harness_version,
                 "extractor_version": cfg.audit_extractor_version,

@@ -652,6 +652,8 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "repair_microbatch_target": 4,
         "repair_reaudit_neighbour_window": 2,
         "repair_reaudit_full_threshold": 8,
+        "repair_reaudit_max_tokens": 20000,
+        "repair_reaudit_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
         "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
         "harness_version": "4.1",
         "extractor_version": "pact-v4-entity-extractor/v1",
@@ -683,6 +685,9 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "microbatch_target": dict(audit_repair_microbatch_target=2),
         "reaudit_neighbour_window": dict(audit_repair_reaudit_neighbour_window=4),
         "reaudit_full_threshold": dict(audit_repair_reaudit_full_threshold=12),
+        "reaudit_max_tokens": dict(audit_repair_reaudit_max_tokens=25000),
+        "reaudit_max_retries": dict(audit_repair_reaudit_max_retries=5),
+        "reaudit_base_delay_seconds": dict(audit_repair_reaudit_base_delay_seconds=2.5),
         "reasoning_budget": dict(audit_reasoning_budget=4096),
         "prompt_version": dict(audit_prompt_version="pact-v4-reviewer-qwen-audit/v9.9"),
         "harness_version": dict(audit_harness_version="9.9"),
@@ -692,6 +697,102 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         mutated = _whole_chapter_cfg(tmp_path, **overrides)
         mutated_id = mutated.to_config_artifact(model_profile="test").config_identity
         assert mutated_id != base_id, f"{label} mutation did not change identity"
+
+
+def test_b3_reaudit_budget_and_retry_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RV 71b7cbc HIGH finding (F5): the production B3 path must carry the
+    # re-audit output budget AND the bounded retry policy from the run
+    # config through B3AuditRepairConfig into SelectiveRepairConfig — a
+    # cache produced under a different budget/policy must never replay.
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(
+        tmp_path,
+        audit_repair_reaudit_max_tokens=25000,
+        audit_repair_reaudit_max_retries=5,
+        audit_repair_reaudit_base_delay_seconds=2.5,
+    )
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_reaudit_max_tokens == 25000
+    assert bundle._config.repair_reaudit_max_retries == 5
+    assert bundle._config.repair_reaudit_base_delay_seconds == 2.5
+
+
+def test_b3_reaudit_request_carries_configured_budget_and_retry(tmp_path: Path) -> None:
+    # RV 71b7cbc HIGH finding: run the full production B3 flow with a
+    # non-default re-audit budget/retry; the re-audit backend request must
+    # carry max_output_tokens == configured budget and an EMPTY re-audit
+    # body must be retried max_retries+1 times before debt (never released).
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _EmptyReauditBackend(_B3MockBackend):
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            # Record EVERY call (including re-audit retries) and serve the
+            # empty re-audit body; the non-reaudit roles reuse the base
+            # dispatch. The base appends too, so only append for the
+            # re-audit calls we intercept here (no double-counting).
+            if "reaudit" in (request.label or ""):
+                self.requests.append(request)
+                return CompletionResponse(
+                    text="", model="qwen-3.6-35b", finish_reason="stop"
+                )
+            return super().complete(request)
+
+    backend = _EmptyReauditBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        repair_results=[{
+            "index": 1, "decision": "repair", "pid": "p00001",
+            "repaired_translation": "Перевод номер1",
+            "reason": "убрал дубль",
+        }],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            repair_reaudit_max_tokens=25000,
+            repair_reaudit_max_retries=3,
+            repair_reaudit_base_delay_seconds=0.0,
+        ),
+    )
+
+    # The re-audit request carried the configured output budget.
+    reaudit_requests = [r for r in backend.requests if "reaudit" in (r.label or "")]
+    assert reaudit_requests, "re-audit request expected after a committed repair"
+    assert all(r.max_output_tokens == 25000 for r in reaudit_requests)
+
+    # Empty re-audit JSON retried max_retries+1 times (4 attempts), then debt.
+    assert backend.reaudit_calls() == 4
+    assert result.step8["released_as_audited"] is False
+    assert any("failed re-audit" in d for d in result.step8["debt_trace"])
+
+
+def test_b3_audit_repair_config_payload_carries_reaudit_budget_and_retry() -> None:
+    # The B3 config/report payload carries the re-audit budget and retry
+    # policy (RV 71b7cbc, F5) — defaults and explicit overrides.
+    payload = B3AuditRepairConfig().to_payload()
+    assert payload["repair_reaudit_max_tokens"] == 20000
+    assert payload["repair_reaudit_retry"] == {
+        "max_retries": 2, "base_delay_seconds": 1.0,
+    }
+    custom = B3AuditRepairConfig(
+        repair_reaudit_max_tokens=25000,
+        repair_reaudit_max_retries=5,
+        repair_reaudit_base_delay_seconds=2.5,
+    ).to_payload()
+    assert custom["repair_reaudit_max_tokens"] == 25000
+    assert custom["repair_reaudit_retry"] == {
+        "max_retries": 5, "base_delay_seconds": 2.5,
+    }
 
 
 # ---------------------------------------------------------------------------
