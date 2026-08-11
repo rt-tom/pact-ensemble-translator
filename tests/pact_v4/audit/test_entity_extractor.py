@@ -911,6 +911,7 @@ def test_extractor_max_tokens_covers_reasoning_budget():
     spend everything on reasoning and return empty content
     (EmptyResponseError after retries on the real Qwen server)."""
     cfg = BackendEntityExtractorConfig()
-    assert cfg.max_tokens == 12000
+    assert cfg.max_tokens == 20000
     assert cfg.max_tokens > 8192  # server --reasoning-budget
     assert cfg.max_tokens >= 8192 + 3000  # budget + content headroom
+    assert cfg.max_tokens >= 8192 * 2  # extractor: whole-chapter input provokes full-budget reasoning
