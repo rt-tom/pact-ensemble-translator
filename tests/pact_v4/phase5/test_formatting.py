@@ -619,6 +619,81 @@ def test_whole_chapter_translation_with_debt_reports_incidents():
     assert out.incidents[0].span_id == "em01"
 
 
+def test_whole_chapter_101_em_spans_zero_unresolved_zero_model_calls():
+    # Card C acceptance on the frozen chapter-0001 shape (V4_1_AUDIT_B1_RU.md
+    # §11: whole-chapter перевод держит <em> 101/101): every already-wrapped
+    # span resolves through the preserved tier -> 0 unresolved spans and
+    # 0 model calls, exactly as the acceptance demands.
+    n = 101
+    blocks = _blocks(
+        "<html><body>"
+        + "".join(f"<p>Para {i} <em>term{i}</em> tail {i}.</p>" for i in range(n))
+        + "</body></html>"
+    )
+    assert len(blocks) == n
+    translation = {
+        b.pid: f"Абзац {i} <em>термин{i}</em> хвост {i}."
+        for i, b in enumerate(blocks)
+    }
+    out = run_formatting_align(
+        blocks=blocks, translation=translation,
+        backend_identity_hash=IDENTITY,
+    )
+    assert out.resolved_count == n
+    assert out.incident_count == 0
+    assert not out.blocking
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+    assert all(r.tier == TIER_PRESERVED for r in out.span_mapping)
+    # The restored text is exactly the already-marked translation — no
+    # re-location drift, no double wrap across all 101 spans.
+    for pid, expected in translation.items():
+        assert dict(out.formatted_text)[pid] == expected
+
+
+def test_whole_chapter_101_em_dropped_tags_are_debt_not_silent():
+    # Same 101-em whole-chapter source, but the translation DROPPED two
+    # emphases (blocks 1 and 51): the preserved tier cannot claim them and
+    # no verbatim fragment exists, so they are blocking debt incidents with
+    # the span id + reason recorded in the outcome — never a silent loss —
+    # and still 0 model calls ("0 model calls" alone is not success).
+    n = 101
+    dropped = {1, 51}
+    blocks = _blocks(
+        "<html><body>"
+        + "".join(f"<p>Para {i} <em>term{i}</em> tail {i}.</p>" for i in range(n))
+        + "</body></html>"
+    )
+    translation = {}
+    for i, b in enumerate(blocks):
+        if i in dropped:
+            translation[b.pid] = f"Абзац {i} термин{i} хвост {i}."
+        else:
+            translation[b.pid] = f"Абзац {i} <em>термин{i}</em> хвост {i}."
+    out = run_formatting_align(
+        blocks=blocks, translation=translation,
+        backend_identity_hash=IDENTITY,
+    )
+    assert out.resolved_count == n - len(dropped)
+    assert out.incident_count == len(dropped)
+    assert out.blocking
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+    # The debt is explicit: each dropped span is recorded with its span id
+    # and a debt reason — never absent from the outcome. (span_id is unique
+    # per block, so the two dropped spans both read "em01".)
+    assert len(out.incidents) == len(dropped)
+    assert all(i.span_id for i in out.incidents)
+    assert {i.reason for i in out.incidents} == {"target_not_found"}
+    assert all(i.required for i in out.incidents)
+    # The dropped pids pass through untouched — no invented markup.
+    for i in dropped:
+        pid = blocks[i].pid
+        assert "<em>" not in dict(out.formatted_text)[pid]
+        assert dict(out.formatted_text)[pid] == translation[pid]
+
+
+
 # ---------------------------------------------------------------------------
 # B14: wrap-only without entities (run_005 double-escaping)
 # ---------------------------------------------------------------------------
