@@ -784,6 +784,7 @@ def generate_whole_chapter(
     model_caller: ModelCaller,
     cache: Optional[GenerationCache] = None,
     retry: WholeChapterRetryPolicy = WholeChapterRetryPolicy(),
+    on_retry: Optional[Callable[[int, str], None]] = None,
 ) -> GenerationOutcome:
     """Generate the whole chapter in ONE model call (V4.1 A1).
 
@@ -801,9 +802,25 @@ def generate_whole_chapter(
     exactly one candidate role, so the strict runner serializes the chapter's
     generation record with the standard ``_serialize_generation_outcome``
     shape (candidate_id ``whole_chapter:<role>:<hash>``).
+
+    ``on_retry`` (optional, diagnostics-only) is invoked as
+    ``on_retry(attempt, reason)`` after EVERY failed attempt with the 1-based
+    attempt number and a classification of the failure (``malformed`` /
+    ``missing_pid`` / ``truncated`` / ``abort``) — the same reason vocabulary
+    the phase-progress monitor renders as "GEN attempt N/M (reason)". It is
+    purely observational: a raise inside the hook is swallowed (logged) and
+    never changes retry behavior.
     """
     if cache is None:
         cache = GenerationCache()
+
+    def _notify_retry(attempt: int, reason: str) -> None:
+        if on_retry is None:
+            return
+        try:
+            on_retry(attempt, reason)
+        except Exception:  # noqa: BLE001 — diagnostics hook, never breaks generation
+            LOG.debug("whole-chapter on_retry hook failed", exc_info=True)
 
     template = _TEMPLATES[role]
     risk = _whole_chapter_risk(source, glossary)
@@ -863,6 +880,7 @@ def generate_whole_chapter(
                 GenerationErrorCode.SESSION_ABORT,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _notify_retry(attempt + 1, "abort")
             if attempt < retry.max_attempts - 1:
                 time.sleep(retry.delay_for(attempt))
                 continue
@@ -882,6 +900,7 @@ def generate_whole_chapter(
                 GenerationErrorCode.INVALID_JSON,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _notify_retry(attempt + 1, "truncated")
             if attempt < retry.max_attempts - 1:
                 time.sleep(retry.delay_for(attempt))
                 continue
@@ -895,11 +914,22 @@ def generate_whole_chapter(
                 GenerationErrorCode.INVALID_JSON,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _notify_retry(attempt + 1, "malformed")
         except _GenerationValidationError as exc:
             last_error = GenerationError(
                 role,
                 exc.code,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc.detail}",
+            )
+            # The A1 contract retries every PID-contract violation
+            # (missing/extra/reordered/duplicate) with the same "missing_pid"
+            # reason; CONTEXT_LEAKAGE cannot fire here (whole-chapter has no
+            # context PIDs) but falls back to malformed for completeness.
+            _notify_retry(
+                attempt + 1,
+                "missing_pid"
+                if exc.code is GenerationErrorCode.PID_MISMATCH
+                else "malformed",
             )
         else:
             candidate = Candidate.create(
