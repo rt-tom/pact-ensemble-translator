@@ -26,6 +26,12 @@ event-specific fields):
     backend_identity_hash, resumed_from_index;
   * ``chunk_started`` / ``chunk_done`` (Steps 1-5) -- chunk_id; chunk_done
     also ``outcome``;
+  * V4.1 whole-chapter generation (one call per chapter, bounded retry):
+    ``wc_generation_started`` (pid_count, reasoning_budget, model,
+    max_attempts), ``wc_retry_attempt`` (attempt, reason
+    malformed|missing_pid|truncated|abort), ``wc_generation_done``
+    (finish_reason, pid_count, duration), ``wc_validated`` (json_ok,
+    pids_ok, order_ok);
   * Step 6: ``audit_unit_started`` / ``audit_unit_done`` (chunk_id,
     detector; done also ``status`` ok|failed), ``audit_done`` (status);
   * Step 7: ``repair_round_started`` (round_number), ``region_started`` /
@@ -121,6 +127,51 @@ class PhaseProgressWriter:
 
     def chunk_done(self, *, chunk_id: str, outcome: str) -> None:
         self.emit("chunk_done", chunk_id=chunk_id, outcome=outcome)
+
+    # ------------------------------------------------------------------
+    # V4.1 whole-chapter generation events (one call per chapter).
+    # ------------------------------------------------------------------
+
+    def wc_generation_started(
+        self,
+        *,
+        pid_count: int,
+        reasoning_budget: int,
+        model: str,
+        max_attempts: int,
+    ) -> None:
+        self.emit(
+            "wc_generation_started",
+            pid_count=pid_count,
+            reasoning_budget=reasoning_budget,
+            model=model,
+            max_attempts=max_attempts,
+        )
+
+    def wc_retry_attempt(self, *, attempt: int, reason: str) -> None:
+        self.emit("wc_retry_attempt", attempt=attempt, reason=reason)
+
+    def wc_generation_done(
+        self,
+        *,
+        finish_reason: str,
+        pid_count: int,
+        duration: float,
+    ) -> None:
+        self.emit(
+            "wc_generation_done",
+            finish_reason=finish_reason,
+            pid_count=pid_count,
+            duration=duration,
+        )
+
+    def wc_validated(self, *, json_ok: bool, pids_ok: bool, order_ok: bool) -> None:
+        self.emit(
+            "wc_validated",
+            json_ok=bool(json_ok),
+            pids_ok=bool(pids_ok),
+            order_ok=bool(order_ok),
+        )
 
     def audit_unit_started(self, *, chunk_id: str, detector: str) -> None:
         self.emit("audit_unit_started", chunk_id=chunk_id, detector=detector)

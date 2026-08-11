@@ -130,6 +130,81 @@ def test_whole_chapter_mode_generates_one_call_full_pid_map(tmp_path):
     assert artifact.values["generation"]["max_tokens"] == 32768
 
 
+def test_whole_chapter_run_emits_wc_progress_events(tmp_path):
+    # V4.1 M (monitor card): the whole-chapter run writes the wc_* generation
+    # events into phase_progress.ndjson — the monitor renders "GEN attempt
+    # N/M (reason)" live and the final PID validation from them.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+    caller = StubModelCaller()
+    _run_whole_chapter(cfg, model_caller=caller)
+
+    events = [
+        json.loads(line)
+        for line in (cfg.out_dir / "phase_progress.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    names = [e["event"] for e in events]
+    assert "wc_generation_started" in names
+    assert "wc_generation_done" in names
+    assert "wc_validated" in names
+
+    started = next(e for e in events if e["event"] == "wc_generation_started")
+    assert started["pid_count"] == 24
+    assert started["max_attempts"] == 3
+    assert started["model"]  # never empty
+    done = next(e for e in events if e["event"] == "wc_generation_done")
+    assert done["finish_reason"] == "complete"
+    assert done["pid_count"] == 24
+    validated = next(e for e in events if e["event"] == "wc_validated")
+    assert validated == {"schema": "pact-v4-phase-progress/ndjson/v1",
+                         "event": "wc_validated", "json_ok": True,
+                         "pids_ok": True, "order_ok": True,
+                         "ts": validated["ts"]}
+    # No retry events on a clean single-shot generation.
+    assert "wc_retry_attempt" not in names
+
+
+def test_whole_chapter_failed_generation_emits_retry_events(tmp_path):
+    # V4.1 M: a malformed-forever caller drives wc_retry_attempt per attempt
+    # with the "malformed" reason (the monitor's live "GEN attempt N/M
+    # (reason)"), and the final wc_validated honestly reports json_ok=False.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+
+    class _BrokenCaller:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, bundle):
+            self.calls.append(bundle)
+            return "{not json"
+
+    result = _run_whole_chapter(cfg, model_caller=_BrokenCaller())
+    assert result.incomplete_generation_count == 1
+
+    events = [
+        json.loads(line)
+        for line in (cfg.out_dir / "phase_progress.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    retries = [e for e in events if e["event"] == "wc_retry_attempt"]
+    assert [(e["attempt"], e["reason"]) for e in retries] == [
+        (1, "malformed"), (2, "malformed"), (3, "malformed"),
+    ]
+    validated = next(e for e in events if e["event"] == "wc_validated")
+    assert validated["json_ok"] is False
+    assert validated["pids_ok"] is False
+    done = next(e for e in events if e["event"] == "wc_generation_done")
+    assert done["finish_reason"] == "incomplete"
+
+
 def test_whole_chapter_resume_reads_raw_snapshot_not_final(tmp_path):
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
     cfg = type(cfg)(
@@ -1255,6 +1330,18 @@ class _CloseTrackingProgress:
         pass
 
     def chunk_done(self, **kwargs):
+        pass
+
+    def wc_generation_started(self, **kwargs):
+        pass
+
+    def wc_retry_attempt(self, **kwargs):
+        pass
+
+    def wc_generation_done(self, **kwargs):
+        pass
+
+    def wc_validated(self, **kwargs):
         pass
 
     def close(self):

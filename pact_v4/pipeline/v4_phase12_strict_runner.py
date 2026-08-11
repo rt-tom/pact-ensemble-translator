@@ -93,6 +93,7 @@ from pact_v4.phase1.models import (
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
 from pact_v4.phase2.generation import (
     GenerationCache,
+    GenerationErrorCode,
     GenerationParams,
     WholeChapterRetryPolicy,
     _GenerationValidationError,
@@ -3447,6 +3448,52 @@ WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
 WHOLE_CHAPTER_ROLE = "balanced_literary"
 
 
+def _wc_generation_model(runtime: Any, cfg: StrictRunConfig) -> str:
+    """Model label for ``wc_generation_started`` (diagnostics only).
+
+    Prefers the backend descriptor's ``generator`` binding (the model that
+    actually serves whole-chapter generation); falls back to the backend
+    profile name, then to a stable ``<kind>:<hash>`` placeholder so the
+    event never carries an empty model field.
+    """
+    try:
+        bindings = runtime.backend_descriptor.model_bindings
+        if bindings:
+            name = bindings.get("generator") or bindings.get("default")
+            if name:
+                return str(name)
+    except Exception:  # noqa: BLE001 — diagnostics, never a crash
+        pass
+    try:
+        profile = cfg.backend.config_profile_name()
+        if profile:
+            return profile
+    except Exception:  # noqa: BLE001
+        pass
+    return f"{cfg.backend.build_descriptor().kind}:{cfg.backend.identity_hash[:8]}"
+
+
+def _wc_validation_flags(outcome: Any) -> Dict[str, bool]:
+    """PID-contract validation flags for ``wc_validated`` (diagnostics).
+
+    A completed whole-chapter outcome is by construction a fully validated
+    ``{pid: text}`` map (json_ok/pids_ok/order_ok all True). For an
+    incomplete outcome the flags reflect the LAST attempt's failure class:
+    invalid JSON -> json_ok False; a PID-set/order violation -> pids_ok /
+    order_ok False; a session abort -> nothing to validate (all False).
+    """
+    if outcome.status == "complete":
+        return {"json_ok": True, "pids_ok": True, "order_ok": True}
+    error = next(iter(outcome.errors.values()), None)
+    code = error.code if error is not None else None
+    if code == GenerationErrorCode.INVALID_JSON:
+        return {"json_ok": False, "pids_ok": False, "order_ok": False}
+    if code == GenerationErrorCode.PID_MISMATCH:
+        return {"json_ok": True, "pids_ok": False, "order_ok": False}
+    # SESSION_ABORT / CONTEXT_LEAKAGE / unknown: nothing validated.
+    return {"json_ok": False, "pids_ok": False, "order_ok": False}
+
+
 def _validate_whole_chapter_generation_record(
     rec: Dict[str, Any],
     *,
@@ -4070,6 +4117,18 @@ def _run_whole_chapter_strict_impl(
         }
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
+        # V4.1 M (monitor card): whole-chapter generation telemetry — the
+        # phase-progress CLI renders "GEN attempt N/M (reason)" live from
+        # these events. Diagnostics only: a write failure is swallowed by
+        # the writer and never affects generation.
+        wc_retry_policy = WholeChapterRetryPolicy()
+        progress.wc_generation_started(
+            pid_count=len(pid_map.pids),
+            reasoning_budget=cfg.reasoning,
+            model=_wc_generation_model(runtime, cfg),
+            max_attempts=wc_retry_policy.max_attempts,
+        )
+        wc_t0 = time.monotonic()
         outcome = generate_whole_chapter(
             role="balanced_literary",
             source=source,
@@ -4082,8 +4141,17 @@ def _run_whole_chapter_strict_impl(
             params=params,
             model_caller=model_caller,
             cache=GenerationCache(),
-            retry=WholeChapterRetryPolicy(),
+            retry=wc_retry_policy,
+            on_retry=lambda attempt, reason: progress.wc_retry_attempt(
+                attempt=attempt, reason=reason
+            ),
         )
+        progress.wc_generation_done(
+            finish_reason="complete" if outcome.status == "complete" else "incomplete",
+            pid_count=len(pid_map.pids),
+            duration=time.monotonic() - wc_t0,
+        )
+        progress.wc_validated(**_wc_validation_flags(outcome))
         generation_records.append(_serialize_generation_outcome(outcome))
 
         if outcome.status == "complete":
