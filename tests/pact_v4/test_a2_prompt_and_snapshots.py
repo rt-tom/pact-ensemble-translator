@@ -116,7 +116,12 @@ def test_gemma_server_args_match_plan_34():
     # §3.4: MTP draft is OFF in v4.1; context is 49k.
     assert "--model-draft" not in args
     assert cli.GEMMA_CONTEXT_SIZE == 49152
-    assert cli.CONTEXT_SIZE == 32768  # Qwen context unchanged (non-goal)
+    # F3 (B3 review): the default local Qwen AUDIT server profile is the B3
+    # contract — MTP draft, reasoning 8192, context 49152 — so the Qwen
+    # context is no longer the historical 32768 (the constant is kept for
+    # backward-compat, the server args carry the B3 profile).
+    assert cli.CONTEXT_SIZE == 32768
+    assert cli.QWEN_SERVER_ARGS[cli.QWEN_SERVER_ARGS.index("-c") + 1] == "49152"
 
 
 # ---------------------------------------------------------------------------
