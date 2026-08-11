@@ -289,3 +289,274 @@ def test_render_book_script_value_never_reaches_output(tmp_path: Path):
     assert "</script>" not in book_content
     # The visible text survives as inert text.
     assert "alert(1)" in book_content
+
+
+# ---------------------------------------------------------------------------
+# V4.1 whole-chapter mode: run_<label>/translations.json + records
+# ---------------------------------------------------------------------------
+
+
+def _write_v41_runs(tmp_path: Path) -> dict:
+    """Two v4.1 whole-chapter run dirs (run_002, run_001) with records.
+
+    run_001 carries chapter_id ``0001``, run_002 carries chapter_id
+    ``0002`` — deliberately shuffled vs. the glob sort so chapter order
+    must come from ``chapter_ids``, not from directory-name order.
+    """
+    out_base = tmp_path / "out"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "0001.html").write_text(_SRC, encoding="utf-8")
+    (src_dir / "0002.html").write_text(
+        "<h1>Chapter Two</h1><p>Text two.</p>", encoding="utf-8",
+    )
+
+    def _write_run(name: str, chapter_id: str, translations: dict) -> Path:
+        run_dir = out_base / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "translations.json").write_text(
+            json.dumps(translations, ensure_ascii=False), encoding="utf-8",
+        )
+        (run_dir / "strict_chapter_trial_record.json").write_text(
+            json.dumps({
+                "schema": "pact-v4-strict-chapter-trial/v2",
+                "run_label": f"v4.1-{name}",
+                "chapter_id": chapter_id,
+                "identities": {},
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    run_001 = _write_run("run_001", "0001", _translations())
+    run_002 = _write_run("run_002", "0002", {
+        "p00001": "Глава вторая", "p00002": "Текст второй.",
+    })
+    return {"out_base": out_base, "src_dir": src_dir,
+            "run_001": run_001, "run_002": run_002}
+
+
+def test_render_book_v41_run_dirs_book_order_toc_sections(tmp_path: Path):
+    """Acceptance: 2+ v4.1 run dirs assemble a book with chapters in
+    chapter_ids order, TOC from headings and per-chapter sections."""
+    paths = _write_v41_runs(tmp_path)
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=["0001", "0002"],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=[paths["run_002"], paths["run_001"]],  # shuffled input
+        title="Тестовая книга",
+    )
+    assert report["errors"] == []
+    assert len(report["chapters"]) == 2
+    book_path = paths["out_base"] / "book.html"
+    assert report["book_path"] == str(book_path)
+    content = book_path.read_text(encoding="utf-8")
+    # Chapters in chapter_ids order (0001 before 0002), each in a section.
+    assert content.index('id="chapter-0001"') < content.index('id="chapter-0002"')
+    # TOC anchors from headings.
+    assert '<a href="#ch-0001-h1">Узы</a>' in content
+    assert '<a href="#ch-0002-h1">Глава вторая</a>' in content
+    # Translations came from the run dirs.
+    assert "Блэйк" in content and "Текст второй." in content
+    # Report records point at the run dir's translations.json.
+    assert "run_002" in report["chapters"][1]["translations"]
+    # Report written next to the book.
+    assert (paths["out_base"] / "book_html_report.json").exists()
+
+
+def test_render_book_v41_run_dirs_pattern_expansion(tmp_path: Path):
+    """A ``run_*`` pattern expands to the matching run dirs."""
+    paths = _write_v41_runs(tmp_path)
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=["0001", "0002"],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=["run_*"],
+    )
+    assert report["errors"] == []
+    assert len(report["chapters"]) == 2
+    content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
+    assert "Блэйк" in content and "Глава вторая" in content
+
+
+def test_render_book_v41_run_dirs_chapter_id_from_record_beats_dirname(
+    tmp_path: Path,
+):
+    """chapter_id comes from strict_chapter_trial_record.json even when the
+    run dir name is unrelated (run_00X -> chapter 0003)."""
+    paths = _write_v41_runs(tmp_path)
+    run_dir = paths["run_001"]
+    (run_dir / "strict_chapter_trial_record.json").write_text(
+        json.dumps({
+            "schema": "pact-v4-strict-chapter-trial/v2",
+            "run_label": "v4.1-run_001",
+            "chapter_id": "0003",
+            "identities": {},
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (paths["src_dir"] / "0003.html").write_text(
+        "<h1>Chapter Three</h1><p>Text three.</p>", encoding="utf-8",
+    )
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=["0003"],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=["run_001"],
+    )
+    assert report["errors"] == []
+    assert report["chapters"][0]["chapter_id"] == "0003"
+    content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
+    assert 'id="chapter-0003"' in content
+    # The heading block of 0003 is replaced by its translation (p00001).
+    assert "Узы" in content
+
+
+def test_render_book_v41_run_dirs_no_record_falls_back_to_dirname(
+    tmp_path: Path,
+):
+    """No record/metadata: chapter_id falls back to the run dir name with a
+    warning, and the chapter still renders."""
+    paths = _write_v41_runs(tmp_path)
+    # Strip the record; the run dir name (run_001) becomes the chapter id.
+    (paths["run_001"] / "strict_chapter_trial_record.json").unlink()
+    # Source HTML for the fallback chapter id (dir name) so it renders.
+    (paths["src_dir"] / "run_001.html").write_text(_SRC, encoding="utf-8")
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=[],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=["run_001"],
+    )
+    assert report["errors"] == []
+    assert any("run_001" in w for w in report["warnings"])
+    assert report["chapters"][0]["chapter_id"] == "run_001"
+    content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
+    assert "Блэйк" in content
+
+
+def test_render_book_v41_run_dirs_missing_run_is_error(tmp_path: Path):
+    """A run dir that does not exist is a per-chapter error, not a crash —
+    the remaining chapters still render (mirrors legacy missing-chapter
+    behavior)."""
+    paths = _write_v41_runs(tmp_path)
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=["0001"],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=["run_001", "run_missing"],
+    )
+    assert len(report["errors"]) == 1
+    assert "run_missing" in report["errors"][0]
+    content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
+    assert "Блэйк" in content  # run_001 still rendered
+
+
+def test_render_book_v41_run_dirs_translations_metadata_fallback(
+    tmp_path: Path,
+):
+    """No record but translations.json carries chapter_id metadata (envelope
+    form) — the id is taken from there."""
+    paths = _write_v41_runs(tmp_path)
+    run_dir = paths["run_001"]
+    (run_dir / "strict_chapter_trial_record.json").unlink()
+    (run_dir / "translations.json").write_text(
+        json.dumps({
+            "chapter_id": "0004",
+            "translations": {
+                "p00001": "Узы",
+                "p00002": "Он встретил <em>Блэйка</em> у ворот.",
+                "p00003": "Блэйк ждал снаружи.",
+            },
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (paths["src_dir"] / "0004.html").write_text(_SRC, encoding="utf-8")
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=["0004"],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=["run_001"],
+    )
+    assert report["errors"] == []
+    assert report["chapters"][0]["chapter_id"] == "0004"
+    content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
+    assert 'id="chapter-0004"' in content
+    assert "<em>Блэйка</em>" in content  # envelope translations rendered
+
+
+def test_render_book_v41_run_dirs_chapter_ids_order_overrides_run_order(
+    tmp_path: Path,
+):
+    """chapter_ids order is the book order even when run dirs are passed in
+    a different order (owner fixes book order explicitly)."""
+    paths = _write_v41_runs(tmp_path)
+    report = render_book(
+        out_base=paths["out_base"],
+        chapter_ids=["0002", "0001"],
+        chapter_html_pattern=str(paths["src_dir"] / "{chapter_id}.html"),
+        run_dirs=["run_001", "run_002"],
+    )
+    assert report["errors"] == []
+    content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
+    assert content.index('id="chapter-0002"') < content.index('id="chapter-0001"')
+
+
+def test_render_book_v41_run_dirs_no_chapter_ids_orders_by_resolved_id(
+    tmp_path: Path,
+):
+    """RV finding (abe40c1): with ``run_dirs`` but no ``chapter_ids`` the
+    book order must follow the RESOLVED chapter_id (natural sort), not the
+    run-dir glob/insertion order. run_001 carries chapter_id 0002 and
+    run_002 carries 0001, so glob order (run_001 first) disagrees with the
+    ids — the report and book.html must still list 0001 before 0002."""
+    out_base = tmp_path / "out"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "0001.html").write_text(_SRC, encoding="utf-8")
+    (src_dir / "0002.html").write_text(
+        "<h1>Chapter Two</h1><p>Text two.</p>", encoding="utf-8",
+    )
+
+    def _write_run(name: str, chapter_id: str, translations: dict) -> Path:
+        run_dir = out_base / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "translations.json").write_text(
+            json.dumps(translations, ensure_ascii=False), encoding="utf-8",
+        )
+        (run_dir / "strict_chapter_trial_record.json").write_text(
+            json.dumps({
+                "schema": "pact-v4-strict-chapter-trial/v2",
+                "run_label": f"v4.1-{name}",
+                "chapter_id": chapter_id,
+                "identities": {},
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    # Glob order run_001 < run_002, but the resolved chapter ids are the
+    # reverse — the dir names deliberately disagree with the ids.
+    _write_run("run_001", "0002", {
+        "p00001": "Глава вторая", "p00002": "Текст второй.",
+    })
+    _write_run("run_002", "0001", _translations())
+
+    report = render_book(
+        out_base=out_base,
+        chapter_ids=[],
+        chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+        run_dirs=["run_*"],
+        title="Тестовая книга",
+    )
+    assert report["errors"] == []
+    # Report chapter order follows the resolved chapter ids.
+    assert [ch["chapter_id"] for ch in report["chapters"]] == ["0001", "0002"]
+    # book.html sections follow the same order.
+    content = (out_base / "book.html").read_text(encoding="utf-8")
+    assert content.index('id="chapter-0001"') < content.index('id="chapter-0002"')
+    # Each chapter's translations come from the run dir whose record carries
+    # that id (0001 -> run_002, 0002 -> run_001).
+    assert "run_002" in report["chapters"][0]["translations"]
+    assert "run_001" in report["chapters"][1]["translations"]
