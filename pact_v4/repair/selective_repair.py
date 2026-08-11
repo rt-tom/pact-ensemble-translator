@@ -134,6 +134,15 @@ DEFAULT_REAUDIT_FULL_THRESHOLD = 8
 DEFAULT_REPAIR_MAX_TOKENS = 4000
 DEFAULT_REAUDIT_MAX_TOKENS = 20000
 
+# The re-audit retry policy is identity-bearing (F5: a policy change must
+# invalidate a stale cached repaired map), so the production config chain
+# (StrictRunConfig -> B3AuditRepairConfig -> SelectiveRepairConfig) carries
+# the policy as scalars. The defaults are pinned to the JsonRetryPolicy
+# class defaults (B4 §5: max_retries=2 -> 3 attempts, base_delay_seconds=1.0)
+# so the identity mirrors the effective runtime policy without drift.
+DEFAULT_REAUDIT_MAX_RETRIES = JsonRetryPolicy.max_retries
+DEFAULT_REAUDIT_BASE_DELAY_SECONDS = JsonRetryPolicy.base_delay_seconds
+
 
 # ---------------------------------------------------------------------------
 # Data shapes
@@ -961,6 +970,8 @@ __all__ = [
     "REPAIR_FINDINGS_CAP",
     "POLICY_LIMIT_TAG",
     "DEFAULT_REAUDIT_MAX_TOKENS",
+    "DEFAULT_REAUDIT_MAX_RETRIES",
+    "DEFAULT_REAUDIT_BASE_DELAY_SECONDS",
     "MICROBATCH_TRIGGER",
     "MICROBATCH_TARGET",
     "SelectiveRepairConfig",

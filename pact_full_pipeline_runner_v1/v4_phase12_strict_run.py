@@ -502,6 +502,13 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             repair_microbatch_target=cfg.audit_repair_microbatch_target,
             repair_reaudit_neighbour_window=cfg.audit_repair_reaudit_neighbour_window,
             repair_reaudit_full_threshold=cfg.audit_repair_reaudit_full_threshold,
+            # RV 71b7cbc fix (F5): the re-audit output budget and bounded B4
+            # JSON retry policy are part of the config identity and are wired
+            # through to the selective-repair evaluator by B3AuditRepair —
+            # never silently left at module defaults.
+            repair_reaudit_max_tokens=cfg.audit_repair_reaudit_max_tokens,
+            repair_reaudit_max_retries=cfg.audit_repair_reaudit_max_retries,
+            repair_reaudit_base_delay_seconds=cfg.audit_repair_reaudit_base_delay_seconds,
             prompt_version=cfg.audit_prompt_version,
             harness_version=cfg.audit_harness_version,
             extractor_version=cfg.audit_extractor_version,

@@ -93,7 +93,10 @@ from pact_v4.audit.entity_extractor import (
 from pact_v4.audit.hard_filters import FilteredIssue, apply_hard_filters
 from pact_v4.phase1.models import SourceArtifact, canonical_json_hash
 from pact_v4.repair.selective_repair import (
+    DEFAULT_REAUDIT_BASE_DELAY_SECONDS,
     DEFAULT_REAUDIT_FULL_THRESHOLD,
+    DEFAULT_REAUDIT_MAX_RETRIES,
+    DEFAULT_REAUDIT_MAX_TOKENS,
     DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
@@ -107,6 +110,7 @@ from pact_v4.runtime.backend_protocol import (
     CompletionBackend,
     CompletionRequest,
 )
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 
 LOG = logging.getLogger(__name__)
 
@@ -260,6 +264,14 @@ class B3AuditRepairConfig:
     repair_microbatch_target: int = MICROBATCH_TARGET
     repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     repair_reaudit_full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD
+    # The re-audit output budget and its bounded B4 JSON retry policy are
+    # part of the run config identity (StrictRunConfig.to_config_artifact)
+    # and are wired into SelectiveRepairConfig below (RV 71b7cbc fix, F5) —
+    # without them the re-audit would silently fall back to module defaults
+    # and a cache written under a different budget/policy could replay.
+    repair_reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
+    repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
+    repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
     prompt_version: str = PROMPT_VERSION
     harness_version: str = HARNESS_VERSION
     extractor_version: str = EXTRACTOR_VERSION
@@ -276,6 +288,11 @@ class B3AuditRepairConfig:
             "repair_microbatch_target": self.repair_microbatch_target,
             "repair_reaudit_neighbour_window": self.repair_reaudit_neighbour_window,
             "repair_reaudit_full_threshold": self.repair_reaudit_full_threshold,
+            "repair_reaudit_max_tokens": self.repair_reaudit_max_tokens,
+            "repair_reaudit_retry": {
+                "max_retries": self.repair_reaudit_max_retries,
+                "base_delay_seconds": self.repair_reaudit_base_delay_seconds,
+            },
             "prompt_version": self.prompt_version,
             "harness_version": self.harness_version,
             "extractor_version": self.extractor_version,
@@ -1030,6 +1047,15 @@ class B3AuditRepair:
                     microbatch_target=cfg.repair_microbatch_target,
                     reaudit_neighbour_window=cfg.repair_reaudit_neighbour_window,
                     reaudit_full_threshold=cfg.repair_reaudit_full_threshold,
+                    # RV 71b7cbc fix (F5): the re-audit output budget and the
+                    # bounded B4 JSON retry policy are wired from the B3
+                    # config — the identity carries them, so the evaluator
+                    # can never silently fall back to module defaults.
+                    reaudit_max_tokens=cfg.repair_reaudit_max_tokens,
+                    reaudit_retry=JsonRetryPolicy(
+                        max_retries=cfg.repair_reaudit_max_retries,
+                        base_delay_seconds=cfg.repair_reaudit_base_delay_seconds,
+                    ),
                 ),
             )
             repair_outcome = repair_evaluator(
