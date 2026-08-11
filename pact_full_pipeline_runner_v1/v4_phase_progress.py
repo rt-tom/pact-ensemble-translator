@@ -257,6 +257,16 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
     recent_usage = usage_age is not None and usage_age <= FRESHNESS_WINDOW_SECONDS
     recent_event = bool(started) and bool(_recent_event_age(events) <= FRESHNESS_WINDOW_SECONDS)
 
+    # V4.1 M (RV fix): local whole-chapter B3 audit/repair calls never write
+    # usage.ndjson rows and do not update phase_progress per chunk/repair
+    # call — the only fresh activity during a long B3 pass is the audit
+    # journal's own events (audit_chunk_started/done, repair_round, ...).
+    # Read it read-only: a fresh journal event keeps the run alive, nothing
+    # more (no writing, no gating).
+    b3_events = _load_b3_events(out_dir)
+    b3_age = _recent_event_age(b3_events)
+    recent_b3 = b3_age <= FRESHNESS_WINDOW_SECONDS
+
     alive_basis: List[str] = []
     if record is not None:
         alive = False
@@ -265,13 +275,15 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         alive = False
         alive_basis.append("terminal event written (run finished)")
     else:
-        alive = bool(recent_usage or recent_event)
+        alive = bool(recent_usage or recent_event or recent_b3)
         if recent_usage:
             alive_basis.append(f"last usage.ndjson {usage_age:.0f}s ago")
         if recent_event:
             alive_basis.append(f"last progress event {_recent_event_age(events):.0f}s ago")
+        if recent_b3:
+            alive_basis.append(f"last audit_journal event {b3_age:.0f}s ago")
         if not alive_basis:
-            alive_basis.append("no recent usage.ndjson / progress events (stalled or unknown)")
+            alive_basis.append("no recent usage.ndjson / progress / audit_journal events (stalled or unknown)")
 
     return {
         "alive": alive,
@@ -400,6 +412,20 @@ def _detect_whole_chapter_phase(
     if repair_rounds or reaudit:
         detail = _b3_repair_hint(b3)
         return "step7", f"B3 repair in progress{detail}"
+
+    # RV fix: after ``audit_complete`` (audit=True) the repair model call may
+    # already be in flight while the repair_round/reaudit_scope event is not
+    # yet appended — the monitor must NOT keep reporting step6
+    # ``AUDIT chunk N/8`` for a finished audit. Transition to step7 until the
+    # repair_round/terminal gate lands. An incomplete audit (audit=False,
+    # gate not yet written — transient crash window) stays fail-closed on
+    # step6; step8 is shown only after the gate event.
+    audit_complete_events = [e for e in b3 if e.get("event") == "audit_complete"]
+    if audit_complete_events:
+        if audit_complete_events[-1].get("audit_complete") is True:
+            return "step7", ("B3 audit complete; repair in flight "
+                             "(awaiting repair_round/gate)")
+        return "step6", "B3 audit incomplete (fail-closed); awaiting gate"
     if audit_chunk_started or audit_chunk_done:
         total = audit_chunk_started[-1].get("total") or audit_chunk_done[-1].get("total")
         done_n = len(audit_chunk_done)

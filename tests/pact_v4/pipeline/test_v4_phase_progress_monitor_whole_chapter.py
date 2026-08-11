@@ -15,6 +15,9 @@ Covers ``docs/plans/V4_1_AUDIT_B1_RU.md`` §13 (card M — whole-chapter events
 * the one-line status renders ``GEN attempt N/M (reason)`` live, ``AUDIT
   chunk N/8`` and ``REPAIR regions done/committed/debt`` from the B3 journal
   events, and ``DONE`` with the wc_validated PID flags after the run;
+* RV fix (t_7b554c07): B3 liveness — a fresh audit_journal event keeps the
+  run alive despite stale phase_progress/usage, and audit_complete=true
+  without repair_round reports step7 (incomplete audits stay fail-closed);
 * chunked mode is NOT broken: old chunk_started/audit_unit/region events
   still drive the same phases as before (backward compatibility).
 
@@ -340,6 +343,90 @@ def test_monitor_whole_chapter_generation_only_no_b3(tmp_path: Path):
     phase, basis = tracker._detect_phase(out, events)
     assert phase == "steps1-5"
     assert "generation done" in basis
+
+
+def test_monitor_whole_chapter_audit_complete_transitions_to_step7(tmp_path: Path):
+    # RV fix: after B3 emits audit_complete=true and BEFORE
+    # repair_round/reaudit_scope is appended, the repair model call may
+    # already be in flight — the monitor must report step7, never step6
+    # ``AUDIT chunk 8/8`` for a finished audit.
+    out = _wc_run_dir(tmp_path)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_generation_done", 480, finish_reason="complete",
+                  pid_count=120, duration=70.0),
+        _wc_event("wc_validated", 479, json_ok=True, pids_ok=True, order_ok=True),
+    ])
+    _write_ndjson(out / "audit_journal.ndjson", [
+        _b3_event("audit_started", 460),
+        _b3_event("audit_chunk_started", 450, chunk=1, total=8),
+        _b3_event("audit_chunk_done", 440, chunk=1, total=8, status="ok"),
+        _b3_event("audit_complete", 430, audit_complete=True, issue_count=3),
+    ])
+    events = tracker._load_events(out)
+    phase, basis = tracker._detect_phase(out, events)
+    assert phase == "step7"
+    assert "audit complete" in basis
+
+    # Fail-closed: audit_complete=false without the gate (transient crash
+    # window before the fail-closed gate is appended) must stay step6 —
+    # never step7/step8.
+    failed = _wc_run_dir(tmp_path / "failed")
+    _write_ndjson(failed / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_generation_done", 480, finish_reason="complete",
+                  pid_count=120, duration=70.0),
+        _wc_event("wc_validated", 479, json_ok=True, pids_ok=True, order_ok=True),
+    ])
+    _write_ndjson(failed / "audit_journal.ndjson", [
+        _b3_event("audit_started", 460),
+        _b3_event("audit_chunk_started", 450, chunk=1, total=8),
+        _b3_event("audit_chunk_done", 440, chunk=1, total=8, status="ok"),
+        _b3_event("audit_complete", 430, audit_complete=False,
+                  issue_count=0, failed_chunks=["c2"]),
+    ])
+    events_f = tracker._load_events(failed)
+    phase_f, basis_f = tracker._detect_phase(failed, events_f)
+    assert phase_f == "step6"
+    assert "fail-closed" in basis_f
+
+    # Step8 appears only after the gate event.
+    _write_ndjson(failed / "audit_journal.ndjson", [
+        _b3_event("gate", 420, audit_complete=False, released_as_audited=False),
+    ])
+    events_g = tracker._load_events(failed)
+    phase_g, _ = tracker._detect_phase(failed, events_g)
+    assert phase_g == "step8"
+
+
+# ---------------------------------------------------------------------------
+# Monitor: B3 liveness (audit_journal activity keeps the run alive)
+# ---------------------------------------------------------------------------
+
+
+def test_liveness_fresh_audit_journal_keeps_alive(tmp_path: Path):
+    # RV fix: local whole-chapter B3 audit/repair calls write NO usage.ndjson
+    # rows and phase_progress is not updated per chunk/repair call. After the
+    # 300s freshness window the ONLY fresh activity is the audit journal: a
+    # fresh audit_chunk_started/done (or repair_round) event must keep
+    # alive=yes; a stale journal with stale wc events stays dead.
+    out = _wc_run_dir(tmp_path)
+    _write_ndjson(out / "audit_journal.ndjson", [
+        _b3_event("audit_chunk_started", 450, chunk=1, total=8),
+        _b3_event("audit_chunk_done", 440, chunk=1, total=8, status="ok"),
+        _b3_event("audit_chunk_started", 1, chunk=2, total=8),
+    ])
+    events = tracker._load_events(out)
+    identity = tracker._identity(out, events)
+    assert identity["alive"] is True
+    assert "audit_journal" in identity["alive_basis"]
+
+    # Stale audit journal + stale wc events + no usage.ndjson -> not alive.
+    stale = _wc_run_dir(tmp_path / "stale")
+    _write_ndjson(stale / "audit_journal.ndjson", [
+        _b3_event("audit_chunk_started", 3600, chunk=1, total=8),
+    ])
+    events2 = tracker._load_events(stale)
+    identity2 = tracker._identity(stale, events2)
+    assert identity2["alive"] is False
 
 
 # ---------------------------------------------------------------------------
