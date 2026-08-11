@@ -645,8 +645,8 @@ Negative rejection: none 0.5 (p00075/p00136/p00184) · gold 0.5 · **auto 0.667*
 4. **B3-спека обновлена**: `entity_context_enabled` дефолт `true`; контекст = только verified-claims
 
 **Замечания developer'у (B1.3 closure):**
-- Fix 1: `metrics_real.json` считает по dev-gold (p00236) — для run_006 нужен параметризуемый gold (или p00236→p00097); пересчитать
-- Fix 2: `render_entity_context_text` — candidate-claims не рендерить в аудит-промпт (проверить кейс 8 на ре-прогоне: rejection 1.0)
+- Fix 1: ~~gold параметризовать/пересчитать metrics_real~~ — **ОТМЕНЕНО (владелец 2026-08-10)**: b13_ab.py — spike, в production не идёт; корректные метрики уже зафиксированы вручную в §9.5.1 (пересчёт 8/10). Параметризация gold в спike-харнессе не окупается
+- Fix 2: `render_entity_context_text` — candidate-claims не рендерить в аудит-промпт (проверить кейс 8 на ре-прогоне: rejection 1.0) — это production-фикс B1.2, обязателен
 - Fix 3: кейс 2 unknown (p00002 invented_gender «Медсестра») — проверить: если nurse=Rich male, то «медсестра» это реальный gender error? Сверить с каноном главы 0001 (The Nurse: female — НО это generic, не Rich; в кейсе синтетический Rich)
 
 **Стоимость в production:** +1 вызов extractor на главу (кэш source_hash+extractor_version); аудит без изменений (8 чанков).
