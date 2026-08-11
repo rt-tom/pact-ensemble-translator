@@ -35,6 +35,7 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     _LifecycleAwareQwenAudit,
     _make_backend,
     _make_cfg,
+    _run,
 )
 
 
@@ -1520,3 +1521,118 @@ def test_whole_chapter_default_local_lifecycle_bounds_calls_to_max_attempts(tmp_
     assert result.selected_count == 0
     assert len(scripted.requests) == WholeChapterRetryPolicy().max_attempts
     assert not (cfg.out_dir / "translations_raw.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# V4.1 audit W (§14): whole-chapter artifacts — whole_chapter_pid_map.json is
+# the honest ordered-PID source of truth in whole-chapter mode; the persisted
+# chunk_plan.json is annotated (mode=whole-chapter-derived) instead of being
+# misread as an active chunking contract. Resume must not depend on
+# chunk_plan.json presence/absence.
+# ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_writes_pid_map_artifact(tmp_path):
+    from pact_v4.phase1.models import WholeChapterPidMap as _PidMapCls
+
+    from pact_v4.pipeline.v4_phase12_strict_runner import (
+        WHOLE_CHAPTER_PID_MAP_SCHEMA,
+    )
+    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _build_artifacts
+
+    # 400 paragraphs -> 400 PIDs (matches the audit acceptance on chapter 0001).
+    cfg = _make_cfg(tmp_path, n_paragraphs=400)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+    result = _run_whole_chapter(cfg)
+
+    pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
+    assert pid_map_path.exists(), "whole-chapter run must write whole_chapter_pid_map.json"
+    payload = json.loads(pid_map_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == WHOLE_CHAPTER_PID_MAP_SCHEMA
+    assert payload["chapter_id"] == cfg.chapter_id
+
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    pid_map = _PidMapCls.derive(chunk_plan, snapshot)
+
+    assert payload["snapshot_hash"] == snapshot.snapshot_hash
+    assert payload["source_hash"] == snapshot.source_hash
+    assert payload["chunk_plan_hash"] == chunk_plan.plan_hash
+    assert payload["map_hash"] == pid_map.map_hash
+    assert payload["pid_count"] == 400
+
+    entries = payload["entries"]
+    assert len(entries) == 400
+    # Exact source order: entry i is snapshot.pids[i] with order i.
+    for index, entry in enumerate(entries):
+        assert entry["pid"] == snapshot.pids[index]
+        assert entry["order"] == index
+
+    # The run record links the artifact hash to the same derived map.
+    assert result.record["identities"]["whole_chapter_pid_map_hash"] == pid_map.map_hash
+    assert result.record["artefacts"]["whole_chapter_pid_map"] == str(pid_map_path)
+
+
+def test_whole_chapter_chunk_plan_marked_whole_chapter_derived(tmp_path):
+    # The persisted chunk_plan.json in whole-chapter mode must be explicitly
+    # annotated (mode=whole-chapter-derived + note), never a silent-looking
+    # active chunking contract. The annotation is metadata: plan_hash is
+    # unchanged by it and the payload still round-trips through from_payload.
+    from pact_v4.phase1.models import ChunkPlanArtifact
+    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _build_artifacts
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+
+    plan_payload = json.loads(
+        (cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8")
+    )
+    assert plan_payload["mode"] == "whole-chapter-derived"
+    assert plan_payload["note"] == "chunk boundaries not used"
+
+    # Round-trip: the annotated payload is still a valid ChunkPlanArtifact and
+    # the annotation does not participate in the identity.
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    loaded = ChunkPlanArtifact.from_payload(plan_payload, snapshot=snapshot)
+    assert loaded == chunk_plan
+    assert loaded.plan_hash == plan_payload["plan_hash"]
+
+
+def test_chunked_run_chunk_plan_unchanged(tmp_path):
+    # Chunked mode keeps the plain chunk_plan.json (the chunk boundaries ARE
+    # used there) — the whole-chapter annotation must never leak into it.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    _run(cfg)
+    plan_payload = json.loads(
+        (cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8")
+    )
+    assert "mode" not in plan_payload
+    assert "note" not in plan_payload
+    assert not (cfg.out_dir / "whole_chapter_pid_map.json").exists()
+
+
+def test_whole_chapter_resume_does_not_depend_on_chunk_plan(tmp_path):
+    # Resume-логика НЕ зависит от наличия/отсутствия chunk_plan.json
+    # (V4.1 audit W §14, acceptance #3): a whole-chapter resume replays the
+    # journal and reconstructs from translations_raw.json — chunk_plan.json
+    # is not part of the resume path. Deleting it must not break resume.
+    cfg = _whole_chapter_cfg(tmp_path)
+    first = _run_whole_chapter(cfg)
+    assert first.resumed_from_index == 0
+    raw = json.loads((cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8"))
+
+    (cfg.out_dir / "chunk_plan.json").unlink()
+
+    caller2 = StubModelCaller()
+    resumed = _run_whole_chapter(cfg, model_caller=caller2)
+    assert len(caller2.calls) == 0
+    assert resumed.resumed_from_index == 1
+    final = json.loads(resumed.translations_path.read_text(encoding="utf-8"))
+    assert final == raw
+    # The pid-map artifact is deterministic and re-written on resume.
+    pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
+    assert pid_map_path.exists()
+    assert json.loads(pid_map_path.read_text(encoding="utf-8"))["pid_count"] == 24

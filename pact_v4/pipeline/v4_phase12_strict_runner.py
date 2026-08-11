@@ -82,6 +82,8 @@ from pact_v4.phase1.chunker import (
     ChunkPlanner,
 )
 from pact_v4.phase1.models import (
+    CHUNK_PLAN_MODE_WHOLE_CHAPTER,
+    CHUNK_PLAN_NOTE_WHOLE_CHAPTER,
     Candidate,
     ChunkPlanArtifact,
     ConfigArtifact,
@@ -2386,9 +2388,19 @@ def run_chapter_strict(
         if not plans:
             raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
         chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+        chunk_plan_payload = chunk_plan.to_payload()
+        if cfg.whole_chapter:
+            # V4.1 audit W (§14): whole-chapter generation does NOT use the
+            # real chunk boundaries — only the ordered PID map
+            # (WholeChapterPidMap) matters. Annotate the persisted plan
+            # explicitly (metadata only, never part of plan_hash) so it
+            # cannot be misread as an active chunking contract; the ordered
+            # PID source of truth is whole_chapter_pid_map.json.
+            chunk_plan_payload["mode"] = CHUNK_PLAN_MODE_WHOLE_CHAPTER
+            chunk_plan_payload["note"] = CHUNK_PLAN_NOTE_WHOLE_CHAPTER
         chunk_plan_path = cfg.out_dir / "chunk_plan.json"
         chunk_plan_path.write_text(
-            json.dumps(chunk_plan.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8",
+            json.dumps(chunk_plan_payload, ensure_ascii=False, indent=2), encoding="utf-8",
         )
 
         glossary = _glossary_entries(memory)
@@ -3436,6 +3448,14 @@ def translations_path_exists(out_dir: Path) -> bool:
 # whether the artifact is missing or selection simply did not run.
 WHOLE_CHAPTER_SELECTION_SCHEMA = "pact-v4-whole-chapter-selection/v1"
 
+# V4.1 audit W (§14): schema of the whole-chapter ordered PID map artifact
+# (whole_chapter_pid_map.json), the honest source of truth for the ordered
+# PID list in whole-chapter mode. Each entry is {pid, order} in exact source
+# order; the artifact header binds the map to the run's snapshot/source/
+# plan/whole-chapter-map identities (snapshot_hash, source_hash,
+# chunk_plan_hash, map_hash).
+WHOLE_CHAPTER_PID_MAP_SCHEMA = "pact-v4-whole-chapter-pid-map/v1"
+
 # Whole-chapter journal/count marker: the single journal entry's chunk_id and
 # the generation record's chunk_id (the whole chapter is one processing unit).
 WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
@@ -3790,6 +3810,20 @@ def _run_whole_chapter_strict_impl(
     recorded as skipped.
     """
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
+    pid_map_path.write_text(json.dumps({
+        "schema": WHOLE_CHAPTER_PID_MAP_SCHEMA,
+        "chapter_id": cfg.chapter_id,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "source_hash": source.source_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "map_hash": pid_map.map_hash,
+        "pid_count": len(pid_map.pids),
+        "entries": [
+            {"pid": pid, "order": order}
+            for order, pid in enumerate(pid_map.pids)
+        ],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     journal_path = cfg.out_dir / "journal.ndjson"
     translations_path = cfg.out_dir / "translations.json"
     raw_translations_path = cfg.out_dir / "translations_raw.json"
@@ -4289,6 +4323,7 @@ def _run_whole_chapter_strict_impl(
     backend_block["config_identity_hash"] = cfg.backend.identity_hash
     artefacts: Dict[str, Any] = {
         "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
+        "whole_chapter_pid_map": str(pid_map_path),
         "generation_outcomes": str(generation_path),
         "selection_results": str(selection_path),
         "translations_raw": str(raw_translations_path),

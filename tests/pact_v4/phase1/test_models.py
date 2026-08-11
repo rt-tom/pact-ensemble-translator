@@ -380,6 +380,42 @@ def test_chunk_plan_artifact_payload_round_trip_recomputes_hash():
         ChunkPlanArtifact.from_payload(tampered, snapshot=snap)
 
 
+def test_chunk_plan_artifact_payload_tolerates_whole_chapter_annotation():
+    # V4.1 audit W (§14): whole-chapter runs annotate the persisted
+    # chunk_plan.json with mode/note (whole-chapter-derived), so the
+    # payload must round-trip with the annotation present — the marker is
+    # metadata, never part of plan_hash.
+    from pact_v4.phase1.models import (
+        CHUNK_PLAN_MODE_WHOLE_CHAPTER,
+        CHUNK_PLAN_NOTE_WHOLE_CHAPTER,
+    )
+
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    payload = artifact.to_payload()
+    payload["mode"] = CHUNK_PLAN_MODE_WHOLE_CHAPTER
+    payload["note"] = CHUNK_PLAN_NOTE_WHOLE_CHAPTER
+    loaded = ChunkPlanArtifact.from_payload(payload, snapshot=snap)
+    assert loaded == artifact
+    # The annotation must not leak into the recomputed identity.
+    assert loaded.plan_hash == artifact.plan_hash
+
+
+def test_chunk_plan_artifact_payload_rejects_foreign_whole_chapter_annotation():
+    # A typo'd/foreign annotation fails closed instead of round-tripping
+    # silently (the persisted marker would then be misleading).
+    snap = _snapshot()
+    artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))
+    payload = artifact.to_payload()
+    payload["mode"] = "chunked"
+    with pytest.raises(ValueError, match="Foreign identity: mode"):
+        ChunkPlanArtifact.from_payload(payload, snapshot=snap)
+    payload2 = artifact.to_payload()
+    payload2["note"] = "boundaries are used"
+    with pytest.raises(ValueError, match="Foreign identity: note"):
+        ChunkPlanArtifact.from_payload(payload2, snapshot=snap)
+
+
 def test_chunk_plan_artifact_replace_cannot_bypass_snapshot_validation():
     snap = _snapshot()
     artifact = ChunkPlanArtifact.create(snap, (_chunk_plan(snap),))

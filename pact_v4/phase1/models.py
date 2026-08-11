@@ -513,6 +513,16 @@ def validate_full_pid_ownership(plans: Tuple[ChunkPlan, ...], snapshot: Snapshot
         raise ValueError(f"Chunk plans own PIDs outside the snapshot: {sorted(extra)}")
 
 
+# V4.1 audit W (§14): in whole-chapter mode the real chunk boundaries are
+# NOT used by generation (only the ordered PID map, ``WholeChapterPidMap``,
+# matters), so the persisted chunk_plan.json is explicitly annotated instead
+# of silently looking like an active chunking contract. The annotation is
+# payload-level metadata only — it never participates in ``plan_hash``, and
+# ``from_payload`` validates the values when present.
+CHUNK_PLAN_MODE_WHOLE_CHAPTER = "whole-chapter-derived"
+CHUNK_PLAN_NOTE_WHOLE_CHAPTER = "chunk boundaries not used"
+
+
 @dataclass(frozen=True)
 class ChunkPlanArtifact:
     """Authoritative chapter-level plan with a content-derived identity.
@@ -579,12 +589,31 @@ class ChunkPlanArtifact:
     def from_payload(
         cls, payload: Mapping[str, Any], *, snapshot: Snapshot
     ) -> "ChunkPlanArtifact":
-        """Load, reconstruct, and re-hash a persisted authoritative plan."""
+        """Load, reconstruct, and re-hash a persisted authoritative plan.
+
+        V4.1 audit W (§14): the payload may carry the optional whole-chapter
+        annotation keys ``mode``/``note`` (written by the strict runner in
+        whole-chapter mode to mark the plan as ``whole-chapter-derived``).
+        They are metadata only — never part of the identity hash — but when
+        present their values are validated so a foreign/typo'd annotation
+        fails closed instead of round-tripping silently.
+        """
+        optional = {k for k in ("mode", "note") if k in payload}
         _require_exact_keys(
             payload,
-            {"artifact", "snapshot_hash", "chunks", "plan_hash"},
+            {"artifact", "snapshot_hash", "chunks", "plan_hash"} | optional,
             "ChunkPlanArtifact payload",
         )
+        if payload.get("mode", CHUNK_PLAN_MODE_WHOLE_CHAPTER) != CHUNK_PLAN_MODE_WHOLE_CHAPTER:
+            raise ValueError(
+                f"Foreign identity: mode={payload.get('mode')!r}, expected "
+                f"{CHUNK_PLAN_MODE_WHOLE_CHAPTER!r}"
+            )
+        if payload.get("note", CHUNK_PLAN_NOTE_WHOLE_CHAPTER) != CHUNK_PLAN_NOTE_WHOLE_CHAPTER:
+            raise ValueError(
+                f"Foreign identity: note={payload.get('note')!r}, expected "
+                f"{CHUNK_PLAN_NOTE_WHOLE_CHAPTER!r}"
+            )
         if payload["artifact"] != "pact-v4-chunk-plan/v1":
             raise ValueError(f"Foreign identity: artifact={payload['artifact']!r}")
         if payload["snapshot_hash"] != snapshot.snapshot_hash:
