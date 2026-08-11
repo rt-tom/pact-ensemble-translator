@@ -567,3 +567,62 @@ def test_mtp_identity_valid_path_but_name_negates_mtp_fails_loudly(tmp_path: Pat
     backend = _b3_local_backend(args, cli.QWEN_PATH, "Qwen-non-MTP.gguf")
     with pytest.raises(ValueError, match="contradicts"):
         cli._validate_b3_qwen_profile(args, backend)
+
+
+# ---------------------------------------------------------------------------
+# RV4 (HIGH, t_fc23a704): _is_b3_qwen_mtp_identity must evaluate the
+# NORMALIZED (dot-segment-collapsed) path — a canonical MTP component
+# followed by a ".." segment resolves to the NON-MTP directory and must be
+# rejected even though the raw Path.parts listing still contains the exact
+# MTP component.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "qwen_path",
+    [
+        # canonical MTP component then ".." into the non-MTP directory
+        # (exact probe from the RV4 finding, backslash form)
+        Path(
+            r"C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\.."
+            r"\Qwen3.6-35B-A3B\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        ),
+        # same effective path, forward-slash form (normpath equivalence)
+        Path(
+            "C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/../"
+            "Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        ),
+    ],
+)
+def test_mtp_identity_canonical_component_then_dotdot_into_non_mtp_fails_loudly(
+    tmp_path: Path, qwen_path: Path
+):
+    # RV4 HIGH: the raw parts scan saw the exact MTP component and accepted
+    # the path, but after collapsing the ".." segment the EFFECTIVE path is
+    # the non-MTP Qwen3.6-35B-A3B directory — identity must fail loudly.
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _b3_local_backend(
+        args, qwen_path, "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+    )
+    with pytest.raises(ValueError, match="MTP variant"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_mtp_identity_dotdot_into_mtp_directory_still_accepted(tmp_path: Path):
+    # Direction guard for the normalization: a ".." segment that resolves
+    # INTO the MTP directory keeps the effective path MTP, so the identity
+    # must still hold (the check rejects only effective NON-MTP paths).
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _b3_local_backend(
+        args,
+        Path(
+            "C:/llama-cpp/models/Qwen3.6-35B-A3B/../"
+            "Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        ),
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+    )
+    cli._validate_b3_qwen_profile(args, backend)  # no exception

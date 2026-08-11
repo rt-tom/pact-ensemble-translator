@@ -554,10 +554,22 @@ _B3_QWEN_MTP_NEGATION_MARKERS = (
 def _is_b3_qwen_mtp_identity(value: str) -> bool:
     """Exact MTP-variant identity: a path component or the file stem EQUALS
     the canonical MTP build name (case-insensitive). Substring lookalikes
-    never match."""
+    never match.
+
+    The path is NORMALIZED (dot segments collapsed) before identity
+    evaluation: a canonical MTP component followed by a ``..`` segment can
+    resolve to a NON-MTP directory (…\\Qwen3.6-35B-A3B-MTP\\..\\
+    Qwen3.6-35B-A3B\\…) while still appearing in the raw Path.parts listing
+    — identity is judged on the EFFECTIVE path, not the literal spelling
+    (RV4 HIGH). Malformed/ambiguous values fail closed (False)."""
     if not value:
         return False
-    path = Path(value)
+    try:
+        path = Path(os.path.normpath(value))
+    except (TypeError, ValueError):
+        # Malformed value (e.g. embedded null byte, invalid Windows path
+        # characters) cannot satisfy the exact MTP identity — fail closed.
+        return False
     return any(
         part.lower() == _B3_QWEN_MTP_VARIANT.lower()
         for part in path.parts
