@@ -84,7 +84,9 @@ class MemoryManager:
         book_memory_obs = obs.get('book_memory', {})
         if book_memory_obs:
             book_memory = load_json(self.book_memory_path, {})
-            if self._merge_with_conflict_resolution(book_memory, book_memory_obs):
+            if self._merge_with_conflict_resolution(
+                book_memory, book_memory_obs, book_memory=True
+            ):
                 atomic_write(self.book_memory_path, book_memory)
 
         atomic_write(self.observations_path, {'glossary': {}, 'book_memory': {}})
@@ -111,15 +113,55 @@ class MemoryManager:
             filtered[category] = kept
         return filtered
 
-    def _merge_with_conflict_resolution(self, main_mem: Dict, new_obs: Dict) -> bool:
+    def _merge_with_conflict_resolution(
+        self, main_mem: Dict, new_obs: Dict, *, book_memory: bool = False
+    ) -> bool:
         """Merge ``new_obs`` into ``main_mem``; return True if anything changed.
 
         Established/locked entries are never overwritten (conflict). An
         assignment whose value equals the existing value counts as no change
         so callers can skip the write and preserve the file's exact bytes.
+
+        BM (V4.1 §15) section-scoped book_memory observation keys are routed
+        into the sectioned ``book_memory.json`` shape instead of being stored
+        flat (``book_memory=True`` only): ``characters:<name>`` /
+        ``entities:<name>`` merge into the corresponding dict section
+        (established/locked entries inside the section are never overwritten),
+        ``facts:<id>`` appends a fact dict to the ``facts`` list (deduplicated
+        by ``fact`` text). Flat keys (no colon) keep the legacy top-level
+        contract. Glossary observations are always merged flat (no colon
+        keys by design), so glossary behaviour is unchanged.
         """
         changed = False
         for key, value in new_obs.items():
+            if book_memory and ':' in key:
+                section, _, entry_key = key.partition(':')
+                if section in ('characters', 'entities'):
+                    section_dict = main_mem.setdefault(section, {})
+                    if not isinstance(section_dict, dict):
+                        section_dict = {}
+                        main_mem[section] = section_dict
+                    existing = section_dict.get(entry_key)
+                    if isinstance(existing, dict) and existing.get('status') in ('established', 'locked'):
+                        # Conflict: do not overwrite
+                        continue
+                    if section_dict.get(entry_key) != value:
+                        section_dict[entry_key] = value
+                        changed = True
+                    continue
+                if section == 'facts':
+                    facts = main_mem.setdefault('facts', [])
+                    if not isinstance(facts, list):
+                        facts = []
+                        main_mem['facts'] = facts
+                    fact_text = value.get('fact') if isinstance(value, dict) else None
+                    if fact_text and not any(
+                        isinstance(f, dict) and f.get('fact') == fact_text
+                        for f in facts
+                    ):
+                        facts.append(value)
+                        changed = True
+                    continue
             if key in main_mem:
                 existing = main_mem[key]
                 if isinstance(existing, dict) and existing.get('status') in ('established', 'locked'):
