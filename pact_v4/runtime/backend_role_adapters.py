@@ -226,6 +226,19 @@ class BackendModelCaller:
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,
+            # AF (2026-08-10): serve 1.4.7 applies a default ~32k output
+            # budget to message bodies that carry system/tools (agentic
+            # mode), truncating whole-chapter reasoning at 32000 tokens
+            # (finish=length, empty output — 2/3 remote whole-chapter
+            # attempts). The neutral system prompt and the all-disabled
+            # tools map do not change the model answer, so the generation
+            # request omits both — the verbatim Gate 0 body
+            # (model+parts+reasoningEffort) that measured 55915 reasoning
+            # tokens with finish=stop. Generation-only: the Qwen audit /
+            # repair / formatting adapters keep the historical
+            # system+tools body. Inert for local llama-server transports
+            # (they never read the field).
+            omit_system_tools=True,
         )
 
         def _complete() -> str:

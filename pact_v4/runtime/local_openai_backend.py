@@ -205,6 +205,7 @@ class LocalOpenAIBackend:
                 ),
                 "attempt_count": attempts,
                 "request_options": dict(request.request_options),
+                "reasoning": record.reasoning if record else "",
             },
         )
         self._records.append(
