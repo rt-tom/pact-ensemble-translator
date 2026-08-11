@@ -29,16 +29,6 @@ _OWNED_SOURCE_BLOCK = re.compile(
 _PID_LINE = re.compile(r"^  (\S+): (.*)$", re.MULTILINE)
 _CANDIDATE_ID = re.compile(r"candidate_id=([^\s\)]+)")
 
-_FORMAT_PID = re.compile(r"FORMAT_PID: (\S+)")
-_FORMAT_TRANSLATION = re.compile(r"^TRANSLATION: (.*)$", re.MULTILINE)
-_FORMAT_SPANS = re.compile(r"^SOURCE_SPANS: (.*)$", re.MULTILINE)
-
-# B12 batching: a formatting prompt may carry several ``FORMAT_PID`` blocks
-# (one per PID of a chunk). Split on the block marker and parse each block
-# with the same per-PID regexes the single-PID prompt uses, so a batched
-# remote fake produces the same mappings as per-PID local calls.
-_FORMAT_BLOCK = re.compile(r"FORMAT_PID: (\S+)(.*?)(?=FORMAT_PID: |\Z)", re.S)
-
 _QWEN_PASS_VERDICT = json.dumps({
     "faithful_to_source": True,
     "completeness": True,
@@ -52,7 +42,13 @@ _NO_ISSUES = json.dumps({"issues": []})
 
 
 def _generation_response(text: str) -> str:
-    """Mirror the strict-driver ``StubModelCaller`` (digits carried through)."""
+    """Mirror the strict-driver stub generator (digits carried through).
+
+    Card C whole-chapter fixture: when the source paragraph contains the
+    emphasized word, it is kept inline in the translation (the same way the
+    local ``_PreservingModelCaller`` stub behaves), so the deterministic
+    formatting tiers resolve the span with 0 model calls on both paths.
+    """
     block = _OWNED_SOURCE_BLOCK.search(text)
     pairs: list[tuple[str, str]] = []
     if block:
@@ -65,43 +61,20 @@ def _generation_response(text: str) -> str:
         digits = "".join(ch for ch in src_text if ch.isdigit())
         digit_part = f" ({digits})" if digits else ""
         out[pid] = f"Перевод номер{index}{digit_part}"
+        if "emphasized" in src_text:
+            out[pid] = f"{out[pid]} (emphasized)"
     return json.dumps(out, ensure_ascii=False)
 
 
-def _formatting_response(text: str) -> str:
-    """Mirror the phase-5 test ``CannedFormattingCaller``.
-
-    Maps each unresolved source span to the corresponding word of the
-    translation (span i -> word i), so a local fake and this remote fake
-    produce byte-identical mappings for the same prompt. Used by the
-    dual-mode parity test (§14.3). B12: the prompt may carry several
-    ``FORMAT_PID`` blocks (one per PID of a chunk); each block is parsed
-    with the same per-PID regexes and mapped independently.
-    """
-    mappings: list[Dict[str, Any]] = []
-    for pid, body in _FORMAT_BLOCK.findall(text):
-        translation_match = _FORMAT_TRANSLATION.search(body)
-        spans_match = _FORMAT_SPANS.search(body)
-        if translation_match is None or spans_match is None:
-            continue
-        translation = translation_match.group(1)
-        spans = json.loads(spans_match.group(1))
-        words = translation.split()
-        for index, span in enumerate(spans):
-            target = words[index] if index < len(words) else ""
-            mappings.append({
-                "pid": pid, "span_id": span["span_id"],
-                "target_text": target, "occurrence": 1,
-            })
-    return json.dumps({"mappings": mappings}, ensure_ascii=False)
-
-
 def _respond_to_prompt(text: str) -> str:
-    """Return the canned assistant text for a Pact prompt."""
+    """Return the canned assistant text for a Pact prompt.
+
+    Card C: there is no Phase 5 formatting prompt family anymore — formatting
+    is model-free, so a formatting prompt would fail loudly here (defense in
+    depth against a regression to the model-fallback path).
+    """
     if "OWNED_SOURCE" in text:
         return _generation_response(text)
-    if "SOURCE_SPANS:" in text:
-        return _formatting_response(text)  # Phase 5 formatting fallback
     if "candidate_id=" in text:
         # Gemma Russian preference: prefer the first candidate id.
         match = _CANDIDATE_ID.search(text)

@@ -1,16 +1,18 @@
-"""Unit tests for the Phase 5 formatting alignment module (B3).
+"""Unit tests for the Phase 5 formatting alignment module (B3, card C).
 
-Covers the §8.14 span contract: span mapping, the exact -> occurrence-aware
--> conservative fuzzy -> model fallback tier cascade, conflicting spans,
-ambiguous occurrence falling through to the next tier, blocking integrity
-(``max_formatting_incidents``), the duplicate-occurrence / HTML / PID /
-number fixtures, the no-marker-leakage guard, and the dual-mode import guard
-(the module never references local lifecycle adapters).
+Covers the §8.14 span contract: span mapping, the preserved (already-present
+markup) -> exact -> occurrence-aware -> conservative fuzzy deterministic
+tier cascade, conflicting spans, ambiguous occurrence falling through to a
+blocking incident, blocking integrity (``max_formatting_incidents``), the
+duplicate-occurrence / HTML / PID / number fixtures, the no-marker-leakage
+guard, the model-free invariant (formatting = 0 model calls), and the
+dual-mode import guard (the module never references local lifecycle
+adapters or any transport).
 """
 from __future__ import annotations
 
 import ast
-import json
+import re
 from pathlib import Path
 
 import pytest
@@ -20,8 +22,8 @@ from pact_v4.phase0b.source_html import parse_source_html
 from pact_v4.phase5.formatting import (
     TIER_EXACT,
     TIER_FUZZY,
-    TIER_MODEL,
     TIER_OCCURRENCE,
+    TIER_PRESERVED,
     FormattingIncident,
     FormattingOutcome,
     find_nonoverlapping_occurrence,
@@ -36,39 +38,13 @@ def _blocks(html: str):
     return parse_source_html(html)
 
 
-def _align(html: str, translation, *, caller=None, max_incidents=0):
+def _align(html: str, translation, *, max_incidents=0):
     return run_formatting_align(
         blocks=_blocks(html),
         translation=translation,
-        formatting_caller=caller,
         backend_identity_hash=IDENTITY,
         max_formatting_incidents=max_incidents,
     )
-
-
-class CannedFormattingCaller:
-    """Fake ``FormattingCaller``: maps each span to a word of the translation."""
-
-    def __init__(self, *, fail: Exception | None = None,
-                 empty: bool = False, suffix: str = "") -> None:
-        self.fail = fail
-        self.empty = empty
-        self.suffix = suffix
-        self.calls: list = []
-
-    def __call__(self, *, pid, source_text, translation, spans):
-        self.calls.append((pid, translation, list(spans)))
-        if self.fail is not None:
-            raise self.fail
-        words = translation.split()
-        mappings = []
-        for index, span in enumerate(spans):
-            target = "" if self.empty else (words[index] if index < len(words) else "")
-            mappings.append({
-                "pid": pid, "span_id": span["span_id"],
-                "target_text": target + self.suffix, "occurrence": 1,
-            })
-        return json.dumps({"mappings": mappings}, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +79,269 @@ def test_find_nonoverlapping_occurrence_prefers_requested_index():
     # first free occurrence, never None while a non-overlapping one exists.
     assert find_nonoverlapping_occurrence(text, "a", preferred=3, occupied=[]) == (0, 1)
     assert find_nonoverlapping_occurrence(text, "a", preferred=3, occupied=[(0, 1)]) == (4, 5)
+
+
+# ---------------------------------------------------------------------------
+# Preserved tier (whole-chapter case: the translation already carries the
+# inline markup — card C §11 "whole-chapter перевод держит <em> 101/101")
+# ---------------------------------------------------------------------------
+
+
+def test_preserved_tier_resolves_already_wrapped_fragment():
+    # The whole-chapter translation keeps the emphasis inline: the span is
+    # already wrapped, so it resolves with 0 model calls and no re-wrap.
+    out = _align(
+        "<html><body><p>In <em>1947</em> we met.</p></body></html>",
+        {"p00001": "В <em>1947</em> году мы встретились."},
+    )
+    assert dict(out.formatted_text)["p00001"] == "В <em>1947</em> году мы встретились."
+    assert out.resolved_count == 1
+    record = out.span_mapping[0]
+    assert record.tier == TIER_PRESERVED
+    assert record.preserved is True
+    assert record.translated_text == "1947"
+    assert out.incident_count == 0
+    assert not out.blocking
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+
+
+def test_preserved_tier_does_not_double_wrap():
+    # The fragment is already wrapped in the translation — apply_span_mappings
+    # must pass it through verbatim, never wrap it a second time.
+    out = _align(
+        "<html><body><p>Go <em>now</em>.</p></body></html>",
+        {"p00001": "Иди <em>сейчас</em>."},
+    )
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted.count("<em>") == 1
+    assert formatted.count("</em>") == 1
+    assert formatted == "Иди <em>сейчас</em>."
+
+
+def test_preserved_tier_duplicate_spans_1to1_by_order():
+    # Two identical <em> spans, both already wrapped in the translation —
+    # the 1:1 order-preserving assignment resolves both.
+    out = _align(
+        "<html><body><p><em>No</em> and <em>No</em>.</p></body></html>",
+        {"p00001": "<em>Нет</em> и <em>Нет</em>."},
+    )
+    assert dict(out.formatted_text)["p00001"] == "<em>Нет</em> и <em>Нет</em>."
+    assert [r.tier for r in out.span_mapping] == [TIER_PRESERVED, TIER_PRESERVED]
+    assert [r.translated_text for r in out.span_mapping] == ["Нет", "Нет"]
+    assert out.incident_count == 0
+
+
+def test_preserved_tier_strong_tag():
+    # <strong> is part of the inline tag set and is recognized the same way.
+    out = _align(
+        "<html><body><p>It is <strong>important</strong>.</p></body></html>",
+        {"p00001": "Это <strong>важно</strong>."},
+    )
+    assert dict(out.formatted_text)["p00001"] == "Это <strong>важно</strong>."
+    assert out.span_mapping[0].tier == TIER_PRESERVED
+    assert out.incident_count == 0
+
+
+def test_preserved_tier_mixed_tags_sequence_match():
+    # em + strong in the same order as the source -> both preserved.
+    out = _align(
+        "<html><body><p><em>one</em> and <strong>two</strong>.</p></body></html>",
+        {"p00001": "<em>раз</em> и <strong>два</strong>."},
+    )
+    assert [r.tier for r in out.span_mapping] == [TIER_PRESERVED, TIER_PRESERVED]
+    assert out.incident_count == 0
+
+
+def test_preserved_tier_count_mismatch_falls_through_to_incident():
+    # The translation has an EXTRA emphasis the source does not: the count
+    # differs, so order-based preservation cannot guess which existing tag
+    # corresponds to the source span — the span falls through to the text
+    # tiers and (with no verbatim fragment) becomes a blocking incident
+    # (debt), never a guess.
+    out = _align(
+        "<html><body><p>She was <em>fair</em>, Peter.</p></body></html>",
+        {"p00001": "Она была <em>честна</em> с <em>нами</em>, Питер."},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    assert out.incidents[0].span_id == "em01"
+    assert out.blocking
+    # The translation's own markup is untouched (wrap-only: nothing claimed).
+    assert dict(out.formatted_text)["p00001"] == "Она была <em>честна</em> с <em>нами</em>, Питер."
+
+
+def test_preserved_tier_missing_tag_is_incident_not_silent():
+    # The translation DROPPED the emphasis entirely: no preserved claim, no
+    # verbatim fragment -> blocking incident (debt), never a silent loss.
+    out = _align(
+        "<html><body><p>You <em>rancid</em> cunt.</p></body></html>",
+        {"p00001": "Ты протухшая сука."},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    assert out.incidents[0].reason == "target_not_found"
+    assert out.blocking
+
+
+def test_preserved_tier_attrs_kept_in_output():
+    # The preserved tier passes the already-wrapped fragment through; the
+    # existing <a href> attribute survives untouched.
+    out = _align(
+        '<html><body><p>See <a href="http://x.example">the link</a>.</p></body></html>',
+        {"p00001": 'Смотри <a href="http://x.example">ссылку</a>.'},
+    )
+    formatted = dict(out.formatted_text)["p00001"]
+    assert '<a href="http://x.example">' in formatted
+    assert out.span_mapping[0].tier == TIER_PRESERVED
+    assert out.incident_count == 0
+
+
+def test_preserved_tier_unbalanced_translation_tag_not_claimed():
+    # A broken/unbalanced tag in the translation must not claim the span —
+    # it falls through to the text tiers and becomes a blocking incident.
+    out = _align(
+        "<html><body><p>Hello <em>world</em>.</p></body></html>",
+        {"p00001": "Привет <em>мир."},  # no closing </em>
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+
+
+def test_preserved_count_mismatch_exact_text_is_debt_no_double_wrap():
+    # Reviewer finding 1: the translation holds an EXTRA inline tag while the
+    # source span text survives verbatim inside the existing markup. The
+    # preserved tier sees a count mismatch; the span must NOT fall through to
+    # the exact tier (which would claim the verbatim fragment inside the
+    # existing markup and add a second wrap with incident_count=0). It is
+    # blocking debt, and the translation's own markup stays untouched.
+    out = _align(
+        "<html><body><p><em>world</em></p></body></html>",
+        {"p00001": "<em>world</em> <em>x</em>"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    incident = out.incidents[0]
+    assert incident.reason == "preserved_tag_mismatch"
+    assert incident.tier == TIER_PRESERVED
+    assert incident.required
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<em>world</em> <em>x</em>", (
+        "no double wrap: the translation's existing markup is never claimed "
+        f"or re-wrapped, got {formatted!r}"
+    )
+    assert "<em><em>" not in formatted
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+
+
+def test_preserved_order_mismatch_exact_text_is_debt_no_double_wrap():
+    # Reviewer finding 1 (order mismatch): same tag count but the translation
+    # REORDERED the emphasis (strong before em). The preserved tier's
+    # order-based 1:1 cannot apply; the spans must NOT fall through to exact
+    # (which would double-wrap the verbatim fragments) — blocking debt, no
+    # re-wrap.
+    out = _align(
+        "<html><body><p><em>world</em> <strong>good</strong></p></body></html>",
+        {"p00001": "<strong>world</strong> <em>good</em>"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 2
+    assert {i.reason for i in out.incidents} == {"preserved_tag_mismatch"}
+    assert all(i.tier == TIER_PRESERVED for i in out.incidents)
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<strong>world</strong> <em>good</em>", (
+        "no double wrap on order mismatch, got {formatted!r}"
+    )
+    assert "<strong><em>" not in formatted
+    assert "<em><strong>" not in formatted
+    assert out.model_call_count == 0
+
+
+def test_preserved_unbalanced_tag_amid_matching_sequence_is_debt():
+    # Unbalanced edge: one tag is balanced and matches the source, but the
+    # translation also carries an unbalanced tag. The unbalanced tag must not
+    # be claimed and must not silently drop out of the sequence comparison —
+    # the count still mismatches (source 2 spans vs 1 balanced + 1 broken
+    # tag), so both spans are blocking debt with no claim.
+    out = _align(
+        "<html><body><p><em>world</em> <strong>good</strong></p></body></html>",
+        {"p00001": "<em>мир</em> <strong>важно"},  # second tag unbalanced
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 2
+    assert {i.reason for i in out.incidents} == {"preserved_tag_mismatch"}
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<em>мир</em> <strong>важно", (
+        "translation's own markup untouched, got {formatted!r}"
+    )
+    assert out.model_call_count == 0
+
+
+def test_preserved_unclosed_open_tag_is_mismatch_not_double_wrap():
+    # RV2 finding (HIGH): source <em>world</em> + translation <em>world
+    # (unclosed opening tag). The old scanner saw the open <em>, found no
+    # closing tag, and silently dropped it — the PID looked "tag-free", the
+    # exact tier claimed the verbatim "world", and the output became
+    # <em><em>world</em> (double wrap) with incident_count == 0. The
+    # unclosed tag is malformed markup: it must be blocking
+    # preserved_tag_mismatch debt, never claimed, never re-wrapped.
+    out = _align(
+        "<html><body><p><em>world</em></p></body></html>",
+        {"p00001": "<em>world"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    incident = out.incidents[0]
+    assert incident.reason == "preserved_tag_mismatch"
+    assert incident.tier == TIER_PRESERVED
+    assert incident.required
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "<em>world", (
+        "translation's own (broken) markup untouched, got {formatted!r}"
+    )
+    assert "<em><em>" not in formatted
+    assert formatted.count("<em>") == 1
+    assert formatted.count("</em>") == 0, (
+        "no generated closing tag may be added, got {formatted!r}"
+    )
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+
+
+def test_preserved_orphan_close_tag_is_mismatch_no_extra_close():
+    # RV2 finding (HIGH): source <em>world</em> + translation world</em>
+    # (orphan closing tag). The old scanner only looked for opening tags,
+    # never saw the orphan </em>, treated the PID as "tag-free", and the
+    # exact tier added its own wrap: <em>world</em></em> — an extra
+    # generated closing tag — with incident_count == 0. The orphan close is
+    # malformed markup: blocking preserved_tag_mismatch debt, translation
+    # untouched, no generated close.
+    out = _align(
+        "<html><body><p><em>world</em></p></body></html>",
+        {"p00001": "world</em>"},
+    )
+    assert out.resolved_count == 0
+    assert out.incident_count == 1
+    incident = out.incidents[0]
+    assert incident.reason == "preserved_tag_mismatch"
+    assert incident.tier == TIER_PRESERVED
+    assert incident.required
+    assert out.blocking
+    formatted = dict(out.formatted_text)["p00001"]
+    assert formatted == "world</em>", (
+        "translation's own (broken) markup untouched, got {formatted!r}"
+    )
+    assert formatted.count("<em>") == 0
+    assert formatted.count("</em>") == 1, (
+        "no extra generated closing tag may appear, got {formatted!r}"
+    )
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -141,18 +380,10 @@ def test_occurrence_aware_duplicate_1to1():
     assert out.incident_count == 0
 
 
-def test_ambiguous_occurrence_falls_through_to_model():
+def test_ambiguous_occurrence_is_blocking_incident():
     # One emphasised "No" but the translation says "No" twice: which one is
-    # the emphasised one is ambiguous, so the span must reach the model tier.
-    caller = CannedFormattingCaller()
-    out = _align("<html><body><p>Go. <em>No</em>. Really.</p></body></html>",
-                 {"p00001": "No and No."}, caller=caller)
-    assert caller.calls, "the ambiguous span reached the model fallback"
-    assert out.span_mapping[0].tier == TIER_MODEL
-    assert out.incident_count == 0
-
-
-def test_ambiguous_occurrence_without_caller_is_blocking_incident():
+    # the emphasised one is ambiguous, so the span is a blocking incident
+    # (debt) — never a guess (card C: there is no model tier to consult).
     out = _align("<html><body><p>Go. <em>No</em>. Really.</p></body></html>",
                  {"p00001": "No and No."})
     assert out.incident_count == 1
@@ -162,23 +393,18 @@ def test_ambiguous_occurrence_without_caller_is_blocking_incident():
     assert out.blocking  # default max_formatting_incidents=0
 
 
-def test_conflicting_spans_fall_through_to_next_tier():
+def test_conflicting_spans_fall_through_to_incident():
     # <em>one two</em> claims [0,7); <strong>one</strong> would overlap it, so
-    # it must NOT resolve at the exact tier — it falls through to the model
-    # fallback. The model's canned fragment ("one") also overlaps the claimed
-    # range, so it honestly becomes an incident instead of double-wrapping.
-    caller = CannedFormattingCaller()
+    # it must NOT resolve at the exact tier — with no model tier, it becomes
+    # a blocking incident instead of double-wrapping.
     out = _align(
         "<html><body><p><em>one two</em> <strong>one</strong></p></body></html>",
-        {"p00001": "one two"}, caller=caller,
+        {"p00001": "one two"},
     )
     tiers = {r.span_id: r.tier for r in out.span_mapping}
     assert tiers["em01"] == TIER_EXACT
     assert "strong01" not in tiers, "the overlapping span never resolved deterministically"
-    assert any(
-        i.span_id == "strong01" and i.tier == TIER_MODEL
-        for i in out.incidents
-    )
+    assert any(i.span_id == "strong01" for i in out.incidents)
 
 
 def test_fuzzy_tier_hyphen_space_tolerance():
@@ -206,77 +432,32 @@ def test_fuzzy_tier_never_guesses_arbitrary_edit():
 
 
 # ---------------------------------------------------------------------------
-# Model fallback tier
+# Model-free invariant (card C: formatting = 0 model calls)
 # ---------------------------------------------------------------------------
 
 
-def test_model_fallback_restores_span():
-    caller = CannedFormattingCaller()
-    out = _align("<html><body><p>Hello <em>world</em>.</p></body></html>",
-                 {"p00001": "Привет мир."}, caller=caller)
-    assert dict(out.formatted_text)["p00001"] == "<em>Привет</em> мир."
-    assert out.span_mapping[0].tier == TIER_MODEL
-    assert out.model_fallback_count == 1
-    assert out.incident_count == 0
+def test_outcome_carries_zero_model_counts():
+    out = _align("<html><body><p>In <em>1947</em> we met.</p></body></html>",
+                 {"p00001": "В 1947 году мы встретились."})
+    assert out.model_fallback_count == 0
+    assert out.model_call_count == 0
+    payload = out.to_payload()
+    assert payload["model_fallback_count"] == 0
+    assert payload["model_call_count"] == 0
 
 
-def test_model_fallback_transport_failure_is_debt_not_verdict():
-    caller = CannedFormattingCaller(fail=RuntimeError("network down"))
-    out = _align("<html><body><p>Hello <em>world</em>.</p></body></html>",
-                 {"p00001": "Привет мир."}, caller=caller)
-    assert out.resolved_count == 0
-    assert out.incident_count == 1
-    incident = out.incidents[0]
-    assert incident.reason == "transport_error"
-    assert incident.tier == TIER_MODEL
-    # Blocking incident (default limit 0) but structurally valid PID map:
-    # the terminal policy downgrades to accepted_degraded, never `failed`
-    # from transport alone. The formatted text is still the verbatim input
-    # (B14: wrap-only, no entity escaping).
-    assert out.blocking
-    assert dict(out.formatted_text)["p00001"] == "Привет мир."
-
-
-def test_model_fallback_invalid_structured_output_is_incident():
-    class Truncated(CannedFormattingCaller):
-        def __call__(self, **kwargs):
-            return '{"mappings": [{"pid": "p00001", "span_id": "em01", "target_text": "П'
-    out = _align("<html><body><p>Hello <em>world</em>.</p></body></html>",
-                 {"p00001": "Привет мир."}, caller=Truncated())
-    assert out.resolved_count == 0
-    assert out.incident_count == 1
-    assert out.incidents[0].reason == "transport_error"
-
-
-def test_model_fallback_missing_mapping_is_incident():
-    class UnknownSpan(CannedFormattingCaller):
-        def __call__(self, **kwargs):
-            return json.dumps({"mappings": [{"pid": "p00001", "span_id": "nope",
-                                             "target_text": "Привет", "occurrence": 1}]})
-    out = _align("<html><body><p>Hello <em>world</em>.</p></body></html>",
-                 {"p00001": "Привет мир."}, caller=UnknownSpan())
-    assert out.resolved_count == 0
-    assert out.incidents[0].reason == "missing_mapping"
-
-
-def test_model_fallback_target_not_found_is_incident():
-    class BadFragment(CannedFormattingCaller):
-        def __call__(self, **kwargs):
-            return json.dumps({"mappings": [{"pid": "p00001", "span_id": "em01",
-                                             "target_text": "не существует",
-                                             "occurrence": 1}]})
-    out = _align("<html><body><p>Hello <em>world</em>.</p></body></html>",
-                 {"p00001": "Привет мир."}, caller=BadFragment())
-    assert out.resolved_count == 0
-    assert out.incidents[0].reason == "target_not_found"
-
-
-def test_model_fallback_explicit_empty_verdict_is_incident():
-    caller = CannedFormattingCaller(empty=True)
-    out = _align("<html><body><p>Hello <em>world</em>.</p></body></html>",
-                 {"p00001": "Привет мир."}, caller=caller)
-    assert out.resolved_count == 0
-    assert out.incidents[0].reason == "target_not_found"
+def test_no_formatting_caller_symbol_exists():
+    # Card C removed the model-fallback path: the module must not expose a
+    # FormattingCaller protocol or a model tier anymore.
+    import pact_v4.phase5.formatting as fmt
+    assert not hasattr(fmt, "FormattingCaller")
+    assert not hasattr(fmt, "TIER_MODEL")
+    assert "formatting_caller" not in dir(fmt)
+    # run_formatting_align must not accept a caller parameter.
+    import inspect
+    params = inspect.signature(fmt.run_formatting_align).parameters
+    assert "formatting_caller" not in params
+    assert "pid_batches" not in params
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +502,10 @@ def test_outcome_payload_carries_provenance_and_backend_identity():
 
 def test_html_attrs_preserved_in_output():
     out = _align(
-        '<html><body><p>See <a href="http://x.example">the <em>link</em></a>.</p></body></html>',
-        {"p00001": "Смотри ссылку."},
-        caller=CannedFormattingCaller(),
+        '<html><body><p>See <a href="http://x.example">the link</a> and <em>it</em>.</p></body></html>',
+        {"p00001": "See the link and it."},
     )
-    # Both spans restored; the <a> keeps its href attribute.
+    # Both spans restore; the <a> keeps its href attribute.
     assert '<a href="http://x.example">' in dict(out.formatted_text)["p00001"]
     assert "<em>" in dict(out.formatted_text)["p00001"]
     assert out.resolved_count == 2
@@ -364,11 +544,9 @@ def test_formatted_text_preserves_pid_map():
 
 
 def test_no_marker_leakage_in_formatted_text():
-    import re
     out = _align(
         "<html><body><p>Hello <em>world</em> and <em>world</em>.</p></body></html>",
         {"p00001": "Привет мир и мир."},
-        caller=CannedFormattingCaller(empty=True),
     )
     for pid, text in out.formatted_text:
         assert not re.search(r"\[\[FMT_|@@FMT|%%FMT|<<FMT", text), pid
@@ -383,9 +561,8 @@ def test_numbers_fixture_preserved():
     )
     formatted = dict(out.formatted_text)["p00001"]
     assert "<em>1947</em>" in formatted
-    # The untranslatable "it" reached the model tier, so a caller is needed
-    # for a clean outcome; without one it is a blocking incident, never a
-    # marker.
+    # The untranslatable "it" has no deterministic fragment -> a blocking
+    # incident (debt), never a marker.
     assert "1947" in formatted
 
 
@@ -406,7 +583,7 @@ def test_strip_inline_markup_removes_only_inline_tags():
 # ---------------------------------------------------------------------------
 
 
-def test_formatting_module_does_not_import_local_lifecycle():
+def test_formatting_module_does_not_import_local_lifecycle_or_transport():
     path = Path("pact_v4/phase5/formatting.py")
     tree = ast.parse(path.read_text(encoding="utf-8"))
     imports: list[str] = []
@@ -419,6 +596,8 @@ def test_formatting_module_does_not_import_local_lifecycle():
         "pact_v4.runtime.model_lifecycle",
         "pact_v4.runtime.model_lifecycle_adapters",
         "pact_v4.runtime.backend_role_adapters",
+        "pact_v4.runtime.prompts_runtime",
+        "pact_v4.runtime.opencode_backend",
     ]
     for mod in imports:
         assert not any(mod.startswith(f) for f in forbidden), (
@@ -440,191 +619,67 @@ def test_run_formatting_align_rejects_pid_drop_at_repair_layer():
 
 
 # ---------------------------------------------------------------------------
-# B12: batched model-fallback tier (one call per pid_batches group)
+# Whole-chapter acceptance (card C §11): a translation that already holds the
+# emphasis resolves with 0 unresolved spans and 0 model calls
 # ---------------------------------------------------------------------------
 
 
-class BatchFormattingCaller(CannedFormattingCaller):
-    """``CannedFormattingCaller`` with a ``batch`` method.
-
-    The batched call maps every PID's spans with the same per-PID word
-    mapping as the per-PID ``__call__``, so the batched path and the
-    per-PID path produce identical span_mapping/incidents on the same
-    chapter — only the number of model calls differs.
-    """
-
-    def __init__(self, *, fail: Exception | None = None, empty: bool = False):
-        super().__init__(fail=fail, empty=empty)
-        self.batch_calls: list = []
-
-    def batch(self, items):
-        self.batch_calls.append([dict(item) for item in items])
-        if self.fail is not None:
-            raise self.fail
-        mappings = []
-        for item in items:
-            words = item["translation"].split()
-            for index, span in enumerate(item["spans"]):
-                target = "" if self.empty else (
-                    words[index] if index < len(words) else ""
-                )
-                mappings.append({
-                    "pid": item["pid"], "span_id": span["span_id"],
-                    "target_text": target + self.suffix, "occurrence": 1,
-                })
-        return json.dumps({"mappings": mappings}, ensure_ascii=False)
-
-
-def test_batch_call_groups_pids_into_one_call():
-    # Two PIDs with unresolved spans in ONE batch -> exactly one model call
-    # for the group; model_fallback_count still counts PIDs, model_call_count
-    # counts actual calls.
-    blocks = _blocks(
+def test_whole_chapter_translation_resolves_all_spans_model_free():
+    # Acceptance (V4_1_AUDIT_B1_RU.md §11): formatting on chapter 0001 with
+    # the whole-chapter translation (which holds <em> inline) -> 0 unresolved
+    # spans, 0 model calls. The preserved tier resolves every already-wrapped
+    # span; no span needs a model.
+    html = (
         "<html><body>"
-        "<p>Hello <em>world</em> one.</p>"
-        "<p>Hello <em>world</em> two.</p>"
+        "<p>My lingering <em>impressions</em> were banished.</p>"
+        "<p>He said <em>no</em>, firmly.</p>"
+        "<p>It is <strong>very</strong> cold.</p>"
+        "<p>Plain paragraph without markup.</p>"
         "</body></html>"
     )
-    pid0, pid1 = blocks[0].pid, blocks[1].pid
-    caller = BatchFormattingCaller()
+    blocks = _blocks(html)
+    translation = {
+        blocks[0].pid: "Мои затянувшиеся <em>впечатления</em> развеялись.",
+        blocks[1].pid: "Он твёрдо сказал <em>нет</em>.",
+        blocks[2].pid: "Очень <strong>холодно</strong>.",
+        blocks[3].pid: "Обычный абзац без разметки.",
+    }
     out = run_formatting_align(
-        blocks=blocks,
-        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
-        formatting_caller=caller,
+        blocks=blocks, translation=translation,
         backend_identity_hash=IDENTITY,
-        pid_batches=[[pid0, pid1]],
     )
-    assert len(caller.batch_calls) == 1
-    assert len(caller.batch_calls[0]) == 2
-    assert len(caller.calls) == 0  # no per-PID calls when batching is active
-    assert out.resolved_count == 2
+    assert out.resolved_count == 3
     assert out.incident_count == 0
-    assert out.model_fallback_count == 2  # PIDs needing the model tier
-    assert out.model_call_count == 1  # one batched call
-    assert "<em>Привет</em> мир один." in dict(out.formatted_text)[pid0]
+    assert not out.blocking
+    assert out.model_call_count == 0
+    assert out.model_fallback_count == 0
+    # The restored text is exactly the already-marked translation (no
+    # double-wrap, no re-location drift).
+    for pid, expected in translation.items():
+        assert dict(out.formatted_text)[pid] == expected
 
 
-def test_batch_call_splits_by_pid_batches():
-    # Two separate batches -> two model calls, same resolution as per-PID.
+def test_whole_chapter_translation_with_debt_reports_incidents():
+    # A whole-chapter translation that DROPPED one emphasis cannot be
+    # restored without guessing: the span becomes a blocking incident (debt),
+    # never a silent loss — "0 model calls" alone is not success.
     blocks = _blocks(
-        "<html><body>"
-        "<p>Hello <em>world</em> one.</p>"
-        "<p>Hello <em>world</em> two.</p>"
-        "</body></html>"
+        "<html><body><p>You <em>rancid</em> cunt.</p>"
+        "<p>Go <em>now</em>.</p></body></html>"
     )
-    pid0, pid1 = blocks[0].pid, blocks[1].pid
-    caller = BatchFormattingCaller()
+    translation = {
+        blocks[0].pid: "Ты протухшая сука.",  # emphasis dropped
+        blocks[1].pid: "Иди <em>сейчас</em>.",
+    }
     out = run_formatting_align(
-        blocks=blocks,
-        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
-        formatting_caller=caller,
-        backend_identity_hash=IDENTITY,
-        pid_batches=[[pid0], [pid1]],
-    )
-    assert len(caller.batch_calls) == 2
-    assert out.resolved_count == 2
-    assert out.model_fallback_count == 2
-    assert out.model_call_count == 2
-
-
-def test_batch_call_matches_per_pid_path_on_identical_mappings():
-    # Batched and per-PID callers resolving identically must produce the same
-    # span_mapping/incidents — only the transport differs (B12 contract).
-    blocks = _blocks(
-        "<html><body>"
-        "<p>Hello <em>world</em> one.</p>"
-        "<p>Hello <em>world</em> two.</p>"
-        "</body></html>"
-    )
-    pid0, pid1 = blocks[0].pid, blocks[1].pid
-    translation = {pid0: "Привет мир один.", pid1: "Привет мир два."}
-    per_pid = run_formatting_align(
         blocks=blocks, translation=translation,
-        formatting_caller=CannedFormattingCaller(),
         backend_identity_hash=IDENTITY,
     )
-    batched = run_formatting_align(
-        blocks=blocks, translation=translation,
-        formatting_caller=BatchFormattingCaller(),
-        backend_identity_hash=IDENTITY,
-        pid_batches=[[pid0, pid1]],
-    )
-    assert batched.span_mapping == per_pid.span_mapping
-    assert batched.incidents == per_pid.incidents
-    assert batched.formatted_text == per_pid.formatted_text
-    assert batched.model_fallback_count == per_pid.model_fallback_count == 2
-    assert batched.model_call_count == 1
-    assert per_pid.model_call_count == 2
-
-
-def test_batch_call_transport_failure_is_debt_for_all_spans():
-    # A batched transport failure marks every span of the batch as
-    # transport_error debt (never a semantic verdict), and the formatted text
-    # stays the verbatim input (B14: wrap-only, no entity escaping).
-    blocks = _blocks(
-        "<html><body>"
-        "<p>Hello <em>world</em> one.</p>"
-        "<p>Hello <em>world</em> two.</p>"
-        "</body></html>"
-    )
-    pid0, pid1 = blocks[0].pid, blocks[1].pid
-    out = run_formatting_align(
-        blocks=blocks,
-        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
-        formatting_caller=BatchFormattingCaller(fail=RuntimeError("network down")),
-        backend_identity_hash=IDENTITY,
-        pid_batches=[[pid0, pid1]],
-    )
-    assert out.resolved_count == 0
-    assert out.incident_count == 2
-    assert {i.reason for i in out.incidents} == {"transport_error"}
-    assert {i.tier for i in out.incidents} == {TIER_MODEL}
-    assert out.model_call_count == 1
-    assert dict(out.formatted_text)[pid0] == "Привет мир один."
-
-
-def test_pid_outside_batches_falls_back_to_per_pid_call():
-    # A PID not covered by any pid_batches group keeps the per-PID path even
-    # when the caller supports batch.
-    blocks = _blocks(
-        "<html><body>"
-        "<p>Hello <em>world</em> one.</p>"
-        "<p>Hello <em>world</em> two.</p>"
-        "</body></html>"
-    )
-    pid0, pid1 = blocks[0].pid, blocks[1].pid
-    caller = BatchFormattingCaller()
-    out = run_formatting_align(
-        blocks=blocks,
-        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
-        formatting_caller=caller,
-        backend_identity_hash=IDENTITY,
-        pid_batches=[[pid0]],  # pid1 is outside the batch
-    )
-    assert len(caller.batch_calls) == 1
-    assert len(caller.calls) == 1  # pid1 via per-PID call
-    assert out.resolved_count == 2
-    assert out.model_call_count == 2
-
-
-def test_model_call_count_in_payload():
-    blocks = _blocks(
-        "<html><body>"
-        "<p>Hello <em>world</em> one.</p>"
-        "<p>Hello <em>world</em> two.</p>"
-        "</body></html>"
-    )
-    pid0, pid1 = blocks[0].pid, blocks[1].pid
-    out = run_formatting_align(
-        blocks=blocks,
-        translation={pid0: "Привет мир один.", pid1: "Привет мир два."},
-        formatting_caller=BatchFormattingCaller(),
-        backend_identity_hash=IDENTITY,
-        pid_batches=[[pid0, pid1]],
-    )
-    payload = out.to_payload()
-    assert payload["model_fallback_count"] == 2
-    assert payload["model_call_count"] == 1
+    assert out.resolved_count == 1          # <em>сейчас</em> preserved
+    assert out.incident_count == 1          # dropped emphasis -> debt
+    assert out.blocking
+    assert out.model_call_count == 0
+    assert out.incidents[0].span_id == "em01"
 
 
 # ---------------------------------------------------------------------------

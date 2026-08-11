@@ -43,7 +43,6 @@ from pact_v4.runtime.runtime_config import (
     LocalLlamaBackendConfig,
     LocalRoutingBackend,
     OpenCodeBackendConfig,
-    build_formatting_adapters,
     build_repair_adapters,
     build_role_adapters,
     build_role_backend,
@@ -258,18 +257,13 @@ def test_build_repair_adapters_retry_defaults_to_json_retry_policy():
     runtime.close()
 
 
-def test_build_formatting_adapters_returns_backend_caller_over_remote():
-    # Phase 5 formatting adapters (B3) are Backend adapters over the same
-    # coordinator backend — the model-fallback tier never uses a local
-    # lifecycle adapter (dual-mode rule).
-    from pact_v4.runtime.backend_role_adapters import BackendFormattingCaller
-
-    cfg = _remote_cfg()
-    runtime = cfg.build_runtime(log_dir=Path("C:/fake/logs"))
-    (formatting_caller,) = build_formatting_adapters(cfg, runtime)
-    assert isinstance(formatting_caller, BackendFormattingCaller)
-    assert formatting_caller.backend is runtime.backend
-    runtime.close()
+def test_no_formatting_adapters_builder_exists():
+    # Card C removed the Phase 5 formatting adapters entirely: formatting is
+    # model-free, so there is no formatting caller to build.
+    import pact_v4.runtime.runtime_config as rc
+    assert not hasattr(rc, "build_formatting_adapters")
+    from pact_v4.runtime import backend_role_adapters as bra
+    assert not hasattr(bra, "BackendFormattingCaller")
 
 
 # ---------------------------------------------------------------------------

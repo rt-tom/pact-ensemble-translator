@@ -9,7 +9,6 @@ provenance rather than silently changing review behaviour.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -678,38 +677,9 @@ REGION_FIDELITY_GATE_BATCH_V1 = ReviewerPrompt(
 )
 
 
-# Phase 5 formatting alignment (§8.14 span contract). The model is asked to
-# map a PID's unresolved source inline spans to exact substrings of the
-# Russian translation, with a 1-based occurrence index. Output parsing /
-# substring verification lives in ``pact_v4.phase5.formatting``; this is the
-# transport-facing template the ``BackendFormattingCaller`` renders.
-FORMAT_SPANS_V1 = ReviewerPrompt(
-    role="formatting_align",
-    version="pact-v4-formatting-align/v1",
-    instructions=(
-        "You restore inline formatting in a Russian translation of English "
-        "fiction. You are given one source paragraph, the inline spans that "
-        "were emphasized in the source, and the Russian translation of that "
-        "paragraph. For each SOURCE_SPAN find the exact continuous substring "
-        "of TRANSLATION that carries the same emphasis; target_text must "
-        "appear verbatim in the translation. For several identical spans "
-        "choose different occurrences in order. If no fragment genuinely "
-        "corresponds to a span, use an empty target_text for it (do not "
-        "invent a fragment). Return STRICT JSON, no markdown fences, no "
-        "commentary, with exactly this schema:\n"
-        "  mappings: array of objects, each with:\n"
-        "    pid: string (the given PID)\n"
-        "    span_id: string (the span's id)\n"
-        "    target_text: string (a substring of the translation, or '' if "
-        "none)\n"
-        "    occurrence: integer (1-based occurrence index in the "
-        "translation)\n"
-        "Do not include any other keys."
-    ),
-)
-
-
-# --- Render helpers --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Render helpers
+# ---------------------------------------------------------------------------
 
 
 def render_qwen_review_prompt(
@@ -888,59 +858,6 @@ def render_region_fidelity_gate_batch_prompt(
             f"SOURCE (PID -> English text):\n  {region.pid}: {item['source_text']}\n\n"
             f"REPAIRED TRANSLATION (same PID):\n  {region.pid}: {item['repaired_text']}\n\n"
             f"REGION (the located repaired span):\n  {region_line}\n"
-        )
-    return f"{template.instructions}\n\n" + "\n\n".join(blocks)
-
-
-def render_formatting_prompt(
-    *,
-    pid: str,
-    source_text: str,
-    translation: str,
-    spans: list[dict[str, Any]],
-    template: ReviewerPrompt = FORMAT_SPANS_V1,
-) -> str:
-    """Render the Phase 5 span-mapping request as one user message.
-
-    ``spans`` is the serialized list of unresolved source spans
-    (``span_id``/``tag``/``text``/``occurrence``/``attrs``) for one PID, and
-    ``translation`` is that PID's Russian text. The block structure is
-    deliberately flat and unambiguous so the transport-facing fake servers
-    and the formatting module agree on one render for every profile.
-    """
-    spans_json = json.dumps(list(spans), ensure_ascii=False)
-    return (
-        f"{template.instructions}\n\n"
-        f"FORMAT_PID: {pid}\n"
-        f"SOURCE: {source_text}\n"
-        f"SOURCE_SPANS: {spans_json}\n"
-        f"TRANSLATION: {translation}\n"
-    )
-
-
-def render_formatting_prompt_batch(
-    *,
-    items: list[dict[str, Any]],
-    template: ReviewerPrompt = FORMAT_SPANS_V1,
-) -> str:
-    """Render a multi-PID Phase 5 span-mapping request as one user message.
-
-    B12 batching: ``items`` is a list of per-PID payloads
-    (``pid``/``source_text``/``translation``/``spans``), each rendered as the
-    same flat ``FORMAT_PID`` block the single-PID renderer produces, so the
-    model maps all PIDs of the batch in one call and the response's
-    ``{"mappings": [{"pid", "span_id", "target_text", "occurrence"}]}``
-    carries the pid per entry. The fake servers reuse the same per-PID
-    parsing on every block, keeping local/remote parity.
-    """
-    blocks = []
-    for item in items:
-        spans_json = json.dumps(list(item["spans"]), ensure_ascii=False)
-        blocks.append(
-            f"FORMAT_PID: {item['pid']}\n"
-            f"SOURCE: {item['source_text']}\n"
-            f"SOURCE_SPANS: {spans_json}\n"
-            f"TRANSLATION: {item['translation']}\n"
         )
     return f"{template.instructions}\n\n" + "\n\n".join(blocks)
 

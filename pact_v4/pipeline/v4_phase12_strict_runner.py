@@ -2275,7 +2275,6 @@ def run_chapter_strict(
     qwen_audit_evaluator: Any,
     gemma_audit_evaluator: Any,
     repair_adapters: Optional[Sequence[Any]] = None,
-    formatting_adapters: Optional[Sequence[Any]] = None,
     b3_audit_repair: Optional[Any] = None,
     now: Optional[Any] = None,
     progress: Optional[Any] = None,
@@ -2318,13 +2317,16 @@ def run_chapter_strict(
     recorded as ``skipped`` (e.g. test stubs that only cover Phase 1-2 + Step
     6).
 
-    Phase 5 formatting (B3) runs between Step 7 convergence and Step 8 when
-    ``formatting_adapters`` (``(formatting_caller,)``, built by
-    ``pact_v4.runtime.runtime_config.build_formatting_adapters``) is also
-    provided. Its model-fallback tier goes through ``BackendFormattingCaller``
-    over the coordinator ``CompletionBackend`` — never a local lifecycle
-    adapter. The formatted text is what the Step 8 integrity check and the
-    terminal transition see.
+    Phase 5 formatting (B3, card C) runs between Step 7 convergence and
+    Step 8 when ``cfg.formatting_required`` is set. It is **model-free by
+    rule** ("formatting = 0 model calls"): the deterministic tiers
+    (``preserved`` / ``exact`` / ``occurrence_aware`` / ``fuzzy``) locate the
+    source inline spans in the repaired text — including the whole-chapter
+    case where the translation already carries the inline markup (the
+    ``preserved`` tier). There is no injected ``FormattingCaller``; a span
+    the deterministic tiers cannot locate becomes a blocking
+    ``FormattingIncident`` (debt), never a model call. The formatted text is
+    what the Step 8 integrity check and the terminal transition see.
 
     V4.1 B3 (concept §10 B3): in whole-chapter mode, when ``cfg.run_audit``
     AND ``b3_audit_repair`` (``pact_v4.pipeline.b3_audit_repair.B3AuditRepair``)
@@ -3067,32 +3069,27 @@ def run_chapter_strict(
         # was skipped) decides the final translations.json write below.
         repair_phase_result: Optional[RepairPhaseResult] = None
         if repair_adapters is not None and phase4_inputs is not None:
-            # Phase 5 formatting (B3): build the formatting step over the source
-            # blocks + the injected formatting caller (a Backend adapter over the
-            # coordinator CompletionBackend), so the model-fallback tier runs
-            # through the backend boundary in local/remote/composite profiles
-            # alike — never a local lifecycle adapter. Applied between Step 7
-            # convergence and Step 8 inside run_repair_phase.
+            # Phase 5 formatting (B3, card C): build the formatting step over
+            # the source blocks. Formatting is model-free by rule — there is
+            # no injected caller, only the deterministic tiers (preserved /
+            # exact / occurrence_aware / fuzzy). A span they cannot locate
+            # becomes a blocking incident (debt), never a model call. Applied
+            # between Step 7 convergence and Step 8 inside
+            # run_repair_phase.
             #
             # ``cfg.formatting_required`` is the runtime master switch (§6.1
-            # ``formatting.required=true``): even when formatting adapters are
-            # configured, the step is skipped entirely when the policy says
-            # formatting is not required — adapters alone never trigger it.
+            # ``formatting.required=true``): when the policy says formatting
+            # is not required, the step is skipped entirely.
             formatting_step = None
-            if formatting_adapters is not None and cfg.formatting_required:
-                formatting_caller = formatting_adapters[0]
+            if cfg.formatting_required:
 
                 def _formatting_step(*, translation):
                     return run_formatting_align(
                         blocks=blocks,
                         translation=translation,
-                        formatting_caller=formatting_caller,
                         backend_identity_hash=cfg.backend.identity_hash,
                         policy_version=cfg.formatting_policy_version,
                         max_formatting_incidents=cfg.max_formatting_incidents,
-                        pid_batches=[
-                            tuple(chunk.pids) for chunk in chunk_plan.chunks
-                        ],
                     )
 
                 formatting_step = _formatting_step
