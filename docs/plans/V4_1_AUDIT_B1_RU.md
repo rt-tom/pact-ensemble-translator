@@ -593,6 +593,64 @@ B3 ──→ owner-run валидация на новых главах
 
 В audit_v4.ps1 пример `Blake's bike / vehicle = motorcycle, evidence p00007` (строки ~469/484) **зашит в промпт** — Qwen ссылалась на него в reasoning и после этого репортила p00097/p00098. Текущий результат доказывает только «применение подсказки», не «извлечение». **Пример в промпте заменить на нейтральный (не из Pact-главы 0001); контекст — только через `-EntityContext`.**
 
+### 9.5. Результаты owner-run B1.3 (2026-08-10) и DECISION GATE
+
+> Прогоны: шаг 2 (A/B главы 0001, run_006 перевод, 3 конфига × 8 чанков, Qwen R8192) + шаг 3 (8 кейсов §9.1). Артефакты: `_b13_out_real/` (ab_real.json, metrics_real.json, cases_summary.json). Прогоны выполнил владелец (правило 2026-08-06).
+
+#### 9.5.1. A/B главы 0001 — пересчитанные метрики
+
+**ВАЖНО (обнаружено при разборе):** gold-список в b13_ab.py зашит из dev-перевода (run_reasoning3_selection), а A/B гоняется на run_006, где Gemma перевела p00236 правильно («байком»), а ошибку сделала в p00097 («Велосипед?»). Поэтому `metrics_real.json` (recall 0.0/0.125) **невалиден** — метрики пересчитаны вручную по фактическим TP run_006 (разбор ревьюера + source-сверка).
+
+| TP run_006 | none | gold | auto |
+|---|---|---|---|
+| p00016 (lingering→мимолётные) | ✅ | ❌ | ❌ |
+| p00035 (preoccupied→поглощена собой) | ❌ | ✅ | ✅ |
+| p00097 (bike→велосипед, long-range) | ✅ | ✅ | ✅ |
+| p00239 (well after dark→за полночь) | ✅ | ✅ | ✅ |
+| p00240 (23:50→00:12) | ❌ | ✅ | ✅ |
+| p00322 (view→сузились) | ✅ | ❌ | ❌ |
+| p00383 (surrounded→прицел) | ✅ | ✅ | ✅ |
+| p00388 (eye contact→перед собой) | ✅ | ✅ | ✅ |
+| p00394+p00397 (следующая, gender) | ✅ | ✅ | ✅ |
+| **Recall (из 10)** | **8/10** | **8/10** | **8/10** |
+
+Negative rejection: none 0.5 (p00075/p00136/p00184) · gold 0.5 · **auto 0.667** (только p00106/p00136 — лучший).
+
+**Вывод A/B:** recall одинаковый (8/10), но entity-context МЕНЯЕТ профиль ошибок, а не просто добавляет: помогает на p00035/p00240 (без контекста пропущены), мешает на p00016/p00322 (с контекстом потеряны). auto НЕ добавляет FP на реальной главе (rejection лучший).
+
+#### 9.5.2. 8 кейсов §9.1 (реальный Qwen)
+
+| Кейс | Тип | TP | Neg rej | Unknown | Вердикт |
+|---|---|---|---|---|---|
+| 1. motorcycle→bike | positive | 1.0 | 1.0 | 0 | ✅ |
+| 2. scrubs→nurse→Rich | positive | 1.0 | 1.0 | 1 (p00002 invented_gender «Медсестра» — Rich male) | ⚠️ |
+| 3. два разных bike | negative | — | 1.0 | 0 | ✅ |
+| 4. два разных nurse | negative | — | 1.0 | 0 | ✅ |
+| 5. generic role vs Rich | negative | — | **0.0** | 0 | ❌ |
+| 6. термин = 2 объекта | negative | — | 1.0 | 0 | ✅ |
+| 7. poisoned gender (source>book) | provenance | — | 1.0 | 0 | ✅ |
+| 8. candidate relation | provenance | — | **0.0** | 1 | ❌ |
+
+**Два системных провала:**
+- **Кейс 5** (generic роль): Qwen не применил «NOT Rich»-нотацию — заpoisonил generic-упоминание. В production НЕ блокер: extractor (B1.2) никогда не выдаёт generic-роли (GENERIC_DESCRIPTIONS + §8.3 валидация, урок «The Nurse»), book_memory не используется (source-only).
+- **Кейс 8** (candidate relation): Qwen принял «CANDIDATE, not verified» за факт → changed_fact FP. **Реальный риск для production**: B1.2 помечает same_entity relation ВСЕГДА candidate → если рендерить candidate в аудит-промпт, будет FP-класс changed_fact по непроверенным связям.
+
+#### 9.5.3. DECISION GATE (решение владельца 2026-08-10)
+
+**Entity-context в production — ДА, с ограничением:**
+
+1. **Verified-факты (anchor/alias) рендерятся в аудит-промпт** (CHAPTER ENTITY FACTS) — recall-выгода подтверждена (p00035/p00240, кейсы 1/2)
+2. **Candidate-relations (same_entity) НЕ рендерятся в аудит-промпт** — Qwen принимает их за факт (кейс 8). Остаются в контексте для hard filters (принудительный TIER_B) и repair. Реализация: `render_entity_context_text` фильтрует `status=candidate` (фикс B1.2, НЕ промпт)
+3. **Generic-роли не выдаются** — уже обеспечено extractor'ом (B1.2)
+4. **B3-спека обновлена**: `entity_context_enabled` дефолт `true`; контекст = только verified-claims
+
+**Замечания developer'у (B1.3 closure):**
+- Fix 1: `metrics_real.json` считает по dev-gold (p00236) — для run_006 нужен параметризуемый gold (или p00236→p00097); пересчитать
+- Fix 2: `render_entity_context_text` — candidate-claims не рендерить в аудит-промпт (проверить кейс 8 на ре-прогоне: rejection 1.0)
+- Fix 3: кейс 2 unknown (p00002 invented_gender «Медсестра») — проверить: если nurse=Rich male, то «медсестра» это реальный gender error? Сверить с каноном главы 0001 (The Nurse: female — НО это generic, не Rich; в кейсе синтетический Rich)
+
+**Стоимость в production:** +1 вызов extractor на главу (кэш source_hash+extractor_version); аудит без изменений (8 чанков).
+
 ## 16. Карточка AF — A-fix: reasoning-cap 32k в whole-chapter генерации (remote)
 
 > **Обнаружено 2026-08-10** (диагностика по run_007_remote_deepseek): 2 из 3 попыток генерации упёрлись в **reasoning=32 000, finish=length, output=0** (пустой вызов, retry спасал). Причину установили эмпирически.
