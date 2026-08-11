@@ -1203,6 +1203,190 @@ def test_repair_module_does_not_import_local_lifecycle():
 
 
 # ---------------------------------------------------------------------------
+# V4.2 R: REVIEW-candidate integration (card t_4707e6e5, R2)
+# ---------------------------------------------------------------------------
+
+
+def test_review_candidates_accepted_and_rejected_journal():
+    """The verifier accepts/rejects each Russian-editor REVIEW candidate
+    against the ORIGINAL: ласка→выдра REJECT (no source confirmation),
+    ты прав→ты права ACCEPT. Accepted -> committed + re-audit; rejected ->
+    pass; the journal records both verdicts."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00106": "— Ten, — I corrected.",
+        "p00240": "\"You're right,\" she said.",
+    }
+    translation = {
+        "p00106": "— Десять, — поправил я.",
+        "p00240": "— Ты прав, — сказала она.",
+    }
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00106",
+            original="— Десять, — поправил я.",
+            proposed="— Выдра, — поправил я.",
+            klass="logic",
+            reason="заменил число без подтверждения (ложная правка)",
+        ),
+        ReviewCandidate(
+            pid="p00240",
+            original="— Ты прав, — сказала она.",
+            proposed="— Ты права, — сказала она.",
+            klass="grammar",
+            reason="род адресата (женский)",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {"index": 1, "decision": "pass",
+             "reason": "источник говорит Ten (10), не выдра — отклонено"},
+            {"index": 2, "decision": "repair", "pid": "p00240",
+             "repaired_translation": "— Ты права, — сказала она.",
+             "reason": "адресат женского рода — принято"},
+        ]),
+        _reaudit_response([]),  # single re-audit after the accepted commit
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=(), review_candidates=review_candidates,
+    )
+    assert outcome.eligible_count == 0  # no audit findings
+    assert outcome.skipped is False     # review candidates still repaired
+    # Accepted candidate committed -> re-audit ran (1 repair + 1 reaudit);
+    # the rejected candidate answered PASS -> passed_pids.
+    assert dict(outcome.committed) == {
+        "p00240": "— Ты права, — сказала она.",
+    }
+    assert outcome.passed_pids == ("p00106",)
+    assert len(backend.requests) == 2
+    # Journal: one entry per candidate with the accept/reject verdict.
+    journal = {entry["pid"]: entry for entry in outcome.review_journal}
+    assert set(journal) == {"p00106", "p00240"}
+    assert journal["p00106"]["verdict"] == "rejected"
+    assert journal["p00106"]["class"] == "logic"
+    assert journal["p00106"]["original"] == "— Десять, — поправил я."
+    assert journal["p00106"]["proposed"] == "— Выдра, — поправил я."
+    assert "не выдра" in journal["p00106"]["reason"]
+    assert journal["p00240"]["verdict"] == "accepted"
+    assert journal["p00240"]["committed_text"] == "— Ты права, — сказала она."
+    assert outcome.repair_complete is True
+
+
+def test_review_candidates_never_displace_audit_findings_at_cap():
+    """Review candidates ride along AFTER the audit findings cap — they
+    never displace code-confirmed audit findings at the cap boundary."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {"p00001": "source 1", "p00002": "source 2"}
+    translation = {"p00001": "перевод 1", "p00002": "перевод 2"}
+    # 12 CONFIRMED audit findings + 2 review candidates; cap = 10 ->
+    # 10 audit findings kept (the cap), the 2 review candidates are ADDED
+    # (never capped away), 2 audit findings capped.
+    issues = [
+        _issue(f"p{i:05d}", "changed_fact", note="n", confidence="high")
+        for i in range(1, 13)
+    ]
+    filtered = [
+        FilteredIssue(issue=iss, verdict=CONFIRMED, filter_name="test", reason="t")
+        for iss in issues
+    ]
+    review_candidates = [
+        ReviewCandidate(pid="p00001", original="перевод 1",
+                        proposed="перевод один", klass="typo", reason="r"),
+        ReviewCandidate(pid="p00002", original="перевод 2",
+                        proposed="перевод два", klass="grammar", reason="r"),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
+                          for i in range(1, 5)]),
+        _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
+                          for i in range(1, 5)]),
+        _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
+                          for i in range(1, 5)]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, review_candidates=review_candidates,
+    )
+    # 12 eligible audit findings -> cap 10 keeps 10, caps 2.
+    assert len(outcome.capped) == 2
+    # 10 audit + 2 review = 12 findings -> 3 microbatches (4+4+4).
+    assert [len(b.findings) for b in outcome.batches] == [4, 4, 4]
+    # Every review candidate was answered (journal entries for both).
+    assert len(outcome.review_journal) == 2
+    assert outcome.repair_complete is True
+
+
+def test_review_candidate_failed_batch_journal_failed():
+    """A failed batch marks its review candidates 'failed' (fail-closed:
+    never silently accepted)."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {"p00001": "source 1"}
+    translation = {"p00001": "перевод 1"}
+    review_candidates = [
+        ReviewCandidate(pid="p00001", original="перевод 1",
+                        proposed="перевод один", klass="typo", reason="r"),
+    ]
+    backend = ScriptedRepairBackend([_repair_response([])])  # empty -> FAILED
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=(), review_candidates=review_candidates,
+    )
+    assert outcome.repair_complete is False
+    assert outcome.review_journal[0]["verdict"] == "failed"
+    assert outcome.committed == ()
+
+
+def test_review_candidates_zero_audit_findings_tear_not_skipped():
+    """TEaR (0 eligible audit findings) still repairs review candidates —
+    the skip is only when BOTH audit findings and review candidates are
+    empty."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {"p00001": "source 1"}
+    translation = {"p00001": "перевод 1"}
+    review_candidates = [
+        ReviewCandidate(pid="p00001", original="перевод 1",
+                        proposed="перевод один", klass="typo", reason="r"),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([{"index": 1, "decision": "repair", "pid": "p00001",
+                           "repaired_translation": "перевод один",
+                           "reason": "принято"}]),
+        _reaudit_response([]),
+    ])
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=(), review_candidates=review_candidates,
+    )
+    assert outcome.skipped is False
+    assert dict(outcome.committed) == {"p00001": "перевод один"}
+    assert outcome.review_journal[0]["verdict"] == "accepted"
+    # Accepted commit -> re-audit ran.
+    assert len(backend.requests) == 2
+
+
+def test_review_candidates_import_contract():
+    """The review-candidate type is the audit module's (no new repair-side
+    transport import)."""
+    import pact_v4.audit.russian_editor as russian_editor
+
+    assert russian_editor.ReviewCandidate.__name__ == "ReviewCandidate"
+    assert "proposed" in russian_editor.ReviewCandidate.__dataclass_fields__
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle wiring (B2 integration: LifecycleSelectiveRepairEvaluator)
 # ---------------------------------------------------------------------------
 

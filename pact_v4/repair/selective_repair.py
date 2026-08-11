@@ -78,6 +78,7 @@ from pact_v4.audit.hard_filters import (
     TIER_B,
     FilteredIssue,
 )
+from pact_v4.audit.russian_editor import ReviewCandidate
 from pact_v4.runtime.backend_protocol import (
     JSON_OBJECT_SCHEMA,
     CompletionBackend,
@@ -253,6 +254,10 @@ class SelectiveRepairOutcome:
     reaudit: Optional[ReauditOutcome]
     repair_complete: bool
     skipped: bool  # TEaR: 0 eligible findings -> repair skipped entirely
+    # V4.2 R: accept/reject journal for the Russian-editor REVIEW candidates
+    # verified in this pass (one entry per candidate: pid, class, original,
+    # proposed, verdict accepted|rejected|failed, reason, committed text).
+    review_journal: Tuple[Dict[str, Any], ...] = ()
 
     def to_payload(self) -> dict:
         return {
@@ -313,6 +318,7 @@ class SelectiveRepairOutcome:
             ),
             "repair_complete": self.repair_complete,
             "skipped": self.skipped,
+            "review_journal": [dict(entry) for entry in self.review_journal],
         }
 
 
@@ -615,6 +621,112 @@ def plan_reaudit_scope(
 
 
 # ---------------------------------------------------------------------------
+# Review-candidate helpers (V4.2 R: Russian-editor REVIEW candidates)
+# ---------------------------------------------------------------------------
+
+
+def _next_index(findings: Sequence[EligibleFinding]) -> int:
+    """Next free explicit index after ``findings`` (batch-local numbering)."""
+    return max((f.index for f in findings), default=0)
+
+
+def _review_candidate_finding(
+    candidate: ReviewCandidate, *, index: int
+) -> EligibleFinding:
+    """Wrap one Russian-editor REVIEW candidate as a verify-before-repair
+    finding (tier ``B`` — the verifier independently decides accept/reject
+    against the ORIGINAL).
+
+    ``excerpt`` carries the PROPOSED rewrite (what the verifier must judge);
+    ``note`` carries the editor's reason. The ``issue`` dict carries a
+    ``source: russian_editor`` marker plus the original/proposed/class so the
+    accept/reject journal can be reconstructed after the batches.
+    """
+    return EligibleFinding(
+        index=index,
+        pid=candidate.pid,
+        tier="B",
+        category=candidate.klass,
+        severity="minor",
+        confidence="high",
+        note=candidate.reason,
+        excerpt=candidate.proposed,
+        issue={
+            "id": candidate.pid,
+            "category": candidate.klass,
+            "severity": "minor",
+            "confidence": "high",
+            "note": candidate.reason,
+            "excerpt": candidate.proposed,
+            "source": "russian_editor",
+            "original": candidate.original,
+            "proposed": candidate.proposed,
+            "class": candidate.klass,
+        },
+    )
+
+
+def _build_review_journal(
+    batch_outcomes: Sequence[RepairBatchOutcome],
+    review_candidates: Sequence[ReviewCandidate],
+) -> Tuple[Dict[str, Any], ...]:
+    """Reconstruct the accept/reject journal for the review candidates.
+
+    One entry per candidate: ``{pid, class, original, proposed, verdict,
+    reason, committed_text}`` where verdict is ``accepted`` (the verifier
+    returned ``repair`` — the accepted text is committed and re-audited),
+    ``rejected`` (verifier returned ``pass``), or ``failed`` (the batch
+    failed / the index was never answered — fail-closed, never silently
+    accepted).
+    """
+    journal: list = []
+    for candidate in review_candidates:
+        entry: Dict[str, Any] = {
+            "pid": candidate.pid,
+            "class": candidate.klass,
+            "original": candidate.original,
+            "proposed": candidate.proposed,
+            "verdict": "failed",
+            "reason": "review candidate was never answered",
+            "committed_text": None,
+        }
+        for batch in batch_outcomes:
+            finding = next(
+                (
+                    f for f in batch.findings
+                    if f.pid == candidate.pid
+                    and f.issue.get("source") == "russian_editor"
+                ),
+                None,
+            )
+            if finding is None:
+                continue
+            if batch.status == "FAILED":
+                entry["verdict"] = "failed"
+                entry["reason"] = f"failed repair batch: {batch.error}"
+                break
+            result = next(
+                (r for r in batch.results if r.index == finding.index), None
+            )
+            if result is None:
+                entry["verdict"] = "failed"
+                entry["reason"] = (
+                    "review candidate index was not answered in the batch"
+                )
+                break
+            if result.decision == "repair":
+                entry["verdict"] = "accepted"
+                entry["reason"] = result.reason
+                entry["committed_text"] = result.repaired_translation
+            else:
+                entry["verdict"] = "rejected"
+                entry["reason"] = result.reason
+            break
+        journal.append(entry)
+    return tuple(journal)
+
+
+# ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------
 
@@ -665,6 +777,7 @@ class SelectiveRepairEvaluator:
         filtered: Sequence[FilteredIssue],
         entity_context: str = "",
         narrator_context: str = "",
+        review_candidates: Sequence[ReviewCandidate] = (),
         on_phase: Optional[Callable[[str], None]] = None,
     ) -> SelectiveRepairOutcome:
         cfg = self._config
@@ -687,6 +800,19 @@ class SelectiveRepairEvaluator:
                 f"(confidence={f.confidence}, category={f.category}) — debt/diagnostic"
             )
 
+        # V4.2 R (card t_4707e6e5): REVIEW-classed Russian-editor candidates
+        # are ADDITIONAL verify-before-repair input (the verifier accepts or
+        # rejects each against the ORIGINAL; accepted -> commit + re-audit).
+        # They are appended AFTER the audit findings cap so they never
+        # displace code-confirmed audit findings at the cap boundary, and
+        # their accept/reject verdicts are journaled for the trial record.
+        # Indices continue after the kept findings (1-based, unique — the
+        # model answers per [index]).
+        kept = tuple(kept) + tuple(
+            _review_candidate_finding(c, index=_next_index(kept) + i + 1)
+            for i, c in enumerate(review_candidates)
+        )
+
         if not kept:
             # TEaR: 0 eligible findings -> repair skipped entirely.
             return SelectiveRepairOutcome(
@@ -705,6 +831,7 @@ class SelectiveRepairEvaluator:
                 reaudit=None,
                 repair_complete=True,
                 skipped=True,
+                review_journal=(),
             )
 
         batches = make_microbatches(
@@ -739,6 +866,8 @@ class SelectiveRepairEvaluator:
                     # The model answers PASS by index without echoing the PID;
                     # resolve it from the batch finding (the index contract).
                     passed_pids.append(finding_by_index[result.index].pid)
+
+        review_journal = _build_review_journal(batch_outcomes, review_candidates)
 
         reaudit: Optional[ReauditOutcome] = None
         repair_complete = all(b.status == "GOOD" for b in batch_outcomes)
@@ -777,6 +906,7 @@ class SelectiveRepairEvaluator:
             reaudit=reaudit,
             repair_complete=repair_complete,
             skipped=False,
+            review_journal=review_journal,
         )
 
     # ------------------------------------------------------------------
@@ -987,4 +1117,5 @@ __all__ = [
     "parse_repair_batch",
     "plan_reaudit_scope",
     "SelectiveRepairEvaluator",
+    "ReviewCandidate",
 ]

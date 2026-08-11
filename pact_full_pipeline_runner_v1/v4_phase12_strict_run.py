@@ -253,6 +253,18 @@ def build_argparser() -> argparse.ArgumentParser:
                         "--no-entity-context audits without the entity block. "
                         "Part of the config identity — use a NEW --out-dir "
                         "when flipping it against an existing run.")
+    p.add_argument("--no-russian-editor", action="store_true",
+                   help="V4.2 R: disable the Russian-only editor stage "
+                        "(Qwen edits the translation WITHOUT the English "
+                        "source, right after generation and BEFORE the "
+                        "audit; SAFE classes typo/grammar/duplicate/"
+                        "preposition auto-apply with a diff-gate, REVIEW "
+                        "classes go to edit_candidates.json for the B2 "
+                        "verifier). Default: R ON. --no-russian-editor "
+                        "restores the 4.1 scheme (raw translation audited "
+                        "directly). Part of the config identity — use a "
+                        "NEW --out-dir when flipping it against an existing "
+                        "run.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -452,6 +464,10 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         entity_context_enabled=(
             True if args.entity_context is None else args.entity_context
         ),
+        # V4.2 R (owner decision 2026-08-11): Russian-only editor stage ON
+        # by default; --no-russian-editor restores the 4.1 scheme (raw
+        # translation audited directly). Part of the config identity.
+        russian_editor_enabled=not args.no_russian_editor,
         # V4 Efficiency A2: CLI flag (--lazy-balanced/--no-lazy-balanced)
         # overrides the env var, which defaults to true (lazy mode on).
         lazy_balanced=(
@@ -512,6 +528,19 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             prompt_version=cfg.audit_prompt_version,
             harness_version=cfg.audit_harness_version,
             extractor_version=cfg.audit_extractor_version,
+            # V4.2 R (card t_4707e6e5): every Russian-editor knob is WIRED
+            # from the run config (never silently left at module defaults)
+            # and participates in the config identity — a policy change
+            # invalidates the cached repaired map (F5 lesson).
+            russian_editor_enabled=cfg.russian_editor_enabled,
+            russian_editor_version=cfg.russian_editor_version,
+            russian_editor_harness_version=cfg.russian_editor_harness_version,
+            russian_editor_chunk_size=cfg.russian_editor_chunk_size,
+            russian_editor_overlap_pairs=cfg.russian_editor_overlap_pairs,
+            russian_editor_max_tokens=cfg.russian_editor_max_tokens,
+            russian_editor_safe_classes=frozenset(
+                cfg.russian_editor_safe_classes
+            ),
         ),
     )
 

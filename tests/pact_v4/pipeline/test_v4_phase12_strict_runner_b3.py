@@ -61,7 +61,8 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
 class _B3MockBackend(CompletionBackend):
     """CompletionBackend serving the B3 stage roles from canned payloads.
 
-    Dispatches on the request ``label``: the entity extractor
+    Dispatches on the request ``label``: the Russian editor
+    (``russian_editor_v4``), the entity extractor
     (``b1.2/entity_extractor``), the chunked audit
     (``phase3/qwen_chapter_audit_v4``), the selective repair
     (``phase3/selective_repair_v4``) and the re-audit
@@ -84,6 +85,7 @@ class _B3MockBackend(CompletionBackend):
         repair_results: Optional[Sequence[Mapping[str, Any]]] = None,
         reaudit_issues: Optional[Sequence[Mapping[str, Any]]] = None,
         entity_payload: Optional[Mapping[str, Any]] = None,
+        r_editor_edits: Optional[Sequence[Mapping[str, Any]]] = None,
         fail_audit: bool = False,
         fail_entity: bool = False,
     ) -> None:
@@ -91,6 +93,8 @@ class _B3MockBackend(CompletionBackend):
         self._repair_results = list(repair_results or [])
         self._reaudit_issues = list(reaudit_issues or [])
         self._entity_payload = entity_payload or {"entities": []}
+        # V4.2 R: canned Russian-editor edits (default empty -> no edits).
+        self._r_editor_edits = list(r_editor_edits or [])
         self._fail_audit = fail_audit
         self._fail_entity = fail_entity
         self.requests: List[CompletionRequest] = []
@@ -109,6 +113,8 @@ class _B3MockBackend(CompletionBackend):
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         self.requests.append(request)
         label = request.label or ""
+        if "russian_editor" in label:
+            return _ok_response(self._r_editor_payload(request))
         if "entity_extractor" in label:
             if self._fail_entity:
                 raise CompletionError("simulated entity extraction failure")
@@ -123,6 +129,40 @@ class _B3MockBackend(CompletionBackend):
             return _ok_response({"issues": self._reaudit_issues})
         raise AssertionError(f"unexpected B3 request label {label!r}")
 
+    def _r_editor_payload(self, request: CompletionRequest) -> dict:
+        """Canned Russian-editor edits, with ``original`` resolved from the
+        request's own EDIT_PAIRS text (the model must echo the EXACT current
+        text, so the mock derives it from the prompt instead of hardcoding
+        fixture text). Entries are ``(pid, klass, rewritten_suffix)``; the
+        rewritten text = current text + suffix."""
+        prompt = request.messages[0].content
+        current: dict = {}
+        for line in prompt.splitlines():
+            line = line.strip()
+            if line.startswith("EDIT_PAIRS"):
+                continue
+            if ":" not in line:
+                continue
+            pid, _, text = line.partition(":")
+            pid = pid.strip()
+            text = text.strip()
+            if pid.startswith("p") and text:
+                current[pid] = text
+        edits = []
+        for entry in self._r_editor_edits:
+            pid, klass, suffix = entry
+            original = current.get(pid, "")
+            if not original:
+                continue
+            edits.append({
+                "pid": pid,
+                "original": original,
+                "rewritten": original + suffix,
+                "reason": "mock",
+                "class": klass,
+            })
+        return {"edits": edits}
+
     def close(self) -> None:
         pass
 
@@ -130,6 +170,9 @@ class _B3MockBackend(CompletionBackend):
         return []
 
     # counters ---------------------------------------------------------
+
+    def r_editor_calls(self) -> int:
+        return sum(1 for r in self.requests if "russian_editor" in (r.label or ""))
 
     def entity_calls(self) -> int:
         return sum(1 for r in self.requests if "entity_extractor" in (r.label or ""))
@@ -834,6 +877,18 @@ def test_b3_cli_flags_parse(tmp_path: Path) -> None:
     )
     assert entity.entity_context_enabled is True
 
+    # V4.2 R: Russian editor ON by default; --no-russian-editor flips it off
+    # (4.1 scheme) and is part of the config identity.
+    assert default_cfg.russian_editor_enabled is True
+    no_r = _build_run_config(
+        build_argparser().parse_args(base_args + ["--no-russian-editor"]), None
+    )
+    assert no_r.russian_editor_enabled is False
+    assert (
+        default_cfg.to_config_artifact(model_profile="test").config_identity
+        != no_r.to_config_artifact(model_profile="test").config_identity
+    )
+
     # --run-audit and --skip-audit are mutually exclusive at parse time.
     with pytest.raises(SystemExit):
         build_argparser().parse_args(base_args + ["--run-audit", "--skip-audit"])
@@ -1380,3 +1435,285 @@ def test_b3_evaluator_coverage_error_writes_terminal_failure_event(
     assert "CoverageError" in gate["error"]
     # The terminal gate is the LAST event (nothing appended after it).
     assert names[-1] == "gate"
+
+
+
+# ---------------------------------------------------------------------------
+# V4.2 R: Russian-only editor stage integration (card t_4707e6e5)
+# ---------------------------------------------------------------------------
+
+
+def test_b3_r_editor_runs_and_applies_safe_edits(tmp_path: Path) -> None:
+    """R runs on the whole-chapter flow (default ON): SAFE edits are
+    auto-applied to the audited map, REVIEW edits become candidates, the
+    repair verifier accepts/rejects them, and the artifacts are written.
+
+    Mock contract: r_editor_edits entries are ``(pid, klass, suffix)``; the
+    mock derives ``original`` from the request's own EDIT_PAIRS text (the
+    model must echo the exact current text)."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    # p00001 typo (SAFE, applied), p00002 calque (REVIEW, candidate).
+    backend = _B3MockBackend(
+        r_editor_edits=[
+            ("p00001", "typo", " — исправлено"),
+            ("p00002", "calque", " — переформулировано"),
+        ],
+        audit_issues=[{
+            "id": "p00003", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование",
+            "excerpt": "номер3 номер3",
+        }],
+        # Audit finding index 1 (p00003) + review candidate index 2 (p00002).
+        repair_results=[
+            {"index": 1, "decision": "repair", "pid": "p00003",
+             "repaired_translation": "Перевод номер3", "reason": "убран дубль"},
+            {"index": 2, "decision": "repair", "pid": "p00002",
+             "repaired_translation": "Перевод номер2 — переформулировано",
+             "reason": "калька подтверждена"},
+        ],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+    assert backend.r_editor_calls() == 1
+    assert result.step8["released_as_audited"] is True
+
+    # SAFE edit applied to the audited/repaired map.
+    repaired = _read_json(cfg.out_dir / "translations_repaired.json")
+    repaired = repaired["translations"]
+    assert repaired["p00001"].endswith("— исправлено")
+    # REVIEW candidate accepted by the verifier -> committed.
+    assert repaired["p00002"].endswith("— переформулировано")
+    # Audit repair committed too.
+    assert repaired["p00003"] == "Перевод номер3"
+
+    # Artifacts written with identity.
+    edited = _read_json(cfg.out_dir / "translations_edited.json")
+    assert edited["schema"] == "pact-v4-translations-edited/v1"
+    assert edited["translations"]["p00001"].endswith("— исправлено")
+    # REVIEW NOT applied to the edited map (still the raw text).
+    assert not edited["translations"]["p00002"].endswith("— переформулировано")
+    candidates = _read_json(cfg.out_dir / "edit_candidates.json")
+    assert candidates["schema"] == "pact-v4-edit-candidates/v1"
+    assert candidates["candidates"][0]["pid"] == "p00002"
+    assert candidates["candidates"][0]["class"] == "calque"
+
+    # Trial-record R report: journal with accept/reject verdicts.
+    r_report = result.record["russian_editor"]
+    assert r_report["status"] == "complete"
+    assert r_report["safe_classes"] == sorted(
+        ["typo", "grammar", "duplicate", "preposition"]
+    )
+    journal = {e["pid"]: e for e in r_report["review_journal"]}
+    assert journal["p00002"]["verdict"] == "accepted"
+    assert journal["p00002"]["committed_text"].endswith("— переформулировано")
+    # The candidate entry appears in the B3 audit journal too.
+    events = _journal_events(cfg.out_dir)
+    names = [e["event"] for e in events]
+    assert "r_editor_started" in names
+    assert "r_editor_done" in names
+
+
+def test_b3_r_editor_disabled_scheme_41(tmp_path: Path) -> None:
+    """--no-russian-editor (russian_editor_enabled=False) restores the 4.1
+    scheme: the raw map is audited directly, 0 R calls, no R artifacts."""
+    from pact_v4.pipeline.b3_audit_repair import B3AuditRepairConfig
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(audit_issues=[], repair_results=[], reaudit_issues=[])
+    result = _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            entity_context_enabled=False, russian_editor_enabled=False,
+        ),
+    )
+    assert backend.r_editor_calls() == 0
+    assert not (cfg.out_dir / "translations_edited.json").exists()
+    assert not (cfg.out_dir / "edit_candidates.json").exists()
+    assert result.record["russian_editor"] is None
+    assert result.step8["released_as_audited"] is True
+
+
+def test_b3_r_editor_incomplete_applies_nothing(tmp_path: Path) -> None:
+    """An incomplete R pass (invalid chunk) applies NO edits and forwards NO
+    candidates (fail-closed at the stage level); the audit still runs on the
+    raw map and protects the chapter."""
+    from pact_v4.pipeline.b3_audit_repair import B3AuditRepairConfig
+
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _FlakyREditorBackend(_B3MockBackend):
+        """Serves a valid first r_editor chunk and a broken second one."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._r_editor_served = 0
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            if "russian_editor" in (request.label or ""):
+                self.requests.append(request)
+                self._r_editor_served += 1
+                if self._r_editor_served > 1:
+                    return _ok_response({"edits": "not-an-array"})
+                return _ok_response({"edits": [
+                    {
+                        "pid": "p00001",
+                        "original": "Перевод номер1 номер1",
+                        "rewritten": "Перевод номер1",
+                        "reason": "дубль",
+                        "class": "duplicate",
+                    },
+                ]})
+            return super().complete(request)
+
+    backend = _FlakyREditorBackend(
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    result = _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            entity_context_enabled=False,
+            russian_editor_enabled=True,
+            russian_editor_chunk_size=4,  # 2 chunks for 8 pids
+        ),
+    )
+    # R incomplete -> nothing applied, audit proceeded on the raw map.
+    assert result.record["russian_editor"]["status"] == "incomplete"
+    repaired = _read_json(cfg.out_dir / "translations_repaired.json")
+    assert repaired["translations"]["p00001"] == "Перевод номер1 номер1"
+    assert not (cfg.out_dir / "translations_edited.json").exists()
+    assert result.step8["released_as_audited"] is True  # audit still protects
+
+
+def test_b3_r_editor_config_part_of_identity(tmp_path: Path) -> None:
+    """F5 lesson: russian_editor_version + chunk settings + class threshold
+    participate in the config identity — flipping any invalidates the
+    repaired cache."""
+    base = _whole_chapter_cfg(tmp_path)
+    base_id = base.to_config_artifact(model_profile="test").config_identity
+    mutations = {
+        "enabled": dict(russian_editor_enabled=False),
+        "version": dict(russian_editor_version="pact-v4.2-russian-editor/v9.9"),
+        "chunk_size": dict(russian_editor_chunk_size=25),
+        "overlap_pairs": dict(russian_editor_overlap_pairs=3),
+        "max_tokens": dict(russian_editor_max_tokens=16000),
+        "safe_classes": dict(russian_editor_safe_classes=("typo", "grammar")),
+    }
+    for label, overrides in mutations.items():
+        mutated = _whole_chapter_cfg(tmp_path, **overrides)
+        mutated_id = mutated.to_config_artifact(model_profile="test").config_identity
+        assert mutated_id != base_id, f"{label} mutation did not change identity"
+
+
+def test_b3_r_editor_cache_hit_restores_report_zero_calls(tmp_path: Path) -> None:
+    """A full audit-cache hit restores the stored R report (candidates +
+    journal) with 0 model calls — resume never re-runs the Russian editor."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        r_editor_edits=[
+            ("p00001", "typo", " — исправлено"),
+            ("p00002", "calque", " — переформулировано"),
+        ],
+        audit_issues=[],
+        repair_results=[
+            {"index": 1, "decision": "repair", "pid": "p00002",
+             "repaired_translation": "Перевод номер2 — переформулировано",
+             "reason": "принято"},
+        ],
+        reaudit_issues=[],
+    )
+    first = _run_with_b3(cfg, backend)
+    assert first.record["russian_editor"]["status"] == "complete"
+    assert backend.r_editor_calls() == 1
+
+    second_backend = _B3MockBackend(
+        audit_issues=[], repair_results=[], reaudit_issues=[]
+    )
+    second = _run_with_b3(cfg, second_backend)
+    assert second.step6["from_cache"] is True
+    assert second_backend.r_editor_calls() == 0
+    assert second_backend.audit_calls() == 0
+    # The stored R report (with the accept journal) is restored verbatim.
+    assert second.record["russian_editor"]["status"] == "complete"
+    journal = {
+        e["pid"]: e for e in second.record["russian_editor"]["review_journal"]
+    }
+    assert journal["p00002"]["verdict"] == "accepted"
+    repaired = _read_json(cfg.out_dir / "translations_repaired.json")
+    assert repaired["translations"]["p00002"].endswith("— переформулировано")
+
+
+def test_b3_r_editor_old_cache_does_not_replay_under_new_policy(
+    tmp_path: Path,
+) -> None:
+    """A repaired cache written under R ON must NOT replay under R OFF (and
+    vice versa): the config identity carries the R keys. Tested at the B3
+    bundle level (the whole-chapter runner already refuses to resume a
+    journal under a different config identity — that fail-closed gate makes
+    the runner-level scenario raise before B3)."""
+    from pact_v4.pipeline.b3_audit_repair import B3AuditRepair
+    from pact_v4.runtime.snapshot_factory import (
+        build_snapshot,
+        build_source_artifact,
+    )
+    from pact_v4.phase0b.source_html import load_source
+    from pact_v4.phase1.chunker import ChunkPlanner
+    from pact_v4.phase1.models import ChunkPlanArtifact
+
+    cfg = _whole_chapter_cfg(tmp_path)  # russian_editor_enabled=True default
+    blocks, _ = load_source(cfg.chapter_html_path)
+    source = build_source_artifact(chapter_id=cfg.chapter_id, blocks=blocks)
+    from pact_v4.runtime.snapshot_factory import ChapterMemory
+
+    memory = ChapterMemory.from_directory(cfg.memory_dir)
+    snapshot = build_snapshot(
+        chapter_id=cfg.chapter_id, source=source, memory=memory,
+        context=f"chapter_html={cfg.chapter_html_path};memory_dir={cfg.memory_dir}",
+    )
+    planner = ChunkPlanner()
+    plans = planner.plan(
+        blocks, snapshot_hash=snapshot.snapshot_hash,
+        following_blocks=cfg.right_context_pids,
+    )
+    chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+    translation = dict(source.source)
+
+    def _run_bundle(r_editor_enabled: bool) -> Any:
+        backend = _B3MockBackend(
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        )
+        bundle = B3AuditRepair(
+            audit_backend=backend,
+            repair_backend=backend,
+            config=B3AuditRepairConfig(
+                entity_context_enabled=False,
+                russian_editor_enabled=r_editor_enabled,
+            ),
+        )
+        run_cfg = _whole_chapter_cfg(
+            tmp_path, russian_editor_enabled=r_editor_enabled
+        )
+        run_config = run_cfg.to_config_artifact(
+            model_profile=run_cfg.backend.config_profile_name()
+        )
+        return bundle.run(
+            chapter_id=cfg.chapter_id,
+            source=source,
+            snapshot_hash=snapshot.snapshot_hash,
+            translation=dict(translation),
+            book_memory={},
+            out_dir=cfg.out_dir,
+            config_identity=run_config.config_identity,
+            backend_identity_hash=cfg.backend.identity_hash,
+        ), backend
+
+    first, first_backend = _run_bundle(r_editor_enabled=True)
+    assert first.from_cache is False
+    assert first_backend.r_editor_calls() == 1
+
+    # Same out-dir, R now DISABLED -> config identity differs -> cache miss
+    # and the audit re-runs (never replay the repaired map under a new R
+    # policy — the F5 lesson).
+    second, second_backend = _run_bundle(r_editor_enabled=False)
+    assert second.from_cache is False
+    assert second_backend.audit_calls() == 1
+    assert second_backend.r_editor_calls() == 0

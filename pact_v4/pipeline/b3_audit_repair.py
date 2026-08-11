@@ -91,6 +91,18 @@ from pact_v4.audit.entity_extractor import (
     extract_entity_context,
 )
 from pact_v4.audit.hard_filters import FilteredIssue, apply_hard_filters
+from pact_v4.audit.russian_editor import (
+    RUSSIAN_EDITOR_HARNESS_VERSION,
+    RUSSIAN_EDITOR_PROMPT_VERSION,
+    SAFE_CLASSES,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_DEFAULT_MAX_TOKENS,
+    DEFAULT_OVERLAP_PAIRS,
+    ReviewCandidate,
+    RussianEditorConfig,
+    RussianEditorEvaluator,
+    RussianEditorOutcome,
+)
 from pact_v4.phase1.models import SourceArtifact, canonical_json_hash
 from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_BASE_DELAY_SECONDS,
@@ -275,6 +287,23 @@ class B3AuditRepairConfig:
     prompt_version: str = PROMPT_VERSION
     harness_version: str = HARNESS_VERSION
     extractor_version: str = EXTRACTOR_VERSION
+    # V4.2 R (card t_4707e6e5): Russian-only editor stage BEFORE the audit.
+    # ``russian_editor_enabled`` is True by default (owner decision
+    # 2026-08-11 — R is on unless the CLI disables it with
+    # ``--no-russian-editor``, scheme 4.1). The R settings are identity-
+    # bearing via ``StrictRunConfig`` (F5 lesson): russian_editor_version +
+    # chunk settings + class threshold are part of the run config identity,
+    # so flipping any of them invalidates the repaired cache — an old
+    # repaired map can never replay under a different editor policy.
+    russian_editor_enabled: bool = True
+    russian_editor_version: str = RUSSIAN_EDITOR_PROMPT_VERSION
+    russian_editor_harness_version: str = RUSSIAN_EDITOR_HARNESS_VERSION
+    russian_editor_chunk_size: int = DEFAULT_CHUNK_SIZE
+    russian_editor_overlap_pairs: int = DEFAULT_OVERLAP_PAIRS
+    russian_editor_max_tokens: int = RUSSIAN_EDITOR_DEFAULT_MAX_TOKENS
+    # Class threshold: classes in this frozenset are SAFE (auto-applied with
+    # the diff-gate); every other known class routes to REVIEW candidates.
+    russian_editor_safe_classes: frozenset = frozenset(SAFE_CLASSES)
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -296,6 +325,15 @@ class B3AuditRepairConfig:
             "prompt_version": self.prompt_version,
             "harness_version": self.harness_version,
             "extractor_version": self.extractor_version,
+            "russian_editor": {
+                "enabled": self.russian_editor_enabled,
+                "version": self.russian_editor_version,
+                "harness_version": self.russian_editor_harness_version,
+                "chunk_size": self.russian_editor_chunk_size,
+                "overlap_pairs": self.russian_editor_overlap_pairs,
+                "max_tokens": self.russian_editor_max_tokens,
+                "safe_classes": sorted(self.russian_editor_safe_classes),
+            },
         }
 
 
@@ -312,6 +350,10 @@ class B3AuditRepairResult:
     entity_context_hash: Optional[str]
     audit_cache_path: Path
     journal_path: Path
+    # V4.2 R: Russian-editor stage report (None when R is disabled) — the
+    # runner records it in the trial record (edit_candidates + accept/reject
+    # journal); on a cache hit it is restored from the audit cache payload.
+    r_editor: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +606,17 @@ class B3AuditCache:
             return None
         return dict(value)
 
+    def stored_r_editor(self) -> Optional[Dict[str, Any]]:
+        """The stored V4.2 R-stage report (None when the cache predates R or
+        the stage was disabled — the caller falls back to a disabled
+        report)."""
+        if not self._payload:
+            return None
+        value = self._payload.get("r_editor")
+        if not isinstance(value, dict):
+            return None
+        return dict(value)
+
     def save(
         self,
         *,
@@ -577,6 +630,7 @@ class B3AuditCache:
         filtered: Sequence[FilteredIssue],
         repair: Optional[SelectiveRepairOutcome],
         translations_repaired: Mapping[str, str],
+        r_editor: Optional[Mapping[str, Any]] = None,
     ) -> None:
         payload = {
             "schema": B3_AUDIT_CACHE_SCHEMA,
@@ -603,6 +657,10 @@ class B3AuditCache:
             ],
             "repair": repair.to_payload() if repair is not None else None,
             "translations_repaired": dict(translations_repaired),
+            # V4.2 R: the Russian-editor report rides the audit cache so a
+            # full cache hit restores the R outcome (edit_candidates +
+            # accept/reject journal) with 0 model calls.
+            "r_editor": dict(r_editor) if r_editor is not None else None,
             # F4: canonical hash of the repaired map binds the map to this
             # cache record. load() recomputes it and rejects a mismatch (old
             # schema / tampered map), so a structurally tampered
@@ -707,6 +765,94 @@ class B3AuditRepair:
     # internals
     # ------------------------------------------------------------------
 
+    def _run_russian_editor(
+        self,
+        *,
+        chapter_id: str,
+        translation: Mapping[str, str],
+        journal: AuditJournal,
+    ) -> Tuple[Dict[str, str], Tuple[ReviewCandidate, ...], Optional[RussianEditorOutcome]]:
+        """V4.2 R stage: run the Russian-only editor over the raw map.
+
+        Returns ``(edited_map, review_candidates, outcome)``:
+        * edited_map = raw + SAFE edits (diff-gated), raw when the stage is
+          disabled or failed;
+        * review_candidates = REVIEW-classed edits (never auto-applied),
+          empty when disabled/failed;
+        * outcome = the evaluator outcome (None when disabled).
+
+        Fail-closed on the STAGE level: an incomplete R pass (any chunk
+        failed) applies NO edits and forwards NO candidates — a partial
+        editor pass is never silently used. The failure is debt (journal +
+        outcome), exactly like a failed repair batch: the audit still
+        protects the chapter.
+        """
+        cfg = self._config
+        if not cfg.russian_editor_enabled:
+            return dict(translation), (), None
+        evaluator = RussianEditorEvaluator(
+            self._audit_backend,
+            config=RussianEditorConfig(
+                chunk_size=cfg.russian_editor_chunk_size,
+                overlap_pairs=cfg.russian_editor_overlap_pairs,
+                max_tokens=cfg.russian_editor_max_tokens,
+                safe_classes=cfg.russian_editor_safe_classes,
+                harness_version=cfg.russian_editor_harness_version,
+                prompt_version=cfg.russian_editor_version,
+            ),
+            on_chunk_event=None,
+        )
+        journal.emit(
+            "r_editor_started",
+            enabled=True,
+            chunk_size=cfg.russian_editor_chunk_size,
+            overlap_pairs=cfg.russian_editor_overlap_pairs,
+            safe_classes=sorted(cfg.russian_editor_safe_classes),
+            prompt_version=cfg.russian_editor_version,
+        )
+        try:
+            outcome = evaluator(chapter_id=chapter_id, translation=translation)
+        except Exception as exc:  # noqa: BLE001 — R failure is debt, never a crash
+            LOG.exception("B3: russian_editor failed for %s", chapter_id)
+            journal.emit(
+                "r_editor_done",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return dict(translation), (), None
+        if not outcome.complete:
+            LOG.warning(
+                "B3: russian_editor incomplete for %s (failed chunks %s) — "
+                "no R edits applied (fail-closed), audit proceeds on raw",
+                chapter_id, list(outcome.failed_chunks),
+            )
+            journal.emit(
+                "r_editor_done",
+                status="incomplete",
+                failed_chunks=list(outcome.failed_chunks),
+                chunk_count=outcome.chunk_count,
+                edit_count=len(outcome.edits),
+            )
+            return dict(translation), (), outcome
+        edited_map = {**dict(translation), **dict(outcome.applied)}
+        journal.emit(
+            "r_editor_done",
+            status="complete",
+            chunk_count=outcome.chunk_count,
+            successful_chunks=outcome.successful_chunks,
+            edit_count=len(outcome.edits),
+            applied_count=len(outcome.applied),
+            candidate_count=len(outcome.candidates),
+            dropped=outcome.dropped,
+        )
+        self._emit_progress(
+            "r_editor_done",
+            complete=True,
+            applied_count=len(outcome.applied),
+            candidate_count=len(outcome.candidates),
+        )
+        return edited_map, outcome.candidates, outcome
+
     def _run_impl(
         self,
         *,
@@ -728,6 +874,12 @@ class B3AuditRepair:
         # translation being audited, so the audit cache identity binds to
         # the exact translation content too — a regenerated/tampered raw
         # map with the same snapshot hash must never be a stale cache hit.
+        # V4.2 R: the identity binds the RAW map hash plus the R config
+        # keys (config_identity carries russian_editor_version + chunk
+        # settings + class threshold), so a cache produced under a different
+        # editor policy never replays (F5 lesson) and R itself runs ONLY on
+        # a cache miss — a full hit restores the stored R report and the
+        # repaired map with 0 model calls (the resume contract).
         translation_hash = canonical_json_hash(dict(sorted(translation_map.items())))
 
         # ------------------------------------------------------------------
@@ -849,6 +1001,10 @@ class B3AuditRepair:
                 entity_context_hash=cache.entity_context_hash(),
                 audit_cache_path=cache_path,
                 journal_path=journal.path,
+                # V4.2 R: restore the Russian-editor report from the cache so
+                # the trial record shows the original R outcome (candidates +
+                # accept/reject journal) even on a 0-call replay.
+                r_editor=cache.stored_r_editor(),
             )
 
         journal.emit(
@@ -859,6 +1015,47 @@ class B3AuditRepair:
             prompt_version=cfg.prompt_version,
             harness_version=cfg.harness_version,
         )
+
+        # ------------------------------------------------------------------
+        # 2.5 V4.2 R: Russian-only editor stage (card t_4707e6e5). Runs on a
+        #     cache MISS only (a full hit restores the stored R report with
+        #     0 model calls). The R config participates in the config
+        #     identity, so a policy change invalidates the repaired cache
+        #     (F5 lesson) and the audit below runs on the R-EDITED map.
+        # ------------------------------------------------------------------
+        r_editor_outcome: Optional[RussianEditorOutcome] = None
+        review_candidates: Tuple[ReviewCandidate, ...] = ()
+        r_editor_report: Optional[Dict[str, Any]] = None
+        if cfg.russian_editor_enabled:
+            edited_map, review_candidates, r_editor_outcome = (
+                self._run_russian_editor(
+                    chapter_id=chapter_id,
+                    translation=translation_map,
+                    journal=journal,
+                )
+            )
+            # The audit/repair consume the R-EDITED map (raw + SAFE edits).
+            translation_map = edited_map
+            r_editor_report = _build_r_editor_report(
+                cfg=cfg,
+                outcome=r_editor_outcome,
+                review_journal=(),
+                from_cache=False,
+            )
+            # Artifacts are written ONLY when the R stage completed — an
+            # incomplete/failed pass leaves no translations_edited.json /
+            # edit_candidates.json (F8: never advertise provenance the stage
+            # did not produce; the audit still runs on the raw map).
+            if r_editor_outcome is not None and r_editor_outcome.complete:
+                _write_r_editor_artifacts(
+                    cfg=cfg,
+                    chapter_id=chapter_id,
+                    snapshot_hash=snapshot_hash,
+                    config_identity=config_identity,
+                    out_dir=out_dir,
+                    edited_map=translation_map,
+                    candidates=review_candidates,
+                )
 
         # ------------------------------------------------------------------
         # 3. Chunked audit (B1).
@@ -1010,6 +1207,10 @@ class B3AuditRepair:
                 entity_context_hash=entity_hash,
                 audit_cache_path=cache_path,
                 journal_path=journal.path,
+                # The R stage already ran (edits recorded) but the audit is
+                # fail-closed — the R report is still surfaced for the trial
+                # record (the chapter is not released as audited).
+                r_editor=r_editor_report,
             )
 
         # ------------------------------------------------------------------
@@ -1065,6 +1266,11 @@ class B3AuditRepair:
                 filtered=filtered,
                 entity_context=entity_context,
                 narrator_context=narrator_context,
+                # V4.2 R: REVIEW-classed Russian-editor candidates are
+                # additional verify-before-repair input — the verifier
+                # accepts/rejects each against the ORIGINAL; accepted ones
+                # are committed and covered by the re-audit.
+                review_candidates=review_candidates,
             )
         except Exception as exc:  # noqa: BLE001 — a repair failure is debt, never a crash
             LOG.exception("B3: selective repair failed for %s", chapter_id)
@@ -1102,6 +1308,16 @@ class B3AuditRepair:
         repair_complete = (
             repair_outcome.repair_complete if repair_outcome is not None else False
         )
+        # V4.2 R: fold the accept/reject journal into the R report so the
+        # trial record and the cached report carry it (on a full cache hit
+        # the journal is restored verbatim from the cache payload).
+        if r_editor_report is not None:
+            review_journal = (
+                repair_outcome.review_journal if repair_outcome is not None else ()
+            )
+            r_editor_report["review_journal"] = [
+                dict(entry) for entry in review_journal
+            ]
 
         # ------------------------------------------------------------------
         # 7. Persist cache + build reports.
@@ -1118,6 +1334,7 @@ class B3AuditRepair:
             filtered=filtered,
             repair=repair_outcome,
             translations_repaired=translations_repaired,
+            r_editor=r_editor_report,
         )
 
         step6 = {
@@ -1194,6 +1411,7 @@ class B3AuditRepair:
             entity_context_hash=entity_hash,
             audit_cache_path=cache_path,
             journal_path=journal.path,
+            r_editor=r_editor_report,
         )
 
     def _emit_progress(self, event: str, **fields: Any) -> None:
@@ -1211,6 +1429,103 @@ class B3AuditRepair:
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
+
+# V4.2 R artifact schemas (identity-bearing, never reused across a schema
+# change).
+R_EDITED_SCHEMA = "pact-v4-translations-edited/v1"
+R_CANDIDATES_SCHEMA = "pact-v4-edit-candidates/v1"
+
+
+def _build_r_editor_report(
+    *,
+    cfg: B3AuditRepairConfig,
+    outcome: Optional[RussianEditorOutcome],
+    review_journal: Sequence[Mapping[str, Any]],
+    from_cache: bool,
+) -> Dict[str, Any]:
+    """Build the Russian-editor report for the trial record / audit cache.
+
+    ``outcome`` is None when the stage failed (transport/evaluator error) —
+    the report then records status ``failed`` (the audit still protects the
+    chapter; R edits were not applied). ``outcome.complete=False`` records
+    status ``incomplete`` (fail-closed: no R edits applied).
+    """
+    status = "disabled"
+    outcome_payload: Optional[Dict[str, Any]] = None
+    if outcome is not None:
+        outcome_payload = outcome.to_payload()
+        if outcome.complete:
+            status = "complete"
+        else:
+            status = "incomplete"
+    report = {
+        "enabled": cfg.russian_editor_enabled,
+        "status": status,
+        "version": cfg.russian_editor_version,
+        "harness_version": cfg.russian_editor_harness_version,
+        "chunk_size": cfg.russian_editor_chunk_size,
+        "overlap_pairs": cfg.russian_editor_overlap_pairs,
+        "safe_classes": sorted(cfg.russian_editor_safe_classes),
+        "outcome": outcome_payload,
+        "review_journal": [dict(entry) for entry in review_journal],
+        "from_cache": from_cache,
+    }
+    return report
+
+
+def _write_r_editor_artifacts(
+    *,
+    cfg: B3AuditRepairConfig,
+    chapter_id: str,
+    snapshot_hash: str,
+    config_identity: str,
+    out_dir: Path,
+    edited_map: Mapping[str, str],
+    candidates: Sequence[Any],
+) -> None:
+    """Persist the R-stage artifacts next to the audit cache.
+
+    * ``translations_edited.json`` (schema ``pact-v4-translations-edited/v1``)
+      — the R-EDITED map (raw + SAFE diff-gated edits) that the audit/repair
+      consumed, with run identity;
+    * ``edit_candidates.json`` (schema ``pact-v4-edit-candidates/v1``) — the
+      REVIEW-classed candidates (pid, original, proposed, class, reason) that
+      were forwarded to the B2 verifier, with run identity.
+
+    Written ONLY on a cache miss (a full cache hit restores the repaired map
+    and the report from the cache payload; the artifacts already exist from
+    the original run — F8: the runner advertises only existing files).
+    """
+    identity = {
+        "schema": R_EDITED_SCHEMA,
+        "chapter_id": chapter_id,
+        "snapshot_hash": snapshot_hash,
+        "config_identity": config_identity,
+    }
+    _atomic_write_json(
+        out_dir / "translations_edited.json",
+        {**identity, "translations": dict(edited_map)},
+    )
+    candidate_payload = [
+        {
+            "pid": c.pid,
+            "original": c.original,
+            "proposed": c.proposed,
+            "class": c.klass,
+            "reason": c.reason,
+        }
+        for c in candidates
+    ]
+    _atomic_write_json(
+        out_dir / "edit_candidates.json",
+        {
+            "schema": R_CANDIDATES_SCHEMA,
+            "chapter_id": chapter_id,
+            "snapshot_hash": snapshot_hash,
+            "config_identity": config_identity,
+            "candidates": candidate_payload,
+        },
+    )
 
 
 def _reports_from_cache(
@@ -1279,4 +1594,6 @@ __all__ = [
     "B3AuditRepairResult",
     "AuditJournal",
     "render_entity_context_block",
+    "R_EDITED_SCHEMA",
+    "R_CANDIDATES_SCHEMA",
 ]
