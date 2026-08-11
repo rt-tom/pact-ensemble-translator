@@ -115,7 +115,7 @@ from pact_v4.phase1.glossary_candidates import (
     candidate_key,
     generate_candidates,
 )
-from pact_v4.phase1.memory import MemoryManager
+from pact_v4.phase1.memory import MemoryManager, atomic_write
 from pact_v4.runtime.bible_renderer import render_bible_section
 
 LOG = logging.getLogger(__name__)
@@ -735,12 +735,20 @@ def _auto_promote_book_memory(
     so ``promote`` merges it into ``book_memory.json["characters"]`` with the
     existing conflict resolution (established/locked never overwritten) and
     the quarantined-chunk filter (``chunk_id`` = first sorted chunk of the
-    current chapter). ``gender`` is included ONLY when the cumulative ledger
-    resolved a single source-confirmed gender (fail-closed: ambiguous or
-    disagreeing chapters -> no gender field). A key-bound presence fact
-    (``facts:<name>:presence``) and, when gender is confirmed, a gender fact
-    (``facts:<name>:gender``) are observed alongside — the fact entry carries
-    explicit ``keys`` so ``build_chapter_index`` can bind it.
+    CURRENT chapter candidate — ``cand['chunk_ids']``, never a chunk from a
+    prior chapter in the cumulative ledger, whose per-chapter chunk IDs
+    repeat and could point at a chunk quarantined in this chapter). A
+    candidate whose current-chapter accepted provenance is missing/invalid
+    (empty ``chunk_ids``) fails closed: it is never promoted, and a prior
+    chapter's chunk_id is never substituted. The cumulative ledger's chunk
+    IDs are retained only as evidence/artifact (``cumulative_chunk_ids`` on
+    the returned proposed records). ``gender`` is included ONLY when the
+    cumulative ledger resolved a single source-confirmed gender
+    (fail-closed: ambiguous or disagreeing chapters -> no gender field). A
+    key-bound presence fact (``facts:<name>:presence``) and, when gender is
+    confirmed, a gender fact (``facts:<name>:gender``) are observed
+    alongside — the fact entry carries explicit ``keys`` so
+    ``build_chapter_index`` can bind it.
 
     Returns ``(proposed, conflicts)`` — the candidate records sent to
     ``add_observation`` (book-run ``proposed`` count) and the records that hit
@@ -780,10 +788,26 @@ def _auto_promote_book_memory(
             str(p) for e in chapters
             for p in (e.get("gender_evidence_pids") or [])
         })
-        chunk_ids = sorted({
+        # RV fix (97571d3 finding): the observation's chunk_id — the B7
+        # quarantined-chunk filter metadata — must come from the CURRENT
+        # chapter candidate ONLY (``cand['chunk_ids']``), never from the
+        # cumulative ledger. Per-chapter chunk IDs repeat (chunk0001, ...),
+        # so the sorted union across cumulative chapters can pick a chunk
+        # that is quarantined in THIS chapter, and the B7 filter would then
+        # drop a valid promotion (proposed=1, committed=0). The cumulative
+        # chunk IDs are kept only as evidence/artifact
+        # (``cumulative_chunk_ids`` in the proposed record / book_run.json).
+        current_chunk_ids = sorted({
+            str(c) for c in (cand.get("chunk_ids") or [])
+        })
+        if not current_chunk_ids:
+            # Fail-closed: current accepted provenance missing/invalid —
+            # a prior chapter's chunk_id must never substitute for it.
+            continue
+        chunk_id = current_chunk_ids[0]
+        cumulative_chunk_ids = sorted({
             str(c) for e in chapters for c in (e.get("chunk_ids") or [])
         })
-        chunk_id = chunk_ids[0] if chunk_ids else ""
         entry: Dict[str, Any] = {
             "type": "character",
             "chapters": chapter_ids,
@@ -828,6 +852,7 @@ def _auto_promote_book_memory(
             "chapters": chapter_ids,
             "evidence_pids": evidence_pids,
             "gender": gender,
+            "cumulative_chunk_ids": cumulative_chunk_ids,
         })
     return proposed, conflicts
 
@@ -863,9 +888,12 @@ def _strip_book_memory_observation_fields(memory_dir: Path) -> None:
                 entry.pop("chunk_id", None)
                 changed = True
     if changed:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
+        # RV fix (97571d3 finding #2): the authoritative book_memory.json
+        # must be rewritten crash-safely — temp file in the same directory
+        # + os.replace — never via a direct Path.write_text, which can leave
+        # a torn/partial file if the process is interrupted mid-write.
+        # atomic_write serializes identically (ensure_ascii=False, indent=2).
+        atomic_write(str(path), data)
 
 
 def run_book(
@@ -1028,6 +1056,9 @@ def run_book(
                     "evidence_pids": list(p.get("evidence_pids") or []),
                     "chunk_ids": sorted({
                         str(c) for c in (p.get("chunk_ids") or [])
+                    }),
+                    "cumulative_chunk_ids": sorted({
+                        str(c) for c in (p.get("cumulative_chunk_ids") or [])
                     }),
                     "context": str(p.get("context") or ""),
                 }

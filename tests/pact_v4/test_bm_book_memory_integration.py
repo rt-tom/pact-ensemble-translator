@@ -497,6 +497,113 @@ class TestBookMemoryAccumulation:
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
         assert "Rose" in bm["characters"]
 
+    def test_accepted_degraded_uses_current_chapter_chunk_provenance(
+        self, tmp_path, monkeypatch,
+    ):
+        """RV fix: observation chunk provenance comes from the CURRENT chapter
+        candidate only, never from the cumulative-ledger union.
+
+        ch1: Rose in chunk0001, chapter complete, but below both thresholds
+        (1 occurrence / 1 chapter) so nothing promotes. ch2: Rose in accepted
+        chunk0002 while chunk0001 is quarantined in THIS chapter; the
+        cumulative ledger then reaches the thresholds (2 occurrences OR 2
+        chapters). The per-chapter chunk IDs repeat (chunk0001/chunk0002 in
+        both chapters), so a union over the cumulative ledger would pick
+        chunk0001 — quarantined in ch2 — and the B7 filter would drop the
+        valid promotion (proposed=1, committed=0). Expected: committed=1 and
+        Rose present in book_memory.
+        """
+        ch1 = (
+            "<p>Blake met Rose at the gate.</p>\n"        # p00001 (chunk0001)
+            "<p>The pact held firm against time.</p>\n"   # p00002 (chunk0001)
+            "<p>The others watched from afar.</p>"       # p00003 (chunk0001)
+        )
+        # ch2: first three paragraphs live in chunk0001 (quarantined here);
+        # Rose's ch2 evidence lives in p00004/p00005 (accepted chunk0002).
+        ch2 = (
+            "<p>The pact held firm against time.</p>\n"   # p00001 (chunk0001, Q)
+            "<p>The others watched from afar.</p>\n"      # p00002 (chunk0001, Q)
+            "<p>The door was old and strong.</p>\n"       # p00003 (chunk0001, Q)
+            "<p>Blake saw Rose smile.</p>\n"              # p00004 (chunk0002)
+            "<p>Rose waited outside.</p>\n"               # p00005 (chunk0002)
+            "<p>The night was quiet.</p>"                 # p00006 (chunk0002)
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Пакт держался стойко против времени.",
+            "p00003": "Остальные наблюдали издалека.",
+            "p00004": "Блэйк видел, как Роуз улыбнулась.",
+            "p00005": "Роуз ждала снаружи.",
+            "p00006": "Ночь была тихой.",
+        }
+        # ch2 is accepted_degraded with chunk0001 quarantined, but all of
+        # ch2's Rose evidence lives in chunk0002 (accepted).
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (ch1, "complete", [], translations),
+            "0002": (ch2, "accepted_degraded", ["chunk0001"], translations),
+        })
+
+        assert result["chapters"][1]["terminal_status"] == "accepted_degraded"
+        assert result["chapters"][1]["book_memory_candidates"]["committed"] == 1
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "Rose" in bm["characters"]
+        # The observation chunk_id must be the CURRENT chapter's accepted
+        # chunk (chunk0002), not the union-picked chunk0001 that is
+        # quarantined here (regression for 97571d3 finding).
+        promo = result["chapters"][1]["book_memory_promotions"][0]
+        assert promo["source"] == "Rose"
+        assert promo["chunk_ids"] == ["chunk0002"]
+
+    def test_fail_closed_when_current_chapter_provenance_missing(
+        self, tmp_path, monkeypatch,
+    ):
+        """RV fix, fail-closed branch: a candidate whose current-chapter
+        accepted provenance is missing/invalid is NEVER promoted, even when
+        the cumulative ledger satisfies the thresholds. A prior chapter's
+        chunk_ids must not substitute for the current chapter's accepted
+        provenance."""
+        html = (
+            "<p>Rose met Blake at the gate.</p>\n"
+            "<p>Rose knew the way.</p>\n"
+        )
+        translations = {
+            "p00001": "Роуз встретила Блэйка у ворот.",
+            "p00002": "Роуз знала дорогу.",
+        }
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        src_dir = tmp_path / "src"
+
+        def fake_run_one(*args, **kwargs):
+            return {"status": "ok"}
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        _write_chapter_html(src_dir, "0001", html)
+        # No chunk_plan.json at all: _pid_to_chunk returns None, so the
+        # candidate carries NO chunk provenance for the current chapter.
+        _make_chapter_artifacts(
+            out_base / "chapter_0001", "0001",
+            terminal_status="accepted_degraded", quarantined=["chunk0001"],
+            translations=translations,
+        )
+        (out_base / "chapter_0001" / "chunk_plan.json").unlink()
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+
+        rec = result["chapters"][0]
+        assert rec["book_memory_candidates"]["proposed"] == 0
+        assert rec["book_memory_candidates"]["committed"] == 0
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "Rose" not in bm["characters"]
+
     def test_fail_closed_on_unavailable_quarantine_provenance(
         self, tmp_path, monkeypatch,
     ):
@@ -546,6 +653,189 @@ class TestBookMemoryAccumulation:
             (memory / "observations.json").read_text(encoding="utf-8")
         )
         assert observations.get("book_memory", {}) == {}
+
+
+class _RecordingManager:
+    """Minimal MemoryManager stand-in recording add_observation calls."""
+
+    def __init__(self):
+        self.calls: list = []
+
+    def add_observation(self, category, key, payload):
+        self.calls.append((category, key, dict(payload)))
+
+
+class TestAutoPromoteBookMemoryProvenance:
+    """Direct unit coverage of _auto_promote_book_memory provenance rules."""
+
+    def _ledger(self, chapter_chunk_ids):
+        """Cumulative ledger record for Rose with per-chapter chunk_ids."""
+        return {
+            "character|rose": {
+                "source": "Rose", "kind": "character",
+                "total_occurrences": 4,
+                "chapters": [
+                    {"chapter_id": f"{i + 1:04d}", "chunk_ids": chunk_ids,
+                     "count": 2, "evidence_pids": [f"p{i + 1:05d}"],
+                     "gender": None, "gender_evidence_pids": []}
+                    for i, chunk_ids in enumerate(chapter_chunk_ids)
+                ],
+                "gender": None,
+            },
+        }
+
+    def test_promotion_uses_current_chapter_chunk_id_only(self):
+        """ch1 chunk0001 + ch2 chunk0002: the observation chunk_id is the
+        CURRENT chapter's chunk0002, never the sorted union chunk0001
+        (regression for the 97571d3 review finding)."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = _RecordingManager()
+        cand = {
+            "source": "Rose", "kind": "character", "occurrences": 2,
+            "chunk_ids": ["chunk0002"],
+            "evidence_pids": ["p00002"], "gender": None,
+        }
+        proposed, conflicts = v4_book_run._auto_promote_book_memory(
+            manager,
+            [cand],
+            self._ledger([["chunk0001"], ["chunk0002"]]),
+            {},
+            min_name_occurrences=2, min_name_chapters=2,
+        )
+        assert len(proposed) == 1
+        assert conflicts == []
+        char_calls = [c for c in manager.calls
+                      if c[0] == "book_memory" and c[1].startswith("characters:")]
+        assert len(char_calls) == 1
+        assert char_calls[0][2]["chunk_id"] == "chunk0002"
+
+    def test_missing_current_chunk_provenance_fails_closed(self):
+        """The candidate carries NO chunk_ids for the current chapter: even
+        though the cumulative ledger satisfies the thresholds, promotion is
+        skipped (fail-closed) — a prior chapter's chunk_id must not stand in
+        for the current chapter's accepted provenance."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = _RecordingManager()
+        cand = {
+            "source": "Rose", "kind": "character", "occurrences": 2,
+            "chunk_ids": [],  # missing/invalid current-chapter provenance
+            "evidence_pids": ["p00002"], "gender": None,
+        }
+        proposed, conflicts = v4_book_run._auto_promote_book_memory(
+            manager,
+            [cand],
+            self._ledger([["chunk0001"], ["chunk0002"]]),
+            {},
+            min_name_occurrences=2, min_name_chapters=2,
+        )
+        assert proposed == []
+        assert conflicts == []
+        assert manager.calls == []
+
+    def test_empty_current_chunk_ids_not_substituted_by_ledger(self):
+        """Same as above with an explicit empty chunk_ids list (a plan that
+        maps nothing): still fail-closed, no observation."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        manager = _RecordingManager()
+        cand = {
+            "source": "Rose", "kind": "character", "occurrences": 2,
+            "chunk_ids": [],
+            "evidence_pids": ["p00002"], "gender": None,
+        }
+        proposed, _conflicts = v4_book_run._auto_promote_book_memory(
+            manager,
+            [cand],
+            self._ledger([["chunk0001"]]),
+            {},
+            min_name_occurrences=2, min_name_chapters=1,
+        )
+        assert proposed == []
+        assert manager.calls == []
+
+
+class TestStripBookMemoryAtomicWrite:
+    """The authoritative book_memory.json rewrite after a BM promotion must
+    go through an atomic temp-file + os.replace path (crash-safe), not a
+    direct Path.write_text (97571d3 review finding #2)."""
+
+    def test_strip_uses_atomic_write_and_valid_json(self, tmp_path, monkeypatch):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        # Simulate a post-promote book_memory.json: a character entry that
+        # still carries the BM-internal chunk_id field.
+        bm = {
+            "pov": {"gender": "male", "source_name": "Blake Thorburn"},
+            "characters": {
+                "Blake Thorburn": {
+                    "type": "character", "gender": "male",
+                    "chapters": ["0001"], "variants": {"Blake": 1},
+                    "forbidden_targets": [],
+                },
+                "Rose": {
+                    "type": "character", "gender": "female",
+                    "chapters": ["0001", "0002"], "variants": {},
+                    "forbidden_targets": [], "chunk_id": "chunk0002",
+                },
+            },
+            "facts": [
+                {"fact": "Rose appears in chapters 0001, 0002.",
+                 "keys": ["Rose"], "chunk_id": "chunk0002"},
+            ],
+        }
+        (memory / "book_memory.json").write_text(
+            json.dumps(bm, ensure_ascii=False), encoding="utf-8",
+        )
+        # Make any direct Path.write_text to book_memory.json explode.
+        import os as _os
+        replace_calls: list = []
+        orig_replace = _os.replace
+
+        def spy_replace(src, dst):
+            replace_calls.append(str(dst))
+            return orig_replace(src, dst)
+
+        monkeypatch.setattr(_os, "replace", spy_replace)
+        # Also prove the strip does not use Path.write_text on the
+        # authoritative file.
+        orig_path_write = Path.write_text
+
+        def guarded_write_text(path_self, *args, **kwargs):
+            if str(path_self).endswith("book_memory.json"):
+                raise AssertionError(
+                    "authoritative book_memory.json must be rewritten via "
+                    "atomic temp-file + os.replace, not Path.write_text"
+                )
+            return orig_path_write(path_self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", guarded_write_text)
+
+        v4_book_run._strip_book_memory_observation_fields(memory)
+
+        # Atomic path used for the authoritative file.
+        assert any(p.endswith("book_memory.json") for p in replace_calls)
+        # Result is valid JSON and chunk_id is gone.
+        out = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "chunk_id" not in out["characters"]["Rose"]
+        assert "chunk_id" not in out["facts"][0]
+        # No leftover temp files in the memory dir.
+        leftovers = [p for p in memory.iterdir()
+                     if p.name not in ("book_memory.json", "glossary.json",
+                                       "observations.json")]
+        assert leftovers == []
+
+    def test_strip_noop_preserves_bytes(self, tmp_path):
+        """Byte preservation: a book_memory.json with no chunk_id fields is
+        never rewritten (no write at all, exact bytes preserved)."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        before = (memory / "book_memory.json").read_bytes()
+        v4_book_run._strip_book_memory_observation_fields(memory)
+        assert (memory / "book_memory.json").read_bytes() == before
 
 
 # ---------------------------------------------------------------------------
