@@ -211,7 +211,7 @@ _CH2_DISAGREE_TRANSLATIONS = {
 
 class TestBookRunCandidateIntegration:
     def _run(self, tmp_path, monkeypatch, chapter_specs,
-             mixed_script_allow=(), book_memory_bytes=None):
+             mixed_script_allow=(), book_memory_bytes=None, **run_kwargs):
         from pact_full_pipeline_runner_v1 import v4_book_run
 
         memory = _setup_memory(tmp_path, book_memory_bytes=book_memory_bytes)
@@ -237,6 +237,7 @@ class TestBookRunCandidateIntegration:
             chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
             out_base=out_base,
             mixed_script_allow=mixed_script_allow,
+            **run_kwargs,
         )
         return memory, out_base, result
 
@@ -306,21 +307,41 @@ class TestBookRunCandidateIntegration:
         """B9-RV9 HIGH regression: a glossary-only promotion must NOT
         read-modify-write ``book_memory.json``.
 
-        ``book_memory.json`` is seeded with deliberately noncanonical compact
-        JSON (``{"pov":{"gender":"male"}}`` — any reformatting would change
-        its bytes). A ``complete`` chapter promotes a glossary candidate; the
-        raw bytes and the recorded per-chapter ``_book_memory_hash`` must
-        stay exactly the same, so snapshot/cache identity cannot change
-        solely from JSON reformatting.
+        BM (V4.1 §15) legitimately promotes recurring proper names (Blake)
+        into book_memory, so a Blake chapter is no longer "glossary-only".
+        This fixture uses a TERM-only chapter (``pact``, lowercase — never a
+        book_memory character candidate) promoted with ``term_min_chapters=1``
+        to keep the byte-preservation invariant testable: the glossary
+        category changes while book_memory has NO observations, so its bytes
+        (and the recorded per-chapter ``_book_memory_hash``) must stay
+        exactly the same.
         """
+        term_html = (
+            "<p>The pact was sealed with blood.</p>\n"
+            "<p>The pact bound them all.</p>\n"
+            "<p>The pact held for years.</p>"
+        )
+        term_translations = {
+            "p00001": "Пакт был скреплён кровью.",
+            "p00002": "Пакт связывал их всех.",
+            "p00003": "Пакт держался годами.",
+        }
         book_memory_bytes = b'{"pov":{"gender":"male"}}'
-        memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (_CH1_HTML, "complete", [], _CH1_TRANSLATIONS),
-        }, book_memory_bytes=book_memory_bytes)
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, {
+                "0001": (term_html, "complete", [], term_translations),
+            },
+            book_memory_bytes=book_memory_bytes,
+            term_min_chapters=1,
+        )
 
-        # Sanity: this IS a real glossary promotion (Blake, 4 occurrences).
+        # Sanity: this IS a real glossary promotion (pact term, 3 occurrences,
+        # term_min_chapters=1) and BM generated NO character candidates.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Blake": "Блэйк"}
+        assert glossary == {"pact": "пакт"}
+        assert result["chapters"][0]["book_memory_candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
 
         # Exact bytes preserved — no read-modify-write reformatting.
         assert (memory / "book_memory.json").read_bytes() == book_memory_bytes
@@ -340,17 +361,32 @@ class TestBookRunCandidateIntegration:
 
         An ``accepted_degraded`` chapter WITHOUT quarantined chunks (valid
         PID->chunk plan, no exclusion needed — the F5/F6 fail-closed branch
-        does not engage) promotes its glossary candidate while leaving
-        ``book_memory.json`` bytes and ``_book_memory_hash`` untouched.
+        does not engage) promotes its glossary term candidate while leaving
+        ``book_memory.json`` bytes and ``_book_memory_hash`` untouched (same
+        term-only fixture as the complete case — see the sibling test).
         """
+        term_html = (
+            "<p>The pact was sealed with blood.</p>\n"
+            "<p>The pact bound them all.</p>\n"
+            "<p>The pact held for years.</p>"
+        )
+        term_translations = {
+            "p00001": "Пакт был скреплён кровью.",
+            "p00002": "Пакт связывал их всех.",
+            "p00003": "Пакт держался годами.",
+        }
         book_memory_bytes = b'{"pov":{"gender":"male"}}'
-        memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (_CH1_HTML, "accepted_degraded", [], _CH1_TRANSLATIONS),
-        }, book_memory_bytes=book_memory_bytes)
+        memory, out_base, result = self._run(
+            tmp_path, monkeypatch, {
+                "0001": (term_html, "accepted_degraded", [], term_translations),
+            },
+            book_memory_bytes=book_memory_bytes,
+            term_min_chapters=1,
+        )
 
         # Sanity: the accepted_degraded valid-plan chapter still promotes.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Blake": "Блэйк"}
+        assert glossary == {"pact": "пакт"}
 
         # Exact bytes preserved — no read-modify-write reformatting.
         assert (memory / "book_memory.json").read_bytes() == book_memory_bytes
