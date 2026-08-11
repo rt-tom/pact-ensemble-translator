@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pytest
 
+from pact_v4.audit.entity_extractor import VALIDATION_REPORT_SCHEMA
 from pact_v4.pipeline.b3_audit_repair import (
     B3AuditRepair,
     B3AuditRepairConfig,
@@ -84,12 +85,14 @@ class _B3MockBackend(CompletionBackend):
         reaudit_issues: Optional[Sequence[Mapping[str, Any]]] = None,
         entity_payload: Optional[Mapping[str, Any]] = None,
         fail_audit: bool = False,
+        fail_entity: bool = False,
     ) -> None:
         self._audit_issues = list(audit_issues or [])
         self._repair_results = list(repair_results or [])
         self._reaudit_issues = list(reaudit_issues or [])
         self._entity_payload = entity_payload or {"entities": []}
         self._fail_audit = fail_audit
+        self._fail_entity = fail_entity
         self.requests: List[CompletionRequest] = []
 
     @property
@@ -107,6 +110,8 @@ class _B3MockBackend(CompletionBackend):
         self.requests.append(request)
         label = request.label or ""
         if "entity_extractor" in label:
+            if self._fail_entity:
+                raise CompletionError("simulated entity extraction failure")
             return _ok_response(self._entity_payload)
         if "qwen_chapter_audit" in label:
             if self._fail_audit:
@@ -384,6 +389,126 @@ def test_b3_entity_disabled_skips_prepass(tmp_path: Path) -> None:
     assert cache["entity_context_enabled"] is False
     # No entity cache file was created.
     assert not (cfg.out_dir / "entity_context_cache.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# B3-DIAG: entity_context_validation_report.json — what the model PROPOSED
+# vs what the code ACCEPTED. Written next to entity_context_cache.json only
+# when a fresh validation actually ran (drop/downgrade decisions with
+# reasons); an extractor failure writes neither file.
+# ---------------------------------------------------------------------------
+
+
+# Mixed model output against the synthetic chapter (8 paragraphs of
+# "word0 word1 ... word34" each): one fully valid entity (no entry), one
+# claim dropped for a dead PID, one relation downgraded (verified->candidate).
+ENTITY_PAYLOAD_MIXED = {
+    "entities": [
+        {
+            "entity": "the thing",
+            "canonical_type": "word0",
+            "anchor": {"pid": "p00001", "span": "word0"},
+            "aliases": [
+                {"surface": "word1", "pid": "p00002", "span": "word1"},
+            ],
+            "claims": [
+                {
+                    "kind": "object_identity",
+                    "value": "word1 = word0",
+                    "status": "candidate",
+                    "evidence": [
+                        {"pid": "p00001", "span": "word0"},
+                        {"pid": "p00002", "span": "word1"},
+                    ],
+                    "evidence_windows": [["p00001", "p00002"]],
+                },
+            ],
+        },
+        {
+            "entity": "the ghost",
+            "canonical_type": "word2",
+            "anchor": {"pid": "p00003", "span": "word2"},
+            "aliases": [],
+            "claims": [
+                {
+                    "kind": "object_identity",
+                    "value": "ghost = word3",
+                    "status": "candidate",
+                    "evidence": [{"pid": "p99999", "span": "word3"}],
+                    "evidence_windows": [["p00003", "p00004"]],
+                },
+            ],
+        },
+        {
+            "entity": "the shadow",
+            "canonical_type": "word4",
+            "anchor": {"pid": "p00005", "span": "word4"},
+            "aliases": [],
+            "claims": [
+                {
+                    "kind": "object_identity",
+                    "value": "shadow = word5",
+                    "status": "verified",
+                    "evidence": [
+                        {"pid": "p00005", "span": "word4"},
+                        {"pid": "p00006", "span": "word5"},
+                    ],
+                    "evidence_windows": [["p00005", "p00006"]],
+                },
+            ],
+        },
+    ],
+}
+
+
+def test_b3_entity_validation_report_records_drop_and_downgrade(
+    tmp_path: Path,
+) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[], reaudit_issues=[],
+        entity_payload=ENTITY_PAYLOAD_MIXED,
+    )
+    result = _run_with_b3(cfg, backend)
+    assert result.step6["entity_context_enabled"] is True
+
+    report_path = cfg.out_dir / "entity_context_validation_report.json"
+    assert report_path.exists()
+    report = _read_json(report_path)
+    assert report["schema"] == VALIDATION_REPORT_SCHEMA
+    entries = report["entries"]
+    # The fully-valid entity produced no entry; the dead-PID claim was
+    # dropped and the verified relation was downgraded — both with reasons.
+    assert [e["entity"] for e in entries] == ["the ghost", "the shadow"]
+    dropped = next(e for e in entries if e["action"] == "dropped")
+    downgraded = next(e for e in entries if e["action"] == "downgraded")
+    assert dropped["entity"] == "the ghost"
+    assert "dead PID p99999" in dropped["reason"]
+    assert downgraded["entity"] == "the shadow"
+    assert "same_entity relation is semantic" in downgraded["reason"]
+    # Every entry carries the entity/claim/action/reason quad.
+    for entry in entries:
+        assert {"entity", "claim", "action", "reason"} <= set(entry)
+
+    # The validated context still carries the surviving entities.
+    cache = _read_json(cfg.out_dir / "entity_context_cache.json")
+    assert cache["schema"] == "pact-v4-entity-context-cache/v1"
+
+
+def test_b3_entity_extractor_failure_writes_no_validation_report(
+    tmp_path: Path,
+) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[], reaudit_issues=[], fail_entity=True,
+    )
+    result = _run_with_b3(cfg, backend)
+
+    # The extractor never reached validation -> B3 failed; neither the
+    # entity cache nor the validation report exists.
+    assert result.step6["status"] == "failed"
+    assert not (cfg.out_dir / "entity_context_cache.json").exists()
+    assert not (cfg.out_dir / "entity_context_validation_report.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1132,7 @@ def test_b8_manifest_omits_b3_when_skipped(tmp_path: Path) -> None:
     assert "b3_audit_journal" not in artefacts
     assert "b3_audit_cache" not in artefacts
     assert "b3_entity_context_cache" not in artefacts
+    assert "b3_entity_validation_report" not in artefacts
 
 
 def test_b8_manifest_omits_b3_when_no_machinery(tmp_path: Path) -> None:
@@ -1025,6 +1151,7 @@ def test_b8_manifest_omits_b3_when_no_machinery(tmp_path: Path) -> None:
     assert "b3_audit_journal" not in artefacts
     assert "b3_audit_cache" not in artefacts
     assert "b3_entity_context_cache" not in artefacts
+    assert "b3_entity_validation_report" not in artefacts
 
 
 def test_b8_manifest_lists_b3_when_full_flow(tmp_path: Path) -> None:
@@ -1035,8 +1162,14 @@ def test_b8_manifest_lists_b3_when_full_flow(tmp_path: Path) -> None:
     assert artefacts["b3_audit_journal"].endswith("audit_journal.ndjson")
     assert artefacts["b3_audit_cache"].endswith("audit_cache_b3.json")
     assert artefacts["b3_entity_context_cache"].endswith("entity_context_cache.json")
+    assert artefacts["b3_entity_validation_report"].endswith(
+        "entity_context_validation_report.json"
+    )
     # The advertised files actually exist.
-    for key in ("b3_audit_journal", "b3_audit_cache", "b3_entity_context_cache"):
+    for key in (
+        "b3_audit_journal", "b3_audit_cache",
+        "b3_entity_context_cache", "b3_entity_validation_report",
+    ):
         assert Path(artefacts[key]).exists(), key
 
 

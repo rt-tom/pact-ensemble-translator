@@ -42,6 +42,14 @@ Provenance / cache contract:
   "resume does not skip an incomplete audit").
 * ``entity_context_cache.json`` (schema from ``entity_extractor``) — the
   B1.2 per-chapter entity cache (``source_hash + extractor_version``).
+* ``entity_context_validation_report.json`` (schema
+  ``pact-v4-entity-extractor-validation/v1``) — B3-DIAG transparency:
+  what the model PROPOSED vs what the code ACCEPTED. Written next to the
+  entity cache whenever a FRESH extraction ran validation (drop/downgrade
+  decisions with reasons from ``EntityExtractionResult.validation``). A
+  cache hit reuses the previously validated context and never clobbers the
+  original report; an extractor failure (never reaching validation) writes
+  neither the cache nor the report.
 
 Transport: audit/repair/entity calls go through ``CompletionBackend``
 (``build_role_backend``), so the same pipeline serves local, remote and
@@ -340,6 +348,10 @@ def _entity_cache_path(out_dir: Path) -> Path:
     return out_dir / "entity_context_cache.json"
 
 
+def _entity_validation_report_path(out_dir: Path) -> Path:
+    return out_dir / "entity_context_validation_report.json"
+
+
 def _journal_path(out_dir: Path) -> Path:
     return out_dir / "audit_journal.ndjson"
 
@@ -367,6 +379,23 @@ def _load_entity_cache(out_dir: Path) -> EntityContextCache:
 
 def _save_entity_cache(out_dir: Path, cache: EntityContextCache) -> None:
     _atomic_write_json(_entity_cache_path(out_dir), cache.to_payload())
+
+
+def _save_entity_validation_report(
+    out_dir: Path, report: Mapping[str, Any]
+) -> None:
+    """Persist the extractor's drop/downgrade decisions (B3-DIAG).
+
+    Written next to ``entity_context_cache.json`` so a run shows what the
+    model PROPOSED vs what the code ACCEPTED (dead PID / non-verbatim span /
+    translation-derived / gender without referent link / relation
+    verified->candidate). Only written when a fresh validation actually ran
+    — a cache hit reuses the previously validated context, so the report of
+    the original extraction is preserved, never clobbered with an empty one.
+    """
+    _atomic_write_json(
+        _entity_validation_report_path(out_dir), report
+    )
 
 
 class B3AuditCache:
@@ -713,6 +742,15 @@ class B3AuditRepair:
             entity_hash = canonical_json_hash(entity_payload)
             entity_context = render_entity_context_block(extraction.context)
             _save_entity_cache(out_dir, entity_cache)
+            # B3-DIAG transparency: what the model proposed vs what the code
+            # accepted. A fresh extraction's validation report is persisted
+            # next to the cache; a cache hit reuses the previously validated
+            # context (validation report empty), so the original report is
+            # kept, never overwritten with an empty one.
+            if not extraction.from_cache:
+                _save_entity_validation_report(
+                    out_dir, extraction.validation.to_payload()
+                )
             journal.emit(
                 "entity_context",
                 enabled=True,

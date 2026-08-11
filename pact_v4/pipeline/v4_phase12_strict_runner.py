@@ -4406,6 +4406,7 @@ def _run_whole_chapter_strict_impl(
         ("b3_audit_journal", "audit_journal.ndjson"),
         ("b3_audit_cache", "audit_cache_b3.json"),
         ("b3_entity_context_cache", "entity_context_cache.json"),
+        ("b3_entity_validation_report", "entity_context_validation_report.json"),
     ):
         candidate = cfg.out_dir / name
         if candidate.exists():
