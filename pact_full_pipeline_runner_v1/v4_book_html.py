@@ -20,8 +20,8 @@ Two input layouts are supported:
   Pass ``--run-dirs`` (literal dirs and/or ``run_*`` glob patterns);
   ``chapter_id`` is resolved from the record (fallback: ``chapter_id``
   metadata inside ``translations.json``, then the run dir name). Chapter
-  order = ``--chapters`` order when given, otherwise the resolved run
-  order.
+  order = ``--chapters`` order when given, otherwise the resolved
+  ``chapter_id`` order (natural sort).
 
 The book is assembled as a single ``book.html``: chapters in the given
 order, each inside a ``<section id="chapter-<id>">``, with a table of
@@ -49,6 +49,7 @@ import glob
 import html
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -72,6 +73,20 @@ _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _ALLOWED_INLINE_TAGS = frozenset({"em", "strong", "i", "b", "a"})
 _ALLOWED_ATTRS = frozenset({"href", "title", "lang", "class"})
 _SAFE_URL_SCHEMES = ("http:", "https:", "mailto:")
+
+
+def natural_key(value: str) -> list:
+    """Natural (numeric-aware) sort key, same pattern as elsewhere in the
+    repo (v4_measurement_harness, compare_pipeline_review, ...).
+
+    ``"0002"`` sorts before ``"0010"`` (numeric), and mixed ids like
+    ``"run_2"`` vs ``"run_10"`` order by their numeric tail rather than
+    lexicographically.
+    """
+    return [
+        int(piece) if piece.isdigit() else piece.casefold()
+        for piece in re.split(r"(\d+)", value)
+    ]
 
 
 def _sanitize_translation(text: str) -> str:
@@ -363,7 +378,8 @@ def render_book(
       resolved from ``strict_chapter_trial_record.json`` (fallback:
       ``chapter_id`` metadata in ``translations.json``, then the run dir
       name). Chapter order = ``chapter_ids`` order when provided (book
-      order), otherwise the resolved run order.
+      order), otherwise the resolved ``chapter_id`` order (natural sort —
+      independent of the run-dir glob/insertion order).
 
     Source HTML is resolved from ``chapter_html_pattern`` (``{chapter_id}``
     placeholder). Returns the report dict (also written to ``report_path``
@@ -393,8 +409,11 @@ def render_book(
                     f"использую имя директории ({chapter_id})"
                 )
             id_to_run.setdefault(chapter_id, run_dir)
-        # Book order: chapter_ids when given, else the run order.
-        ordered_ids = list(chapter_ids) if chapter_ids else list(id_to_run)
+        # Book order: chapter_ids when given, else the resolved chapter_id
+        # order (natural sort — NOT the run-dir glob/insertion order, which
+        # can disagree with the ids when a run dir name is unrelated).
+        ordered_ids = list(chapter_ids) if chapter_ids else \
+            sorted(id_to_run, key=natural_key)
         for chapter_id in ordered_ids:
             run_dir = id_to_run.get(chapter_id)
             if run_dir is None:

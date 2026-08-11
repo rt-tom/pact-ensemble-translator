@@ -501,3 +501,62 @@ def test_render_book_v41_run_dirs_chapter_ids_order_overrides_run_order(
     assert report["errors"] == []
     content = (paths["out_base"] / "book.html").read_text(encoding="utf-8")
     assert content.index('id="chapter-0002"') < content.index('id="chapter-0001"')
+
+
+def test_render_book_v41_run_dirs_no_chapter_ids_orders_by_resolved_id(
+    tmp_path: Path,
+):
+    """RV finding (abe40c1): with ``run_dirs`` but no ``chapter_ids`` the
+    book order must follow the RESOLVED chapter_id (natural sort), not the
+    run-dir glob/insertion order. run_001 carries chapter_id 0002 and
+    run_002 carries 0001, so glob order (run_001 first) disagrees with the
+    ids — the report and book.html must still list 0001 before 0002."""
+    out_base = tmp_path / "out"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "0001.html").write_text(_SRC, encoding="utf-8")
+    (src_dir / "0002.html").write_text(
+        "<h1>Chapter Two</h1><p>Text two.</p>", encoding="utf-8",
+    )
+
+    def _write_run(name: str, chapter_id: str, translations: dict) -> Path:
+        run_dir = out_base / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "translations.json").write_text(
+            json.dumps(translations, ensure_ascii=False), encoding="utf-8",
+        )
+        (run_dir / "strict_chapter_trial_record.json").write_text(
+            json.dumps({
+                "schema": "pact-v4-strict-chapter-trial/v2",
+                "run_label": f"v4.1-{name}",
+                "chapter_id": chapter_id,
+                "identities": {},
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    # Glob order run_001 < run_002, but the resolved chapter ids are the
+    # reverse — the dir names deliberately disagree with the ids.
+    _write_run("run_001", "0002", {
+        "p00001": "Глава вторая", "p00002": "Текст второй.",
+    })
+    _write_run("run_002", "0001", _translations())
+
+    report = render_book(
+        out_base=out_base,
+        chapter_ids=[],
+        chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+        run_dirs=["run_*"],
+        title="Тестовая книга",
+    )
+    assert report["errors"] == []
+    # Report chapter order follows the resolved chapter ids.
+    assert [ch["chapter_id"] for ch in report["chapters"]] == ["0001", "0002"]
+    # book.html sections follow the same order.
+    content = (out_base / "book.html").read_text(encoding="utf-8")
+    assert content.index('id="chapter-0001"') < content.index('id="chapter-0002"')
+    # Each chapter's translations come from the run dir whose record carries
+    # that id (0001 -> run_002, 0002 -> run_001).
+    assert "run_002" in report["chapters"][0]["translations"]
+    assert "run_001" in report["chapters"][1]["translations"]
