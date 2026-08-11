@@ -921,13 +921,16 @@ class BackendEntityExtractorConfig:
     ``max_tokens`` must cover the server's reasoning budget PLUS content
     headroom — the llama-server counts reasoning and content TOGETHER
     against ``max_tokens`` (same contract as the audit's
-    ``DEFAULT_MAX_TOKENS = 12000`` = reasoning 8192 + ~3500 headroom).
-    The previous 4096 value was pre-reasoning: with ``--reasoning-budget
-    8192`` the model spent the whole budget on reasoning and emitted zero
-    content tokens (EmptyResponseError after retries).
+    ``DEFAULT_MAX_TOKENS``). The 12000 value (= 8192 reasoning + ~3800
+    headroom) is enough for audit chunks (3.6k input, short reasoning) but
+    NOT for the extractor: its input is the WHOLE chapter (~16k tokens),
+    which provokes reasoning to the full 8192 budget, leaving only ~3800
+    tokens for the entities JSON — the response was truncated exactly at
+    12000 tokens (3/3 retries, run_009 2026-08-11). 20000 = 8192 reasoning
+    + ~11800 content headroom (entities JSON for a 400-PID chapter).
     """
 
-    max_tokens: int = 12000
+    max_tokens: int = 20000
     label: str = "b1.2/entity_extractor"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
 
