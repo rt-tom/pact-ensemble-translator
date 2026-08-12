@@ -427,7 +427,10 @@ def _detect_whole_chapter_phase(
                              "(awaiting repair_round/gate)")
         return "step6", "B3 audit incomplete (fail-closed); awaiting gate"
     if audit_chunk_started or audit_chunk_done:
-        total = audit_chunk_started[-1].get("total") or audit_chunk_done[-1].get("total")
+        total = ((audit_chunk_started[-1].get("total")
+                  if audit_chunk_started else None)
+                 or (audit_chunk_done[-1].get("total")
+                     if audit_chunk_done else None))
         done_n = len(audit_chunk_done)
         last = (audit_chunk_started or audit_chunk_done)[-1]
         current = last.get("chunk") or done_n or len(audit_chunk_started)
@@ -735,8 +738,8 @@ def _whole_chapter_chunk_row(out_dir: Path, events: List[Dict[str, Any]]) -> Dic
              else ("in_progress" if audit_started else "not_started"))
     audit_total = (
         (audit_done or audit_started)[-1].get("total")
-        or len(audit_started)
-    )
+        if (audit_done or audit_started) else 0
+    ) or len(audit_started)
     audit_basis = f"B3 audit chunks done={len(audit_done)}/{audit_total}"
 
     repair_rounds = [e for e in b3 if e.get("event") == "repair_round"]
