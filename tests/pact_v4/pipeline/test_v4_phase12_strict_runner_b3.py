@@ -124,7 +124,7 @@ class _B3MockBackend(CompletionBackend):
                 raise CompletionError("simulated audit transport failure")
             return _ok_response({"issues": self._audit_issues})
         if "selective_repair" in label:
-            return _ok_response({"results": self._repair_results})
+            return _ok_response(self._repair_payload(request))
         if "reaudit" in label:
             return _ok_response({"issues": self._reaudit_issues})
         raise AssertionError(f"unexpected B3 request label {label!r}")
@@ -162,6 +162,46 @@ class _B3MockBackend(CompletionBackend):
                 "class": klass,
             })
         return {"edits": edits}
+
+    def _repair_payload(self, request: CompletionRequest) -> dict:
+        """Resolve canned repair results against the request's TRANSLATION.
+
+        ``repaired_translation`` entries of the literal token ``"<current>"``
+        are replaced with the request's own current text for that PID (parsed
+        from the TRANSLATION block, mirroring ``_r_editor_payload``), so a
+        mock repair always echoes a FULL-LENGTH text — never a fragment that
+        the run_011 text-preservation gate would (correctly) reject. Any other
+        canned string is returned verbatim (explicit-fixture tests).
+        """
+        prompt = request.messages[0].content
+        current: dict = {}
+        in_translation = False
+        for line in prompt.splitlines():
+            line = line.strip()
+            if line.startswith("TRANSLATION"):
+                in_translation = True
+                continue
+            if in_translation:
+                if line.startswith("FINDINGS") or not line:
+                    break
+                if ":" not in line:
+                    continue
+                pid, _, text = line.partition(":")
+                pid = pid.strip()
+                text = text.strip()
+                if pid.startswith("p") and text:
+                    current[pid] = text
+        results = []
+        for entry in self._repair_results:
+            item = dict(entry)
+            repaired = item.get("repaired_translation")
+            if isinstance(repaired, str) and repaired.startswith("<current>"):
+                suffix = repaired[len("<current>"):]
+                item["repaired_translation"] = (
+                    current.get(item.get("pid", ""), "") + suffix
+                )
+            results.append(item)
+        return {"results": results}
 
     def close(self) -> None:
         pass
@@ -1274,6 +1314,145 @@ def test_b7_journal_started_before_failed_done_transport_error(tmp_path: Path) -
     assert failed[0]["error"]
 
 
+def test_b7_r_editor_chunk_events_in_journal(tmp_path: Path) -> None:
+    """A2 (run_011): R emits per-chunk ``r_editor_chunk_started`` /
+    ``r_editor_chunk_done`` journal events — a failed R chunk carries the
+    REAL reason (parse/transport error), not just r_editor_started/done."""
+    from pact_v4.pipeline.b3_audit_repair import B3AuditRepairConfig
+
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _FlakyREditorBackend(_B3MockBackend):
+        """Serves a valid first r_editor chunk and a BROKEN second one."""
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._r_editor_served = 0
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            if "russian_editor" in (request.label or ""):
+                self.requests.append(request)
+                self._r_editor_served += 1
+                if self._r_editor_served > 1:
+                    # run_011 shape: the model omits ``class`` -> parse fails
+                    # fail-closed 'unknown edit class' — the journal must name
+                    # it. The edit targets the FIRST pid of THIS chunk and
+                    # echoes its exact current text (chunk 2 = p00005..).
+                    first_pid, current_text = self._first_chunk_pair(request)
+                    return _ok_response({"edits": [{
+                        "pid": first_pid,
+                        "original": current_text,
+                        "rewritten": current_text + " испр.",
+                        "reason": "дубль",
+                        # no "class" key
+                    }]})
+                return _ok_response({"edits": []})
+            return super().complete(request)
+
+        @staticmethod
+        def _first_chunk_pair(request: CompletionRequest) -> tuple:
+            import re as _re
+            in_edit_pairs = False
+            for line in request.messages[0].content.splitlines():
+                line = line.strip()
+                if line.startswith("EDIT_PAIRS"):
+                    in_edit_pairs = True
+                    continue
+                if not in_edit_pairs or ":" not in line:
+                    continue
+                pid, _, text = line.partition(":")
+                pid = pid.strip()
+                text = text.strip()
+                # Only real PIDs (p00001-style) inside EDIT_PAIRS, never
+                # schema lines ("pid: string ...") or CONTEXT_ONLY pids.
+                if _re.fullmatch(r"p\d{5}", pid) and text:
+                    return pid, text
+            return "p00001", ""
+
+    backend = _FlakyREditorBackend(
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            entity_context_enabled=False,
+            russian_editor_enabled=True,
+            russian_editor_chunk_size=4,  # 2 chunks for 8 pids
+        ),
+    )
+    events = _journal_events(cfg.out_dir)
+    started = [e for e in events if e["event"] == "r_editor_chunk_started"]
+    done = [e for e in events if e["event"] == "r_editor_chunk_done"]
+    assert len(started) == 2 and len(done) == 2
+    # Causality: each started precedes its matching done.
+    assert events.index(started[0]) < events.index(done[0])
+    # The SECOND chunk failed and the journal names the REAL reason.
+    failed = [e for e in done if e["status"] == "FAILED"]
+    assert failed, "a failed R chunk must carry a terminal done event"
+    assert failed[0]["error"], "the fail reason must be in the journal"
+    assert "class" in failed[0]["error"]
+    # R raw artifacts are on disk for BOTH chunks (A1 trail).
+    assert (cfg.out_dir / "r_editor_chunk1_raw.txt").exists()
+    assert (cfg.out_dir / "r_editor_chunk2_raw.txt").exists()
+    assert (cfg.out_dir / "r_editor_chunk2_reasoning.txt").exists()
+
+
+def test_b3_repair_and_reaudit_raw_artifacts_written(tmp_path: Path) -> None:
+    """B1/C1 (run_011): repair-batch + re-audit raw/reasoning artifacts appear
+    in the out_dir next to the audit cache."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        repair_results=[{
+            "index": 1, "decision": "repair", "pid": "p00001",
+            "repaired_translation": "<current> — убран дубль",
+            "reason": "убрал дубль",
+        }],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+    assert result.step8["released_as_audited"] is True
+    assert (cfg.out_dir / "b3_repair_batch1_raw.txt").exists()
+    assert (cfg.out_dir / "b3_repair_batch1_reasoning.txt").exists()
+    assert (cfg.out_dir / "b3_repair_reaudit_raw.txt").exists()
+    assert (cfg.out_dir / "b3_repair_reaudit_reasoning.txt").exists()
+
+
+def test_b3_truncated_repair_rejected_in_journal(tmp_path: Path) -> None:
+    """B3 (run_011): a repair that truncates the PID text >60% is REJECTED —
+    the batch FAILS with 'truncated repair' and the journal records it in the
+    repair_round debt_trace (never committed, never released)."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        # A FRAGMENT: ~6 chars vs the ~18-char current text -> <40% -> rejected.
+        repair_results=[{
+            "index": 1, "decision": "repair", "pid": "p00001",
+            "repaired_translation": "дубль",
+            "reason": "убрал дубль",
+        }],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+    # The truncated repair is REJECTED: the gate holds, nothing committed.
+    assert result.step7["committed_pids"] == []
+    assert result.step8["released_as_audited"] is False
+    events = _journal_events(cfg.out_dir)
+    rounds = [e for e in events if e["event"] == "repair_round"]
+    assert rounds and any("truncated repair" in d for d in rounds[0]["debt_trace"])
+    # The raw artifact preserves the fragment for diagnosis (B1 trail).
+    raw = cfg.out_dir / "b3_repair_batch1_raw.txt"
+    assert raw.exists()
+    assert '"repaired_translation": "дубль"' in raw.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # F8 (B3 review): the artifact manifest advertises only artifacts that were
 # actually created — skip/fail runs must not list nonexistent B3 outputs.
@@ -1464,11 +1643,15 @@ def test_b3_r_editor_runs_and_applies_safe_edits(tmp_path: Path) -> None:
             "excerpt": "номер3 номер3",
         }],
         # Audit finding index 1 (p00003) + review candidate index 2 (p00002).
+        # ``<current>`` resolves to the request's full current text (the
+        # mock echoes a FULL-LENGTH repair, as the verifier contract demands —
+        # a fragment would be rejected by the run_011 preservation gate).
         repair_results=[
             {"index": 1, "decision": "repair", "pid": "p00003",
-             "repaired_translation": "Перевод номер3", "reason": "убран дубль"},
+             "repaired_translation": "<current> — убран дубль",
+             "reason": "убран дубль"},
             {"index": 2, "decision": "repair", "pid": "p00002",
-             "repaired_translation": "Перевод номер2 — переформулировано",
+             "repaired_translation": "<current> — переформулировано",
              "reason": "калька подтверждена"},
         ],
         reaudit_issues=[],
@@ -1483,8 +1666,10 @@ def test_b3_r_editor_runs_and_applies_safe_edits(tmp_path: Path) -> None:
     assert repaired["p00001"].endswith("— исправлено")
     # REVIEW candidate accepted by the verifier -> committed.
     assert repaired["p00002"].endswith("— переформулировано")
-    # Audit repair committed too.
-    assert repaired["p00003"] == "Перевод номер3"
+    # Audit repair committed too (full-length text echoed, per the verifier
+    # contract — never a fragment).
+    assert repaired["p00003"].endswith("— убран дубль")
+    assert len(repaired["p00003"]) > len(repaired["p00001"])  # paragraph kept
 
     # Artifacts written with identity.
     edited = _read_json(cfg.out_dir / "translations_edited.json")

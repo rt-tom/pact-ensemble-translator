@@ -63,6 +63,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
@@ -107,7 +108,7 @@ LOG = logging.getLogger(__name__)
 
 REPAIR_SCHEMA = "pact-repair/v1"
 REPAIR_HARNESS_VERSION = "1.0"
-REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v1"
+REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v2"
 
 # Cap on eligible findings repaired per chapter (owner decision 2026-08-11:
 # run_010 showed the 10-finding cap cut 73% of real findings — cap on
@@ -567,6 +568,21 @@ def parse_repair_batch(
                 f"(no-op repair is a contract violation — use decision 'pass')"
             )
             continue
+        # B3 (run_011): text-preservation gate — a repair that keeps under 40%
+        # of the current text is a TRUNCATED repair (the model returned a
+        # fragment instead of the FULL corrected PID; 7 PIDs in run_011 lost
+        # dialogues/sentences this way). One-directional length guard, NOT
+        # two-way similarity — a legitimate fix may rewrite heavily but must
+        # keep the whole paragraph.
+        current_text = str(current_by_pid.get(pid, ""))
+        if len(repaired.strip()) < 0.4 * len(current_text.strip()):
+            errors.append(
+                f"index {index}: truncated repair — repaired_translation is "
+                f"{len(repaired.strip())} chars vs {len(current_text.strip())} "
+                f"chars current text (<40% preserved; the FULL corrected PID "
+                f"text must be returned, never a fragment)"
+            )
+            continue
         out.append(
             RepairResult(
                 index=index,
@@ -779,6 +795,8 @@ class SelectiveRepairEvaluator:
         narrator_context: str = "",
         review_candidates: Sequence[ReviewCandidate] = (),
         on_phase: Optional[Callable[[str], None]] = None,
+        out_dir: Optional[Path] = None,
+        out_base: str = "b3_repair",
     ) -> SelectiveRepairOutcome:
         cfg = self._config
         model_ref = repair_model_ref(self._repair_backend)
@@ -850,6 +868,8 @@ class SelectiveRepairEvaluator:
                 translation=translation,
                 findings=batch,
                 batch_index=batch_index,
+                out_dir=out_dir,
+                out_base=out_base,
             )
             batch_outcomes.append(outcome)
             finding_by_index = {f.index: f for f in batch}
@@ -880,6 +900,8 @@ class SelectiveRepairEvaluator:
                 changed_pids=tuple(committed),
                 entity_context=entity_context,
                 narrator_context=narrator_context,
+                out_dir=out_dir,
+                out_base=out_base,
             )
             if reaudit.failed:
                 repair_complete = False
@@ -913,6 +935,32 @@ class SelectiveRepairEvaluator:
     # internals
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _write_batch_artifacts(
+        *,
+        out_dir: Optional[Path],
+        out_base: str,
+        batch_index: int,
+        content: str,
+        reasoning: str,
+    ) -> None:
+        """Persist one repair batch's raw response + reasoning.
+
+        Mirrors ``ChunkedAudit._write_artifacts``: ``b3_repair_batch{N}_raw.txt``
+        / ``b3_repair_batch{N}_reasoning.txt``. Written on EVERY batch — a
+        parse failure (incl. the 'truncated repair' gate) then leaves a disk
+        trail (run_011 lesson: truncated PIDs were undiagnosable).
+        """
+        if out_dir is None:
+            return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"{out_base}_batch{batch_index}_raw.txt").write_text(
+            content, encoding="utf-8"
+        )
+        (out_dir / f"{out_base}_batch{batch_index}_reasoning.txt").write_text(
+            reasoning, encoding="utf-8"
+        )
+
     def _run_batch(
         self,
         *,
@@ -921,6 +969,8 @@ class SelectiveRepairEvaluator:
         translation: Mapping[str, str],
         findings: Sequence[EligibleFinding],
         batch_index: int,
+        out_dir: Optional[Path] = None,
+        out_base: str = "b3_repair",
     ) -> RepairBatchOutcome:
         cfg = self._config
         prompt = render_selective_repair_prompt(
@@ -944,14 +994,27 @@ class SelectiveRepairEvaluator:
             response = self._repair_backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
             LOG.error("repair batch transport failure (%s): %s", type(exc).__name__, exc)
+            self._write_batch_artifacts(
+                out_dir=out_dir, out_base=out_base, batch_index=batch_index,
+                content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                reasoning="",
+            )
             return RepairBatchOutcome(
                 batch_index=batch_index,
                 status="FAILED",
                 findings=tuple(findings),
                 error=f"{type(exc).__name__}: {exc}",
             )
+        content = response.text or ""
+        reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+        # B1 (run_011): persist raw + reasoning on EVERY batch — a parse
+        # failure (incl. a 'truncated repair' gate hit) leaves a disk trail.
+        self._write_batch_artifacts(
+            out_dir=out_dir, out_base=out_base, batch_index=batch_index,
+            content=content, reasoning=reasoning,
+        )
         results, errors = parse_repair_batch(
-            response.text or "", findings, current_by_pid=dict(translation)
+            content, findings, current_by_pid=dict(translation)
         )
         if errors:
             return RepairBatchOutcome(
@@ -968,6 +1031,31 @@ class SelectiveRepairEvaluator:
             results=results,
         )
 
+    @staticmethod
+    def _write_reaudit_artifacts(
+        *,
+        out_dir: Optional[Path],
+        out_base: str,
+        content: str,
+        reasoning: str,
+    ) -> None:
+        """Persist the re-audit's raw response + reasoning.
+
+        ``b3_repair_reaudit_raw.txt`` / ``b3_repair_reaudit_reasoning.txt``
+        (single re-audit call per chapter — no batch index). Written on EVERY
+        attempt, incl. transport failure (run_010 lesson: an empty JSON of
+        8265 tokens with content=0 was undiagnosable without the raw trail).
+        """
+        if out_dir is None:
+            return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"{out_base}_reaudit_raw.txt").write_text(
+            content, encoding="utf-8"
+        )
+        (out_dir / f"{out_base}_reaudit_reasoning.txt").write_text(
+            reasoning, encoding="utf-8"
+        )
+
     def _run_reaudit(
         self,
         *,
@@ -977,6 +1065,8 @@ class SelectiveRepairEvaluator:
         changed_pids: Sequence[str],
         entity_context: str,
         narrator_context: str = "",
+        out_dir: Optional[Path] = None,
+        out_base: str = "b3_repair",
     ) -> ReauditOutcome:
         cfg = self._config
         try:
@@ -1027,10 +1117,27 @@ class SelectiveRepairEvaluator:
             # (CompletionError or any subclass) propagates immediately and is
             # never retried as a JSON problem (B4 §1/§3).
             try:
-                return self._reaudit_backend.complete(request).text or ""
+                response = self._reaudit_backend.complete(request)
             except CompletionError as exc:
                 LOG.error("re-audit transport failure (%s): %s", type(exc).__name__, exc)
+                # C1 (run_010): even a transport failure leaves a disk trail —
+                # the empty-JSON mystery (8265 tokens, content=0) must be
+                # diagnosable from the artifact, not just the journal.
+                self._write_reaudit_artifacts(
+                    out_dir=out_dir, out_base=out_base,
+                    content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                    reasoning="",
+                )
                 raise
+            text = response.text or ""
+            reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+            # C1 (run_010): persist raw + reasoning on EVERY attempt — a final
+            # empty/truncated body still leaves the reasoning that caused it.
+            self._write_reaudit_artifacts(
+                out_dir=out_dir, out_base=out_base,
+                content=text, reasoning=reasoning,
+            )
+            return text
 
         try:
             content = retry_json_call(

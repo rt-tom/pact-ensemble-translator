@@ -436,7 +436,7 @@ def test_parse_repair_same_pid_wrong_index_fails_closed():
     text = json.dumps({
         "results": [{
             "index": 1, "decision": "repair", "pid": "p00193",
-            "repaired_translation": "x", "reason": "a",
+            "repaired_translation": "внучек", "reason": "a",
         }]
     })
     _, errors = parse_repair_batch(text, findings, {"p00193": "внучка"})
@@ -457,6 +457,155 @@ def test_parse_repair_invalid_json_fails_closed():
     findings = (_eligible("p00193", 1),)
     _, errors = parse_repair_batch("not json {", findings, {})
     assert errors and "not valid JSON" in errors[0]
+
+
+def test_parse_repair_truncated_fragment_rejected():
+    """B3 (run_011): a repair that keeps <40% of the current text is a
+    TRUNCATED repair (the model returned a fragment instead of the FULL
+    corrected PID — 7 PIDs lost dialogues/sentences this way). The batch is
+    REJECTED with 'truncated repair', never committed."""
+    findings = (_eligible("p00193", 1),)
+    current = {
+        "p00193": "— Понимаю, — сказал я. Я встал и потянулся. Был почти "
+                  "уверен, что завтра всё тело будет ломить. — Объяснять "
+                  "не нужно. Я всё понимаю.",
+    }
+    assert len("Был почти уверен.") < 0.4 * len(current["p00193"])
+    text = json.dumps({
+        "results": [{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "Был почти уверен.",
+            "reason": "обрезка",
+        }]
+    }, ensure_ascii=False)
+    results, errors = parse_repair_batch(text, findings, current)
+    assert results == ()
+    assert errors and "truncated repair" in errors[0]
+    assert "40%" in errors[0]
+
+
+def test_parse_repair_full_length_rewrite_accepted():
+    """B3: the gate is a ONE-DIRECTIONAL length guard, NOT two-way
+    similarity — a fix that heavily rewrites the paragraph but keeps >=40%
+    of the text is accepted (the model may rephrase freely within the PID)."""
+    findings = (_eligible("p00193", 1),)
+    current = {"p00193": "Она была так поглощена собой, что почти не "
+                         "заметила меня; её пальцы нервно перебирали что-то "
+                         "на коленях."}
+    repaired = "Она была так поглощена своими мыслями, что почти не " \
+               "заметила меня; её пальцы нервно переплетались на коленях."
+    assert len(repaired) >= 0.4 * len(current["p00193"])
+    text = json.dumps({
+        "results": [{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": repaired, "reason": "переформулировано",
+        }]
+    }, ensure_ascii=False)
+    results, errors = parse_repair_batch(text, findings, current)
+    assert not errors
+    assert results[0].repaired_translation == repaired
+
+
+def test_repair_prompt_requires_full_pid_text_not_fragment():
+    """B2 (run_011): REPAIR_AS_VERIFIER_V1 must instruct the model that
+    repaired_translation is the FULL corrected PID text — never a fragment
+    (the run_011 truncations came from the model returning a fragment)."""
+    instructions = REPAIR_AS_VERIFIER_V1.instructions
+    assert "FULL corrected text" in instructions
+    assert "every sentence of the paragraph" in instructions
+    assert "Never return a fragment" in instructions
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v2"
+
+
+def test_repair_and_reaudit_write_raw_reasoning_artifacts(tmp_path):
+    """B1/C1 (run_011): the repair evaluator persists
+    ``b3_repair_batch{N}_raw.txt``/``_reasoning.txt`` for EVERY batch and
+    ``b3_repair_reaudit_raw.txt``/``_reasoning.txt`` for the re-audit — a
+    parse failure (incl. the 'truncated repair' gate) leaves a disk trail."""
+    issue = _issue(
+        "p00193", "invented_gender",
+        note="gender-neutral grandchild translated as female внучка",
+        excerpt="внучка", severity="minor", confidence="high",
+    )
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+
+    class _ReasoningBackend(ScriptedRepairBackend):
+        def __init__(self, script: Sequence[CompletionResponse]) -> None:
+            super().__init__(script)
+            self._i = 0
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            if not self._script:
+                raise AssertionError("ScriptedRepairBackend: script exhausted")
+            resp = self._script.pop(0)
+            self._i += 1
+            return CompletionResponse(
+                text=resp.text or "",
+                model=resp.model or "qwen-3.6-35b",
+                finish_reason="stop",
+                raw_metadata={"reasoning": f"reasoning-call-{self._i}"},
+            )
+
+    backend = _ReasoningBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "А потом заявила, что это должен быть внук-",
+            "reason": "source is gender-neutral grandchild",
+        }]),
+        _reaudit_response([]),  # clean re-audit
+    ])
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
+    )
+    assert outcome.repair_complete is True
+    batch_raw = tmp_path / "b3_repair_batch1_raw.txt"
+    batch_reason = tmp_path / "b3_repair_batch1_reasoning.txt"
+    reaudit_raw = tmp_path / "b3_repair_reaudit_raw.txt"
+    reaudit_reason = tmp_path / "b3_repair_reaudit_reasoning.txt"
+    assert batch_raw.exists() and batch_reason.exists()
+    assert reaudit_raw.exists() and reaudit_reason.exists()
+    assert "внук-" in batch_raw.read_text(encoding="utf-8")
+    assert batch_reason.read_text(encoding="utf-8") == "reasoning-call-1"
+    assert reaudit_reason.read_text(encoding="utf-8") == "reasoning-call-2"
+
+
+def test_truncated_repair_rejected_leaves_raw_artifact(tmp_path):
+    """B3 + B1: a batch whose model returns a truncated fragment is FAILED
+    with 'truncated repair' AND the raw response is preserved on disk."""
+    issue = _issue(
+        "p00193", "invented_gender",
+        note="gender-neutral grandchild translated as female внучка",
+        excerpt="внучка", severity="minor", confidence="high",
+    )
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {
+        "p00193": "А потом заявила, что это должна быть внучка-"
+                  " Она была так поглощена собой, что почти не заметила меня;"
+                  " её пальцы нервно перебирали что-то на коленях.",
+    }
+    filtered = _hard_filtered([issue], source, translation)
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "Она была так поглощена собой.",
+            "reason": "обрезка",
+        }]),
+    ])
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
+    )
+    assert outcome.repair_complete is False
+    assert any("truncated repair" in d for d in outcome.debt_trace)
+    raw = tmp_path / "b3_repair_batch1_raw.txt"
+    assert raw.exists()
+    assert "Она была так поглощена собой." in raw.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
