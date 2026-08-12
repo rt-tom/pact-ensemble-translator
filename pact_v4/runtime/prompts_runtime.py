@@ -705,7 +705,11 @@ REGION_FIDELITY_GATE_BATCH_V1 = ReviewerPrompt(
 # for a CONTEXT_ONLY pid.
 RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
     role="russian_editor",
-    version="pact-v4.2-russian-editor/v2",
+    # R-FIX2 (run_012, 2026-08-12): v3 — original is now a VERBATIM FRAGMENT
+    # of the PID text (one sentence or a shorter span), not the whole PID.
+    # The parse/apply contract mirrors this (substring validation +
+    # substring-replace). Identity-bearing: bumping invalidates the R cache.
+    version="pact-v4.2-russian-editor/v3",
     instructions=(
         "You are a Russian-language editor for a Russian literary "
         "translation. You are given the RUSSIAN text of a chapter as a map "
@@ -731,6 +735,9 @@ RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
         "Rules:\n"
         "- Only edit the target PID; keep every other PID verbatim.\n"
         "- Fix only the stated defect; do not rewrite the whole paragraph.\n"
+        "- original is the exact fragment you are fixing, quoted verbatim "
+        "from the PID text (may be one sentence or a shorter span); it must "
+        "appear in the PID text word-for-word.\n"
         "- rewritten must actually differ from original (no-op edits are "
         "invalid).\n"
         "- Do not change names, numbers, or already-correct text.\n"
@@ -740,8 +747,11 @@ RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
         "this schema:\n"
         "  edits: array of objects, one per proposed edit, each with:\n"
         "    pid: string (the target PID)\n"
-        "    original: string (the exact current Russian text of that PID)\n"
-        "    rewritten: string (the corrected Russian text of that PID)\n"
+        "    original: string (the exact fragment you are fixing, quoted "
+        "verbatim from the PID text — may be one sentence or a shorter span; "
+        "it must appear in the PID text word-for-word)\n"
+        "    rewritten: string (the corrected Russian text of that "
+        "fragment)\n"
         "    reason: short string (one or two sentences)\n"
         "    class: one of typo|grammar|duplicate|preposition|calque|logic|"
         "ambiguity|unnatural|register\n"

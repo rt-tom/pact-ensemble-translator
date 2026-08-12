@@ -27,17 +27,20 @@ harmful):
    ``rewritten != original`` (cuts the p00095-class false positive where
    Qwen proposes the same text). A no-op edit is dropped for BOTH classes
    (never applied, never forwarded as a candidate).
-5. **Routing** — SAFE edits (diff-gated) are applied and become
-   ``translations_edited.json``; REVIEW edits become ``edit_candidates.json``
-   and are NEVER auto-applied (they are later verified by the B2
-   repair-as-verifier against the ORIGINAL).
+5. **Routing (R-FIX2 substring-replace)** — a SAFE edit is applied as
+   ``current.replace(original, rewritten, 1)``: only the quoted fragment
+   changes, the rest of the PID text is preserved (run_012 p00010-class
+   fragments; also the run_011 p00244-class truncation guard). Applied
+   edits become ``translations_edited.json``; REVIEW edits become
+   ``edit_candidates.json`` and are NEVER auto-applied (they are later
+   verified by the B2 repair-as-verifier against the ORIGINAL).
 6. **Fail-closed** — a structurally invalid chunk (unknown pid, pid outside
-   the chunk, ``original`` mismatch with the current text, unknown class,
-   non-string/missing fields, duplicate pid) makes the WHOLE chunk FAILED,
-   and the stage is recorded ``complete=False`` — the caller must then NOT
-   apply a partial editor pass (the B3 integration treats an incomplete R
-   stage as debt and proceeds with the raw map, exactly like a failed repair
-   batch: the audit still protects the chapter).
+   the chunk, ``original`` not a verbatim substring of the current text,
+   unknown class, non-string/missing fields, duplicate pid) makes the WHOLE
+   chunk FAILED, and the stage is recorded ``complete=False`` — the caller
+   must then NOT apply a partial editor pass (the B3 integration treats an
+   incomplete R stage as debt and proceeds with the raw map, exactly like a
+   failed repair batch: the audit still protects the chapter).
 
 Transport: the evaluator is backend-neutral over ``CompletionBackend`` (the
 same boundary the B1 chunked audit uses); it resolves the model ref via
@@ -175,11 +178,13 @@ class RussianEditorOutcome:
     """Aggregated result of one Russian-editor pass.
 
     ``edits`` carries every structurally valid edit of GOOD chunks;
-    ``applied`` is the SAFE/diff-gated subset as ``(pid, rewritten)``;
-    ``candidates`` is the REVIEW subset (never auto-applied). ``dropped``
-    counts no-op edits (rewritten == original) cut by the diff-gate.
-    ``complete`` is False when ANY chunk failed (fail-closed: the caller
-    must not apply a partial pass).
+    ``applied`` is the SAFE/diff-gated subset as ``(pid, new_text)`` where
+    ``new_text`` is the current text with the ``original`` fragment replaced
+    once by ``rewritten`` (R-FIX2 substring-replace — the rest of the PID is
+    preserved); ``candidates`` is the REVIEW subset (never auto-applied).
+    ``dropped`` counts no-op edits (rewritten == original) cut by the
+    diff-gate. ``complete`` is False when ANY chunk failed (fail-closed: the
+    caller must not apply a partial pass).
     """
 
     schema: str
@@ -290,11 +295,14 @@ def parse_editor_edits(
 
     Fail-closed contract: the response must be a JSON object with an
     ``edits`` array; every edit must name a pid OF THE CURRENT CHUNK (never
-    CONTEXT_ONLY), echo the EXACT current text as ``original``, carry a
-    non-empty ``rewritten`` and ``reason``, and tag a KNOWN class. Any
-    structural violation (unknown pid, original mismatch, unknown class,
-    missing/non-string fields, duplicate pid) fails the WHOLE chunk — a bad
-    chunk is never silently read as ``edits=[]``.
+    CONTEXT_ONLY), quote the exact FRAGMENT being fixed verbatim from the
+    current text as ``original`` (one sentence or a shorter span; it must be
+    a substring of the current text — R-FIX2, run_012 p00010-class
+    fragments), carry a non-empty ``rewritten`` and ``reason``, and tag a
+    KNOWN class. Any structural violation (unknown pid, original not a
+    substring, unknown class, missing/non-string fields, duplicate pid)
+    fails the WHOLE chunk — a bad chunk is never silently read as
+    ``edits=[]``.
 
     The diff-gate (``rewritten == original`` → no-op) is NOT a parse error:
     a no-op edit is structurally valid but worthless, so it is cut per-edit
@@ -335,11 +343,11 @@ def parse_editor_edits(
         if not isinstance(original, str) or original == "":
             errors.append(f"pid {pid}: original is missing or not a string")
             continue
-        if original != str(current_by_pid.get(pid, "")):
+        if original not in str(current_by_pid.get(pid, "")):
             errors.append(
-                f"pid {pid}: original does not match the current text "
-                f"(model must echo the exact current Russian text, "
-                f"including leading/trailing whitespace)"
+                f"pid {pid}: original is not a substring of the current text "
+                f"(model must quote the exact fragment verbatim from the "
+                f"current Russian text)"
             )
             continue
         if not isinstance(rewritten, str) or not rewritten.strip():
@@ -375,15 +383,25 @@ def parse_editor_edits(
 
 def route_edits(
     edits: Sequence[EditorEdit],
+    *,
+    current_by_pid: Mapping[str, str],
     safe_classes: frozenset = frozenset(SAFE_CLASSES),
 ) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[ReviewCandidate, ...], int]:
     """Route parsed edits into (applied, candidates, dropped).
 
     * SAFE-classed edit with ``rewritten != original`` (diff-gate) →
-      applied ``(pid, rewritten)``;
+      applied ``(pid, new_text)`` where ``new_text`` is the current text
+      with the ``original`` FRAGMENT replaced once by ``rewritten``
+      (R-FIX2 substring-replace: only the quoted fragment changes, the
+      rest of the PID is preserved — run_012 p00010-class, and the
+      run_011 p00244-class truncation guard);
     * REVIEW-classed edit → ``ReviewCandidate`` (never auto-applied);
     * any class with ``rewritten == original`` → no-op, dropped (the
       p00095-class false positive the diff-gate cuts).
+
+    ``current_by_pid`` is the pid→current-text map the parse validated
+    against; parse guarantees ``original`` is a substring, so ``replace``
+    always finds the fragment (fail-closed at parse, applied here).
     """
     applied: list = []
     candidates: list = []
@@ -393,7 +411,10 @@ def route_edits(
             dropped += 1
             continue
         if edit.klass in safe_classes:
-            applied.append((edit.pid, edit.rewritten))
+            current = str(current_by_pid.get(edit.pid, ""))
+            applied.append(
+                (edit.pid, current.replace(edit.original, edit.rewritten, 1))
+            )
         else:
             candidates.append(
                 ReviewCandidate(
@@ -577,7 +598,9 @@ class RussianEditorEvaluator:
             )
 
         applied, candidates, dropped = route_edits(
-            all_edits, safe_classes=cfg.safe_classes
+            all_edits,
+            current_by_pid=dict(translation),
+            safe_classes=cfg.safe_classes,
         )
         successful = len(chunks) - len(failed_chunks)
         return RussianEditorOutcome(
