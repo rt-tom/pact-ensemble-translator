@@ -106,10 +106,15 @@ from pact_v4.audit.russian_editor import (
 from pact_v4.phase1.models import SourceArtifact, canonical_json_hash
 from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_BASE_DELAY_SECONDS,
-    DEFAULT_REAUDIT_FULL_THRESHOLD,
+    DEFAULT_REAUDIT_MAX_INPUT_TOKENS,
+    DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS,
     DEFAULT_REAUDIT_MAX_RETRIES,
     DEFAULT_REAUDIT_MAX_TOKENS,
+    DEFAULT_REAUDIT_MIN_OVERLAP_PAIRS,
     DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
+    DEFAULT_REAUDIT_OVERLAP_TOKENS,
+    DEFAULT_REPAIR_CONTEXT_WINDOW,
+    REAUDIT_DELTA_FORMAT,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
     REPAIR_FINDINGS_CAP,
@@ -274,8 +279,26 @@ class B3AuditRepairConfig:
     repair_findings_cap: int = REPAIR_FINDINGS_CAP
     repair_microbatch_trigger: int = MICROBATCH_TRIGGER
     repair_microbatch_target: int = MICROBATCH_TARGET
+    # REPAIR-CTX (card t_97b31f81, F5): the repair-batch local context
+    # window (±N neighbour pairs around each finding PID) is part of the run
+    # config identity (StrictRunConfig.to_config_artifact) and is wired into
+    # SelectiveRepairConfig below — a window change must invalidate a stale
+    # cached repaired map (old full-chapter batches can never replay under a
+    # local-context prompt).
+    repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW
     repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
-    repair_reaudit_full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD
+    # REPAIR-CTX (t_97b31f81, owner decision 2026-08-12): the re-audit is a
+    # CHUNKED audit over the affected region (changed PIDs + neighbours) —
+    # the whole-chapter re-audit mode (old full_threshold) is CANCELLED. The
+    # re-audit chunk/overlap settings and the REPAIRED CHANGES delta format
+    # are identity-bearing (F5): a change invalidates a stale cached repaired
+    # map (an old full-chapter re-audit can never replay under the chunked
+    # local-context prompt).
+    repair_reaudit_max_input_tokens: int = DEFAULT_REAUDIT_MAX_INPUT_TOKENS
+    repair_reaudit_overlap_tokens: int = DEFAULT_REAUDIT_OVERLAP_TOKENS
+    repair_reaudit_min_overlap_pairs: int = DEFAULT_REAUDIT_MIN_OVERLAP_PAIRS
+    repair_reaudit_max_overlap_pairs: int = DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS
+    repair_reaudit_delta_format: str = REAUDIT_DELTA_FORMAT
     # The re-audit output budget and its bounded B4 JSON retry policy are
     # part of the run config identity (StrictRunConfig.to_config_artifact)
     # and are wired into SelectiveRepairConfig below (RV 71b7cbc fix, F5) —
@@ -315,8 +338,15 @@ class B3AuditRepairConfig:
             "repair_findings_cap": self.repair_findings_cap,
             "repair_microbatch_trigger": self.repair_microbatch_trigger,
             "repair_microbatch_target": self.repair_microbatch_target,
+            "repair_context_window": self.repair_context_window,
             "repair_reaudit_neighbour_window": self.repair_reaudit_neighbour_window,
-            "repair_reaudit_full_threshold": self.repair_reaudit_full_threshold,
+            "repair_reaudit_chunk": {
+                "max_input_tokens": self.repair_reaudit_max_input_tokens,
+                "overlap_tokens": self.repair_reaudit_overlap_tokens,
+                "min_overlap_pairs": self.repair_reaudit_min_overlap_pairs,
+                "max_overlap_pairs": self.repair_reaudit_max_overlap_pairs,
+                "delta_format": self.repair_reaudit_delta_format,
+            },
             "repair_reaudit_max_tokens": self.repair_reaudit_max_tokens,
             "repair_reaudit_retry": {
                 "max_retries": self.repair_reaudit_max_retries,
@@ -1273,8 +1303,24 @@ class B3AuditRepair:
                     findings_cap=cfg.repair_findings_cap,
                     microbatch_trigger=cfg.repair_microbatch_trigger,
                     microbatch_target=cfg.repair_microbatch_target,
+                    # REPAIR-CTX (t_97b31f81, F5): the local-context window is
+                    # wired from the B3 config (identity carries it), so the
+                    # evaluator can never silently fall back to module
+                    # defaults — a window change invalidates the repaired map
+                    # cache.
+                    repair_context_window=cfg.repair_context_window,
                     reaudit_neighbour_window=cfg.repair_reaudit_neighbour_window,
-                    reaudit_full_threshold=cfg.repair_reaudit_full_threshold,
+                    # REPAIR-CTX (t_97b31f81, F5): the re-audit chunk/overlap
+                    # settings and the REPAIRED CHANGES delta format are
+                    # wired from the B3 config (identity carries them), so the
+                    # evaluator can never silently fall back to module
+                    # defaults — a chunk/delta change invalidates the repaired
+                    # map cache.
+                    reaudit_max_input_tokens=cfg.repair_reaudit_max_input_tokens,
+                    reaudit_overlap_tokens=cfg.repair_reaudit_overlap_tokens,
+                    reaudit_min_overlap_pairs=cfg.repair_reaudit_min_overlap_pairs,
+                    reaudit_max_overlap_pairs=cfg.repair_reaudit_max_overlap_pairs,
+                    reaudit_delta_format=cfg.repair_reaudit_delta_format,
                     # RV 71b7cbc fix (F5): the re-audit output budget and the
                     # bounded B4 JSON retry policy are wired from the B3
                     # config — the identity carries them, so the evaluator

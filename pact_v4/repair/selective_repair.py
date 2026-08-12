@@ -67,8 +67,14 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
+    DEFAULT_MAX_INPUT_TOKENS,
+    DEFAULT_OVERLAP_TOKENS,
+    MAX_OVERLAP_PAIRS,
+    MIN_OVERLAP_PAIRS,
     AuditPair,
     audit_model_ref,
+    build_greedy_chunks,
+    get_overlap_context,
     pairs_from_maps,
     validate_chunk_json,
 )
@@ -94,6 +100,7 @@ from pact_v4.runtime.json_resilience import (
     retry_json_call,
 )
 from pact_v4.runtime.prompts_runtime import (
+    DEFAULT_REPAIR_CONTEXT_WINDOW,
     REPAIR_AS_VERIFIER_V1,
     ReviewerPrompt,
     render_reaudit_prompt,
@@ -123,16 +130,31 @@ MICROBATCH_TRIGGER = 4
 MICROBATCH_TARGET = 4
 
 # Default neighbour window for the single re-audit (PIDs before/after each
-# changed PID, in source order) and the full-re-audit threshold (changed PID
-# count above which the re-audit covers the whole chapter).
+# changed PID, in source order) — REPAIR-CTX (t_97b31f81): the re-audit is a
+# CHUNKED audit over the affected region (changed + neighbours), NEVER the
+# whole chapter (run_012 re-audit input was 41.5k tokens and truncated the
+# 49k context). The whole-chapter mode (old ``full_threshold``) is CANCELLED.
 DEFAULT_REAUDIT_NEIGHBOUR_WINDOW = 2
-DEFAULT_REAUDIT_FULL_THRESHOLD = 8
 
-# Repair output budget (per batch call) and re-audit output budget. The
-# re-audit input profile is the SAME as the extractor (full source + full
-# current translation), so it shares the extractor's 20000-token budget
-# (8192 reasoning + content headroom; 12000 was exhausted by reasoning on
-# the full input in run_010-style chapters — owner decision 2026-08-11).
+# REPAIR-CTX re-audit chunk settings (identity-bearing, F5): the re-audit
+# reuses the audit's chunking/overlap mechanisms (build_greedy_chunks /
+# get_overlap_context) over the affected region. Defaults mirror the audit
+# chunk budget/overlap so ~50 pairs per chunk.
+DEFAULT_REAUDIT_MAX_INPUT_TOKENS = DEFAULT_MAX_INPUT_TOKENS  # 3600
+DEFAULT_REAUDIT_OVERLAP_TOKENS = DEFAULT_OVERLAP_TOKENS      # 400
+DEFAULT_REAUDIT_MIN_OVERLAP_PAIRS = MIN_OVERLAP_PAIRS        # 2
+DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS = MAX_OVERLAP_PAIRS        # 6
+# Version of the REPAIRED CHANGES delta block {pid, before, after} rendered
+# into the re-audit prompt (identity-bearing — a format change invalidates
+# cache/resume, F5).
+REAUDIT_DELTA_FORMAT = "pact-v4-reaudit-delta/v1"
+
+# Repair output budget (per batch call) and re-audit output budget. REPAIR-CTX
+# (t_97b31f81): the re-audit input is now the affected REGION (changed PIDs +
+# neighbours, chunked), not the full chapter — but the 20000-token output
+# budget is kept (chunked JSON responses + reasoning headroom; the old
+# 12000-token budget was exhausted by reasoning on the full input in
+# run_010-style chapters — owner decision 2026-08-11).
 DEFAULT_REPAIR_MAX_TOKENS = 4000
 DEFAULT_REAUDIT_MAX_TOKENS = 20000
 
@@ -164,9 +186,25 @@ class SelectiveRepairConfig:
     label: str = "phase3/selective_repair_v4"
     harness_version: str = REPAIR_HARNESS_VERSION
     prompt_version: str = REPAIR_PROMPT_VERSION
+    # REPAIR-CTX (card t_97b31f81, owner decision 2026-08-12): local context
+    # window for repair batches — ONLY the findings PIDs plus ±N neighbour
+    # pairs are rendered (NOT the full chapter maps). Default ±3 (3 назад +
+    # 3 вперёд). Identity-bearing (F5): a window change must invalidate a
+    # stale cached repaired map.
+    repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW
     reaudit_enabled: bool = True
     reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
-    reaudit_full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD
+    # REPAIR-CTX (t_97b31f81): the re-audit is a CHUNKED audit over the
+    # affected region (changed + neighbours) reusing the audit's chunking /
+    # overlap mechanisms — the whole-chapter re-audit mode is CANCELLED, so
+    # there is no full_threshold anymore. Chunk/overlap settings and the
+    # REPAIRED CHANGES delta format are identity-bearing (F5): changing them
+    # invalidates a stale cached repaired map.
+    reaudit_max_input_tokens: int = DEFAULT_REAUDIT_MAX_INPUT_TOKENS
+    reaudit_overlap_tokens: int = DEFAULT_REAUDIT_OVERLAP_TOKENS
+    reaudit_min_overlap_pairs: int = DEFAULT_REAUDIT_MIN_OVERLAP_PAIRS
+    reaudit_max_overlap_pairs: int = DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS
+    reaudit_delta_format: str = REAUDIT_DELTA_FORMAT
     reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
     # Bounded B4 JSON retry for the re-audit call (owner decision 2026-08-11,
     # run_010: a single empty content on the full-input re-audit failed the
@@ -220,20 +258,39 @@ class RepairBatchOutcome:
 
 @dataclass(frozen=True)
 class ReauditOutcome:
-    """Outcome of the single post-repair re-audit call.
+    """Outcome of the post-repair re-audit pass.
 
-    ``complete`` is True when the call, JSON parse and scope validation all
-    succeeded (``issues`` then carries what the re-audit found in scope);
-    ``failed`` is True when any of those failed — the caller must treat that
-    as debt and NEVER claim ``0 findings`` (fail-closed, Phase 0/A1c fix).
+    REPAIR-CTX (t_97b31f81): the re-audit is a CHUNKED audit over the
+    affected region (changed PIDs + neighbours), never the whole chapter.
+    ``complete`` is True when EVERY chunk's call, JSON parse and scope
+    validation succeeded (``issues`` then carries what the re-audit found in
+    scope across all chunks); ``failed`` is True when any chunk failed — the
+    caller must treat that as debt and NEVER claim ``0 findings``
+    (fail-closed, Phase 0/A1c fix). ``full`` is retained for journal schema
+    stability and is ALWAYS False (the whole-chapter re-audit mode is
+    cancelled).
     """
 
     complete: bool
     failed: bool
     issues: Tuple[Mapping[str, Any], ...] = ()
     scope: Tuple[str, ...] = ()
-    full: bool = False
+    full: bool = False  # always False — whole-chapter mode cancelled
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class RepairedChange:
+    """One repair delta entry for the re-audit prompt (REPAIRED CHANGES).
+
+    ``pid``, ``before`` (pre-repair translation), ``after`` (repaired
+    translation) — the auditor verifies the CORRECTNESS of each repair
+    against the delta instead of just re-reading the text.
+    """
+
+    pid: str
+    before: str
+    after: str
 
 
 @dataclass(frozen=True)
@@ -608,19 +665,17 @@ def plan_reaudit_scope(
     all_pids: Sequence[str],
     *,
     neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
-    full_threshold: int = DEFAULT_REAUDIT_FULL_THRESHOLD,
-) -> Tuple[Tuple[str, ...], bool]:
-    """Scope of the single post-repair re-audit: ``(pids, full)``.
+) -> Tuple[str, ...]:
+    """Scope of the post-repair re-audit: changed PIDs + their neighbours.
 
-    Default: the changed PIDs plus their neighbour window (``window`` PIDs
-    before/after each in source order), in source order — a single Qwen call.
-    When the number of changed PIDs exceeds ``full_threshold`` the scope
-    becomes the whole chapter (``full=True``), per the architecture plan
-    §10 B2.4 ("при превышении порога изменённых регионов — один full
-    re-audit").
+    REPAIR-CTX (t_97b31f81, owner decision 2026-08-12): the re-audit covers
+    ONLY the affected region — the changed PIDs plus ``neighbour_window``
+    PIDs before/after each in source order, in source order. The whole-
+    chapter re-audit mode (old ``full_threshold``) is CANCELLED: the re-audit
+    NEVER drags the full chapter (run_012 re-audit input was 41.5k tokens
+    and truncated the 49k context); the region is chunked like the audit
+    instead.
     """
-    if len(changed_pids) > full_threshold:
-        return tuple(all_pids), True
     positions = {pid: i for i, pid in enumerate(all_pids)}
     scope: set = set()
     for pid in changed_pids:
@@ -633,7 +688,7 @@ def plan_reaudit_scope(
             min(len(all_pids), i + neighbour_window + 1),
         ):
             scope.add(all_pids[j])
-    return tuple(pid for pid in all_pids if pid in scope), False
+    return tuple(pid for pid in all_pids if pid in scope)
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +952,7 @@ class SelectiveRepairEvaluator:
                 chapter_id=chapter_id,
                 source=source,
                 translation=dict(translation, **committed),
+                original_translation=translation,
                 changed_pids=tuple(committed),
                 entity_context=entity_context,
                 narrator_context=narrator_context,
@@ -979,6 +1035,7 @@ class SelectiveRepairEvaluator:
             translation=dict(translation),
             findings=findings,
             template=cfg.template,
+            repair_context_window=cfg.repair_context_window,
         )
         model_ref = repair_model_ref(self._repair_backend)
         request = CompletionRequest(
@@ -1036,23 +1093,26 @@ class SelectiveRepairEvaluator:
         *,
         out_dir: Optional[Path],
         out_base: str,
+        chunk_index: int,
         content: str,
         reasoning: str,
     ) -> None:
-        """Persist the re-audit's raw response + reasoning.
+        """Persist one re-audit chunk's raw response + reasoning.
 
-        ``b3_repair_reaudit_raw.txt`` / ``b3_repair_reaudit_reasoning.txt``
-        (single re-audit call per chapter — no batch index). Written on EVERY
-        attempt, incl. transport failure (run_010 lesson: an empty JSON of
-        8265 tokens with content=0 was undiagnosable without the raw trail).
+        ``b3_repair_reaudit_chunk{N}_raw.txt`` /
+        ``b3_repair_reaudit_chunk{N}_reasoning.txt`` (REPAIR-CTX: the re-audit
+        is chunked like the audit — one artifact pair per chunk). Written on
+        EVERY attempt, incl. transport failure (run_010 lesson: an empty JSON
+        of 8265 tokens with content=0 was undiagnosable without the raw
+        trail).
         """
         if out_dir is None:
             return
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / f"{out_base}_reaudit_raw.txt").write_text(
+        (out_dir / f"{out_base}_reaudit_chunk{chunk_index}_raw.txt").write_text(
             content, encoding="utf-8"
         )
-        (out_dir / f"{out_base}_reaudit_reasoning.txt").write_text(
+        (out_dir / f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt").write_text(
             reasoning, encoding="utf-8"
         )
 
@@ -1062,6 +1122,7 @@ class SelectiveRepairEvaluator:
         chapter_id: str,
         source: Mapping[str, str],
         translation: Mapping[str, str],
+        original_translation: Mapping[str, str],
         changed_pids: Sequence[str],
         entity_context: str,
         narrator_context: str = "",
@@ -1075,128 +1136,168 @@ class SelectiveRepairEvaluator:
             return ReauditOutcome(
                 complete=False, failed=True, reason=f"pair construction failed: {exc}"
             )
-        scope_pids, full = plan_reaudit_scope(
+        all_pids = [p.pid for p in pairs]
+        scope_pids = plan_reaudit_scope(
             changed_pids,
-            [p.pid for p in pairs],
+            all_pids,
             neighbour_window=cfg.reaudit_neighbour_window,
-            full_threshold=cfg.reaudit_full_threshold,
         )
+        # Fail-loud (REPAIR-CTX): every re-audited PID must be present in the
+        # maps — the model cannot re-audit a PID it cannot see.
+        missing = [pid for pid in changed_pids if pid not in all_pids]
+        if missing:
+            return ReauditOutcome(
+                complete=False, failed=True, scope=scope_pids,
+                reason=f"re-audit changed PID(s) {missing} missing from "
+                       f"source/translation maps — the model cannot re-audit "
+                       f"what it cannot see",
+            )
         by_pid = {p.pid: p for p in pairs}
-        if full:
-            audit_pairs = pairs
-            context_pairs: Tuple[AuditPair, ...] = ()
-        else:
-            audit_pairs = tuple(by_pid[pid] for pid in scope_pids if pid in by_pid)
-            # Full-chapter input (architecture plan §10 B2.4: "вход = полный
-            # source + полная translation"): every pair OUTSIDE the reportable
-            # scope is supplied as CONTEXT_ONLY so the model can resolve
-            # distant speakers/referents/continuity; validation still rejects
-            # any issue reported outside ``scope_pids`` (fail-closed scope).
-            context_pairs = tuple(p for p in pairs if p.pid not in scope_pids)
-        prompt = render_reaudit_prompt(
-            chapter_id=chapter_id,
-            audit_pairs=audit_pairs,
-            context_pairs=context_pairs,
-            narrator_context=narrator_context,
-            entity_context=entity_context,
+        scope_pairs = tuple(by_pid[pid] for pid in scope_pids if pid in by_pid)
+        # REPAIR-CTX (owner decision 2026-08-12): the re-audit is a CHUNKED
+        # audit over the affected region, reusing the audit's chunking /
+        # overlap mechanisms (build_greedy_chunks / get_overlap_context) —
+        # NEVER the whole chapter (run_012 re-audit input was 41.5k tokens
+        # and truncated the 49k context).
+        chunks = build_greedy_chunks(
+            scope_pairs, max_input=cfg.reaudit_max_input_tokens,
+        )
+        repaired_changes = tuple(
+            RepairedChange(
+                pid=pid,
+                before=str(original_translation.get(pid, "")),
+                after=str(translation.get(pid, "")),
+            )
+            for pid in changed_pids
         )
         model_ref = audit_model_ref(self._reaudit_backend)
-        request = CompletionRequest(
-            model_ref=model_ref,
-            messages=(Message(role="user", content=prompt),),
-            max_output_tokens=cfg.reaudit_max_tokens,
-            temperature=0.0,
-            response_schema=JSON_OBJECT_SCHEMA,
-            label=cfg.reaudit_label,
-        )
+        all_issues: List[Mapping[str, Any]] = []
+        errors: List[str] = []
+        for chunk_index, chunk_pairs in enumerate(chunks, start=1):
+            chunk_pids = [p.pid for p in chunk_pairs]
+            context_pairs = get_overlap_context(
+                pairs,
+                chunk_pids[0],
+                cfg.reaudit_overlap_tokens,
+                cfg.reaudit_min_overlap_pairs,
+                cfg.reaudit_max_overlap_pairs,
+            )
+            prompt = render_reaudit_prompt(
+                chapter_id=chapter_id,
+                audit_pairs=chunk_pairs,
+                context_pairs=context_pairs,
+                repaired_changes=repaired_changes,
+                narrator_context=narrator_context,
+                entity_context=entity_context,
+                chunk_index=chunk_index,
+                chunk_total=len(chunks),
+            )
+            request = CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=cfg.reaudit_max_tokens,
+                temperature=0.0,
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=cfg.reaudit_label,
+            )
 
-        def _complete() -> str:
-            # Re-issues the IDENTICAL request on a retry (same prompt, same
-            # max_output_tokens, same model_ref, same backend — B4 §4), so a
-            # retry never changes cache/resume identity. A transport failure
-            # (CompletionError or any subclass) propagates immediately and is
-            # never retried as a JSON problem (B4 §1/§3).
-            try:
-                response = self._reaudit_backend.complete(request)
-            except CompletionError as exc:
-                LOG.error("re-audit transport failure (%s): %s", type(exc).__name__, exc)
-                # C1 (run_010): even a transport failure leaves a disk trail —
-                # the empty-JSON mystery (8265 tokens, content=0) must be
-                # diagnosable from the artifact, not just the journal.
+            def _complete() -> str:
+                # Re-issues the IDENTICAL request on a retry (same prompt,
+                # same max_output_tokens, same model_ref, same backend — B4
+                # §4), so a retry never changes cache/resume identity. A
+                # transport failure (CompletionError or any subclass)
+                # propagates immediately and is never retried as a JSON
+                # problem (B4 §1/§3).
+                try:
+                    response = self._reaudit_backend.complete(request)
+                except CompletionError as exc:
+                    LOG.error(
+                        "re-audit chunk %s transport failure (%s): %s",
+                        chunk_index, type(exc).__name__, exc,
+                    )
+                    # C1 (run_010): even a transport failure leaves a disk
+                    # trail — the empty-JSON mystery (8265 tokens, content=0)
+                    # must be diagnosable from the artifact, not just the
+                    # journal.
+                    self._write_reaudit_artifacts(
+                        out_dir=out_dir, out_base=out_base,
+                        chunk_index=chunk_index,
+                        content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                        reasoning="",
+                    )
+                    raise
+                text = response.text or ""
+                reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+                # C1 (run_010): persist raw + reasoning on EVERY attempt — a
+                # final empty/truncated body still leaves the reasoning that
+                # caused it.
                 self._write_reaudit_artifacts(
                     out_dir=out_dir, out_base=out_base,
-                    content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
-                    reasoning="",
+                    chunk_index=chunk_index,
+                    content=text, reasoning=reasoning,
                 )
-                raise
-            text = response.text or ""
-            reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
-            # C1 (run_010): persist raw + reasoning on EVERY attempt — a final
-            # empty/truncated body still leaves the reasoning that caused it.
-            self._write_reaudit_artifacts(
-                out_dir=out_dir, out_base=out_base,
-                content=text, reasoning=reasoning,
-            )
-            return text
+                return text
 
-        try:
-            content = retry_json_call(
-                _complete, cfg.reaudit_retry, label=cfg.reaudit_label,
-            )
-        except (EmptyResponseError, TruncatedJSONError) as exc:
-            # Budget exhausted: the last attempt still returned an
-            # empty/truncated body. Fail-closed debt — never "0 findings".
+            try:
+                content = retry_json_call(
+                    _complete, cfg.reaudit_retry, label=cfg.reaudit_label,
+                )
+            except (EmptyResponseError, TruncatedJSONError) as exc:
+                # Budget exhausted: the last attempt still returned an
+                # empty/truncated body. Fail-closed debt — never "0 findings".
+                return ReauditOutcome(
+                    complete=False,
+                    failed=True,
+                    scope=scope_pids,
+                    reason=f"re-audit chunk {chunk_index} response invalid after "
+                           f"{cfg.reaudit_retry.max_retries + 1} attempt(s): {exc}",
+                )
+            except CompletionError as exc:
+                return ReauditOutcome(
+                    complete=False,
+                    failed=True,
+                    scope=scope_pids,
+                    reason=f"re-audit chunk {chunk_index}: {type(exc).__name__}: {exc}",
+                )
+            except Exception as exc:  # noqa: BLE001 — any transport-level failure is debt, never a crash
+                LOG.error(
+                    "re-audit chunk %s unexpected failure (%s): %s",
+                    chunk_index, type(exc).__name__, exc,
+                )
+                return ReauditOutcome(
+                    complete=False,
+                    failed=True,
+                    scope=scope_pids,
+                    reason=f"re-audit chunk {chunk_index}: {type(exc).__name__}: {exc}",
+                )
+            try:
+                parsed = json.loads(content)
+            except Exception as exc:
+                return ReauditOutcome(
+                    complete=False,
+                    failed=True,
+                    scope=scope_pids,
+                    reason=f"re-audit chunk {chunk_index} response is not valid JSON: {exc}",
+                )
+            validation = validate_chunk_json(parsed, chunk_pids)
+            if not validation.valid:
+                errors.append(
+                    f"chunk {chunk_index}: " + "; ".join(validation.errors)
+                )
+            all_issues.extend(validation.issues)
+        if errors:
             return ReauditOutcome(
                 complete=False,
                 failed=True,
                 scope=scope_pids,
-                full=full,
-                reason=f"re-audit response invalid after "
-                       f"{cfg.reaudit_retry.max_retries + 1} attempt(s): {exc}",
-            )
-        except CompletionError as exc:
-            return ReauditOutcome(
-                complete=False,
-                failed=True,
-                scope=scope_pids,
-                full=full,
-                reason=f"{type(exc).__name__}: {exc}",
-            )
-        except Exception as exc:  # noqa: BLE001 — any transport-level failure is debt, never a crash
-            LOG.error("re-audit unexpected failure (%s): %s", type(exc).__name__, exc)
-            return ReauditOutcome(
-                complete=False,
-                failed=True,
-                scope=scope_pids,
-                full=full,
-                reason=f"{type(exc).__name__}: {exc}",
-            )
-        try:
-            parsed = json.loads(content)
-        except Exception as exc:
-            return ReauditOutcome(
-                complete=False,
-                failed=True,
-                scope=scope_pids,
-                full=full,
-                reason=f"re-audit response is not valid JSON: {exc}",
-            )
-        validation = validate_chunk_json(parsed, scope_pids)
-        if not validation.valid:
-            return ReauditOutcome(
-                complete=False,
-                failed=True,
-                scope=scope_pids,
-                full=full,
-                issues=validation.issues,
-                reason="; ".join(validation.errors),
+                issues=tuple(all_issues),
+                reason="; ".join(errors),
             )
         return ReauditOutcome(
             complete=True,
             failed=False,
-            issues=validation.issues,
+            issues=tuple(all_issues),
             scope=scope_pids,
-            full=full,
         )
 
 
@@ -1209,6 +1310,8 @@ __all__ = [
     "DEFAULT_REAUDIT_MAX_TOKENS",
     "DEFAULT_REAUDIT_MAX_RETRIES",
     "DEFAULT_REAUDIT_BASE_DELAY_SECONDS",
+    "DEFAULT_REAUDIT_NEIGHBOUR_WINDOW",
+    "REAUDIT_DELTA_FORMAT",
     "MICROBATCH_TRIGGER",
     "MICROBATCH_TARGET",
     "SelectiveRepairConfig",
@@ -1216,6 +1319,7 @@ __all__ = [
     "RepairResult",
     "RepairBatchOutcome",
     "ReauditOutcome",
+    "RepairedChange",
     "SelectiveRepairOutcome",
     "repair_model_ref",
     "select_eligible",

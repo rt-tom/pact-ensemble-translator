@@ -565,8 +565,8 @@ def test_repair_and_reaudit_write_raw_reasoning_artifacts(tmp_path):
     assert outcome.repair_complete is True
     batch_raw = tmp_path / "b3_repair_batch1_raw.txt"
     batch_reason = tmp_path / "b3_repair_batch1_reasoning.txt"
-    reaudit_raw = tmp_path / "b3_repair_reaudit_raw.txt"
-    reaudit_reason = tmp_path / "b3_repair_reaudit_reasoning.txt"
+    reaudit_raw = tmp_path / "b3_repair_reaudit_chunk1_raw.txt"
+    reaudit_reason = tmp_path / "b3_repair_reaudit_chunk1_reasoning.txt"
     assert batch_raw.exists() and batch_reason.exists()
     assert reaudit_raw.exists() and reaudit_reason.exists()
     assert "внук-" in batch_raw.read_text(encoding="utf-8")
@@ -615,23 +615,32 @@ def test_truncated_repair_rejected_leaves_raw_artifact(tmp_path):
 
 def test_reaudit_scope_changed_plus_neighbours():
     all_pids = [f"p{i:05d}" for i in range(1, 21)]
-    scope, full = plan_reaudit_scope(["p00010"], all_pids, neighbour_window=2)
-    assert not full
+    scope = plan_reaudit_scope(["p00010"], all_pids, neighbour_window=2)
     assert scope == ("p00008", "p00009", "p00010", "p00011", "p00012")
 
 
-def test_reaudit_scope_full_when_threshold_exceeded():
+def test_reaudit_scope_never_whole_chapter_above_threshold():
+    """REPAIR-CTX (t_97b31f81): the whole-chapter re-audit mode is CANCELLED
+    — even with many changed PIDs the scope stays the changed + neighbours
+    region (the old full_threshold returned the whole chapter)."""
     all_pids = [f"p{i:05d}" for i in range(1, 21)]
-    changed = [f"p{i:05d}" for i in range(1, 10)]  # 9 > threshold 8
-    scope, full = plan_reaudit_scope(changed, all_pids, full_threshold=8)
-    assert full
-    assert tuple(scope) == tuple(all_pids)
+    changed = [f"p{i:05d}" for i in range(1, 10)]  # 9 changed PIDs
+    scope = plan_reaudit_scope(changed, all_pids, neighbour_window=2)
+    # 9 changed with ±2 covers p00001..p00011 — NOT the whole 20-PID chapter
+    assert scope == tuple(all_pids[:11])
+    # a 50-PID chapter with 9 changed must NOT return the whole chapter
+    big = [f"p{i:05d}" for i in range(1, 51)]
+    scope_big = plan_reaudit_scope(changed, big, neighbour_window=2)
+    assert scope_big != tuple(big)
+    assert scope_big == (
+        "p00001", "p00002", "p00003", "p00004", "p00005", "p00006",
+        "p00007", "p00008", "p00009", "p00010", "p00011",
+    )
 
 
 def test_reaudit_scope_clamps_at_chapter_edges():
     all_pids = [f"p{i:05d}" for i in range(1, 6)]
-    scope, full = plan_reaudit_scope(["p00001"], all_pids, neighbour_window=2)
-    assert not full
+    scope = plan_reaudit_scope(["p00001"], all_pids, neighbour_window=2)
     assert scope == ("p00001", "p00002", "p00003")
 
 
@@ -1085,7 +1094,7 @@ def test_reaudit_invalid_json_three_attempts_then_debt():
     )
     assert outcome.committed != ()
     assert outcome.reaudit is not None and outcome.reaudit.failed
-    assert "re-audit response invalid after 3 attempt(s)" in outcome.reaudit.reason
+    assert "re-audit chunk 1 response invalid after 3 attempt(s)" in outcome.reaudit.reason
     assert outcome.repair_complete is False
     assert any("failed re-audit" in d for d in outcome.debt_trace)
     assert len(backend.requests) == 4  # 1 repair + 3 re-audit attempts
@@ -1171,11 +1180,11 @@ def test_reaudit_scope_uses_changed_pids_and_neighbours():
     assert len(backend.requests) == 2  # one repair call + ONE re-audit
 
 
-def test_reaudit_request_carries_full_chapter_context_only():
-    """HIGH review finding (fea68de): the actual re-audit call must include
-    the FULL source + FULL current translation. Distant PIDs (far outside the
-    reportable scope) appear in the request as CONTEXT_ONLY; the scope PIDs
-    are the only reportable RE-AUDIT PAIRS."""
+def test_reaudit_request_carries_local_context_and_repaired_delta():
+    """REPAIR-CTX (t_97b31f81): the re-audit request carries ONLY the
+    affected region (changed PIDs + neighbours) plus the REPAIRED CHANGES
+    delta — distant PIDs are NOT in the prompt (run_012 re-audit input was
+    41.5k tokens and truncated the 49k context)."""
     issue = _issue("p00005", "invented_gender", note="n", confidence="high")
     source = {f"p{i:05d}": f"Source paragraph {i}." for i in range(1, 11)}
     translation = {f"p{i:05d}": f"Перевод абзаца {i}." for i in range(1, 11)}
@@ -1201,21 +1210,82 @@ def test_reaudit_request_carries_full_chapter_context_only():
     assert outcome.reaudit.scope == ("p00003", "p00004", "p00005", "p00006", "p00007")
     assert len(backend.requests) == 2
     reaudit_prompt = backend.requests[1].messages[0].content
-    assert "CONTEXT_ONLY" in reaudit_prompt
-    # distant pairs (before AND after the scope) are present in the prompt
-    assert "Перевод абзаца 1." in reaudit_prompt
-    assert "Перевод абзаца 10." in reaudit_prompt
-    assert 'id="p00001"' in reaudit_prompt
-    assert 'id="p00010"' in reaudit_prompt
+    # the REPAIRED CHANGES delta tells the auditor what the repair changed
+    assert "REPAIRED CHANGES" in reaudit_prompt
+    assert "before:" in reaudit_prompt and "after:" in reaudit_prompt
+    assert "Перевод абзаца 5." in reaudit_prompt
+    assert "Исправленный перевод абзаца 5." in reaudit_prompt
+    # the affected region is in the prompt (audit + preceding overlap)
+    assert 'id="p00003"' in reaudit_prompt
+    assert 'id="p00007"' in reaudit_prompt
+    # distant pairs (far after the scope) are NOT dragged in
+    assert "Перевод абзаца 10." not in reaudit_prompt
+    assert 'id="p00010"' not in reaudit_prompt
     # only the scope is reportable
     reaudit_section = reaudit_prompt.split(
         "RE-AUDIT PAIRS (changed PIDs + neighbours)"
     )[1]
     assert 'id="p00005"' in reaudit_section
-    assert 'id="p00001"' not in reaudit_section
-    assert 'id="p00010"' not in reaudit_section
-    # the committed text is what the re-audit sees for the changed PID
-    assert "Исправленный перевод абзаца 5." in reaudit_prompt
+    assert 'id="p00003"' in reaudit_section
+
+
+def test_reaudit_token_budget_local_region():
+    """REPAIR-CTX acceptance: the re-audit input for a 400-PID chapter with a
+    handful of changed PIDs must estimate well under ~5k tokens (run_012
+    re-audit input was 41.5k tokens and truncated the 49k context)."""
+    from pact_v4.audit.chunked_audit import text_token_estimate
+    source, translation = _chapter_maps(400)
+    changed = ("p00010", "p00200", "p00390")
+    backend = ScriptedRepairBackend([_reaudit_response([])])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+    )
+    outcome = evaluator._run_reaudit(
+        chapter_id="0001", source=source, translation=translation,
+        original_translation=translation, changed_pids=changed,
+        entity_context="", narrator_context="",
+    )
+    assert outcome.complete and not outcome.failed
+    prompt = backend.requests[0].messages[0].content
+    assert text_token_estimate(prompt) <= 5000, \
+        f"re-audit input too large: {text_token_estimate(prompt):.0f} tokens"
+    # distant PIDs are NOT in the prompt
+    assert "p00100" not in prompt
+    assert 'id="p00200"' in prompt  # a changed PID IS present
+    # the delta block names every changed PID
+    assert "p00010" in prompt.split("REPAIRED CHANGES")[1]
+    assert "p00390" in prompt.split("REPAIRED CHANGES")[1]
+
+
+def test_reaudit_chunked_multiple_calls_for_large_region():
+    """REPAIR-CTX: a large affected region is re-audited in MULTIPLE chunks
+    (like the audit), not one full-chapter call — one request per chunk and
+    the chunk header labels each."""
+    source, translation = _chapter_maps(60)
+    changed = (f"p{i:05d}" for i in range(10, 40))  # 30 changed PIDs
+    backend = ScriptedRepairBackend(
+        [_reaudit_response([]) for _ in range(8)]  # enough responses
+    )
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(
+            reaudit_neighbour_window=2,
+            reaudit_max_input_tokens=300,  # small budget -> many chunks
+        ),
+    )
+    outcome = evaluator._run_reaudit(
+        chapter_id="0001", source=source, translation=translation,
+        original_translation=translation, changed_pids=tuple(changed),
+        entity_context="", narrator_context="",
+    )
+    assert outcome.complete and not outcome.failed
+    assert len(backend.requests) >= 2, "large region must be chunked"
+    chunk_headers = [
+        r.messages[0].content for r in backend.requests
+    ]
+    assert any("RE-AUDIT PAIRS (chunk 1 of " in p for p in chunk_headers)
+    assert any("RE-AUDIT PAIRS (chunk 2 of " in p for p in chunk_headers)
+    # every chunk carries the REPAIRED CHANGES delta
+    assert all("REPAIRED CHANGES" in p for p in chunk_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1328,182 @@ def test_repair_prompt_renders_findings_with_index_identifiers():
     assert "TRANSLATION (PID -> Russian text" in prompt
 
 
+def _chapter_maps(n: int) -> tuple:
+    """Synthetic chapter: 400-style PID maps, source order = insertion order."""
+    source = {f"p{i:05d}": f"Source paragraph {i} with some English words." for i in range(n)}
+    translation = {pid: f"Перевод абзаца {i} — синтетический текст." for i, pid in enumerate(source)}
+    return source, translation
+
+
+def test_repair_prompt_local_context_only_findings_plus_neighbours():
+    """REPAIR-CTX (t_97b31f81): the batch prompt carries ONLY the findings
+    PIDs plus their ±3 neighbours (CONTEXT_ONLY) — NOT the full chapter maps.
+    Far PIDs must be absent; the repairable PID and its neighbourhood must be
+    present; neighbours are named in a CONTEXT_ONLY block."""
+    source, translation = _chapter_maps(400)
+    findings = [
+        EligibleFinding(index=1, pid="p00003", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n3",
+                        excerpt="ex3", issue={}),
+        EligibleFinding(index=2, pid="p00100", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n100",
+                        excerpt="ex100", issue={}),
+    ]
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=findings,
+    )
+    # repairable PIDs + their ±3 neighbourhood are present
+    for pid in ("p00003", "p00000", "p00006", "p00100", "p00097", "p00103"):
+        assert f"  {pid}: " in prompt, f"{pid} missing from local context"
+    # far PIDs are NOT visible
+    for pid in ("p00200", "p00399", "p00010"):
+        assert f"  {pid}: " not in prompt, f"{pid} outside window leaked in"
+    # neighbours are named as CONTEXT_ONLY, never repairable
+    assert "CONTEXT_ONLY" in prompt
+    assert "NEVER propose an edit for a CONTEXT_ONLY pid" in prompt
+    assert "p00003" in prompt.split("CONTEXT_ONLY")[0]
+    # FINDINGS block keeps the [index] contract
+    assert "[1] p00003 | CANDIDATE | changed_fact" in prompt
+    assert "[2] p00100 | CANDIDATE | changed_fact" in prompt
+
+
+def test_repair_prompt_local_context_window_configurable():
+    """REPAIR-CTX: the ±N window is configurable (window=0 -> findings only;
+    window=1 -> one neighbour on each side)."""
+    source, translation = _chapter_maps(20)
+    findings = [
+        EligibleFinding(index=1, pid="p00010", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    narrow = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=findings, repair_context_window=0,
+    )
+    assert "  p00010: " in narrow
+    assert "  p00009: " not in narrow and "  p00011: " not in narrow
+    wide = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=findings, repair_context_window=1,
+    )
+    assert "  p00009: " in wide and "  p00011: " in wide
+    assert "  p00008: " not in wide and "  p00012: " not in wide
+
+
+def test_repair_prompt_local_context_fails_loud_on_missing_pid():
+    """REPAIR-CTX fail-loud: a repairable PID absent from the maps raises
+    ValueError — the model cannot repair a PID it cannot see."""
+    source, translation = _chapter_maps(20)
+    findings = [
+        EligibleFinding(index=1, pid="p00400", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    with pytest.raises(ValueError, match="p00400"):
+        render_selective_repair_prompt(
+            chapter_id="0001", source=source, translation=translation,
+            findings=findings,
+        )
+    # a finding PID present in source but missing from translation is ALSO
+    # fail-loud (the model needs the current Russian text to repair it)
+    missing_tr = [
+        EligibleFinding(index=1, pid="p00003", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    bad_tr = dict(source)
+    bad_tr.pop("p00003")
+    with pytest.raises(ValueError, match="p00003"):
+        render_selective_repair_prompt(
+            chapter_id="0001", source=source, translation=bad_tr,
+            findings=list(missing_tr),
+        )
+
+
+def test_repair_prompt_local_context_token_budget():
+    """REPAIR-CTX acceptance: a 400-PID chapter batch with 3-4 findings and
+    ±3 window must estimate ≤ ~5k input tokens (was ~33.7k on run_012)."""
+    from pact_v4.audit.chunked_audit import text_token_estimate
+    source, translation = _chapter_maps(400)
+    findings = [
+        EligibleFinding(index=i, pid=pid, tier="B", category="changed_fact",
+                        severity="major", confidence="high", note=f"n{i}",
+                        excerpt=f"e{i}", issue={})
+        for i, pid in enumerate(("p00003", "p00100", "p00250", "p00390"), start=1)
+    ]
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=findings,
+    )
+    assert text_token_estimate(prompt) <= 5000, \
+        f"repair batch input too large: {text_token_estimate(prompt):.0f} tokens"
+
+
+def test_repair_prompt_run012_batch1_replay_local_context():
+    """REPAIR-CTX regression (acceptance): the SAME findings as run_012
+    batch1 (p00003, p00010, p00014, p00029 — changed_fact, major, high)
+    rendered with the local-context prompt must keep the [index] contract and
+    parse to the SAME decisions the model made on the full-chapter prompt
+    (repair p00003/p00010/p00014, pass p00029). Far PIDs must be absent."""
+    source, translation = _chapter_maps(400)
+    findings = [
+        EligibleFinding(index=1, pid="p00003", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00003", excerpt="ex3", issue={}),
+        EligibleFinding(index=2, pid="p00010", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00010", excerpt="ex10", issue={}),
+        EligibleFinding(index=3, pid="p00014", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00014", excerpt="ex14", issue={}),
+        EligibleFinding(index=4, pid="p00029", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00029", excerpt="ex29", issue={}),
+    ]
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=findings,
+    )
+    # local context: every repairable PID + its ±3 neighbourhood present
+    for pid in ("p00003", "p00010", "p00014", "p00029"):
+        assert f"  {pid}: " in prompt
+    for pid in ("p00000", "p00006", "p00007", "p00013", "p00011", "p00017",
+                "p00026", "p00032"):
+        assert f"  {pid}: " in prompt
+    # far PIDs (as far from the findings as the old full-chapter prompt
+    # would have shown) are NOT visible
+    for pid in ("p00200", "p00399", "p00050"):
+        assert f"  {pid}: " not in prompt
+    assert "CONTEXT_ONLY" in prompt
+    for pid in ("[1] p00003 |", "[2] p00010 |", "[3] p00014 |", "[4] p00029 |"):
+        assert pid in prompt
+
+    # Replay the run_012 batch1 model decisions against the SAME findings:
+    # the [index] contract is unchanged, so the same response parses to the
+    # same committed/passed PIDs (equivalent results on the raw).
+    raw = json.dumps({
+        "results": [
+            {"index": 1, "decision": "repair", "pid": "p00003",
+             "repaired_translation": translation["p00003"] + " Исправлено.",
+             "reason": "r1"},
+            {"index": 2, "decision": "repair", "pid": "p00010",
+             "repaired_translation": translation["p00010"] + " Исправлено.",
+             "reason": "r2"},
+            {"index": 3, "decision": "repair", "pid": "p00014",
+             "repaired_translation": translation["p00014"] + " Исправлено.",
+             "reason": "r3"},
+            {"index": 4, "decision": "pass", "reason": "fp"},
+        ]
+    }, ensure_ascii=False)
+    results, errors = parse_repair_batch(raw, findings, current_by_pid=translation)
+    assert not errors
+    decisions = {r.index: r.decision for r in results}
+    assert decisions == {1: "repair", 2: "repair", 3: "repair", 4: "pass"}
+    repaired = {r.pid for r in results if r.decision == "repair"}
+    assert repaired == {"p00003", "p00010", "p00014"}
+
+
 def test_reaudit_prompt_marks_context_pairs_context_only():
     from pact_v4.audit.chunked_audit import AuditPair
     audit = [AuditPair(pid="p00010", source="A wannabe-architect.",
@@ -1274,49 +1520,56 @@ def test_reaudit_prompt_marks_context_pairs_context_only():
     assert "NEVER report an issue for a CONTEXT_ONLY pair" in prompt
 
 
-def test_reaudit_prompt_includes_distant_pairs_as_context_only():
-    """HIGH review finding (fea68de): the re-audit input must be the FULL
-    source + FULL translation — distant pairs (far before/after the scope)
-    are present as CONTEXT_ONLY, and only the scope pairs are reportable
-    (RE-AUDIT PAIRS)."""
+def test_reaudit_prompt_renders_repaired_changes_delta():
+    """REPAIR-CTX (t_97b31f81): the re-audit prompt carries a REPAIRED
+    CHANGES block {pid, before, after} so the auditor verifies the repair
+    correctness instead of just re-reading the text."""
     from pact_v4.audit.chunked_audit import AuditPair
-    pairs = [
-        AuditPair(pid=f"p{i:05d}", source=f"Source {i}.",
-                  translation=f"Перевод {i}.")
-        for i in range(1, 21)
-    ]
-    scope_pids = {f"p{i:05d}" for i in range(8, 13)}  # p00008..p00012
-    audit = [p for p in pairs if p.pid in scope_pids]
-    context = [p for p in pairs if p.pid not in scope_pids]
+    from pact_v4.repair.selective_repair import RepairedChange
+    audit = [AuditPair(pid="p00010", source="A wannabe-architect.",
+                       translation="Парнем, мечтавшим стать архитектором.")]
     prompt = render_reaudit_prompt(
-        chapter_id="0001", audit_pairs=audit, context_pairs=context,
+        chapter_id="0001", audit_pairs=audit,
+        repaired_changes=[RepairedChange(
+            pid="p00010",
+            before="Девушкой, мечтавшей стать архитектором.",
+            after="Парнем, мечтавшим стать архитектором.",
+        )],
     )
-    # distant pairs are in the prompt, marked CONTEXT_ONLY
-    assert 'id="p00001"' in prompt  # far before the scope
-    assert 'id="p00020"' in prompt  # far after the scope
-    assert "Перевод 1." in prompt
-    assert "Перевод 20." in prompt
-    assert "CONTEXT_ONLY" in prompt
-    # only the scope pairs are reportable
-    reaudit_section = prompt.split("RE-AUDIT PAIRS (changed PIDs + neighbours)")[1]
-    assert 'id="p00008"' in reaudit_section
-    assert 'id="p00012"' in reaudit_section
-    assert 'id="p00007"' not in reaudit_section
-    assert 'id="p00013"' not in reaudit_section
+    assert "REPAIRED CHANGES" in prompt
+    assert "p00010" in prompt.split("REPAIRED CHANGES")[1]
+    assert "before:" in prompt and "after:" in prompt
+    assert "Девушкой" in prompt and "Парнем" in prompt
 
 
-def test_reaudit_prompt_full_scope_has_no_context_only():
-    """When the changed-PID count exceeds the full threshold, the whole
-    chapter is reportable — no pair is demoted to CONTEXT_ONLY."""
+def test_reaudit_prompt_chunk_header_when_chunked():
+    """REPAIR-CTX: a chunked re-audit labels each chunk (chunk X of Y) so a
+    multi-chunk re-audit is unambiguous; a single chunk keeps the plain
+    header."""
     from pact_v4.audit.chunked_audit import AuditPair
-    pairs = [
-        AuditPair(pid=f"p{i:05d}", source=f"S{i}", translation=f"T{i}")
-        for i in range(1, 6)
-    ]
+    pairs = [AuditPair(pid=f"p{i:05d}", source=f"S{i}", translation=f"T{i}")
+             for i in range(1, 4)]
+    multi = render_reaudit_prompt(
+        chapter_id="0001", audit_pairs=pairs, chunk_index=2, chunk_total=3,
+    )
+    assert "RE-AUDIT PAIRS (chunk 2 of 3, changed PIDs + neighbours):" in multi
+    single = render_reaudit_prompt(chapter_id="0001", audit_pairs=pairs)
+    assert "RE-AUDIT PAIRS (changed PIDs + neighbours):" in single
+    assert "chunk 1 of 1" not in single
+
+
+def test_reaudit_prompt_overlap_context_only_block():
+    """REPAIR-CTX: CONTEXT_ONLY now means the chunk's preceding overlap
+    pairs (the audit's get_overlap_context mechanism) — NOT the whole
+    chapter."""
+    from pact_v4.audit.chunked_audit import AuditPair
+    pairs = [AuditPair(pid=f"p{i:05d}", source=f"S{i}", translation=f"T{i}")
+             for i in range(1, 6)]
     prompt = render_reaudit_prompt(chapter_id="0001", audit_pairs=pairs)
-    # No CONTEXT_ONLY section is rendered (the frozen template's own wording
-    # about CONTEXT_ONLY is fine; the block header must be absent).
-    assert "CONTEXT_ONLY (full chapter pairs" not in prompt
+    # no CONTEXT_ONLY block when there is no overlap (the frozen template's
+    # own wording about CONTEXT_ONLY is fine; the block header must be
+    # absent)
+    assert "CONTEXT_ONLY (preceding overlap pairs" not in prompt
     assert 'id="p00001"' in prompt
     assert 'id="p00005"' in prompt
 
@@ -1431,8 +1684,12 @@ def test_review_candidates_never_displace_audit_findings_at_cap():
     never displace code-confirmed audit findings at the cap boundary."""
     from pact_v4.audit.russian_editor import ReviewCandidate
 
-    source = {"p00001": "source 1", "p00002": "source 2"}
-    translation = {"p00001": "перевод 1", "p00002": "перевод 2"}
+    # REPAIR-CTX (t_97b31f81): the renderer fails loud if a finding PID is
+    # missing from the maps (the model cannot repair a PID it cannot see),
+    # so the fixture maps must cover every finding PID — as they always do
+    # in production (findings come from the audit of the chapter's PIDs).
+    source = {f"p{i:05d}": f"source {i}" for i in range(1, 13)}
+    translation = {f"p{i:05d}": f"перевод {i}" for i in range(1, 13)}
     # 12 CONFIRMED audit findings + 2 review candidates; cap = 10 ->
     # 10 audit findings kept (the cap), the 2 review candidates are ADDED
     # (never capped away), 2 audit findings capped.
