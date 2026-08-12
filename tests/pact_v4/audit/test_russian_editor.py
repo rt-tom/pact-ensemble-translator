@@ -198,31 +198,71 @@ def test_parse_rejects_original_mismatch() -> None:
         ["p00001"], current,
     )
     assert edits == ()
-    assert any("original does not match" in e for e in errors)
+    assert any("not a substring" in e for e in errors)
 
 
 def test_parse_rejects_original_leading_trailing_whitespace() -> None:
-    # RV fd7ee8e: strict exact-echo — ' текст А ' must NOT match 'текст А'.
+    # RV fd7ee8e + R-FIX2: verbatim substring — ' текст А ' must NOT match
+    # 'текст А' (leading/trailing whitespace is not a verbatim substring).
     # The old strip()-based comparison silently accepted a whitespace-wrapped
-    # original; strict equality fails the WHOLE chunk.
+    # original; strict verbatim fails the WHOLE chunk.
     current = {"p00001": "текст А"}
     edits, errors = parse_editor_edits(
         _ok([_edit("p00001", " текст А ", "текст Б", "r", "typo")]),
         ["p00001"], current,
     )
     assert edits == ()
-    assert any("original does not match" in e for e in errors)
+    assert any("not a substring" in e for e in errors)
 
 
 def test_parse_rejects_original_trailing_whitespace() -> None:
-    # Even a single trailing space is a mismatch under strict equality.
+    # Even a single trailing space is not a verbatim substring.
     current = {"p00001": "текст А"}
     edits, errors = parse_editor_edits(
         _ok([_edit("p00001", "текст А ", "текст Б", "r", "typo")]),
         ["p00001"], current,
     )
     assert edits == ()
-    assert any("original does not match" in e for e in errors)
+    assert any("not a substring" in e for e in errors)
+
+
+def test_parse_accepts_original_fragment_substring() -> None:
+    # R-FIX2 (run_012, p00010-class): the model quotes ONE sentence of a
+    # multi-sentence PID as original — a verbatim substring — and the edit
+    # is structurally valid (no longer a whole-chunk failure).
+    pid_text = (
+        "Три этажа, с однокомнатной башней, выступающей на этаж выше "
+        "с одного из углов. Стены обшиты серым деревом."
+    )
+    fragment = "Три этажа, с однокомнатной башней, выступающей на этаж выше с одного из углов."
+    current = {"p00010": pid_text}
+    edits, errors = parse_editor_edits(
+        _ok([
+            _edit("p00010", fragment,
+                  "Три этажа, с однокомнатной башней, выступающей на один "
+                  "этаж выше из одного из углов.",
+                  "предлог/уточнение", "grammar"),
+        ]),
+        ["p00010"], current,
+    )
+    assert errors == ()
+    assert len(edits) == 1
+    assert edits[0].original == fragment
+
+
+def test_parse_rejects_original_not_a_substring_invented() -> None:
+    # R-FIX2 fail-closed: a model-INVENTED original (not a substring of the
+    # PID) voids the whole chunk — 'not a substring', never applied.
+    current = {"p00010": "Три этажа, с однокомнатной башней."}
+    edits, errors = parse_editor_edits(
+        _ok([
+            _edit("p00010", "Совершенно другой текст, которого нет в PID.",
+                  "какой-то фикс", "выдумка", "typo"),
+        ]),
+        ["p00010"], current,
+    )
+    assert edits == ()
+    assert any("not a substring" in e for e in errors)
 
 
 def test_parse_preserves_exact_rewritten_no_strip() -> None:
@@ -238,7 +278,9 @@ def test_parse_preserves_exact_rewritten_no_strip() -> None:
     assert len(edits) == 1
     assert edits[0].original == "текст А"
     assert edits[0].rewritten == " изменён "
-    applied, candidates, dropped = route_edits(edits)
+    applied, candidates, dropped = route_edits(
+        edits, current_by_pid=current
+    )
     assert applied == (("p00001", " изменён "),)
     assert candidates == ()
     assert dropped == 0
@@ -295,7 +337,9 @@ def test_route_safe_applied_review_candidates() -> None:
         EditorEdit("p00008", "о", "п", "r", "unnatural"),
         EditorEdit("p00009", "р", "с", "r", "register"),
     )
-    applied, candidates, dropped = route_edits(edits)
+    applied, candidates, dropped = route_edits(
+        edits, current_by_pid={e.pid: e.original for e in edits}
+    )
     assert [p for p, _ in applied] == ["p00001", "p00002", "p00003", "p00004"]
     assert [c.pid for c in candidates] == [
         "p00005", "p00006", "p00007", "p00008", "p00009",
@@ -312,7 +356,13 @@ def test_route_diff_gate_cuts_noop_p00095_false() -> None:
         EditorEdit("p00095", "Тот же текст", "Тот же текст", "ложное", "typo"),
         EditorEdit("p00001", "а", "б", "r", "grammar"),
     )
-    applied, candidates, dropped = route_edits(edits)
+    applied, candidates, dropped = route_edits(
+        edits,
+        current_by_pid={
+            "p00095": "Тот же текст",
+            "p00001": "а",
+        },
+    )
     assert applied == (("p00001", "б"),)
     assert candidates == ()
     assert dropped == 1
@@ -322,10 +372,56 @@ def test_route_review_noop_also_dropped() -> None:
     edits = (
         EditorEdit("p00005", "одинаково", "одинаково", "noop", "calque"),
     )
-    applied, candidates, dropped = route_edits(edits)
+    applied, candidates, dropped = route_edits(
+        edits, current_by_pid={"p00005": "одинаково"}
+    )
     assert applied == ()
     assert candidates == ()
     assert dropped == 1
+
+
+def test_route_fragment_safe_edit_preserves_rest_of_pid() -> None:
+    # R-FIX2 acceptance (run_012 p00010-class): a SAFE edit whose original is
+    # a fragment (one sentence of a multi-sentence PID) applies via
+    # current.replace(original, rewritten, 1) — ONLY the fragment changes,
+    # the rest of the PID text is preserved.
+    pid_text = (
+        "Три этажа, с однокомнатной башней, выступающей на этаж выше "
+        "с одного из углов. Стены обшиты серым деревом."
+    )
+    fragment = "выступающей на этаж выше с одного из углов"
+    edits = (
+        EditorEdit("p00010", fragment,
+                   "выступающей на один этаж выше из одного из углов",
+                   "уточнение/предлог", "grammar"),
+    )
+    applied, candidates, dropped = route_edits(
+        edits, current_by_pid={"p00010": pid_text}
+    )
+    assert dropped == 0
+    assert candidates == ()
+    assert applied == ((
+        "p00010",
+        "Три этажа, с однокомнатной башней, выступающей на один этаж "
+        "выше из одного из углов. Стены обшиты серым деревом.",
+    ),)
+
+
+def test_route_fragment_rewritten_full_text_also_works() -> None:
+    # R-FIX2: rewritten may itself be the full corrected text — the
+    # substring-replace handles it (fragment original + full rewritten).
+    pid_text = "Он сказал что придёт позже. Она кивнула."
+    edits = (
+        EditorEdit("p00042", "Он сказал что придёт позже.",
+                   "Он сказал, что придёт позже.",
+                   "пунктуация", "typo"),
+    )
+    applied, candidates, dropped = route_edits(
+        edits, current_by_pid={"p00042": pid_text}
+    )
+    assert applied == (("p00042", "Он сказал, что придёт позже. Она кивнула."),)
+    assert candidates == ()
+    assert dropped == 0
 
 
 def test_class_sets_cover_contract() -> None:
@@ -462,6 +558,61 @@ def test_evaluator_chunk_failure_marks_incomplete() -> None:
     assert outcome.chunk_count == 2
 
 
+def test_evaluator_fragment_originals_complete_and_preserve_pid() -> None:
+    """R-FIX2 acceptance (run_012): a chunk whose edits quote FRAGMENTS of
+    their PIDs (one sentence each, verbatim substrings) is GOOD — applied
+    SAFE edits change ONLY the quoted fragment, the rest of each PID is
+    preserved."""
+    pid1 = ("Три этажа, с однокомнатной башней, выступающей на этаж выше "
+            "с одного из углов. Стены обшиты серым деревом.")
+    pid2 = "Он сказал что придёт позже. Она кивнула."
+    translation = {"p00010": pid1, "p00011": pid2}
+    backend = _MockBackend(
+        _ok([
+            _edit("p00010",
+                  "Три этажа, с однокомнатной башней, выступающей на этаж "
+                  "выше с одного из углов.",
+                  "Три этажа, с однокомнатной башней, выступающей на один "
+                  "этаж выше из одного из углов.",
+                  "уточнение/предлог", "grammar"),
+            _edit("p00011", "Он сказал что придёт позже.",
+                  "Он сказал, что придёт позже.", "пунктуация", "typo"),
+        ]),
+    )
+    evaluator = RussianEditorEvaluator(backend)
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is True
+    assert outcome.successful_chunks == 1
+    assert outcome.failed_chunks == ()
+    assert outcome.dropped == 0
+    applied = dict(outcome.applied)
+    # Fragment replaced, rest of the PID preserved.
+    assert applied["p00010"] == (
+        "Три этажа, с однокомнатной башней, выступающей на один этаж "
+        "выше из одного из углов. Стены обшиты серым деревом."
+    )
+    assert applied["p00011"] == "Он сказал, что придёт позже. Она кивнула."
+    assert applied["p00011"].endswith("Она кивнула.")
+
+
+def test_evaluator_invented_original_chunk_fails_closed() -> None:
+    """R-FIX2 fail-closed: a chunk containing a model-INVENTED original (not
+    a substring of the PID) is FAILED — nothing from that chunk is applied."""
+    translation = {"p00010": "Три этажа, с однокомнатной башней."}
+    backend = _MockBackend(
+        _ok([
+            _edit("p00010", "Выдуманный текст без совпадения с PID.",
+                  "фикс", "r", "typo"),
+        ]),
+    )
+    evaluator = RussianEditorEvaluator(backend)
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is False
+    assert outcome.failed_chunks == (1,)
+    assert outcome.applied == ()
+    assert outcome.candidates == ()
+
+
 def test_evaluator_transport_failure_is_failed_chunk() -> None:
     translation = _translation(10)
     backend = _MockBackend(fail=True)
@@ -490,7 +641,8 @@ def test_outcome_payload_roundtrip() -> None:
 
 def test_module_constants() -> None:
     assert RUSSIAN_EDITOR_SCHEMA == "pact-v4-russian-editor/v1"
-    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v2"
+    # R-FIX2 (run_012): v3 = substring-original contract (fragment quotes).
+    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v3"
     assert RUSSIAN_EDITOR_HARNESS_VERSION == "4.2"
 
 
@@ -518,6 +670,24 @@ def test_prompt_few_shot_example_includes_class() -> None:
     assert match is not None
     example = _json.loads(match.group(0))
     assert example["edits"][0]["class"] == "typo"
+
+
+def test_prompt_original_fragment_contract_wording() -> None:
+    """R-FIX2 (run_012): the prompt tells the model that ``original`` is a
+    VERBATIM FRAGMENT of the PID text (one sentence or a shorter span that
+    must appear word-for-word) — never a request to echo the whole PID."""
+    prompt = render_russian_editor_prompt(
+        chunk_id="0001/chunk1",
+        edit_pairs=[
+            _TranslationPairProxy("p00001", "Он сказал что придёт позже.")
+        ],
+        chunk_index=1,
+        chunk_total=1,
+    )
+    assert "exact fragment you are fixing" in prompt
+    assert "quoted verbatim from the PID text" in prompt
+    assert "must appear in the PID text word-for-word" in prompt
+    assert "exact current Russian text of that PID" not in prompt
 
 
 class _TranslationPairProxy:
