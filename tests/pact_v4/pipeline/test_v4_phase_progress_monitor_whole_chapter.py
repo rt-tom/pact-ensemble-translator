@@ -592,6 +592,77 @@ def test_render_report_whole_chapter_is_read_only(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# M2-FIX (run_012): B3 journal present but audit_chunk_* absent
+# ---------------------------------------------------------------------------
+
+
+def test_render_report_b3_journal_without_audit_chunk_events(tmp_path: Path):
+    # M2 regression (run_012, R-stage): the B3 journal contains only
+    # r_editor_*/entity_context/audit_started events — audit_chunk_started
+    # has not been emitted yet. The monitor must NOT crash with IndexError
+    # on ``(audit_done or audit_started)[-1]``; it reports the generation
+    # state and audit not_started instead.
+    out = _wc_run_dir(tmp_path)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_generation_done", 480, finish_reason="complete",
+                  pid_count=120, duration=70.0),
+        _wc_event("wc_validated", 479, json_ok=True, pids_ok=True, order_ok=True),
+    ])
+    _write_ndjson(out / "audit_journal.ndjson", [
+        _b3_event("r_editor_started", 470),
+        _b3_event("r_editor_chunk_started", 460, chunk=1, total=6),
+        _b3_event("r_editor_chunk_done", 450, chunk=1, total=6),
+        _b3_event("r_editor_chunk_started", 440, chunk=2, total=6),
+        _b3_event("entity_context", 430, pid="p00001"),
+        _b3_event("audit_started", 420),
+        _b3_event("r_editor_chunk_done", 410, chunk=2, total=6),
+    ])
+    events = tracker._load_events(out)
+    phase, basis = tracker._detect_phase(out, events)
+    assert phase == "step6"
+    assert "B3 audit started" in basis
+
+    row = tracker._whole_chapter_chunk_row(out, events)
+    assert row["chunk_id"] == "whole_chapter"
+    assert row["audit"] == "not_started"
+    assert "done=0/0" in row["audit_basis"]
+    assert row["repair"] == "not_started"
+
+    report = tracker.render_report(out)
+    assert "GEN attempt 1/3 done finish_reason=complete" in report
+    assert "B3 audit started" in report
+    assert "not_started" in report
+
+
+def test_monitor_audit_chunk_done_without_started_no_crash(tmp_path: Path):
+    # M2 sibling: a partial B3 journal may contain audit_chunk_done while
+    # audit_chunk_started is still absent (e.g. crash between the two
+    # appends). _detect_phase must not IndexError on
+    # ``audit_chunk_started[-1]`` when only the done event is present.
+    out = _wc_run_dir(tmp_path)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_generation_done", 480, finish_reason="complete",
+                  pid_count=120, duration=70.0),
+        _wc_event("wc_validated", 479, json_ok=True, pids_ok=True, order_ok=True),
+    ])
+    _write_ndjson(out / "audit_journal.ndjson", [
+        _b3_event("audit_started", 460),
+        _b3_event("audit_chunk_done", 440, chunk=1, total=8, status="ok"),
+    ])
+    events = tracker._load_events(out)
+    phase, basis = tracker._detect_phase(out, events)
+    assert phase == "step6"
+    assert "chunk 1/8" in basis
+
+    row = tracker._whole_chapter_chunk_row(out, events)
+    assert row["audit"] == "not_started"
+    assert "done=1/8" in row["audit_basis"]
+
+    report = tracker.render_report(out)
+    assert "AUDIT chunk 1/8" in report
+
+
+# ---------------------------------------------------------------------------
 # Book mode: whole-chapter chapter summary row
 # ---------------------------------------------------------------------------
 
