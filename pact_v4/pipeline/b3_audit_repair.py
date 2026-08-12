@@ -771,6 +771,7 @@ class B3AuditRepair:
         chapter_id: str,
         translation: Mapping[str, str],
         journal: AuditJournal,
+        out_dir: Optional[Path],
     ) -> Tuple[Dict[str, str], Tuple[ReviewCandidate, ...], Optional[RussianEditorOutcome]]:
         """V4.2 R stage: run the Russian-only editor over the raw map.
 
@@ -790,6 +791,28 @@ class B3AuditRepair:
         cfg = self._config
         if not cfg.russian_editor_enabled:
             return dict(translation), (), None
+
+        def _journal_r_editor_chunk_event(kind: str, fields: Dict[str, Any]) -> None:
+            # A2 (run_011): per-chunk causality in the append-only journal —
+            # started BEFORE the model call, terminal done AFTER it, with the
+            # FAILED reason (parse/transport) so a failed R chunk is
+            # diagnosable even without reading the raw artifact.
+            if kind == "started":
+                journal.emit(
+                    "r_editor_chunk_started",
+                    chunk=fields.get("chunk"),
+                    total=fields.get("total"),
+                )
+            else:
+                journal.emit(
+                    "r_editor_chunk_done",
+                    chunk=fields.get("chunk"),
+                    total=fields.get("total"),
+                    status=fields.get("status"),
+                    edit_count=fields.get("edit_count", 0),
+                    error=fields.get("error"),
+                )
+
         evaluator = RussianEditorEvaluator(
             self._audit_backend,
             config=RussianEditorConfig(
@@ -800,7 +823,7 @@ class B3AuditRepair:
                 harness_version=cfg.russian_editor_harness_version,
                 prompt_version=cfg.russian_editor_version,
             ),
-            on_chunk_event=None,
+            on_chunk_event=_journal_r_editor_chunk_event,
         )
         journal.emit(
             "r_editor_started",
@@ -811,7 +834,10 @@ class B3AuditRepair:
             prompt_version=cfg.russian_editor_version,
         )
         try:
-            outcome = evaluator(chapter_id=chapter_id, translation=translation)
+            outcome = evaluator(
+                chapter_id=chapter_id, translation=translation,
+                out_dir=out_dir, out_base="r_editor",
+            )
         except Exception as exc:  # noqa: BLE001 — R failure is debt, never a crash
             LOG.exception("B3: russian_editor failed for %s", chapter_id)
             journal.emit(
@@ -1032,6 +1058,7 @@ class B3AuditRepair:
                     chapter_id=chapter_id,
                     translation=translation_map,
                     journal=journal,
+                    out_dir=out_dir,
                 )
             )
             # The audit/repair consume the R-EDITED map (raw + SAFE edits).
@@ -1271,6 +1298,10 @@ class B3AuditRepair:
                 # accepts/rejects each against the ORIGINAL; accepted ones
                 # are committed and covered by the re-audit.
                 review_candidates=review_candidates,
+                # B1/C1 (run_011): persist repair-batch + re-audit raw and
+                # reasoning artifacts next to the audit cache.
+                out_dir=out_dir,
+                out_base="b3_repair",
             )
         except Exception as exc:  # noqa: BLE001 — a repair failure is debt, never a crash
             LOG.exception("B3: selective repair failed for %s", chapter_id)

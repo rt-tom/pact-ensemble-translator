@@ -453,11 +453,39 @@ class RussianEditorEvaluator:
             except Exception:  # noqa: BLE001 — a journal hook never breaks R
                 LOG.debug("russian_editor on_chunk_event(%r) failed", kind, exc_info=True)
 
+    @staticmethod
+    def _write_chunk_artifacts(
+        *,
+        out_dir: Optional[Path],
+        out_base: str,
+        chunk_index: int,
+        content: str,
+        reasoning: str,
+    ) -> None:
+        """Persist one R chunk's raw response + reasoning (diagnostic trail).
+
+        Mirrors ``ChunkedAudit._write_artifacts``: ``r_editor_chunk{N}_raw.txt``
+        / ``r_editor_chunk{N}_reasoning.txt``. Written on EVERY chunk — a
+        parse/transport failure then leaves a disk trail (run_011 lesson:
+        7/8 R chunks FAILED with no artifacts, diagnosis impossible).
+        """
+        if out_dir is None:
+            return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"{out_base}_chunk{chunk_index}_raw.txt").write_text(
+            content, encoding="utf-8"
+        )
+        (out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt").write_text(
+            reasoning, encoding="utf-8"
+        )
+
     def __call__(
         self,
         *,
         chapter_id: str,
         translation: Mapping[str, str],
+        out_dir: Optional[Path] = None,
+        out_base: str = "r_editor",
     ) -> RussianEditorOutcome:
         cfg = self._config
         model_ref = audit_model_ref(self._backend)
@@ -508,14 +536,28 @@ class RussianEditorEvaluator:
                     "russian_editor chunk %d transport failure (%s): %s",
                     chunk_index, type(exc).__name__, exc,
                 )
+                self._write_chunk_artifacts(
+                    out_dir=out_dir, out_base=out_base, chunk_index=chunk_index,
+                    content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                    reasoning="",
+                )
                 failed_chunks.append(chunk_index)
                 self._emit_chunk_event(
                     "done", chunk=chunk_index, status="FAILED",
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 continue
+            content = response.text or ""
+            reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+            # Persist the raw response + reasoning on EVERY chunk — a parse
+            # failure then has a disk trail (run_011: 7/8 chunks FAILED with
+            # no artifacts, diagnosis impossible).
+            self._write_chunk_artifacts(
+                out_dir=out_dir, out_base=out_base, chunk_index=chunk_index,
+                content=content, reasoning=reasoning,
+            )
             edits, errors = parse_editor_edits(
-                response.text or "", chunk_pids, current_by_pid=dict(translation)
+                content, chunk_pids, current_by_pid=dict(translation)
             )
             if errors:
                 LOG.warning(

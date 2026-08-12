@@ -490,5 +490,114 @@ def test_outcome_payload_roundtrip() -> None:
 
 def test_module_constants() -> None:
     assert RUSSIAN_EDITOR_SCHEMA == "pact-v4-russian-editor/v1"
-    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v1"
+    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v2"
     assert RUSSIAN_EDITOR_HARNESS_VERSION == "4.2"
+
+
+def test_prompt_few_shot_example_includes_class() -> None:
+    """A3 (run_011): the R prompt carries a few-shot JSON example WITH the
+    ``class`` field — the manual 25-edit test showed Qwen without a class
+    example omits ``class``, and the fail-closed parser then voids the whole
+    chunk ('unknown edit class'). The example must include class explicitly."""
+    prompt = render_russian_editor_prompt(
+        chunk_id="0001/chunk1",
+        edit_pairs=[
+            _TranslationPairProxy("p00001", "Он сказал что придёт позже.")
+        ],
+        chunk_index=1,
+        chunk_total=1,
+    )
+    assert "Example of a valid response" in prompt
+    assert '"class": "typo"' in prompt
+    assert '"pid": "p00042"' in prompt
+    # The example itself is a valid R-parseable edit (round-trip through the
+    # strict parser so the few-shot never teaches a malformed shape).
+    import json as _json
+    import re as _re
+    match = _re.search(r"\{.*\}", prompt, _re.S)
+    assert match is not None
+    example = _json.loads(match.group(0))
+    assert example["edits"][0]["class"] == "typo"
+
+
+class _TranslationPairProxy:
+    def __init__(self, pid: str, text: str) -> None:
+        self.pid = pid
+        self.text = text
+
+
+def test_evaluator_writes_raw_and_reasoning_artifacts(tmp_path) -> None:
+    """A1 (run_011): the R evaluator persists ``r_editor_chunk{N}_raw.txt`` /
+    ``_reasoning.txt`` for EVERY chunk — a parse failure then leaves a disk
+    trail (run_011: 7/8 R chunks FAILED with no artifacts, undiagnosable)."""
+    from pact_v4.runtime.backend_protocol import CompletionResponse
+
+    class _RawBackend(_MockBackend):
+        def __init__(self, *responses: str) -> None:
+            super().__init__(*responses)
+            self._i = 0
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            text = self._responses.pop(0) if self._responses else '{"edits": []}'
+            self._i += 1
+            return CompletionResponse(
+                text=text,
+                model="qwen-3.6-35b",
+                finish_reason="stop",
+                raw_metadata={"reasoning": f"reasoning-for-chunk-{self._i}"},
+            )
+
+    translation = _translation(60)  # 2 chunks (50 + 10)
+    backend = _RawBackend(
+        '{"edits": [{"pid": "p00001", "original": "Русский текст абзаца 1.", '
+        '"rewritten": "Исправленный текст абзаца 1.", "reason": "r", '
+        '"class": "typo"}]}',
+        'not-json',  # second chunk parse-fails but MUST still leave artifacts
+    )
+    evaluator = RussianEditorEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", translation=translation,
+        out_dir=tmp_path, out_base="r_editor",
+    )
+    assert outcome.complete is False  # second chunk invalid
+    raw1 = tmp_path / "r_editor_chunk1_raw.txt"
+    raw2 = tmp_path / "r_editor_chunk2_raw.txt"
+    reason1 = tmp_path / "r_editor_chunk1_reasoning.txt"
+    reason2 = tmp_path / "r_editor_chunk2_reasoning.txt"
+    assert raw1.exists() and raw2.exists()
+    assert reason1.exists() and reason2.exists()
+    assert "Исправленный текст абзаца 1." in raw1.read_text(encoding="utf-8")
+    # The FAILED chunk's raw body is preserved (diagnosis trail).
+    assert "not-json" in raw2.read_text(encoding="utf-8")
+    assert reason1.read_text(encoding="utf-8") == "reasoning-for-chunk-1"
+    assert reason2.read_text(encoding="utf-8") == "reasoning-for-chunk-2"
+
+
+def test_evaluator_no_out_dir_skips_artifacts() -> None:
+    """A1: without ``out_dir`` the R evaluator writes nothing (pure default)."""
+    translation = _translation(10)
+    backend = _MockBackend(
+        '{"edits": [{"pid": "p00001", "original": "Русский текст абзаца 1.", '
+        '"rewritten": "Исправленный текст абзаца 1.", "reason": "r", '
+        '"class": "typo"}]}'
+    )
+    evaluator = RussianEditorEvaluator(backend)
+    evaluator(chapter_id="0001", translation=translation)
+    # no exception, no disk writes required
+
+
+def test_evaluator_transport_failure_writes_transport_error_artifact(tmp_path) -> None:
+    """A1: a transport failure leaves a TRANSPORT_ERROR artifact (the audit
+    pattern) so the failed chunk is diagnosable on disk."""
+    translation = _translation(10)
+    backend = _MockBackend(fail=True)
+    evaluator = RussianEditorEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", translation=translation,
+        out_dir=tmp_path, out_base="r_editor",
+    )
+    assert outcome.complete is False
+    raw = tmp_path / "r_editor_chunk1_raw.txt"
+    assert raw.exists()
+    assert raw.read_text(encoding="utf-8").startswith("TRANSPORT_ERROR:")

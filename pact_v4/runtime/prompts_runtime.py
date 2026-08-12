@@ -581,7 +581,7 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 # results; every index must be answered exactly once (fail-closed).
 REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
     role="selective_repair",
-    version="pact-v4-repair-as-verifier/v1",
+    version="pact-v4-repair-as-verifier/v2",
     instructions=(
         "You are a Russian-language repair editor for an English-to-Russian "
         "literary translation. You are given the SOURCE (PID -> English text) "
@@ -608,6 +608,13 @@ REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
         "every other PID and the rest of the affected PID verbatim. Do not "
         "re-translate the whole chapter. Do not change names, numbers, ты/вы "
         "or adjacent text unless the finding requires it.\n"
+        "\n"
+        "CRITICAL: repaired_translation MUST be the FULL corrected text of "
+        "the entire PID — every sentence of the paragraph, with ONLY the "
+        "stated defect fixed inside it. Never return a fragment, a partial "
+        "sentence, or a single corrected clause: the value is written back as "
+        "the whole paragraph. If you are not sure, return decision 'pass' "
+        "instead of a truncated repair.\n"
         "\n"
         "Return STRICT JSON, no markdown fences, no commentary, with exactly "
         "this schema:\n"
@@ -698,7 +705,7 @@ REGION_FIDELITY_GATE_BATCH_V1 = ReviewerPrompt(
 # for a CONTEXT_ONLY pid.
 RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
     role="russian_editor",
-    version="pact-v4.2-russian-editor/v1",
+    version="pact-v4.2-russian-editor/v2",
     instructions=(
         "You are a Russian-language editor for a Russian literary "
         "translation. You are given the RUSSIAN text of a chapter as a map "
@@ -738,6 +745,11 @@ RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
         "    reason: short string (one or two sentences)\n"
         "    class: one of typo|grammar|duplicate|preposition|calque|logic|"
         "ambiguity|unnatural|register\n"
+        "\n"
+        "Example of a valid response (every edit MUST include its class):\n"
+        "{\"edits\": [{\"pid\": \"p00042\", \"original\": \"Он сказал что "
+        "придёт позже.\", \"rewritten\": \"Он сказал, что придёт позже.\", "
+        "\"reason\": \"пропущена запятая\", \"class\": \"typo\"}]}\n"
         "Do not include any other keys."
     ),
 )
