@@ -733,8 +733,15 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "repair_findings_cap": 100,
         "repair_microbatch_trigger": 4,
         "repair_microbatch_target": 4,
+        "repair_context_window": 3,
         "repair_reaudit_neighbour_window": 2,
-        "repair_reaudit_full_threshold": 8,
+        "repair_reaudit_chunk": {
+            "max_input_tokens": 3600,
+            "overlap_tokens": 400,
+            "min_overlap_pairs": 2,
+            "max_overlap_pairs": 6,
+            "delta_format": "pact-v4-reaudit-delta/v1",
+        },
         "repair_reaudit_max_tokens": 20000,
         "repair_reaudit_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
         "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
@@ -766,8 +773,11 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "repair_findings_cap": dict(audit_repair_findings_cap=7),
         "microbatch_trigger": dict(audit_repair_microbatch_trigger=6),
         "microbatch_target": dict(audit_repair_microbatch_target=2),
+        "repair_context_window": dict(audit_repair_context_window=8),
         "reaudit_neighbour_window": dict(audit_repair_reaudit_neighbour_window=4),
-        "reaudit_full_threshold": dict(audit_repair_reaudit_full_threshold=12),
+        "reaudit_chunk_max_input": dict(audit_repair_reaudit_max_input_tokens=1800),
+        "reaudit_chunk_overlap": dict(audit_repair_reaudit_overlap_tokens=200),
+        "reaudit_delta_format": dict(audit_repair_reaudit_delta_format="pact-v4-reaudit-delta/v2"),
         "reaudit_max_tokens": dict(audit_repair_reaudit_max_tokens=25000),
         "reaudit_max_retries": dict(audit_repair_reaudit_max_retries=5),
         "reaudit_base_delay_seconds": dict(audit_repair_reaudit_base_delay_seconds=2.5),
@@ -804,6 +814,59 @@ def test_b3_reaudit_budget_and_retry_wired_from_run_config(
     assert bundle._config.repair_reaudit_max_tokens == 25000
     assert bundle._config.repair_reaudit_max_retries == 5
     assert bundle._config.repair_reaudit_base_delay_seconds == 2.5
+
+
+def test_b3_reaudit_chunk_settings_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # REPAIR-CTX (t_97b31f81, F5): the re-audit chunk/overlap settings and
+    # the REPAIRED CHANGES delta format are wired from the run config through
+    # B3AuditRepairConfig into SelectiveRepairConfig — a cache produced under
+    # a different chunk/delta policy must never replay (defaults mirror the
+    # module constants).
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(
+        tmp_path,
+        audit_repair_reaudit_max_input_tokens=1800,
+        audit_repair_reaudit_overlap_tokens=200,
+        audit_repair_reaudit_delta_format="pact-v4-reaudit-delta/v2",
+    )
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_reaudit_max_input_tokens == 1800
+    assert bundle._config.repair_reaudit_overlap_tokens == 200
+    assert bundle._config.repair_reaudit_delta_format == "pact-v4-reaudit-delta/v2"
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.repair_reaudit_max_input_tokens == 3600
+    assert default_bundle._config.repair_reaudit_delta_format == "pact-v4-reaudit-delta/v1"
+
+
+def test_b3_repair_context_window_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # REPAIR-CTX (t_97b31f81, F5): the production B3 path must carry the
+    # local-context window from the run config through B3AuditRepairConfig
+    # into SelectiveRepairConfig — a cache produced under a different window
+    # must never replay (the default mirrors the module constant).
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(tmp_path, audit_repair_context_window=8)
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_context_window == 8
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.repair_context_window == 3
 
 
 def test_b3_reaudit_request_carries_configured_budget_and_retry(tmp_path: Path) -> None:
@@ -875,6 +938,43 @@ def test_b3_audit_repair_config_payload_carries_reaudit_budget_and_retry() -> No
     assert custom["repair_reaudit_max_tokens"] == 25000
     assert custom["repair_reaudit_retry"] == {
         "max_retries": 5, "base_delay_seconds": 2.5,
+    }
+
+
+def test_b3_config_payload_carries_repair_context_window() -> None:
+    # REPAIR-CTX (t_97b31f81): the local-context window is part of the B3
+    # config payload (identity) — default 3 (owner 2026-08-12) and overrides.
+    from pact_v4.runtime.prompts_runtime import DEFAULT_REPAIR_CONTEXT_WINDOW
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW == 3
+    assert B3AuditRepairConfig().to_payload()["repair_context_window"] == 3
+    custom = B3AuditRepairConfig(repair_context_window=8).to_payload()
+    assert custom["repair_context_window"] == 8
+
+
+def test_b3_config_payload_carries_reaudit_chunk_settings() -> None:
+    # REPAIR-CTX (t_97b31f81, F5): the re-audit chunk/overlap settings and
+    # the REPAIRED CHANGES delta format are identity-bearing — defaults and
+    # overrides.
+    payload = B3AuditRepairConfig().to_payload()
+    assert payload["repair_reaudit_chunk"] == {
+        "max_input_tokens": 3600,
+        "overlap_tokens": 400,
+        "min_overlap_pairs": 2,
+        "max_overlap_pairs": 6,
+        "delta_format": "pact-v4-reaudit-delta/v1",
+    }
+    assert "repair_reaudit_full_threshold" not in payload  # whole-chapter mode cancelled
+    custom = B3AuditRepairConfig(
+        repair_reaudit_max_input_tokens=1800,
+        repair_reaudit_overlap_tokens=200,
+        repair_reaudit_delta_format="pact-v4-reaudit-delta/v2",
+    ).to_payload()
+    assert custom["repair_reaudit_chunk"] == {
+        "max_input_tokens": 1800,
+        "overlap_tokens": 200,
+        "min_overlap_pairs": 2,
+        "max_overlap_pairs": 6,
+        "delta_format": "pact-v4-reaudit-delta/v2",
     }
 
 
@@ -1417,8 +1517,9 @@ def test_b3_repair_and_reaudit_raw_artifacts_written(tmp_path: Path) -> None:
     assert result.step8["released_as_audited"] is True
     assert (cfg.out_dir / "b3_repair_batch1_raw.txt").exists()
     assert (cfg.out_dir / "b3_repair_batch1_reasoning.txt").exists()
-    assert (cfg.out_dir / "b3_repair_reaudit_raw.txt").exists()
-    assert (cfg.out_dir / "b3_repair_reaudit_reasoning.txt").exists()
+    # REPAIR-CTX: the re-audit is chunked like the audit — per-chunk artifacts
+    assert (cfg.out_dir / "b3_repair_reaudit_chunk1_raw.txt").exists()
+    assert (cfg.out_dir / "b3_repair_reaudit_chunk1_reasoning.txt").exists()
 
 
 def test_b3_truncated_repair_rejected_in_journal(tmp_path: Path) -> None:

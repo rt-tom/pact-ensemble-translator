@@ -1064,6 +1064,16 @@ def render_chunked_audit_prompt(
     )
 
 
+# REPAIR-CTX (card t_97b31f81, owner decision 2026-08-12): local context for
+# repair batches. A repair batch used to carry the FULL chapter SOURCE +
+# TRANSLATION maps (~33.7k tokens for 400 PIDs, run_012) for 3-4 findings
+# (findings were 1.5% of the prompt; prompt eval 93-114s). The fix renders
+# ONLY the repairable PIDs (findings) plus their ±N neighbour pairs
+# (CONTEXT_ONLY — the model may use them for referents/continuity but must
+# NEVER edit them). Owner: окрестность = ±3 PID (3 назад + 3 вперёд).
+DEFAULT_REPAIR_CONTEXT_WINDOW = 3
+
+
 def render_selective_repair_prompt(
     *,
     chapter_id: str,
@@ -1071,6 +1081,7 @@ def render_selective_repair_prompt(
     translation: dict[str, str],
     findings: Sequence[Any],
     template: ReviewerPrompt = REPAIR_AS_VERIFIER_V1,
+    repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW,
 ) -> str:
     """Render a B2 selective-repair batch request as one user message.
 
@@ -1078,12 +1089,53 @@ def render_selective_repair_prompt(
     ``[index]`` identifier), ``pid``, ``tier`` (``"A"`` for CONFIRMED /
     ``"B"`` for CANDIDATE), ``category``, ``severity``, ``confidence``,
     ``note``, ``excerpt`` (``pact_v4.repair.selective_repair.EligibleFinding``
-    or any object with those attributes). The batch prompt carries the full
-    SOURCE/TRANSLATION maps plus the FINDINGS block; the model answers per
-    ``[index]`` (repair-as-verifier, §5.2/§10 B2).
+    or any object with those attributes).
+
+    REPAIR-CTX (t_97b31f81): the batch prompt carries ONLY the repairable
+    PIDs (the findings) plus their ±``repair_context_window`` neighbourhood
+    in source order (CONTEXT_ONLY), NOT the full chapter maps — run_012
+    sent 33.7k tokens for 3-4 findings, of which the findings were 1.5%.
+    The CONTEXT_ONLY block names the neighbour PIDs so the model can resolve
+    speakers/referents/ellipsis/continuity but must NEVER propose an edit
+    for them. Fail-loud: a finding PID missing from the maps raises
+    ``ValueError`` — the model cannot repair a PID it cannot see.
+
+    The model answers per ``[index]`` (repair-as-verifier, §5.2/§10 B2).
     """
-    src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
-    tr_lines = "\n".join(f"  {pid}: {text}" for pid, text in translation.items())
+    # Fail-loud: the model cannot repair a PID it cannot see.
+    missing = [
+        f.pid for f in findings
+        if f.pid not in source or f.pid not in translation
+    ]
+    if missing:
+        raise ValueError(
+            "repair finding PID(s) not present in source/translation maps: "
+            f"{sorted(set(missing))} — the model cannot repair what it cannot see"
+        )
+    order = list(source.keys())
+    positions = {pid: i for i, pid in enumerate(order)}
+    scope: set = set()
+    for pid in {f.pid for f in findings}:
+        scope.add(pid)
+        i = positions[pid]
+        for j in range(
+            max(0, i - repair_context_window),
+            min(len(order), i + repair_context_window + 1),
+        ):
+            scope.add(order[j])
+    # Local window in source order; context-only = in-window, non-finding PIDs.
+    local_pids = [pid for pid in order if pid in scope]
+    finding_pids = {f.pid for f in findings}
+    context_pids = [pid for pid in local_pids if pid not in finding_pids]
+    src_lines = "\n".join(f"  {pid}: {source[pid]}" for pid in local_pids)
+    tr_lines = "\n".join(f"  {pid}: {translation[pid]}" for pid in local_pids)
+    ctx_block = ""
+    if context_pids:
+        ctx_block = (
+            "\n\nCONTEXT_ONLY (neighbour PIDs in the maps above: "
+            f"{', '.join(context_pids)} — for resolving speakers, referents, "
+            "ellipsis, continuity).\nNEVER propose an edit for a CONTEXT_ONLY pid."
+        )
     # The instructions label findings [CONFIRMED] (Tier A) / [CANDIDATE]
     # (Tier B); the FINDINGS block uses the same labels so the model can
     # apply the right per-finding contract.
@@ -1099,7 +1151,8 @@ def render_selective_repair_prompt(
         f"{template.instructions}\n\n"
         f"CHUNK: {chapter_id}\n\n"
         f"SOURCE (PID -> English text):\n{src_lines}\n\n"
-        f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n\n"
+        f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
+        f"{ctx_block}\n\n"
         f"FINDINGS (verify, then repair only confirmed issues):\n{finding_lines}\n"
     )
 
@@ -1109,21 +1162,27 @@ def render_reaudit_prompt(
     chapter_id: str,
     audit_pairs: Sequence[Any],
     context_pairs: Sequence[Any] = (),
+    repaired_changes: Sequence[Any] = (),
     narrator_context: str = "",
     entity_context: str = "",
+    chunk_index: int = 1,
+    chunk_total: int = 1,
     template: ReviewerPrompt = QWEN_AUDIT_V4_1,
 ) -> str:
-    """Render a B2 single re-audit call (full chapter, scoped report).
+    """Render one re-audit chunk request (REPAIR-CTX, t_97b31f81).
 
-    One Qwen call at the end of selective repair when at least one repair was
-    committed (``V4_1_WHOLE_CHAPTER_ARCHITECTURE_PLAN_RU.md`` §10 B2.4): the
-    INPUT is the full source + full current translation — ``audit_pairs``
-    plus ``context_pairs`` cover every chapter pair exactly once. The
-    RESPONSE scope is exactly the changed PIDs + their neighbour window
-    (``audit_pairs``); every pair outside that scope is ``context_pairs``
-    (CONTEXT_ONLY — the model must NEVER report an issue for them; the
-    caller's JSON validation additionally rejects any issue id outside the
-    scope). Reuses the frozen v4.1 audit template and block layout.
+    REPAIR-CTX (owner decision 2026-08-12): the post-repair re-audit is a
+    CHUNKED audit over the affected region (changed PIDs + neighbour window),
+    reusing the audit's chunking/overlap mechanisms — NEVER the whole chapter
+    (run_012 re-audit input was 41.5k tokens and truncated the 49k context).
+    ``audit_pairs`` is ONE chunk of the region (reportable); ``context_pairs``
+    is the chunk's preceding CONTEXT_ONLY overlap (the audit's
+    ``get_overlap_context`` mechanism — the model must NEVER report an issue
+    for them); ``repaired_changes`` carries the repair delta ``{pid, before,
+    after}`` so the auditor verifies the CORRECTNESS of each repair instead
+    of just re-reading the text. The caller's JSON validation rejects any
+    issue id outside the chunk (fail-closed scope, like the audit).
+    Reuses the frozen v4.1 audit template and block layout.
     """
     ctx_block = ""
     if narrator_context.strip():
@@ -1137,22 +1196,41 @@ def render_reaudit_prompt(
             "\n\nCHAPTER ENTITY FACTS - SOURCE-DERIVED\n\n"
             f"{entity_context}"
         )
+    delta_block = ""
+    if repaired_changes:
+        rendered_delta = "\n".join(
+            f"  {c.pid}:\n"
+            f"    before: {c.before}\n"
+            f"    after: {c.after}"
+            for c in repaired_changes
+        )
+        delta_block = (
+            "\n\nREPAIRED CHANGES (the repair editor changed these PIDs after "
+            "the last audit; verify each repair is CORRECT — the after text "
+            "must fix the reported issue without introducing a new defect):\n"
+            f"{rendered_delta}"
+        )
     ctx_pairs_block = ""
     if context_pairs:
         rendered_ctx = "\n".join(
             _render_pair_block(p.pid, p.source, p.translation) for p in context_pairs
         )
         ctx_pairs_block = (
-            "\n\nCONTEXT_ONLY (full chapter pairs outside the re-audit scope; "
-            "for resolving speakers, referents, ellipsis, continuity, and "
+            "\n\nCONTEXT_ONLY (preceding overlap pairs for resolving "
+            "speakers, referents, ellipsis, continuity, and "
             "cross-references).\nNEVER report an issue for a CONTEXT_ONLY pair.\n\n"
             f"{rendered_ctx}"
         )
     rendered_audit = "\n".join(
         _render_pair_block(p.pid, p.source, p.translation) for p in audit_pairs
     )
+    header = (
+        f"RE-AUDIT PAIRS (chunk {chunk_index} of {chunk_total}, "
+        "changed PIDs + neighbours):"
+        if chunk_total > 1 else "RE-AUDIT PAIRS (changed PIDs + neighbours):"
+    )
     return (
         f"{template.instructions}"
-        f"{ctx_block}{ent_block}{ctx_pairs_block}\n\n"
-        f"RE-AUDIT PAIRS (changed PIDs + neighbours):\n{rendered_audit}"
+        f"{ctx_block}{ent_block}{delta_block}{ctx_pairs_block}\n\n"
+        f"{header}\n{rendered_audit}"
     )
