@@ -88,6 +88,16 @@ class HttpModelCaller:
     def backend(self) -> LocalOpenAIBackend:
         return self._backend
 
+    @property
+    def last_reasoning(self) -> str:
+        """Reasoning text of the most recent backend completion ('' when none).
+
+        V4.1 GEN-REASONING: forwarded from the inner ``BackendModelCaller``
+        so the whole-chapter generation layer can persist per-attempt
+        reasoning diagnostics regardless of which caller wrapper is used.
+        """
+        return getattr(self._impl, "last_reasoning", "")
+
     def __call__(self, bundle: PromptBundle) -> str:
         try:
             return self._impl(bundle)

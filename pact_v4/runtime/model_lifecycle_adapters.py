@@ -97,6 +97,16 @@ class LifecycleModelCaller:
         self._router.ensure_resident(GEMMA_MODEL_KEY)
         return self._caller(bundle)
 
+    @property
+    def last_reasoning(self) -> str:
+        """Reasoning text of the most recent backend completion ('' when none).
+
+        V4.1 GEN-REASONING: forwarded from the wrapped ``HttpModelCaller`` so
+        the whole-chapter generation layer can persist per-attempt reasoning
+        diagnostics regardless of which caller wrapper is used.
+        """
+        return getattr(self._caller, "last_reasoning", "")
+
 
 class LifecycleQwenEvaluator:
     """``QwenEvaluator`` that ensures Qwen is resident before every call."""

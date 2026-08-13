@@ -384,3 +384,96 @@ def test_whole_chapter_bundle_identity_hashes_full_chapter(tmp_path):
     # max_output_tokens=32768 lives in the bundle identity (Gate 0 §8.5).
     assert payload["params"]["max_tokens"] == 32768
     assert payload["params"]["reasoning"] == 2
+
+
+# ---------------------------------------------------------------------------
+# V4.1 GEN-REASONING: per-attempt reasoning transport (whole-chapter path)
+# ---------------------------------------------------------------------------
+
+
+class _ReasoningCaller:
+    """Echo caller that also reports per-call reasoning (``last_reasoning``).
+
+    Mirrors the production ``BackendModelCaller`` contract: the reasoning of
+    the most recent completion is exposed via a ``last_reasoning`` attribute
+    that ``generate_whole_chapter`` reads after each attempt.
+    """
+
+    def __init__(self, responses, reasonings) -> None:
+        self.responses = list(responses)
+        self.reasonings = list(reasonings)
+        self.calls = 0
+        self.last_reasoning = ""
+
+    def __call__(self, bundle) -> str:
+        self.calls += 1
+        if self.reasonings:
+            self.last_reasoning = self.reasonings.pop(0)
+        return self.responses.pop(0)
+
+
+def test_whole_chapter_reasoning_sink_receives_successful_attempt(tmp_path):
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ReasoningCaller(
+        [good],
+        ["model thought about register and gender here"],
+    )
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    # One attempt, its reasoning text delivered to the sink.
+    assert received == [(0, "model thought about register and gender here")]
+
+
+def test_whole_chapter_reasoning_sink_receives_truncated_retry(tmp_path):
+    # GEN-REASONING acceptance: a truncated first attempt's reasoning must be
+    # preserved (diagnosis of WHY the retry happened), and the retry's own
+    # reasoning must also arrive — each attempt is one sink call.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ReasoningCaller(
+        ["{truncated json", good],
+        ["attempt 0: thinking cut off mid-argument", "attempt 1: revised approach"],
+    )
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    assert caller.calls == 2
+    assert received == [
+        (0, "attempt 0: thinking cut off mid-argument"),
+        (1, "attempt 1: revised approach"),
+    ]
+
+
+def test_whole_chapter_reasoning_sink_absent_reasoning_is_empty(tmp_path):
+    # A caller that does NOT expose last_reasoning (e.g. a stub) yields "" —
+    # the sink still fires per attempt so the runner can record presence=0.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ScriptedCaller([good])
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    assert received == [(0, "")]

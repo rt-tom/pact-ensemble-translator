@@ -3654,6 +3654,57 @@ def _wc_validation_flags(outcome: Any) -> Dict[str, bool]:
     return {"json_ok": False, "pids_ok": False, "order_ok": False}
 
 
+# V4.1 GEN-REASONING: schema of the compact per-attempt reasoning marker that
+# rides inside the whole-chapter generation record (full text lives in the
+# .txt files; the JSON carries only presence + char counts so the artifact
+# stays small — owner decision 2026-08-13).
+WHOLE_CHAPTER_REASONING_SCHEMA = "pact-v4-whole-chapter-reasoning/v1"
+
+
+def _persist_whole_chapter_reasoning(
+    out_dir: Path,
+    reasoning_by_attempt: Mapping[int, str],
+) -> Dict[str, Any]:
+    """Write per-attempt reasoning text files and return the compact marker.
+
+    For every attempt that produced reasoning text, the full text is written
+    to ``whole_chapter_reasoning.txt`` (attempt 0) or
+    ``whole_chapter_retry{N}_reasoning.txt`` (retry attempt N) — the same
+    diagnostic pattern as the audit layer's ``b3_audit_chunkN_reasoning.txt``.
+    The returned marker records, per attempt, only presence + char count
+    (never the full text), so ``generation_outcomes.json`` stays compact.
+
+    Reasoning is a diagnostics text artifact only: writing these files never
+    affects ``whole_chapter_pid_map`` / ``wc_validated`` / cache / resume
+    identity, and a write failure is a warning, not a gate.
+    """
+    attempts: Dict[str, Any] = {}
+    for attempt, reasoning in sorted(reasoning_by_attempt.items()):
+        attempts[str(attempt)] = {
+            "present": bool(reasoning),
+            "chars": len(reasoning),
+        }
+        if not reasoning:
+            continue
+        name = (
+            "whole_chapter_reasoning.txt"
+            if attempt == 0
+            else f"whole_chapter_retry{attempt}_reasoning.txt"
+        )
+        try:
+            (out_dir / name).write_text(reasoning, encoding="utf-8")
+        except OSError as exc:
+            LOG.warning(
+                "whole-chapter reasoning artifact write failed (%s); "
+                "reasoning is diagnostics-only, continuing",
+                exc,
+            )
+    return {
+        "schema": WHOLE_CHAPTER_REASONING_SCHEMA,
+        "attempts": attempts,
+    }
+
+
 def _validate_whole_chapter_generation_record(
     rec: Dict[str, Any],
     *,
@@ -4303,6 +4354,16 @@ def _run_whole_chapter_strict_impl(
             max_attempts=wc_retry_policy.max_attempts,
         )
         wc_t0 = time.monotonic()
+        # V4.1 GEN-REASONING: per-attempt reasoning text collector for the
+        # whole-chapter generation call. Reasoning is a diagnostics TEXT
+        # artifact only — it never enters cache/resume identity (the record
+        # below carries only presence/char-count markers; the full text lives
+        # in whole_chapter_reasoning.txt / whole_chapter_retryN_reasoning.txt).
+        reasoning_by_attempt: Dict[int, str] = {}
+
+        def _wc_reasoning_sink(attempt: int, reasoning: str) -> None:
+            reasoning_by_attempt[attempt] = reasoning
+
         outcome = generate_whole_chapter(
             role="balanced_literary",
             source=source,
@@ -4319,6 +4380,7 @@ def _run_whole_chapter_strict_impl(
             on_retry=lambda attempt, reason: progress.wc_retry_attempt(
                 attempt=attempt, reason=reason
             ),
+            reasoning_sink=_wc_reasoning_sink,
         )
         progress.wc_generation_done(
             finish_reason="complete" if outcome.status == "complete" else "incomplete",
@@ -4326,7 +4388,19 @@ def _run_whole_chapter_strict_impl(
             duration=time.monotonic() - wc_t0,
         )
         progress.wc_validated(**_wc_validation_flags(outcome))
-        generation_records.append(_serialize_generation_outcome(outcome))
+        generation_record = _serialize_generation_outcome(outcome)
+        if any(reasoning_by_attempt.values()):
+            # GEN-REASONING: persist the full reasoning text per attempt and
+            # carry a compact presence/char-count marker in the record so the
+            # artifact stays small (the spec's decision: full text in the
+            # .txt files, JSON gets length/presence only). When NO attempt
+            # produced reasoning (reasoning=0 / transport reported none) the
+            # record stays byte-identical to the pre-GEN-REASONING shape.
+            reasoning_marker = _persist_whole_chapter_reasoning(
+                cfg.out_dir, reasoning_by_attempt
+            )
+            generation_record["reasoning"] = reasoning_marker
+        generation_records.append(generation_record)
 
         if outcome.status == "complete":
             candidate = outcome.candidates["balanced_literary"]
@@ -4555,6 +4629,10 @@ def _run_whole_chapter_strict_impl(
         # leaves them absent — F8: never advertise nonexistent provenance).
         ("translations_edited", "translations_edited.json"),
         ("edit_candidates", "edit_candidates.json"),
+        # V4.1 GEN-REASONING: the whole-chapter reasoning text artifact is
+        # advertised only when reasoning>0 produced it (a reasoning=0 run or
+        # a transport that reported no reasoning leaves it absent — F8).
+        ("whole_chapter_reasoning", "whole_chapter_reasoning.txt"),
     ):
         candidate = cfg.out_dir / name
         if candidate.exists():

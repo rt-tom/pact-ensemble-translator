@@ -180,10 +180,21 @@ class BackendModelCaller:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
         self._max_tokens = int(self._config.max_tokens)
+        # V4.1 GEN-REASONING: the reasoning text of the most recent backend
+        # completion (raw_metadata['reasoning'], '' when the transport or
+        # provider reported none). Exposed for the whole-chapter generation
+        # layer to persist per-attempt reasoning diagnostics — never part of
+        # cache/resume identity.
+        self._last_reasoning: str = ""
 
     @property
     def backend(self) -> CompletionBackend:
         return self._backend
+
+    @property
+    def last_reasoning(self) -> str:
+        """Reasoning text of the most recent backend completion ('' when none)."""
+        return self._last_reasoning
 
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
@@ -238,16 +249,31 @@ class BackendModelCaller:
             omit_system_tools=True,
         )
 
+        # V4.1 GEN-REASONING: each model-call attempt starts with a clean
+        # reasoning slate. On a transport failure no response ever arrives,
+        # so last_reasoning stays '' (never a stale value from a previous
+        # attempt); on a completed backend call _complete() records the
+        # reasoning text from raw_metadata.
+        self._last_reasoning = ""
+
         def _complete() -> str:
             # Re-issues the identical request on a retry: same prompt, same
             # model/backend, same request_options (including any pinned
             # reasoning) — so retry never changes cache/resume identity and
             # never switches the reasoning budget mid-request (B1).
             try:
-                return self._backend.complete(request).text
+                response = self._backend.complete(request)
             except CompletionError as exc:
                 LOG.error("BackendModelCaller: backend failure: %s", exc)
                 raise
+            # GEN-REASONING: capture the reasoning text of THIS completion
+            # (open-code backend: type=reasoning parts; local: the server's
+            # reported reasoning field). Diagnostics only — never part of
+            # the returned text, cache, or resume identity.
+            metadata = response.raw_metadata if isinstance(response.raw_metadata, Mapping) else {}
+            reasoning = metadata.get("reasoning")
+            self._last_reasoning = str(reasoning) if reasoning is not None else ""
+            return response.text
 
         return retry_json_call(
             _complete, self._config.retry, label=request.label,

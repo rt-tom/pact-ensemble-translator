@@ -203,6 +203,13 @@ class _LifecycleAwareModelCaller:
         self._router.ensure_resident("gemma")
         return self._inner(bundle)
 
+    @property
+    def last_reasoning(self) -> str:
+        # V4.1 GEN-REASONING: mirror the production LifecycleModelCaller
+        # forwarding so the whole-chapter reasoning capture (which reads
+        # model_caller.last_reasoning) works through the lifecycle wrapper.
+        return getattr(self._inner, "last_reasoning", "")
+
 
 class _LifecycleAwareQwen:
     def __init__(self, router: ModelRouter, inner: StubQwen) -> None:
