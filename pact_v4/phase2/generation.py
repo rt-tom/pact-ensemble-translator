@@ -995,6 +995,17 @@ def generate_whole_chapter(
                 continue
             break
         except _JsonResilienceErrorTypes() as exc:
+            # RAW-SINK: the transport returned text, but classify rejected
+            # it (TruncatedJSONError). The raw survives in the caller's
+            # ``last_raw`` (captured in _complete BEFORE classification) —
+            # persist it so the disk trail exists for diagnosis. Best-effort.
+            if raw_sink is not None:
+                try:
+                    fallback_raw = getattr(model_caller, "last_raw", None)
+                    if fallback_raw:
+                        raw_sink(attempt, fallback_raw)
+                except Exception:  # noqa: BLE001 — diagnostics hook
+                    LOG.debug("whole-chapter raw_sink (fallback) failed", exc_info=True)
             # A2 review fix: ``BackendModelCaller`` re-raises
             # EmptyResponseError/TruncatedJSONError after ITS OWN bounded JSON
             # retry budget is exhausted. Those are ValueError subclasses, not
