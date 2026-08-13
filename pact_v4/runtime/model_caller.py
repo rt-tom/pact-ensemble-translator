@@ -98,6 +98,16 @@ class HttpModelCaller:
         """
         return getattr(self._impl, "last_reasoning", "")
 
+    def reset_attempt_state(self) -> None:
+        """GEN-REASONING: forward the attempt-boundary reset to the inner
+        ``BackendModelCaller`` (see ``BackendModelCaller.reset_attempt_state``).
+        The lifecycle wrappers call this before model acquisition so an
+        acquisition failure never leaves stale reasoning behind.
+        """
+        reset = getattr(self._impl, "reset_attempt_state", None)
+        if reset is not None:
+            reset()
+
     def __call__(self, bundle: PromptBundle) -> str:
         try:
             return self._impl(bundle)

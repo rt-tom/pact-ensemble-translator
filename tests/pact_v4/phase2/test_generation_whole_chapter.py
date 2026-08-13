@@ -477,3 +477,39 @@ def test_whole_chapter_reasoning_sink_absent_reasoning_is_empty(tmp_path):
     )
     assert outcome.status == "complete"
     assert received == [(0, "")]
+
+
+def test_whole_chapter_reasoning_sink_empty_on_lifecycle_acquisition_abort(tmp_path):
+    # GEN-REASONING regression (RV t_a790dbab): a lifecycle acquisition
+    # failure (model load/swap raising CompletionError) aborts the attempt
+    # BEFORE the wrapped caller is entered. The abort attempt must emit ''
+    # to the reasoning sink — never the reasoning left over from a prior
+    # successful completion.
+    from pact_v4.runtime.model_lifecycle_adapters import LifecycleModelCaller
+
+    class _FailingRouter:
+        base_url = "http://router.invalid"
+
+        def ensure_resident(self, model_key: str):
+            raise CompletionError(f"{model_key} load failed (simulated)")
+
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+
+    caller = LifecycleModelCaller(_FailingRouter(), model_name="gemma-4-26B")
+    # Simulate a prior successful completion that populated last_reasoning.
+    caller._caller._impl._last_reasoning = "STALE prior reasoning"
+    assert caller.last_reasoning == "STALE prior reasoning"
+
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    # Every attempt aborts at acquisition; each must report empty reasoning.
+    assert outcome.status == "incomplete"
+    assert received == [(0, ""), (1, ""), (2, "")]
+    assert caller.last_reasoning == ""

@@ -196,6 +196,19 @@ class BackendModelCaller:
         """Reasoning text of the most recent backend completion ('' when none)."""
         return self._last_reasoning
 
+    def reset_attempt_state(self) -> None:
+        """Clear the per-attempt reasoning diagnostic at a call-attempt boundary.
+
+        V4.1 GEN-REASONING (RV t_a790dbab): the lifecycle wrappers invoke
+        this BEFORE model acquisition (``ensure_resident``) so that an
+        acquisition failure (``CompletionError`` from a model load/swap)
+        never exposes the previous successful completion's reasoning — the
+        wrapped ``__call__`` is never entered in that case, so its
+        clear-at-start reset cannot run. Direct callers keep the existing
+        clear-at-start behavior inside ``__call__``.
+        """
+        self._last_reasoning = ""
+
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
         # Generation bundle roles are the template roles ("fidelity_first" /
