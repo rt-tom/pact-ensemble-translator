@@ -842,6 +842,37 @@ class OpenCodeServerBackend:
                 chunks.append(text)
         return "".join(chunks)
 
+    def _extract_reasoning(self, parts: Sequence[Mapping[str, Any]]) -> str:
+        """Concatenate the model's thinking from message parts (v1.4.7).
+
+        Reasoning arrives either as dedicated ``type="reasoning"`` parts
+        (``ReasoningPart``, the canonical v1.4.7 shape) or as synthetic
+        text parts for providers that stream thinking through the text
+        channel. Both must be excluded from ``_extract_text`` (that
+        method keeps only non-synthetic ``text`` parts) and surfaced
+        separately via ``raw_metadata["reasoning"]`` so audit/repair
+        ``_reasoning.txt`` artifacts are not empty on the remote path.
+        """
+        chunks = []
+        for part in parts:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("ignored"):
+                continue
+            if part.get("type") == "reasoning":
+                text = part.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+                continue
+            if part.get("type") != "text":
+                continue
+            if not part.get("synthetic"):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+        return "".join(chunks)
+
     def _map_message_error(
         self, info: Mapping[str, Any], *, session_id: str
     ) -> Optional[OpenCodeError]:
@@ -1053,6 +1084,7 @@ class OpenCodeServerBackend:
             # Success path.
             self._owned_sessions[session_id] = "success"
             text = self._extract_text(parts)
+            reasoning = self._extract_reasoning(parts)
             structured = info.get("structured")
             if self._cfg.structured_output_mode == "json_schema":
                 if structured is None:
@@ -1112,6 +1144,7 @@ class OpenCodeServerBackend:
                     "server_version": self._server_version,
                     "attempts": attempt_log,
                     "structured_output_mode": self._cfg.structured_output_mode,
+                    "reasoning": reasoning,
                 },
             )
 
