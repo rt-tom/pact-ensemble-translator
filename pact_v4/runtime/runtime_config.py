@@ -1022,6 +1022,9 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
         ),
         default_temperature=payload.get("default_temperature"),
         default_max_output_tokens=payload.get("default_max_output_tokens"),
+        timeout_seconds=float(
+            payload.get("timeout_seconds", OpenCodeServerBackendConfig().timeout_seconds)
+        ),
     )
     if remote_budget is not None:
         # None keeps the dataclass default (``RemoteBudget()``); only an
