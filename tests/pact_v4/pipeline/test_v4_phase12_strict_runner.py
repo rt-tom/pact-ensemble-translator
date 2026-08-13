@@ -200,8 +200,24 @@ class _LifecycleAwareModelCaller:
         self._inner = inner
 
     def __call__(self, bundle: PromptBundle) -> str:
+        # GEN-REASONING (RV t_a790dbab): mirror the production
+        # LifecycleModelCaller — reset the per-attempt reasoning diagnostic
+        # BEFORE ensure_resident so an acquisition failure never exposes a
+        # prior completion's stale reasoning. The StubModelCaller has no
+        # reset_attempt_state; the getattr keeps the double working for
+        # both stub kinds (plain StubModelCaller and _ReasoningStubCaller).
+        reset = getattr(self._inner, "reset_attempt_state", None)
+        if reset is not None:
+            reset()
         self._router.ensure_resident("gemma")
         return self._inner(bundle)
+
+    @property
+    def last_reasoning(self) -> str:
+        # V4.1 GEN-REASONING: mirror the production LifecycleModelCaller
+        # forwarding so the whole-chapter reasoning capture (which reads
+        # model_caller.last_reasoning) works through the lifecycle wrapper.
+        return getattr(self._inner, "last_reasoning", "")
 
 
 class _LifecycleAwareQwen:
