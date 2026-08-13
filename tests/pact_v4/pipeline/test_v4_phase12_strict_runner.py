@@ -219,6 +219,14 @@ class _LifecycleAwareModelCaller:
         # model_caller.last_reasoning) works through the lifecycle wrapper.
         return getattr(self._inner, "last_reasoning", "")
 
+    def set_reasoning_chunk_sink(self, sink) -> None:
+        # V4.1 GEN-STREAM: mirror the production LifecycleModelCaller
+        # forwarding so the whole-chapter live reasoning writer reaches the
+        # wrapped caller (see BackendModelCaller.set_reasoning_chunk_sink).
+        setter = getattr(self._inner, "set_reasoning_chunk_sink", None)
+        if setter is not None:
+            setter(sink)
+
 
 class _LifecycleAwareQwen:
     def __init__(self, router: ModelRouter, inner: StubQwen) -> None:

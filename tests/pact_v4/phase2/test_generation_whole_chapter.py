@@ -513,3 +513,105 @@ def test_whole_chapter_reasoning_sink_empty_on_lifecycle_acquisition_abort(tmp_p
     assert outcome.status == "incomplete"
     assert received == [(0, ""), (1, ""), (2, "")]
     assert caller.last_reasoning == ""
+
+
+# ---------------------------------------------------------------------------
+# V4.1 GEN-STREAM: live reasoning writer (whole-chapter path)
+# ---------------------------------------------------------------------------
+
+
+class _LiveChunkCaller:
+    """``ModelCaller`` that accepts a live reasoning-chunk sink (the
+    ``set_reasoning_chunk_sink`` duck-typed hook of the production
+    ``BackendModelCaller`` chain) and streams chunks through it DURING
+    ``__call__``, i.e. BEFORE the response is returned.
+    """
+
+    def __init__(self, responses, reasonings, reason_path=None) -> None:
+        self.responses = list(responses)
+        self.reasonings = list(reasonings)
+        self.calls = 0
+        self.last_reasoning = ""
+        self.installed_sink = None
+        self.reason_path = reason_path
+        self.file_state_during_call = None
+
+    def set_reasoning_chunk_sink(self, sink) -> None:
+        self.installed_sink = sink
+
+    def __call__(self, bundle) -> str:
+        self.calls += 1
+        # GEN-STREAM acceptance: the live sink is installed BEFORE the call
+        # and streamed through DURING it — the backing file grows before the
+        # response is produced.
+        if self.installed_sink is not None:
+            self.installed_sink("думает о роде и регистре… ")
+            self.installed_sink("окончательный вывод")
+            if self.reason_path is not None:
+                self.file_state_during_call = self.reason_path.read_text(
+                    encoding="utf-8"
+                )
+        if self.reasonings:
+            self.last_reasoning = self.reasonings.pop(0)
+        return self.responses.pop(0)
+
+
+def test_whole_chapter_live_reasoning_writer_grows_file_during_call(tmp_path):
+    # GEN-STREAM acceptance (mock): when the caller supports the live sink
+    # and the runner supplies a live_reasoning_writer factory, the per-attempt
+    # reasoning file is created BEFORE the model call and grows live DURING
+    # it (the on_reasoning_chunk callback fires before complete finishes).
+    from pact_v4.runtime.reasoning_writer import open_reasoning_writer
+
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    reason_path = tmp_path / "out" / "whole_chapter_reasoning.txt"
+    caller = _LiveChunkCaller([good], ["полный текст размышлений"], reason_path=reason_path)
+
+    def _live_writer(attempt: int):
+        assert attempt == 0
+        # open_reasoning_writer creates/truncates the file BEFORE the call.
+        return open_reasoning_writer(reason_path)
+
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+        live_reasoning_writer=_live_writer,
+    )
+    assert outcome.status == "complete"
+    # The file grew live DURING the call — the caller observed its non-empty
+    # content while the model was still "generating" (before the response).
+    assert caller.installed_sink is None  # cleared after the call
+    assert caller.file_state_during_call == "думает о роде и регистре… окончательный вывод"
+    live_text = reason_path.read_text(encoding="utf-8")
+    assert live_text == "думает о роде и регистре… окончательный вывод"
+    # The authoritative post-completion sink still fires with the full text.
+    assert received == [(0, "полный текст размышлений")]
+
+
+def test_whole_chapter_live_reasoning_writer_respects_stub_caller(tmp_path):
+    # GEN-STREAM NON-GOAL: a caller WITHOUT set_reasoning_chunk_sink (the
+    # common test stub) is left untouched — the live factory is never
+    # invoked and the post-completion reasoning_sink path is preserved.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ScriptedCaller([good])
+    factory_calls = []
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+        live_reasoning_writer=lambda attempt: factory_calls.append(attempt),
+    )
+    assert outcome.status == "complete"
+    assert factory_calls == []
+    assert received == [(0, "")]

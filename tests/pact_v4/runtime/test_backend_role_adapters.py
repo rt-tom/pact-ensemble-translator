@@ -248,6 +248,45 @@ def test_model_caller_reset_attempt_state_clears_reasoning():
     assert caller2.last_reasoning == "обдумал род и регистр"
 
 
+def test_model_caller_forwards_live_reasoning_chunk_sink():
+    # V4.1 GEN-STREAM: BackendModelCaller forwards the installed live
+    # reasoning sink (set_reasoning_chunk_sink) into the CompletionRequest's
+    # on_reasoning_chunk hook, and the transport invokes it BEFORE the call
+    # completes — so the whole-chapter *_reasoning.txt file grows live.
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+
+    class _StreamingBackend(ScriptedBackend):
+        """Backend that delivers reasoning chunks DURING complete() — the
+        local llama-server SSE behavior (reasoning_content streamed live)."""
+
+        def complete(self, request):
+            assert request.on_reasoning_chunk is not None, (
+                "GEN-STREAM: live sink must reach the CompletionRequest"
+            )
+            # The sink is invoked BEFORE the response is returned, i.e.
+            # while the model is still generating.
+            request.on_reasoning_chunk("подумал о роде ")
+            request.on_reasoning_chunk("и регистре")
+            return super().complete(request)
+
+    backend = _StreamingBackend([_text_response(canned)])
+    caller = BackendModelCaller(backend)
+    chunks: list[str] = []
+    caller.set_reasoning_chunk_sink(chunks.append)
+
+    caller(_bundle())
+    # Both chunks arrived BEFORE complete() returned — the file (backed by
+    # this sink) grows during the call, not after it.
+    assert chunks == ["подумал о роде ", "и регистре"]
+
+    # Clearing the sink restores the historical behavior: no hook forwarded.
+    caller.set_reasoning_chunk_sink(None)
+    backend2 = ScriptedBackend([_text_response(canned)])
+    caller2 = BackendModelCaller(backend2)
+    caller2(_bundle())
+    assert backend2.requests[0].on_reasoning_chunk is None
+
+
 def test_model_caller_uses_role_model_ref_from_descriptor():
     backend = ScriptedBackend([_text_response("{}")])
     caller = BackendModelCaller(backend)

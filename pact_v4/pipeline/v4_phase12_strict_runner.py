@@ -66,7 +66,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
     DEFAULT_REASONING_BUDGET,
@@ -181,6 +181,7 @@ from pact_v4.pipeline.phase_progress import PhaseProgressWriter
 from pact_v4.pipeline.usage_record import UsageRecordWriter
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.json_resilience import JsonRetryPolicy
+from pact_v4.runtime.reasoning_writer import open_reasoning_writer
 from pact_v4.runtime.model_lifecycle_adapters import (
     GEMMA_MODEL_KEY,
     QWEN_MODEL_KEY,
@@ -4393,6 +4394,28 @@ def _run_whole_chapter_strict_impl(
         def _wc_reasoning_sink(attempt: int, reasoning: str) -> None:
             reasoning_by_attempt[attempt] = reasoning
 
+        # V4.1 GEN-STREAM: per-attempt live reasoning writer. The file is
+        # created BEFORE the model call (open_reasoning_writer truncates and
+        # returns an appender) and grows live while the model generates
+        # (local llama-server streams reasoning_content; the OpenCode
+        # transport delivers once after completion — both through the same
+        # sink, the documented fallback). Gated on cfg.reasoning>0 so a
+        # reasoning=0 run writes no file; the authoritative post-completion
+        # write (_persist_whole_chapter_reasoning) then overwrites the same
+        # path with the full text — the live writer is a diagnostics bonus,
+        # never the source of truth, and the final flush is authoritative.
+        def _wc_live_reasoning_writer(
+            attempt: int,
+        ) -> Optional[Callable[[str], None]]:
+            if cfg.reasoning <= 0:
+                return None
+            name = (
+                "whole_chapter_reasoning.txt"
+                if attempt == 0
+                else f"whole_chapter_retry{attempt}_reasoning.txt"
+            )
+            return open_reasoning_writer(cfg.out_dir / name)
+
         outcome = generate_whole_chapter(
             role="balanced_literary",
             source=source,
@@ -4410,6 +4433,7 @@ def _run_whole_chapter_strict_impl(
                 attempt=attempt, reason=reason
             ),
             reasoning_sink=_wc_reasoning_sink,
+            live_reasoning_writer=_wc_live_reasoning_writer,
         )
         progress.wc_generation_done(
             finish_reason="complete" if outcome.status == "complete" else "incomplete",
@@ -4429,6 +4453,29 @@ def _run_whole_chapter_strict_impl(
                 cfg.out_dir, reasoning_by_attempt
             )
             generation_record["reasoning"] = reasoning_marker
+        # GEN-STREAM cleanup: the live writer truncated the per-attempt
+        # files BEFORE the calls (open_reasoning_writer), but an attempt
+        # that ended up with NO reasoning (reasoning=0, a transport that
+        # reported none, or a failed attempt superseded by a retry) leaves
+        # an EMPTY live file behind. Remove those so the F8 manifest never
+        # advertises an artifact that carries no reasoning text. A file that
+        # already holds streamed content is kept (it is real data).
+        for attempt, reasoning in reasoning_by_attempt.items():
+            if reasoning:
+                continue
+            name = (
+                "whole_chapter_reasoning.txt"
+                if attempt == 0
+                else f"whole_chapter_retry{attempt}_reasoning.txt"
+            )
+            try:
+                path = cfg.out_dir / name
+                if path.exists() and path.stat().st_size == 0:
+                    path.unlink()
+            except OSError as exc:
+                LOG.warning(
+                    "whole-chapter reasoning live-file cleanup failed: %s", exc
+                )
         generation_records.append(generation_record)
 
         if outcome.status == "complete":

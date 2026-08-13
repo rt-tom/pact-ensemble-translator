@@ -53,14 +53,13 @@ def _run_whole_chapter(cfg, *, model_caller=None):
     model_caller = _LifecycleAwareModelCaller(
         router, model_caller or StubModelCaller()
     )
-    result = run_chapter_strict(
+    return run_chapter_strict(
         cfg, router=router, model_caller=model_caller,
         qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()),
         gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
         qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
         gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
     )
-    return result
 
 
 def test_whole_chapter_mode_generates_one_call_full_pid_map(tmp_path):
@@ -1849,3 +1848,109 @@ def test_whole_chapter_no_reasoning_writes_no_artifact(tmp_path):
     )
     assert "reasoning" not in outcomes["outcomes"][0]
     assert "whole_chapter_reasoning" not in result.record["artefacts"]
+
+
+class _LiveStreamingReasoningCaller:
+    """StubModelCaller that supports the GEN-STREAM live reasoning sink.
+
+    Mirrors the production ``BackendModelCaller.set_reasoning_chunk_sink``
+    hook: the generation layer installs a per-attempt writer BEFORE the call,
+    and this stub streams chunks through it DURING ``__call__`` (i.e. before
+    the response is returned) — so the backing ``*_reasoning.txt`` file grows
+    live while the model is still generating.
+    """
+
+    def __init__(self, good: str, *, reasonings=None) -> None:
+        self.good = good
+        self.reasonings = list(reasonings or [])
+        self.calls = 0
+        self.last_reasoning = ""
+        self._sink = None
+
+    def set_reasoning_chunk_sink(self, sink) -> None:
+        self._sink = sink
+
+    def __call__(self, bundle) -> str:
+        self.calls += 1
+        if self._sink is not None:
+            self._sink("думает о роде и регистре… ")
+            self._sink("окончательный вывод")
+        if self.reasonings:
+            self.last_reasoning = self.reasonings.pop(0)
+        return self.good
+
+
+def _whole_chapter_reasoning_cfg_with_reasoning(tmp_path, reasoning: int) -> StrictRunConfig:
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    return type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True, reasoning=reasoning,
+    )
+
+
+def test_whole_chapter_reasoning_live_file_grows_during_generation(tmp_path):
+    # GEN-STREAM acceptance: with a reasoning budget > 0, the per-attempt
+    # reasoning file is created BEFORE the whole-chapter model call and grows
+    # live DURING it (the on_reasoning_chunk sink fires while the model is
+    # still generating, mirroring r_editor_chunkN_reasoning.txt). The
+    # authoritative post-completion write (attempt 0 -> whole_chapter_reasoning
+    # .txt) then overwrites the same path with the full text — the final
+    # flush is the final content, no duplication.
+    cfg = _whole_chapter_reasoning_cfg_with_reasoning(tmp_path, reasoning=1)
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    good = json.dumps(
+        {pid: f"Перевод {pid}" for pid in snapshot.pids},
+        ensure_ascii=False,
+    )
+    caller = _LiveStreamingReasoningCaller(
+        good, reasonings=["полный текст размышлений за главу"]
+    )
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+    assert caller.calls == 1
+    # The sink was installed and cleared around the single attempt.
+    assert caller._sink is None
+
+    reasoning_path = cfg.out_dir / "whole_chapter_reasoning.txt"
+    assert reasoning_path.exists()
+    # GEN-STREAM regression: the final file content is the authoritative
+    # full text exactly once — the live chunks were overwritten, not
+    # duplicated, by the post-completion write (last flush = final content).
+    assert reasoning_path.read_text(encoding="utf-8") == (
+        "полный текст размышлений за главу"
+    )
+
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    marker = outcomes["outcomes"][0]["reasoning"]
+    assert marker["attempts"]["0"]["present"] is True
+    assert marker["attempts"]["0"]["chars"] == len("полный текст размышлений за главу")
+    assert result.record["artefacts"]["whole_chapter_reasoning"] == str(reasoning_path)
+
+
+def test_whole_chapter_reasoning_no_live_file_when_reasoning_off(tmp_path):
+    # GEN-STREAM NON-GOAL: with reasoning=0 the live writer is never opened
+    # (no file before/after the call, sink never installed) — the
+    # pre-GEN-STREAM contract that a reasoning=0 run writes NO live
+    # reasoning artifact is preserved. The authoritative post-completion
+    # write still happens when reasoning text exists.
+    cfg = _whole_chapter_reasoning_cfg_with_reasoning(tmp_path, reasoning=0)
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    good = json.dumps(
+        {pid: f"Перевод {pid}" for pid in snapshot.pids},
+        ensure_ascii=False,
+    )
+    caller = _LiveStreamingReasoningCaller(good, reasonings=["полный текст размышлений"])
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+    # The live sink was never installed (factory gated on reasoning>0) —
+    # the caller's streaming path did not run, so no live file was written
+    # during the call.
+    assert caller._sink is None
+    # The authoritative post-completion write still fired (reasoning text
+    # was reported) — the file exists with the full text, exactly once.
+    assert (cfg.out_dir / "whole_chapter_reasoning.txt").read_text(
+        encoding="utf-8"
+    ) == "полный текст размышлений"
