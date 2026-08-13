@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 # ---------------------------------------------------------------------------
 # Response helper
@@ -142,9 +143,17 @@ class FakeOpenCodeServer:
         # proves the transport budget passed to the session is the configured
         # timeout_seconds, so a long generation is not cut at an old default).
         self.timeouts_log: List[Optional[float]] = []
-        # Optional artificial delay per POST message (seconds) to simulate a
-        # long-running generation request offline.
-        self.message_delay_seconds: float = 0.0
+        # Deterministic virtual-duration simulation (TIMEOUT-FIX): the
+        # simulated duration of one POST message generation, in seconds. No
+        # wall-clock sleep is performed; instead the fake ENFORCES the
+        # per-request ``timeout`` it received against this duration and raises
+        # ``requests.exceptions.Timeout`` when the budget is exceeded — the
+        # same abort the real ``requests.Session`` would perform. A test can
+        # therefore prove "a generation longer than 600s is accepted with a
+        # 900s budget but aborted with the old 600s budget" in milliseconds
+        # instead of sleeping 10-15 real minutes. Applies to message POSTs
+        # only (the generation itself); preflight/session/delete stay instant.
+        self.virtual_generation_seconds: float = 0.0
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self.created_titles: List[str] = []
         self._session_seq = 0
@@ -176,7 +185,7 @@ class FakeOpenCodeServer:
             session_id = path[len("/session/") :]
             return self._delete_session(session_id)
         if method == "POST" and _match_message_path(path):
-            return self._post_message(path)
+            return self._post_message(path, timeout=kwargs.get("timeout"))
         if method == "GET" and _match_message_path(path):
             return self._list_messages(path)
         return FakeResponse(404, {"error": f"unexpected request: {method} {path}"})
@@ -224,12 +233,24 @@ class FakeOpenCodeServer:
             return FakeResponse(200, True)
         return FakeResponse(404, {"error": f"Session not found: {session_id}"})
 
-    def _post_message(self, path: str) -> FakeResponse:
+    def _post_message(self, path: str, *, timeout: Optional[float] = None) -> FakeResponse:
         session_id = _session_id_of(path)
         if not self.message_responses:
             return FakeResponse(500, {"error": "no scripted message response"})
-        if self.message_delay_seconds > 0:
-            time.sleep(self.message_delay_seconds)
+        if (
+            self.virtual_generation_seconds > 0
+            and timeout is not None
+            and self.virtual_generation_seconds > timeout
+        ):
+            # Simulate the client-side transport aborting the call: the real
+            # requests.Session raises Timeout when the generation outlives the
+            # configured budget, and the backend normalizes it to
+            # ERROR_TRANSPORT_TIMEOUT. The scripted response stays queued, so
+            # a bounded transport retry would re-raise deterministically.
+            raise requests.exceptions.Timeout(
+                f"simulated generation of {self.virtual_generation_seconds}s "
+                f"exceeded the {timeout}s transport timeout"
+            )
         item = self.message_responses.pop(0)
         if isinstance(item, BaseException):
             raise item

@@ -260,14 +260,15 @@ class OpenCodeServerBackendConfig:
     structured_output_retry_count: int = 2
 
     # Transport retry policy (plan §10).
-    # TIMEOUT-FIX (2026-08-13): whole-chapter generation with
-    # --reasoning 3 (high) routinely exceeds 10 minutes (run_remote_003:
-    # attempt 2 was cut at exactly 600s; 001/002 took 7-9:45 min; 003
-    # streamed 155k delta events for 10+ min). Default raised 600 -> 2400
-    # (40 min) so a long generation is NOT aborted by the transport; the
-    # value is part of backend identity (build_opencode_descriptor), so a
-    # config that changes it needs a fresh --out-dir/--run-label.
-    timeout_seconds: float = 2400.0
+    # TIMEOUT-FIX (2026-08-13): whole-chapter generation with --reasoning 3
+    # (high) takes up to ~10 min (run_remote_003: attempt 2 was cut at
+    # exactly 600s; 001/002 took 7-9:45 min; 003 streamed 155k delta events
+    # for 10+ min). Default raised 600 -> 900 (15 min) per OWNER DECISION
+    # 2026-08-13 — 900s is headroom over the real 7-10 min, explicitly NOT
+    # 2400 — so a long generation is NOT aborted by the transport. The value
+    # is part of backend identity (build_opencode_descriptor), so a config
+    # that changes it needs a fresh --out-dir/--run-label.
+    timeout_seconds: float = 900.0
     http_retries: int = 2
     retry_delay_seconds: float = 5.0
 
