@@ -810,6 +810,7 @@ def generate_whole_chapter(
     live_reasoning_writer: Optional[
         Callable[[int], Optional[Callable[[str], None]]]
     ] = None,
+    raw_sink: Optional[Callable[[int, str], None]] = None,
 ) -> GenerationOutcome:
     """Generate the whole chapter in ONE model call (V4.1 A1).
 
@@ -965,6 +966,18 @@ def generate_whole_chapter(
         _install_live_reasoning(attempt)
         try:
             raw = model_caller(bundle)
+            # RAW-SINK (architect, run_remote_004/005): persist the raw
+            # model response of EVERY attempt — a later parse/validation
+            # failure then leaves a disk trail (the run_011 lesson applied
+            # to whole-chapter generation; previously raw was only written
+            # on success as translations_raw.json, so TruncatedJSONError
+            # diagnosis was guesswork). Best-effort: a raise here never
+            # changes generation behavior.
+            if raw_sink is not None:
+                try:
+                    raw_sink(attempt, raw)
+                except Exception:  # noqa: BLE001 — diagnostics hook
+                    LOG.debug("whole-chapter raw_sink failed", exc_info=True)
         except _CompletionErrorType() as exc:
             # Transport/session abort (Gate 0: finish=other/error). Retried
             # boundedly like every other failure class. Imported lazily: the

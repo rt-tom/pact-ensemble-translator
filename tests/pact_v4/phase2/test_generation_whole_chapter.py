@@ -530,6 +530,31 @@ def test_whole_chapter_reasoning_sink_receives_truncated_retry(tmp_path):
     ]
 
 
+def test_whole_chapter_raw_sink_receives_every_attempt(tmp_path):
+    # RAW-SINK acceptance (architect, run_remote_004/005): the raw model
+    # response of EVERY attempt — including a truncated first attempt that
+    # would otherwise vanish — must reach the sink, so a disk trail exists
+    # for TruncatedJSONError diagnosis (the run_011 lesson for generation).
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ReasoningCaller(["{truncated json", good], ["", ""])
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        raw_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    assert caller.calls == 2
+    assert received == [
+        (0, "{truncated json"),  # the failed attempt's raw text survives
+        (1, good),
+    ]
+
+
 def test_whole_chapter_reasoning_sink_absent_reasoning_is_empty(tmp_path):
     # A caller that does NOT expose last_reasoning (e.g. a stub) yields "" —
     # the sink still fires per attempt so the runner can record presence=0.
