@@ -479,6 +479,51 @@ def test_no_reasoning_parts_yield_empty_reasoning_metadata():
     assert response.raw_metadata["reasoning"] == ""
 
 
+def test_on_reasoning_chunk_delivered_once_after_completion():
+    """REASONING-STREAM acceptance (opencode): POST /session/{id}/message is
+    NOT an SSE stream — serve 1.4.7 returns the complete message in one
+    response. So on_reasoning_chunk is delivered ONCE with the full reasoning
+    AFTER completion (documented), and raw_metadata marks
+    reasoning_streamed=False."""
+    fake = FakeOpenCodeServer()
+    fake.script_message(
+        {
+            "info": {
+                "id": "m1",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "qwen3.7-plus",
+                "tokens": {"input": 1, "output": 1, "reasoning": 42, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"id": "r1", "type": "reasoning", "text": "step one "},
+                {"id": "r2", "type": "reasoning", "text": "step two"},
+                {"id": "t1", "type": "text", "text": "the answer"},
+            ],
+        }
+    )
+    backend = _backend(fake)
+    received: list = []
+
+    response = backend.complete(
+        _request(on_reasoning_chunk=received.append)
+    )
+
+    assert response.text == "the answer"
+    # One post-completion delivery with the FULL reasoning, not per-chunk.
+    assert received == ["step one step two"]
+    assert response.raw_metadata["reasoning_streamed"] is False
+
+
+def test_on_reasoning_chunk_not_called_when_no_reasoning():
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("plain"))
+    backend = _backend(fake)
+    received: list = []
+    backend.complete(_request(on_reasoning_chunk=received.append))
+    assert received == []
+
+
 # ---------------------------------------------------------------------------
 # Structured output
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from pact_v4.phase1.models import SourceArtifact, canonical_json_hash
@@ -57,6 +58,7 @@ from pact_v4.runtime.json_resilience import (
     retry_json_call,
 )
 from pact_v4.runtime.prompts_runtime import ReviewerPrompt
+from pact_v4.runtime.reasoning_writer import append_error_marker, open_reasoning_writer
 
 LOG = logging.getLogger(__name__)
 
@@ -950,10 +952,21 @@ class BackendEntityExtractor:
     def backend(self) -> CompletionBackend:
         return self._backend
 
-    def __call__(self, *, chapter_id: str, source: Mapping[str, str]) -> str:
+    def __call__(
+        self,
+        *,
+        chapter_id: str,
+        source: Mapping[str, str],
+        out_dir: Optional[Path] = None,
+    ) -> str:
         prompt = render_entity_extraction_prompt(
             chapter_id=chapter_id, source=dict(source)
         )
+        reasoning_path: Optional[Path] = None
+        if out_dir is not None:
+            out_dir = Path(out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            reasoning_path = out_dir / "b1.2_entity_reasoning.txt"
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "entity_extractor"),
             messages=(Message(role="user", content=prompt),),
@@ -961,16 +974,63 @@ class BackendEntityExtractor:
             temperature=0.0,
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
+            # REASONING-STREAM: the reasoning file is created before the call
+            # and grows live (gemma_rewrite_v4 pattern); the final marked
+            # write below stays authoritative.
+            on_reasoning_chunk=open_reasoning_writer(reasoning_path),
         )
+        attempts: List[Tuple[int, str, str]] = []  # (attempt_no, raw, reasoning)
 
         def _complete() -> str:
             try:
-                return self._backend.complete(request).text
+                response = self._backend.complete(request)
             except CompletionError as exc:
                 LOG.error("BackendEntityExtractor: backend failure: %s", exc)
                 raise
+            raw = response.text or ""
+            reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+            attempts.append((len(attempts) + 1, raw, reasoning))
+            return raw
 
-        return retry_json_call(_complete, self._config.retry, label=self._config.label)
+        try:
+            return retry_json_call(
+                _complete, self._config.retry, label=self._config.label
+            )
+        finally:
+            # Persist every attempt's raw + reasoning (ATTEMPT N markers when
+            # a JSON retry happened) — a parse failure leaves a disk trail.
+            self._write_entity_artifacts(out_dir=out_dir, attempts=attempts)
+
+    @staticmethod
+    def _write_entity_artifacts(
+        *,
+        out_dir: Optional[Path],
+        attempts: List[Tuple[int, str, str]],
+    ) -> None:
+        """Persist ``b1.2_entity_reasoning.txt`` + ``b1.2_entity_raw.txt``.
+
+        Single attempt -> plain content; multiple attempts (JSON retry) ->
+        ``ATTEMPT N`` sections so each attempt's reasoning/raw is preserved
+        for parse diagnostics (spec FIX 1: append with ATTEMPT N marker).
+        """
+        if out_dir is None or not attempts:
+            return
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if len(attempts) == 1:
+            reason_text = attempts[0][2]
+            raw_text = attempts[0][1]
+        else:
+            reason_text = "\n\n".join(
+                f"ATTEMPT {n}\n{reasoning}" for n, _, reasoning in attempts
+            )
+            raw_text = "\n\n".join(
+                f"ATTEMPT {n}\n{raw}" for n, raw, _ in attempts
+            )
+        (out_dir / "b1.2_entity_reasoning.txt").write_text(
+            reason_text, encoding="utf-8"
+        )
+        (out_dir / "b1.2_entity_raw.txt").write_text(raw_text, encoding="utf-8")
 
 
 def _model_ref_for(backend: CompletionBackend, role: str) -> str:
@@ -1010,15 +1070,19 @@ def extract_entity_context(
     cache: Optional[EntityContextCache] = None,
     extractor_version: str = EXTRACTOR_VERSION,
     retry: Optional[JsonRetryPolicy] = None,
+    out_dir: Optional[Path] = None,
 ) -> EntityExtractionResult:
     """Source-only prepass: cache hit -> reuse; miss -> Qwen -> validate.
 
     ``extractor`` is duck-typed (any object exposing ``__call__(*,
-    chapter_id, source) -> raw str``); the reference implementation is
-    ``BackendEntityExtractor`` / ``LifecycleQwenEntityExtractor``. The model
-    is called ONCE per chapter when the cache misses; the validated result
-    is stored under ``source_hash + extractor_version`` so resume never
-    repeats the call.
+    chapter_id, source, out_dir=None) -> raw str``); the reference
+    implementation is ``BackendEntityExtractor`` /
+    ``LifecycleQwenEntityExtractor``. ``out_dir`` is forwarded to the
+    extractor so it can persist its ``b1.2_entity_reasoning.txt`` /
+    ``b1.2_entity_raw.txt`` artifacts (REASONING-STREAM; artifact only,
+    never part of cache identity). The model is called ONCE per chapter
+    when the cache misses; the validated result is stored under
+    ``source_hash + extractor_version`` so resume never repeats the call.
 
     Fail-closed (RV t_7e9ab408 findings 1+2, RV2 fix): the model body is
     stamped with the harness-owned top-level metadata (``schema``/
@@ -1071,7 +1135,9 @@ def extract_entity_context(
                 )
 
     raw = extractor(
-        chapter_id=source_artifact.chapter_id, source=source_map
+        chapter_id=source_artifact.chapter_id,
+        source=source_map,
+        out_dir=out_dir,
     )
     payload = parse_model_output(raw)
     stamped = with_entity_context_metadata(

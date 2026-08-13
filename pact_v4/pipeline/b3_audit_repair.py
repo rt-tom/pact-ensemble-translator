@@ -1017,6 +1017,7 @@ class B3AuditRepair:
                     ),
                     cache=entity_cache,
                     extractor_version=cfg.extractor_version,
+                    out_dir=out_dir,
                 )
             except Exception as exc:  # noqa: BLE001 — fail-closed, never silent skip
                 LOG.exception("B3: entity context extraction failed for %s", chapter_id)

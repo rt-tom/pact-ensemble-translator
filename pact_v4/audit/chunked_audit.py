@@ -55,7 +55,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.runtime.backend_protocol import (
     JSON_OBJECT_SCHEMA,
@@ -68,6 +68,7 @@ from pact_v4.runtime.prompts_runtime import (
     ReviewerPrompt,
     render_chunked_audit_prompt,
 )
+from pact_v4.runtime.reasoning_writer import append_error_marker, open_reasoning_writer
 
 LOG = logging.getLogger(__name__)
 
@@ -785,6 +786,7 @@ class ChunkedAuditEvaluator:
         chapter_id: str,
         prompt: str,
         model_ref: str,
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
     ) -> CompletionRequest:
         return CompletionRequest(
             model_ref=model_ref,
@@ -793,6 +795,7 @@ class ChunkedAuditEvaluator:
             temperature=0.0,
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
+            on_reasoning_chunk=on_reasoning_chunk,
             # NOTE: no request_options — the reasoning budget is a server
             # arg (--reasoning-budget); LocalOpenAIBackend rejects options.
         )
@@ -840,11 +843,22 @@ class ChunkedAuditEvaluator:
             chunk_total=chunk_total,
             template=cfg.template,
         )
-        request = self._request(chapter_id=chapter_id, prompt=prompt, model_ref=model_ref)
         chunk_pids = [p.pid for p in chunk_pairs]
         file_stem = (
             f"{out_base}_{suffix}_chunk{chunk_index}"
             if suffix else f"{out_base}_chunk{chunk_index}"
+        )
+        # REASONING-STREAM: the reasoning file is created BEFORE the call and
+        # grows live via on_reasoning_chunk (gemma_rewrite_v4 pattern); the
+        # authoritative write after completion stays unchanged.
+        reason_path: Optional[Path] = None
+        if out_dir is not None:
+            reason_path = out_dir / f"{file_stem}_reasoning.txt"
+        request = self._request(
+            chapter_id=chapter_id,
+            prompt=prompt,
+            model_ref=model_ref,
+            on_reasoning_chunk=open_reasoning_writer(reason_path),
         )
         try:
             self._emit_chunk_event(
@@ -860,11 +874,15 @@ class ChunkedAuditEvaluator:
                 "audit chunk %s transport failure (%s): %s",
                 chunk_index, type(exc).__name__, exc,
             )
-            self._write_artifacts(
-                out_dir=out_dir, file_stem=file_stem,
-                content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
-                reasoning="",
-            )
+            # Raw error trail (run_011 lesson) + preserve any reasoning that
+            # streamed live before the failure instead of wiping it.
+            if out_dir is not None:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / f"{file_stem}_raw.txt").write_text(
+                    f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                    encoding="utf-8",
+                )
+                append_error_marker(reason_path, exc)
             meta = ChunkMeta(
                 chunk=chunk_index,
                 first_pid=chunk_pids[0],

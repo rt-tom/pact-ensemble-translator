@@ -9,7 +9,7 @@ no-op diff-gate), and the evaluator over a scripted in-memory backend
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import pytest
 
@@ -898,3 +898,39 @@ def test_evaluator_transport_failure_writes_transport_error_artifact(tmp_path) -
     raw = tmp_path / "r_editor_chunk1_raw.txt"
     assert raw.exists()
     assert raw.read_text(encoding="utf-8").startswith("TRANSPORT_ERROR:")
+
+
+def test_evaluator_streams_reasoning_live_during_call(tmp_path) -> None:
+    """REASONING-STREAM acceptance: the R editor's reasoning file is created
+    BEFORE the call and grows live — a scripted backend firing
+    on_reasoning_chunk mid-call sees the file already populated, and the
+    authoritative post-completion write still carries the full reasoning."""
+    observed: Dict[str, str] = {}
+
+    class _StreamingBackend(_MockBackend):
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            assert request.on_reasoning_chunk is not None
+            request.on_reasoning_chunk("live-")
+            request.on_reasoning_chunk("edits")
+            observed["during"] = (
+                tmp_path / "r_editor_chunk1_reasoning.txt"
+            ).read_text(encoding="utf-8")
+            return CompletionResponse(
+                text='{"edits": []}',
+                model="qwen-3.6-35b",
+                finish_reason="stop",
+                raw_metadata={"reasoning": "full-reasoning"},
+            )
+
+    evaluator = RussianEditorEvaluator(_StreamingBackend())
+    outcome = evaluator(
+        chapter_id="0001",
+        translation=_translation(10),
+        out_dir=tmp_path, out_base="r_editor",
+    )
+    assert outcome.complete is True
+    assert observed["during"] == "live-edits"
+    assert (tmp_path / "r_editor_chunk1_reasoning.txt").read_text(
+        encoding="utf-8"
+    ) == "full-reasoning"

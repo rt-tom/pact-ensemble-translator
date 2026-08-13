@@ -1085,6 +1085,24 @@ class OpenCodeServerBackend:
             self._owned_sessions[session_id] = "success"
             text = self._extract_text(parts)
             reasoning = self._extract_reasoning(parts)
+            # REASONING-STREAM: POST /session/{id}/message is NOT an SSE
+            # stream — serve 1.4.7 returns the complete message (info +
+            # parts) in one JSON response; opencode streams via the separate
+            # /event SSE endpoint (message.part.updated), which this
+            # transport does not consume. So reasoning is delivered once,
+            # AFTER completion, through the optional on_reasoning_chunk sink
+            # (documented fallback; the phase's *_reasoning.txt file is
+            # written after the call returns, not live). A raise inside the
+            # sink is best-effort — it must never fail the model call.
+            if request.on_reasoning_chunk is not None and reasoning:
+                try:
+                    request.on_reasoning_chunk(reasoning)
+                except Exception:  # noqa: BLE001 — a sink failure is best-effort
+                    LOG.warning(
+                        "OpenCodeServerBackend: on_reasoning_chunk callback "
+                        "raised; reasoning delivery is best-effort",
+                        exc_info=True,
+                    )
             structured = info.get("structured")
             if self._cfg.structured_output_mode == "json_schema":
                 if structured is None:
@@ -1145,6 +1163,11 @@ class OpenCodeServerBackend:
                     "attempts": attempt_log,
                     "structured_output_mode": self._cfg.structured_output_mode,
                     "reasoning": reasoning,
+                    # REASONING-STREAM: the opencode message POST is batch —
+                    # reasoning is never streamed live on this transport (see
+                    # the comment at the delivery site). Marker for phases/
+                    # tests to distinguish live from post-completion writes.
+                    "reasoning_streamed": False,
                 },
             )
 

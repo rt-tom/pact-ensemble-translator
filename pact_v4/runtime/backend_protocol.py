@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pact_v4.phase1.models import canonical_json_hash
@@ -186,6 +186,16 @@ class CompletionRequest:
     # every other transport (local llama-server never reads it). Defaults
     # to False so the historical body shape is preserved.
     omit_system_tools: bool = False
+    # Optional live-reasoning sink: called with each reasoning chunk as it
+    # is produced (REASONING-STREAM). Phases pass a writer that appends to
+    # the ``*_reasoning.txt`` artifact, so the file grows DURING the model
+    # call (gemma_rewrite_v4 pattern) instead of only after completion.
+    # When None (default) the backend delivers reasoning after completion
+    # as before. Never part of identity/cache: excluded from equality and
+    # repr, and transports must not send it on the wire.
+    on_reasoning_chunk: Optional[Callable[[str], None]] = field(
+        default=None, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_ref, str) or not self.model_ref:
@@ -207,6 +217,12 @@ class CompletionRequest:
             raise ValueError(
                 "CompletionRequest: unknown request option(s) "
                 f"{sorted(unknown)}; allowed: {sorted(ALLOWED_REQUEST_OPTIONS)}"
+            )
+        if self.on_reasoning_chunk is not None and not callable(
+            self.on_reasoning_chunk
+        ):
+            raise ValueError(
+                "CompletionRequest: on_reasoning_chunk must be None or callable"
             )
         object.__setattr__(
             self,

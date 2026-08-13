@@ -35,20 +35,40 @@ class _FakeResponse:
             raise ValueError("no JSON payload")
         return self._payload
 
+    def close(self) -> None:
+        pass
+
+
+class _FakeStreamResponse:
+    """Minimal SSE stand-in used by the REASONING-STREAM tests."""
+
+    def __init__(self, *, status_code: int, lines: List[str]):
+        self.status_code = status_code
+        self.reason = "OK" if 200 <= status_code < 300 else "Error"
+        self.text = "\n".join(lines)
+        self._lines = list(lines)
+
+    def iter_lines(self, decode_unicode: bool = False):
+        for line in self._lines:
+            yield line
+
+    def close(self) -> None:
+        pass
+
 
 class _FakeSession:
     def __init__(self, script: List[Any]):
         self._script = list(script)
         self.posts: List[Dict[str, Any]] = []
 
-    def post(self, url: str, *, json: Dict[str, Any], timeout: float):
-        self.posts.append({"url": url, "json": json, "timeout": timeout})
+    def post(self, url: str, *, json: Dict[str, Any], timeout: float, stream: bool = False):
+        self.posts.append({"url": url, "json": json, "timeout": timeout, "stream": stream})
         if not self._script:
             raise AssertionError("FakeSession: script exhausted")
         item = self._script.pop(0)
         if isinstance(item, BaseException):
             raise item
-        if isinstance(item, _FakeResponse):
+        if isinstance(item, (_FakeResponse, _FakeStreamResponse)):
             return item
         status, text, payload = item
         return _FakeResponse(status_code=status, text=text, json_payload=payload)
@@ -307,3 +327,82 @@ def test_config_constructor_wires_api_client_with_config():
     backend = LocalOpenAIBackend(config=cfg)
     assert backend.api.config.model == "qwen-custom"
     assert backend.descriptor.model_bindings == {"generator": "qwen-custom"}
+
+
+# ---------------------------------------------------------------------------
+# REASONING-STREAM: on_reasoning_chunk forwarding
+# ---------------------------------------------------------------------------
+
+
+def _sse_lines(*chunks: str) -> List[str]:
+    """llama-server-style SSE lines: reasoning deltas, then content, [DONE]."""
+    import json
+
+    lines = []
+    for rc in chunks:
+        lines.append(
+            "data: "
+            + json.dumps(
+                {"choices": [{"delta": {"reasoning_content": rc}, "finish_reason": None}]}
+            )
+        )
+    lines.append(
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {"delta": {"content": '{"ok": true}'}, "finish_reason": None}
+                ]
+            }
+        )
+    )
+    lines.append(
+        "data: "
+        + json.dumps(
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            }
+        )
+    )
+    lines.append("data: [DONE]")
+    return lines
+
+
+def test_complete_forwards_on_reasoning_chunk_and_marks_streamed():
+    """REASONING-STREAM: LocalOpenAIBackend forwards the request's
+    on_reasoning_chunk to ApiClient, which uses the SSE transport; the
+    response marks reasoning_streamed=True so phases can distinguish live
+    from post-completion writes."""
+    client = _client(
+        script=[_FakeStreamResponse(status_code=200, lines=_sse_lines("a", "b"))]
+    )
+    backend = LocalOpenAIBackend(api=client)
+    received: List[str] = []
+
+    response = backend.complete(
+        _request(on_reasoning_chunk=received.append)
+    )
+
+    assert response.text == '{"ok": true}'
+    assert received == ["a", "b"]
+    assert response.raw_metadata["reasoning"] == "ab"
+    assert response.raw_metadata["reasoning_streamed"] is True
+    assert client._session.posts[0]["stream"] is True
+
+
+def test_complete_without_callback_marks_not_streamed():
+    """No on_reasoning_chunk -> batch path, reasoning_streamed=False."""
+    client = _client(script=[_ok('{"ok": true}')])
+    backend = LocalOpenAIBackend(api=client)
+    response = backend.complete(_request())
+    assert response.raw_metadata["reasoning_streamed"] is False
+    assert client._session.posts[0]["stream"] is False
+
+
+def test_request_rejects_non_callable_on_reasoning_chunk():
+    from pact_v4.runtime.backend_protocol import CompletionRequest
+
+    with pytest.raises(ValueError, match="on_reasoning_chunk"):
+        _request(on_reasoning_chunk="not-callable")  # type: ignore[arg-type]
+    assert CompletionRequest
