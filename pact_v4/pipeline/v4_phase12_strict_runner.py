@@ -155,6 +155,7 @@ from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
     DEFAULT_REAUDIT_OVERLAP_TOKENS,
     DEFAULT_REPAIR_CONTEXT_WINDOW,
+    DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
     REAUDIT_DELTA_FORMAT,
@@ -357,6 +358,17 @@ class StrictRunConfig:
     # local-context prompt. Wired into B3AuditRepairConfig by
     # _build_b3_audit_repair.
     audit_repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW
+    # REPAIR-2 (card t_768537b9, F5): the per-category window overrides
+    # ({category: window}; categories not in the map fall back to
+    # ``audit_repair_context_window`` — invented_gender/referent/omission
+    # default ±10, changed_fact/addition stay ±3; owner decision 2026-08-12).
+    # Identity-bearing: a per-category window change invalidates cache/resume
+    # exactly like the scalar window, so a stale cached repaired map (narrow
+    # gender window) can never replay under a wide-gender-window prompt.
+    # Wired into B3AuditRepairConfig by _build_b3_audit_repair.
+    audit_repair_context_window_by_category: Mapping[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY)
+    )
     audit_repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     # REPAIR-CTX (t_97b31f81, owner decision 2026-08-12): the re-audit is a
     # CHUNKED audit over the affected region — the whole-chapter re-audit
@@ -467,6 +479,14 @@ class StrictRunConfig:
                     # (F5: an old full-chapter repaired map must never replay
                     # under a local-context prompt).
                     "repair_context_window": self.audit_repair_context_window,
+                    # REPAIR-2 (t_768537b9): the per-category window
+                    # overrides are identity-bearing — a change invalidates
+                    # cache/resume (F5: a stale repaired map written under a
+                    # narrow gender window must never replay under a
+                    # wide-gender-window prompt).
+                    "repair_context_window_by_category": dict(
+                        self.audit_repair_context_window_by_category
+                    ),
                     "repair_reaudit_neighbour_window": self.audit_repair_reaudit_neighbour_window,
                     # REPAIR-CTX (t_97b31f81): the re-audit chunk/overlap
                     # settings and the REPAIRED CHANGES delta format are

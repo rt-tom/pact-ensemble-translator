@@ -114,6 +114,7 @@ from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
     DEFAULT_REAUDIT_OVERLAP_TOKENS,
     DEFAULT_REPAIR_CONTEXT_WINDOW,
+    DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     REAUDIT_DELTA_FORMAT,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
@@ -286,6 +287,15 @@ class B3AuditRepairConfig:
     # cached repaired map (old full-chapter batches can never replay under a
     # local-context prompt).
     repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW
+    # REPAIR-2 (card t_768537b9, F5): the per-category window overrides
+    # ({category: window}; categories not in the map fall back to
+    # ``repair_context_window`` — invented_gender/referent/omission default
+    # ±10, changed_fact/addition stay ±3). Part of the run config identity
+    # and wired into SelectiveRepairConfig below — a window change must
+    # invalidate a stale cached repaired map.
+    repair_context_window_by_category: Mapping[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY)
+    )
     repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     # REPAIR-CTX (t_97b31f81, owner decision 2026-08-12): the re-audit is a
     # CHUNKED audit over the affected region (changed PIDs + neighbours) —
@@ -339,6 +349,9 @@ class B3AuditRepairConfig:
             "repair_microbatch_trigger": self.repair_microbatch_trigger,
             "repair_microbatch_target": self.repair_microbatch_target,
             "repair_context_window": self.repair_context_window,
+            "repair_context_window_by_category": dict(
+                self.repair_context_window_by_category
+            ),
             "repair_reaudit_neighbour_window": self.repair_reaudit_neighbour_window,
             "repair_reaudit_chunk": {
                 "max_input_tokens": self.repair_reaudit_max_input_tokens,
@@ -1309,6 +1322,14 @@ class B3AuditRepair:
                     # defaults — a window change invalidates the repaired map
                     # cache.
                     repair_context_window=cfg.repair_context_window,
+                    # REPAIR-2 (t_768537b9, F5): the per-category window
+                    # overrides are wired from the B3 config (identity
+                    # carries them), so the evaluator can never silently fall
+                    # back to module defaults — a per-category window change
+                    # invalidates the repaired map cache.
+                    repair_context_window_by_category=dict(
+                        cfg.repair_context_window_by_category
+                    ),
                     reaudit_neighbour_window=cfg.repair_reaudit_neighbour_window,
                     # REPAIR-CTX (t_97b31f81, F5): the re-audit chunk/overlap
                     # settings and the REPAIRED CHANGES delta format are
@@ -1363,6 +1384,11 @@ class B3AuditRepair:
                 committed_pids=[pid for pid, _ in repair_outcome.committed],
                 passed_pids=list(repair_outcome.passed_pids),
                 debt_trace=list(repair_outcome.debt_trace),
+                # REPAIR-2 (t_768537b9): per-index non-fatal notices (no-op
+                # repairs converted to per-index pass) — journaled with the
+                # round so the operator sees the model misused the decision
+                # contract without losing the batch's real repairs.
+                warnings=list(repair_outcome.warnings),
                 repair_complete=repair_outcome.repair_complete,
                 skipped=repair_outcome.skipped,
             )
@@ -1441,6 +1467,12 @@ class B3AuditRepair:
             ),
             "debt_trace": (
                 list(repair_outcome.debt_trace) if repair_outcome is not None else []
+            ),
+            # REPAIR-2 (t_768537b9): per-index non-fatal notices (no-op
+            # repairs converted to per-index pass) ride the repair record so
+            # the operator can see them in step7 / the trial record.
+            "warnings": (
+                list(repair_outcome.warnings) if repair_outcome is not None else []
             ),
         }
         # F1 (B3 review): the terminal gate is honest about repair debt. The
@@ -1625,6 +1657,9 @@ def _reports_from_cache(
     ]
     passed_pids = list((repair_payload or {}).get("passed_pids") or [])
     debt_trace = list((repair_payload or {}).get("debt_trace") or [])
+    # REPAIR-2 (t_768537b9): per-index non-fatal notices (no-op repairs
+    # converted to per-index pass) restored from the cached repair payload.
+    warnings = list((repair_payload or {}).get("warnings") or [])
     step6 = {
         "status": "complete",
         "audit_complete": True,
@@ -1641,6 +1676,7 @@ def _reports_from_cache(
         "committed_pids": committed_pids,
         "passed_pids": passed_pids,
         "debt_trace": debt_trace,
+        "warnings": warnings,
         "from_cache": True,
     }
     # F1: the cache replay honors the same terminal gate as a live run — a

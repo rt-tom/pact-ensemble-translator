@@ -10,7 +10,7 @@ provenance rather than silently changing review behaviour.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -579,9 +579,19 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 # перебила) — a literary interpretation of a speech verb is NOT a fidelity
 # defect, so the model must PASS those. Output schema: per-``[index]`` JSON
 # results; every index must be answered exactly once (fail-closed).
+#
+# REPAIR-2 (card t_768537b9, owner decision 2026-08-12): guardrails from the
+# run_013 review — self-verification of the DRAFTED repair (no new verifier
+# call), the invented-gender rule (restore SOURCE gender when SOURCE
+# specifies it; REMOVE the unsupported gender entirely when SOURCE is
+# gender-neutral — never invent EITHER gender, never replace one invented
+# gender with the opposite; run_013 p00193 wrongly changed внучка→внук on a
+# gender-neutral 'grandchild'), and the referent rule (preserve the
+# grammatical attachment of surrounding clauses; run_013 p00096 reassigned
+# the narrator's action to the object).
 REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
     role="selective_repair",
-    version="pact-v4-repair-as-verifier/v2",
+    version="pact-v4-repair-as-verifier/v3",
     instructions=(
         "You are a Russian-language repair editor for an English-to-Russian "
         "literary translation. You are given the SOURCE (PID -> English text) "
@@ -608,6 +618,29 @@ REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
         "every other PID and the rest of the affected PID verbatim. Do not "
         "re-translate the whole chapter. Do not change names, numbers, ты/вы "
         "or adjacent text unless the finding requires it.\n"
+        "\n"
+        "SELF-VERIFICATION (before returning decision 'repair'): after "
+        "drafting the repair, compare your REWRITTEN sentence against SOURCE "
+        "again from scratch. Reject your own rewrite and keep the original if "
+        "the rewrite: (a) introduces a new fact or referent; (b) changes an "
+        "unrelated clause; (c) merely replaces one unsupported gender with "
+        "another; (d) creates a new ambiguity or contradiction. The repaired "
+        "sentence must fix the reported issue without changing any unrelated "
+        "information.\n"
+        "\n"
+        "GENDER RULE: if the audit issue is invented gender, FIRST check "
+        "whether SOURCE explicitly specifies the gender (he/she, male/female "
+        "referent, gendered noun). If SOURCE DOES specify it — restore the "
+        "SOURCE gender (this is a legitimate repair: «она»→«он» when source "
+        "says he). If SOURCE is gender-NEUTRAL (grandchild, child, person) — "
+        "REMOVE the unsupported gender entirely (use a neutral/parallel "
+        "construction); never invent EITHER gender, and never replace one "
+        "invented gender with the opposite.\n"
+        "\n"
+        "REFERENT RULE: when repairing a referent/coreference error, preserve "
+        "the grammatical attachment of all surrounding clauses. Do not "
+        "reassign a modifier or action to another entity unless SOURCE "
+        "explicitly supports it.\n"
         "\n"
         "CRITICAL: repaired_translation MUST be the FULL corrected text of "
         "the entire PID — every sentence of the paragraph, with ONLY the "
@@ -1073,6 +1106,23 @@ def render_chunked_audit_prompt(
 # NEVER edit them). Owner: окрестность = ±3 PID (3 назад + 3 вперёд).
 DEFAULT_REPAIR_CONTEXT_WINDOW = 3
 
+# REPAIR-2 (card t_768537b9, run_013 p00193 regression, owner decision
+# 2026-08-12): category-dependent context window. run_013's invented_gender
+# repair changed the CORRECT «внучка» into «внук» because the female
+# referent («наследство получит внучка») sat 7 PIDs away, outside the ±3
+# window — gender/referent decisions need DISTANT context, while a local
+# changed_fact/addition edit is safely judged inside ±3. The default map
+# widens ONLY the categories whose judgment needs the far referent; every
+# category NOT in the map falls back to ``repair_context_window``. Identity-
+# bearing (F5): the per-category windows ride the run config identity via
+# ``StrictRunConfig.audit_repair_context_window_by_category``, so a window
+# change invalidates a stale cached repaired map.
+DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY: Mapping[str, int] = {
+    "invented_gender": 10,
+    "referent": 10,
+    "omission": 10,
+}
+
 
 def render_selective_repair_prompt(
     *,
@@ -1082,6 +1132,7 @@ def render_selective_repair_prompt(
     findings: Sequence[Any],
     template: ReviewerPrompt = REPAIR_AS_VERIFIER_V1,
     repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW,
+    repair_context_window_by_category: Optional[Mapping[str, int]] = None,
 ) -> str:
     """Render a B2 selective-repair batch request as one user message.
 
@@ -1100,6 +1151,17 @@ def render_selective_repair_prompt(
     for them. Fail-loud: a finding PID missing from the maps raises
     ``ValueError`` — the model cannot repair a PID it cannot see.
 
+    REPAIR-2 (t_768537b9): ``repair_context_window_by_category`` widens the
+    window per finding CATEGORY ({category: window}; a category not in the
+    map falls back to ``repair_context_window``). Defaults
+    (``DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY``) widen
+    invented_gender/referent/omission to ±10 because those judgments need
+    the FAR referent (run_013 p00193: the female referent was 7 PIDs away,
+    outside ±3, so the repair wrongly changed внучка→внук); changed_fact /
+    addition stay ±3 (local edit). The scope is the UNION of every finding's
+    own window, so a batch mixing categories serves the widest needed
+    context.
+
     The model answers per ``[index]`` (repair-as-verifier, §5.2/§10 B2).
     """
     # Fail-loud: the model cannot repair a PID it cannot see.
@@ -1112,15 +1174,21 @@ def render_selective_repair_prompt(
             "repair finding PID(s) not present in source/translation maps: "
             f"{sorted(set(missing))} — the model cannot repair what it cannot see"
         )
+    window_by_category = (
+        dict(repair_context_window_by_category)
+        if repair_context_window_by_category is not None
+        else dict(DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY)
+    )
     order = list(source.keys())
     positions = {pid: i for i, pid in enumerate(order)}
     scope: set = set()
-    for pid in {f.pid for f in findings}:
-        scope.add(pid)
-        i = positions[pid]
+    for finding in findings:
+        window = window_by_category.get(finding.category, repair_context_window)
+        scope.add(finding.pid)
+        i = positions[finding.pid]
         for j in range(
-            max(0, i - repair_context_window),
-            min(len(order), i + repair_context_window + 1),
+            max(0, i - window),
+            min(len(order), i + window + 1),
         ):
             scope.add(order[j])
     # Local window in source order; context-only = in-window, non-finding PIDs.
