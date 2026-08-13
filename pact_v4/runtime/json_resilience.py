@@ -18,6 +18,19 @@ role-adapter boundary (``BackendQwenAuditEvaluator`` /
 exponential backoff before the unit is declared failed / the repair is
 declared debt.
 
+REPAIR-RECEIVER (t_b590c24f, run_remote_007): whole-chapter generation keeps
+hitting a NEW JSON defect class on long outputs (pid-colon PR #178, then the
+string-aware variant, then p00087's typographic „ closed by an ASCII ``"``).
+Point repairs per error class are the wrong path. The single tolerant
+receiver ``extract_pid_pairs`` splits a whole-chapter body on its top-level
+``"p\\d{5}"`` keys and is robust to ANY defect (pid-colon, ASCII quote inside
+a value, truncation, missing commas, garbage); ``parse_json_response`` tries
+it after the fences/prose strip. It is fail-closed: a dict is returned only
+when coverage >= ``min_coverage`` (90%) and every value is clean; otherwise
+the unchanged ``TruncatedJSONError`` -> bounded retry path runs — a damaged
+response is never accepted. ``repair_pid_colon_comma`` (PR #178) is removed;
+its logic is absorbed by the extractor.
+
 Error classification (explicit, per B4 §3):
 
   * ``EmptyResponseError`` — empty body;
@@ -51,7 +64,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 
 LOG = logging.getLogger(__name__)
 
@@ -174,79 +187,215 @@ def _first_balanced_json_block(text: str) -> Optional[str]:
     return None  # unbalanced -> truncated
 
 
-_PID_COLON_COMMA_RE = re.compile(r'"p(\d{5})", "')
+_PID_KEY_RE = re.compile(r'"p(\d{5})"')
 
 
-def repair_pid_colon_comma(text: str) -> Tuple[str, int]:
-    """Deterministic, JSON-string-aware repair of the whole-chapter
-    pid-colon model error.
-
-    run_remote_004 (t_34ceca50): DeepSeek on a long whole-chapter output
-    occasionally emits a COMMA instead of a COLON after a PID key —
-    ``"p00082", "`` instead of ``"p00082": "``. The comma form is never
-    valid JSON inside an object (a bare string cannot be followed by `,`
-    outside an array), so the pattern is unique to the model error.
-
-    The substitution is NOT a global text replace: it is applied only at
-    syntactically valid PID-key positions of the top-level JSON object —
-    a quote that opens a key string right after ``{`` or ``,`` while the
-    scanner is inside the top-level object and outside any string
-    literal. Occurrences inside string VALUES (including escaped quotes
-    and nested strings) are skipped, so a legitimate translation value
-    containing the literal ``"p12345", "`` is never corrupted
-    (F1 / t_0626267d).
-
-    Returns ``(repaired_text, n_substitutions)``; the input is returned
-    unchanged when no occurrence matches. The caller re-parses and keeps
-    its own fail-closed path: a body that still does not parse after the
-    substitution is rejected exactly as before (real damage is never
-    masked).
+def _unescape_json_string(value: str) -> str:
+    """Unescape JSON string escapes in a value slice extracted without
+    ``json.loads`` (the tolerant receiver path): ``\\"``, ``\\\\``, ``\\n``,
+    ``\\t``, ``\\r``, ``\\uXXXX``. Unknown escapes are kept verbatim.
     """
     out: list[str] = []
-    containers: list[str] = []  # stack of "obj"/"arr" seen outside strings
-    last_significant = ""  # last non-whitespace char seen outside strings
-    in_string = False
-    escaped = False
-    subs = 0
-    i, n = 0, len(text)
+    i, n = 0, len(value)
     while i < n:
-        ch = text[i]
-        if in_string:
-            out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            i += 1
-            continue
-        if ch == '"':
-            m = _PID_COLON_COMMA_RE.match(text, i)
-            if (
-                m is not None
-                and containers == ["obj"]
-                and last_significant in ("{", ",")
-            ):
-                out.append(f'"p{m.group(1)}": "')
-                i += m.end() - m.start()
-                subs += 1
-                in_string = True  # the value string was just opened
+        ch = value[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = value[i + 1]
+            if nxt == '"':
+                out.append('"')
+                i += 2
                 continue
-            out.append(ch)
-            in_string = True
-            i += 1
-            continue
-        if ch == "{" or ch == "[":
-            containers.append("obj" if ch == "{" else "arr")
-        elif ch == "}" or ch == "]":
-            if containers:
-                containers.pop()
-        if not ch.isspace():
-            last_significant = ch
+            if nxt == "\\":
+                out.append("\\")
+                i += 2
+                continue
+            if nxt == "n":
+                out.append("\n")
+                i += 2
+                continue
+            if nxt == "t":
+                out.append("\t")
+                i += 2
+                continue
+            if nxt == "r":
+                out.append("\r")
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < n:
+                try:
+                    out.append(chr(int(value[i + 2 : i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
         out.append(ch)
         i += 1
-    return "".join(out), subs
+    return "".join(out)
+
+
+# Typographic quote pairs used in Russian prose: «…» / „…" / “…” / ‘…’.
+# An ASCII `"` may close a typographic opener (the p00087 defect: „…"
+# where the model typed the closer as ASCII). This is a COARSE balance
+# check for the tolerant receiver — it only needs to flag clearly broken
+# values, not to validate typography.
+_TYPO_OPEN = {"«", "„", "“"}
+_TYPO_CLOSE = {"»", "”", "’"}
+
+
+def _quotes_balanced(value: str) -> bool:
+    """Coarse quote-balance check for an extracted value.
+
+    Escape-aware: a backslash escape (``\\"``, ``\\\\``, ``\\n``, …) skips the
+    next char, so a legitimately escaped interior quote never counts as a
+    structural quote — the F1 embedded literal ``\\"p12345\\", \\"`` (escaped)
+    is balanced by construction. Typographic openers (« „ “) must be closed
+    by a typographic closer (» ” ’) or by an ASCII `"`; a lone ASCII quote
+    without an open typographic partner toggles its own depth (a pair of
+    ASCII quotes balances). Returns ``True`` when no opener is left unclosed
+    and no ASCII quote is left dangling.
+    """
+    depth = 0
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i]
+        if ch == "\\":
+            i += 2  # skip the escape sequence (\" \\ \n \t \r \uXXXX …)
+            continue
+        if ch in _TYPO_OPEN:
+            depth += 1
+        elif ch in _TYPO_CLOSE:
+            if depth:
+                depth -= 1
+        elif ch == '"':
+            if depth:
+                depth -= 1
+            else:
+                depth += 1
+        i += 1
+    return depth == 0
+
+
+def _clean_pid_value(segment: str, *, is_last: bool) -> Optional[str]:
+    """Extract and clean one PID value from the raw slice between two keys.
+
+    ``segment`` is ``raw[key_end : next_key_start]`` — it begins with the
+    key→value separator (``: "`` normally, ``, "`` in the pid-colon model
+    error) and ends at the next key's opening quote (or at the end of the
+    response for the last key). Cleaning strips the leading separator and
+    the opening quote, then cuts at the LAST quote (the value's closing
+    quote; any trailing ``,``/``}``/garbage between values is dropped).
+    The p00087 defect — a typographic „ opened inside the value and closed
+    with an ASCII ``"`` — leaves the interior quote INTACT (it is not the
+    last quote).
+
+    For the LAST key, a missing closing quote is tolerated (the response
+    was cut off mid-value at the end — the tail is accepted; see the
+    REPAIR-RECEIVER contract). For any other key an unclosed value is
+    suspicious.
+
+    Returns the unescaped value, or ``None`` when the slice is
+    suspicious (fail-closed): empty value, a quoted ``"p\\d{5}"`` trace of
+    a following key inside the value, or unbalanced quotes.
+    """
+    seg = segment.strip()
+    if seg.startswith((":", ",")):
+        seg = seg[1:].lstrip()
+    if not seg.startswith('"'):
+        return None  # value is not a quoted string
+    seg = seg[1:]  # drop the opening quote
+    idx = seg.rfind('"')
+    if idx == -1:
+        if not is_last:
+            return None  # unclosed value in the middle — suspicious
+        value = seg  # tail of the response — accepted for the last key
+    else:
+        value = seg[:idx]
+    value = value.strip()
+    if not value:
+        return None  # empty value — suspicious
+    if _PID_KEY_RE.search(value):
+        # A quoted p\d{5} trace inside a value means the split boundary is
+        # wrong (a key form the model embedded in text) — fail-closed.
+        # Checked on the RAW slice (pre-unescape): a legitimately escaped
+        # literal like `\"p12345\"` contains a backslash between the digits
+        # and the closing quote, so it does NOT match `"p\d{5}"` here and
+        # survives verbatim (F1 t_0626267d).
+        return None
+    if not _quotes_balanced(value):
+        # Unbalanced quotes — suspicious. Escape-aware and typographic-aware
+        # on the RAW slice: the p00087 defect („…" with an ASCII closer)
+        # balances, and escaped interior quotes are balanced by construction.
+        return None
+    return _unescape_json_string(value)
+
+
+def extract_pid_pairs(
+    raw: str,
+    *,
+    expected_pids: Optional[Sequence[str]] = None,
+    min_coverage: float = 0.9,
+) -> Optional[dict]:
+    """REPAIR-RECEIVER: string-aware pair extractor for whole-chapter bodies.
+
+    One tolerant receiver replaces the growing stack of point repairs
+    (pid-colon, string-aware variants, …). It splits the raw response on
+    every top-level ``"p\\d{5}"`` key and takes each value as the text up
+    to the next key, so it is robust to ANY defect the model can emit on a
+    long pid-keyed JSON: the pid-colon ``, "`` separator, an ASCII quote
+    inside a value (run_remote_007 p00087 „…"), truncation mid-object,
+    missing commas, and garbage around/between values.
+
+    Fail-closed success criteria (all must hold, else ``None``):
+
+      * the response's FIRST key (right after ``{``) is a PID key — the
+        extractor is ONLY for whole-chapter top-level pid-keyed objects;
+        R / audit / repair / re-audit bodies (``{edits: [...]}`` /
+        ``{issues: [...]}``, arrays) are refused here and keep the
+        existing fences/prose path untouched;
+      * keys are unique (no duplicate PID);
+      * every value is non-empty, quote-balanced (typographic-aware) and
+        free of a quoted ``"p\\d{5}"`` next-key trace;
+      * coverage ``len(extracted) / expected`` >= ``min_coverage``, where
+        ``expected`` is ``len(expected_pids)`` when the caller knows the
+        contract PID set (whole-chapter / chunk generation) and otherwise
+        the number of keys found in the text (the generic
+        ``parse_json_response`` path). Below 90% the body is honestly
+        truncated and must go through the SAME fail-closed path
+        (``TruncatedJSONError`` -> bounded retry) — a damaged response is
+        never accepted.
+
+    Returns ``{pid: value}`` in source order, or ``None`` on suspicion.
+    """
+    if not 0 < min_coverage <= 1:
+        raise ValueError("extract_pid_pairs: min_coverage must be in (0, 1]")
+    text = raw.lstrip("\ufeff").lstrip()
+    brace = text.find("{")
+    if brace == -1:
+        return None
+    first = _PID_KEY_RE.search(text, brace)
+    if first is None:
+        return None
+    if text[brace + 1 : first.start()].strip():
+        # The object's first key is not a PID key (e.g. {"edits": [...]},
+        # {"issues": [...]}) — not a whole-chapter pid-keyed body.
+        return None
+    matches = list(_PID_KEY_RE.finditer(text))
+    if len({m.group(1) for m in matches}) != len(matches):
+        return None  # duplicate PID keys — suspicious
+    result: dict = {}
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        value = _clean_pid_value(text[start:end], is_last=(i + 1 == len(matches)))
+        if value is None:
+            return None
+        result["p" + m.group(1)] = value
+    expected = len(expected_pids) if expected_pids is not None else len(matches)
+    if expected == 0:
+        return None
+    if len(result) / expected < min_coverage:
+        return None  # honest truncation — fail-closed
+    return result
 
 
 def parse_json_response(text: str) -> dict:
@@ -261,30 +410,27 @@ def parse_json_response(text: str) -> dict:
 
     1. BOM + surrounding whitespace are stripped;
     2. markdown fences are removed;
-    3. if the whole body is not directly JSON, a deterministic
-       pid-colon repair is applied first (t_34ceca50, run_remote_004):
-       a COMMA after a PID key — ``"p00082", "`` instead of ``"p00082": "``
-       — is substituted back to a colon at every syntactically valid
-       PID-key position of the top-level object (the comma form is never
-       valid JSON inside an object). The substitution is JSON-string-aware
-       (t_0626267d): occurrences inside string values — a legitimate
-       translation may contain the literal ``"p12345", "`` — and at
-       non-key positions are never touched. A successful parse after the
-       substitution is returned with a WARNING logging the substitution
-       count;
+    3. if the whole body is not directly JSON, the REPAIR-RECEIVER pair
+       extractor (``extract_pid_pairs``) is tried — ONLY for whole-chapter
+       top-level pid-keyed bodies (first key right after ``{`` is a
+       ``"p\\d{5}"``). It repairs ANY defect the model can emit on a long
+       pid-keyed object (pid-colon ``, "``, an ASCII quote inside a value
+       like run_remote_007 p00087, truncation, missing commas, garbage)
+       and returns the pairs when coverage >= 90% of the keys found;
     4. if the body is STILL not JSON, the FIRST balanced ``{...}`` block
        is extracted (string-aware, so braces inside strings never
-       unbalance it);
+       unbalance it) — this keeps the fences/prose path for R / audit /
+       repair / re-audit bodies untouched (they have no top-level pid
+       keys, so step 3 refuses them);
     5. ``json.loads``; on failure a ``TruncatedJSONError`` (a
        ``ValueError``) with a clear message is raised — fail-closed, the
        retry zone stays unchanged (broken/truncated JSON is NOT repaired
-       here beyond the single deterministic pid-colon substitution, it is
-       retried by B4).
+       beyond the pair extractor, it is retried by B4).
 
     Raises:
       * ``EmptyResponseError`` — empty body (B4 retryable);
       * ``TruncatedJSONError`` — not complete JSON even after
-        fence/prose stripping (B4 retryable);
+        fence/prose stripping and the pair extractor (B4 retryable);
       * ``ValueError`` — valid JSON but not an object (not a retry
         trigger; wrong shape is a downstream validation concern).
     """
@@ -297,28 +443,26 @@ def parse_json_response(text: str) -> dict:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        # JSON-REPAIR (t_34ceca50, run_remote_004): DeepSeek on a long
-        # whole-chapter output occasionally emits `"p00082", "` (COMMA)
-        # instead of `"p00082": "` (COLON) after a PID key. The comma form
-        # is never valid JSON inside an object (a bare string cannot be
-        # followed by `,` outside an array), so the pattern is unique to
-        # the model error. Deterministically substitute ALL occurrences at
-        # syntactically valid PID-key positions of the top-level object —
-        # the repair is JSON-string-aware (t_0626267d), so a literal
-        # `"p12345", "` inside a translation value is never touched — and
-        # re-parse; a successful parse is returned with a WARNING so the
-        # model error rate stays visible. Fail-closed is preserved: if the
-        # body still does not parse, the existing
-        # _first_balanced_json_block path runs unchanged (TruncatedJSONError).
-        repaired, n_subs = repair_pid_colon_comma(cleaned)
+        # REPAIR-RECEIVER (t_b590c24f, run_remote_007): DeepSeek on a long
+        # whole-chapter output emits a THIRD class of JSON defect — a
+        # typographic „ inside a value closed with an ASCII `"` (p00087:
+        # `«Когда я думаю о „побеге из дома", ...»`) that breaks
+        # json.loads. Point repairs per error class are the wrong path
+        # (pid-colon PR #178, string-aware variant, …); the single
+        # tolerant receiver ``extract_pid_pairs`` splits the text on the
+        # top-level ``"p\\d{5}"`` keys and is robust to ANY of them. It is
+        # fail-closed: a dict is returned only when every value is clean
+        # and coverage >= min_coverage; a suspicious body returns None and
+        # falls through to the unchanged TruncatedJSONError path (bounded
+        # retry) — a damaged response is never accepted.
+        extracted = extract_pid_pairs(cleaned)
         parsed = None
-        if n_subs:
-            try:
-                parsed = json.loads(repaired)
-            except json.JSONDecodeError:
-                parsed = None
-            else:
-                LOG.warning("json repair: %d substitution(s) pid-colon", n_subs)
+        if extracted is not None:
+            LOG.warning(
+                "json repair: pid-pair extractor recovered %d pair(s)",
+                len(extracted),
+            )
+            parsed = extracted
         if parsed is None:
             block = _first_balanced_json_block(cleaned)
             if block is None:
@@ -394,6 +538,7 @@ __all__ = [
     "TruncatedJSONError",
     "JsonRetryPolicy",
     "classify_response_text",
+    "extract_pid_pairs",
     "parse_json_response",
     "retry_json_call",
 ]
