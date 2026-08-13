@@ -32,8 +32,12 @@ review):
   10-finding cap that cut 73% of real findings); beyond the cap the findings
   go to debt tagged ``POLICY_LIMIT_TAG`` (analog of remote_budget).
 * **Fail-closed** — a failed repair batch (transport error, invalid JSON,
-  unknown/duplicate/missing index, invalid decision, no-op repair) is debt,
-  NEVER a silent PASS. A failed re-audit is debt, never ``0 findings``.
+  unknown/duplicate/missing index, invalid decision, pid mismatch, truncated
+  repair) is debt, NEVER a silent PASS. A failed re-audit is debt, never
+  ``0 findings``. REPAIR-2 (t_768537b9): a NO-OP repair (the model returned
+  the current text with decision='repair') is NOT a batch failure — it is
+  converted to a per-index PASS (journaled as a WARNING) so one no-op index
+  cannot push the batch's real repairs into debt (run_013 batch1).
 * **TEaR** — 0 eligible findings -> repair is skipped entirely (no model
   calls, ``skipped=True``, ``repair_complete=True``).
 * **Single re-audit with bounded retry** — when at least one repair was
@@ -101,6 +105,7 @@ from pact_v4.runtime.json_resilience import (
 )
 from pact_v4.runtime.prompts_runtime import (
     DEFAULT_REPAIR_CONTEXT_WINDOW,
+    DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     REPAIR_AS_VERIFIER_V1,
     ReviewerPrompt,
     render_reaudit_prompt,
@@ -115,7 +120,7 @@ LOG = logging.getLogger(__name__)
 
 REPAIR_SCHEMA = "pact-repair/v1"
 REPAIR_HARNESS_VERSION = "1.0"
-REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v2"
+REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v3"
 
 # Cap on eligible findings repaired per chapter (owner decision 2026-08-11:
 # run_010 showed the 10-finding cap cut 73% of real findings — cap on
@@ -192,6 +197,19 @@ class SelectiveRepairConfig:
     # 3 вперёд). Identity-bearing (F5): a window change must invalidate a
     # stale cached repaired map.
     repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW
+    # REPAIR-2 (card t_768537b9, owner decision 2026-08-12): per-category
+    # window overrides — {category: window}; a category not in the map falls
+    # back to ``repair_context_window``. Default widens
+    # invented_gender/referent/omission to ±10 (gender/referent judgments
+    # need the FAR referent — run_013 p00193's female referent sat 7 PIDs
+    # away, outside ±3, and the repair wrongly changed внучка→внук);
+    # changed_fact/addition stay ±3 (local edit). Identity-bearing (F5): the
+    # per-category windows ride the run config identity via
+    # ``StrictRunConfig.audit_repair_context_window_by_category``, so a
+    # change invalidates a stale cached repaired map.
+    repair_context_window_by_category: Mapping[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY)
+    )
     reaudit_enabled: bool = True
     reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     # REPAIR-CTX (t_97b31f81): the re-audit is a CHUNKED audit over the
@@ -254,6 +272,10 @@ class RepairBatchOutcome:
     findings: Tuple[EligibleFinding, ...] = ()
     results: Tuple[RepairResult, ...] = ()
     error: str = ""
+    # REPAIR-2 (t_768537b9): per-index NON-FATAL notices journaled with the
+    # batch — e.g. no-op repairs converted to per-index pass (the batch stays
+    # GOOD when they are the only issue). Never a batch-killing error.
+    warnings: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -312,6 +334,10 @@ class SelectiveRepairOutcome:
     reaudit: Optional[ReauditOutcome]
     repair_complete: bool
     skipped: bool  # TEaR: 0 eligible findings -> repair skipped entirely
+    # REPAIR-2 (t_768537b9): non-fatal per-index notices aggregated from the
+    # batches (no-op repairs converted to pass) — journaled with the repair
+    # round (audit_journal repair_round event), never batch-fatal.
+    warnings: Tuple[str, ...] = ()
     # V4.2 R: accept/reject journal for the Russian-editor REVIEW candidates
     # verified in this pass (one entry per candidate: pid, class, original,
     # proposed, verdict accepted|rejected|failed, reason, committed text).
@@ -356,12 +382,16 @@ class SelectiveRepairOutcome:
                         for r in b.results
                     ],
                     "error": b.error,
+                    # REPAIR-2 (t_768537b9): per-index non-fatal notices.
+                    "warnings": list(b.warnings),
                 }
                 for b in self.batches
             ],
             "committed": [list(pair) for pair in self.committed],
             "passed_pids": list(self.passed_pids),
             "debt_trace": list(self.debt_trace),
+            # REPAIR-2 (t_768537b9): aggregated non-fatal per-index notices.
+            "warnings": list(self.warnings),
             "reaudit": (
                 {
                     "complete": self.reaudit.complete,
@@ -554,7 +584,7 @@ def parse_repair_batch(
     text: str,
     findings: Sequence[EligibleFinding],
     current_by_pid: Mapping[str, str],
-) -> Tuple[Tuple[RepairResult, ...], Tuple[str, ...]]:
+) -> Tuple[Tuple[RepairResult, ...], Tuple[str, ...], Tuple[str, ...]]:
     """Parse and strictly validate one repair batch response.
 
     Fail-closed contract: the response must be a JSON object with a
@@ -562,23 +592,38 @@ def parse_repair_batch(
     once; each result must carry ``decision`` ``pass``|``repair``; a repair
     must name the EXACT PID of the finding that ``index`` refers to (the
     index/PID contract — a repair naming any other batch target would commit
-    the fix to the wrong paragraph) and a NON-EMPTY ``repaired_translation``
-    that actually differs from the current text (a no-op "repair" is a
-    contract violation -> error). When several findings share one PID each
-    index is still validated against its own finding's PID, so a shared-PID
-    group is answered per index exactly like a distinct-PID one. ANY error
-    -> the whole batch is failed (debt), never a silent PASS.
+    the fix to the wrong paragraph) and a NON-EMPTY ``repaired_translation``.
+    When several findings share one PID each index is still validated against
+    its own finding's PID, so a shared-PID group is answered per index exactly
+    like a distinct-PID one.
+
+    REPAIR-2 (card t_768537b9, run_013): a "repair" whose text equals the
+    current text is a NO-OP — it is converted to a per-index PASS (``decision=
+    "pass"``, ``reason="no-op repair converted to pass"``) and reported in the
+    returned ``warnings``, it does NOT fail the batch (run_013 batch1: one
+    no-op index killed the whole batch and pushed 4 real findings into debt).
+    If EVERY index of the batch is a no-op the batch is GOOD with no repairs
+    committed (the model honestly decided nothing needed changing).
+
+    Returns ``(results, errors, warnings)``:
+    * ``errors`` — FATAL for the batch (debt, never a silent PASS): invalid
+      JSON, unknown/duplicate/missing index, invalid decision, repair pid not
+      matching the finding's pid, empty repaired_translation, truncated
+      repair. ANY error fails the whole batch.
+    * ``warnings`` — per-index NON-FATAL notices (no-op repairs converted to
+      pass); the batch stays GOOD when they are the only issue.
     """
     errors: list = []
+    warnings: list = []
     try:
         parsed = json.loads(text)
     except Exception as exc:
-        return (), (f"response is not valid JSON: {exc}",)
+        return (), (f"response is not valid JSON: {exc}",), ()
     if not isinstance(parsed, dict) or "results" not in parsed:
-        return (), ("root object has no 'results' array",)
+        return (), ("root object has no 'results' array",), ()
     results = parsed.get("results")
     if not isinstance(results, list):
-        return (), ("'results' is not an array",)
+        return (), ("'results' is not an array",), ()
     expected = {f.index for f in findings}
     finding_by_index = {f.index: f for f in findings}
     seen: set = set()
@@ -620,9 +665,25 @@ def parse_repair_batch(
             errors.append(f"index {index}: repair has empty repaired_translation")
             continue
         if repaired.strip() == str(current_by_pid.get(pid, "")).strip():
-            errors.append(
-                f"index {index}: repaired_translation equals the current text "
-                f"(no-op repair is a contract violation — use decision 'pass')"
+            # REPAIR-2 (card t_768537b9, run_013 batch1): a no-op "repair"
+            # (model returned the current text with decision='repair') is
+            # converted to a per-index PASS — the model effectively decided
+            # nothing needed changing. NOT a batch-killing error: run_013's
+            # single no-op index failed the whole batch and pushed 4 real
+            # findings (p00016/p00033/p00035/p00080) into debt. The WARNING
+            # is journaled (RepairBatchOutcome.warnings) so the operator sees
+            # the model misused the decision contract.
+            warnings.append(
+                f"index {index}: no-op repair converted to pass "
+                f"(repaired_translation equals the current text for pid {pid})"
+            )
+            out.append(
+                RepairResult(
+                    index=index,
+                    decision="pass",
+                    pid=pid,
+                    reason="no-op repair converted to pass",
+                )
             )
             continue
         # B3 (run_011): text-preservation gate — a repair that keeps under 40%
@@ -652,7 +713,7 @@ def parse_repair_batch(
     missing = sorted(expected - seen)
     if missing:
         errors.append(f"missing answer(s) for finding index(es) {missing}")
-    return tuple(out), tuple(errors)
+    return tuple(out), tuple(errors), tuple(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +1004,11 @@ class SelectiveRepairEvaluator:
                     passed_pids.append(finding_by_index[result.index].pid)
 
         review_journal = _build_review_journal(batch_outcomes, review_candidates)
+        # REPAIR-2 (t_768537b9): aggregate per-index non-fatal notices from
+        # the batches (no-op repairs converted to pass) for the journal.
+        batch_warnings = tuple(
+            warning for outcome in batch_outcomes for warning in outcome.warnings
+        )
 
         reaudit: Optional[ReauditOutcome] = None
         repair_complete = all(b.status == "GOOD" for b in batch_outcomes)
@@ -984,6 +1050,7 @@ class SelectiveRepairEvaluator:
             reaudit=reaudit,
             repair_complete=repair_complete,
             skipped=False,
+            warnings=batch_warnings,
             review_journal=review_journal,
         )
 
@@ -1036,6 +1103,7 @@ class SelectiveRepairEvaluator:
             findings=findings,
             template=cfg.template,
             repair_context_window=cfg.repair_context_window,
+            repair_context_window_by_category=cfg.repair_context_window_by_category,
         )
         model_ref = repair_model_ref(self._repair_backend)
         request = CompletionRequest(
@@ -1070,9 +1138,14 @@ class SelectiveRepairEvaluator:
             out_dir=out_dir, out_base=out_base, batch_index=batch_index,
             content=content, reasoning=reasoning,
         )
-        results, errors = parse_repair_batch(
+        results, errors, warnings = parse_repair_batch(
             content, findings, current_by_pid=dict(translation)
         )
+        if warnings:
+            LOG.warning(
+                "repair batch %s: %d non-fatal warning(s): %s",
+                batch_index, len(warnings), "; ".join(warnings),
+            )
         if errors:
             return RepairBatchOutcome(
                 batch_index=batch_index,
@@ -1080,12 +1153,14 @@ class SelectiveRepairEvaluator:
                 findings=tuple(findings),
                 results=results,
                 error="; ".join(errors),
+                warnings=warnings,
             )
         return RepairBatchOutcome(
             batch_index=batch_index,
             status="GOOD",
             findings=tuple(findings),
             results=results,
+            warnings=warnings,
         )
 
     @staticmethod
@@ -1311,6 +1386,8 @@ __all__ = [
     "DEFAULT_REAUDIT_MAX_RETRIES",
     "DEFAULT_REAUDIT_BASE_DELAY_SECONDS",
     "DEFAULT_REAUDIT_NEIGHBOUR_WINDOW",
+    "DEFAULT_REPAIR_CONTEXT_WINDOW",
+    "DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY",
     "REAUDIT_DELTA_FORMAT",
     "MICROBATCH_TRIGGER",
     "MICROBATCH_TARGET",

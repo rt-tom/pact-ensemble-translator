@@ -521,6 +521,13 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             # defaults) and is identity-bearing — a window change
             # invalidates the cached repaired map.
             repair_context_window=cfg.audit_repair_context_window,
+            # REPAIR-2 (card t_768537b9, F5): the per-category window
+            # overrides are wired from the run config (never silently left at
+            # module defaults) and are identity-bearing — a per-category
+            # window change invalidates the cached repaired map.
+            repair_context_window_by_category=dict(
+                cfg.audit_repair_context_window_by_category
+            ),
             repair_reaudit_neighbour_window=cfg.audit_repair_reaudit_neighbour_window,
             # REPAIR-CTX (card t_97b31f81, F5): the re-audit chunk/overlap
             # settings and the REPAIRED CHANGES delta format are wired from

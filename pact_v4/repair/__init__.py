@@ -10,6 +10,8 @@ retry. Transport-neutral over
 """
 
 from pact_v4.repair.selective_repair import (
+    DEFAULT_REPAIR_CONTEXT_WINDOW,
+    DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     EligibleFinding,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
@@ -33,6 +35,8 @@ from pact_v4.repair.selective_repair import (
 )
 
 __all__ = [
+    "DEFAULT_REPAIR_CONTEXT_WINDOW",
+    "DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY",
     "EligibleFinding",
     "MICROBATCH_TARGET",
     "MICROBATCH_TRIGGER",

@@ -320,9 +320,9 @@ def test_microbatch_7_splits_into_4_3():
 # ---------------------------------------------------------------------------
 
 
-def _eligible(pid: str, index: int = 1) -> EligibleFinding:
+def _eligible(pid: str, index: int = 1, category: str = "invented_gender") -> EligibleFinding:
     return EligibleFinding(
-        index=index, pid=pid, tier="B", category="invented_gender",
+        index=index, pid=pid, tier="B", category=category,
         severity="minor", confidence="high", note="n", excerpt="e", issue={},
     )
 
@@ -336,7 +336,7 @@ def test_parse_repair_accepts_pass_and_repair():
             {"index": 2, "decision": "pass", "reason": "dialogue tag, literary"},
         ]
     }, ensure_ascii=False)
-    results, errors = parse_repair_batch(text, findings, {"p00193": "— внучка."})
+    results, errors, _ = parse_repair_batch(text, findings, {"p00193": "— внучка."})
     assert not errors
     assert len(results) == 2
     assert results[0].decision == "repair"
@@ -349,7 +349,7 @@ def test_parse_repair_missing_index_fails_closed():
     text = json.dumps({
         "results": [{"index": 1, "decision": "pass", "reason": "ok"}]
     })
-    results, errors = parse_repair_batch(text, findings, {})
+    results, errors, _ = parse_repair_batch(text, findings, {})
     assert errors and "missing" in errors[0]
 
 
@@ -361,21 +361,21 @@ def test_parse_repair_duplicate_index_fails_closed():
             {"index": 1, "decision": "pass", "reason": "b"},
         ]
     })
-    _, errors = parse_repair_batch(text, findings, {})
+    _, errors, _ = parse_repair_batch(text, findings, {})
     assert errors and "duplicate" in errors[0]
 
 
 def test_parse_repair_unknown_index_fails_closed():
     findings = (_eligible("p00193", 1),)
     text = json.dumps({"results": [{"index": 9, "decision": "pass"}]})
-    _, errors = parse_repair_batch(text, findings, {})
+    _, errors, _ = parse_repair_batch(text, findings, {})
     assert errors and "unknown" in errors[0]
 
 
 def test_parse_repair_invalid_decision_fails_closed():
     findings = (_eligible("p00193", 1),)
     text = json.dumps({"results": [{"index": 1, "decision": "maybe"}]})
-    _, errors = parse_repair_batch(text, findings, {})
+    _, errors, _ = parse_repair_batch(text, findings, {})
     assert errors and "invalid decision" in errors[0]
 
 
@@ -385,7 +385,7 @@ def test_parse_repair_repair_pid_not_in_batch_fails_closed():
         "results": [{"index": 1, "decision": "repair", "pid": "p99999",
                      "repaired_translation": "x"}]
     })
-    _, errors = parse_repair_batch(text, findings, {})
+    _, errors, _ = parse_repair_batch(text, findings, {})
     assert errors and "does not match finding pid" in errors[0]
 
 
@@ -402,7 +402,7 @@ def test_parse_repair_index_pid_mismatch_fails_closed():
             "reason": "oops",
         }]
     }, ensure_ascii=False)
-    results, errors = parse_repair_batch(
+    results, errors, _ = parse_repair_batch(
         text, findings, {"p00193": "внучка", "p00106": "поправил я"}
     )
     assert not results
@@ -422,7 +422,7 @@ def test_parse_repair_multiple_findings_same_pid_each_index_must_match():
              "repaired_translation": "второй фикс", "reason": "b"},
         ]
     }, ensure_ascii=False)
-    results, errors = parse_repair_batch(
+    results, errors, _ = parse_repair_batch(
         text, findings, {"p00193": "внучка"}
     )
     assert not errors
@@ -439,23 +439,68 @@ def test_parse_repair_same_pid_wrong_index_fails_closed():
             "repaired_translation": "внучек", "reason": "a",
         }]
     })
-    _, errors = parse_repair_batch(text, findings, {"p00193": "внучка"})
+    _, errors, _ = parse_repair_batch(text, findings, {"p00193": "внучка"})
     assert errors and "missing" in errors[0]  # index 2 unanswered
 
 
-def test_parse_repair_noop_repair_fails_closed():
-    findings = (_eligible("p00193", 1),)
+def test_parse_repair_noop_repair_converted_to_pass():
+    """REPAIR-2 (t_768537b9, run_013 batch1): a no-op \"repair\" (the model
+    returned the current text with decision='repair') is converted to a
+    per-index PASS with a WARNING — it does NOT fail the batch (run_013: one
+    no-op index killed the whole batch and pushed 4 real findings into debt).
+    The other indices of the same batch are still processed normally."""
+    findings = (
+        _eligible("p00193", 1, category="changed_fact"),
+        _eligible("p00106", 2, category="changed_fact"),
+    )
     text = json.dumps({
-        "results": [{"index": 1, "decision": "repair", "pid": "p00193",
-                     "repaired_translation": "same text"}]
-    })
-    _, errors = parse_repair_batch(text, findings, {"p00193": "same text"})
-    assert errors and "no-op" in errors[0]
+        "results": [
+            {"index": 1, "decision": "repair", "pid": "p00193",
+             "repaired_translation": "same text", "reason": "no-op"},
+            {"index": 2, "decision": "repair", "pid": "p00106",
+             "repaired_translation": "реальный фикс", "reason": "fixed"},
+        ]
+    }, ensure_ascii=False)
+    results, errors, warnings = parse_repair_batch(
+        text, findings, {"p00193": "same text", "p00106": "старый текст"}
+    )
+    assert not errors  # batch survives the no-op index
+    by_index = {r.index: r for r in results}
+    assert by_index[1].decision == "pass"
+    assert by_index[1].reason == "no-op repair converted to pass"
+    # the other index is still processed normally (real repair survives)
+    assert by_index[2].decision == "repair"
+    assert by_index[2].repaired_translation == "реальный фикс"
+    assert any("no-op repair converted to pass" in w for w in warnings)
+
+
+def test_parse_repair_all_noop_batch_good_with_no_repairs():
+    """REPAIR-2 (t_768537b9): if EVERY index of a batch is a no-op the batch
+    is GOOD with no repairs committed (the model honestly decided nothing
+    needed changing) — NOT a failed batch."""
+    findings = (
+        _eligible("p00193", 1, category="changed_fact"),
+        _eligible("p00106", 2, category="changed_fact"),
+    )
+    text = json.dumps({
+        "results": [
+            {"index": 1, "decision": "repair", "pid": "p00193",
+             "repaired_translation": "same text", "reason": "a"},
+            {"index": 2, "decision": "repair", "pid": "p00106",
+             "repaired_translation": "same two", "reason": "b"},
+        ]
+    }, ensure_ascii=False)
+    results, errors, warnings = parse_repair_batch(
+        text, findings, {"p00193": "same text", "p00106": "same two"}
+    )
+    assert not errors
+    assert all(r.decision == "pass" for r in results)
+    assert len(warnings) == 2
 
 
 def test_parse_repair_invalid_json_fails_closed():
     findings = (_eligible("p00193", 1),)
-    _, errors = parse_repair_batch("not json {", findings, {})
+    _, errors, _ = parse_repair_batch("not json {", findings, {})
     assert errors and "not valid JSON" in errors[0]
 
 
@@ -478,7 +523,7 @@ def test_parse_repair_truncated_fragment_rejected():
             "reason": "обрезка",
         }]
     }, ensure_ascii=False)
-    results, errors = parse_repair_batch(text, findings, current)
+    results, errors, _ = parse_repair_batch(text, findings, current)
     assert results == ()
     assert errors and "truncated repair" in errors[0]
     assert "40%" in errors[0]
@@ -501,7 +546,7 @@ def test_parse_repair_full_length_rewrite_accepted():
             "repaired_translation": repaired, "reason": "переформулировано",
         }]
     }, ensure_ascii=False)
-    results, errors = parse_repair_batch(text, findings, current)
+    results, errors, _ = parse_repair_batch(text, findings, current)
     assert not errors
     assert results[0].repaired_translation == repaired
 
@@ -514,7 +559,51 @@ def test_repair_prompt_requires_full_pid_text_not_fragment():
     assert "FULL corrected text" in instructions
     assert "every sentence of the paragraph" in instructions
     assert "Never return a fragment" in instructions
-    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v2"
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v3"
+
+
+def test_repair_prompt_guardrails_self_verification_present():
+    """REPAIR-2 (t_768537b9, run_013 review): the repair prompt must carry
+    the SELF-VERIFICATION block — the model rejects its own rewrite and
+    keeps the original when the rewrite introduces a new fact/referent,
+    changes an unrelated clause, swaps an unsupported gender, or creates a
+    new ambiguity. No new verifier call (architect: same prompt)."""
+    instructions = REPAIR_AS_VERIFIER_V1.instructions
+    assert "SELF-VERIFICATION" in instructions
+    assert "compare your REWRITTEN sentence against SOURCE again" in instructions
+    assert "Reject your own rewrite and keep the original" in instructions
+    assert "introduces a new fact or referent" in instructions
+    assert "merely replaces one unsupported gender with another" in instructions
+    assert "without changing any unrelated information" in instructions
+
+
+def test_repair_prompt_guardrail_gender_rule_p00193():
+    """REPAIR-2 (t_768537b9, run_013 p00193 regression): invented_gender
+    repair on a gender-NEUTRAL source ('grandchild') must NOT replace one
+    invented gender with the opposite (внучка→внук) — the GENDER RULE in the
+    prompt says: source gender-neutral -> REMOVE the unsupported gender,
+    never invent EITHER gender, never replace one invented gender with the
+    opposite; source specifies gender -> restore the SOURCE gender."""
+    instructions = REPAIR_AS_VERIFIER_V1.instructions
+    assert "GENDER RULE" in instructions
+    assert "invented gender" in instructions
+    assert "REMOVE the unsupported gender entirely" in instructions
+    assert "never replace one invented gender with the opposite" in instructions
+    assert "restore the SOURCE gender" in instructions
+    assert "gender-NEUTRAL (grandchild, child, person)" in instructions
+
+
+def test_repair_prompt_guardrail_referent_rule_p00096():
+    """REPAIR-2 (t_768537b9, run_013 p00096 regression): a referent/
+    coreference repair must preserve the grammatical attachment of the
+    surrounding clauses — the REFERENT RULE in the prompt forbids
+    reassigning a modifier/action to another entity unless SOURCE supports
+    it (p00096 moved the narrator's leaning to the object)."""
+    instructions = REPAIR_AS_VERIFIER_V1.instructions
+    assert "REFERENT RULE" in instructions
+    assert "preserve the grammatical attachment" in instructions
+    assert "Do not reassign a modifier or action to another entity" in instructions
+    assert "unless SOURCE explicitly supports it" in instructions
 
 
 def test_repair_and_reaudit_write_raw_reasoning_artifacts(tmp_path):
@@ -1391,6 +1480,65 @@ def test_repair_prompt_local_context_window_configurable():
     assert "  p00008: " not in wide and "  p00012: " not in wide
 
 
+def test_repair_prompt_category_window_covers_far_gender_referent():
+    """REPAIR-2 (t_768537b9, run_013 p00193 regression, acceptance): a
+    finding whose category is in the wide-window map (invented_gender /
+    referent / omission) renders with a BIGGER window so the FAR referent is
+    covered. run_013's p00193 (index 192) needed the female referent at
+    p00200 (index 199 — 7 PIDs away, outside ±3) to keep «внучка»; the ±3
+    window hid it and the repair wrongly wrote «внук»."""
+    from pact_v4.runtime.prompts_runtime import (
+        DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
+    )
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY["invented_gender"] >= 7
+    source, translation = _chapter_maps(400)
+    finding = EligibleFinding(
+        index=1, pid="p00193", tier="B", category="invented_gender",
+        severity="minor", confidence="high",
+        note="gender-neutral 'grandchild' prematurely female", excerpt="внучка",
+        issue={},
+    )
+    # default (category map active): referent 7 PIDs away IS covered
+    wide = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=[finding],
+    )
+    assert "  p00193: " in wide
+    assert "  p00200: " in wide, "wide category window must cover the far referent"
+    # narrow legacy window (window=3, no category map): referent NOT covered
+    narrow = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=[finding], repair_context_window=3,
+        repair_context_window_by_category={},
+    )
+    assert "  p00193: " in narrow
+    assert "  p00200: " not in narrow, "±3 window must NOT cover the far referent"
+
+
+def test_repair_prompt_changed_fact_window_stays_narrow():
+    """REPAIR-2 (t_768537b9, acceptance): changed_fact/addition are NOT in
+    the wide-window map — their window stays ±3 (a local edit), even with
+    the per-category map active."""
+    from pact_v4.runtime.prompts_runtime import (
+        DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
+    )
+    assert "changed_fact" not in DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY
+    assert "addition" not in DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY
+    source, translation = _chapter_maps(400)
+    finding = EligibleFinding(
+        index=1, pid="p00193", tier="B", category="changed_fact",
+        severity="major", confidence="high", note="n", excerpt="e", issue={},
+    )
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001", source=source, translation=translation,
+        findings=[finding],
+    )
+    # p00193 is index 192; ±3 covers 189..195, p00200 (index 199) stays out
+    assert "  p00193: " in prompt
+    assert "  p00196: " in prompt
+    assert "  p00200: " not in prompt, "changed_fact must keep the ±3 window"
+
+
 def test_repair_prompt_local_context_fails_loud_on_missing_pid():
     """REPAIR-CTX fail-loud: a repairable PID absent from the maps raises
     ValueError — the model cannot repair a PID it cannot see."""
@@ -1496,12 +1644,71 @@ def test_repair_prompt_run012_batch1_replay_local_context():
             {"index": 4, "decision": "pass", "reason": "fp"},
         ]
     }, ensure_ascii=False)
-    results, errors = parse_repair_batch(raw, findings, current_by_pid=translation)
+    results, errors, _ = parse_repair_batch(raw, findings, current_by_pid=translation)
     assert not errors
     decisions = {r.index: r.decision for r in results}
     assert decisions == {1: "repair", 2: "repair", 3: "repair", 4: "pass"}
     repaired = {r.pid for r in results if r.decision == "repair"}
     assert repaired == {"p00003", "p00010", "p00014"}
+
+
+def test_repair_prompt_run013_batch1_noop_replay():
+    """REPAIR-2 (t_768537b9, acceptance): replay run_013 batch1 — the model
+    answered index 1 (p00016) with a NO-OP repair (repaired_translation ==
+    current, a contract violation in v2). Under the new contract index 1 is
+    converted to a per-index PASS, the other 3 indices are repaired normally
+    (p00033/p00035/p00080), and the batch is NOT failed — the 4 findings are
+    not lost to debt (run_013: the whole batch failed and all 4 went to debt).
+    """
+    source, translation = _chapter_maps(400)
+    findings = [
+        EligibleFinding(index=1, pid="p00016", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00016", excerpt="ex16", issue={}),
+        EligibleFinding(index=2, pid="p00033", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00033", excerpt="ex33", issue={}),
+        EligibleFinding(index=3, pid="p00035", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00035", excerpt="ex35", issue={}),
+        EligibleFinding(index=4, pid="p00080", tier="B", category="changed_fact",
+                        severity="major", confidence="high",
+                        note="changed_fact p00080", excerpt="ex80", issue={}),
+    ]
+    current = {
+        "p00016": "Мои мимолётные впечатления от дома быстро развеялись.",
+        "p00033": "Пэйдж выглядела так, будто хотела подойти ко мне.",
+        "p00035": "У тёти Ирэн тоже были дети, но я видел только двоих.",
+        "p00080": "Она протянула руки для объятий, и я вздрогнул.",
+    }
+    raw = json.dumps({
+        "results": [
+            # index 1: NO-OP — the model returned the current text unchanged
+            {"index": 1, "decision": "repair", "pid": "p00016",
+             "repaired_translation": current["p00016"], "reason": "no-op"},
+            {"index": 2, "decision": "repair", "pid": "p00033",
+             "repaired_translation": current["p00033"] + " Исправлено.",
+             "reason": "r2"},
+            {"index": 3, "decision": "repair", "pid": "p00035",
+             "repaired_translation": current["p00035"] + " Исправлено.",
+             "reason": "r3"},
+            {"index": 4, "decision": "repair", "pid": "p00080",
+             "repaired_translation": current["p00080"] + " Исправлено.",
+             "reason": "r4"},
+        ]
+    }, ensure_ascii=False)
+    results, errors, warnings = parse_repair_batch(
+        raw, findings, current_by_pid=current
+    )
+    assert not errors, "the no-op index must NOT fail the whole batch"
+    decisions = {r.index: r.decision for r in results}
+    assert decisions == {1: "pass", 2: "repair", 3: "repair", 4: "repair"}
+    assert results[0].reason == "no-op repair converted to pass"
+    repaired = {r.pid for r in results if r.decision == "repair"}
+    assert repaired == {"p00033", "p00035", "p00080"}
+    # p00016 is NOT lost — it is an explicit per-index pass with a warning
+    assert any("no-op repair converted to pass" in w for w in warnings)
+    assert "p00016" in warnings[0]
 
 
 def test_reaudit_prompt_marks_context_pairs_context_only():

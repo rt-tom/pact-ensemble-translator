@@ -401,6 +401,50 @@ def test_b3_full_flow_repairs_and_updates_snapshots(tmp_path: Path) -> None:
     assert backend.reaudit_calls() == 1
 
 
+def test_b3_full_flow_noop_repair_converted_to_pass(tmp_path: Path) -> None:
+    # REPAIR-2 (t_768537b9, run_013 batch1): a repair batch where ONE index
+    # is a no-op (repaired_translation == current) must NOT fail the batch —
+    # the no-op index is converted to a per-index PASS (journaled as a
+    # WARNING), the other index is repaired normally, and the chapter is
+    # released as audited (run_013: the no-op index failed the whole batch
+    # and pushed 4 real findings into debt).
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "addition", "severity": "major",
+            "confidence": "high", "note": "дублирование слова",
+            "excerpt": "номер1 номер1",
+        }],
+        repair_results=[
+            # index 1: NO-OP — "<current>" echoes the request's own current
+            # text back unchanged (the mock's no-op contract).
+            {"index": 1, "decision": "repair", "pid": "p00001",
+             "repaired_translation": "<current>", "reason": "no-op"},
+        ],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+
+    # Batch survived the no-op index: repair completed, chapter released.
+    assert result.step7["repair_complete"] is True
+    assert result.step7["committed_pids"] == []
+    assert result.step7["passed_pids"] == ["p00001"]
+    assert result.step8 == {
+        "status": "complete", "audit_complete": True, "released_as_audited": True,
+    }
+    # The no-op is journaled as a non-fatal WARNING (never batch-fatal debt).
+    assert any("no-op repair converted to pass" in w for w in result.step7["warnings"])
+    journal = [
+        json.loads(line)
+        for line in (cfg.out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    round_event = next(e for e in journal if e["event"] == "repair_round")
+    assert any("no-op repair converted to pass" in w for w in round_event["warnings"])
+    assert round_event["committed_pids"] == []
+    assert round_event["passed_pids"] == ["p00001"]
+    assert round_event["repair_complete"] is True
+
+
 # ---------------------------------------------------------------------------
 # Acceptance 2: audit_complete=false -> fail-closed (never released)
 # ---------------------------------------------------------------------------
@@ -734,6 +778,9 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "repair_microbatch_trigger": 4,
         "repair_microbatch_target": 4,
         "repair_context_window": 3,
+        "repair_context_window_by_category": {
+            "invented_gender": 10, "referent": 10, "omission": 10,
+        },
         "repair_reaudit_neighbour_window": 2,
         "repair_reaudit_chunk": {
             "max_input_tokens": 3600,
@@ -774,6 +821,9 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "microbatch_trigger": dict(audit_repair_microbatch_trigger=6),
         "microbatch_target": dict(audit_repair_microbatch_target=2),
         "repair_context_window": dict(audit_repair_context_window=8),
+        "repair_context_window_by_category": dict(
+            audit_repair_context_window_by_category={"invented_gender": 12}
+        ),
         "reaudit_neighbour_window": dict(audit_repair_reaudit_neighbour_window=4),
         "reaudit_chunk_max_input": dict(audit_repair_reaudit_max_input_tokens=1800),
         "reaudit_chunk_overlap": dict(audit_repair_reaudit_overlap_tokens=200),
@@ -869,6 +919,35 @@ def test_b3_repair_context_window_wired_from_run_config(
     assert default_bundle._config.repair_context_window == 3
 
 
+def test_b3_per_category_windows_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # REPAIR-2 (t_768537b9, F5): the per-category window map is wired from
+    # the run config through B3AuditRepairConfig into SelectiveRepairConfig —
+    # a cache produced under a different per-category window must never
+    # replay (defaults mirror the module constant).
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(
+        tmp_path,
+        audit_repair_context_window_by_category={"invented_gender": 12},
+    )
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_context_window_by_category == {
+        "invented_gender": 12,
+    }
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.repair_context_window_by_category == {
+        "invented_gender": 10, "referent": 10, "omission": 10,
+    }
+
+
 def test_b3_reaudit_request_carries_configured_budget_and_retry(tmp_path: Path) -> None:
     # RV 71b7cbc HIGH finding: run the full production B3 flow with a
     # non-default re-audit budget/retry; the re-audit backend request must
@@ -949,6 +1028,26 @@ def test_b3_config_payload_carries_repair_context_window() -> None:
     assert B3AuditRepairConfig().to_payload()["repair_context_window"] == 3
     custom = B3AuditRepairConfig(repair_context_window=8).to_payload()
     assert custom["repair_context_window"] == 8
+
+
+def test_b3_config_payload_carries_per_category_windows() -> None:
+    # REPAIR-2 (t_768537b9, F5): the per-category window map is part of the
+    # B3 config payload (identity) — default widens invented_gender /
+    # referent / omission (owner 2026-08-12), changed_fact/addition stay ±3.
+    from pact_v4.runtime.prompts_runtime import (
+        DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
+    )
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY == {
+        "invented_gender": 10, "referent": 10, "omission": 10,
+    }
+    payload = B3AuditRepairConfig().to_payload()
+    assert payload["repair_context_window_by_category"] == {
+        "invented_gender": 10, "referent": 10, "omission": 10,
+    }
+    custom = B3AuditRepairConfig(
+        repair_context_window_by_category={"referent": 25}
+    ).to_payload()
+    assert custom["repair_context_window_by_category"] == {"referent": 25}
 
 
 def test_b3_config_payload_carries_reaudit_chunk_settings() -> None:
