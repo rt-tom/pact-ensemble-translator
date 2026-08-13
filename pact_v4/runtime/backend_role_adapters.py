@@ -201,6 +201,16 @@ class BackendModelCaller:
         """Reasoning text of the most recent backend completion ('' when none)."""
         return self._last_reasoning
 
+    @property
+    def last_raw(self) -> str:
+        """Raw text of the most recent backend completion ('' when none).
+
+        RAW-SINK (architect, run_remote_006): captured in ``_complete``
+        BEFORE ``retry_json_call`` classifies the body, so the raw survives
+        a TruncatedJSONError — the disk trail for whole-chapter diagnosis.
+        """
+        return self._last_raw
+
     def reset_attempt_state(self) -> None:
         """Clear the per-attempt reasoning diagnostic at a call-attempt boundary.
 
@@ -213,6 +223,7 @@ class BackendModelCaller:
         clear-at-start behavior inside ``__call__``.
         """
         self._last_reasoning = ""
+        self._last_raw = ""
 
     def set_reasoning_chunk_sink(
         self, sink: Optional[Callable[[str], None]]
@@ -295,6 +306,13 @@ class BackendModelCaller:
         # attempt); on a completed backend call _complete() records the
         # reasoning text from raw_metadata.
         self._last_reasoning = ""
+        # RAW-SINK (architect, run_remote_006): capture the raw model text of
+        # this attempt BEFORE retry_json_call classifies it — the transport
+        # returned the text, but classify_response_text may raise
+        # TruncatedJSONError/EmptyResponseError, and then the raw would
+        # otherwise vanish (no disk trail for diagnosis). _complete()
+        # overwrites it per backend call; a transport failure leaves it ''.
+        self._last_raw = ""
 
         def _complete() -> str:
             # Re-issues the identical request on a retry: same prompt, same
@@ -313,6 +331,10 @@ class BackendModelCaller:
             metadata = response.raw_metadata if isinstance(response.raw_metadata, Mapping) else {}
             reasoning = metadata.get("reasoning")
             self._last_reasoning = str(reasoning) if reasoning is not None else ""
+            # RAW-SINK: keep the raw text even if the caller's classify step
+            # (retry_json_call → classify_response_text) later rejects it —
+            # the disk trail must survive TruncatedJSONError.
+            self._last_raw = response.text or ""
             return response.text
 
         return retry_json_call(

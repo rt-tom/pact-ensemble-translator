@@ -474,12 +474,15 @@ class _ReasoningCaller:
         self.reasonings = list(reasonings)
         self.calls = 0
         self.last_reasoning = ""
+        self.last_raw = ""
 
     def __call__(self, bundle) -> str:
         self.calls += 1
         if self.reasonings:
             self.last_reasoning = self.reasonings.pop(0)
-        return self.responses.pop(0)
+        text = self.responses.pop(0)
+        self.last_raw = text  # RAW-SINK: like BackendModelCaller._complete
+        return text
 
 
 def test_whole_chapter_reasoning_sink_receives_successful_attempt(tmp_path):
@@ -551,6 +554,33 @@ def test_whole_chapter_raw_sink_receives_every_attempt(tmp_path):
     assert caller.calls == 2
     assert received == [
         (0, "{truncated json"),  # the failed attempt's raw text survives
+        (1, good),
+    ]
+
+
+def test_whole_chapter_raw_sink_fallback_after_truncated_retry(tmp_path):
+    # RAW-SINK fallback (architect, run_remote_006): when the transport
+    # returns text but classify rejects it (TruncatedJSONError), the raw
+    # survives in the caller's ``last_raw`` and the sink must still fire —
+    # the disk trail exists even for a rejected body. Without the fallback
+    # the raw vanishes (the bug that made 004/005/006 diagnosis guesswork).
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    broken = '{"p00001": "текст", "p00002", "обрыв"}'
+    caller = _ReasoningCaller([broken, good], ["", ""])
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        raw_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    assert caller.calls == 2
+    assert received == [
+        (0, broken),  # the REJECTED attempt's raw text survives via last_raw
         (1, good),
     ]
 
