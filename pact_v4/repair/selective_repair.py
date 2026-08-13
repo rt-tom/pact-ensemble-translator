@@ -122,7 +122,12 @@ LOG = logging.getLogger(__name__)
 
 REPAIR_SCHEMA = "pact-repair/v1"
 REPAIR_HARNESS_VERSION = "1.0"
-REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v3"
+# CANDIDATE-MERGE (t_0ffe56e1): v4 — REPAIR_AS_VERIFIER_V1 now tells the
+# verifier the SOURCE of each finding (fidelity_auditor vs russian_editor)
+# and that one PID may carry BOTH remarks to be resolved in ONE decision.
+# Identity-bearing: the prompt version rides the run config identity, so a
+# stale cached repaired map written under v3 can never replay under v4.
+REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v4"
 
 # Cap on eligible findings repaired per chapter (owner decision 2026-08-11:
 # run_010 showed the 10-finding cap cut 73% of real findings — cap on
@@ -241,6 +246,17 @@ class EligibleFinding:
     ``index`` is the explicit ``[index]`` identifier the model answers by
     (Cheng et al. contract); ``tier`` is ``"A"`` (CONFIRMED — repair
     directly) or ``"B"`` (CANDIDATE — verify-before-repair).
+
+    CANDIDATE-MERGE (t_0ffe56e1): ``source_stage`` names the stage that
+    produced the remark — ``"fidelity_auditor"`` (B1 audit finding) or
+    ``"russian_editor"`` (R-editor REVIEW candidate). A MERGED finding (one
+    PID with several remarks — same-stage or cross-stage alike, owner
+    clarification 2026-08-13) joins the distinct stage labels with ``"+"``
+    (``source_stage="fidelity_auditor+russian_editor"``) and carries the
+    per-source remarks in ``sources`` (each with its own stage/tier/category/
+    severity/confidence/note/excerpt/issue) so the repair model sees ALL
+    remarks of the PID in ONE call and builds ONE decision. After the merge
+    every PID appears at most once in a batch (indices unique 1..N).
     """
 
     index: int
@@ -252,6 +268,8 @@ class EligibleFinding:
     note: str
     excerpt: str
     issue: Mapping[str, Any]
+    source_stage: str = "fidelity_auditor"
+    sources: Tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -370,6 +388,11 @@ class SelectiveRepairOutcome:
                             "category": f.category,
                             "severity": f.severity,
                             "confidence": f.confidence,
+                            # CANDIDATE-MERGE (t_0ffe56e1): the finding's
+                            # source stage(s) + merged per-source remarks
+                            # (journal visibility for the trial record).
+                            "source_stage": f.source_stage,
+                            "sources": [dict(s) for s in f.sources],
                         }
                         for f in b.findings
                     ],
@@ -480,6 +503,10 @@ def select_eligible(
                     note=str(issue.get("note", "")),
                     excerpt=str(issue.get("excerpt", "")),
                     issue=issue,
+                    # CANDIDATE-MERGE (t_0ffe56e1): audit findings carry the
+                    # fidelity-auditor stage label (the repair prompt renders
+                    # it so the verifier applies the right contract).
+                    source_stage=f.source_stage,
                 )
             )
         elif f.verdict == REJECTED:
@@ -501,6 +528,7 @@ def select_eligible(
                         note=str(issue.get("note", "")),
                         excerpt=str(issue.get("excerpt", "")),
                         issue=issue,
+                        source_stage=f.source_stage,
                     )
                 )
             else:
@@ -515,6 +543,7 @@ def select_eligible(
                         note=str(issue.get("note", "")),
                         excerpt=str(issue.get("excerpt", "")),
                         issue=issue,
+                        source_stage=f.source_stage,
                     )
                 )
     return tuple(eligible), tuple(rejected), tuple(ineligible)
@@ -579,6 +608,11 @@ def make_microbatches(
                 note=finding.note,
                 excerpt=finding.excerpt,
                 issue=finding.issue,
+                # CANDIDATE-MERGE (t_0ffe56e1): the source stage and the
+                # merged per-source remarks survive the microbatch
+                # renumbering — the model must still see them per index.
+                source_stage=finding.source_stage,
+                sources=finding.sources,
             )
         batches.append(tuple(chunk))
     return tuple(batches)
@@ -782,6 +816,9 @@ def _review_candidate_finding(
     ``note`` carries the editor's reason. The ``issue`` dict carries a
     ``source: russian_editor`` marker plus the original/proposed/class so the
     accept/reject journal can be reconstructed after the batches.
+    ``source_stage`` (CANDIDATE-MERGE, t_0ffe56e1) is ``candidate.source_stage``
+    (``"russian_editor"``) — the repair prompt renders it so the verifier
+    knows this remark is a Russian-defect hypothesis, not a source mismatch.
     """
     return EligibleFinding(
         index=index,
@@ -804,7 +841,122 @@ def _review_candidate_finding(
             "proposed": candidate.proposed,
             "class": candidate.klass,
         },
+        source_stage=candidate.source_stage,
     )
+
+
+def merge_candidates_by_pid(
+    findings: Sequence[EligibleFinding],
+) -> Tuple[EligibleFinding, ...]:
+    """Group kept findings by PID before microbatching (CANDIDATE-MERGE,
+    t_0ffe56e1; owner clarification 2026-08-13): ALL remarks of ONE pid —
+    every fidelity-auditor finding AND every Russian-editor candidate,
+    same-stage or cross-stage alike — merge into ONE ``EligibleFinding``
+    that carries every remark in ``sources``, so the repair model sees the
+    pid's complete remark set in ONE ``[index]`` block and builds ONE
+    decision — never partial/sequential rewrites of the same paragraph
+    (run_remote_001 p00303-class: the fidelity repair made an exact-but-
+    clunky Russian, then the editor candidate rewrote it back with meaning
+    loss; two blocks force partial decisions and let remarks get ignored).
+
+    Rules (owner clarification 2026-08-13 — supersedes the t_78a3d02c
+    partial-merge rule):
+
+    * EVERY finding of one PID merges into a single finding — same-stage
+      included. ``[A1, A2, E]`` -> ONE finding with ``sources=[A1, A2, E]``
+      (three remarks, three stages where applicable), never
+      ``[merged(A1+E), A2]``. The repair model must see ALL remarks of the
+      pid at once to build one complete decision; keeping same-stage
+      remarks in a second block makes it decide partially.
+    * The merged finding keeps the FIRST finding's index (source order), its
+      own ``source_stage`` joins every distinct stage with ``+`` and
+      ``sources`` carries every remark (stage, tier, category, severity,
+      confidence, note, excerpt, issue) so the prompt renderer can show them
+      all (``_render_finding_block`` already renders N sources). All other
+      indices of the group are consumed; indices re-number contiguously.
+    * The merge runs BEFORE the cap re-numbering/ordering is undone: the
+      findings passed in are the post-cap kept set (audit findings first,
+      review candidates appended after), so an editor candidate never
+      displaces a code-confirmed audit finding at the cap boundary.
+    """
+    by_pid: dict = {}
+    for f in findings:
+        by_pid.setdefault(f.pid, []).append(f)
+    merged: list = []
+    for f in findings:
+        group = by_pid[f.pid]
+        if group is None:
+            continue
+        merged.append(_merge_source_group(group))
+        by_pid[f.pid] = None  # emitted once
+    # Re-index contiguously in source order (indices must be unique — a
+    # merged finding consumes its group's indices).
+    out: list = []
+    for i, f in enumerate(merged, start=1):
+        out.append(
+            EligibleFinding(
+                index=i,
+                pid=f.pid,
+                tier=f.tier,
+                category=f.category,
+                severity=f.severity,
+                confidence=f.confidence,
+                note=f.note,
+                excerpt=f.excerpt,
+                issue=f.issue,
+                source_stage=f.source_stage,
+                sources=f.sources,
+            )
+        )
+    return tuple(out)
+
+
+def _merge_source_group(group: Sequence[EligibleFinding]) -> EligibleFinding:
+    """Merge a same-PID group into ONE finding carrying all remarks in
+    ``sources`` (CANDIDATE-MERGE, t_0ffe56e1; owner clarification
+    2026-08-13: same-stage and cross-stage remarks alike). The first finding
+    (source order — audit findings precede review candidates in the kept
+    set) keeps its tier/severity/confidence/note/excerpt as the headline
+    values; ``source_stage`` joins every distinct stage with ``+``."""
+    primary = group[0]
+    sources = tuple(
+        {
+            "stage": g.source_stage,
+            "tier": g.tier,
+            "category": g.category,
+            "severity": g.severity,
+            "confidence": g.confidence,
+            "note": g.note,
+            "excerpt": g.excerpt,
+            "issue": dict(g.issue),
+        }
+        for g in group
+    )
+    stage_label = "+".join(sorted({g.source_stage for g in group}))
+    return EligibleFinding(
+        index=primary.index,
+        pid=primary.pid,
+        tier=primary.tier,
+        category=primary.category,
+        severity=primary.severity,
+        confidence=primary.confidence,
+        note=primary.note,
+        excerpt=primary.excerpt,
+        issue=primary.issue,
+        source_stage=stage_label,
+        sources=sources,
+    )
+
+
+def _finding_has_editor_source(finding: EligibleFinding) -> bool:
+    """True when a finding carries the Russian-editor stage — either as a
+    plain review candidate (``issue.source == \"russian_editor\"``) or as one
+    remark of a CANDIDATE-MERGE group (``sources[].stage == \"russian_editor\"``,
+    t_0ffe56e1). The merged finding's headline ``issue`` is the audit issue,
+    so the source marker must be searched in ``sources`` too."""
+    if any(s.get("stage") == "russian_editor" for s in finding.sources):
+        return True
+    return finding.issue.get("source") == "russian_editor"
 
 
 def _build_review_journal(
@@ -818,7 +970,11 @@ def _build_review_journal(
     returned ``repair`` — the accepted text is committed and re-audited),
     ``rejected`` (verifier returned ``pass``), or ``failed`` (the batch
     failed / the index was never answered — fail-closed, never silently
-    accepted).
+    accepted). With CANDIDATE-MERGE (t_0ffe56e1, owner clarification
+    2026-08-13) a candidate is always served by the PID's SINGLE merged
+    finding (ALL remarks of the pid live in one index) — the journal verdict
+    comes from that one index's answer (one decision for the whole PID; a
+    pid appears at most once per batch, so there is no sub-index ambiguity).
     """
     journal: list = []
     for candidate in review_candidates:
@@ -835,8 +991,7 @@ def _build_review_journal(
             finding = next(
                 (
                     f for f in batch.findings
-                    if f.pid == candidate.pid
-                    and f.issue.get("source") == "russian_editor"
+                    if f.pid == candidate.pid and _finding_has_editor_source(f)
                 ),
                 None,
             )
@@ -955,6 +1110,20 @@ class SelectiveRepairEvaluator:
             _review_candidate_finding(c, index=_next_index(kept) + i + 1)
             for i, c in enumerate(review_candidates)
         )
+
+        # CANDIDATE-MERGE (t_0ffe56e1; owner clarification 2026-08-13):
+        # group the kept findings by PID BEFORE microbatching — ALL remarks
+        # of ONE pid (every fidelity-auditor finding AND every Russian-editor
+        # candidate, same-stage or cross-stage alike) become ONE
+        # EligibleFinding (source_stage joins the distinct stages, every
+        # remark in ``sources``) so the repair model sees the pid's complete
+        # remark set in a single call and builds ONE decision. run_remote_001
+        # p00303-class: without the merge the fidelity repair first wrote an
+        # exact-but-clunky Russian, then the editor candidate rewrote the
+        # same PID back losing the source meaning. The merge runs on the
+        # post-cap kept set (audit first, candidates appended) — it never
+        # re-opens the cap.
+        kept = merge_candidates_by_pid(kept)
 
         if not kept:
             # TEaR: 0 eligible findings -> repair skipped entirely.
@@ -1413,6 +1582,7 @@ __all__ = [
     "make_microbatches",
     "parse_repair_batch",
     "plan_reaudit_scope",
+    "merge_candidates_by_pid",
     "SelectiveRepairEvaluator",
     "ReviewCandidate",
 ]

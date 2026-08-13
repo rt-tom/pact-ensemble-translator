@@ -46,6 +46,7 @@ from pact_v4.repair.selective_repair import (
     SelectiveRepairOutcome,
     apply_findings_cap,
     make_microbatches,
+    merge_candidates_by_pid,
     parse_repair_batch,
     plan_reaudit_scope,
     select_eligible,
@@ -602,7 +603,7 @@ def test_repair_prompt_requires_full_pid_text_not_fragment():
     assert "FULL corrected text" in instructions
     assert "every sentence of the paragraph" in instructions
     assert "Never return a fragment" in instructions
-    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v3"
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v4"
 
 
 def test_repair_prompt_guardrails_self_verification_present():
@@ -1965,7 +1966,10 @@ def test_review_candidates_accepted_and_rejected_journal():
 
 def test_review_candidates_never_displace_audit_findings_at_cap():
     """Review candidates ride along AFTER the audit findings cap — they
-    never displace code-confirmed audit findings at the cap boundary."""
+    never displace code-confirmed audit findings at the cap boundary.
+    CANDIDATE-MERGE (t_0ffe56e1): the p00001/p00002 candidates MERGE with
+    the audit findings on the same PIDs (one finding, both sources), so the
+    post-merge kept set is 10 findings -> microbatches [4, 3, 3]."""
     from pact_v4.audit.russian_editor import ReviewCandidate
 
     # REPAIR-CTX (t_97b31f81): the renderer fails loud if a finding PID is
@@ -1995,9 +1999,9 @@ def test_review_candidates_never_displace_audit_findings_at_cap():
         _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
                           for i in range(1, 5)]),
         _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
-                          for i in range(1, 5)]),
+                          for i in range(1, 4)]),
         _repair_response([{"index": i, "decision": "pass", "reason": "ok"}
-                          for i in range(1, 5)]),
+                          for i in range(1, 4)]),
     ])
     evaluator = SelectiveRepairEvaluator(
         backend, config=SelectiveRepairConfig(findings_cap=10)
@@ -2008,8 +2012,17 @@ def test_review_candidates_never_displace_audit_findings_at_cap():
     )
     # 12 eligible audit findings -> cap 10 keeps 10, caps 2.
     assert len(outcome.capped) == 2
-    # 10 audit + 2 review = 12 findings -> 3 microbatches (4+4+4).
-    assert [len(b.findings) for b in outcome.batches] == [4, 4, 4]
+    # 10 kept audit findings, p00001/p00002 merge with their review
+    # candidates -> 10 findings (8 audit + 2 merged) -> microbatches 4+3+3.
+    assert [len(b.findings) for b in outcome.batches] == [4, 3, 3]
+    # the merged p00001/p00002 findings carry both sources
+    merged_stages = {
+        b.findings[0].source_stage
+        for b in outcome.batches
+        for f in b.findings
+        if f.pid in ("p00001", "p00002")
+    }
+    assert merged_stages == {"fidelity_auditor+russian_editor"}
     # Every review candidate was answered (journal entries for both).
     assert len(outcome.review_journal) == 2
     assert outcome.repair_complete is True
@@ -2074,6 +2087,575 @@ def test_review_candidates_import_contract():
 
     assert russian_editor.ReviewCandidate.__name__ == "ReviewCandidate"
     assert "proposed" in russian_editor.ReviewCandidate.__dataclass_fields__
+
+
+# ---------------------------------------------------------------------------
+# CANDIDATE-MERGE (t_0ffe56e1): source_stage in candidates + PID merging
+# ---------------------------------------------------------------------------
+
+
+def test_select_eligible_sets_source_stage_fidelity_auditor():
+    """CANDIDATE-MERGE: audit findings carry ``source_stage=fidelity_auditor``
+    (the repair prompt renders it so the verifier knows the remark claims a
+    SOURCE mismatch, not a Russian defect)."""
+    eligible, _, _ = select_eligible(
+        [_issue_with("p00240", category="changed_fact", _verdict=CONFIRMED)]
+    )
+    assert eligible[0].source_stage == "fidelity_auditor"
+
+
+def test_review_candidate_source_stage_russian_editor():
+    """CANDIDATE-MERGE: a Russian-editor REVIEW candidate carries
+    ``source_stage=russian_editor`` (the prompt tells the verifier this is a
+    Russian-defect hypothesis)."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    candidate = ReviewCandidate(
+        pid="p00303", original="Он сделал себе обещание.",
+        proposed="Он пообещал себе.", klass="calque", reason="калька",
+    )
+    assert candidate.source_stage == "russian_editor"
+
+
+def test_merge_candidates_by_pid_two_auditors_one_editor_all_merged():
+    """CANDIDATE-MERGE (owner clarification 2026-08-13): a PID with TWO
+    same-stage auditor findings PLUS one editor candidate merges ALL THREE
+    remarks into ONE finding — ``[A1, A2, E] -> [merged(A1+A2+E)]`` with all
+    three remarks in ``sources``, one index, one decision (never two blocks
+    that force partial decisions)."""
+    a1 = EligibleFinding(
+        index=1, pid="p00303", tier="B", category="changed_fact",
+        severity="major", confidence="high",
+        note="fact shifted", excerpt="excerpt1", issue={"id": "p00303"},
+        source_stage="fidelity_auditor",
+    )
+    a2 = EligibleFinding(
+        index=2, pid="p00303", tier="B", category="omission",
+        severity="minor", confidence="high",
+        note="missing clause", excerpt="excerpt2", issue={"id": "p00303"},
+        source_stage="fidelity_auditor",
+    )
+    e = EligibleFinding(
+        index=3, pid="p00303", tier="B", category="calque",
+        severity="minor", confidence="high",
+        note="калька с английского", excerpt="proposed rewrite",
+        issue={"id": "p00303", "source": "russian_editor"},
+        source_stage="russian_editor",
+    )
+    merged = merge_candidates_by_pid((a1, a2, e))
+    # ONE finding with ALL THREE remarks — same-stage included.
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.pid == "p00303"
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert {s["stage"] for s in f.sources} == {
+        "fidelity_auditor", "russian_editor",
+    }
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "omission", "calque",
+    }
+    # the headline values come from the first finding
+    assert f.category == "changed_fact"
+    assert f.index == 1
+    assert [f.index for f in merged] == [1]
+
+
+def test_merge_candidates_by_pid_one_auditor_two_editors_all_merged():
+    """CANDIDATE-MERGE symmetric multiplicity (owner clarification
+    2026-08-13): one auditor finding + TWO editor candidates on the same PID
+    merge into ONE finding with all three remarks (one decision for the
+    whole PID)."""
+    a = EligibleFinding(
+        index=1, pid="p00303", tier="B", category="changed_fact",
+        severity="major", confidence="high",
+        note="fact shifted", excerpt="excerpt", issue={"id": "p00303"},
+        source_stage="fidelity_auditor",
+    )
+    e1 = EligibleFinding(
+        index=2, pid="p00303", tier="B", category="calque",
+        severity="minor", confidence="high",
+        note="калька", excerpt="proposed1", issue={"id": "p00303"},
+        source_stage="russian_editor",
+    )
+    e2 = EligibleFinding(
+        index=3, pid="p00303", tier="B", category="grammar",
+        severity="minor", confidence="high",
+        note="грамматика", excerpt="proposed2", issue={"id": "p00303"},
+        source_stage="russian_editor",
+    )
+    merged = merge_candidates_by_pid((a, e1, e2))
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "calque", "grammar",
+    }
+    assert [f.index for f in merged] == [1]
+
+
+def test_merge_candidates_by_pid_two_auditors_two_editors_all_merged():
+    """CANDIDATE-MERGE full multiplicity (owner clarification 2026-08-13):
+    TWO auditor findings + TWO editor candidates on one PID -> ONE merged
+    finding with all four remarks (one index, one decision)."""
+    def mk(idx, stage, cat):
+        return EligibleFinding(
+            index=idx, pid="p00303", tier="B", category=cat,
+            severity="minor", confidence="high", note=f"n{idx}",
+            excerpt=f"e{idx}", issue={"id": "p00303"}, source_stage=stage,
+        )
+    merged = merge_candidates_by_pid((
+        mk(1, "fidelity_auditor", "changed_fact"),
+        mk(2, "fidelity_auditor", "omission"),
+        mk(3, "russian_editor", "calque"),
+        mk(4, "russian_editor", "grammar"),
+    ))
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 4
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "omission", "calque", "grammar",
+    }
+    assert [f.index for f in merged] == [1]
+
+
+def test_merge_candidates_by_pid_same_pid_editor_auditor_merged():
+    """CANDIDATE-MERGE regression (acceptance, p00303-class): one PID with
+    BOTH an editor candidate (calque) and an auditor changed_fact finding
+    becomes ONE EligibleFinding whose ``source_stage`` joins both stages and
+    whose ``sources`` carries both remarks — one repair call sees both."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    audit = EligibleFinding(
+        index=1, pid="p00303", tier="B", category="changed_fact",
+        severity="major", confidence="high",
+        note="translation changed the fact", excerpt="excerpt", issue={},
+        source_stage="fidelity_auditor",
+    )
+    editor = EligibleFinding(
+        index=2, pid="p00303", tier="B", category="calque",
+        severity="minor", confidence="high",
+        note="калька с английского", excerpt="proposed rewrite", issue={},
+        source_stage="russian_editor",
+    )
+    merged = merge_candidates_by_pid((audit, editor))
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.pid == "p00303"
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 2
+    stages = {s["stage"] for s in f.sources}
+    assert stages == {"fidelity_auditor", "russian_editor"}
+    # indices are unique (single finding keeps index 1)
+    assert f.index == 1
+
+
+def test_merge_candidates_by_pid_same_stage_merged_too():
+    """CANDIDATE-MERGE (owner clarification 2026-08-13): same-stage multiple
+    findings of one PID (e.g. two audit findings on one paragraph) ALSO
+    merge into ONE finding — the repair model must see all remarks of the
+    pid in one block, regardless of stage."""
+    a = EligibleFinding(
+        index=1, pid="p00193", tier="B", category="invented_gender",
+        severity="minor", confidence="high", note="n1", excerpt="e1", issue={},
+        source_stage="fidelity_auditor",
+    )
+    b = EligibleFinding(
+        index=2, pid="p00193", tier="B", category="omission",
+        severity="minor", confidence="high", note="n2", excerpt="e2", issue={},
+        source_stage="fidelity_auditor",
+    )
+    merged = merge_candidates_by_pid((a, b))
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.pid == "p00193"
+    assert f.source_stage == "fidelity_auditor"  # single stage, no join
+    assert len(f.sources) == 2
+    assert {s["category"] for s in f.sources} == {"invented_gender", "omission"}
+    assert f.index == 1
+
+
+def test_merge_candidates_by_pid_distinct_pids_untouched():
+    """CANDIDATE-MERGE: findings on different PIDs are untouched (each keeps
+    its own index and stage)."""
+    a = EligibleFinding(
+        index=1, pid="p00106", tier="B", category="logic",
+        severity="minor", confidence="high", note="n", excerpt="e", issue={},
+        source_stage="russian_editor",
+    )
+    b = EligibleFinding(
+        index=2, pid="p00240", tier="A", category="changed_fact",
+        severity="major", confidence="high", note="n", excerpt="e", issue={},
+        source_stage="fidelity_auditor",
+    )
+    merged = merge_candidates_by_pid((a, b))
+    assert len(merged) == 2
+    assert [f.pid for f in merged] == ["p00106", "p00240"]
+    assert [f.source_stage for f in merged] == ["russian_editor", "fidelity_auditor"]
+
+
+def test_repair_prompt_renders_source_stage_per_finding():
+    """ACCEPTANCE: the repair prompt shows ``source=<stage>`` for every
+    candidate (fidelity_auditor / russian_editor)."""
+    findings = [
+        EligibleFinding(
+            index=1, pid="p00193", tier="B", category="invented_gender",
+            severity="minor", confidence="high", note="grandchild",
+            excerpt="внучка", issue={}, source_stage="fidelity_auditor",
+        ),
+        EligibleFinding(
+            index=2, pid="p00303", tier="B", category="calque",
+            severity="minor", confidence="high", note="калька",
+            excerpt="пообещал", issue={}, source_stage="russian_editor",
+        ),
+    ]
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001",
+        source={"p00193": "grandchild", "p00303": "made a promise"},
+        translation={"p00193": "внучка", "p00303": "сделал обещание"},
+        findings=findings,
+    )
+    assert "source=fidelity_auditor" in prompt
+    assert "source=russian_editor" in prompt
+    assert "[1] p00193 | CANDIDATE | invented_gender" in prompt
+    assert "[2] p00303 | CANDIDATE | calque" in prompt
+
+
+def test_repair_prompt_merged_finding_shows_both_remarks():
+    """ACCEPTANCE: a merged finding (editor + auditor on one PID) renders
+    BOTH remarks with their stages in the FINDINGS block — the model sees
+    both in one call and builds one decision."""
+    merged = EligibleFinding(
+        index=1, pid="p00303", tier="B", category="changed_fact",
+        severity="major", confidence="high",
+        note="audit note", excerpt="audit excerpt", issue={},
+        source_stage="fidelity_auditor+russian_editor",
+        sources=(
+            {
+                "stage": "fidelity_auditor", "tier": "B",
+                "category": "changed_fact", "severity": "major",
+                "confidence": "high", "note": "audit note",
+                "excerpt": "audit excerpt", "issue": {},
+            },
+            {
+                "stage": "russian_editor", "tier": "B",
+                "category": "calque", "severity": "minor",
+                "confidence": "high", "note": "калька",
+                "excerpt": "пообещал", "issue": {},
+            },
+        ),
+    )
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001",
+        source={"p00303": "made a promise to himself"},
+        translation={"p00303": "сделал себе обещание"},
+        findings=[merged],
+    )
+    assert "source=fidelity_auditor+russian_editor" in prompt
+    assert "[fidelity_auditor |" in prompt and "changed_fact" in prompt
+    assert "[russian_editor |" in prompt and "calque" in prompt
+    assert "audit note" in prompt and "калька" in prompt
+
+
+def test_repair_instructions_mention_source_difference():
+    """ACCEPTANCE: REPAIR_AS_VERIFIER_V1 (v4) tells the verifier the two
+    source kinds differ — editor: Russian defect; auditor: source mismatch —
+    and that a merged finding is one decision, never sequential rewrites."""
+    instructions = REPAIR_AS_VERIFIER_V1.instructions
+    assert "source=fidelity_auditor" in instructions
+    assert "source=russian_editor" in instructions
+    assert "source=fidelity_auditor+russian_editor" in instructions
+    assert "Never apply two sequential rewrites to the same pid" in instructions
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v4"
+
+
+def test_merged_editor_auditor_single_repair_call():
+    """CANDIDATE-MERGE regression (acceptance, p00303-class): one PID with
+    editor calque + auditor changed_fact is ONE repair call with BOTH remarks
+    visible; the model builds ONE decision — committed once, re-audit covers
+    the PID (never two sequential rewrites)."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00303": "He made a solemn promise to himself.",
+        "p00304": "Next paragraph.",
+    }
+    translation = {
+        "p00303": "Он сделал торжественное обещание себе.",
+        "p00304": "Следующий абзац.",
+    }
+    filtered = [
+        FilteredIssue(
+            issue=_issue("p00303", "changed_fact", note="fact shifted",
+                         excerpt="торжественное обещание"),
+            verdict=TIER_B, filter_name="test", reason="test",
+        )
+    ]
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он торжественно пообещал себе.",
+            klass="calque", reason="калька с английского",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {
+                "index": 1, "decision": "repair", "pid": "p00303",
+                "repaired_translation": (
+                    "Он дал себе торжественное обещание."
+                ),
+                "reason": "fixed the calque and kept the fact",
+            },
+        ]),
+        _reaudit_response([]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, review_candidates=review_candidates,
+    )
+    # ONE repair call (repair + re-audit), one batch, one finding for p00303
+    assert len(backend.requests) == 2
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    finding = outcome.batches[0].findings[0]
+    assert finding.pid == "p00303"
+    assert finding.source_stage == "fidelity_auditor+russian_editor"
+    assert len(finding.sources) == 2
+    # the single call's prompt shows BOTH remarks
+    prompt = backend.requests[0].messages[0].content
+    assert "source=fidelity_auditor+russian_editor" in prompt
+    assert "changed_fact" in prompt and "calque" in prompt
+    # one decision, committed once
+    assert dict(outcome.committed) == {
+        "p00303": "Он дал себе торжественное обещание."
+    }
+    assert outcome.review_journal[0]["verdict"] == "accepted"
+    assert outcome.repair_complete is True
+
+
+def test_mixed_multiplicity_two_auditors_one_editor_one_index():
+    """CANDIDATE-MERGE regression (owner clarification 2026-08-13), end-to-
+    end: a PID with TWO auditor findings PLUS one editor candidate produces
+    ONE per-index repair finding — ALL THREE remarks merged into one block
+    (every remark visible in one prompt block, ONE decision), never two
+    indices that would force a partial decision. Unique indices, correct
+    commit behavior, and the review journal maps the editor candidate to the
+    single merged finding's verdict."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00303": "He made a solemn promise to himself.",
+        "p00304": "Next paragraph.",
+    }
+    translation = {
+        "p00303": "Он сделал торжественное обещание себе.",
+        "p00304": "Следующий абзац.",
+    }
+    filtered = [
+        FilteredIssue(
+            issue=_issue("p00303", "changed_fact", note="fact shifted",
+                         excerpt="торжественное обещание"),
+            verdict=TIER_B, filter_name="test", reason="test",
+        ),
+        FilteredIssue(
+            issue=_issue("p00303", "omission", note="clause omitted",
+                         excerpt="себе"),
+            verdict=TIER_B, filter_name="test", reason="test",
+        ),
+    ]
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он торжественно пообещал себе.",
+            klass="calque", reason="калька с английского",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {
+                "index": 1, "decision": "repair", "pid": "p00303",
+                "repaired_translation": (
+                    "Он дал себе торжественное обещание."
+                ),
+                "reason": "fixed the calque and kept the fact",
+            },
+        ]),
+        _reaudit_response([]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, review_candidates=review_candidates,
+    )
+    # ONE repair call (repair + re-audit) — all three remarks share the batch
+    assert len(backend.requests) == 2
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    f = outcome.batches[0].findings[0]
+    # ALL THREE remarks in ONE merged finding
+    assert f.pid == "p00303"
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "omission", "calque",
+    }
+    # unique index (single finding keeps index 1)
+    assert [f.index for f in outcome.batches[0].findings] == [1]
+    # prompt: the merged finding shows ALL THREE remarks with their stages
+    prompt = backend.requests[0].messages[0].content
+    assert "source=fidelity_auditor+russian_editor" in prompt
+    assert "fact shifted" in prompt and "калька" in prompt
+    assert "clause omitted" in prompt
+    # commit behavior: the merged index's repair is committed once
+    assert dict(outcome.committed) == {
+        "p00303": "Он дал себе торжественное обещание."
+    }
+    # the review journal maps the editor candidate to the merged finding's
+    # verdict (the single index answered 'repair' -> accepted)
+    assert len(outcome.review_journal) == 1
+    assert outcome.review_journal[0]["verdict"] == "accepted"
+    assert outcome.repair_complete is True
+
+
+def test_one_pid_auditor_two_editors_single_index_journal_both_bound():
+    """CANDIDATE-MERGE regression (RV2 MEDIUM finding, owner clarification
+    2026-08-13): one PID with [A, E1, E2] (auditor + TWO editor candidates)
+    merges into ONE index (all three remarks in one block, one decision) —
+    the journal binds BOTH editor candidates to that single merged index's
+    verdict (no sub-index ambiguity: there is exactly one index per pid)."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00303": "He made a solemn promise to himself.",
+        "p00304": "Next paragraph.",
+    }
+    translation = {
+        "p00303": "Он сделал торжественное обещание себе.",
+        "p00304": "Следующий абзац.",
+    }
+    filtered = [
+        FilteredIssue(
+            issue=_issue("p00303", "changed_fact", note="fact shifted",
+                         excerpt="торжественное обещание"),
+            verdict=TIER_B, filter_name="test", reason="test",
+        ),
+    ]
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он торжественно пообещал себе.",
+            klass="calque", reason="калька с английского",
+        ),
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он дал себе торжественное обещание.",
+            klass="grammar", reason="порядок слов",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {
+                "index": 1, "decision": "repair", "pid": "p00303",
+                "repaired_translation": (
+                    "Он дал себе торжественное обещание."
+                ),
+                "reason": "fixed the calque, the word order and kept the fact",
+            },
+        ]),
+        _reaudit_response([]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, review_candidates=review_candidates,
+    )
+    # ONE index carries all three remarks (auditor + both editor candidates).
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    f = outcome.batches[0].findings[0]
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert f.index == 1
+    # BOTH editor candidates are bound to the single merged index's verdict
+    # (accepted — the one decision for the pid); no candidate is left with
+    # the "never answered" failure verdict.
+    assert len(outcome.review_journal) == 2
+    for entry in outcome.review_journal:
+        assert entry["pid"] == "p00303"
+        assert entry["verdict"] == "accepted"
+        assert entry["committed_text"] == "Он дал себе торжественное обещание."
+    assert dict(outcome.committed) == {
+        "p00303": "Он дал себе торжественное обещание."
+    }
+    assert outcome.repair_complete is True
+
+
+def test_one_pid_two_editor_candidates_only_single_index():
+    """CANDIDATE-MERGE (owner clarification 2026-08-13): a PID with ONLY
+    same-stage remarks (two editor candidates, no audit finding) also merges
+    into ONE finding — the repair model sees both proposals in one block and
+    decides once."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00303": "He made a solemn promise to himself.",
+        "p00304": "Next paragraph.",
+    }
+    translation = {
+        "p00303": "Он сделал торжественное обещание себе.",
+        "p00304": "Следующий абзац.",
+    }
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он торжественно пообещал себе.",
+            klass="calque", reason="калька с английского",
+        ),
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он дал себе торжественное обещание.",
+            klass="grammar", reason="порядок слов",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {
+                "index": 1, "decision": "pass",
+                "reason": "правка спорна — отклонено",
+            },
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=(), review_candidates=review_candidates,
+    )
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    f = outcome.batches[0].findings[0]
+    assert f.source_stage == "russian_editor"  # single stage, no join
+    assert len(f.sources) == 2
+    assert f.index == 1
+    # both candidates share the single index's verdict (rejected)
+    assert len(outcome.review_journal) == 2
+    for entry in outcome.review_journal:
+        assert entry["verdict"] == "rejected"
+    assert outcome.committed == ()
+    assert outcome.repair_complete is True
 
 
 # ---------------------------------------------------------------------------

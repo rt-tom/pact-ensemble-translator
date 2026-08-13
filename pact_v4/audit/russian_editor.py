@@ -135,7 +135,11 @@ class ReviewCandidate:
 
     Carried to the B2 selective repair as additional verify-before-repair
     input (``(pid, original, proposed, class)`` per the card); the verifier
-    accepts/rejects each against the ORIGINAL.
+    accepts/rejects each against the ORIGINAL. ``source_stage`` names the
+    stage that produced the candidate (CANDIDATE-MERGE, t_0ffe56e1): always
+    ``"russian_editor"`` — the repair prompt renders it so the verifier
+    applies the right contract (editor: is there a Russian-language defect
+    and can it be fixed without changing the SOURCE meaning?).
     """
 
     pid: str
@@ -143,6 +147,7 @@ class ReviewCandidate:
     proposed: str
     klass: str
     reason: str = ""
+    source_stage: str = "russian_editor"
 
 
 @dataclass(frozen=True)
