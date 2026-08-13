@@ -785,6 +785,7 @@ def generate_whole_chapter(
     cache: Optional[GenerationCache] = None,
     retry: WholeChapterRetryPolicy = WholeChapterRetryPolicy(),
     on_retry: Optional[Callable[[int, str], None]] = None,
+    reasoning_sink: Optional[Callable[[int, str], None]] = None,
 ) -> GenerationOutcome:
     """Generate the whole chapter in ONE model call (V4.1 A1).
 
@@ -810,6 +811,17 @@ def generate_whole_chapter(
     the phase-progress monitor renders as "GEN attempt N/M (reason)". It is
     purely observational: a raise inside the hook is swallowed (logged) and
     never changes retry behavior.
+
+    ``reasoning_sink`` (optional, GEN-REASONING, diagnostics-only) is invoked
+    as ``reasoning_sink(attempt_index, reasoning_text)`` after EVERY model
+    call attempt (0-based attempt index; the successful attempt AND any
+    truncated/aborted retry), with the reasoning text the caller reported for
+    that attempt (``''`` when the transport or provider produced none). The
+    text is read from the caller's ``last_reasoning`` attribute (production
+    callers capture ``response.raw_metadata['reasoning']``), so a stub caller
+    without the attribute yields ``''``. Purely observational: a raise inside
+    the sink is swallowed (logged) and never changes generation behavior.
+    Reasoning is a text artifact only — it never enters cache/resume identity.
     """
     if cache is None:
         cache = GenerationCache()
@@ -821,6 +833,15 @@ def generate_whole_chapter(
             on_retry(attempt, reason)
         except Exception:  # noqa: BLE001 — diagnostics hook, never breaks generation
             LOG.debug("whole-chapter on_retry hook failed", exc_info=True)
+
+    def _emit_reasoning(attempt: int) -> None:
+        if reasoning_sink is None:
+            return
+        try:
+            reasoning = getattr(model_caller, "last_reasoning", None)
+            reasoning_sink(attempt, str(reasoning or ""))
+        except Exception:  # noqa: BLE001 — diagnostics sink, never breaks generation
+            LOG.debug("whole-chapter reasoning_sink failed", exc_info=True)
 
     template = _TEMPLATES[role]
     risk = _whole_chapter_risk(source, glossary)
@@ -880,6 +901,7 @@ def generate_whole_chapter(
                 GenerationErrorCode.SESSION_ABORT,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _emit_reasoning(attempt)
             _notify_retry(attempt + 1, "abort")
             if attempt < retry.max_attempts - 1:
                 time.sleep(retry.delay_for(attempt))
@@ -900,11 +922,14 @@ def generate_whole_chapter(
                 GenerationErrorCode.INVALID_JSON,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _emit_reasoning(attempt)
             _notify_retry(attempt + 1, "truncated")
             if attempt < retry.max_attempts - 1:
                 time.sleep(retry.delay_for(attempt))
                 continue
             break
+
+        _emit_reasoning(attempt)
 
         try:
             translation = validate_whole_chapter_raw(raw, pid_map)

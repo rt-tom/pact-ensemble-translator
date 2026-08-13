@@ -94,8 +94,26 @@ class LifecycleModelCaller:
         self._caller = HttpModelCaller(config=inner_config)
 
     def __call__(self, bundle: PromptBundle) -> str:
+        # GEN-REASONING (RV t_a790dbab): reset the per-attempt reasoning
+        # diagnostic BEFORE lifecycle acquisition. ``ensure_resident`` can
+        # raise ``CompletionError`` (model load/swap failure); the wrapped
+        # caller is then never entered, so without this reset its
+        # ``last_reasoning`` would stay stale from the previous successful
+        # completion and the whole-chapter reasoning sink would attribute
+        # old text to the aborted attempt.
+        self._caller.reset_attempt_state()
         self._router.ensure_resident(GEMMA_MODEL_KEY)
         return self._caller(bundle)
+
+    @property
+    def last_reasoning(self) -> str:
+        """Reasoning text of the most recent backend completion ('' when none).
+
+        V4.1 GEN-REASONING: forwarded from the wrapped ``HttpModelCaller`` so
+        the whole-chapter generation layer can persist per-attempt reasoning
+        diagnostics regardless of which caller wrapper is used.
+        """
+        return getattr(self._caller, "last_reasoning", "")
 
 
 class LifecycleQwenEvaluator:

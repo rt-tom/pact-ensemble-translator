@@ -70,6 +70,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
     DEFAULT_REASONING_BUDGET,
+    DEFAULT_TRANSPORT_MAX_RETRIES,
+    DEFAULT_TRANSPORT_BASE_DELAY_SECONDS,
     HARNESS_VERSION,
     PROMPT_VERSION,
 )
@@ -81,6 +83,9 @@ from pact_v4.audit.russian_editor import (
     DEFAULT_CHUNK_SIZE as RUSSIAN_EDITOR_CHUNK_SIZE,
     DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_MAX_TOKENS,
     DEFAULT_OVERLAP_PAIRS as RUSSIAN_EDITOR_OVERLAP_PAIRS,
+    DEFAULT_RETRY_MAX_RETRIES as RUSSIAN_EDITOR_RETRY_MAX_RETRIES,
+    DEFAULT_RETRY_BASE_DELAY_SECONDS as RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS,
+    MAX_EDITS_PER_PID as RUSSIAN_EDITOR_MAX_EDITS_PER_PID,
 )
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
@@ -341,6 +346,13 @@ class StrictRunConfig:
     audit_max_input_tokens: int = 3600
     audit_max_tokens: int = 12000
     audit_overlap_tokens: int = 400
+    # R-RETRY (t_8ab8ab35, operator extension 2026-08-13, F5): the chunk-
+    # level TRANSPORT_ERROR bounded retry policy (NEW session per attempt)
+    # is identity-bearing and wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair — a cache written under a different
+    # transport-retry policy must never replay a failed chunk.
+    audit_transport_max_retries: int = DEFAULT_TRANSPORT_MAX_RETRIES
+    audit_transport_base_delay_seconds: float = DEFAULT_TRANSPORT_BASE_DELAY_SECONDS
     # V4.1 B3 (review fix F5): EVERY authoritative B3 repair-policy knob and
     # prompt/extractor version participates in the config identity and is
     # wired into B3AuditRepairConfig by _build_b3_audit_repair. Before this
@@ -426,6 +438,14 @@ class StrictRunConfig:
     russian_editor_max_tokens: int = RUSSIAN_EDITOR_MAX_TOKENS
     # Class threshold: SAFE classes (auto-applied with the diff-gate).
     russian_editor_safe_classes: tuple = tuple(sorted(RUSSIAN_EDITOR_SAFE_CLASSES))
+    # R-RETRY (t_8ab8ab35, F5): the per-pid edit cap (duplicate pid is NOT
+    # an error — up to this many edits per pid; 11th+ drops per-edit with a
+    # WARNING) and the bounded retry policy (transport + empty/truncated
+    # JSON) are identity-bearing — a cache written under a different
+    # cap/retry policy must never replay the edited map.
+    russian_editor_max_edits_per_pid: int = RUSSIAN_EDITOR_MAX_EDITS_PER_PID
+    russian_editor_retry_max_retries: int = RUSSIAN_EDITOR_RETRY_MAX_RETRIES
+    russian_editor_retry_base_delay_seconds: float = RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -484,6 +504,10 @@ class StrictRunConfig:
                     "max_tokens": self.audit_max_tokens,
                     "overlap_tokens": self.audit_overlap_tokens,
                     "reasoning_budget": self.audit_reasoning_budget,
+                    "audit_transport_retry": {
+                        "max_retries": self.audit_transport_max_retries,
+                        "base_delay_seconds": self.audit_transport_base_delay_seconds,
+                    },
                     "repair_findings_cap": self.audit_repair_findings_cap,
                     "repair_microbatch_trigger": self.audit_repair_microbatch_trigger,
                     "repair_microbatch_target": self.audit_repair_microbatch_target,
@@ -547,6 +571,11 @@ class StrictRunConfig:
                     "overlap_pairs": self.russian_editor_overlap_pairs,
                     "max_tokens": self.russian_editor_max_tokens,
                     "safe_classes": list(self.russian_editor_safe_classes),
+                    "max_edits_per_pid": self.russian_editor_max_edits_per_pid,
+                    "r_editor_retry": {
+                        "max_retries": self.russian_editor_retry_max_retries,
+                        "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
+                    },
                 },
             },
         )
@@ -3654,6 +3683,57 @@ def _wc_validation_flags(outcome: Any) -> Dict[str, bool]:
     return {"json_ok": False, "pids_ok": False, "order_ok": False}
 
 
+# V4.1 GEN-REASONING: schema of the compact per-attempt reasoning marker that
+# rides inside the whole-chapter generation record (full text lives in the
+# .txt files; the JSON carries only presence + char counts so the artifact
+# stays small — owner decision 2026-08-13).
+WHOLE_CHAPTER_REASONING_SCHEMA = "pact-v4-whole-chapter-reasoning/v1"
+
+
+def _persist_whole_chapter_reasoning(
+    out_dir: Path,
+    reasoning_by_attempt: Mapping[int, str],
+) -> Dict[str, Any]:
+    """Write per-attempt reasoning text files and return the compact marker.
+
+    For every attempt that produced reasoning text, the full text is written
+    to ``whole_chapter_reasoning.txt`` (attempt 0) or
+    ``whole_chapter_retry{N}_reasoning.txt`` (retry attempt N) — the same
+    diagnostic pattern as the audit layer's ``b3_audit_chunkN_reasoning.txt``.
+    The returned marker records, per attempt, only presence + char count
+    (never the full text), so ``generation_outcomes.json`` stays compact.
+
+    Reasoning is a diagnostics text artifact only: writing these files never
+    affects ``whole_chapter_pid_map`` / ``wc_validated`` / cache / resume
+    identity, and a write failure is a warning, not a gate.
+    """
+    attempts: Dict[str, Any] = {}
+    for attempt, reasoning in sorted(reasoning_by_attempt.items()):
+        attempts[str(attempt)] = {
+            "present": bool(reasoning),
+            "chars": len(reasoning),
+        }
+        if not reasoning:
+            continue
+        name = (
+            "whole_chapter_reasoning.txt"
+            if attempt == 0
+            else f"whole_chapter_retry{attempt}_reasoning.txt"
+        )
+        try:
+            (out_dir / name).write_text(reasoning, encoding="utf-8")
+        except OSError as exc:
+            LOG.warning(
+                "whole-chapter reasoning artifact write failed (%s); "
+                "reasoning is diagnostics-only, continuing",
+                exc,
+            )
+    return {
+        "schema": WHOLE_CHAPTER_REASONING_SCHEMA,
+        "attempts": attempts,
+    }
+
+
 def _validate_whole_chapter_generation_record(
     rec: Dict[str, Any],
     *,
@@ -4303,6 +4383,16 @@ def _run_whole_chapter_strict_impl(
             max_attempts=wc_retry_policy.max_attempts,
         )
         wc_t0 = time.monotonic()
+        # V4.1 GEN-REASONING: per-attempt reasoning text collector for the
+        # whole-chapter generation call. Reasoning is a diagnostics TEXT
+        # artifact only — it never enters cache/resume identity (the record
+        # below carries only presence/char-count markers; the full text lives
+        # in whole_chapter_reasoning.txt / whole_chapter_retryN_reasoning.txt).
+        reasoning_by_attempt: Dict[int, str] = {}
+
+        def _wc_reasoning_sink(attempt: int, reasoning: str) -> None:
+            reasoning_by_attempt[attempt] = reasoning
+
         outcome = generate_whole_chapter(
             role="balanced_literary",
             source=source,
@@ -4319,6 +4409,7 @@ def _run_whole_chapter_strict_impl(
             on_retry=lambda attempt, reason: progress.wc_retry_attempt(
                 attempt=attempt, reason=reason
             ),
+            reasoning_sink=_wc_reasoning_sink,
         )
         progress.wc_generation_done(
             finish_reason="complete" if outcome.status == "complete" else "incomplete",
@@ -4326,7 +4417,19 @@ def _run_whole_chapter_strict_impl(
             duration=time.monotonic() - wc_t0,
         )
         progress.wc_validated(**_wc_validation_flags(outcome))
-        generation_records.append(_serialize_generation_outcome(outcome))
+        generation_record = _serialize_generation_outcome(outcome)
+        if any(reasoning_by_attempt.values()):
+            # GEN-REASONING: persist the full reasoning text per attempt and
+            # carry a compact presence/char-count marker in the record so the
+            # artifact stays small (the spec's decision: full text in the
+            # .txt files, JSON gets length/presence only). When NO attempt
+            # produced reasoning (reasoning=0 / transport reported none) the
+            # record stays byte-identical to the pre-GEN-REASONING shape.
+            reasoning_marker = _persist_whole_chapter_reasoning(
+                cfg.out_dir, reasoning_by_attempt
+            )
+            generation_record["reasoning"] = reasoning_marker
+        generation_records.append(generation_record)
 
         if outcome.status == "complete":
             candidate = outcome.candidates["balanced_literary"]
@@ -4555,6 +4658,10 @@ def _run_whole_chapter_strict_impl(
         # leaves them absent — F8: never advertise nonexistent provenance).
         ("translations_edited", "translations_edited.json"),
         ("edit_candidates", "edit_candidates.json"),
+        # V4.1 GEN-REASONING: the whole-chapter reasoning text artifact is
+        # advertised only when reasoning>0 produced it (a reasoning=0 run or
+        # a transport that reported no reasoning leaves it absent — F8).
+        ("whole_chapter_reasoning", "whole_chapter_reasoning.txt"),
     ):
         candidate = cfg.out_dir / name
         if candidate.exists():
@@ -4603,6 +4710,10 @@ def _run_whole_chapter_strict_impl(
                 "max_tokens": cfg.audit_max_tokens,
                 "overlap_tokens": cfg.audit_overlap_tokens,
                 "reasoning_budget": cfg.audit_reasoning_budget,
+                "audit_transport_retry": {
+                    "max_retries": cfg.audit_transport_max_retries,
+                    "base_delay_seconds": cfg.audit_transport_base_delay_seconds,
+                },
                 "repair_findings_cap": cfg.audit_repair_findings_cap,
                 "repair_microbatch_trigger": cfg.audit_repair_microbatch_trigger,
                 "repair_microbatch_target": cfg.audit_repair_microbatch_target,
@@ -4643,6 +4754,11 @@ def _run_whole_chapter_strict_impl(
                 "overlap_pairs": cfg.russian_editor_overlap_pairs,
                 "max_tokens": cfg.russian_editor_max_tokens,
                 "safe_classes": list(cfg.russian_editor_safe_classes),
+                "max_edits_per_pid": cfg.russian_editor_max_edits_per_pid,
+                "r_editor_retry": {
+                    "max_retries": cfg.russian_editor_retry_max_retries,
+                    "base_delay_seconds": cfg.russian_editor_retry_base_delay_seconds,
+                },
             },
         },
         "resumed_from_index": resumed_from_index,

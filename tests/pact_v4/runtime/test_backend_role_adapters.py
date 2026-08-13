@@ -190,6 +190,64 @@ def test_model_caller_propagates_completion_error():
         caller(_bundle())
 
 
+def test_model_caller_captures_reasoning_from_raw_metadata():
+    # V4.1 GEN-REASONING: BackendModelCaller exposes the last completion's
+    # reasoning text (raw_metadata['reasoning']) so the whole-chapter
+    # generation layer can persist it per attempt. A completion without
+    # reasoning reports ''; a transport failure resets it to ''.
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+    with_reasoning = CompletionResponse(
+        text=canned, model="gemma-4-26B",
+        raw_metadata={"reasoning": "обдумал род и регистр"},
+    )
+    without_reasoning = CompletionResponse(text=canned, model="gemma-4-26B")
+    backend = ScriptedBackend([with_reasoning, without_reasoning])
+    caller = BackendModelCaller(backend)
+
+    caller(_bundle())
+    assert caller.last_reasoning == "обдумал род и регистр"
+
+    caller(_bundle())
+    assert caller.last_reasoning == ""
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            raise CompletionError("network unreachable")
+
+    caller2 = BackendModelCaller(_FailingBackend([]))
+    with pytest.raises(CompletionError, match="network unreachable"):
+        caller2(_bundle())
+    # A transport failure leaves last_reasoning empty (never a stale value).
+    assert caller2.last_reasoning == ""
+
+
+def test_model_caller_reset_attempt_state_clears_reasoning():
+    # V4.1 GEN-REASONING (RV t_a790dbab): reset_attempt_state() is the
+    # explicit attempt-boundary reset the lifecycle wrappers invoke BEFORE
+    # model acquisition (ensure_resident). Direct callers keep the existing
+    # clear-at-start behavior inside __call__ — this API is additive.
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+    with_reasoning = CompletionResponse(
+        text=canned, model="gemma-4-26B",
+        raw_metadata={"reasoning": "обдумал род и регистр"},
+    )
+    backend = ScriptedBackend([with_reasoning])
+    caller = BackendModelCaller(backend)
+
+    caller(_bundle())
+    assert caller.last_reasoning == "обдумал род и регистр"
+
+    caller.reset_attempt_state()
+    assert caller.last_reasoning == ""
+
+    # A subsequent successful completion still captures reasoning (the
+    # explicit reset does not disable capture for the next call).
+    backend2 = ScriptedBackend([with_reasoning])
+    caller2 = BackendModelCaller(backend2)
+    caller2(_bundle())
+    assert caller2.last_reasoning == "обдумал род и регистр"
+
+
 def test_model_caller_uses_role_model_ref_from_descriptor():
     backend = ScriptedBackend([_text_response("{}")])
     caller = BackendModelCaller(backend)

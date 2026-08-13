@@ -820,6 +820,7 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "max_tokens": 12000,
         "overlap_tokens": 400,
         "reasoning_budget": 8192,
+        "audit_transport_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
         "repair_findings_cap": 100,
         "repair_microbatch_trigger": 4,
         "repair_microbatch_target": 4,
@@ -882,6 +883,12 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "reaudit_max_tokens": dict(audit_repair_reaudit_max_tokens=25000),
         "reaudit_max_retries": dict(audit_repair_reaudit_max_retries=5),
         "reaudit_base_delay_seconds": dict(audit_repair_reaudit_base_delay_seconds=2.5),
+        # R-RETRY (t_8ab8ab35): the chunk-level TRANSPORT_ERROR retry policy
+        # is identity-bearing — flipping it invalidates the cached audit.
+        "audit_transport_max_retries": dict(audit_transport_max_retries=5),
+        "audit_transport_base_delay_seconds": dict(
+            audit_transport_base_delay_seconds=2.5
+        ),
         "reasoning_budget": dict(audit_reasoning_budget=4096),
         "prompt_version": dict(audit_prompt_version="pact-v4-reviewer-qwen-audit/v9.9"),
         "harness_version": dict(audit_harness_version="9.9"),
@@ -922,6 +929,41 @@ def test_b3_reaudit_budget_and_retry_wired_from_run_config(
     assert bundle._config.repair_reaudit_max_tokens == 25000
     assert bundle._config.repair_reaudit_max_retries == 5
     assert bundle._config.repair_reaudit_base_delay_seconds == 2.5
+
+
+def test_b3_r_retry_and_cap_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R-RETRY (t_8ab8ab35, F5): the production B3 path must carry the
+    # russian_editor per-pid cap AND the bounded retry policy from the run
+    # config through B3AuditRepairConfig into RussianEditorConfig — a cache
+    # produced under a different cap/retry policy must never replay.
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(
+        tmp_path,
+        russian_editor_max_edits_per_pid=7,
+        russian_editor_retry_max_retries=3,
+        russian_editor_retry_base_delay_seconds=2.0,
+        audit_transport_max_retries=4,
+        audit_transport_base_delay_seconds=1.5,
+    )
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.russian_editor_max_edits_per_pid == 7
+    assert bundle._config.russian_editor_retry_max_retries == 3
+    assert bundle._config.russian_editor_retry_base_delay_seconds == 2.0
+    assert bundle._config.audit_transport_max_retries == 4
+    assert bundle._config.audit_transport_base_delay_seconds == 1.5
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.russian_editor_max_edits_per_pid == 10
+    assert default_bundle._config.russian_editor_retry_max_retries == 2
+    assert default_bundle._config.russian_editor_retry_base_delay_seconds == 1.0
 
 
 def test_b3_repair_prompt_version_wired_from_run_config(
@@ -1703,6 +1745,82 @@ def test_b7_r_editor_chunk_events_in_journal(tmp_path: Path) -> None:
     assert (cfg.out_dir / "r_editor_chunk2_reasoning.txt").exists()
 
 
+def test_b3_r_editor_retry_and_warnings_in_journal(tmp_path: Path) -> None:
+    """R-RETRY (t_8ab8ab35): the B3 journal carries the bounded retry
+    attempts (``r_editor_chunk_retry``) AND the per-chunk warning_count
+    (edits dropped over MAX_EDITS_PER_PID — duplicate pid no longer fails
+    the chunk)."""
+    from pact_v4.pipeline.b3_audit_repair import B3AuditRepairConfig
+
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _RetryREditorBackend(_B3MockBackend):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._r_editor_served = 0
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            if "russian_editor" in (request.label or ""):
+                self.requests.append(request)
+                self._r_editor_served += 1
+                if self._r_editor_served == 1:
+                    # run_remote_001 chunk3 shape: empty body (max_tokens
+                    # exhausted) — the retry must recover.
+                    return CompletionResponse(
+                        text="", model="qwen-3.6-35b", finish_reason="stop",
+                    )
+                if self._r_editor_served == 2:
+                    # Chunk 1 (recovered): TWO edits for ONE pid (typo +
+                    # grammar) — duplicate pid is legal (cap 10), so the
+                    # chunk is GOOD with warning_count=0.
+                    return _ok_response({"edits": [
+                        {
+                            "pid": "p00001",
+                            "original": "Перевод номер1 номер1",
+                            "rewritten": "Перевод номер1",
+                            "reason": "дубль",
+                            "class": "duplicate",
+                        },
+                        {
+                            "pid": "p00001",
+                            "original": "номер1",
+                            "rewritten": "номерИспр",
+                            "reason": "грамматика",
+                            "class": "grammar",
+                        },
+                    ]})
+                # Chunk 2: empty edits (GOOD).
+                return _ok_response({"edits": []})
+            return super().complete(request)
+
+    backend = _RetryREditorBackend(
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    _run_with_b3(
+        cfg, backend,
+        config_override=B3AuditRepairConfig(
+            entity_context_enabled=False,
+            russian_editor_enabled=True,
+            russian_editor_chunk_size=4,  # 2 chunks for 8 pids
+            russian_editor_retry_base_delay_seconds=0.0,
+        ),
+    )
+    events = _journal_events(cfg.out_dir)
+    retries = [e for e in events if e["event"] == "r_editor_chunk_retry"]
+    assert len(retries) == 1, "the empty-body attempt must be journaled as a retry"
+    assert retries[0]["attempt"] == 1
+    assert "not valid JSON" in retries[0]["error"]
+    done = [e for e in events if e["event"] == "r_editor_chunk_done"]
+    good = [e for e in done if e["status"] == "GOOD"]
+    assert good, "the recovered chunk must be GOOD, not FAILED"
+    # warning_count: the duplicate-pid chunk is GOOD with 0 warnings (2 <=
+    # cap 10); chunk 2 (empty edits) also GOOD with 0 warnings.
+    assert all(e.get("warning_count", 0) == 0 for e in good)
+    r_done = [e for e in events if e["event"] == "r_editor_done"]
+    assert r_done and r_done[-1]["status"] == "complete"
+    assert r_done[-1]["warning_count"] == 0
+
+
 def test_b3_repair_and_reaudit_raw_artifacts_written(tmp_path: Path) -> None:
     """B1/C1 (run_011): repair-batch + re-audit raw/reasoning artifacts appear
     in the out_dir next to the audit cache."""
@@ -2158,6 +2276,13 @@ def test_b3_r_editor_config_part_of_identity(tmp_path: Path) -> None:
         "overlap_pairs": dict(russian_editor_overlap_pairs=3),
         "max_tokens": dict(russian_editor_max_tokens=16000),
         "safe_classes": dict(russian_editor_safe_classes=("typo", "grammar")),
+        # R-RETRY (t_8ab8ab35, F5): the per-pid cap and the bounded retry
+        # policy are identity-bearing — flipping them invalidates cache.
+        "max_edits_per_pid": dict(russian_editor_max_edits_per_pid=5),
+        "retry_max_retries": dict(russian_editor_retry_max_retries=5),
+        "retry_base_delay_seconds": dict(
+            russian_editor_retry_base_delay_seconds=2.5
+        ),
     }
     for label, overrides in mutations.items():
         mutated = _whole_chapter_cfg(tmp_path, **overrides)

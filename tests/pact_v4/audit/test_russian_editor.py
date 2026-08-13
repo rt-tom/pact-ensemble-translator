@@ -165,7 +165,7 @@ def test_render_prompt_has_no_english_source() -> None:
 
 def test_parse_valid_edits() -> None:
     current = {"p00001": "Он сказал: «Привет»", "p00002": "Это хорошо хорошо."}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([
             _edit("p00001", "Он сказал: «Привет»", "Он сказал: \"Привет\"",
                   "кавычки", "typo"),
@@ -183,7 +183,7 @@ def test_parse_valid_edits() -> None:
 
 def test_parse_rejects_unknown_pid_and_context_only() -> None:
     current = {"p00001": "текст"}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([_edit("p00099", "текст", "другой", "r", "typo")]),
         ["p00001"], current,
     )
@@ -193,7 +193,7 @@ def test_parse_rejects_unknown_pid_and_context_only() -> None:
 
 def test_parse_rejects_original_mismatch() -> None:
     current = {"p00001": "текст А"}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([_edit("p00001", "текст Б", "текст В", "r", "typo")]),
         ["p00001"], current,
     )
@@ -207,7 +207,7 @@ def test_parse_rejects_original_leading_trailing_whitespace() -> None:
     # The old strip()-based comparison silently accepted a whitespace-wrapped
     # original; strict verbatim fails the WHOLE chunk.
     current = {"p00001": "текст А"}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([_edit("p00001", " текст А ", "текст Б", "r", "typo")]),
         ["p00001"], current,
     )
@@ -218,7 +218,7 @@ def test_parse_rejects_original_leading_trailing_whitespace() -> None:
 def test_parse_rejects_original_trailing_whitespace() -> None:
     # Even a single trailing space is not a verbatim substring.
     current = {"p00001": "текст А"}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([_edit("p00001", "текст А ", "текст Б", "r", "typo")]),
         ["p00001"], current,
     )
@@ -236,7 +236,7 @@ def test_parse_accepts_original_fragment_substring() -> None:
     )
     fragment = "Три этажа, с однокомнатной башней, выступающей на этаж выше с одного из углов."
     current = {"p00010": pid_text}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([
             _edit("p00010", fragment,
                   "Три этажа, с однокомнатной башней, выступающей на один "
@@ -254,7 +254,7 @@ def test_parse_rejects_original_not_a_substring_invented() -> None:
     # R-FIX2 fail-closed: a model-INVENTED original (not a substring of the
     # PID) voids the whole chunk — 'not a substring', never applied.
     current = {"p00010": "Три этажа, с однокомнатной башней."}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([
             _edit("p00010", "Совершенно другой текст, которого нет в PID.",
                   "какой-то фикс", "выдумка", "typo"),
@@ -270,7 +270,7 @@ def test_parse_preserves_exact_rewritten_no_strip() -> None:
     # ' изменён ' must NOT be silently stripped to 'изменён' before
     # auto-apply; route returns the exact rewritten string.
     current = {"p00001": "текст А"}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([_edit("p00001", "текст А", " изменён ", "r", "typo")]),
         ["p00001"], current,
     )
@@ -278,7 +278,7 @@ def test_parse_preserves_exact_rewritten_no_strip() -> None:
     assert len(edits) == 1
     assert edits[0].original == "текст А"
     assert edits[0].rewritten == " изменён "
-    applied, candidates, dropped = route_edits(
+    applied, candidates, dropped, _ = route_edits(
         edits, current_by_pid=current
     )
     assert applied == (("p00001", " изменён "),)
@@ -288,7 +288,7 @@ def test_parse_preserves_exact_rewritten_no_strip() -> None:
 
 def test_parse_rejects_unknown_class() -> None:
     current = {"p00001": "текст"}
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         _ok([_edit("p00001", "текст", "другой", "r", "bogus")]),
         ["p00001"], current,
     )
@@ -296,24 +296,57 @@ def test_parse_rejects_unknown_class() -> None:
     assert any("unknown edit class" in e for e in errors)
 
 
-def test_parse_rejects_duplicate_pid() -> None:
-    current = {"p00001": "текст"}
-    edits, errors = parse_editor_edits(
+def test_parse_accepts_duplicate_pid_up_to_cap() -> None:
+    """R-RETRY (t_8ab8ab35, owner contract 2026-08-13): a duplicate pid is
+    NOT a structural error anymore — the model legitimately returns 2+
+    problems for one pid (typo + grammar, run_remote_002 chunk4 p00180).
+    Both edits are accepted (different fragments), the chunk stays GOOD."""
+    current = {"p00001": "текст один два"}
+    edits, errors, warnings = parse_editor_edits(
         _ok([
-            _edit("p00001", "текст", "один", "r", "typo"),
-            _edit("p00001", "текст", "два", "r", "grammar"),
+            _edit("p00001", "текст", "текстИспр", "r", "typo"),
+            _edit("p00001", "один два", "один", "r", "grammar"),
         ]),
         ["p00001"], current,
     )
-    assert edits == ()
-    assert any("duplicate edit pid" in e for e in errors)
+    assert errors == ()
+    assert len(edits) == 2
+    assert [e.pid for e in edits] == ["p00001", "p00001"]
+    assert warnings == ()
+
+
+def test_parse_drops_over_cap_duplicate_with_warning() -> None:
+    """R-RETRY (t_8ab8ab35): the 11th+ edit of the same pid is dropped
+    per-edit with a WARNING (journal), never a structural error — the chunk
+    stays GOOD (fail-closed preserved only for pid outside chunk / unknown
+    class / original not substring / invalid JSON)."""
+    current = {"p00001": "текст " + " ".join(f"слово{i}" for i in range(1, 13))}
+    edits = [
+        _edit("p00001", f"слово{i}", f"слово{i}Испр", "r", "typo")
+        for i in range(1, 12)  # 11 edits for ONE pid, cap = 10
+    ]
+    parsed, errors, warnings = parse_editor_edits(
+        _ok(edits), ["p00001"], current,
+    )
+    assert errors == ()
+    assert len(parsed) == 10  # cap: 10 accepted
+    assert len(warnings) == 1  # 11th dropped with WARNING, not an error
+    assert "dropped" in warnings[0] and "MAX_EDITS_PER_PID" in warnings[0]
+    # max_edits_per_pid is configurable (identity-bearing knob).
+    parsed2, errors2, warnings2 = parse_editor_edits(
+        _ok(edits), ["p00001"], current, max_edits_per_pid=12,
+    )
+    assert errors2 == ()
+    assert len(parsed2) == 11
+    assert warnings2 == ()
+
 
 
 def test_parse_rejects_non_json_and_missing_edits() -> None:
-    edits, errors = parse_editor_edits("not json", ["p00001"], {"p00001": "x"})
+    edits, errors, _ = parse_editor_edits("not json", ["p00001"], {"p00001": "x"})
     assert edits == ()
     assert any("not valid JSON" in e for e in errors)
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         json.dumps({"issues": []}), ["p00001"], {"p00001": "x"}
     )
     assert edits == ()
@@ -337,7 +370,7 @@ def test_parse_accepts_fenced_json() -> None:
         ]
     }
     fenced = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         fenced, ["p00070"], {"p00070": "«Не важно»."}
     )
     assert not errors, f"unexpected errors: {errors}"
@@ -360,7 +393,7 @@ def test_parse_accepts_prose_wrapped_json() -> None:
         ]
     }
     prose = "Here is the JSON: " + json.dumps(payload, ensure_ascii=False)
-    edits, errors = parse_editor_edits(
+    edits, errors, _ = parse_editor_edits(
         prose, ["p00001"], {"p00001": "Перевод номер1 номер1"}
     )
     assert not errors, f"unexpected errors: {errors}"
@@ -384,7 +417,7 @@ def test_route_safe_applied_review_candidates() -> None:
         EditorEdit("p00008", "о", "п", "r", "unnatural"),
         EditorEdit("p00009", "р", "с", "r", "register"),
     )
-    applied, candidates, dropped = route_edits(
+    applied, candidates, dropped, _ = route_edits(
         edits, current_by_pid={e.pid: e.original for e in edits}
     )
     assert [p for p, _ in applied] == ["p00001", "p00002", "p00003", "p00004"]
@@ -403,7 +436,7 @@ def test_route_diff_gate_cuts_noop_p00095_false() -> None:
         EditorEdit("p00095", "Тот же текст", "Тот же текст", "ложное", "typo"),
         EditorEdit("p00001", "а", "б", "r", "grammar"),
     )
-    applied, candidates, dropped = route_edits(
+    applied, candidates, dropped, _ = route_edits(
         edits,
         current_by_pid={
             "p00095": "Тот же текст",
@@ -419,7 +452,7 @@ def test_route_review_noop_also_dropped() -> None:
     edits = (
         EditorEdit("p00005", "одинаково", "одинаково", "noop", "calque"),
     )
-    applied, candidates, dropped = route_edits(
+    applied, candidates, dropped, _ = route_edits(
         edits, current_by_pid={"p00005": "одинаково"}
     )
     assert applied == ()
@@ -442,7 +475,7 @@ def test_route_fragment_safe_edit_preserves_rest_of_pid() -> None:
                    "выступающей на один этаж выше из одного из углов",
                    "уточнение/предлог", "grammar"),
     )
-    applied, candidates, dropped = route_edits(
+    applied, candidates, dropped, _ = route_edits(
         edits, current_by_pid={"p00010": pid_text}
     )
     assert dropped == 0
@@ -463,12 +496,59 @@ def test_route_fragment_rewritten_full_text_also_works() -> None:
                    "Он сказал, что придёт позже.",
                    "пунктуация", "typo"),
     )
-    applied, candidates, dropped = route_edits(
+    applied, candidates, dropped, _ = route_edits(
         edits, current_by_pid={"p00042": pid_text}
     )
     assert applied == (("p00042", "Он сказал, что придёт позже. Она кивнула."),)
     assert candidates == ()
     assert dropped == 0
+
+
+def test_route_sequential_safe_apply_same_pid() -> None:
+    """R-RETRY (t_8ab8ab35, owner contract 2026-08-13): SAFE edits of the
+    SAME pid apply SEQUENTIALLY — the working text updates between edits,
+    so a later edit replaces against the ACTUAL current text (run_remote_002
+    chunk4 p00180: typo «рубашка» + grammar «острыми» both applied)."""
+    pid_text = "рубашка была белой с острыми рукавами"
+    edits = (
+        EditorEdit("p00180", "рубашка", "рубашкаИспр", "опечатка", "typo"),
+        EditorEdit("p00180", "острыми", "острымиИспр", "грамматика", "grammar"),
+    )
+    applied, candidates, dropped, warnings = route_edits(
+        edits, current_by_pid={"p00180": pid_text}
+    )
+    assert dropped == 0
+    assert candidates == ()
+    assert warnings == ()
+    # One (pid, new_text) per applied SAFE edit: the SECOND edit replaced
+    # against the text AFTER the first edit — both fragments survived
+    # (non-overlapping), so both are applied and the final text (last
+    # entry, what dict(applied) keeps) carries both fixes.
+    assert applied == (
+        ("p00180", "рубашкаИспр была белой с острыми рукавами"),
+        ("p00180", "рубашкаИспр была белой с острымиИспр рукавами"),
+    )
+    assert dict(applied)["p00180"] == "рубашкаИспр была белой с острымиИспр рукавами"
+
+
+def test_route_same_pid_fragment_gone_warns_and_skips() -> None:
+    """R-RETRY (t_8ab8ab35, owner contract 2026-08-13): if a later edit's
+    fragment stopped being a substring after the earlier edits (overlapping
+    fragments), it is dropped per-edit with a WARNING — never a structural
+    error, the chunk stays GOOD."""
+    pid_text = "она сказала что придёт"
+    edits = (
+        EditorEdit("p00001", "она сказала что", "она сказала, что", "r", "grammar"),
+        # second edit's original OVERLAPS the first replace region
+        EditorEdit("p00001", "сказала что", "сказала, что", "r", "typo"),
+    )
+    applied, candidates, dropped, warnings = route_edits(
+        edits, current_by_pid={"p00001": pid_text}
+    )
+    assert applied == (("p00001", "она сказала, что придёт"),)
+    assert dropped == 0
+    assert len(warnings) == 1
+    assert "no longer a substring" in warnings[0]
 
 
 def test_class_sets_cover_contract() -> None:
@@ -594,7 +674,9 @@ def test_evaluator_chunk_failure_marks_incomplete() -> None:
         '"class": "typo"}]}',
         'not-json',  # second chunk invalid -> stage incomplete
     )
-    evaluator = RussianEditorEvaluator(backend)
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(retry_max_retries=0)
+    )
     outcome = evaluator(chapter_id="0001", translation=translation)
     assert outcome.complete is False
     assert outcome.failed_chunks == (2,)
@@ -660,7 +742,7 @@ def test_evaluator_partial_apply_isolates_failed_chunks_5of8() -> None:
         ]),
     )
     evaluator = RussianEditorEvaluator(
-        backend, config=RussianEditorConfig(chunk_size=5)
+        backend, config=RussianEditorConfig(chunk_size=5, retry_max_retries=0)
     )
     outcome = evaluator(chapter_id="0001", translation=translation)
     assert outcome.complete is False
@@ -750,6 +832,119 @@ def test_evaluator_transport_failure_is_failed_chunk() -> None:
     assert outcome.applied == ()
 
 
+def test_evaluator_transport_retry_recovers() -> None:
+    """R-RETRY (t_8ab8ab35, acceptance: run_remote_001 chunk3 empty body):
+    a transport failure is retried (bounded) and a later attempt succeeds —
+    the chunk is GOOD, not FAILED."""
+    translation = _translation(10)
+    backend = _FlakyTransportBackend(
+        # attempt 1 -> transport error, attempt 2 -> valid empty edits
+        [{"raise": "ConnectionError", "text": None},
+         {"text": '{"edits": []}'}],
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(retry_base_delay_seconds=0.0),
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is True
+    assert outcome.failed_chunks == ()
+    assert backend.call_count() == 2
+    retries = [e for e in events if e[0] == "retry"]
+    assert len(retries) == 1
+    assert retries[0][1]["attempt"] == 1
+    assert "ConnectionError" in retries[0][1]["error"]
+    done = [e for e in events if e[0] == "done"]
+    assert done and done[0][1]["status"] == "GOOD"
+
+
+def test_evaluator_invalid_json_retry_recovers() -> None:
+    """R-RETRY (t_8ab8ab35, acceptance: run_remote_002 chunk3 empty body /
+    run_remote_001 chunk1 truncated): invalid JSON/empty body is retried
+    (bounded) and a later attempt succeeds."""
+    translation = _translation(10)
+    backend = _FlakyTransportBackend(
+        [{"text": ""},  # empty body (max_tokens exhausted inside <think>)
+         {"text": '{"edits": []}'}],
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(retry_base_delay_seconds=0.0),
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is True
+    assert backend.call_count() == 2
+    retries = [e for e in events if e[0] == "retry"]
+    assert len(retries) == 1
+    assert "not valid JSON" in retries[0][1]["error"]
+
+
+def test_evaluator_transport_retry_exhausted_still_fails() -> None:
+    """R-RETRY (t_8ab8ab35): after the bounded retries are exhausted the
+    chunk stays FAILED — fail-closed is preserved."""
+    translation = _translation(10)
+    backend = _FlakyTransportBackend(
+        [{"raise": "ConnectionError", "text": None}] * 3,
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(retry_base_delay_seconds=0.0),
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is False
+    assert outcome.failed_chunks == (1,)
+    assert backend.call_count() == 3  # 1 + 2 retries
+    retries = [e for e in events if e[0] == "retry"]
+    assert len(retries) == 2
+    done = [e for e in events if e[0] == "done"]
+    assert done and done[0][1]["status"] == "FAILED"
+
+
+def test_evaluator_structural_error_not_retried() -> None:
+    """R-RETRY (t_8ab8ab35): a STRUCTURAL error (pid outside the chunk) is
+    NOT retried — it is not randomness, fail-closed as-is (single call)."""
+    translation = _translation(10)
+    backend = _MockBackend(
+        _ok([_edit("p99999", "нет такого", "фикс", "r", "typo")]),
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend,
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is False
+    assert outcome.failed_chunks == (1,)
+    assert backend.call_count() == 1  # NO retry for structural errors
+    assert not [e for e in events if e[0] == "retry"]
+
+
+class _FlakyTransportBackend(_MockBackend):
+    """Scripted backend: each entry is ``{"text": ...}`` or
+    ``{"raise": "ConnectionError"}`` — the evaluator's bounded retry should
+    recover when a later attempt succeeds."""
+
+    def __init__(self, script: Sequence[Mapping[str, Any]]) -> None:
+        super().__init__()
+        self._script = list(script)
+
+    def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self.requests.append(request)
+        entry = self._script.pop(0) if self._script else {"text": '{"edits": []}'}
+        if entry.get("raise"):
+            raise ConnectionError(f"simulated {entry['raise']}")
+        from pact_v4.runtime.backend_protocol import CompletionResponse as _CR
+
+        return _CR(
+            text=entry.get("text") or "",
+            model="qwen-3.6-35b",
+            finish_reason="stop",
+        )
+
+
 def test_evaluator_empty_translation_rejected() -> None:
     backend = _MockBackend()
     evaluator = RussianEditorEvaluator(backend)
@@ -764,6 +959,12 @@ def test_outcome_payload_roundtrip() -> None:
     assert outcome_payload["prompt_version"] == RUSSIAN_EDITOR_PROMPT_VERSION
     assert outcome_payload["harness_version"] == RUSSIAN_EDITOR_HARNESS_VERSION
     assert outcome_payload["label"] == "phase3/russian_editor_v4"
+    # R-RETRY (t_8ab8ab35): the per-pid cap and the bounded retry policy
+    # ride the config payload (identity-bearing, F5).
+    assert outcome_payload["max_edits_per_pid"] == 10
+    assert outcome_payload["r_editor_retry"] == {
+        "max_retries": 2, "base_delay_seconds": 1.0,
+    }
 
 
 def test_module_constants() -> None:
@@ -852,7 +1053,9 @@ def test_evaluator_writes_raw_and_reasoning_artifacts(tmp_path) -> None:
         '"class": "typo"}]}',
         'not-json',  # second chunk parse-fails but MUST still leave artifacts
     )
-    evaluator = RussianEditorEvaluator(backend)
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(retry_max_retries=0)
+    )
     outcome = evaluator(
         chapter_id="0001", translation=translation,
         out_dir=tmp_path, out_base="r_editor",

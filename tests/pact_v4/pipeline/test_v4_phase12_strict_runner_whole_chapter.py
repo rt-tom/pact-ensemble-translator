@@ -35,6 +35,7 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     _LifecycleAwareQwenAudit,
     _make_backend,
     _make_cfg,
+    _build_artifacts,
     _run,
 )
 
@@ -1723,3 +1724,128 @@ def test_whole_chapter_resume_does_not_depend_on_chunk_plan(tmp_path):
     pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
     assert pid_map_path.exists()
     assert json.loads(pid_map_path.read_text(encoding="utf-8"))["pid_count"] == 24
+
+
+# ---------------------------------------------------------------------------
+# V4.1 GEN-REASONING: whole-chapter generation reasoning artifacts
+# ---------------------------------------------------------------------------
+
+
+class _ReasoningStubCaller(StubModelCaller):
+    """StubModelCaller that also reports per-call reasoning text."""
+
+    def __init__(self, reasoning: str = "gen-reasoning-diagnostics") -> None:
+        super().__init__()
+        self.last_reasoning = reasoning
+
+
+class _TruncatedThenGoodReasoningCaller:
+    """First attempt returns truncated JSON (with reasoning), then success."""
+
+    def __init__(self, good: str) -> None:
+        self.good = good
+        self.calls = []
+        self.last_reasoning = ""
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        if len(self.calls) == 1:
+            self.last_reasoning = "attempt 0: thought about register, then cut off"
+            return "{truncated"
+        self.last_reasoning = "attempt 1: decided on formal register"
+        return self.good
+
+
+def _whole_chapter_reasoning_cfg(tmp_path) -> StrictRunConfig:
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    return type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+
+
+def test_whole_chapter_reasoning_written_when_present(tmp_path):
+    # GEN-REASONING acceptance: a whole-chapter run whose generation reported
+    # reasoning>0 (usage) must leave whole_chapter_reasoning.txt on disk with
+    # the full text, and the generation record carries a compact marker.
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    caller = _ReasoningStubCaller(reasoning="pov and register analysis for ch 046")
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+
+    reasoning_path = cfg.out_dir / "whole_chapter_reasoning.txt"
+    assert reasoning_path.exists()
+    text = reasoning_path.read_text(encoding="utf-8")
+    assert text == "pov and register analysis for ch 046"
+    assert text.strip()  # non-empty when reasoning>0
+
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    rec = outcomes["outcomes"][0]
+    assert rec["reasoning"]["schema"] == "pact-v4-whole-chapter-reasoning/v1"
+    assert rec["reasoning"]["attempts"]["0"]["present"] is True
+    assert rec["reasoning"]["attempts"]["0"]["chars"] == len(text)
+
+    # The record advertises the reasoning artifact (F8: only when created).
+    assert result.record["artefacts"]["whole_chapter_reasoning"] == str(reasoning_path)
+
+    # Identity is untouched: reasoning is a text artifact only.
+    assert result.record["identities"]["whole_chapter_pid_map_hash"]
+    pid_map = json.loads(
+        (cfg.out_dir / "whole_chapter_pid_map.json").read_text(encoding="utf-8")
+    )
+    assert pid_map["pid_count"] == 24
+
+
+def test_whole_chapter_reasoning_truncated_retry_also_on_disk(tmp_path):
+    # GEN-REASONING acceptance: when attempt 0 is truncated, the failed
+    # attempt's reasoning is ALSO persisted (whole_chapter_retry1_reasoning.txt
+    # names the retry attempt) so the diagnosis of WHY the retry happened is
+    # recoverable; attempt 0's reasoning lives in whole_chapter_reasoning.txt.
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    good = json.dumps(
+        {pid: f"Перевод {pid}" for pid in snapshot.pids},
+        ensure_ascii=False,
+    )
+    caller = _TruncatedThenGoodReasoningCaller(good)
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+
+    main_path = cfg.out_dir / "whole_chapter_reasoning.txt"
+    retry_path = cfg.out_dir / "whole_chapter_retry1_reasoning.txt"
+    assert main_path.read_text(encoding="utf-8") == (
+        "attempt 0: thought about register, then cut off"
+    )
+    assert retry_path.read_text(encoding="utf-8") == "attempt 1: decided on formal register"
+
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    marker = outcomes["outcomes"][0]["reasoning"]
+    assert marker["attempts"]["0"]["present"] is True
+    assert marker["attempts"]["1"]["present"] is True
+    assert marker["attempts"]["1"]["chars"] == len("attempt 1: decided on formal register")
+
+    # Identity is untouched by the retry/reasoning path (wc_validated honest).
+    assert result.record["identities"]["whole_chapter_pid_map_hash"]
+
+
+def test_whole_chapter_no_reasoning_writes_no_artifact(tmp_path):
+    # GEN-REASONING NON-GOAL check: when no attempt produced reasoning
+    # (reasoning=0 / transport reported none) the run writes NO reasoning file
+    # and the generation record stays byte-identical to the pre-GEN-REASONING
+    # shape (no marker key) — reasoning must not change cache/identity.
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    result = _run_whole_chapter(cfg)  # plain StubModelCaller: no last_reasoning
+    assert result.selected_count == 1
+
+    assert not (cfg.out_dir / "whole_chapter_reasoning.txt").exists()
+    assert not (cfg.out_dir / "whole_chapter_retry1_reasoning.txt").exists()
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    assert "reasoning" not in outcomes["outcomes"][0]
+    assert "whole_chapter_reasoning" not in result.record["artefacts"]

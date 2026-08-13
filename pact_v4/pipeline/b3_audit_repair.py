@@ -72,6 +72,8 @@ from pact_v4.audit.chunked_audit import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_TOKENS,
     DEFAULT_REASONING_BUDGET,
+    DEFAULT_TRANSPORT_MAX_RETRIES,
+    DEFAULT_TRANSPORT_BASE_DELAY_SECONDS,
     HARNESS_VERSION,
     PROMPT_VERSION,
     AuditPair,
@@ -98,6 +100,9 @@ from pact_v4.audit.russian_editor import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_PAIRS,
+    MAX_EDITS_PER_PID,
+    DEFAULT_RETRY_MAX_RETRIES,
+    DEFAULT_RETRY_BASE_DELAY_SECONDS,
     ReviewCandidate,
     RussianEditorConfig,
     RussianEditorEvaluator,
@@ -279,6 +284,13 @@ class B3AuditRepairConfig:
     max_tokens: int = DEFAULT_MAX_TOKENS
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS
     reasoning_budget: int = DEFAULT_REASONING_BUDGET
+    # R-RETRY (t_8ab8ab35, operator extension 2026-08-13): the chunk-level
+    # TRANSPORT_ERROR bounded retry policy (NEW session per attempt). It is
+    # part of the run config identity (StrictRunConfig.to_config_artifact)
+    # and is wired into ChunkedAuditConfig below — a cache written under a
+    # different transport-retry policy must never replay a failed chunk.
+    audit_transport_max_retries: int = DEFAULT_TRANSPORT_MAX_RETRIES
+    audit_transport_base_delay_seconds: float = DEFAULT_TRANSPORT_BASE_DELAY_SECONDS
     repair_findings_cap: int = REPAIR_FINDINGS_CAP
     repair_microbatch_trigger: int = MICROBATCH_TRIGGER
     repair_microbatch_target: int = MICROBATCH_TARGET
@@ -347,6 +359,14 @@ class B3AuditRepairConfig:
     # Class threshold: classes in this frozenset are SAFE (auto-applied with
     # the diff-gate); every other known class routes to REVIEW candidates.
     russian_editor_safe_classes: frozenset = frozenset(SAFE_CLASSES)
+    # R-RETRY (t_8ab8ab35, F5): the per-pid edit cap (duplicate pid is NOT
+    # an error — up to this many edits per pid; 11th+ drops per-edit with a
+    # WARNING) and the bounded retry policy (transport + empty/truncated
+    # JSON) are identity-bearing — a cache written under a different
+    # cap/retry policy must never replay the edited map.
+    russian_editor_max_edits_per_pid: int = MAX_EDITS_PER_PID
+    russian_editor_retry_max_retries: int = DEFAULT_RETRY_MAX_RETRIES
+    russian_editor_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -355,6 +375,10 @@ class B3AuditRepairConfig:
             "max_tokens": self.max_tokens,
             "overlap_tokens": self.overlap_tokens,
             "reasoning_budget": self.reasoning_budget,
+            "audit_transport_retry": {
+                "max_retries": self.audit_transport_max_retries,
+                "base_delay_seconds": self.audit_transport_base_delay_seconds,
+            },
             "repair_findings_cap": self.repair_findings_cap,
             "repair_microbatch_trigger": self.repair_microbatch_trigger,
             "repair_microbatch_target": self.repair_microbatch_target,
@@ -391,6 +415,11 @@ class B3AuditRepairConfig:
                 "overlap_pairs": self.russian_editor_overlap_pairs,
                 "max_tokens": self.russian_editor_max_tokens,
                 "safe_classes": sorted(self.russian_editor_safe_classes),
+                "max_edits_per_pid": self.russian_editor_max_edits_per_pid,
+                "r_editor_retry": {
+                    "max_retries": self.russian_editor_retry_max_retries,
+                    "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
+                },
             },
         }
 
@@ -870,6 +899,19 @@ class B3AuditRepair:
                     chunk=fields.get("chunk"),
                     total=fields.get("total"),
                 )
+            elif kind == "retry":
+                # R-RETRY (t_8ab8ab35): a bounded retry attempt (transport
+                # or invalid JSON/empty body) is journaled so retry
+                # causality is visible (acceptance: retry attempts in the
+                # journal).
+                journal.emit(
+                    "r_editor_chunk_retry",
+                    chunk=fields.get("chunk"),
+                    attempt=fields.get("attempt"),
+                    total=fields.get("total"),
+                    error=fields.get("error"),
+                    delay=fields.get("delay"),
+                )
             else:
                 journal.emit(
                     "r_editor_chunk_done",
@@ -877,6 +919,7 @@ class B3AuditRepair:
                     total=fields.get("total"),
                     status=fields.get("status"),
                     edit_count=fields.get("edit_count", 0),
+                    warning_count=fields.get("warning_count", 0),
                     error=fields.get("error"),
                 )
 
@@ -889,6 +932,9 @@ class B3AuditRepair:
                 safe_classes=cfg.russian_editor_safe_classes,
                 harness_version=cfg.russian_editor_harness_version,
                 prompt_version=cfg.russian_editor_version,
+                max_edits_per_pid=cfg.russian_editor_max_edits_per_pid,
+                retry_max_retries=cfg.russian_editor_retry_max_retries,
+                retry_base_delay_seconds=cfg.russian_editor_retry_base_delay_seconds,
             ),
             on_chunk_event=_journal_r_editor_chunk_event,
         )
@@ -942,6 +988,7 @@ class B3AuditRepair:
                 applied_count=len(outcome.applied),
                 candidate_count=len(outcome.candidates),
                 dropped=outcome.dropped,
+                warning_count=outcome.warning_count,
             )
             self._emit_progress(
                 "r_editor_done",
@@ -961,6 +1008,7 @@ class B3AuditRepair:
             applied_count=len(outcome.applied),
             candidate_count=len(outcome.candidates),
             dropped=outcome.dropped,
+            warning_count=outcome.warning_count,
         )
         self._emit_progress(
             "r_editor_done",
@@ -1212,6 +1260,18 @@ class B3AuditRepair:
                         total=fields.get("total"),
                         sub=fields.get("sub") or "",
                     )
+                elif kind == "retry":
+                    # R-RETRY (t_8ab8ab35): a TRANSPORT_ERROR chunk is retried
+                    # with a NEW session — the retry attempt is journaled so
+                    # the operator sees the transport blip and its backoff.
+                    journal.emit(
+                        "audit_chunk_retry",
+                        chunk=fields.get("chunk"),
+                        total=fields.get("total"),
+                        attempt=fields.get("attempt"),
+                        error=fields.get("error"),
+                        delay=fields.get("delay"),
+                    )
                 else:
                     journal.emit(
                         "audit_chunk_done",
@@ -1231,6 +1291,11 @@ class B3AuditRepair:
                     reasoning_budget=cfg.reasoning_budget,
                     harness_version=cfg.harness_version,
                     prompt_version=cfg.prompt_version,
+                    # R-RETRY (t_8ab8ab35, F5): the chunk-level TRANSPORT_ERROR
+                    # retry policy is wired from the B3 config (identity
+                    # carries it) — never silently left at module defaults.
+                    transport_max_retries=cfg.audit_transport_max_retries,
+                    transport_base_delay_seconds=cfg.audit_transport_base_delay_seconds,
                 ),
                 on_chunk_event=_journal_chunk_event,
             )
