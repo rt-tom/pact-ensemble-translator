@@ -220,6 +220,113 @@ def test_parse_json_response_regression_run_remote_001_chunk1_raw(tmp_path):
     assert len(parsed["edits"]) == 2
 
 
+# ---------------------------------------------------------------------------
+# JSON-REPAIR: deterministic pid-colon fix (t_34ceca50, run_remote_004)
+# ---------------------------------------------------------------------------
+
+
+def _whole_chapter_400_pids(*, broken: Sequence[str], sep: str = ": ") -> str:
+    """Build a whole-chapter-shaped 400-PID JSON object.
+
+    ``broken`` lists the PIDs whose key separator is written as a COMMA
+    (the DeepSeek long-output error ``"p00082", "``) instead of a colon.
+    """
+    parts = []
+    for i in range(400):
+        pid = f"p{i:05d}"
+        parts.append(f'"{pid}"{", " if pid in broken else sep}"текст {i}"')
+    return "{" + ", ".join(parts) + "}"
+
+
+def test_parse_json_response_repairs_pid_colon_replay_400(caplog):
+    # run_remote_004 replay: a 400-PID whole-chapter body with one
+    # `"p00082", "` (comma instead of colon) is repaired deterministically
+    # and parses; the WARNING records the substitution count.
+    raw = _whole_chapter_400_pids(broken=("p00082",))
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.json_resilience"):
+        parsed = parse_json_response(raw)
+    assert isinstance(parsed, dict)
+    assert len(parsed) == 400
+    assert parsed["p00082"] == "текст 82"
+    assert parsed["p00000"] == "текст 0"
+    assert parsed["p00399"] == "текст 399"
+    assert any(
+        record.levelname == "WARNING"
+        and "json repair: 1 substitution(s) pid-colon" in record.message
+        for record in caplog.records
+    )
+
+
+def test_parse_json_response_repairs_all_pid_colon_occurrences(caplog):
+    # Two errors in one text -> BOTH substituted (the model can err in two
+    # places; a partial repair would leave the body unparseable).
+    raw = _whole_chapter_400_pids(broken=("p00082", "p00153"))
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.json_resilience"):
+        parsed = parse_json_response(raw)
+    assert isinstance(parsed, dict)
+    assert len(parsed) == 400
+    assert parsed["p00082"] == "текст 82"
+    assert parsed["p00153"] == "текст 153"
+    assert any(
+        record.levelname == "WARNING"
+        and "json repair: 2 substitution(s) pid-colon" in record.message
+        for record in caplog.records
+    )
+
+
+def test_parse_json_response_pid_colon_repair_stays_fail_closed():
+    # The repair must not mask real damage: a body that still does not
+    # parse AFTER the substitution goes through the unchanged fail-closed
+    # path (TruncatedJSONError), exactly as before the fix.
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response('{"p00082", "текст"')  # unbalanced after repair
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response('{"p00082", "текст", "p00083": "т"')  # still truncated
+    # No pid pattern at all -> unchanged rejection.
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response('{"edits": [')
+
+
+def test_parse_json_response_pid_colon_repair_leaves_valid_bodies_untouched():
+    # Ordinary fenced / prose-wrapped answers (R/repair/re-audit) must parse
+    # unchanged: PIDs inside {"edits": [...]} / {"issues": [...]} arrays are
+    # values, not top-level keys, and the comma-after-value form is valid
+    # JSON that the first json.loads already accepts (no substitution path).
+    valid = (
+        "```json\n"
+        '{"edits": [{"pid": "p00082", "original": "A", "rewritten": "Б", '
+        '"class": "preposition"}, {"pid": "p00153", "original": "B", '
+        '"rewritten": "В", "class": "grammar"}]}\n'
+        "```"
+    )
+    parsed = parse_json_response(valid)
+    assert [e["pid"] for e in parsed["edits"]] == ["p00082", "p00153"]
+    # Valid whole-chapter JSON with the colon separators is untouched too.
+    good = _whole_chapter_400_pids(broken=())
+    assert parse_json_response(good)["p00082"] == "текст 82"
+
+
+def test_retry_json_call_pid_colon_replay_does_not_retry():
+    # _diag_wc_omit regression (400 keys): the comma-for-colon body used to
+    # be classified as TruncatedJSONError (a retry trigger — 92k tokens
+    # wasted per whole-chapter attempt). The deterministic repair makes
+    # classify_response_text accept it, so retry_json_call returns after
+    # EXACTLY ONE model call — no retry, no wasted generation. The returned
+    # raw text itself still contains the comma (repair lives in the parse
+    # layer: parse_json_response and the whole-chapter _parse_ordered_pid_pairs),
+    # so we assert the no-retry contract here, not json.loads(out).
+    calls: list[str] = []
+    raw = _whole_chapter_400_pids(broken=("p00082",))
+
+    def _call() -> str:
+        calls.append(raw)
+        return raw
+
+    out = retry_json_call(_call, _retry(max_retries=2), label="wc-replay")
+    assert len(calls) == 1
+    assert out == raw  # raw passes through unchanged; repair is parse-side
+
+
 def test_json_retry_policy_defaults_and_validation():
     policy = JsonRetryPolicy()
     assert policy.max_retries == 2

@@ -261,6 +261,35 @@ def test_whole_chapter_invalid_or_truncated_json_retries_then_honest_error(tmp_p
     assert len(caller.calls) == 3
 
 
+def test_whole_chapter_pid_colon_comma_repaired_without_retry(tmp_path):
+    # JSON-REPAIR (t_34ceca50, run_remote_004): the whole-chapter generator
+    # occasionally emits `"p00082", "` (COMMA) instead of `"p00082": "`
+    # (COLON) after a PID key on a long output. The deterministic repair in
+    # _parse_ordered_pid_pairs fixes ALL occurrences, so a 400-PID body
+    # with one such error validates on the FIRST attempt — no retry, no
+    # wasted 92k-token regeneration.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    parts = []
+    for pid in pid_map.pids:
+        sep = ", " if pid == "p00082" else ": "
+        parts.append(f'"{pid}"{sep}"Перевод {pid}"')
+    broken_raw = "{" + ", ".join(parts) + "}"
+    assert ", " in broken_raw  # the model error is present in the raw body
+    caller = _ScriptedCaller([broken_raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "complete"
+    assert len(caller.calls) == 1  # repaired on the first attempt, no retry
+    candidate = outcome.candidates["balanced_literary"]
+    assert candidate.pid_order() == pid_map.pids
+    assert dict(candidate.translation)["p00082"] == "Перевод p00082"
+
+
 def test_whole_chapter_session_abort_retried_then_honest_error(tmp_path):
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
