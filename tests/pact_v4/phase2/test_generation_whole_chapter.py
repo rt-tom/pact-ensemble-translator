@@ -290,6 +290,47 @@ def test_whole_chapter_pid_colon_comma_repaired_without_retry(tmp_path):
     assert dict(candidate.translation)["p00082"] == "Перевод p00082"
 
 
+def test_whole_chapter_pid_colon_repair_skips_embedded_literals(tmp_path):
+    # F1 regression (t_0626267d): a translation VALUE that legitimately
+    # contains the literal `"p12345", "` (with escaped quotes) must survive
+    # the pid-colon repair byte-for-byte, while a real broken key
+    # (`"p00082", "`) in the SAME object is still fixed. The old global
+    # regex silently rewrote the embedded literal to `"p12345": "`, i.e.
+    # silently corrupted the chapter text even though the parse succeeded.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    parts = []
+    for pid in pid_map.pids:
+        if pid == "p00001":
+            # Value embeds the collision literal with escaped quotes:
+            #   Перевод p00001: цитата "p12345", "закрыто"
+            value = 'Перевод p00001: цитата \\"p12345\\", \\"закрыто\\"'
+        elif pid == "p00082":
+            value = "Перевод p00082"
+        else:
+            value = f"Перевод {pid}"
+        sep = ", " if pid == "p00082" else ": "
+        parts.append(f'"{pid}"{sep}"{value}"')
+    broken_raw = "{" + ", ".join(parts) + "}"
+    caller = _ScriptedCaller([broken_raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "complete"
+    assert len(caller.calls) == 1
+    candidate = outcome.candidates["balanced_literary"]
+    assert candidate.pid_order() == pid_map.pids
+    translation = dict(candidate.translation)
+    # The broken key is repaired...
+    assert translation["p00082"] == "Перевод p00082"
+    # ...and the embedded literal in p00001 is UNCHANGED (the value was
+    # parsed as `Перевод p00001: цитата "p12345", "закрыто"`).
+    assert translation["p00001"] == 'Перевод p00001: цитата "p12345", "закрыто"'
+
+
 def test_whole_chapter_session_abort_retried_then_honest_error(tmp_path):
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)

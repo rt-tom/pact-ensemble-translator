@@ -376,7 +376,10 @@ def _parse_ordered_pid_pairs(raw: str) -> list:
     exception is the whole-chapter pid-colon model error (``"p00082", "``
     comma instead of ``"p00082": "`` colon — never valid JSON inside an
     object, unique to the model error). The same single repair helper as
-    ``parse_json_response`` substitutes ALL occurrences and re-parses; a
+    ``parse_json_response`` substitutes ALL occurrences at syntactically
+    valid PID-key positions of the top-level object and re-parses; the
+    substitution is JSON-string-aware (t_0626267d) — a literal
+    ``"p12345", "`` embedded in a translation value is never touched. A
     body that still does not parse is rejected exactly as before
     (fail-closed, real damage is never masked).
     """

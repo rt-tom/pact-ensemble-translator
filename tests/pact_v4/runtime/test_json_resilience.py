@@ -38,6 +38,7 @@ from pact_v4.runtime.json_resilience import (
     TruncatedJSONError,
     classify_response_text,
     parse_json_response,
+    repair_pid_colon_comma,
     retry_json_call,
 )
 from tests.pact_v4.phase3.test_audit import _env as _audit_env
@@ -304,6 +305,67 @@ def test_parse_json_response_pid_colon_repair_leaves_valid_bodies_untouched():
     # Valid whole-chapter JSON with the colon separators is untouched too.
     good = _whole_chapter_400_pids(broken=())
     assert parse_json_response(good)["p00082"] == "текст 82"
+
+
+def test_repair_pid_colon_comma_is_json_string_aware():
+    # F1 regression (t_0626267d): the repair must not mutate legitimate
+    # JSON string VALUES that contain the same literal `"p12345", "` — the
+    # old global regex rewrote it to `"p12345": "` inside the value,
+    # silently corrupting translation text. The probe from the review:
+    # the value of p00001 is `quote "p12345", "` (with escaped quotes),
+    # and p00002 is a genuinely broken top-level key.
+    raw = '{"p00001": "quote \\"p12345\\", \\"", "p00002", "normal"}'
+    repaired, n_subs = repair_pid_colon_comma(raw)
+    assert n_subs == 1
+    assert repaired == '{"p00001": "quote \\"p12345\\", \\"", "p00002": "normal"}'
+
+
+def test_repair_pid_colon_comma_fixes_all_top_level_broken_keys():
+    # F1 regression (t_0626267d): every REAL broken top-level PID key in
+    # one whole-chapter object is still repaired (criterion 2) — here
+    # THREE broken keys (p00001, p00002, p00003) plus a value containing
+    # the colliding literal, which must stay untouched.
+    raw = (
+        '{"p00001", "quote \\"p12345\\", \\"", '
+        '"p00002", "normal", "p00003", "also broken"}'
+    )
+    repaired, n_subs = repair_pid_colon_comma(raw)
+    assert n_subs == 3
+    assert repaired == (
+        '{"p00001": "quote \\"p12345\\", \\"", '
+        '"p00002": "normal", "p00003": "also broken"}'
+    )
+
+
+def test_parse_json_response_pid_colon_repair_skips_embedded_literals(caplog):
+    # F1 end-to-end (t_0626267d): parse_json_response must return the
+    # translation value `quote "p12345", "` UNCHANGED while repairing the
+    # broken p00002 key — the probe from the review t_cdf26dd2.
+    raw = '{"p00001": "quote \\"p12345\\", \\"", "p00002", "normal"}'
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.json_resilience"):
+        parsed = parse_json_response(raw)
+    assert parsed["p00001"] == 'quote "p12345", "'
+    assert parsed["p00002"] == "normal"
+    assert any(
+        record.levelname == "WARNING"
+        and "json repair: 1 substitution(s) pid-colon" in record.message
+        for record in caplog.records
+    )
+
+
+def test_parse_json_response_pid_colon_repair_ignores_non_key_positions():
+    # F1 regression (t_0626267d): the pattern at a VALUE position (a PID
+    # that is a value, followed by the comma separator of the NEXT key) is
+    # legitimate JSON — it must never be rewritten. `"p00082", "p00002"` is
+    # `value p00082, key p00002`, i.e. a valid comma after a value inside an
+    # object; the whole body already parses (no substitution path), and a
+    # direct helper call must also leave it alone (the scanner only fixes
+    # key positions right after `{` or `,`).
+    valid = '{"a": "p00082", "p00002": "normal"}'
+    assert parse_json_response(valid) == {"a": "p00082", "p00002": "normal"}
+    repaired, n_subs = repair_pid_colon_comma(valid)
+    assert n_subs == 0
+    assert repaired == valid
 
 
 def test_retry_json_call_pid_colon_replay_does_not_retry():
