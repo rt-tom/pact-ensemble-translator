@@ -16,7 +16,7 @@ Covers the B4 acceptance criteria (``docs/plans/V4_B4_JSON_RESILIENCE_TASK_RU.md
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, get_type_hints
 
 import pytest
 
@@ -322,6 +322,17 @@ def test_parse_json_response_pid_receiver_leaves_valid_bodies_untouched():
     # Valid whole-chapter JSON with the colon separators is untouched too.
     good = _whole_chapter_400_pids(broken=())
     assert parse_json_response(good)["p00082"] == "текст 82"
+
+
+def test_extract_pid_pairs_type_hints_resolve():
+    # RV2 finding (t_a6f84d75): `expected_pids: Optional[Sequence[str]]`
+    # referenced Sequence without importing it. With `from __future__ import
+    # annotations` ordinary calls pass, but get_type_hints() evaluates the
+    # postponed annotation and raised NameError. The import must exist so
+    # introspection (and static analyzers) can resolve the signature.
+    hints = get_type_hints(extract_pid_pairs)
+    assert hints["expected_pids"] == Optional[Sequence[str]]
+    assert hints["min_coverage"] is float
 
 
 def test_extract_pid_pairs_replay_007_p00087_ascii_quote():

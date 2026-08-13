@@ -64,7 +64,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 LOG = logging.getLogger(__name__)
 
