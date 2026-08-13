@@ -853,7 +853,11 @@ def merge_candidates_by_pid(
 
     * Same-stage multiple findings of one PID (e.g. two audit findings on
       one paragraph) are NOT merged — they keep their separate indices
-      (the existing shared-PID per-index contract).
+      (the existing shared-PID per-index contract). This holds even when the
+      group ALSO carries an opposite-stage remark (mixed multiplicity,
+      t_78a3d02c): auditor A1 + auditor A2 + editor E -> ``[merged(A1+E),
+      A2]`` — only the cross-stage pair merges, every same-stage remark
+      stays its own per-index finding (all indices remain unique).
     * The merged finding keeps the FIRST finding's index (source order), its
       own ``source_stage`` becomes ``"fidelity_auditor+russian_editor"`` and
       ``sources`` carries every remark (stage, tier, category, severity,
@@ -874,7 +878,29 @@ def merge_candidates_by_pid(
             continue
         stages = {g.source_stage for g in group}
         if len(stages) > 1:
-            merged.append(_merge_source_group(group))
+            # Mixed-stage group (t_78a3d02c): merge ONLY the cross-stage
+            # pair(s) into ONE repair finding — the first finding (source
+            # order) absorbs the first remark of every OTHER stage; every
+            # later remark — whether same-stage as the primary or a second
+            # remark of an already-merged other stage — keeps its own index.
+            # Example: auditor A1 + auditor A2 + editor E -> [merged(A1+E),
+            # A2] — never all three collapsed into one index.
+            primary = group[0]
+            primary_stage = primary.source_stage
+            merged_parts: list = [primary]
+            other_stages_absorbed: set = set()
+            rest: list = []
+            for g in group[1:]:
+                if (
+                    g.source_stage == primary_stage
+                    or g.source_stage in other_stages_absorbed
+                ):
+                    rest.append(g)
+                else:
+                    other_stages_absorbed.add(g.source_stage)
+                    merged_parts.append(g)
+            merged.append(_merge_source_group(merged_parts))
+            merged.extend(rest)
         else:
             merged.extend(group)
         by_pid[f.pid] = None  # emitted once
