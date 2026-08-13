@@ -37,6 +37,7 @@ from pact_v4.runtime.json_resilience import (
     JsonRetryPolicy,
     TruncatedJSONError,
     classify_response_text,
+    parse_json_response,
     retry_json_call,
 )
 from tests.pact_v4.phase3.test_audit import _env as _audit_env
@@ -122,6 +123,101 @@ def test_classify_response_text_accepts_any_parseable_json():
     # A parseable-but-wrong-shape body is NOT a retry trigger: downstream
     # validation rejects it (B4: retry only empty/truncated JSON).
     assert classify_response_text('"just a string"') is None
+
+
+# ---------------------------------------------------------------------------
+# parse_json_response (RESILIENCE t_406fc48c: fences/BOM/prose tolerance in
+# R / repair / re-audit / entity extraction)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_json_response_plain_dict():
+    assert parse_json_response('{"edits": []}') == {"edits": []}
+
+
+def test_parse_json_response_strips_markdown_fences():
+    good = '{"edits": []}'
+    assert parse_json_response(f"```json\n{good}\n```") == {"edits": []}
+    assert parse_json_response(f"```\n{good}\n```") == {"edits": []}
+    # Fence with BOM and extra whitespace.
+    assert parse_json_response(f"\ufeff  ```json\n{good}\n```  ") == {"edits": []}
+
+
+def test_parse_json_response_extracts_first_balanced_block_from_prose():
+    # Models wrap the payload in prose ('Here is the JSON: {...}').
+    assert parse_json_response('Here is the JSON: {"edits": []}') == {"edits": []}
+    assert parse_json_response('Sure! {"edits": []} Hope that helps.') == {"edits": []}
+    # Braces inside a JSON string must not unbalance the block.
+    payload = '{"note": "brace { inside string", "edits": []}'
+    assert parse_json_response(f"prefix {payload} suffix") == json.loads(payload)
+
+
+def test_parse_json_response_rejects_truncated_json_retry_zone():
+    # Broken/truncated JSON is NOT repaired here — it is the B4 retry zone.
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response('{"edits": [')
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response('{"edits": [{"pid": "p00001"')
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response("plain prose with no JSON object")
+
+
+def test_parse_json_response_rejects_empty_body():
+    with pytest.raises(EmptyResponseError):
+        parse_json_response("")
+    with pytest.raises(EmptyResponseError):
+        parse_json_response("   \n ")
+
+
+def test_parse_json_response_rejects_wrong_shape():
+    # Valid JSON that is not an object is a downstream validation concern,
+    # NOT a retry trigger (plain ValueError, not TruncatedJSONError).
+    with pytest.raises(ValueError) as excinfo:
+        parse_json_response("[1, 2, 3]")
+    assert not isinstance(excinfo.value, TruncatedJSONError)
+    with pytest.raises(ValueError):
+        parse_json_response('"just a string"')
+
+
+def test_classify_response_text_accepts_fenced_json():
+    # RESILIENCE: a fence-wrapped valid body is NOT truncated — it must not
+    # trigger a retry.
+    fenced = "```json\n{\"issues\": []}\n```"
+    assert classify_response_text(fenced) is None
+
+
+def test_parse_json_response_regression_run_remote_001_chunk1_raw(tmp_path):
+    """Regression on the run_remote_001 chunk1 raw artifact: the Qwen
+    Russian-editor chunk1 response was wrapped in ```json fences and the R
+    phase failed with 'response is not valid JSON: Expecting value: line 1
+    column 1 (char 0)'. The tolerant utility must parse it."""
+    raw = (
+        "```json\n"
+        "{\n"
+        "  \"edits\": [\n"
+        "    {\n"
+        "      \"pid\": \"p00003\",\n"
+        "      \"original\": \"Во въезде, прямо посередине\",\n"
+        "      \"rewritten\": \"На въезде, прямо посередине\",\n"
+        "      \"reason\": \"Неверный предлог: по-русски говорят «на въезде».\",\n"
+        "      \"class\": \"preposition\"\n"
+        "    },\n"
+        "    {\n"
+        "      \"pid\": \"p00005\",\n"
+        "      \"original\": \"На приличное расстояние в любую сторону\",\n"
+        "      \"rewritten\": \"На приличном расстоянии в любую сторону\",\n"
+        "      \"reason\": \"Предложный падеж.\",\n"
+        "      \"class\": \"grammar\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "```"
+    )
+    parsed = parse_json_response(raw)
+    assert isinstance(parsed, dict)
+    assert parsed["edits"][0]["pid"] == "p00003"
+    assert parsed["edits"][0]["class"] == "preposition"
+    assert len(parsed["edits"]) == 2
 
 
 def test_json_retry_policy_defaults_and_validation():

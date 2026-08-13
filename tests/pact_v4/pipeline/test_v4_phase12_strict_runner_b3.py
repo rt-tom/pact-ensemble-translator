@@ -445,6 +445,52 @@ def test_b3_full_flow_noop_repair_converted_to_pass(tmp_path: Path) -> None:
     assert round_event["repair_complete"] is True
 
 
+def test_b3_medium_confidence_finding_reaches_verifier_and_can_pass(
+    tmp_path: Path,
+) -> None:
+    """Owner decision 2026-08-13 (run_remote_001): a medium-confidence TIER_B
+    finding is ELIGIBLE — it goes to the repair-as-verifier, which decides
+    pass/repair. Here the verifier honestly passes it (source check) and the
+    chapter is released; the finding is NOT silently sent to debt (the old
+    behavior: 4 of 6 medium findings in run_remote_001 went to debt
+    unrepaired)."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    backend = _B3MockBackend(
+        audit_issues=[{
+            "id": "p00001", "category": "changed_fact", "severity": "minor",
+            "confidence": "medium", "note": "trolley -> столик?",
+            "excerpt": "Перевод номер1",
+        }],
+        # The verifier examines the medium candidate and decides PASS (the
+        # repair-as-verifier contract: the audit issue is a candidate, not a
+        # fact).
+        repair_results=[{
+            "index": 1, "decision": "pass",
+            "reason": "по источнику корректно — «столик» в контексте",
+        }],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+
+    # The finding was eligible -> it reached the repair round as a candidate
+    # (eligible_count=1) and the verifier passed it (no commit, no debt).
+    assert result.step7["repair_complete"] is True
+    assert result.step7["committed_pids"] == []
+    assert result.step7["passed_pids"] == ["p00001"]
+    assert not any("not eligible for repair" in d for d in result.step7["debt_trace"])
+    assert result.step8 == {
+        "status": "complete", "audit_complete": True, "released_as_audited": True,
+    }
+    journal = [
+        json.loads(line)
+        for line in (cfg.out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    round_event = next(e for e in journal if e["event"] == "repair_round")
+    assert round_event["eligible_count"] == 1
+    assert round_event["committed_pids"] == []
+    assert round_event["passed_pids"] == ["p00001"]
+
+
 # ---------------------------------------------------------------------------
 # Acceptance 2: audit_complete=false -> fail-closed (never released)
 # ---------------------------------------------------------------------------
@@ -1918,10 +1964,13 @@ def test_b3_r_editor_disabled_scheme_41(tmp_path: Path) -> None:
     assert result.step8["released_as_audited"] is True
 
 
-def test_b3_r_editor_incomplete_applies_nothing(tmp_path: Path) -> None:
-    """An incomplete R pass (invalid chunk) applies NO edits and forwards NO
-    candidates (fail-closed at the stage level); the audit still runs on the
-    raw map and protects the chapter."""
+def test_b3_r_editor_partial_applies_successful_chunk_edits(tmp_path: Path) -> None:
+    """A partial R pass (one GOOD chunk + one broken chunk) applies the GOOD
+    chunk's edits and forwards its candidates (per-chunk fail-closed,
+    RESILIENCE t_406fc48c), journals ``r_editor_done`` with
+    ``partial=true``/``applied_count``/``failed_chunks``, writes the edited
+    map artifact, and the audit still protects the chapter (never a
+    silent partial release)."""
     from pact_v4.pipeline.b3_audit_repair import B3AuditRepairConfig
 
     cfg = _whole_chapter_cfg(tmp_path)
@@ -1961,11 +2010,23 @@ def test_b3_r_editor_incomplete_applies_nothing(tmp_path: Path) -> None:
             russian_editor_chunk_size=4,  # 2 chunks for 8 pids
         ),
     )
-    # R incomplete -> nothing applied, audit proceeded on the raw map.
-    assert result.record["russian_editor"]["status"] == "incomplete"
+    # R partial -> the GOOD chunk's edit IS applied (per-chunk fail-closed),
+    # the broken chunk's edits are skipped; audit still protects the chapter.
+    assert result.record["russian_editor"]["status"] == "partial"
     repaired = _read_json(cfg.out_dir / "translations_repaired.json")
-    assert repaired["translations"]["p00001"] == "Перевод номер1 номер1"
-    assert not (cfg.out_dir / "translations_edited.json").exists()
+    assert repaired["translations"]["p00001"] == "Перевод номер1"
+    # The edited map the audit consumed is persisted (partial provenance).
+    edited = _read_json(cfg.out_dir / "translations_edited.json")
+    assert edited["schema"] == "pact-v4-translations-edited/v1"
+    assert edited["translations"]["p00001"] == "Перевод номер1"
+    # Journal records the partial-apply facts.
+    events = _journal_events(cfg.out_dir)
+    done = [e for e in events if e["event"] == "r_editor_done"]
+    assert done and done[-1]["status"] == "partial"
+    assert done[-1]["partial"] is True
+    assert done[-1]["applied_count"] == 1
+    assert done[-1]["failed_chunks"] == [2]
+    assert done[-1]["successful_chunks"] == 1
     assert result.step8["released_as_audited"] is True  # audit still protects
 
 

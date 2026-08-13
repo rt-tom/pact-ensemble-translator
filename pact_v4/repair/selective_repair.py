@@ -18,11 +18,13 @@ review):
   wrong, and repair only after confirming (``REPAIR_AS_VERIFIER_V1``).
 * **Eligibility** — NOT a severity filter (Qwen severity is uncalibrated:
   real TPs are often minor). Tier A findings (``CONFIRMED``) repair directly;
-  Tier B findings are eligible ONLY at ``confidence=high`` AND within the
-  allowed semantic categories (``changed_fact``/numeric claims are Tier A
-  code-verified by B1.1, never guessed here). ``REJECTED`` findings are
-  deterministic FPs — never repaired. Tier B below the eligibility bar goes
-  to debt/diagnostic, never auto-repair.
+  Tier B findings are eligible at ``confidence=high`` OR ``medium`` (owner
+  decision 2026-08-13: the repair-as-verifier itself decides pass/repair —
+  run_remote_001 sent 4 of 6 medium findings to debt unrepaired) AND within
+  the allowed semantic categories (``changed_fact``/numeric claims are
+  Tier A code-verified by B1.1, never guessed here). ``REJECTED`` findings
+  are deterministic FPs — never repaired. Tier B below the eligibility bar
+  goes to debt/diagnostic, never auto-repair.
 * **Batch** — ONE call per group of eligible findings (not per-finding), each
   finding carrying an explicit ``[index]`` identifier; when eligible > 4 the
   group is split into microbatches of 3-4 (Cheng et al., Batch Prompting:
@@ -64,7 +66,6 @@ This module is pure and deterministic except for the injected model calls.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -101,6 +102,7 @@ from pact_v4.runtime.json_resilience import (
     EmptyResponseError,
     JsonRetryPolicy,
     TruncatedJSONError,
+    parse_json_response,
     retry_json_call,
 )
 from pact_v4.runtime.prompts_runtime import (
@@ -444,11 +446,14 @@ def select_eligible(
     * ``CONFIRMED`` (Tier A) — always eligible, tier ``"A"`` (repair directly;
       the code already proved the issue, no re-verification needed).
     * ``TIER_B`` — eligible (tier ``"B"``, verify-before-repair) ONLY when
-      ``confidence=high`` AND the category is in ``allowed_categories``
-      (2026-08-10 review: severity is NOT an eligibility filter — real TPs
-      are often minor; severity stays in the journal only).
+      ``confidence`` is ``high`` or ``medium`` AND the category is in
+      ``allowed_categories`` (owner decision 2026-08-13: medium-confidence
+      findings also go to the repair-as-verifier, which itself decides
+      pass/repair — run_remote_001 sent 4 of 6 medium findings to debt
+      unrepaired; severity is NOT an eligibility filter — real TPs are
+      often minor, severity stays in the journal only).
     * ``REJECTED`` — deterministic false positive: never repaired.
-    * ``TIER_B`` below the bar (low/medium confidence or category outside the
+    * ``TIER_B`` below the bar (low confidence or category outside the
       allowed set) — ineligible: debt/diagnostic, never auto-repair.
 
     ``index`` here is the batch-local explicit ``[index]`` identifier,
@@ -480,7 +485,11 @@ def select_eligible(
         elif f.verdict == REJECTED:
             rejected.append(f)
         else:  # TIER_B
-            if confidence == "high" and category in allowed_categories:
+            # Owner decision 2026-08-13: medium-confidence findings are
+            # eligible too — the repair-as-verifier decides pass/repair
+            # (run_remote_001: 4 of 6 findings with confidence=medium went
+            # to debt unrepaired because eligibility required high).
+            if confidence in ("high", "medium") and category in allowed_categories:
                 eligible.append(
                     EligibleFinding(
                         index=position,
@@ -616,7 +625,7 @@ def parse_repair_batch(
     errors: list = []
     warnings: list = []
     try:
-        parsed = json.loads(text)
+        parsed = parse_json_response(text)
     except Exception as exc:
         return (), (f"response is not valid JSON: {exc}",), ()
     if not isinstance(parsed, dict) or "results" not in parsed:
@@ -1346,7 +1355,7 @@ class SelectiveRepairEvaluator:
                     reason=f"re-audit chunk {chunk_index}: {type(exc).__name__}: {exc}",
                 )
             try:
-                parsed = json.loads(content)
+                parsed = parse_json_response(content)
             except Exception as exc:
                 return ReauditOutcome(
                     complete=False,

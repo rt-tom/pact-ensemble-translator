@@ -320,6 +320,53 @@ def test_parse_rejects_non_json_and_missing_edits() -> None:
     assert any("no 'edits' array" in e for e in errors)
 
 
+def test_parse_accepts_fenced_json() -> None:
+    # RESILIENCE (t_406fc48c, run_remote_001 chunk1): the R model wrapped
+    # its edits response in ```json fences, and the phase failed with
+    # 'response is not valid JSON: Expecting value: line 1 column 1'. The
+    # tolerant parse must accept the fence-wrapped body.
+    payload = {
+        "edits": [
+            {
+                "pid": "p00070",
+                "original": "«Не важно».",
+                "rewritten": "«Неважно».",
+                "reason": "В значении «не имеет значения» наречие пишется слитно.",
+                "class": "typo",
+            },
+        ]
+    }
+    fenced = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+    edits, errors = parse_editor_edits(
+        fenced, ["p00070"], {"p00070": "«Не важно»."}
+    )
+    assert not errors, f"unexpected errors: {errors}"
+    assert len(edits) == 1
+    assert edits[0].pid == "p00070"
+    assert edits[0].klass == "typo"
+
+
+def test_parse_accepts_prose_wrapped_json() -> None:
+    # Prose around the JSON block ('Here is the JSON: {...}').
+    payload = {
+        "edits": [
+            {
+                "pid": "p00001",
+                "original": "Перевод номер1 номер1",
+                "rewritten": "Перевод номер1",
+                "reason": "дубль",
+                "class": "duplicate",
+            },
+        ]
+    }
+    prose = "Here is the JSON: " + json.dumps(payload, ensure_ascii=False)
+    edits, errors = parse_editor_edits(
+        prose, ["p00001"], {"p00001": "Перевод номер1 номер1"}
+    )
+    assert not errors, f"unexpected errors: {errors}"
+    assert len(edits) == 1
+
+
 # ---------------------------------------------------------------------------
 # Routing: SAFE auto-apply with diff-gate, REVIEW never applied
 # ---------------------------------------------------------------------------
@@ -551,11 +598,91 @@ def test_evaluator_chunk_failure_marks_incomplete() -> None:
     outcome = evaluator(chapter_id="0001", translation=translation)
     assert outcome.complete is False
     assert outcome.failed_chunks == (2,)
-    # The good first chunk's edits are collected for DIAGNOSIS, but the
-    # stage is incomplete — the caller (B3) must never apply a partial pass
-    # (fail-closed at the stage level; the audit still protects the chapter).
-    assert outcome.applied != ()  # diagnostic visibility
+    # Fail-closed is PER-CHUNK (RESILIENCE t_406fc48c): the good first
+    # chunk's edits are collected (outcome.applied) and applied by B3; the
+    # failed chunk contributes NO edits. The audit still protects the
+    # chapter.
+    assert outcome.applied != ()
+    assert dict(outcome.applied)["p00001"].startswith("Исправленный текст")
     assert outcome.chunk_count == 2
+
+
+def test_evaluator_partial_apply_isolates_failed_chunks_5of8() -> None:
+    """RESILIENCE acceptance (run_remote_001 shape): with 8 chunks where 3
+    fail (fences / broken JSON / foreign pid) and 5 are GOOD carrying 17
+    edits, the outcome carries ONLY the 5 GOOD chunks' edits — a failed
+    chunk contributes none (per-chunk fail-closed), so the B3 partial-apply
+    can safely apply the successful work."""
+    translation = _translation(40)  # 8 chunks of 5 (chunk_size=5)
+    backend = _MockBackend(
+        # chunk 1 GOOD — 2 SAFE edits
+        _ok([
+            _edit("p00001", "Русский текст абзаца 1.", "Русский текст абзаца 1 исправлен.",
+                  "r", "typo"),
+            _edit("p00002", "Русский текст абзаца 2.", "Русский текст абзаца 2 исправлен.",
+                  "r", "grammar"),
+        ]),
+        # chunk 2 FAILED (fence-wrapped JSON — now parseable, kept GOOD for
+        # the isolation check below; here we make it fail via broken JSON)
+        '{"edits": [',
+        # chunk 3 GOOD — 3 SAFE edits
+        _ok([
+            _edit("p00011", "Русский текст абзаца 11.", "Русский текст абзаца 11 исправлен.",
+                  "r", "duplicate"),
+            _edit("p00012", "Русский текст абзаца 12.", "Русский текст абзаца 12 исправлен.",
+                  "r", "preposition"),
+            _edit("p00013", "Русский текст абзаца 13.", "Русский текст абзаца 13 исправлен.",
+                  "r", "typo"),
+        ]),
+        # chunk 4 FAILED (foreign pid)
+        _ok([
+            _edit("p99999", "не важно", "не важно 2", "r", "typo"),
+        ]),
+        # chunk 5 GOOD — 4 SAFE edits
+        _ok([
+            _edit(f"p{i:05d}", f"Русский текст абзаца {i}.",
+                  f"Русский текст абзаца {i} исправлен.", "r", "grammar")
+            for i in (21, 22, 23, 24)
+        ]),
+        # chunk 6 FAILED (transport)
+        '{"edits": [',
+        # chunk 7 GOOD — 5 SAFE edits
+        _ok([
+            _edit(f"p{i:05d}", f"Русский текст абзаца {i}.",
+                  f"Русский текст абзаца {i} исправлен.", "r", "typo")
+            for i in (31, 32, 33, 34, 35)
+        ]),
+        # chunk 8 GOOD — 3 SAFE edits
+        _ok([
+            _edit(f"p{i:05d}", f"Русский текст абзаца {i}.",
+                  f"Русский текст абзаца {i} исправлен.", "r", "duplicate")
+            for i in (36, 37, 38)
+        ]),
+    )
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(chunk_size=5)
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is False
+    assert outcome.chunk_count == 8
+    assert outcome.successful_chunks == 5
+    assert outcome.failed_chunks == (2, 4, 6)
+    # 2+3+4+5+3 = 17 edits from the GOOD chunks only.
+    assert len(outcome.edits) == 17
+    applied_pids = {pid for pid, _ in outcome.applied}
+    # Failed-chunk pids never appear (chunk2: p00006-p00010, chunk4:
+    # p99999, chunk6: p00026-p00030).
+    assert not (applied_pids & {"p00006", "p00007", "p00008", "p00009", "p00010"})
+    assert not (applied_pids & {"p00026", "p00027", "p00028", "p00029", "p00030"})
+    assert not (applied_pids & {"p99999"})
+    # GOOD-chunk edits are all applied.
+    assert len(applied_pids) == len(outcome.edits)
+    assert applied_pids == {
+        "p00001", "p00002", "p00011", "p00012", "p00013",
+        "p00021", "p00022", "p00023", "p00024",
+        "p00031", "p00032", "p00033", "p00034", "p00035",
+        "p00036", "p00037", "p00038",
+    }
 
 
 def test_evaluator_fragment_originals_complete_and_preserve_pid() -> None:

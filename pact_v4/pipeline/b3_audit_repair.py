@@ -819,17 +819,22 @@ class B3AuditRepair:
         """V4.2 R stage: run the Russian-only editor over the raw map.
 
         Returns ``(edited_map, review_candidates, outcome)``:
-        * edited_map = raw + SAFE edits (diff-gated), raw when the stage is
-          disabled or failed;
-        * review_candidates = REVIEW-classed edits (never auto-applied),
-          empty when disabled/failed;
+        * edited_map = raw + SAFE edits (diff-gated) from SUCCESSFUL
+          chunks, raw when the stage is disabled or failed;
+        * review_candidates = REVIEW-classed edits (never auto-applied)
+          from SUCCESSFUL chunks, empty when disabled/failed;
         * outcome = the evaluator outcome (None when disabled).
 
-        Fail-closed on the STAGE level: an incomplete R pass (any chunk
-        failed) applies NO edits and forwards NO candidates — a partial
-        editor pass is never silently used. The failure is debt (journal +
-        outcome), exactly like a failed repair batch: the audit still
-        protects the chapter.
+        Partial-apply (RESILIENCE t_406fc48c, run_remote_001): R edits are
+        per-chunk independent, so a failed chunk discards ONLY its own
+        edits — the successful chunks' edits are applied and their
+        candidates forwarded. Fail-closed is preserved PER-CHUNK: the
+        evaluator routes no edits for a failed chunk (``outcome.edits`` /
+        ``applied`` / ``candidates`` already contain only GOOD-chunk
+        content), and the journal records ``r_editor_done`` with
+        ``partial=true`` + ``applied_count`` + ``failed_chunks``. The
+        failure is debt (journal + outcome), exactly like a failed repair
+        batch: the audit still protects the chapter.
         """
         cfg = self._config
         if not cfg.russian_editor_enabled:
@@ -890,19 +895,43 @@ class B3AuditRepair:
             )
             return dict(translation), (), None
         if not outcome.complete:
+            # RESILIENCE (t_406fc48c, run_remote_001): partial-apply — R
+            # edits are per-chunk independent; a failed chunk discards ONLY
+            # its own edits, never the successful chunks' work. The
+            # evaluator's outcome.applied/edits/candidates already contain
+            # only GOOD-chunk content (fail-closed per chunk), so applying
+            # them is safe. run_remote_001: 17 edits from 5 GOOD chunks
+            # were dropped because 3 chunks failed (incl. the p00070 typo
+            # 'Не важно'→'Неважно').
+            edited_map = {**dict(translation), **dict(outcome.applied)}
             LOG.warning(
-                "B3: russian_editor incomplete for %s (failed chunks %s) — "
-                "no R edits applied (fail-closed), audit proceeds on raw",
+                "B3: russian_editor partial for %s (failed chunks %s) — "
+                "applied %d edit(s) from %d successful chunk(s), failed "
+                "chunk edits skipped (per-chunk fail-closed); audit "
+                "proceeds on the partially edited map",
                 chapter_id, list(outcome.failed_chunks),
+                len(outcome.applied), outcome.successful_chunks,
             )
             journal.emit(
                 "r_editor_done",
-                status="incomplete",
+                status="partial",
+                partial=True,
                 failed_chunks=list(outcome.failed_chunks),
+                successful_chunks=outcome.successful_chunks,
                 chunk_count=outcome.chunk_count,
                 edit_count=len(outcome.edits),
+                applied_count=len(outcome.applied),
+                candidate_count=len(outcome.candidates),
+                dropped=outcome.dropped,
             )
-            return dict(translation), (), outcome
+            self._emit_progress(
+                "r_editor_done",
+                complete=False,
+                partial=True,
+                applied_count=len(outcome.applied),
+                candidate_count=len(outcome.candidates),
+            )
+            return edited_map, outcome.candidates, outcome
         edited_map = {**dict(translation), **dict(outcome.applied)}
         journal.emit(
             "r_editor_done",
@@ -1112,11 +1141,18 @@ class B3AuditRepair:
                 review_journal=(),
                 from_cache=False,
             )
-            # Artifacts are written ONLY when the R stage completed — an
-            # incomplete/failed pass leaves no translations_edited.json /
-            # edit_candidates.json (F8: never advertise provenance the stage
-            # did not produce; the audit still runs on the raw map).
-            if r_editor_outcome is not None and r_editor_outcome.complete:
+            # Artifacts are written when the R stage produced ANY edited map
+            # (complete pass, or a partial pass whose successful chunks
+            # applied edits / forwarded candidates) — the audit/repair
+            # consume that exact map, so translations_edited.json must
+            # reflect it (F8: never advertise provenance the stage did not
+            # produce; a fully-failed pass — 0 successful chunks — leaves
+            # no artifacts and the audit runs on the raw map).
+            if r_editor_outcome is not None and (
+                r_editor_outcome.complete
+                or r_editor_outcome.applied
+                or r_editor_outcome.candidates
+            ):
                 _write_r_editor_artifacts(
                     cfg=cfg,
                     chapter_id=chapter_id,
@@ -1557,7 +1593,10 @@ def _build_r_editor_report(
     ``outcome`` is None when the stage failed (transport/evaluator error) —
     the report then records status ``failed`` (the audit still protects the
     chapter; R edits were not applied). ``outcome.complete=False`` records
-    status ``incomplete`` (fail-closed: no R edits applied).
+    status ``partial`` when at least one successful chunk produced edits /
+    candidates (RESILIENCE t_406fc48c: per-chunk partial-apply) or
+    ``incomplete`` when nothing was applied (all chunks failed — fail-closed
+    with 0 successful output).
     """
     status = "disabled"
     outcome_payload: Optional[Dict[str, Any]] = None
@@ -1571,6 +1610,8 @@ def _build_r_editor_report(
             outcome_payload = outcome.to_payload()
             if outcome.complete:
                 status = "complete"
+            elif outcome.applied or outcome.candidates:
+                status = "partial"
             else:
                 status = "incomplete"
     report = {
