@@ -6,6 +6,14 @@ model call and pass the returned appender as
 model is still generating (gemma_rewrite_v4 pattern). The phase still writes
 the authoritative final reasoning after completion — the live writer is a
 diagnostics/monitoring bonus, never the source of truth.
+
+Transactional rollback (RV2 t_a7c14251 HIGH): the returned writer is a
+callable object that also exposes ``rollback()`` — truncates the artifact
+back to the empty pre-call state. ``ApiClient`` calls it when a streamed
+attempt fails (mid-stream connection drop or an SSE stream that later breaks
+and triggers the batch fallback), so tentative chunks already delivered by
+the failed attempt are discarded instead of being kept as a successful write
+(no partial+full duplicate artifact).
 """
 from __future__ import annotations
 
@@ -16,6 +24,37 @@ from typing import Callable, Optional
 LOG = logging.getLogger(__name__)
 
 
+class _ReasoningFileWriter:
+    """Callable live reasoning-file appender with transactional rollback.
+
+    ``__call__(chunk)`` appends one streamed reasoning chunk (best-effort:
+    a disk failure is logged and swallowed so the live writer never breaks
+    the model call — the phase's post-completion write is authoritative).
+    ``rollback()`` truncates the file back to the empty pre-call state so a
+    failed stream attempt's tentative chunks do not survive.
+    """
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        self._path = path
+
+    def __call__(self, chunk: str) -> None:
+        try:
+            with self._path.open("a", encoding="utf-8") as fh:
+                fh.write(chunk)
+        except OSError as exc:  # pragma: no cover - disk failure only
+            LOG.warning("reasoning writer failed for %s: %s", self._path, exc)
+
+    def rollback(self) -> None:
+        """Discard everything appended so far (back to the empty pre-call
+        state). Best-effort like ``__call__``."""
+        try:
+            self._path.write_text("", encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - disk failure only
+            LOG.warning("reasoning writer rollback failed for %s: %s", self._path, exc)
+
+
 def open_reasoning_writer(
     path: Optional[Path],
 ) -> Optional[Callable[[str], None]]:
@@ -23,23 +62,13 @@ def open_reasoning_writer(
     return an appending writer for live reasoning chunks.
 
     Returns ``None`` when ``path`` is ``None`` (no artifact requested, e.g.
-    the phase runs without ``out_dir``). Appends are best-effort: a disk
-    failure is logged and swallowed so the live writer never breaks the
-    model call — the phase's post-completion write is authoritative.
+    the phase runs without ``out_dir``). The returned object is callable
+    (append a chunk) and additionally exposes a ``rollback()`` method for
+    transactional recovery of failed stream attempts.
     """
     if path is None:
         return None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("", encoding="utf-8")
-
-    def _append(chunk: str) -> None:
-        try:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(chunk)
-        except OSError as exc:  # pragma: no cover - disk failure only
-            LOG.warning("reasoning writer failed for %s: %s", path, exc)
-
-    return _append
+    return _ReasoningFileWriter(Path(path))
 
 
 def append_error_marker(path: Optional[Path], exc: BaseException) -> None:

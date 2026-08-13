@@ -168,8 +168,14 @@ class ApiClient:
         writer can grow the ``*_reasoning.txt`` file live. When the server
         does not support streaming (or the stream fails), the call falls
         back to the batch path and the callback receives the full reasoning
-        once after completion (documented fallback). Without a callback the
-        historical batch behaviour is preserved exactly.
+        once after completion (documented fallback). The fallback is
+        transactional (RV2 t_a7c14251 HIGH): reasoning chunks already
+        delivered live before a mid-stream failure are tentative — the sink
+        is rolled back (when it exposes a callable ``rollback()``) so the
+        artifact ends up with ONLY the full batch reasoning, delivered
+        exactly once. Sinks without a ``rollback()`` keep the delivered
+        partial chunks (best-effort, documented limitation). Without a
+        callback the historical batch behaviour is preserved exactly.
         """
         if not messages:
             raise ApiClientError(f"{self._name}: empty messages list")
@@ -211,6 +217,17 @@ class ApiClient:
                         payload
                     )
                     text, finish_reason, usage, reasoning = self._extract_message(data)
+                    # Transactional fallback (RV2 t_a7c14251 HIGH): the
+                    # stream may already have delivered tentative reasoning
+                    # chunks — roll the sink back so the artifact ends up
+                    # with ONLY the full batch reasoning delivered below,
+                    # exactly once (no partial+full duplicate). Only after
+                    # the batch POST succeeded: if IT failed too, the
+                    # exception propagates and the phase's TRANSPORT_ERROR
+                    # trail preserves the streamed partials (run_011).
+                    # Best-effort: a sink without rollback() keeps the
+                    # partial chunks (documented limitation).
+                    self._rollback_sink(on_reasoning_chunk)
                     # Post-completion delivery of the full reasoning
                     # (documented fallback: stream unavailable/failed).
                     if reasoning:
@@ -386,6 +403,30 @@ class ApiClient:
         if attempt < int(self._cfg.http_retries):
             time.sleep(float(self._cfg.retry_delay_seconds))
 
+    @staticmethod
+    def _rollback_sink(
+        on_reasoning_chunk: Optional[Callable[[str], None]],
+    ) -> None:
+        """Transactional rollback of a reasoning sink (RV2 t_a7c14251 HIGH).
+
+        Called when a stream attempt failed after delivering tentative
+        chunks: a sink exposing a callable ``rollback()`` (the phase
+        reasoning-file writer does) discards those chunks so a later
+        batch/retry delivery is the only content in the artifact. Best-effort
+        like the sink itself: a missing ``rollback`` or a raising one is
+        logged and swallowed — the model call must never fail because of it.
+        """
+        rollback = getattr(on_reasoning_chunk, "rollback", None)
+        if callable(rollback):
+            try:
+                rollback()
+            except Exception:  # noqa: BLE001 — rollback is best-effort
+                LOG.warning(
+                    "on_reasoning_chunk rollback() raised; "
+                    "tentative chunks may remain",
+                    exc_info=True,
+                )
+
     def _post_stream(
         self,
         messages: List[Dict[str, str]],
@@ -405,6 +446,10 @@ class ApiClient:
         stream that ends before ``[DONE]``/terminal ``finish_reason``)
         raises ``ApiClientError`` so the caller can fall back to the batch
         path.
+
+        Transactional (RV2 t_a7c14251 HIGH): a mid-stream connection error
+        rolls the reasoning sink back before the retry, so a failed
+        attempt's tentative chunks never survive into the retry's artifact.
         """
         payload = self.build_payload(
             messages,
@@ -466,6 +511,10 @@ class ApiClient:
                     "%s SSE attempt %s failed mid-stream: %s",
                     self._name, attempt, exc,
                 )
+                # Transactional rule (RV2 t_a7c14251 HIGH): chunks already
+                # delivered by this failed attempt are tentative — roll the
+                # sink back so the retry's reasoning is the only content.
+                self._rollback_sink(on_reasoning_chunk)
                 self._backoff(attempt)
                 continue
             finally:

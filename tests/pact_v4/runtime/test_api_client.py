@@ -497,11 +497,34 @@ def test_complete_stream_falls_back_to_batch_on_non_sse_body():
     assert client.calls[0].streamed is False
 
 
+class _RollbackSink:
+    """Callable reasoning sink that also supports transactional rollback.
+
+    Mirrors the production phase writer (``open_reasoning_writer``): chunks
+    are recorded on call; ``rollback()`` discards everything recorded so far
+    (like truncating the reasoning file back to its pre-call state).
+    """
+
+    def __init__(self) -> None:
+        self.received: List[str] = []
+        self.rollbacks = 0
+
+    def __call__(self, chunk: str) -> None:
+        self.received.append(chunk)
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+        self.received.clear()
+
+
 def test_complete_truncated_stream_falls_back_to_batch():
-    """Regression (RV t_df24524d HIGH): an SSE stream that ends before
-    [DONE] / terminal finish_reason is a truncated response — ApiClientError
-    must be raised so complete() performs the batch fallback instead of
-    returning a partial/empty streamed response as success."""
+    """Regression (RV t_df24524d HIGH + RV2 t_a7c14251 HIGH): an SSE stream
+    that ends before [DONE] / terminal finish_reason is a truncated response
+    — ApiClientError must be raised so complete() performs the batch
+    fallback instead of returning a partial/empty streamed response as
+    success. The fallback is transactional: the partial streamed delta is
+    rolled back (sink.rollback()), so the sink receives the full batch
+    reasoning EXACTLY ONCE — no partial+full duplicate artifact."""
     lines = [
         "data: " + json.dumps({
             "choices": [{"delta": {"reasoning_content": "partial "}, "finish_reason": None}]
@@ -516,18 +539,19 @@ def test_complete_truncated_stream_falls_back_to_batch():
         _ok_reasoning_response('{"ok": true}', "batch-thinking"),
     ])
     client = ApiClient(ApiClientConfig(), session=session)
-    received: List[str] = []
+    sink = _RollbackSink()
 
     out = client.complete(
         [{"role": "user", "content": "x"}],
         max_tokens=10,
-        on_reasoning_chunk=received.append,
+        on_reasoning_chunk=sink,
     )
 
-    # Fallback happened: batch result wins, callback got the batch reasoning
-    # exactly once (the partial streamed delta was already delivered live).
+    # Fallback happened: batch result wins, the sink got the batch reasoning
+    # exactly once (the tentative "partial " delta was rolled back).
     assert out == '{"ok": true}'
-    assert received == ["partial ", "batch-thinking"]
+    assert sink.received == ["batch-thinking"]
+    assert sink.rollbacks == 1
     record = client.calls[0]
     assert record.streamed is False
     assert record.reasoning == "batch-thinking"
@@ -536,6 +560,75 @@ def test_complete_truncated_stream_falls_back_to_batch():
     assert len(session.posts) == 2
     assert session.posts[0]["stream"] is True
     assert session.posts[1]["stream"] is False
+
+
+def test_complete_truncated_stream_plain_sink_keeps_partial():
+    """Documented limitation (RV2 t_a7c14251 HIGH): a sink WITHOUT a
+    rollback() method cannot discard the tentative streamed delta — it keeps
+    the partial chunk AND the full batch reasoning. The batch fallback still
+    delivers the full reasoning once; only rollback-capable sinks (the
+    production file writer) get the transactional exactly-once artifact."""
+    lines = [
+        "data: " + json.dumps({
+            "choices": [{"delta": {"reasoning_content": "partial "}, "finish_reason": None}]
+        }),
+        # stream dies here
+    ]
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=lines),
+        _ok_reasoning_response('{"ok": true}', "batch-thinking"),
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    assert received == ["partial ", "batch-thinking"]
+    assert client.calls[0].streamed is False
+    assert client.calls[0].reasoning == "batch-thinking"
+
+
+def test_complete_midstream_retry_rolls_back_tentative_chunks():
+    """Regression (RV2 t_a7c14251 HIGH): when a stream attempt fails
+    mid-stream (connection drop) after delivering tentative reasoning
+    chunks, the retry must start from a clean sink — the failed attempt's
+    chunks are rolled back so only the retry's reasoning survives."""
+    import requests as _requests
+
+    class _DroppingStream(_FakeStreamResponse):
+        def iter_lines(self, decode_unicode: bool = False):
+            for i, line in enumerate(self._lines):
+                if i == 1:
+                    raise _requests.ConnectionError("connection dropped")
+                yield line
+
+    session = _FakeSession([
+        _DroppingStream(status_code=200, lines=_sse_lines("tentative-", "garbage")),
+        _FakeStreamResponse(status_code=200, lines=_sse_lines("clean-", "reasoning")),
+    ])
+    client = ApiClient(ApiClientConfig(retry_delay_seconds=0.0), session=session)
+    sink = _RollbackSink()
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=sink,
+    )
+
+    # First attempt streamed "tentative-" then dropped; rollback cleared it;
+    # the retry's clean reasoning is the only content.
+    assert out == '{"ok": true}'
+    assert sink.received == ["clean-", "reasoning"]
+    assert sink.rollbacks == 1
+    record = client.calls[0]
+    assert record.streamed is True
+    assert record.reasoning == "clean-reasoning"
+    assert len(session.posts) == 2
 
 
 def test_complete_malformed_data_line_falls_back_to_batch():
