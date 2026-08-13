@@ -550,12 +550,20 @@ def _translation_gender(text: str) -> str | None:
 
 @dataclass(frozen=True)
 class FilteredIssue:
-    """Verdict for one audit issue after the Tier A hard filters."""
+    """Verdict for one audit issue after the Tier A hard filters.
+
+    ``source_stage`` names the stage that produced the remark (CANDIDATE-MERGE,
+    t_0ffe56e1): always ``"fidelity_auditor"`` here — hard-filtered issues
+    come from the B1 chunked audit. The repair prompt renders it so the
+    verifier applies the right contract (auditor: does the TRANSLATION
+    diverge from the English SOURCE?).
+    """
 
     issue: Mapping[str, Any]
     verdict: str
     filter_name: str
     reason: str
+    source_stage: str = "fidelity_auditor"
 
 
 def _filter_one(

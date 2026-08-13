@@ -589,9 +589,20 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 # gender-neutral 'grandchild'), and the referent rule (preserve the
 # grammatical attachment of surrounding clauses; run_013 p00096 reassigned
 # the narrator's action to the object).
+#
+# CANDIDATE-MERGE (t_0ffe56e1, run_remote_001 review): each finding now
+# carries a SOURCE label — ``source=fidelity_auditor`` (the B1 audit: does
+# the TRANSLATION diverge from the English SOURCE?) vs
+# ``source=russian_editor`` (the R-stage Russian editor: is there a genuine
+# Russian-language defect, and can it be fixed without changing the source
+# meaning?). One PID may carry BOTH sources in a single finding — the model
+# must resolve BOTH remarks in ONE decision (one repaired_translation), never
+# rewrite the PID twice in sequence (run_remote_001 p00303: the fidelity
+# repair wrote exact-but-clunky Russian, then the editor candidate rewrote it
+# back losing the meaning).
 REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
     role="selective_repair",
-    version="pact-v4-repair-as-verifier/v3",
+    version="pact-v4-repair-as-verifier/v4",
     instructions=(
         "You are a Russian-language repair editor for an English-to-Russian "
         "literary translation. You are given the SOURCE (PID -> English text) "
@@ -609,6 +620,21 @@ REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
         "  [CANDIDATE] not code-verifiable — independently verify it yourself "
         "against SOURCE and TRANSLATION before repairing; return PASS if the "
         "auditor is wrong.\n"
+        "\n"
+        "Each finding also carries a SOURCE label telling you what the remark "
+        "claims:\n"
+        "  source=fidelity_auditor — the B1 fidelity auditor: verify whether "
+        "the TRANSLATION really diverges from the English SOURCE (meaning, "
+        "numbers, names, negation); repair only if it does.\n"
+        "  source=russian_editor — the Russian-language editor: verify whether "
+        "there is a genuine RUSSIAN-language defect (calque, unnatural "
+        "phrasing, ambiguity, register, logic) and whether the proposed "
+        "rewrite preserves the SOURCE meaning; accept it only if both hold.\n"
+        "  source=fidelity_auditor+russian_editor — the SAME pid carries "
+        "BOTH remarks: resolve them in ONE decision and ONE "
+        "repaired_translation that fixes every stated issue of that pid. "
+        "Never apply two sequential rewrites to the same pid — build a single "
+        "text that satisfies both remarks at once.\n"
         "\n"
         "Expected false-positive class: a literary interpretation of a speech "
         "verb (e.g. 'said' rendered as позвала/буркнула/перебила) is NOT a "
@@ -644,7 +670,7 @@ REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
         "\n"
         "CRITICAL: repaired_translation MUST be the FULL corrected text of "
         "the entire PID — every sentence of the paragraph, with ONLY the "
-        "stated defect fixed inside it. Never return a fragment, a partial "
+        "stated defect(s) fixed inside it. Never return a fragment, a partial "
         "sentence, or a single corrected clause: the value is written back as "
         "the whole paragraph. If you are not sure, return decision 'pass' "
         "instead of a truncated repair.\n"
@@ -1206,15 +1232,14 @@ def render_selective_repair_prompt(
         )
     # The instructions label findings [CONFIRMED] (Tier A) / [CANDIDATE]
     # (Tier B); the FINDINGS block uses the same labels so the model can
-    # apply the right per-finding contract.
-    finding_lines = "\n".join(
-        f"  [{f.index}] {f.pid} | {'CONFIRMED' if f.tier == 'A' else 'CANDIDATE'} | "
-        f"{f.category} | "
-        f"severity={f.severity} | confidence={f.confidence}\n"
-        f"      note: {f.note}\n"
-        f"      excerpt: {f.excerpt or '(none)'}"
-        for f in findings
-    ) or "  (none)"
+    # apply the right per-finding contract. CANDIDATE-MERGE (t_0ffe56e1):
+    # each line also carries ``source=<stage>`` — ``fidelity_auditor`` /
+    # ``russian_editor`` / ``fidelity_auditor+russian_editor`` — so the
+    # verifier knows whether the remark claims a source mismatch or a
+    # Russian-language defect; a MERGED finding (``f.sources`` non-empty)
+    # renders EVERY remark with its own stage/tier so both are visible in the
+    # single call (one decision per pid, never sequential rewrites).
+    finding_lines = "\n".join(_render_finding_block(f) for f in findings) or "  (none)"
     return (
         f"{template.instructions}\n\n"
         f"CHUNK: {chapter_id}\n\n"
@@ -1223,6 +1248,40 @@ def render_selective_repair_prompt(
         f"{ctx_block}\n\n"
         f"FINDINGS (verify, then repair only confirmed issues):\n{finding_lines}\n"
     )
+
+
+def _render_finding_block(f: Any) -> str:
+    """Render one finding's FINDINGS-block lines.
+
+    Single-source findings keep the classic two-line layout plus a
+    ``source=<stage>`` label. A CANDIDATE-MERGE finding (``sources``
+    non-empty, t_0ffe56e1) renders every per-source remark with its own
+    stage/tier/category/severity/confidence/note/excerpt so the repair model
+    sees BOTH remarks in one call and builds ONE decision.
+    """
+    header = (
+        f"  [{f.index}] {f.pid} | "
+        f"{'CONFIRMED' if f.tier == 'A' else 'CANDIDATE'} | "
+        f"{f.category} | severity={f.severity} | confidence={f.confidence} | "
+        f"source={f.source_stage}"
+    )
+    if not getattr(f, "sources", ()):
+        return (
+            f"{header}\n"
+            f"      note: {f.note}\n"
+            f"      excerpt: {f.excerpt or '(none)'}"
+        )
+    lines = [header]
+    for s in f.sources:
+        lines.append(
+            f"      [{s.get('stage')} | "
+            f"{'CONFIRMED' if s.get('tier') == 'A' else 'CANDIDATE'} | "
+            f"{s.get('category')} | severity={s.get('severity')} | "
+            f"confidence={s.get('confidence')}]"
+        )
+        lines.append(f"      note: {s.get('note', '')}")
+        lines.append(f"      excerpt: {s.get('excerpt') or '(none)'}")
+    return "\n".join(lines)
 
 
 def render_reaudit_prompt(

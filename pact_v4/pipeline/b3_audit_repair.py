@@ -695,6 +695,10 @@ class B3AuditCache:
                     "verdict": f.verdict,
                     "filter_name": f.filter_name,
                     "reason": f.reason,
+                    # CANDIDATE-MERGE (t_0ffe56e1): the source stage is part
+                    # of the cached filtered round-trip (old caches without
+                    # the key restore the fidelity_auditor default).
+                    "source_stage": f.source_stage,
                 }
                 for f in filtered
             ],
