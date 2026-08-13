@@ -786,6 +786,9 @@ def generate_whole_chapter(
     retry: WholeChapterRetryPolicy = WholeChapterRetryPolicy(),
     on_retry: Optional[Callable[[int, str], None]] = None,
     reasoning_sink: Optional[Callable[[int, str], None]] = None,
+    live_reasoning_writer: Optional[
+        Callable[[int], Optional[Callable[[str], None]]]
+    ] = None,
 ) -> GenerationOutcome:
     """Generate the whole chapter in ONE model call (V4.1 A1).
 
@@ -822,6 +825,24 @@ def generate_whole_chapter(
     without the attribute yields ``''``. Purely observational: a raise inside
     the sink is swallowed (logged) and never changes generation behavior.
     Reasoning is a text artifact only — it never enters cache/resume identity.
+
+    ``live_reasoning_writer`` (optional, GEN-STREAM, diagnostics-only) is a
+    per-attempt factory invoked BEFORE each model call as
+    ``live_reasoning_writer(attempt_index)``; the returned callable (or
+    ``None``) is installed on the model caller as its live reasoning-chunk
+    sink (``CompletionRequest.on_reasoning_chunk``) for the duration of that
+    attempt and cleared immediately after the call. The runner passes a
+    factory that opens the per-attempt ``whole_chapter_reasoning.txt`` /
+    ``whole_chapter_retryN_reasoning.txt`` file via ``open_reasoning_writer``
+    BEFORE the call, so the file grows live while the model is still
+    generating (the REASONING-STREAM pattern; local llama-server streams
+    reasoning_content chunks, the OpenCode transport delivers once after
+    completion — both through the same sink). Callers without a
+    ``set_reasoning_chunk_sink`` method are left untouched (stub callers keep
+    the post-completion ``reasoning_sink`` path). Purely observational: any
+    failure here is logged and swallowed, and the live file is never the
+    source of truth — the authoritative post-completion write stays in the
+    runner.
     """
     if cache is None:
         cache = GenerationCache()
@@ -842,6 +863,35 @@ def generate_whole_chapter(
             reasoning_sink(attempt, str(reasoning or ""))
         except Exception:  # noqa: BLE001 — diagnostics sink, never breaks generation
             LOG.debug("whole-chapter reasoning_sink failed", exc_info=True)
+
+    # V4.1 GEN-STREAM: optional per-attempt live reasoning sink. The caller
+    # may expose ``set_reasoning_chunk_sink`` (BackendModelCaller and its
+    # HttpModelCaller/LifecycleModelCaller wrappers do; stub callers do not).
+    # When both the factory and the setter exist, the per-attempt writer is
+    # installed BEFORE the model call and cleared right after, so the
+    # ``*_reasoning.txt`` file grows live during generation. Every hook here
+    # is best-effort: a raise never changes generation behavior.
+    _live_setter = getattr(model_caller, "set_reasoning_chunk_sink", None)
+
+    def _install_live_reasoning(attempt: int) -> None:
+        if live_reasoning_writer is None or _live_setter is None:
+            return
+        try:
+            _live_setter(live_reasoning_writer(attempt))
+        except Exception:  # noqa: BLE001 — diagnostics hook, never breaks generation
+            LOG.debug("whole-chapter live reasoning install failed", exc_info=True)
+            try:
+                _live_setter(None)
+            except Exception:  # noqa: BLE001
+                LOG.debug("whole-chapter live reasoning clear failed", exc_info=True)
+
+    def _clear_live_reasoning() -> None:
+        if _live_setter is None:
+            return
+        try:
+            _live_setter(None)
+        except Exception:  # noqa: BLE001 — diagnostics hook, never breaks generation
+            LOG.debug("whole-chapter live reasoning clear failed", exc_info=True)
 
     template = _TEMPLATES[role]
     risk = _whole_chapter_risk(source, glossary)
@@ -889,6 +939,9 @@ def generate_whole_chapter(
 
     last_error: Optional[GenerationError] = None
     for attempt in range(retry.max_attempts):
+        # GEN-STREAM: open/install the per-attempt live reasoning writer
+        # BEFORE the model call so the file exists and grows during it.
+        _install_live_reasoning(attempt)
         try:
             raw = model_caller(bundle)
         except _CompletionErrorType() as exc:
@@ -928,6 +981,13 @@ def generate_whole_chapter(
                 time.sleep(retry.delay_for(attempt))
                 continue
             break
+        finally:
+            # GEN-STREAM: the live sink is per-attempt — clear it as soon as
+            # the model call returns (success, abort, or truncated) so the
+            # next attempt (or a later caller user) never appends into the
+            # previous attempt's file. The authoritative post-completion
+            # reasoning_sink write is unaffected by this clear.
+            _clear_live_reasoning()
 
         _emit_reasoning(attempt)
 

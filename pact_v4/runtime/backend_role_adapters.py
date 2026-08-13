@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import ModelCaller, PromptBundle
@@ -176,6 +176,7 @@ class BackendModelCaller:
         backend: CompletionBackend,
         *,
         config: Optional[BackendModelCallerConfig] = None,
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
@@ -186,6 +187,10 @@ class BackendModelCaller:
         # layer to persist per-attempt reasoning diagnostics — never part of
         # cache/resume identity.
         self._last_reasoning: str = ""
+        # V4.1 GEN-STREAM: optional live reasoning sink forwarded into every
+        # CompletionRequest this caller issues (see set_reasoning_chunk_sink).
+        # Diagnostics-only — never part of cache/resume identity.
+        self._on_reasoning_chunk: Optional[Callable[[str], None]] = on_reasoning_chunk
 
     @property
     def backend(self) -> CompletionBackend:
@@ -208,6 +213,22 @@ class BackendModelCaller:
         clear-at-start behavior inside ``__call__``.
         """
         self._last_reasoning = ""
+
+    def set_reasoning_chunk_sink(
+        self, sink: Optional[Callable[[str], None]]
+    ) -> None:
+        """Install (or clear, with ``None``) the live reasoning-chunk sink.
+
+        V4.1 GEN-STREAM: the whole-chapter generation layer opens the
+        per-attempt reasoning file BEFORE the model call (via
+        ``open_reasoning_writer``, the REASONING-STREAM pattern) and passes
+        the returned appender here so ``__call__`` forwards it into the
+        ``CompletionRequest.on_reasoning_chunk`` hook — the file then grows
+        live while the model is still generating. Diagnostics-only: never
+        part of cache/resume identity, and a failing sink never breaks the
+        model call (best-effort, like every other reasoning hook).
+        """
+        self._on_reasoning_chunk = sink
 
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
@@ -260,6 +281,12 @@ class BackendModelCaller:
             # system+tools body. Inert for local llama-server transports
             # (they never read the field).
             omit_system_tools=True,
+            # V4.1 GEN-STREAM: forward the live reasoning sink (installed by
+            # the generation layer per attempt via set_reasoning_chunk_sink)
+            # so the transport can grow the per-attempt *_reasoning.txt file
+            # while the model is still generating (REASONING-STREAM pattern).
+            # Diagnostics-only: a None sink keeps the historical behavior.
+            on_reasoning_chunk=self._on_reasoning_chunk,
         )
 
         # V4.1 GEN-REASONING: each model-call attempt starts with a clean

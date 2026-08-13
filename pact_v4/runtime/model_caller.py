@@ -14,7 +14,7 @@ not duplicate the library's contract here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from pact_v4.phase2.generation import PromptBundle
 from pact_v4.runtime.api_client import ApiClient, ApiClientConfig, ApiClientError
@@ -107,6 +107,17 @@ class HttpModelCaller:
         reset = getattr(self._impl, "reset_attempt_state", None)
         if reset is not None:
             reset()
+
+    def set_reasoning_chunk_sink(
+        self, sink: Optional[Callable[[str], None]]
+    ) -> None:
+        """V4.1 GEN-STREAM: forward the live reasoning sink to the inner
+        ``BackendModelCaller`` so the whole-chapter generation layer can
+        grow the per-attempt ``*_reasoning.txt`` file live (see
+        ``BackendModelCaller.set_reasoning_chunk_sink``)."""
+        setter = getattr(self._impl, "set_reasoning_chunk_sink", None)
+        if setter is not None:
+            setter(sink)
 
     def __call__(self, bundle: PromptBundle) -> str:
         try:

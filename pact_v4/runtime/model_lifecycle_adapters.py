@@ -25,7 +25,7 @@ this module only decides *when to swap*, never *what the model is asked*.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
     AuditPair,
@@ -114,6 +114,21 @@ class LifecycleModelCaller:
         diagnostics regardless of which caller wrapper is used.
         """
         return getattr(self._caller, "last_reasoning", "")
+
+    def set_reasoning_chunk_sink(
+        self, sink: Optional[Callable[[str], None]]
+    ) -> None:
+        """V4.1 GEN-STREAM: forward the live reasoning sink to the wrapped
+        ``HttpModelCaller`` (and through it to the inner
+        ``BackendModelCaller``) so the whole-chapter generation layer can
+        grow the per-attempt ``*_reasoning.txt`` file live. The lifecycle
+        wrapper must not swallow or store it — acquisition
+        (``ensure_resident``) is unchanged and the sink reaches the actual
+        ``CompletionRequest`` of the model call.
+        """
+        setter = getattr(self._caller, "set_reasoning_chunk_sink", None)
+        if setter is not None:
+            setter(sink)
 
 
 class LifecycleQwenEvaluator:
