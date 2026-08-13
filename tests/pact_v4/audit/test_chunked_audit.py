@@ -929,3 +929,42 @@ def test_lifecycle_qwen_audit_legacy_call_requires_source_and_translation() -> N
     evaluator = LifecycleQwenAuditEvaluator(router, model_name="qwen-3.6-35b")
     with pytest.raises(TypeError):
         evaluator(chunk_id="0001")  # neither pairs nor source/translation
+
+
+def test_audit_streams_reasoning_live_during_call(tmp_path) -> None:
+    """REASONING-STREAM acceptance: the audit reasoning file is created
+    BEFORE the call and grows live — a scripted backend that fires
+    on_reasoning_chunk mid-call sees the file already populated, and the
+    authoritative post-completion write still carries the full reasoning."""
+    observed: Dict[str, str] = {}
+
+    class _StreamingBackend(ScriptedBackend):
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            assert request.on_reasoning_chunk is not None
+            request.on_reasoning_chunk("live-part-")
+            request.on_reasoning_chunk("abc")
+            observed["during"] = (
+                tmp_path / "audit_chunk1_reasoning.txt"
+            ).read_text(encoding="utf-8")
+            return CompletionResponse(
+                text=json.dumps({"issues": []}, ensure_ascii=False),
+                model="qwen-3.6-35b",
+                finish_reason="stop",
+                raw_metadata={"reasoning": "full-reasoning"},
+            )
+
+    evaluator = ChunkedAuditEvaluator(_StreamingBackend([]))
+    out = evaluator(
+        chapter_id="0001",
+        pairs=_pairs("p", 2),
+        out_dir=tmp_path,
+        out_base="audit",
+    )
+    assert out.chunks[0]["status"] == "GOOD"
+    # Live chunks hit the file while complete() was still running.
+    assert observed["during"] == "live-part-abc"
+    # Authoritative final write carries the complete reasoning.
+    assert (tmp_path / "audit_chunk1_reasoning.txt").read_text(
+        encoding="utf-8"
+    ) == "full-reasoning"

@@ -82,6 +82,7 @@ from pact_v4.runtime.prompts_runtime import (
     ReviewerPrompt,
     render_russian_editor_prompt,
 )
+from pact_v4.runtime.reasoning_writer import append_error_marker, open_reasoning_writer
 
 LOG = logging.getLogger(__name__)
 
@@ -659,6 +660,12 @@ class RussianEditorEvaluator:
                 chunk_total=len(chunks),
                 template=cfg.template,
             )
+            # REASONING-STREAM: the reasoning file is created BEFORE the call
+            # and grows live via on_reasoning_chunk (gemma_rewrite_v4 pattern);
+            # the authoritative write after completion stays unchanged.
+            reason_path: Optional[Path] = None
+            if out_dir is not None:
+                reason_path = out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt"
             request = CompletionRequest(
                 model_ref=model_ref,
                 messages=(Message(role="user", content=prompt),),
@@ -666,6 +673,7 @@ class RussianEditorEvaluator:
                 temperature=0.0,
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=cfg.label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
             )
             self._emit_chunk_event(
                 "started", chunk=chunk_index, total=len(chunks)
@@ -703,11 +711,15 @@ class RussianEditorEvaluator:
                         "russian_editor chunk %d transport failure (%s): %s",
                         chunk_index, type(exc).__name__, exc,
                     )
-                    self._write_chunk_artifacts(
-                        out_dir=out_dir, out_base=out_base, chunk_index=chunk_index,
-                        content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
-                        reasoning="",
-                    )
+                    # Raw error trail (run_011 lesson) + preserve any reasoning
+                    # that streamed live before the failure instead of wiping it.
+                    if out_dir is not None:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        (out_dir / f"{out_base}_chunk{chunk_index}_raw.txt").write_text(
+                            f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                            encoding="utf-8",
+                        )
+                        append_error_marker(reason_path, exc)
                     failed_chunks.append(chunk_index)
                     self._emit_chunk_event(
                         "done", chunk=chunk_index, status="FAILED",

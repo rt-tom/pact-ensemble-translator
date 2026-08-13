@@ -707,6 +707,66 @@ def test_repair_and_reaudit_write_raw_reasoning_artifacts(tmp_path):
     assert reaudit_reason.read_text(encoding="utf-8") == "reasoning-call-2"
 
 
+def test_repair_streams_reasoning_live_during_call(tmp_path):
+    """REASONING-STREAM acceptance: the repair batch reasoning file is
+    created BEFORE the call and grows live — a scripted backend firing
+    on_reasoning_chunk mid-call sees the file already populated, and the
+    authoritative post-completion write still carries the full reasoning."""
+    issue = _issue(
+        "p00193", "invented_gender",
+        note="gender-neutral grandchild translated as female внучка",
+        excerpt="внучка", severity="minor", confidence="high",
+    )
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+    observed: dict = {}
+
+    class _StreamingBackend(ScriptedRepairBackend):
+        def __init__(self, script):
+            super().__init__(script)
+            self._first = True
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            if not self._script:
+                raise AssertionError("ScriptedRepairBackend: script exhausted")
+            resp = self._script.pop(0)
+            if request.on_reasoning_chunk is not None and self._first:
+                # Only the repair-batch call (not the re-audit) proves the
+                # live growth of the batch reasoning file.
+                request.on_reasoning_chunk("live-")
+                request.on_reasoning_chunk("repair")
+                observed["during"] = (
+                    tmp_path / "b3_repair_batch1_reasoning.txt"
+                ).read_text(encoding="utf-8")
+                self._first = False
+            return CompletionResponse(
+                text=resp.text or "",
+                model="qwen-3.6-35b",
+                finish_reason="stop",
+                raw_metadata={"reasoning": "full-reasoning"},
+            )
+
+    evaluator = SelectiveRepairEvaluator(_StreamingBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "А потом заявила, что это должен быть внук-",
+            "reason": "source is gender-neutral grandchild",
+        }]),
+        _reaudit_response([]),  # clean re-audit
+    ]))
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
+    )
+    assert outcome.repair_complete is True
+    assert observed["during"] == "live-repair"
+    assert (tmp_path / "b3_repair_batch1_reasoning.txt").read_text(
+        encoding="utf-8"
+    ) == "full-reasoning"
+
+
 def test_truncated_repair_rejected_leaves_raw_artifact(tmp_path):
     """B3 + B1: a batch whose model returns a truncated fragment is FAILED
     with 'truncated repair' AND the raw response is preserved on disk."""

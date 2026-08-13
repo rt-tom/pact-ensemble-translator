@@ -172,6 +172,7 @@ class LocalOpenAIBackend:
                 temperature=request.temperature,
                 response_format_json=request.response_schema is not None,
                 label=request.label,
+                on_reasoning_chunk=request.on_reasoning_chunk,
             )
         except ApiClientError as exc:
             LOG.error("%s: %s API failure: %s", self._cfg.name, self._api.name, exc)
@@ -187,6 +188,7 @@ class LocalOpenAIBackend:
         record = calls[-1] if calls else None
         attempts = getattr(record, "attempt_count", None) if record else None
         retry_count = max(0, int(attempts) - 1) if attempts else 0
+        streamed = bool(getattr(record, "streamed", False)) if record else False
         response = CompletionResponse(
             text=text,
             structured=None,
@@ -206,6 +208,10 @@ class LocalOpenAIBackend:
                 "attempt_count": attempts,
                 "request_options": dict(request.request_options),
                 "reasoning": record.reasoning if record else "",
+                # REASONING-STREAM provenance: True when the call used the
+                # SSE streaming transport (live reasoning chunks); False for
+                # the batch path (reasoning delivered after completion).
+                "reasoning_streamed": streamed,
             },
         )
         self._records.append(

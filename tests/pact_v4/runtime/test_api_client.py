@@ -33,12 +33,34 @@ class _FakeResponse:
             raise ValueError("no JSON payload")
         return self._payload
 
+    def close(self) -> None:
+        pass
+
+
+class _FakeStreamResponse:
+    """Minimal SSE stand-in: ``iter_lines`` yields ``data: {...}`` lines."""
+
+    def __init__(self, *, status_code: int, lines: List[str]):
+        self.status_code = status_code
+        self.reason = "OK" if 200 <= status_code < 300 else "Error"
+        self.ok = 200 <= status_code < 300
+        self.text = "\n".join(lines)
+        self._lines = list(lines)
+
+    def iter_lines(self, decode_unicode: bool = False):
+        for line in self._lines:
+            yield line
+
+    def close(self) -> None:
+        pass
+
 
 class _FakeSession:
     """In-memory stand-in for ``requests.Session``.
 
     Each entry in ``script`` is one of:
       * a ``_FakeResponse`` — return immediately,
+      * a ``_FakeStreamResponse`` — return immediately (SSE),
       * an ``Exception`` instance — raise it,
       * a tuple ``(status_code, text, json_payload)`` — return a
         ``_FakeResponse`` built from those.
@@ -48,14 +70,14 @@ class _FakeSession:
         self._script = list(script)
         self.posts: List[Dict[str, Any]] = []
 
-    def post(self, url: str, *, json: Dict[str, Any], timeout: float):
-        self.posts.append({"url": url, "json": json, "timeout": timeout})
+    def post(self, url: str, *, json: Dict[str, Any], timeout: float, stream: bool = False):
+        self.posts.append({"url": url, "json": json, "timeout": timeout, "stream": stream})
         if not self._script:
             raise AssertionError("FakeSession: script exhausted")
         item = self._script.pop(0)
         if isinstance(item, BaseException):
             raise item
-        if isinstance(item, _FakeResponse):
+        if isinstance(item, (_FakeResponse, _FakeStreamResponse)):
             return item
         status, text, payload = item
         return _FakeResponse(status_code=status, text=text, json_payload=payload)
@@ -347,3 +369,356 @@ def test_complete_raises_on_malformed_choices_payload():
     client = ApiClient(ApiClientConfig(), session=session)
     with pytest.raises(ApiClientError, match="Malformed API response"):
         client.complete([{"role": "user", "content": "x"}], max_tokens=10)
+
+
+# ---------------------------------------------------------------------------
+# REASONING-STREAM: SSE streaming via on_reasoning_chunk
+# ---------------------------------------------------------------------------
+
+
+def _sse_lines(*chunks: str) -> List[str]:
+    """llama-server-style SSE lines: reasoning deltas then content + [DONE]."""
+    lines = []
+    for rc in chunks:
+        lines.append(
+            "data: " + json.dumps({
+                "choices": [{"delta": {"reasoning_content": rc}, "finish_reason": None}]
+            })
+        )
+    lines.append(
+        "data: " + json.dumps({
+            "choices": [{"delta": {"content": "{\"ok\": true}"}, "finish_reason": None}]
+        })
+    )
+    lines.append(
+        "data: " + json.dumps({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 5},
+        })
+    )
+    lines.append("data: [DONE]")
+    return lines
+
+
+def test_complete_streams_reasoning_live_via_callback():
+    """REASONING-STREAM acceptance: with on_reasoning_chunk the client uses
+    the SSE transport and the callback receives each reasoning delta BEFORE
+    complete() returns (the phase writer grows the file during the call)."""
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=_sse_lines("think ", "more"))
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        label="stream-test",
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    # Callback fired during the call, chunk-by-chunk.
+    assert received == ["think ", "more"]
+    record = client.calls[0]
+    assert record.reasoning == "think more"
+    assert record.streamed is True
+    assert record.finish_reason == "stop"
+    assert record.usage["completion_tokens"] == 5
+    # The wire request really used stream=True.
+    assert session.posts[0]["stream"] is True
+
+
+def test_complete_without_callback_stays_batch():
+    """No on_reasoning_chunk -> historical batch behaviour (stream=False),
+    reasoning still captured from the batch message body."""
+    session = _FakeSession([
+        _ok_reasoning_response('{"ok": true}', "thinking...")
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    out = client.complete(
+        [{"role": "user", "content": "x"}], max_tokens=10, label="batch-test"
+    )
+    assert out == '{"ok": true}'
+    assert session.posts[0]["stream"] is False
+    assert client.calls[0].reasoning == "thinking..."
+    assert client.calls[0].streamed is False
+
+
+def test_complete_stream_falls_back_to_batch_on_http_error():
+    """If the SSE stream fails (e.g. 500), the call falls back to the batch
+    path and the callback receives the full reasoning once after completion
+    (documented fallback)."""
+    session = _FakeSession([
+        _FakeResponse(status_code=500, text="boom"),
+        _FakeResponse(status_code=500, text="boom"),
+        _ok_reasoning_response('{"ok": true}', "batch-thinking"),
+    ])
+    client = ApiClient(
+        ApiClientConfig(http_retries=2, retry_delay_seconds=0.0),
+        session=session,
+    )
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    assert received == ["batch-thinking"]  # one post-completion delivery
+    assert client.calls[0].streamed is False
+    assert client.calls[0].reasoning == "batch-thinking"
+    # First two POSTs were the stream attempts, third the batch fallback.
+    assert session.posts[0]["stream"] is True
+    assert session.posts[1]["stream"] is True
+    assert session.posts[2]["stream"] is False
+
+
+def test_complete_stream_falls_back_to_batch_on_non_sse_body():
+    """A 200 response that is not SSE (no data: lines) must not silently
+    produce empty text — fall back to the batch path."""
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=["not an sse body"]),
+        _ok_reasoning_response('{"ok": true}', "batch-thinking"),
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    assert received == ["batch-thinking"]
+    assert client.calls[0].streamed is False
+
+
+class _RollbackSink:
+    """Callable reasoning sink that also supports transactional rollback.
+
+    Mirrors the production phase writer (``open_reasoning_writer``): chunks
+    are recorded on call; ``rollback()`` discards everything recorded so far
+    (like truncating the reasoning file back to its pre-call state).
+    """
+
+    def __init__(self) -> None:
+        self.received: List[str] = []
+        self.rollbacks = 0
+
+    def __call__(self, chunk: str) -> None:
+        self.received.append(chunk)
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+        self.received.clear()
+
+
+def test_complete_truncated_stream_falls_back_to_batch():
+    """Regression (RV t_df24524d HIGH + RV2 t_a7c14251 HIGH): an SSE stream
+    that ends before [DONE] / terminal finish_reason is a truncated response
+    — ApiClientError must be raised so complete() performs the batch
+    fallback instead of returning a partial/empty streamed response as
+    success. The fallback is transactional: the partial streamed delta is
+    rolled back (sink.rollback()), so the sink receives the full batch
+    reasoning EXACTLY ONCE — no partial+full duplicate artifact."""
+    lines = [
+        "data: " + json.dumps({
+            "choices": [{"delta": {"reasoning_content": "partial "}, "finish_reason": None}]
+        }),
+        "data: " + json.dumps({
+            "choices": [{"delta": {"content": "{\"partial\":"}, "finish_reason": None}]
+        }),
+        # stream dies here: no finish_reason chunk, no data: [DONE]
+    ]
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=lines),
+        _ok_reasoning_response('{"ok": true}', "batch-thinking"),
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    sink = _RollbackSink()
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=sink,
+    )
+
+    # Fallback happened: batch result wins, the sink got the batch reasoning
+    # exactly once (the tentative "partial " delta was rolled back).
+    assert out == '{"ok": true}'
+    assert sink.received == ["batch-thinking"]
+    assert sink.rollbacks == 1
+    record = client.calls[0]
+    assert record.streamed is False
+    assert record.reasoning == "batch-thinking"
+    assert record.finish_reason == "stop"
+    # One stream POST (ApiClientError is not retried) + one batch POST.
+    assert len(session.posts) == 2
+    assert session.posts[0]["stream"] is True
+    assert session.posts[1]["stream"] is False
+
+
+def test_complete_truncated_stream_plain_sink_keeps_partial():
+    """Documented limitation (RV2 t_a7c14251 HIGH): a sink WITHOUT a
+    rollback() method cannot discard the tentative streamed delta — it keeps
+    the partial chunk AND the full batch reasoning. The batch fallback still
+    delivers the full reasoning once; only rollback-capable sinks (the
+    production file writer) get the transactional exactly-once artifact."""
+    lines = [
+        "data: " + json.dumps({
+            "choices": [{"delta": {"reasoning_content": "partial "}, "finish_reason": None}]
+        }),
+        # stream dies here
+    ]
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=lines),
+        _ok_reasoning_response('{"ok": true}', "batch-thinking"),
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    assert received == ["partial ", "batch-thinking"]
+    assert client.calls[0].streamed is False
+    assert client.calls[0].reasoning == "batch-thinking"
+
+
+def test_complete_midstream_retry_rolls_back_tentative_chunks():
+    """Regression (RV2 t_a7c14251 HIGH): when a stream attempt fails
+    mid-stream (connection drop) after delivering tentative reasoning
+    chunks, the retry must start from a clean sink — the failed attempt's
+    chunks are rolled back so only the retry's reasoning survives."""
+    import requests as _requests
+
+    class _DroppingStream(_FakeStreamResponse):
+        def iter_lines(self, decode_unicode: bool = False):
+            for i, line in enumerate(self._lines):
+                if i == 1:
+                    raise _requests.ConnectionError("connection dropped")
+                yield line
+
+    session = _FakeSession([
+        _DroppingStream(status_code=200, lines=_sse_lines("tentative-", "garbage")),
+        _FakeStreamResponse(status_code=200, lines=_sse_lines("clean-", "reasoning")),
+    ])
+    client = ApiClient(ApiClientConfig(retry_delay_seconds=0.0), session=session)
+    sink = _RollbackSink()
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=sink,
+    )
+
+    # First attempt streamed "tentative-" then dropped; rollback cleared it;
+    # the retry's clean reasoning is the only content.
+    assert out == '{"ok": true}'
+    assert sink.received == ["clean-", "reasoning"]
+    assert sink.rollbacks == 1
+    record = client.calls[0]
+    assert record.streamed is True
+    assert record.reasoning == "clean-reasoning"
+    assert len(session.posts) == 2
+
+
+def test_complete_malformed_data_line_falls_back_to_batch():
+    """Regression (RV t_df24524d HIGH): a data: line that is not valid JSON
+    (e.g. ``data: not-json``) is a malformed SSE payload — ApiClientError
+    must be raised so complete() falls back to the batch path instead of
+    treating the stream as a successful empty response."""
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=["data: not-json"]),
+        _ok_reasoning_response('{"ok": true}', "batch-thinking"),
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    assert received == ["batch-thinking"]  # once, post-completion
+    record = client.calls[0]
+    assert record.streamed is False
+    assert record.reasoning == "batch-thinking"
+    assert record.finish_reason == "stop"
+    assert len(session.posts) == 2
+    assert session.posts[0]["stream"] is True
+    assert session.posts[1]["stream"] is False
+
+
+def test_consume_sse_raises_on_truncated_stream():
+    """Direct contract: _consume_sse must raise ApiClientError for a stream
+    that ends without a terminal marker, so complete() can do the fallback."""
+    lines = [
+        "data: " + json.dumps({
+            "choices": [{"delta": {"content": "partial"}, "finish_reason": None}]
+        }),
+    ]
+    client = ApiClient(ApiClientConfig())
+    with pytest.raises(ApiClientError, match="truncated SSE stream"):
+        client._consume_sse(
+            _FakeStreamResponse(status_code=200, lines=lines),
+            on_reasoning_chunk=lambda s: None,
+            http_status=200,
+            response_format_attempted=True,
+            attempts=1,
+        )
+
+
+def test_consume_sse_raises_on_malformed_data_line():
+    """Direct contract: a non-JSON data: payload must raise ApiClientError
+    instead of being silently skipped (fail-closed)."""
+    client = ApiClient(ApiClientConfig())
+    with pytest.raises(ApiClientError, match="malformed SSE data payload"):
+        client._consume_sse(
+            _FakeStreamResponse(status_code=200, lines=["data: not-json"]),
+            on_reasoning_chunk=lambda s: None,
+            http_status=200,
+            response_format_attempted=True,
+            attempts=1,
+        )
+
+
+def test_complete_callback_exception_does_not_fail_stream():
+    """Regression (RV t_df24524d MEDIUM): an exception raised inside
+    on_reasoning_chunk is a best-effort sink failure — it must be logged and
+    swallowed, NOT propagated (which would break the model call / look like
+    a transport failure). The stream still completes, reasoning still
+    accumulates into the call record, and no batch fallback happens."""
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=_sse_lines("think ", "more"))
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+
+    def _exploding_sink(chunk: str) -> None:
+        raise OSError(f"sink disk failure on {chunk!r}")
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        label="sink-fail",
+        on_reasoning_chunk=_exploding_sink,
+    )
+
+    assert out == '{"ok": true}'
+    record = client.calls[0]
+    assert record.streamed is True          # no false transport failure
+    assert record.reasoning == "think more"  # accumulation stayed correct
+    assert record.finish_reason == "stop"
+    # Only the stream POST happened — no batch fallback, no exception escape.
+    assert len(session.posts) == 1
+    assert session.posts[0]["stream"] is True

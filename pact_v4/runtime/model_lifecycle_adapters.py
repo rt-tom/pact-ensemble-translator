@@ -330,9 +330,17 @@ class LifecycleQwenEntityExtractor:
             ),
         )
 
-    def __call__(self, *, chapter_id: str, source: Mapping[str, str]) -> str:
+    def __call__(
+        self,
+        *,
+        chapter_id: str,
+        source: Mapping[str, str],
+        out_dir: Optional[Path] = None,
+    ) -> str:
         self._router.ensure_resident(QWEN_MODEL_KEY)
-        return self._extractor(chapter_id=chapter_id, source=source)
+        return self._extractor(
+            chapter_id=chapter_id, source=source, out_dir=out_dir
+        )
 
 
 class LifecycleSelectiveRepairEvaluator:

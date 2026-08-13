@@ -343,7 +343,9 @@ class _RecordingExtractor:
         self.payload = payload
         self.calls = 0
 
-    def __call__(self, *, chapter_id: str, source: Dict[str, str]) -> str:
+    def __call__(
+        self, *, chapter_id: str, source: Dict[str, str], out_dir=None
+    ) -> str:
         self.calls += 1
         return json.dumps(self.payload, ensure_ascii=False)
 
@@ -445,6 +447,122 @@ def test_backend_extractor_retries_empty_then_succeeds():
     assert len(backend.requests) == 2
 
 
+def test_backend_extractor_writes_reasoning_and_raw_artifacts(tmp_path):
+    """REASONING-STREAM FIX 1: the extractor persists its reasoning to
+    ``b1.2_entity_reasoning.txt`` and the raw response to
+    ``b1.2_entity_raw.txt`` when an ``out_dir`` is supplied (non-empty when
+    reasoning>0; artifact only, never part of cache identity)."""
+    source = _source_0001()
+    canned = json.dumps(_gold_payload_0001(source), ensure_ascii=False)
+    backend = ScriptedBackend([
+        CompletionResponse(
+            text=canned,
+            model="qwen-3.6-35b",
+            finish_reason="stop",
+            raw_metadata={"reasoning": "thinking about entities..."},
+        )
+    ])
+    extractor = BackendEntityExtractor(backend)
+    raw = extractor(
+        chapter_id=source.chapter_id,
+        source=dict(source.source),
+        out_dir=tmp_path,
+    )
+    assert raw == canned
+    reason_file = tmp_path / "b1.2_entity_reasoning.txt"
+    raw_file = tmp_path / "b1.2_entity_raw.txt"
+    assert reason_file.read_text(encoding="utf-8") == "thinking about entities..."
+    assert raw_file.read_text(encoding="utf-8") == canned
+
+
+def test_backend_extractor_retry_appends_attempt_markers(tmp_path):
+    """REASONING-STREAM FIX 1: on a JSON retry, every attempt's reasoning is
+    preserved in the reasoning file with an ``ATTEMPT N`` marker."""
+    source = _source_0001()
+    canned = json.dumps(_gold_payload_0001(source), ensure_ascii=False)
+    backend = ScriptedBackend([
+        CompletionResponse(
+            text="",
+            model="qwen-3.6-35b",
+            finish_reason="stop",
+            raw_metadata={"reasoning": "attempt-one-reasoning"},
+        ),
+        CompletionResponse(
+            text=canned,
+            model="qwen-3.6-35b",
+            finish_reason="stop",
+            raw_metadata={"reasoning": "attempt-two-reasoning"},
+        ),
+    ])
+    extractor = BackendEntityExtractor(
+        backend,
+        config=BackendEntityExtractorConfig(
+            retry=JsonRetryPolicy(max_retries=1, base_delay_seconds=0.0)
+        ),
+    )
+    raw = extractor(
+        chapter_id=source.chapter_id,
+        source=dict(source.source),
+        out_dir=tmp_path,
+    )
+    assert raw == canned
+    reason_file = tmp_path / "b1.2_entity_reasoning.txt"
+    text = reason_file.read_text(encoding="utf-8")
+    assert "ATTEMPT 1" in text and "attempt-one-reasoning" in text
+    assert "ATTEMPT 2" in text and "attempt-two-reasoning" in text
+
+
+def test_backend_extractor_no_out_dir_writes_nothing(tmp_path):
+    """Without ``out_dir`` the extractor writes no artifacts (old behaviour)."""
+    source = _source_0001()
+    canned = json.dumps(_gold_payload_0001(source), ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(canned)])
+    extractor = BackendEntityExtractor(backend)
+    extractor(chapter_id=source.chapter_id, source=dict(source.source))
+    assert not list(tmp_path.iterdir())
+
+
+def test_backend_extractor_streams_reasoning_live_during_call(tmp_path):
+    """REASONING-STREAM acceptance: with out_dir the reasoning file exists
+    and grows DURING the call — a mock backend that fires
+    on_reasoning_chunk before returning sees the file already populated."""
+    source = _source_0001()
+    canned = json.dumps(_gold_payload_0001(source), ensure_ascii=False)
+    observed: Dict[str, str] = {}
+
+    class _StreamingBackend(ScriptedBackend):
+        def complete(self, request):
+            self.requests.append(request)
+            assert request.on_reasoning_chunk is not None
+            request.on_reasoning_chunk("live-part-1")
+            request.on_reasoning_chunk("live-part-2")
+            # The file must already contain the streamed chunks BEFORE the
+            # call returns (that is what "grows live" means).
+            observed["during"] = (
+                tmp_path / "b1.2_entity_reasoning.txt"
+            ).read_text(encoding="utf-8")
+            return CompletionResponse(
+                text=canned,
+                model="qwen-3.6-35b",
+                finish_reason="stop",
+                raw_metadata={"reasoning": "full-reasoning"},
+            )
+
+    extractor = BackendEntityExtractor(_StreamingBackend([]))
+    raw = extractor(
+        chapter_id=source.chapter_id,
+        source=dict(source.source),
+        out_dir=tmp_path,
+    )
+    assert raw == canned
+    # Live chunks were written while complete() was still running...
+    assert observed["during"] == "live-part-1live-part-2"
+    # ...and the authoritative final write carries the full reasoning.
+    assert (tmp_path / "b1.2_entity_reasoning.txt").read_text(
+        encoding="utf-8"
+    ) == "full-reasoning"
+
+
 def test_backend_extractor_does_not_retry_transport_failure():
     attempts = []
 
@@ -511,7 +629,7 @@ def test_lifecycle_extractor_ensures_qwen_resident_then_calls_backend(
             self.backend = backend
             self.config = config
 
-        def __call__(self, *, chapter_id, source):
+        def __call__(self, *, chapter_id, source, out_dir=None):
             called["chapter_id"] = chapter_id
             called["source"] = dict(source)
             return canned

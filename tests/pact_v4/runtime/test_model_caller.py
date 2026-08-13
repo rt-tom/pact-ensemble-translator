@@ -47,6 +47,7 @@ class _StubApiClient:
         temperature: Optional[float] = None,
         response_format_json: bool = True,
         label: str = "stub",
+        on_reasoning_chunk=None,
     ) -> str:
         self.calls.append({
             "messages": list(messages),

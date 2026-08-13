@@ -113,6 +113,7 @@ from pact_v4.runtime.prompts_runtime import (
     render_reaudit_prompt,
     render_selective_repair_prompt,
 )
+from pact_v4.runtime.reasoning_writer import append_error_marker, open_reasoning_writer
 
 LOG = logging.getLogger(__name__)
 
@@ -1284,6 +1285,12 @@ class SelectiveRepairEvaluator:
             repair_context_window_by_category=cfg.repair_context_window_by_category,
         )
         model_ref = repair_model_ref(self._repair_backend)
+        # REASONING-STREAM: the reasoning file is created BEFORE the call and
+        # grows live via on_reasoning_chunk (gemma_rewrite_v4 pattern); the
+        # authoritative write after completion stays unchanged.
+        reason_path: Optional[Path] = None
+        if out_dir is not None:
+            reason_path = out_dir / f"{out_base}_batch{batch_index}_reasoning.txt"
         request = CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
@@ -1291,17 +1298,22 @@ class SelectiveRepairEvaluator:
             temperature=0.0,
             response_schema=JSON_OBJECT_SCHEMA,
             label=cfg.label,
+            on_reasoning_chunk=open_reasoning_writer(reason_path),
             # NOTE: no request_options — the reasoning budget is a server arg.
         )
         try:
             response = self._repair_backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
             LOG.error("repair batch transport failure (%s): %s", type(exc).__name__, exc)
-            self._write_batch_artifacts(
-                out_dir=out_dir, out_base=out_base, batch_index=batch_index,
-                content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
-                reasoning="",
-            )
+            # Raw error trail + preserve any reasoning that streamed live
+            # before the failure instead of wiping it.
+            if out_dir is not None:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / f"{out_base}_batch{batch_index}_raw.txt").write_text(
+                    f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                    encoding="utf-8",
+                )
+                append_error_marker(reason_path, exc)
             return RepairBatchOutcome(
                 batch_index=batch_index,
                 status="FAILED",
@@ -1445,6 +1457,14 @@ class SelectiveRepairEvaluator:
                 chunk_index=chunk_index,
                 chunk_total=len(chunks),
             )
+            # REASONING-STREAM: the reasoning file is created BEFORE the call
+            # and grows live via on_reasoning_chunk (gemma_rewrite_v4 pattern);
+            # the per-attempt authoritative write below stays unchanged.
+            reason_path: Optional[Path] = None
+            if out_dir is not None:
+                reason_path = out_dir / (
+                    f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
+                )
             request = CompletionRequest(
                 model_ref=model_ref,
                 messages=(Message(role="user", content=prompt),),
@@ -1452,6 +1472,7 @@ class SelectiveRepairEvaluator:
                 temperature=0.0,
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=cfg.reaudit_label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
             )
 
             def _complete() -> str:
@@ -1471,13 +1492,17 @@ class SelectiveRepairEvaluator:
                     # C1 (run_010): even a transport failure leaves a disk
                     # trail — the empty-JSON mystery (8265 tokens, content=0)
                     # must be diagnosable from the artifact, not just the
-                    # journal.
-                    self._write_reaudit_artifacts(
-                        out_dir=out_dir, out_base=out_base,
-                        chunk_index=chunk_index,
-                        content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
-                        reasoning="",
-                    )
+                    # journal. Preserve any reasoning streamed live before
+                    # the failure instead of wiping it.
+                    if out_dir is not None:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        (out_dir / (
+                            f"{out_base}_reaudit_chunk{chunk_index}_raw.txt"
+                        )).write_text(
+                            f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                            encoding="utf-8",
+                        )
+                        append_error_marker(reason_path, exc)
                     raise
                 text = response.text or ""
                 reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
