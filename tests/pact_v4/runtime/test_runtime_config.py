@@ -127,6 +127,41 @@ def test_opencode_identity_changes_with_structured_output_policy():
     assert a.identity_hash != b.identity_hash
 
 
+def test_opencode_identity_changes_with_timeout_seconds():
+    # TIMEOUT-FIX (2026-08-13): timeout_seconds is serialized into the
+    # backend descriptor (build_opencode_descriptor), so it is an identity
+    # parameter: a config that changes the transport budget invalidates
+    # cache/resume and must use a fresh --out-dir/--run-label.
+    a = OpenCodeBackendConfig(
+        server=OpenCodeServerBackendConfig(
+            base_url="http://127.0.0.1:4096",
+            model_bindings={"generator": "opencode-go/deepseek-v4-flash"},
+            timeout_seconds=600.0,
+        )
+    )
+    b = OpenCodeBackendConfig(
+        server=OpenCodeServerBackendConfig(
+            base_url="http://127.0.0.1:4096",
+            model_bindings={"generator": "opencode-go/deepseek-v4-flash"},
+            timeout_seconds=900.0,
+        )
+    )
+    assert a.identity_hash != b.identity_hash
+
+
+def test_opencode_timeout_seconds_default_is_900():
+    # TIMEOUT-FIX: whole-chapter generation with --reasoning 3 takes up to
+    # ~10 min (run_remote_003 attempt 2 was cut at exactly 600s); the
+    # default transport budget is 15 min (owner decision 2026-08-13: 900,
+    # NOT 2400 — headroom over the real 7-10 min) so a long generation is
+    # not aborted.
+    cfg = OpenCodeServerBackendConfig(
+        base_url="http://127.0.0.1:4096",
+        model_bindings={"generator": "opencode-go/deepseek-v4-flash"},
+    )
+    assert cfg.timeout_seconds == 900.0
+
+
 def test_opencode_server_mode_validation():
     server = OpenCodeServerBackendConfig(
         base_url="http://127.0.0.1:4096", model_bindings={"generator": "opencode-go/x"},
@@ -309,6 +344,36 @@ def test_load_opencode_remote_budget_defaults_to_500() -> None:
     assert cfg.server.remote_budget.max_requests_per_chapter == 500
 
 
+def test_load_opencode_timeout_seconds_from_yaml() -> None:
+    # TIMEOUT-FIX: the remote example carries an explicit timeout_seconds
+    # (900 = 15 min, owner decision 2026-08-13) because whole-chapter
+    # generation with --reasoning 3 exceeds the old 600s budget; the loader
+    # must surface it and the missing key must fall back to the raised
+    # default.
+    payload = {
+        "kind": "opencode_server",
+        "base_url": "http://127.0.0.1:4096",
+        "server_mode": "external",
+        "model_bindings": {"generator": "opencode-go/deepseek-v4-flash"},
+        "timeout_seconds": 900,
+    }
+    cfg = load_runtime_config(payload)
+    assert isinstance(cfg, OpenCodeBackendConfig)
+    assert cfg.server.timeout_seconds == 900.0
+    # Missing key -> the code default (900.0), not an older 600s budget;
+    # explicit 900 and the default produce the SAME identity (one value).
+    default_cfg = load_runtime_config(
+        {k: v for k, v in payload.items() if k != "timeout_seconds"}
+    )
+    assert default_cfg.server.timeout_seconds == 900.0
+    assert default_cfg.identity_hash == cfg.identity_hash
+    # timeout_seconds participates in identity: a changed budget (600) must
+    # produce a different identity than the default (cache/resume boundary).
+    legacy_cfg = load_runtime_config({**payload, "timeout_seconds": 600})
+    assert legacy_cfg.server.timeout_seconds == 600.0
+    assert legacy_cfg.identity_hash != cfg.identity_hash
+
+
 def test_load_opencode_remote_budget_partial_block_keeps_other_defaults() -> None:
     # Only the overridden field changes; the rest fall back to the class
     # defaults (B11 identity stability for a single-field budget block).
@@ -484,12 +549,17 @@ def test_example_composite_config_loads_with_string_server_args():
 
 def test_example_remote_config_loads_remote_budget_500():
     """B11: the remote example carries the identity-bound budget block, and
-    the loader must surface it as the effective per-chapter budget."""
+    the loader must surface it as the effective per-chapter budget.
+    TIMEOUT-FIX: the example also pins timeout_seconds=900 (15 min, owner
+    decision 2026-08-13) so a whole-chapter generation with --reasoning 3
+    (up to ~10 min) is not cut at the old 600s budget.
+    """
     yaml = pytest.importorskip("yaml")
     path = _repo_root() / "configs" / "runtime_remote.example.yaml"
     cfg = load_runtime_config(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert isinstance(cfg, OpenCodeBackendConfig)
     assert cfg.server.remote_budget.max_requests_per_chapter == 500
+    assert cfg.server.timeout_seconds == 900.0
 
 
 def test_local_config_rejects_non_string_server_args():

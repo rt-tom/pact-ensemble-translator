@@ -726,6 +726,42 @@ def test_timeout_error_normalizes_as_transport_timeout():
     assert exc_info.value.error_class == ERROR_TRANSPORT_TIMEOUT
 
 
+def test_long_generation_request_is_not_aborted_by_default_timeout():
+    # TIMEOUT-FIX (2026-08-13): whole-chapter generation with --reasoning 3
+    # takes >10 min (run_remote_003 attempt 2 was cut at exactly 600s). The
+    # fake models a deterministic VIRTUAL generation duration of 700s —
+    # beyond the old 600s budget, inside the raised 900s default (owner
+    # decision 2026-08-13) — and ENFORCES the transport ``timeout`` it
+    # receives against that duration, so the contract is proven without
+    # sleeping 10-15 real minutes.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("long generation done"))
+    fake.virtual_generation_seconds = 700.0
+    backend = _backend(fake)  # default timeout_seconds = 900.0
+    response = backend.complete(_request())
+    assert response.text == "long generation done"
+    # The transport budget actually handed to the session is 900s, not 600s.
+    message_posts = [
+        timeout
+        for (method, path, _), timeout in zip(fake.requests_log, fake.timeouts_log)
+        if method == "POST" and "/message" in path
+    ]
+    assert message_posts, "expected at least one message POST"
+    assert all(t == 900.0 for t in message_posts)
+
+    # The SAME 700s simulation with the old 600s budget is aborted by the
+    # transport: the fake (standing in for requests.Session) raises
+    # requests.exceptions.Timeout, which the backend normalizes to
+    # ERROR_TRANSPORT_TIMEOUT — a 600s config would still cut the request.
+    fake_600 = FakeOpenCodeServer()
+    fake_600.script_message(_text_message("long generation done"))
+    fake_600.virtual_generation_seconds = 700.0
+    backend_600 = _backend(fake_600, timeout_seconds=600.0, http_retries=0)
+    with pytest.raises(OpenCodeError) as exc_info:
+        backend_600.complete(_request())
+    assert exc_info.value.error_class == ERROR_TRANSPORT_TIMEOUT
+
+
 def test_429_retries_with_retry_after():
     fake = FakeOpenCodeServer()
     fake.script_message(
