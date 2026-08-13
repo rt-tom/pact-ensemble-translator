@@ -4394,6 +4394,21 @@ def _run_whole_chapter_strict_impl(
         def _wc_reasoning_sink(attempt: int, reasoning: str) -> None:
             reasoning_by_attempt[attempt] = reasoning
 
+        # RAW-SINK (architect, run_remote_004/005): persist the raw model
+        # response of EVERY whole-chapter attempt to a disk file. The run_011
+        # lesson (raw on every attempt) previously covered R/audit/repair but
+        # NOT generation — a TruncatedJSONError left no text trail and the
+        # diagnosis (fences? pid-colon? provider budget?) was guesswork. Each
+        # attempt writes whole_chapter_attempt{N}_raw.txt (attempt 0 ->
+        # whole_chapter_attempt0_raw.txt). Best-effort: a write failure never
+        # changes generation behavior.
+        def _wc_raw_sink(attempt: int, raw: str) -> None:
+            try:
+                name = f"whole_chapter_attempt{attempt}_raw.txt"
+                (cfg.out_dir / name).write_text(raw, encoding="utf-8")
+            except Exception:  # noqa: BLE001 — diagnostics hook
+                LOG.debug("whole-chapter raw_sink write failed", exc_info=True)
+
         # V4.1 GEN-STREAM: per-attempt live reasoning writer. The file is
         # created BEFORE the model call (open_reasoning_writer truncates and
         # returns an appender) and grows live while the model generates
@@ -4434,6 +4449,7 @@ def _run_whole_chapter_strict_impl(
             ),
             reasoning_sink=_wc_reasoning_sink,
             live_reasoning_writer=_wc_live_reasoning_writer,
+            raw_sink=_wc_raw_sink,
         )
         progress.wc_generation_done(
             finish_reason="complete" if outcome.status == "complete" else "incomplete",
