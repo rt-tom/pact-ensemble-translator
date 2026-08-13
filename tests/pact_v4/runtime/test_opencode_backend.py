@@ -613,6 +613,46 @@ def test_prompt_only_mode_does_not_send_format():
     assert "format" not in fake.last_message_body()
 
 
+def test_message_level_transport_error_retried_with_new_session():
+    """R-RETRY (t_8ab8ab35, run_remote_002 chunk2): a message-level
+    transport error ('Type validation failed: Value: {}' from a dead
+    session) is retried with a NEW session, bounded like the HTTP path —
+    the chunk recovers instead of being lost."""
+    fake = FakeOpenCodeServer()
+    # Attempt 1: message-level error mapped to transport_network (unknown
+    # error name -> transport class, like the run_remote_002 empty {}).
+    fake.script_message(
+        {
+            "info": {
+                "id": "m_dead",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "deepseek-v4-flash",
+                "error": {
+                    "name": "TypeValidationError",
+                    "data": {"message": "Type validation failed: Value: {}"},
+                },
+                "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [],
+        }
+    )
+    # Attempt 2 (NEW session): recovers.
+    fake.script_message(_text_message("recovered"))
+    backend = _backend(fake, http_retries=1, retry_delay_seconds=0.0)
+    response = backend.complete(_request())
+    assert response.text == "recovered"
+    assert response.retry_count == 1
+    assert len(fake.message_bodies()) == 2
+    # The retry used a NEW session (the old one was dead) — two distinct
+    # session ids in the attempt log.
+    attempts = response.raw_metadata["attempts"]
+    session_ids = {a.get("session_id") for a in attempts if a.get("session_id")}
+    assert len(session_ids) == 2, f"expected a new session per retry: {session_ids}"
+    assert backend.call_records()[0].retry_count == 1
+
+
+
 # ---------------------------------------------------------------------------
 # Errors: timeout / network / 429 / 5xx / auth
 # ---------------------------------------------------------------------------

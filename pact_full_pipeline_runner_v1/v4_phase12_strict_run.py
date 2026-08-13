@@ -513,6 +513,12 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             # at module defaults), and it is part of the config identity — a
             # policy change invalidates the cached repaired map.
             reasoning_budget=cfg.audit_reasoning_budget,
+            # R-RETRY (t_8ab8ab35, F5): the chunk-level TRANSPORT_ERROR
+            # retry policy is WIRED from the run config (never silently left
+            # at module defaults) and participates in the config identity —
+            # a policy change invalidates the cached audit.
+            audit_transport_max_retries=cfg.audit_transport_max_retries,
+            audit_transport_base_delay_seconds=cfg.audit_transport_base_delay_seconds,
             repair_findings_cap=cfg.audit_repair_findings_cap,
             repair_microbatch_trigger=cfg.audit_repair_microbatch_trigger,
             repair_microbatch_target=cfg.audit_repair_microbatch_target,
@@ -569,6 +575,13 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             russian_editor_safe_classes=frozenset(
                 cfg.russian_editor_safe_classes
             ),
+            # R-RETRY (t_8ab8ab35, F5): the per-pid edit cap and the bounded
+            # retry policy are WIRED from the run config (never silently left
+            # at module defaults) and participate in the config identity — a
+            # policy change invalidates the cached repaired map.
+            russian_editor_max_edits_per_pid=cfg.russian_editor_max_edits_per_pid,
+            russian_editor_retry_max_retries=cfg.russian_editor_retry_max_retries,
+            russian_editor_retry_base_delay_seconds=cfg.russian_editor_retry_base_delay_seconds,
         ),
     )
 

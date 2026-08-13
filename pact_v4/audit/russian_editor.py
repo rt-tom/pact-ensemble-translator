@@ -36,8 +36,13 @@ harmful):
    verified by the B2 repair-as-verifier against the ORIGINAL).
 6. **Fail-closed (per-chunk)** — a structurally invalid chunk (unknown pid,
    pid outside the chunk, ``original`` not a verbatim substring of the
-   current text, unknown class, non-string/missing fields, duplicate pid)
-   makes the WHOLE chunk FAILED, and the stage is recorded ``complete=False``.
+   current text, unknown class, non-string/missing fields) makes the WHOLE
+   chunk FAILED, and the stage is recorded ``complete=False``. R-RETRY
+   (t_8ab8ab35): a DUPLICATE pid is NOT structural — up to
+   ``MAX_EDITS_PER_PID`` edits per pid are accepted (the model legitimately
+   returns 2+ problems for one pid, run_remote_002 chunk4 p00180), the
+   11th+ drops per-edit with a WARNING; TRANSPORT failures and
+   INVALID_JSON/empty bodies get a bounded retry (3 attempts, backoff).
    Fail-closed is per-chunk: a failed chunk contributes NO edits to
    ``edits``/``applied``/``candidates``, so the caller applies exactly the
    successful chunks' work (RESILIENCE t_406fc48c, run_remote_001: 17 valid
@@ -56,6 +61,7 @@ This module is pure and deterministic except for the injected model calls.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -67,7 +73,10 @@ from pact_v4.runtime.backend_protocol import (
     CompletionRequest,
     Message,
 )
-from pact_v4.runtime.json_resilience import parse_json_response
+from pact_v4.runtime.json_resilience import (
+    JsonRetryPolicy,
+    parse_json_response,
+)
 from pact_v4.runtime.prompts_runtime import (
     RUSSIAN_EDITOR_V4_2_R1,
     ReviewerPrompt,
@@ -98,6 +107,23 @@ DEFAULT_OVERLAP_PAIRS = 6
 # the chunked audit; the editor never emits request_options (reasoning is a
 # server arg, V4.1 rule).
 DEFAULT_MAX_TOKENS = 12000
+
+# R-RETRY (t_8ab8ab35, owner contract 2026-08-13): the R stage is the only
+# phase WITHOUT retry; run_remote_002/013 showed two FAILED-chunk classes.
+# This cap allows up to N edits per pid — the model legitimately returns
+# 2+ problems for one pid (typo + grammar, run_remote_002 chunk4 p00180);
+# the old "1 pid = 1 edit" fail-closed contract discarded the WHOLE chunk
+# on a duplicate. The 11th+ edit of the same pid is dropped per-edit with a
+# WARNING (journal), never a structural error.
+MAX_EDITS_PER_PID = 10
+
+# Bounded retry policy for the R stage (mirrors the re-audit B4 pattern:
+# selective_repair.JsonRetryPolicy defaults — max_retries=2 -> 3 attempts,
+# base_delay_seconds=1.0). Applied to TRANSPORT failures AND
+# INVALID_JSON/empty bodies; structural errors (pid outside chunk, unknown
+# class, original not a substring) are NEVER retried (not randomness).
+DEFAULT_RETRY_MAX_RETRIES: int = JsonRetryPolicy().max_retries
+DEFAULT_RETRY_BASE_DELAY_SECONDS: float = JsonRetryPolicy().base_delay_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +194,14 @@ class RussianEditorConfig:
     label: str = "phase3/russian_editor_v4"
     harness_version: str = RUSSIAN_EDITOR_HARNESS_VERSION
     prompt_version: str = RUSSIAN_EDITOR_PROMPT_VERSION
+    # R-RETRY (t_8ab8ab35): the per-pid edit cap (duplicate pid is NOT an
+    # error — up to this many edits per pid; the 11th+ drops per-edit with
+    # a WARNING). Identity-bearing via StrictRunConfig (F5).
+    max_edits_per_pid: int = MAX_EDITS_PER_PID
+    # Bounded retry policy (transport + empty/truncated JSON), identity-
+    # bearing via StrictRunConfig (F5): flipping it must invalidate cache.
+    retry_max_retries: int = DEFAULT_RETRY_MAX_RETRIES
+    retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -178,6 +212,11 @@ class RussianEditorConfig:
             "label": self.label,
             "harness_version": self.harness_version,
             "prompt_version": self.prompt_version,
+            "max_edits_per_pid": self.max_edits_per_pid,
+            "r_editor_retry": {
+                "max_retries": self.retry_max_retries,
+                "base_delay_seconds": self.retry_base_delay_seconds,
+            },
         }
 
 
@@ -212,6 +251,10 @@ class RussianEditorOutcome:
     applied: Tuple[Tuple[str, str], ...]
     candidates: Tuple[ReviewCandidate, ...]
     dropped: int
+    # R-RETRY (t_8ab8ab35): count of per-edit drops that did NOT fail the
+    # chunk (edits over MAX_EDITS_PER_PID dropped with a WARNING; SAFE edits
+    # whose fragment stopped being a substring after earlier same-pid edits).
+    warning_count: int = 0
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -247,6 +290,7 @@ class RussianEditorOutcome:
                 for c in self.candidates
             ],
             "dropped": self.dropped,
+            "warning_count": self.warning_count,
         }
 
 
@@ -297,11 +341,34 @@ def get_editor_overlap(
 # ---------------------------------------------------------------------------
 
 
+def _is_retryable_json_error(errors: Sequence[str]) -> bool:
+    """Whether ``parse_editor_edits`` errors are INVALID_JSON/empty (retryable).
+
+    R-RETRY (t_8ab8ab35): only the JSON-level failure (empty body / not
+    complete JSON after fence/prose stripping) is retried. Structural
+    errors (pid outside chunk, unknown class, original not a substring,
+    missing fields) and valid-JSON-wrong-shape (B4: not a retry trigger)
+    are NOT randomness — fail-closed as-is.
+    """
+    if not errors:
+        return False
+    # parse_editor_edits reports the JSON-level failure as a single
+    # "response is not valid JSON: ..." error; structural errors never
+    # start with that prefix. A valid-JSON-wrong-shape body (bare string,
+    # etc.) is reported by parse_json_response as "valid JSON but not an
+    # object" — per B4 that is NOT a retry trigger (retry only
+    # empty/truncated JSON).
+    if len(errors) != 1 or not errors[0].startswith("response is not valid JSON:"):
+        return False
+    return "valid JSON but not an object" not in errors[0]
+
+
 def parse_editor_edits(
     text: str,
     chunk_pids: Sequence[str],
     current_by_pid: Mapping[str, str],
-) -> Tuple[Tuple[EditorEdit, ...], Tuple[str, ...]]:
+    max_edits_per_pid: int = MAX_EDITS_PER_PID,
+) -> Tuple[Tuple[EditorEdit, ...], Tuple[str, ...], Tuple[str, ...]]:
     """Parse and strictly validate one Russian-editor chunk response.
 
     Fail-closed contract: the response must be a JSON object with an
@@ -311,27 +378,39 @@ def parse_editor_edits(
     a substring of the current text — R-FIX2, run_012 p00010-class
     fragments), carry a non-empty ``rewritten`` and ``reason``, and tag a
     KNOWN class. Any structural violation (unknown pid, original not a
-    substring, unknown class, missing/non-string fields, duplicate pid)
-    fails the WHOLE chunk — a bad chunk is never silently read as
-    ``edits=[]``.
+    substring, unknown class, missing/non-string fields) fails the WHOLE
+    chunk — a bad chunk is never silently read as ``edits=[]``.
+
+    R-RETRY (t_8ab8ab35, owner contract 2026-08-13): a DUPLICATE pid is NOT
+    a structural violation anymore — the model legitimately returns 2+
+    problems for one pid (typo + grammar, run_remote_002 chunk4 p00180),
+    and the old fail-closed "1 pid = 1 edit" threw away the whole chunk.
+    Up to ``max_edits_per_pid`` edits per pid are accepted; the edit over
+    the cap is dropped per-edit and reported as a WARNING (third return
+    element), never as an error. Fail-closed is preserved for: pid outside
+    the chunk, unknown class, original not a substring, invalid JSON.
 
     The diff-gate (``rewritten == original`` → no-op) is NOT a parse error:
     a no-op edit is structurally valid but worthless, so it is cut per-edit
     by the caller (dropped count), never applied and never a candidate.
+
+    Returns ``(edits, errors, warnings)`` — ``errors`` fail the chunk,
+    ``warnings`` are per-edit drops that did NOT fail it.
     """
     errors: list = []
+    warnings: list = []
     try:
         parsed = parse_json_response(text)
     except Exception as exc:
-        return (), (f"response is not valid JSON: {exc}",)
+        return (), (f"response is not valid JSON: {exc}",), ()
     if not isinstance(parsed, dict) or "edits" not in parsed:
-        return (), ("root object has no 'edits' array",)
+        return (), ("root object has no 'edits' array",), ()
     edits = parsed.get("edits")
     if not isinstance(edits, list):
-        return (), ("'edits' is not an array",)
+        return (), ("'edits' is not an array",), ()
     chunk_pid_set = frozenset(chunk_pids)
     out: list = []
-    seen: set = set()
+    pid_count: dict = {}
     for item in edits:
         if not isinstance(item, dict):
             errors.append("edit entry is not an object")
@@ -347,10 +426,16 @@ def parse_editor_edits(
         if pid not in chunk_pid_set:
             errors.append(f"edit pid {pid!r} is not in the current chunk")
             continue
-        if pid in seen:
-            errors.append(f"duplicate edit pid {pid}")
+        # R-RETRY: duplicate pid is allowed up to the cap. The 11th+ edit
+        # of the same pid is dropped per-edit with a WARNING (journal),
+        # never a structural error — the chunk stays GOOD.
+        if pid_count.get(pid, 0) >= max_edits_per_pid:
+            warnings.append(
+                f"duplicate edit pid {pid} dropped "
+                f"(over MAX_EDITS_PER_PID={max_edits_per_pid})"
+            )
             continue
-        seen.add(pid)
+        pid_count[pid] = pid_count.get(pid, 0) + 1
         if not isinstance(original, str) or original == "":
             errors.append(f"pid {pid}: original is missing or not a string")
             continue
@@ -388,8 +473,8 @@ def parse_editor_edits(
         )
     if errors:
         # Fail-closed: a structurally invalid chunk is never partially used.
-        return (), tuple(errors)
-    return tuple(out), ()
+        return (), tuple(errors), tuple(warnings)
+    return tuple(out), (), tuple(warnings)
 
 
 def route_edits(
@@ -397,8 +482,8 @@ def route_edits(
     *,
     current_by_pid: Mapping[str, str],
     safe_classes: frozenset = frozenset(SAFE_CLASSES),
-) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[ReviewCandidate, ...], int]:
-    """Route parsed edits into (applied, candidates, dropped).
+) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[ReviewCandidate, ...], int, Tuple[str, ...]]:
+    """Route parsed edits into (applied, candidates, dropped, warnings).
 
     * SAFE-classed edit with ``rewritten != original`` (diff-gate) →
       applied ``(pid, new_text)`` where ``new_text`` is the current text
@@ -410,22 +495,43 @@ def route_edits(
     * any class with ``rewritten == original`` → no-op, dropped (the
       p00095-class false positive the diff-gate cuts).
 
+    R-RETRY (t_8ab8ab35, owner contract 2026-08-13): SAFE edits of the same
+    PID apply SEQUENTIALLY — the working text is updated between edits of
+    one pid, so a later edit replaces against the ACTUAL current text (two
+    different fragments of one pid are both applied, run_remote_002 chunk4
+    p00180 typo+grammar). If a later edit's fragment stopped being a
+    substring after the earlier edits, it is dropped per-edit with a
+    WARNING (never a structural error — the chunk stays GOOD). REVIEW
+    candidates go to repair ALL together (CANDIDATE-MERGE already full-
+    merges by pid).
+
     ``current_by_pid`` is the pid→current-text map the parse validated
-    against; parse guarantees ``original`` is a substring, so ``replace``
-    always finds the fragment (fail-closed at parse, applied here).
+    against; parse guarantees ``original`` is a substring of the ORIGINAL
+    text, so the FIRST replace always finds the fragment (fail-closed at
+    parse, applied here).
     """
     applied: list = []
     candidates: list = []
     dropped = 0
+    warnings: list = []
+    # Working copy: SAFE edits of one pid update it between edits, so a
+    # later same-pid edit replaces against the actual current text.
+    working: dict = {pid: str(text) for pid, text in current_by_pid.items()}
     for edit in edits:
         if edit.rewritten == edit.original:
             dropped += 1
             continue
         if edit.klass in safe_classes:
-            current = str(current_by_pid.get(edit.pid, ""))
-            applied.append(
-                (edit.pid, current.replace(edit.original, edit.rewritten, 1))
-            )
+            current = working.get(edit.pid, "")
+            if edit.original not in current:
+                warnings.append(
+                    f"pid {edit.pid}: original is no longer a substring after "
+                    f"earlier edits — SAFE edit skipped per-edit"
+                )
+                continue
+            new_text = current.replace(edit.original, edit.rewritten, 1)
+            working[edit.pid] = new_text
+            applied.append((edit.pid, new_text))
         else:
             candidates.append(
                 ReviewCandidate(
@@ -436,7 +542,7 @@ def route_edits(
                     reason=edit.reason,
                 )
             )
-    return tuple(applied), tuple(candidates), dropped
+    return tuple(applied), tuple(candidates), dropped, tuple(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +642,9 @@ class RussianEditorEvaluator:
         chunks = build_editor_chunks(pairs, chunk_size=cfg.chunk_size)
         all_edits: List[EditorEdit] = []
         failed_chunks: List[int] = []
+        # Per-chunk parse warnings (over MAX_EDITS_PER_PID drops) — counted
+        # separately from route warnings in the outcome.
+        chunk_warning_counts: List[int] = []
 
         for chunk_index, chunk_pairs in enumerate(chunks, start=1):
             chunk_pids = [p.pid for p in chunk_pairs]
@@ -561,58 +670,119 @@ class RussianEditorEvaluator:
             self._emit_chunk_event(
                 "started", chunk=chunk_index, total=len(chunks)
             )
-            try:
-                response = self._backend.complete(request)
-            except Exception as exc:  # CompletionError + transport failures
-                LOG.error(
-                    "russian_editor chunk %d transport failure (%s): %s",
-                    chunk_index, type(exc).__name__, exc,
-                )
+            # R-RETRY (t_8ab8ab35): the R stage is the only phase without
+            # retry. Bounded retry (mirrors the re-audit B4 pattern) for
+            # TRANSPORT failures and INVALID_JSON/empty bodies — both are
+            # transient (run_remote_002 chunk3 empty body, run_remote_001
+            # chunk1/6 truncation). Structural errors (pid outside chunk,
+            # unknown class, original not a substring) are NOT retried —
+            # they are not randomness, fail-closed as-is.
+            max_attempts = cfg.retry_max_retries + 1
+            chunk_edits: Tuple[EditorEdit, ...] = ()
+            chunk_warnings: Tuple[str, ...] = ()
+            for attempt in range(max_attempts):
+                try:
+                    response = self._backend.complete(request)
+                except Exception as exc:  # CompletionError + transport failures
+                    if attempt < cfg.retry_max_retries:
+                        delay = cfg.retry_base_delay_seconds * (2 ** attempt)
+                        LOG.warning(
+                            "russian_editor chunk %d transport failure (%s) — "
+                            "retry %d/%d in %.2fs",
+                            chunk_index, type(exc).__name__,
+                            attempt + 1, max_attempts, delay,
+                        )
+                        self._emit_chunk_event(
+                            "retry", chunk=chunk_index, attempt=attempt + 1,
+                            total=max_attempts,
+                            error=f"{type(exc).__name__}: {exc}", delay=delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    LOG.error(
+                        "russian_editor chunk %d transport failure (%s): %s",
+                        chunk_index, type(exc).__name__, exc,
+                    )
+                    self._write_chunk_artifacts(
+                        out_dir=out_dir, out_base=out_base, chunk_index=chunk_index,
+                        content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                        reasoning="",
+                    )
+                    failed_chunks.append(chunk_index)
+                    self._emit_chunk_event(
+                        "done", chunk=chunk_index, status="FAILED",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    break
+                content = response.text or ""
+                reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
+                # Persist the raw response + reasoning on EVERY attempt — a
+                # final parse/transport failure then leaves a disk trail
+                # (run_011: 7/8 R chunks FAILED with no artifacts).
                 self._write_chunk_artifacts(
                     out_dir=out_dir, out_base=out_base, chunk_index=chunk_index,
-                    content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
-                    reasoning="",
+                    content=content, reasoning=reasoning,
                 )
-                failed_chunks.append(chunk_index)
-                self._emit_chunk_event(
-                    "done", chunk=chunk_index, status="FAILED",
-                    error=f"{type(exc).__name__}: {exc}",
+                edits, errors, warnings = parse_editor_edits(
+                    content, chunk_pids, current_by_pid=dict(translation),
+                    max_edits_per_pid=cfg.max_edits_per_pid,
                 )
+                if errors and _is_retryable_json_error(errors):
+                    # INVALID_JSON / empty body: the model did not manage to
+                    # answer (max_tokens exhausted inside <think>, truncated
+                    # body). Retryable, bounded (B4 pattern).
+                    if attempt < cfg.retry_max_retries:
+                        delay = cfg.retry_base_delay_seconds * (2 ** attempt)
+                        LOG.warning(
+                            "russian_editor chunk %d invalid JSON (%s) — "
+                            "retry %d/%d in %.2fs",
+                            chunk_index, "; ".join(errors),
+                            attempt + 1, max_attempts, delay,
+                        )
+                        self._emit_chunk_event(
+                            "retry", chunk=chunk_index, attempt=attempt + 1,
+                            total=max_attempts,
+                            error="; ".join(errors), delay=delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                if errors:
+                    # Structural errors (pid outside chunk, unknown class,
+                    # original not a substring) — NOT retried.
+                    LOG.warning(
+                        "russian_editor chunk %d invalid (%s) — chunk FAILED",
+                        chunk_index, "; ".join(errors),
+                    )
+                    failed_chunks.append(chunk_index)
+                    self._emit_chunk_event(
+                        "done", chunk=chunk_index, status="FAILED",
+                        error="; ".join(errors),
+                    )
+                    break
+                chunk_edits = edits
+                chunk_warnings = warnings
+                break
+            else:
                 continue
-            content = response.text or ""
-            reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
-            # Persist the raw response + reasoning on EVERY chunk — a parse
-            # failure then has a disk trail (run_011: 7/8 chunks FAILED with
-            # no artifacts, diagnosis impossible).
-            self._write_chunk_artifacts(
-                out_dir=out_dir, out_base=out_base, chunk_index=chunk_index,
-                content=content, reasoning=reasoning,
-            )
-            edits, errors = parse_editor_edits(
-                content, chunk_pids, current_by_pid=dict(translation)
-            )
-            if errors:
-                LOG.warning(
-                    "russian_editor chunk %d invalid (%s) — chunk FAILED",
-                    chunk_index, "; ".join(errors),
-                )
-                failed_chunks.append(chunk_index)
-                self._emit_chunk_event(
-                    "done", chunk=chunk_index, status="FAILED",
-                    error="; ".join(errors),
-                )
+            if chunk_index in failed_chunks:
                 continue
-            all_edits.extend(edits)
+            all_edits.extend(chunk_edits)
+            chunk_warning_counts.append(len(chunk_warnings))
             self._emit_chunk_event(
                 "done", chunk=chunk_index, status="GOOD",
-                edit_count=len(edits),
+                edit_count=len(chunk_edits),
+                warning_count=len(chunk_warnings),
             )
 
-        applied, candidates, dropped = route_edits(
+        applied, candidates, dropped, route_warnings = route_edits(
             all_edits,
             current_by_pid=dict(translation),
             safe_classes=cfg.safe_classes,
         )
+        # Total per-edit warnings: parse-level (over MAX_EDITS_PER_PID
+        # drops) + route-level (SAFE fragment no longer a substring after
+        # earlier same-pid edits). None of them fail the chunk.
+        parse_warning_count = sum(chunk_warning_counts)
         successful = len(chunks) - len(failed_chunks)
         return RussianEditorOutcome(
             schema=RUSSIAN_EDITOR_SCHEMA,
@@ -629,6 +799,7 @@ class RussianEditorEvaluator:
             applied=tuple(applied),
             candidates=tuple(candidates),
             dropped=dropped,
+            warning_count=parse_warning_count + len(route_warnings),
         )
 
 
@@ -642,6 +813,9 @@ __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "DEFAULT_OVERLAP_PAIRS",
     "DEFAULT_MAX_TOKENS",
+    "MAX_EDITS_PER_PID",
+    "DEFAULT_RETRY_MAX_RETRIES",
+    "DEFAULT_RETRY_BASE_DELAY_SECONDS",
     "TranslationPair",
     "EditorEdit",
     "ReviewCandidate",

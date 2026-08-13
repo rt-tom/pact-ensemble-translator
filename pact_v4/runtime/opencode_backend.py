@@ -1063,19 +1063,39 @@ class OpenCodeServerBackend:
                 attempt_log.append(
                     _attempt_entry(message_error, session_id, request.model_ref)
                 )
-                if (
+                # R-RETRY (t_8ab8ab35, run_remote_002 chunk2): the message-
+                # level path retried ONLY structured-output failures, so a
+                # transport-class error surfacing through info.error
+                # ('Type validation failed: Value: {}' from a dead session,
+                # mapped to transport_network) fell straight to
+                # _raise_final and the chunk was lost. Transport-class
+                # message errors are now retried too — bounded like the
+                # HTTP path (same transport counter + backoff) — and the
+                # `continue` re-creates the session at the loop top (the
+                # old one is dead).
+                structured_retryable = (
                     message_error.error_class in _STRUCTURED_RETRYABLE_ERROR_CLASSES
                     and self._cfg.structured_output_mode == "json_schema"
                     and structured_attempts < max_structured_attempts - 1
-                ):
+                )
+                transport_retryable = (
+                    message_error.error_class in _RETRYABLE_ERROR_CLASSES
+                    and transport_attempts < max_transport_attempts - 1
+                )
+                if structured_retryable or transport_retryable:
                     if not self._can_retry():
                         if not self._cfg.retain_failed_sessions:
                             self._delete_own_session(session_id)
                         self._raise_budget_exhausted(
                             message_error, attempt_log, started, request
                         )
-                    structured_attempts += 1
-                    self._reserve_retry()
+                    if transport_retryable:
+                        transport_attempts += 1
+                        self._reserve_retry()
+                        self._backoff(message_error)
+                    else:
+                        structured_attempts += 1
+                        self._reserve_retry()
                     continue
                 if not self._cfg.retain_failed_sessions:
                     self._delete_own_session(session_id)

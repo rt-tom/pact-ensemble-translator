@@ -512,13 +512,18 @@ def test_fail_closed_on_validation_error() -> None:
 
 def test_transport_failure_is_fail_closed_not_escaped() -> None:
     """A ``CompletionError`` from ``complete`` must become a failed chunk
-    (audit_complete=false), never escape the evaluator."""
+    (audit_complete=false), never escape the evaluator. Pinned to
+    ``transport_max_retries=0`` (R-RETRY t_8ab8ab35): the default transport
+    retry would re-issue the call, which is covered by
+    ``test_transport_failure_retried_with_new_session``."""
     pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
     backend = _TransportFailingBackend(
         script=[_ok_response([])],  # consumed by chunk 2
         fail_on=(1,),               # chunk 1 transport failure
     )
-    evaluator = ChunkedAuditEvaluator(backend)
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(transport_max_retries=0),
+    )
     outcome = evaluator(chapter_id="0001", pairs=pairs)
     assert not outcome.audit_complete
     assert outcome.failed_chunks == (1,)
@@ -527,6 +532,52 @@ def test_transport_failure_is_fail_closed_not_escaped() -> None:
     assert outcome.issue_count == 0  # failed chunk is never issues=[]
     # the diagnostic is recorded on the failed chunk meta
     assert outcome.chunks[0]["reasoning_file"].endswith("_reasoning.txt")
+
+
+def test_transport_failure_retried_with_new_session() -> None:
+    """R-RETRY (t_8ab8ab35, operator extension): a TRANSPORT_ERROR is
+    retried with a NEW session (bounded, backoff) — a transient failure
+    recovers and the chunk is GOOD, not failed. Only after the bounded
+    retries are exhausted does it become a failed TRANSPORT_ERROR chunk."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    # chunk 1: first call raises (call 1), retry succeeds (call 2 consumes
+    # script[0]); chunk 2 consumes script[1].
+    backend = _TransportFailingBackend(
+        script=[
+            _ok_response([_issue("p00001", category="omission")]),
+            _ok_response([]),
+        ],
+        fail_on=(1,),
+    )
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(transport_base_delay_seconds=0.0),
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert outcome.audit_complete
+    assert outcome.failed_chunks == ()
+    assert outcome.successful_chunks == 2
+    # chunk 1 recovered after 1 retry (2 backend calls: fail + GOOD)
+    assert outcome.chunks[0]["status"] == "GOOD"
+    assert len(backend.requests) == 3  # 2 for chunk1 + 1 for chunk2
+
+
+def test_transport_failure_retries_exhausted_still_fail_closed() -> None:
+    """R-RETRY (t_8ab8ab35): after the bounded transport retries are
+    exhausted the chunk is a failed TRANSPORT_ERROR — fail-closed."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    backend = _TransportFailingBackend(
+        script=[_ok_response([])],
+        fail_on=(1, 2, 3),  # all 3 attempts of chunk 1 fail
+    )
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(transport_base_delay_seconds=0.0),
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert not outcome.audit_complete
+    assert outcome.failed_chunks == (1,)
+    assert outcome.chunks[0]["status"] == "TRANSPORT_ERROR"
+    # 3 attempts for chunk 1 + 1 for chunk 2, no RetryShrink dead calls
+    assert len(backend.requests) == 4
 
 
 def test_transport_failure_continues_other_chunks() -> None:
@@ -550,13 +601,18 @@ def test_transport_failure_continues_other_chunks() -> None:
 
 def test_transport_failure_skips_retry_shrink() -> None:
     """RetryShrink is an input-size strategy: a TRANSPORT_ERROR chunk is
-    recorded as failed as-is (no dead sub-chunk calls)."""
+    recorded as failed as-is (no dead sub-chunk calls). Pinned to
+    ``transport_max_retries=0`` (R-RETRY t_8ab8ab35) — the retry behavior
+    is covered by ``test_transport_failure_retried_with_new_session``."""
     pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
     backend = _TransportFailingBackend(
         script=[_ok_response([])],
         fail_on=(1,),
     )
-    evaluator = ChunkedAuditEvaluator(backend)  # retry_shrink=True default
+    evaluator = ChunkedAuditEvaluator(
+        backend,
+        config=ChunkedAuditConfig(transport_max_retries=0),  # retry_shrink=True default
+    )
     outcome = evaluator(chapter_id="0001", pairs=pairs)
     assert not outcome.audit_complete
     assert outcome.chunks[0]["status"] == "TRANSPORT_ERROR"
@@ -566,7 +622,8 @@ def test_transport_failure_skips_retry_shrink() -> None:
 
 def test_transport_failure_during_retry_shrink_is_fail_closed() -> None:
     """A transport error inside RetryShrink marks the chunk failed and does
-    not re-queue the sub (no dead sub-chunk call multiplication)."""
+    not re-queue the sub (no dead sub-chunk call multiplication). Pinned to
+    ``transport_max_retries=0`` (R-RETRY t_8ab8ab35)."""
     pairs = [_big_pair(f"p{i:05d}") for i in range(1, 26)]  # 1 chunk (25 pairs)
     # parent LENGTH -> shrink level 1: sub1 (p00001..18) transport-fails,
     # sub2 (p00019..25) GOOD -> chunk still failed (sub1 not audited)
@@ -577,7 +634,9 @@ def test_transport_failure_during_retry_shrink_is_fail_closed() -> None:
         ],
         fail_on=(2,),  # lvl1 sub1 transport failure
     )
-    evaluator = ChunkedAuditEvaluator(backend)
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(transport_max_retries=0),
+    )
     outcome = evaluator(chapter_id="0001", pairs=pairs)
     assert not outcome.audit_complete
     assert outcome.failed_chunks == (1,)

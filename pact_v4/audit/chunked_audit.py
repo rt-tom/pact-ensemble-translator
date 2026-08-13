@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -63,6 +64,7 @@ from pact_v4.runtime.backend_protocol import (
     CompletionRequest,
     Message,
 )
+from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.prompts_runtime import (
     QWEN_AUDIT_V4_1,
     ReviewerPrompt,
@@ -91,6 +93,12 @@ DEFAULT_OVERLAP_TOKENS = 400
 MIN_OVERLAP_PAIRS = 2
 MAX_OVERLAP_PAIRS = 6
 DEFAULT_REASONING_BUDGET = 8192
+# R-RETRY (t_8ab8ab35, operator extension 2026-08-13): a chunk-level
+# TRANSPORT_ERROR is retried with a NEW session (the old one is dead),
+# bounded like the HTTP path — a transport failure is not an input-size
+# problem, so RetryShrink never applies. Defaults mirror JsonRetryPolicy.
+DEFAULT_TRANSPORT_MAX_RETRIES: int = JsonRetryPolicy().max_retries
+DEFAULT_TRANSPORT_BASE_DELAY_SECONDS: float = JsonRetryPolicy().base_delay_seconds
 
 ENTITY_SOFT_TOKENS = 500
 ENTITY_HARD_TOKENS = 800
@@ -568,6 +576,12 @@ class ChunkedAuditConfig:
     min_overlap_pairs: int = MIN_OVERLAP_PAIRS
     max_overlap_pairs: int = MAX_OVERLAP_PAIRS
     retry_shrink: bool = True
+    # R-RETRY (t_8ab8ab35, operator extension): bounded TRANSPORT_ERROR
+    # retry with a NEW session (per_request backend → new session per
+    # complete call). Identity-bearing via StrictRunConfig (F5) — a cache
+    # written under a different transport-retry policy must never replay.
+    transport_max_retries: int = DEFAULT_TRANSPORT_MAX_RETRIES
+    transport_base_delay_seconds: float = DEFAULT_TRANSPORT_BASE_DELAY_SECONDS
     reasoning_budget: int = DEFAULT_REASONING_BUDGET
     calibrated_total: Optional[int] = None
     template: ReviewerPrompt = QWEN_AUDIT_V4_1
@@ -854,10 +868,71 @@ class ChunkedAuditEvaluator:
                 pids=chunk_pids,
                 sub=suffix or "",
             )
-            response = self._backend.complete(request)
-        except Exception as exc:  # CompletionError and any transport-level failure
+            # R-RETRY (t_8ab8ab35, operator extension 2026-08-13): a
+            # TRANSPORT_ERROR is retried with a NEW session (per_request
+            # backend → each complete() call creates a fresh session), not
+            # RetryShrink — a transport failure is not an input-size
+            # problem. Bounded by cfg.transport_max_retries + backoff.
+            max_attempts = cfg.transport_max_retries + 1
+            for attempt in range(max_attempts):
+                try:
+                    response = self._backend.complete(request)
+                    break
+                except Exception as exc:  # CompletionError + transport-level failures
+                    if attempt < cfg.transport_max_retries:
+                        delay = cfg.transport_base_delay_seconds * (2 ** attempt)
+                        LOG.warning(
+                            "audit chunk %s transport failure (%s) — retry "
+                            "%d/%d in %.2fs (new session)",
+                            chunk_index, type(exc).__name__,
+                            attempt + 1, max_attempts, delay,
+                        )
+                        self._emit_chunk_event(
+                            "retry",
+                            chunk=chunk_index,
+                            total=chunk_total,
+                            attempt=attempt + 1,
+                            error=f"{type(exc).__name__}: {exc}",
+                            delay=delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    LOG.error(
+                        "audit chunk %s transport failure (%s): %s",
+                        chunk_index, type(exc).__name__, exc,
+                    )
+                    self._write_artifacts(
+                        out_dir=out_dir, file_stem=file_stem,
+                        content=f"TRANSPORT_ERROR: {type(exc).__name__}: {exc}\n",
+                        reasoning="",
+                    )
+                    meta = ChunkMeta(
+                        chunk=chunk_index,
+                        first_pid=chunk_pids[0],
+                        last_pid=chunk_pids[-1],
+                        pair_count=len(chunk_pairs),
+                        context_count=len(context_pairs),
+                        status="TRANSPORT_ERROR",
+                        finish_reason=None,
+                        content_chars=0,
+                        reasoning_chars=0,
+                        json_parse="transport_error",
+                        validation_errors=(f"{type(exc).__name__}: {exc}",),
+                        reasoning_file=f"{file_stem}_reasoning.txt",
+                        issues=(),
+                    )
+                    self._emit_chunk_event(
+                        "done",
+                        chunk=chunk_index,
+                        total=chunk_total,
+                        status=meta.status,
+                        issue_count=0,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return meta
+        except Exception as exc:  # pragma: no cover - defensive (event hook)
             LOG.error(
-                "audit chunk %s transport failure (%s): %s",
+                "audit chunk %s unexpected failure (%s): %s",
                 chunk_index, type(exc).__name__, exc,
             )
             self._write_artifacts(
