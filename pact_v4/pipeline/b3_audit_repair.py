@@ -119,6 +119,8 @@ from pact_v4.repair.selective_repair import (
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
     REPAIR_FINDINGS_CAP,
+    REPAIR_HARNESS_VERSION,
+    REPAIR_PROMPT_VERSION,
     SelectiveRepairConfig,
     SelectiveRepairEvaluator,
     SelectiveRepairOutcome,
@@ -320,6 +322,14 @@ class B3AuditRepairConfig:
     prompt_version: str = PROMPT_VERSION
     harness_version: str = HARNESS_VERSION
     extractor_version: str = EXTRACTOR_VERSION
+    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
+    # version (REPAIR_AS_VERIFIER_V1 v4 — the source_stage/merge contract)
+    # is identity-bearing and wired into SelectiveRepairConfig below (F5) —
+    # a cache written under a different repair prompt must never replay the
+    # repaired map. Defaults mirror the module constants and are overridden
+    # by _build_b3_audit_repair from StrictRunConfig.audit_repair_prompt_version.
+    repair_prompt_version: str = REPAIR_PROMPT_VERSION
+    repair_harness_version: str = REPAIR_HARNESS_VERSION
     # V4.2 R (card t_4707e6e5): Russian-only editor stage BEFORE the audit.
     # ``russian_editor_enabled`` is True by default (owner decision
     # 2026-08-11 — R is on unless the CLI disables it with
@@ -368,6 +378,11 @@ class B3AuditRepairConfig:
             "prompt_version": self.prompt_version,
             "harness_version": self.harness_version,
             "extractor_version": self.extractor_version,
+            # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR
+            # prompt version rides the payload/report like every other
+            # version field (F5 — the repaired map is a function of it).
+            "repair_prompt_version": self.repair_prompt_version,
+            "repair_harness_version": self.repair_harness_version,
             "russian_editor": {
                 "enabled": self.russian_editor_enabled,
                 "version": self.russian_editor_version,
@@ -1320,6 +1335,14 @@ class B3AuditRepair:
                     findings_cap=cfg.repair_findings_cap,
                     microbatch_trigger=cfg.repair_microbatch_trigger,
                     microbatch_target=cfg.repair_microbatch_target,
+                    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
+                    # REPAIR prompt/harness version is wired from the B3
+                    # config (the run identity carries it) — the evaluator
+                    # can never silently fall back to a stale module default,
+                    # and a cache written under a different repair prompt
+                    # must never replay the repaired map.
+                    prompt_version=cfg.repair_prompt_version,
+                    harness_version=cfg.repair_harness_version,
                     # REPAIR-CTX (t_97b31f81, F5): the local-context window is
                     # wired from the B3 config (identity carries it), so the
                     # evaluator can never silently fall back to module

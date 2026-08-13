@@ -794,6 +794,11 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
         "harness_version": "4.1",
         "extractor_version": "pact-v4-entity-extractor/v1",
+        # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
+        # version participates in the identity — a cache written under a
+        # different repair prompt must never replay the repaired map.
+        "repair_prompt_version": "pact-v4-repair-as-verifier/v4",
+        "repair_harness_version": "1.0",
     }
     on = _whole_chapter_cfg(tmp_path)
     off = _whole_chapter_cfg(tmp_path, run_audit=False)
@@ -835,6 +840,13 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "prompt_version": dict(audit_prompt_version="pact-v4-reviewer-qwen-audit/v9.9"),
         "harness_version": dict(audit_harness_version="9.9"),
         "extractor_version": dict(audit_extractor_version="pact-v4-entity-extractor/v9.9"),
+        # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
+        # version is identity-bearing — flipping it invalidates the cached
+        # repaired map (F5).
+        "repair_prompt_version": dict(
+            audit_repair_prompt_version="pact-v4-repair-as-verifier/v9.9"
+        ),
+        "repair_harness_version": dict(audit_repair_harness_version="9.9"),
     }
     for label, overrides in mutations.items():
         mutated = _whole_chapter_cfg(tmp_path, **overrides)
@@ -864,6 +876,35 @@ def test_b3_reaudit_budget_and_retry_wired_from_run_config(
     assert bundle._config.repair_reaudit_max_tokens == 25000
     assert bundle._config.repair_reaudit_max_retries == 5
     assert bundle._config.repair_reaudit_base_delay_seconds == 2.5
+
+
+def test_b3_repair_prompt_version_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the production B3
+    # path must carry the REPAIR prompt/harness version from the run config
+    # through B3AuditRepairConfig into the repair evaluator — a cache
+    # produced under a different repair prompt must never replay (defaults
+    # mirror the module constants).
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(
+        tmp_path,
+        audit_repair_prompt_version="pact-v4-repair-as-verifier/v9.9",
+        audit_repair_harness_version="9.9",
+    )
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_prompt_version == "pact-v4-repair-as-verifier/v9.9"
+    assert bundle._config.repair_harness_version == "9.9"
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.repair_prompt_version == "pact-v4-repair-as-verifier/v4"
+    assert default_bundle._config.repair_harness_version == "1.0"
 
 
 def test_b3_reaudit_chunk_settings_wired_from_run_config(
@@ -1018,6 +1059,27 @@ def test_b3_audit_repair_config_payload_carries_reaudit_budget_and_retry() -> No
     assert custom["repair_reaudit_retry"] == {
         "max_retries": 5, "base_delay_seconds": 2.5,
     }
+
+
+def test_b3_config_payload_carries_repair_prompt_version() -> None:
+    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the REPAIR prompt
+    # version is part of the B3 config payload/report (the repaired map is a
+    # function of the repair prompt) — defaults mirror the module constant
+    # and explicit overrides are preserved.
+    from pact_v4.repair.selective_repair import (
+        REPAIR_HARNESS_VERSION,
+        REPAIR_PROMPT_VERSION,
+    )
+    assert REPAIR_PROMPT_VERSION == "pact-v4-repair-as-verifier/v4"
+    payload = B3AuditRepairConfig().to_payload()
+    assert payload["repair_prompt_version"] == "pact-v4-repair-as-verifier/v4"
+    assert payload["repair_harness_version"] == REPAIR_HARNESS_VERSION
+    custom = B3AuditRepairConfig(
+        repair_prompt_version="pact-v4-repair-as-verifier/v9.9",
+        repair_harness_version="9.9",
+    ).to_payload()
+    assert custom["repair_prompt_version"] == "pact-v4-repair-as-verifier/v9.9"
+    assert custom["repair_harness_version"] == "9.9"
 
 
 def test_b3_config_payload_carries_repair_context_window() -> None:

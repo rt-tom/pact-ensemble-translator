@@ -549,6 +549,13 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             prompt_version=cfg.audit_prompt_version,
             harness_version=cfg.audit_harness_version,
             extractor_version=cfg.audit_extractor_version,
+            # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the REPAIR
+            # prompt/harness version is WIRED from the run config (never
+            # silently left at module defaults) and participates in the
+            # config identity — a repair-prompt change invalidates the
+            # cached repaired map.
+            repair_prompt_version=cfg.audit_repair_prompt_version,
+            repair_harness_version=cfg.audit_repair_harness_version,
             # V4.2 R (card t_4707e6e5): every Russian-editor knob is WIRED
             # from the run config (never silently left at module defaults)
             # and participates in the config identity — a policy change

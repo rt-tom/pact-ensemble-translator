@@ -160,6 +160,8 @@ from pact_v4.repair.selective_repair import (
     MICROBATCH_TRIGGER,
     REAUDIT_DELTA_FORMAT,
     REPAIR_FINDINGS_CAP,
+    REPAIR_HARNESS_VERSION,
+    REPAIR_PROMPT_VERSION,
 )
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
@@ -397,6 +399,17 @@ class StrictRunConfig:
     audit_prompt_version: str = PROMPT_VERSION
     audit_harness_version: str = HARNESS_VERSION
     audit_extractor_version: str = EXTRACTOR_VERSION
+    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
+    # version (REPAIR_AS_VERIFIER_V1 v4 — the source_stage/merge contract)
+    # is identity-bearing like every other B3 prompt/extractor version (F5).
+    # Before this field, a cache written under the v3 repair prompt could
+    # replay under v4 — the repaired map is a function of the repair prompt,
+    # so its version MUST participate in the config identity and the B3
+    # payload/report. Values mirror the module defaults
+    # (pact_v4.repair.selective_repair); wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair.
+    audit_repair_prompt_version: str = REPAIR_PROMPT_VERSION
+    audit_repair_harness_version: str = REPAIR_HARNESS_VERSION
     # V4.2 R (card t_4707e6e5): Russian-only editor stage BEFORE the audit.
     # On by default (owner decision 2026-08-11 — R is production-default);
     # ``--no-russian-editor`` turns it off (scheme 4.1, backward compatible).
@@ -512,6 +525,12 @@ class StrictRunConfig:
                     "prompt_version": self.audit_prompt_version,
                     "harness_version": self.audit_harness_version,
                     "extractor_version": self.audit_extractor_version,
+                    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
+                    # REPAIR prompt version participates in the identity —
+                    # a cache written under a different repair prompt must
+                    # never replay the repaired map.
+                    "repair_prompt_version": self.audit_repair_prompt_version,
+                    "repair_harness_version": self.audit_repair_harness_version,
                 },
                 # V4.2 R (card t_4707e6e5, F5 lesson): the Russian-only
                 # editor stage is part of the run's config identity — its
@@ -4608,6 +4627,11 @@ def _run_whole_chapter_strict_impl(
                 "prompt_version": cfg.audit_prompt_version,
                 "harness_version": cfg.audit_harness_version,
                 "extractor_version": cfg.audit_extractor_version,
+                # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR
+                # prompt version rides the record alongside the identity so
+                # the report reflects what the repair stage actually ran with.
+                "repair_prompt_version": cfg.audit_repair_prompt_version,
+                "repair_harness_version": cfg.audit_repair_harness_version,
             },
             # V4.2 R: the Russian-editor stage policy is recorded alongside
             # the identity (the config artifact carries the same keys).

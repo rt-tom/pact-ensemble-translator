@@ -2040,11 +2040,12 @@ def test_review_candidate_source_stage_russian_editor():
     assert candidate.source_stage == "russian_editor"
 
 
-def test_merge_candidates_by_pid_two_auditors_one_editor_partial_merge():
-    """CANDIDATE-MERGE regression (t_78a3d02c, HIGH review finding): a PID
-    with TWO same-stage auditor findings PLUS one editor candidate does NOT
-    collapse all three into one finding — only the cross-stage pair merges
-    (``[merged(A1+E), A2]``), every same-stage remark keeps its own index."""
+def test_merge_candidates_by_pid_two_auditors_one_editor_all_merged():
+    """CANDIDATE-MERGE (owner clarification 2026-08-13): a PID with TWO
+    same-stage auditor findings PLUS one editor candidate merges ALL THREE
+    remarks into ONE finding — ``[A1, A2, E] -> [merged(A1+A2+E)]`` with all
+    three remarks in ``sources``, one index, one decision (never two blocks
+    that force partial decisions)."""
     a1 = EligibleFinding(
         index=1, pid="p00303", tier="B", category="changed_fact",
         severity="major", confidence="high",
@@ -2065,32 +2066,29 @@ def test_merge_candidates_by_pid_two_auditors_one_editor_partial_merge():
         source_stage="russian_editor",
     )
     merged = merge_candidates_by_pid((a1, a2, e))
-    # TWO findings: the cross-stage pair merged into one, the second
-    # same-stage auditor remark kept separate — never all three collapsed.
-    assert len(merged) == 2
-    f_merged, f_sep = merged
-    assert f_merged.pid == "p00303"
-    assert f_merged.source_stage == "fidelity_auditor+russian_editor"
-    assert len(f_merged.sources) == 2
-    assert {s["stage"] for s in f_merged.sources} == {
+    # ONE finding with ALL THREE remarks — same-stage included.
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.pid == "p00303"
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert {s["stage"] for s in f.sources} == {
         "fidelity_auditor", "russian_editor",
     }
-    # the headline values come from the first auditor finding
-    assert f_merged.category == "changed_fact"
-    assert f_merged.index == 1
-    # the remaining same-stage auditor remark keeps its own index and stage
-    assert f_sep.source_stage == "fidelity_auditor"
-    assert f_sep.sources == ()
-    assert f_sep.category == "omission"
-    assert f_sep.index == 2
-    assert [f.index for f in merged] == [1, 2]
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "omission", "calque",
+    }
+    # the headline values come from the first finding
+    assert f.category == "changed_fact"
+    assert f.index == 1
+    assert [f.index for f in merged] == [1]
 
 
-def test_merge_candidates_by_pid_one_auditor_two_editors_partial_merge():
-    """CANDIDATE-MERGE symmetric multiplicity (t_78a3d02c): one auditor
-    finding + TWO editor candidates on the same PID -> the auditor merges
-    with the FIRST editor candidate only; the second editor candidate keeps
-    its own index (same-stage remarks stay distinct)."""
+def test_merge_candidates_by_pid_one_auditor_two_editors_all_merged():
+    """CANDIDATE-MERGE symmetric multiplicity (owner clarification
+    2026-08-13): one auditor finding + TWO editor candidates on the same PID
+    merge into ONE finding with all three remarks (one decision for the
+    whole PID)."""
     a = EligibleFinding(
         index=1, pid="p00303", tier="B", category="changed_fact",
         severity="major", confidence="high",
@@ -2110,22 +2108,20 @@ def test_merge_candidates_by_pid_one_auditor_two_editors_partial_merge():
         source_stage="russian_editor",
     )
     merged = merge_candidates_by_pid((a, e1, e2))
-    assert len(merged) == 2
-    f_merged, f_sep = merged
-    assert f_merged.source_stage == "fidelity_auditor+russian_editor"
-    assert len(f_merged.sources) == 2
-    # the second editor candidate stays a separate per-index finding
-    assert f_sep.source_stage == "russian_editor"
-    assert f_sep.sources == ()
-    assert f_sep.category == "grammar"
-    assert [f.index for f in merged] == [1, 2]
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "calque", "grammar",
+    }
+    assert [f.index for f in merged] == [1]
 
 
-def test_merge_candidates_by_pid_two_auditors_two_editors_partial_merge():
-    """CANDIDATE-MERGE full mixed multiplicity (t_78a3d02c): TWO auditor
-    findings + TWO editor candidates on one PID -> ONE cross-stage merged
-    finding plus each remaining remark as its own index (2 auditor + 2
-    editor remarks -> 3 findings: merged pair + 2 separate)."""
+def test_merge_candidates_by_pid_two_auditors_two_editors_all_merged():
+    """CANDIDATE-MERGE full multiplicity (owner clarification 2026-08-13):
+    TWO auditor findings + TWO editor candidates on one PID -> ONE merged
+    finding with all four remarks (one index, one decision)."""
     def mk(idx, stage, cat):
         return EligibleFinding(
             index=idx, pid="p00303", tier="B", category=cat,
@@ -2138,13 +2134,14 @@ def test_merge_candidates_by_pid_two_auditors_two_editors_partial_merge():
         mk(3, "russian_editor", "calque"),
         mk(4, "russian_editor", "grammar"),
     ))
-    assert len(merged) == 3
-    f_merged, f_aud2, f_ed2 = merged
-    assert f_merged.source_stage == "fidelity_auditor+russian_editor"
-    assert len(f_merged.sources) == 2
-    assert f_aud2.source_stage == "fidelity_auditor" and f_aud2.sources == ()
-    assert f_ed2.source_stage == "russian_editor" and f_ed2.sources == ()
-    assert [f.index for f in merged] == [1, 2, 3]
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 4
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "omission", "calque", "grammar",
+    }
+    assert [f.index for f in merged] == [1]
 
 
 def test_merge_candidates_by_pid_same_pid_editor_auditor_merged():
@@ -2178,10 +2175,11 @@ def test_merge_candidates_by_pid_same_pid_editor_auditor_merged():
     assert f.index == 1
 
 
-def test_merge_candidates_by_pid_same_stage_kept_separate():
-    """CANDIDATE-MERGE: same-stage multiple findings of one PID (e.g. two
-    audit findings on one paragraph) are NOT merged — they keep their
-    separate per-index contract."""
+def test_merge_candidates_by_pid_same_stage_merged_too():
+    """CANDIDATE-MERGE (owner clarification 2026-08-13): same-stage multiple
+    findings of one PID (e.g. two audit findings on one paragraph) ALSO
+    merge into ONE finding — the repair model must see all remarks of the
+    pid in one block, regardless of stage."""
     a = EligibleFinding(
         index=1, pid="p00193", tier="B", category="invented_gender",
         severity="minor", confidence="high", note="n1", excerpt="e1", issue={},
@@ -2193,8 +2191,13 @@ def test_merge_candidates_by_pid_same_stage_kept_separate():
         source_stage="fidelity_auditor",
     )
     merged = merge_candidates_by_pid((a, b))
-    assert len(merged) == 2
-    assert [f.index for f in merged] == [1, 2]
+    assert len(merged) == 1
+    f = merged[0]
+    assert f.pid == "p00193"
+    assert f.source_stage == "fidelity_auditor"  # single stage, no join
+    assert len(f.sources) == 2
+    assert {s["category"] for s in f.sources} == {"invented_gender", "omission"}
+    assert f.index == 1
 
 
 def test_merge_candidates_by_pid_distinct_pids_untouched():
@@ -2359,14 +2362,14 @@ def test_merged_editor_auditor_single_repair_call():
     assert outcome.repair_complete is True
 
 
-def test_mixed_multiplicity_two_auditors_one_editor_two_indices():
-    """CANDIDATE-MERGE regression (t_78a3d02c, HIGH review finding), end-to-
+def test_mixed_multiplicity_two_auditors_one_editor_one_index():
+    """CANDIDATE-MERGE regression (owner clarification 2026-08-13), end-to-
     end: a PID with TWO auditor findings PLUS one editor candidate produces
-    TWO per-index repair findings — the cross-stage pair merged into one
-    (both remarks visible in one prompt block, ONE decision), the second
-    same-stage auditor remark kept as its own index. Unique indices, correct
+    ONE per-index repair finding — ALL THREE remarks merged into one block
+    (every remark visible in one prompt block, ONE decision), never two
+    indices that would force a partial decision. Unique indices, correct
     commit behavior, and the review journal maps the editor candidate to the
-    merged finding's verdict."""
+    single merged finding's verdict."""
     from pact_v4.audit.russian_editor import ReviewCandidate
 
     source = {
@@ -2406,8 +2409,90 @@ def test_mixed_multiplicity_two_auditors_one_editor_two_indices():
                 ),
                 "reason": "fixed the calque and kept the fact",
             },
+        ]),
+        _reaudit_response([]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, review_candidates=review_candidates,
+    )
+    # ONE repair call (repair + re-audit) — all three remarks share the batch
+    assert len(backend.requests) == 2
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    f = outcome.batches[0].findings[0]
+    # ALL THREE remarks in ONE merged finding
+    assert f.pid == "p00303"
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert {s["category"] for s in f.sources} == {
+        "changed_fact", "omission", "calque",
+    }
+    # unique index (single finding keeps index 1)
+    assert [f.index for f in outcome.batches[0].findings] == [1]
+    # prompt: the merged finding shows ALL THREE remarks with their stages
+    prompt = backend.requests[0].messages[0].content
+    assert "source=fidelity_auditor+russian_editor" in prompt
+    assert "fact shifted" in prompt and "калька" in prompt
+    assert "clause omitted" in prompt
+    # commit behavior: the merged index's repair is committed once
+    assert dict(outcome.committed) == {
+        "p00303": "Он дал себе торжественное обещание."
+    }
+    # the review journal maps the editor candidate to the merged finding's
+    # verdict (the single index answered 'repair' -> accepted)
+    assert len(outcome.review_journal) == 1
+    assert outcome.review_journal[0]["verdict"] == "accepted"
+    assert outcome.repair_complete is True
+
+
+def test_one_pid_auditor_two_editors_single_index_journal_both_bound():
+    """CANDIDATE-MERGE regression (RV2 MEDIUM finding, owner clarification
+    2026-08-13): one PID with [A, E1, E2] (auditor + TWO editor candidates)
+    merges into ONE index (all three remarks in one block, one decision) —
+    the journal binds BOTH editor candidates to that single merged index's
+    verdict (no sub-index ambiguity: there is exactly one index per pid)."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00303": "He made a solemn promise to himself.",
+        "p00304": "Next paragraph.",
+    }
+    translation = {
+        "p00303": "Он сделал торжественное обещание себе.",
+        "p00304": "Следующий абзац.",
+    }
+    filtered = [
+        FilteredIssue(
+            issue=_issue("p00303", "changed_fact", note="fact shifted",
+                         excerpt="торжественное обещание"),
+            verdict=TIER_B, filter_name="test", reason="test",
+        ),
+    ]
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он торжественно пообещал себе.",
+            klass="calque", reason="калька с английского",
+        ),
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он дал себе торжественное обещание.",
+            klass="grammar", reason="порядок слов",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
             {
-                "index": 2, "decision": "pass", "reason": "no repair needed",
+                "index": 1, "decision": "repair", "pid": "p00303",
+                "repaired_translation": (
+                    "Он дал себе торжественное обещание."
+                ),
+                "reason": "fixed the calque, the word order and kept the fact",
             },
         ]),
         _reaudit_response([]),
@@ -2419,37 +2504,80 @@ def test_mixed_multiplicity_two_auditors_one_editor_two_indices():
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered, review_candidates=review_candidates,
     )
-    # ONE repair call (repair + re-audit) — the two findings share the batch
-    assert len(backend.requests) == 2
-    assert [len(b.findings) for b in outcome.batches] == [2]
-    f_merged, f_sep = outcome.batches[0].findings
-    # the cross-stage pair is ONE merged finding with both remarks
-    assert f_merged.pid == "p00303"
-    assert f_merged.source_stage == "fidelity_auditor+russian_editor"
-    assert len(f_merged.sources) == 2
-    # the second same-stage auditor remark keeps its own index
-    assert f_sep.pid == "p00303"
-    assert f_sep.source_stage == "fidelity_auditor"
-    assert f_sep.sources == ()
-    assert f_sep.category == "omission"
-    # unique indices (1-based, contiguous)
-    assert [f.index for f in outcome.batches[0].findings] == [1, 2]
-    # prompt: the merged finding shows BOTH remarks with their stages; the
-    # separate finding shows its own stage
-    prompt = backend.requests[0].messages[0].content
-    assert "source=fidelity_auditor+russian_editor" in prompt
-    assert "source=fidelity_auditor" in prompt
-    assert "fact shifted" in prompt and "калька" in prompt
-    assert "clause omitted" in prompt
-    # commit behavior: the merged index's repair is committed; the pass index
-    # is passed
+    # ONE index carries all three remarks (auditor + both editor candidates).
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    f = outcome.batches[0].findings[0]
+    assert f.source_stage == "fidelity_auditor+russian_editor"
+    assert len(f.sources) == 3
+    assert f.index == 1
+    # BOTH editor candidates are bound to the single merged index's verdict
+    # (accepted — the one decision for the pid); no candidate is left with
+    # the "never answered" failure verdict.
+    assert len(outcome.review_journal) == 2
+    for entry in outcome.review_journal:
+        assert entry["pid"] == "p00303"
+        assert entry["verdict"] == "accepted"
+        assert entry["committed_text"] == "Он дал себе торжественное обещание."
     assert dict(outcome.committed) == {
         "p00303": "Он дал себе торжественное обещание."
     }
-    # the review journal maps the editor candidate to the merged finding's
-    # verdict (the merged index answered 'repair' -> accepted)
-    assert len(outcome.review_journal) == 1
-    assert outcome.review_journal[0]["verdict"] == "accepted"
+    assert outcome.repair_complete is True
+
+
+def test_one_pid_two_editor_candidates_only_single_index():
+    """CANDIDATE-MERGE (owner clarification 2026-08-13): a PID with ONLY
+    same-stage remarks (two editor candidates, no audit finding) also merges
+    into ONE finding — the repair model sees both proposals in one block and
+    decides once."""
+    from pact_v4.audit.russian_editor import ReviewCandidate
+
+    source = {
+        "p00303": "He made a solemn promise to himself.",
+        "p00304": "Next paragraph.",
+    }
+    translation = {
+        "p00303": "Он сделал торжественное обещание себе.",
+        "p00304": "Следующий абзац.",
+    }
+    review_candidates = [
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он торжественно пообещал себе.",
+            klass="calque", reason="калька с английского",
+        ),
+        ReviewCandidate(
+            pid="p00303",
+            original="Он сделал торжественное обещание себе.",
+            proposed="Он дал себе торжественное обещание.",
+            klass="grammar", reason="порядок слов",
+        ),
+    ]
+    backend = ScriptedRepairBackend([
+        _repair_response([
+            {
+                "index": 1, "decision": "pass",
+                "reason": "правка спорна — отклонено",
+            },
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(findings_cap=10)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=(), review_candidates=review_candidates,
+    )
+    assert [len(b.findings) for b in outcome.batches] == [1]
+    f = outcome.batches[0].findings[0]
+    assert f.source_stage == "russian_editor"  # single stage, no join
+    assert len(f.sources) == 2
+    assert f.index == 1
+    # both candidates share the single index's verdict (rejected)
+    assert len(outcome.review_journal) == 2
+    for entry in outcome.review_journal:
+        assert entry["verdict"] == "rejected"
+    assert outcome.committed == ()
     assert outcome.repair_complete is True
 
 
