@@ -70,6 +70,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
     DEFAULT_REASONING_BUDGET,
+    DEFAULT_TRANSPORT_MAX_RETRIES,
+    DEFAULT_TRANSPORT_BASE_DELAY_SECONDS,
     HARNESS_VERSION,
     PROMPT_VERSION,
 )
@@ -81,6 +83,9 @@ from pact_v4.audit.russian_editor import (
     DEFAULT_CHUNK_SIZE as RUSSIAN_EDITOR_CHUNK_SIZE,
     DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_MAX_TOKENS,
     DEFAULT_OVERLAP_PAIRS as RUSSIAN_EDITOR_OVERLAP_PAIRS,
+    DEFAULT_RETRY_MAX_RETRIES as RUSSIAN_EDITOR_RETRY_MAX_RETRIES,
+    DEFAULT_RETRY_BASE_DELAY_SECONDS as RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS,
+    MAX_EDITS_PER_PID as RUSSIAN_EDITOR_MAX_EDITS_PER_PID,
 )
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
@@ -341,6 +346,13 @@ class StrictRunConfig:
     audit_max_input_tokens: int = 3600
     audit_max_tokens: int = 12000
     audit_overlap_tokens: int = 400
+    # R-RETRY (t_8ab8ab35, operator extension 2026-08-13, F5): the chunk-
+    # level TRANSPORT_ERROR bounded retry policy (NEW session per attempt)
+    # is identity-bearing and wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair — a cache written under a different
+    # transport-retry policy must never replay a failed chunk.
+    audit_transport_max_retries: int = DEFAULT_TRANSPORT_MAX_RETRIES
+    audit_transport_base_delay_seconds: float = DEFAULT_TRANSPORT_BASE_DELAY_SECONDS
     # V4.1 B3 (review fix F5): EVERY authoritative B3 repair-policy knob and
     # prompt/extractor version participates in the config identity and is
     # wired into B3AuditRepairConfig by _build_b3_audit_repair. Before this
@@ -426,6 +438,14 @@ class StrictRunConfig:
     russian_editor_max_tokens: int = RUSSIAN_EDITOR_MAX_TOKENS
     # Class threshold: SAFE classes (auto-applied with the diff-gate).
     russian_editor_safe_classes: tuple = tuple(sorted(RUSSIAN_EDITOR_SAFE_CLASSES))
+    # R-RETRY (t_8ab8ab35, F5): the per-pid edit cap (duplicate pid is NOT
+    # an error — up to this many edits per pid; 11th+ drops per-edit with a
+    # WARNING) and the bounded retry policy (transport + empty/truncated
+    # JSON) are identity-bearing — a cache written under a different
+    # cap/retry policy must never replay the edited map.
+    russian_editor_max_edits_per_pid: int = RUSSIAN_EDITOR_MAX_EDITS_PER_PID
+    russian_editor_retry_max_retries: int = RUSSIAN_EDITOR_RETRY_MAX_RETRIES
+    russian_editor_retry_base_delay_seconds: float = RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -484,6 +504,10 @@ class StrictRunConfig:
                     "max_tokens": self.audit_max_tokens,
                     "overlap_tokens": self.audit_overlap_tokens,
                     "reasoning_budget": self.audit_reasoning_budget,
+                    "audit_transport_retry": {
+                        "max_retries": self.audit_transport_max_retries,
+                        "base_delay_seconds": self.audit_transport_base_delay_seconds,
+                    },
                     "repair_findings_cap": self.audit_repair_findings_cap,
                     "repair_microbatch_trigger": self.audit_repair_microbatch_trigger,
                     "repair_microbatch_target": self.audit_repair_microbatch_target,
@@ -547,6 +571,11 @@ class StrictRunConfig:
                     "overlap_pairs": self.russian_editor_overlap_pairs,
                     "max_tokens": self.russian_editor_max_tokens,
                     "safe_classes": list(self.russian_editor_safe_classes),
+                    "max_edits_per_pid": self.russian_editor_max_edits_per_pid,
+                    "r_editor_retry": {
+                        "max_retries": self.russian_editor_retry_max_retries,
+                        "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
+                    },
                 },
             },
         )
@@ -4681,6 +4710,10 @@ def _run_whole_chapter_strict_impl(
                 "max_tokens": cfg.audit_max_tokens,
                 "overlap_tokens": cfg.audit_overlap_tokens,
                 "reasoning_budget": cfg.audit_reasoning_budget,
+                "audit_transport_retry": {
+                    "max_retries": cfg.audit_transport_max_retries,
+                    "base_delay_seconds": cfg.audit_transport_base_delay_seconds,
+                },
                 "repair_findings_cap": cfg.audit_repair_findings_cap,
                 "repair_microbatch_trigger": cfg.audit_repair_microbatch_trigger,
                 "repair_microbatch_target": cfg.audit_repair_microbatch_target,
@@ -4721,6 +4754,11 @@ def _run_whole_chapter_strict_impl(
                 "overlap_pairs": cfg.russian_editor_overlap_pairs,
                 "max_tokens": cfg.russian_editor_max_tokens,
                 "safe_classes": list(cfg.russian_editor_safe_classes),
+                "max_edits_per_pid": cfg.russian_editor_max_edits_per_pid,
+                "r_editor_retry": {
+                    "max_retries": cfg.russian_editor_retry_max_retries,
+                    "base_delay_seconds": cfg.russian_editor_retry_base_delay_seconds,
+                },
             },
         },
         "resumed_from_index": resumed_from_index,
