@@ -36,7 +36,6 @@ Design rules (konspekt §8.3 + B1.1 review, PROPOSAL reply §1.2/§1.4/§1.5):
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -54,6 +53,7 @@ from pact_v4.runtime.json_resilience import (
     EmptyResponseError,
     JsonRetryPolicy,
     TruncatedJSONError,
+    parse_json_response,
     retry_json_call,
 )
 from pact_v4.runtime.prompts_runtime import ReviewerPrompt
@@ -333,40 +333,31 @@ def render_entity_extraction_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _strip_fences(raw: str) -> str:
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-    return text
-
-
 def parse_model_output(raw: str) -> Dict[str, Any]:
     """Parse the Qwen extraction response into a payload dict.
 
     Mirrors the audit parser contract: empty/truncated bodies raise the
     retryable ``EmptyResponseError``/``TruncatedJSONError`` (the role
     adapter's B4 retry owns them), a well-formed but wrong-shaped body
-    raises ``ValueError`` — never a silent accept.
+    raises ``ValueError`` — never a silent accept. RESILIENCE
+    (t_406fc48c): fences / BOM / prose are stripped by the shared
+    ``parse_json_response`` utility.
     """
     if not raw.strip():
         raise EmptyResponseError(
             "empty entity-extraction response body (max_tokens exhausted?)"
         )
     try:
-        payload = json.loads(_strip_fences(raw))
-    except json.JSONDecodeError as exc:
-        raise TruncatedJSONError(
-            f"entity-extraction response is not complete JSON: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
+        payload = parse_json_response(raw)
+    except ValueError as exc:
+        # parse_json_response already raises the retryable classes for
+        # empty/truncated bodies; only re-wrap the wrong-shape case with
+        # extraction-specific wording.
+        if isinstance(exc, (EmptyResponseError, TruncatedJSONError)):
+            raise
         raise ValueError(
-            f"entity-extraction payload must be a JSON object, got {type(payload).__name__}"
-        )
+            f"entity-extraction payload must be a JSON object: {exc}"
+        ) from exc
     return payload
 
 

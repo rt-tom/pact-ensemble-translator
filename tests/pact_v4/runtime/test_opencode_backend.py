@@ -409,6 +409,76 @@ def test_multiple_text_parts_are_concatenated():
     assert backend.complete(_request()).text == "part-one part-two"
 
 
+def test_reasoning_part_populates_raw_metadata_not_text():
+    """Regression (run_remote_001, 2026-08-13): serve 1.4.7 returns the
+    model's thinking as ``type=\"reasoning\"`` parts; they must land in
+    ``raw_metadata[\"reasoning\"]`` (so audit/repair ``_reasoning.txt``
+    artifacts are not empty on the remote path) while ``_extract_text``
+    keeps returning only the answer text."""
+    fake = FakeOpenCodeServer()
+    fake.script_message(
+        {
+            "info": {
+                "id": "m1",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "qwen3.7-plus",
+                "tokens": {"input": 1, "output": 1, "reasoning": 42, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"id": "r1", "type": "reasoning", "text": "step one "},
+                {"id": "r2", "type": "reasoning", "text": "step two"},
+                {"id": "t1", "type": "text", "text": "the answer"},
+            ],
+        }
+    )
+    backend = _backend(fake)
+    response = backend.complete(_request())
+    assert response.text == "the answer"
+    assert response.raw_metadata["reasoning"] == "step one step two"
+    assert response.raw_metadata["server_version"] == "1.4.7"
+    assert len(response.raw_metadata["attempts"]) == 1
+    assert response.raw_metadata["attempts"][0]["error_class"] is None
+    assert response.raw_metadata["structured_output_mode"] == "prompt_only"
+    # The call record carries the same raw_metadata (D1 usage journaling).
+    assert backend.call_records()[0].raw_metadata["reasoning"] == "step one step two"
+
+
+def test_synthetic_text_parts_are_captured_as_reasoning():
+    """Some providers stream thinking through the text channel; serve marks
+    such parts ``synthetic``. They must not pollute the answer text but
+    must still be preserved as reasoning (same remote-reasoning contract)."""
+    fake = FakeOpenCodeServer()
+    fake.script_message(
+        {
+            "info": {
+                "id": "m1",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "qwen3.7-plus",
+                "tokens": {"input": 1, "output": 1, "reasoning": 7, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"id": "s1", "type": "text", "text": "thinking...", "synthetic": True},
+                {"id": "t1", "type": "text", "text": "final answer"},
+            ],
+        }
+    )
+    backend = _backend(fake)
+    response = backend.complete(_request())
+    assert response.text == "final answer"
+    assert response.raw_metadata["reasoning"] == "thinking..."
+
+
+def test_no_reasoning_parts_yield_empty_reasoning_metadata():
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("plain"))
+    backend = _backend(fake)
+    response = backend.complete(_request())
+    assert response.text == "plain"
+    assert response.raw_metadata["reasoning"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Structured output
 # ---------------------------------------------------------------------------

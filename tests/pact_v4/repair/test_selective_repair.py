@@ -205,10 +205,23 @@ def test_rejected_never_repaired():
 
 def test_tier_b_low_confidence_ineligible():
     eligible, _, ineligible = select_eligible(
-        [_issue_with("p00016", category="changed_fact", confidence="medium", _verdict=TIER_B)]
+        [_issue_with("p00016", category="changed_fact", confidence="low", _verdict=TIER_B)]
     )
     assert not eligible
     assert len(ineligible) == 1
+
+
+def test_tier_b_medium_confidence_eligible_verify():
+    # Owner decision 2026-08-13 (run_remote_001): medium-confidence findings
+    # go to the repair-as-verifier, which itself decides pass/repair — they
+    # are eligible, never silently sent to debt.
+    eligible, rejected, ineligible = select_eligible(
+        [_issue_with("p00184", category="changed_fact", confidence="medium", _verdict=TIER_B)]
+    )
+    assert len(eligible) == 1
+    assert eligible[0].tier == "B"
+    assert eligible[0].confidence == "medium"
+    assert not rejected and not ineligible
 
 
 def test_tier_b_category_outside_allowed_ineligible():
@@ -228,8 +241,9 @@ def test_eligible_confidence_high_medium_categories():
         _issue_with("p00075", category="omission", confidence="low", _verdict=TIER_B),
     ]
     eligible, _, ineligible = select_eligible(issues)
-    assert [f.pid for f in eligible] == ["p00010", "p00193"]
-    assert [f.pid for f in ineligible] == ["p00016", "p00075"]
+    # high AND medium are eligible (owner decision 2026-08-13); low is not.
+    assert [f.pid for f in eligible] == ["p00010", "p00193", "p00016"]
+    assert [f.pid for f in ineligible] == ["p00075"]
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +357,35 @@ def test_parse_repair_accepts_pass_and_repair():
     assert results[0].decision == "repair"
     assert results[0].pid == "p00193"
     assert results[1].decision == "pass"
+
+
+def test_parse_repair_accepts_fenced_json():
+    # RESILIENCE (t_406fc48c): the repair model sometimes wraps the batch
+    # response in ```json fences — the tolerant parse must accept it.
+    findings = (_eligible("p00193", 1),)
+    payload = {
+        "results": [
+            {"index": 1, "decision": "pass", "reason": "verified against source"},
+        ]
+    }
+    fenced = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+    results, errors, _ = parse_repair_batch(fenced, findings, {"p00193": "x"})
+    assert not errors
+    assert results[0].decision == "pass"
+
+
+def test_parse_repair_prose_wrapped_json():
+    # Prose around the JSON block ('Here is the JSON: {...}').
+    findings = (_eligible("p00193", 1),)
+    payload = {
+        "results": [
+            {"index": 1, "decision": "pass", "reason": "verified against source"},
+        ]
+    }
+    prose = "Here is the JSON: " + json.dumps(payload, ensure_ascii=False)
+    results, errors, _ = parse_repair_batch(prose, findings, {"p00193": "x"})
+    assert not errors
+    assert results[0].decision == "pass"
 
 
 def test_parse_repair_missing_index_fails_closed():
@@ -1188,6 +1231,40 @@ def test_reaudit_invalid_json_three_attempts_then_debt():
     assert outcome.repair_complete is False
     assert any("failed re-audit" in d for d in outcome.debt_trace)
     assert len(backend.requests) == 4  # 1 repair + 3 re-audit attempts
+
+
+def test_reaudit_accepts_fenced_json_no_retry():
+    """RESILIENCE (t_406fc48c): a fence-wrapped re-audit response is valid
+    JSON — it must parse on the first attempt, never be retried as
+    truncated and never become debt."""
+    issue = _issue("p00193", "invented_gender", note="n", confidence="high")
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+
+    fenced_ok = "```json\n" + json.dumps({"issues": []}) + "\n```"
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "А потом заявила, что это должен быть внук-",
+            "reason": "confirmed",
+        }]),
+        CompletionResponse(text=fenced_ok, model="qwen-3.6-35b", finish_reason="stop"),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(
+            reaudit_retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0),
+        )
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.committed != ()
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    assert outcome.repair_complete is True
+    assert not any("failed re-audit" in d for d in outcome.debt_trace)
+    assert len(backend.requests) == 2  # 1 repair + 1 re-audit (no retry)
 
 
 def test_reaudit_max_tokens_default_is_20000():
