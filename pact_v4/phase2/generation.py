@@ -371,11 +371,32 @@ def _parse_ordered_pid_pairs(raw: str) -> list:
 
     Returns the raw ``(key, value)`` pairs of the top-level JSON object, in
     source order, with duplicates intact so callers can detect them.
+
+    JSON-REPAIR (t_34ceca50, run_remote_004): the one deterministic
+    exception is the whole-chapter pid-colon model error (``"p00082", "``
+    comma instead of ``"p00082": "`` colon — never valid JSON inside an
+    object, unique to the model error). The same single repair helper as
+    ``parse_json_response`` substitutes ALL occurrences at syntactically
+    valid PID-key positions of the top-level object and re-parses; the
+    substitution is JSON-string-aware (t_0626267d) — a literal
+    ``"p12345", "`` embedded in a translation value is never touched. A
+    body that still does not parse is rejected exactly as before
+    (fail-closed, real damage is never masked).
     """
     try:
         parsed = json.loads(raw, object_pairs_hook=_OrderedPairs)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Reject partial or invalid JSON: {exc}") from exc
+        from pact_v4.runtime.json_resilience import (  # noqa: PLC0415
+            repair_pid_colon_comma,
+        )
+
+        repaired, n_subs = repair_pid_colon_comma(raw)
+        if n_subs == 0:
+            raise ValueError(f"Reject partial or invalid JSON: {exc}") from exc
+        try:
+            parsed = json.loads(repaired, object_pairs_hook=_OrderedPairs)
+        except json.JSONDecodeError as exc2:
+            raise ValueError(f"Reject partial or invalid JSON: {exc2}") from exc2
     if not isinstance(parsed, _OrderedPairs):
         raise ValueError("Reject partial or invalid JSON: expected a JSON object")
     return list(parsed)

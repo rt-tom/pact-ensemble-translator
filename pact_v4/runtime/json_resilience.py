@@ -48,9 +48,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 LOG = logging.getLogger(__name__)
 
@@ -173,6 +174,81 @@ def _first_balanced_json_block(text: str) -> Optional[str]:
     return None  # unbalanced -> truncated
 
 
+_PID_COLON_COMMA_RE = re.compile(r'"p(\d{5})", "')
+
+
+def repair_pid_colon_comma(text: str) -> Tuple[str, int]:
+    """Deterministic, JSON-string-aware repair of the whole-chapter
+    pid-colon model error.
+
+    run_remote_004 (t_34ceca50): DeepSeek on a long whole-chapter output
+    occasionally emits a COMMA instead of a COLON after a PID key —
+    ``"p00082", "`` instead of ``"p00082": "``. The comma form is never
+    valid JSON inside an object (a bare string cannot be followed by `,`
+    outside an array), so the pattern is unique to the model error.
+
+    The substitution is NOT a global text replace: it is applied only at
+    syntactically valid PID-key positions of the top-level JSON object —
+    a quote that opens a key string right after ``{`` or ``,`` while the
+    scanner is inside the top-level object and outside any string
+    literal. Occurrences inside string VALUES (including escaped quotes
+    and nested strings) are skipped, so a legitimate translation value
+    containing the literal ``"p12345", "`` is never corrupted
+    (F1 / t_0626267d).
+
+    Returns ``(repaired_text, n_substitutions)``; the input is returned
+    unchanged when no occurrence matches. The caller re-parses and keeps
+    its own fail-closed path: a body that still does not parse after the
+    substitution is rejected exactly as before (real damage is never
+    masked).
+    """
+    out: list[str] = []
+    containers: list[str] = []  # stack of "obj"/"arr" seen outside strings
+    last_significant = ""  # last non-whitespace char seen outside strings
+    in_string = False
+    escaped = False
+    subs = 0
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            m = _PID_COLON_COMMA_RE.match(text, i)
+            if (
+                m is not None
+                and containers == ["obj"]
+                and last_significant in ("{", ",")
+            ):
+                out.append(f'"p{m.group(1)}": "')
+                i += m.end() - m.start()
+                subs += 1
+                in_string = True  # the value string was just opened
+                continue
+            out.append(ch)
+            in_string = True
+            i += 1
+            continue
+        if ch == "{" or ch == "[":
+            containers.append("obj" if ch == "{" else "arr")
+        elif ch == "}" or ch == "]":
+            if containers:
+                containers.pop()
+        if not ch.isspace():
+            last_significant = ch
+        out.append(ch)
+        i += 1
+    return "".join(out), subs
+
+
 def parse_json_response(text: str) -> dict:
     """Parse a model response into a JSON dict, tolerating the formatting
     noise models wrap their answers in.
@@ -185,13 +261,25 @@ def parse_json_response(text: str) -> dict:
 
     1. BOM + surrounding whitespace are stripped;
     2. markdown fences are removed;
-    3. if the whole body is not directly JSON, the FIRST balanced ``{...}``
-       block is extracted (string-aware, so braces inside strings never
+    3. if the whole body is not directly JSON, a deterministic
+       pid-colon repair is applied first (t_34ceca50, run_remote_004):
+       a COMMA after a PID key — ``"p00082", "`` instead of ``"p00082": "``
+       — is substituted back to a colon at every syntactically valid
+       PID-key position of the top-level object (the comma form is never
+       valid JSON inside an object). The substitution is JSON-string-aware
+       (t_0626267d): occurrences inside string values — a legitimate
+       translation may contain the literal ``"p12345", "`` — and at
+       non-key positions are never touched. A successful parse after the
+       substitution is returned with a WARNING logging the substitution
+       count;
+    4. if the body is STILL not JSON, the FIRST balanced ``{...}`` block
+       is extracted (string-aware, so braces inside strings never
        unbalance it);
-    4. ``json.loads``; on failure a ``TruncatedJSONError`` (a
+    5. ``json.loads``; on failure a ``TruncatedJSONError`` (a
        ``ValueError``) with a clear message is raised — fail-closed, the
        retry zone stays unchanged (broken/truncated JSON is NOT repaired
-       here, it is retried by B4).
+       here beyond the single deterministic pid-colon substitution, it is
+       retried by B4).
 
     Raises:
       * ``EmptyResponseError`` — empty body (B4 retryable);
@@ -209,19 +297,42 @@ def parse_json_response(text: str) -> dict:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        block = _first_balanced_json_block(cleaned)
-        if block is None:
-            raise TruncatedJSONError(
-                "response is not complete JSON (no balanced {...} object "
-                "found after stripping fences/prose — truncated or "
-                "missing)"
-            )
-        try:
-            parsed = json.loads(block)
-        except json.JSONDecodeError as exc:
-            raise TruncatedJSONError(
-                f"response is not complete JSON: {exc}"
-            ) from exc
+        # JSON-REPAIR (t_34ceca50, run_remote_004): DeepSeek on a long
+        # whole-chapter output occasionally emits `"p00082", "` (COMMA)
+        # instead of `"p00082": "` (COLON) after a PID key. The comma form
+        # is never valid JSON inside an object (a bare string cannot be
+        # followed by `,` outside an array), so the pattern is unique to
+        # the model error. Deterministically substitute ALL occurrences at
+        # syntactically valid PID-key positions of the top-level object —
+        # the repair is JSON-string-aware (t_0626267d), so a literal
+        # `"p12345", "` inside a translation value is never touched — and
+        # re-parse; a successful parse is returned with a WARNING so the
+        # model error rate stays visible. Fail-closed is preserved: if the
+        # body still does not parse, the existing
+        # _first_balanced_json_block path runs unchanged (TruncatedJSONError).
+        repaired, n_subs = repair_pid_colon_comma(cleaned)
+        parsed = None
+        if n_subs:
+            try:
+                parsed = json.loads(repaired)
+            except json.JSONDecodeError:
+                parsed = None
+            else:
+                LOG.warning("json repair: %d substitution(s) pid-colon", n_subs)
+        if parsed is None:
+            block = _first_balanced_json_block(cleaned)
+            if block is None:
+                raise TruncatedJSONError(
+                    "response is not complete JSON (no balanced {...} object "
+                    "found after stripping fences/prose — truncated or "
+                    "missing)"
+                )
+            try:
+                parsed = json.loads(block)
+            except json.JSONDecodeError as exc:
+                raise TruncatedJSONError(
+                    f"response is not complete JSON: {exc}"
+                ) from exc
     if not isinstance(parsed, dict):
         raise ValueError(
             f"response is valid JSON but not an object: "
