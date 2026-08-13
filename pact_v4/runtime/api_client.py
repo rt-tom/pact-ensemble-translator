@@ -401,8 +401,10 @@ class ApiClient:
         response_format_attempted, attempts)``. Every reasoning delta is
         forwarded to ``on_reasoning_chunk`` as it arrives (the caller's file
         writer grows the artifact live). On ANY failure (HTTP error,
-        connection error, non-SSE body) raises ``ApiClientError`` so the
-        caller can fall back to the batch path.
+        connection error, non-SSE body, malformed ``data:`` payload, or a
+        stream that ends before ``[DONE]``/terminal ``finish_reason``)
+        raises ``ApiClientError`` so the caller can fall back to the batch
+        path.
         """
         payload = self.build_payload(
             messages,
@@ -474,8 +476,8 @@ class ApiClient:
             f"{int(self._cfg.http_retries)} attempts: {last_error}"
         )
 
-    @staticmethod
     def _consume_sse(
+        self,
         response,
         *,
         on_reasoning_chunk: Callable[[str], None],
@@ -492,12 +494,26 @@ class ApiClient:
         ``on_reasoning_chunk`` immediately. Content deltas accumulate into
         the returned text. ``usage`` (when the server sends it, e.g. via
         ``stream_options``) is captured from the last chunk.
+
+        Fail-closed (RV t_df24524d): a stream that ends without a terminal
+        marker — ``data: [DONE]`` or a chunk carrying a non-empty
+        ``finish_reason`` — is a truncated response and raises
+        ``ApiClientError``; a ``data:`` line that is neither ``[DONE]`` nor
+        valid JSON is a malformed payload and also raises. ``complete()``
+        then performs the declared batch fallback instead of surfacing a
+        partial/empty streamed response as success.
+
+        ``on_reasoning_chunk`` is a best-effort sink (same contract as the
+        batch fallback / OpenCode post-completion delivery): an exception
+        it raises is logged and swallowed — reasoning still accumulates into
+        the returned value / call record and the stream is NOT failed.
         """
         text_parts: List[str] = []
         reasoning_parts: List[str] = []
         finish_reason: Optional[str] = None
         usage: Dict[str, Any] = {}
         saw_data_line = False
+        saw_terminal = False
         for raw_line in response.iter_lines(decode_unicode=True):
             if not raw_line:
                 continue
@@ -507,12 +523,15 @@ class ApiClient:
             saw_data_line = True
             data = line[len("data:"):].strip()
             if data == "[DONE]":
+                saw_terminal = True
                 break
             try:
                 chunk = json.loads(data)
-            except ValueError:
-                # Ignore stray keep-alive lines that are not valid JSON.
-                continue
+            except ValueError as exc:
+                raise ApiClientError(
+                    f"{self._name}: malformed SSE data payload (not JSON): "
+                    f"{data[:200]!r}"
+                ) from exc
             try:
                 choice = chunk["choices"][0]
             except (KeyError, TypeError, IndexError):
@@ -521,13 +540,21 @@ class ApiClient:
             rc = delta.get("reasoning_content") if isinstance(delta, Mapping) else None
             if isinstance(rc, str) and rc:
                 reasoning_parts.append(rc)
-                on_reasoning_chunk(rc)
+                try:
+                    on_reasoning_chunk(rc)
+                except Exception:  # noqa: BLE001 — sink is best-effort
+                    LOG.warning(
+                        "%s: on_reasoning_chunk callback raised; "
+                        "reasoning still accumulated",
+                        self._name, exc_info=True,
+                    )
             content = delta.get("content") if isinstance(delta, Mapping) else None
             if isinstance(content, str) and content:
                 text_parts.append(content)
             fr = choice.get("finish_reason") if isinstance(choice, Mapping) else None
             if isinstance(fr, str) and fr:
                 finish_reason = fr
+                saw_terminal = True
             if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                 usage = chunk["usage"]
         if not saw_data_line:
@@ -535,7 +562,13 @@ class ApiClient:
             # as stream-not-supported so the caller falls back to the batch
             # path instead of silently returning empty text.
             raise ApiClientError(
-                "server returned a non-SSE response to a stream=True request"
+                f"{self._name}: server returned a non-SSE response to a "
+                f"stream=True request"
+            )
+        if not saw_terminal:
+            raise ApiClientError(
+                f"{self._name}: truncated SSE stream: connection ended "
+                f"before [DONE] or a terminal finish_reason"
             )
         return (
             "".join(text_parts),
