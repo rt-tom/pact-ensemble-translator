@@ -236,6 +236,36 @@ def test_tools_really_disabled():
     assert "grep" in tools and "webfetch" in tools and "task" in tools
 
 
+def test_omit_system_tools_drops_system_and_tools_from_body():
+    # AF: serve 1.4.7 serves a body carrying system/tools with a default
+    # ~32k output budget, truncating whole-chapter generation reasoning.
+    # Generation requests omit both (verbatim Gate 0 body shape); the
+    # default keeps the historical system+tools body.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(_request(omit_system_tools=True))
+    body = fake.last_message_body()
+    assert "system" not in body
+    assert "tools" not in body
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"}
+    assert body["parts"] == [{"type": "text", "text": "Translate: Hello."}]
+
+
+def test_omit_system_tools_keeps_reasoning_effort():
+    # AF: reasoningEffort still travels on an omit_system_tools body — the
+    # whole-chapter wire shape is model+parts+reasoningEffort only.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(
+        _request(request_options={"reasoning": 3}, omit_system_tools=True)
+    )
+    body = fake.last_message_body()
+    assert "system" not in body and "tools" not in body
+    assert body["reasoningEffort"] == "high"
+
+
 def test_malformed_session_response_raises_transport_network():
     fake = FakeOpenCodeServer()
     fake.session_create_response = ["not-an-object"]
@@ -379,6 +409,121 @@ def test_multiple_text_parts_are_concatenated():
     assert backend.complete(_request()).text == "part-one part-two"
 
 
+def test_reasoning_part_populates_raw_metadata_not_text():
+    """Regression (run_remote_001, 2026-08-13): serve 1.4.7 returns the
+    model's thinking as ``type=\"reasoning\"`` parts; they must land in
+    ``raw_metadata[\"reasoning\"]`` (so audit/repair ``_reasoning.txt``
+    artifacts are not empty on the remote path) while ``_extract_text``
+    keeps returning only the answer text."""
+    fake = FakeOpenCodeServer()
+    fake.script_message(
+        {
+            "info": {
+                "id": "m1",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "qwen3.7-plus",
+                "tokens": {"input": 1, "output": 1, "reasoning": 42, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"id": "r1", "type": "reasoning", "text": "step one "},
+                {"id": "r2", "type": "reasoning", "text": "step two"},
+                {"id": "t1", "type": "text", "text": "the answer"},
+            ],
+        }
+    )
+    backend = _backend(fake)
+    response = backend.complete(_request())
+    assert response.text == "the answer"
+    assert response.raw_metadata["reasoning"] == "step one step two"
+    assert response.raw_metadata["server_version"] == "1.4.7"
+    assert len(response.raw_metadata["attempts"]) == 1
+    assert response.raw_metadata["attempts"][0]["error_class"] is None
+    assert response.raw_metadata["structured_output_mode"] == "prompt_only"
+    # The call record carries the same raw_metadata (D1 usage journaling).
+    assert backend.call_records()[0].raw_metadata["reasoning"] == "step one step two"
+
+
+def test_synthetic_text_parts_are_captured_as_reasoning():
+    """Some providers stream thinking through the text channel; serve marks
+    such parts ``synthetic``. They must not pollute the answer text but
+    must still be preserved as reasoning (same remote-reasoning contract)."""
+    fake = FakeOpenCodeServer()
+    fake.script_message(
+        {
+            "info": {
+                "id": "m1",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "qwen3.7-plus",
+                "tokens": {"input": 1, "output": 1, "reasoning": 7, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"id": "s1", "type": "text", "text": "thinking...", "synthetic": True},
+                {"id": "t1", "type": "text", "text": "final answer"},
+            ],
+        }
+    )
+    backend = _backend(fake)
+    response = backend.complete(_request())
+    assert response.text == "final answer"
+    assert response.raw_metadata["reasoning"] == "thinking..."
+
+
+def test_no_reasoning_parts_yield_empty_reasoning_metadata():
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("plain"))
+    backend = _backend(fake)
+    response = backend.complete(_request())
+    assert response.text == "plain"
+    assert response.raw_metadata["reasoning"] == ""
+
+
+def test_on_reasoning_chunk_delivered_once_after_completion():
+    """REASONING-STREAM acceptance (opencode): POST /session/{id}/message is
+    NOT an SSE stream — serve 1.4.7 returns the complete message in one
+    response. So on_reasoning_chunk is delivered ONCE with the full reasoning
+    AFTER completion (documented), and raw_metadata marks
+    reasoning_streamed=False."""
+    fake = FakeOpenCodeServer()
+    fake.script_message(
+        {
+            "info": {
+                "id": "m1",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "qwen3.7-plus",
+                "tokens": {"input": 1, "output": 1, "reasoning": 42, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"id": "r1", "type": "reasoning", "text": "step one "},
+                {"id": "r2", "type": "reasoning", "text": "step two"},
+                {"id": "t1", "type": "text", "text": "the answer"},
+            ],
+        }
+    )
+    backend = _backend(fake)
+    received: list = []
+
+    response = backend.complete(
+        _request(on_reasoning_chunk=received.append)
+    )
+
+    assert response.text == "the answer"
+    # One post-completion delivery with the FULL reasoning, not per-chunk.
+    assert received == ["step one step two"]
+    assert response.raw_metadata["reasoning_streamed"] is False
+
+
+def test_on_reasoning_chunk_not_called_when_no_reasoning():
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("plain"))
+    backend = _backend(fake)
+    received: list = []
+    backend.complete(_request(on_reasoning_chunk=received.append))
+    assert received == []
+
+
 # ---------------------------------------------------------------------------
 # Structured output
 # ---------------------------------------------------------------------------
@@ -511,6 +656,46 @@ def test_prompt_only_mode_does_not_send_format():
     backend = _backend(fake, structured_output_mode="prompt_only")
     backend.complete(_request())
     assert "format" not in fake.last_message_body()
+
+
+def test_message_level_transport_error_retried_with_new_session():
+    """R-RETRY (t_8ab8ab35, run_remote_002 chunk2): a message-level
+    transport error ('Type validation failed: Value: {}' from a dead
+    session) is retried with a NEW session, bounded like the HTTP path —
+    the chunk recovers instead of being lost."""
+    fake = FakeOpenCodeServer()
+    # Attempt 1: message-level error mapped to transport_network (unknown
+    # error name -> transport class, like the run_remote_002 empty {}).
+    fake.script_message(
+        {
+            "info": {
+                "id": "m_dead",
+                "role": "assistant",
+                "providerID": "opencode-go",
+                "modelID": "deepseek-v4-flash",
+                "error": {
+                    "name": "TypeValidationError",
+                    "data": {"message": "Type validation failed: Value: {}"},
+                },
+                "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [],
+        }
+    )
+    # Attempt 2 (NEW session): recovers.
+    fake.script_message(_text_message("recovered"))
+    backend = _backend(fake, http_retries=1, retry_delay_seconds=0.0)
+    response = backend.complete(_request())
+    assert response.text == "recovered"
+    assert response.retry_count == 1
+    assert len(fake.message_bodies()) == 2
+    # The retry used a NEW session (the old one was dead) — two distinct
+    # session ids in the attempt log.
+    attempts = response.raw_metadata["attempts"]
+    session_ids = {a.get("session_id") for a in attempts if a.get("session_id")}
+    assert len(session_ids) == 2, f"expected a new session per retry: {session_ids}"
+    assert backend.call_records()[0].retry_count == 1
+
 
 
 # ---------------------------------------------------------------------------

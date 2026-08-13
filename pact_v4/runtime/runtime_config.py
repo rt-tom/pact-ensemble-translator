@@ -909,24 +909,6 @@ def build_repair_adapters(
     )
 
 
-def build_formatting_adapters(
-    cfg: BackendRuntimeConfig, runtime: RuntimeCoordinator
-) -> Tuple[Any]:
-    """The Phase 5 formatting callable ``run_chapter_strict`` needs injected.
-
-    Return order: ``(formatting_caller,)`` — a single ``BackendFormattingCaller``
-    over the coordinator ``CompletionBackend`` (``build_role_backend``), never
-    a local lifecycle adapter. Phase 5's model fallback tier must run through
-    the same backend-neutral boundary in local, remote and composite profiles
-    (dual-mode rule; no retrofit needed). Imported lazily to avoid an import
-    cycle with ``backend_role_adapters``.
-    """
-    from pact_v4.runtime.backend_role_adapters import BackendFormattingCaller
-
-    backend = build_role_backend(cfg, runtime)
-    return (BackendFormattingCaller(backend),)
-
-
 # ---------------------------------------------------------------------------
 # Loader (dict -> tagged config). Values of secrets are never read here:
 # only env-var *names* are recorded (plan §12).
@@ -1095,6 +1077,5 @@ __all__ = [
     "build_role_backend",
     "build_role_adapters",
     "build_repair_adapters",
-    "build_formatting_adapters",
     "JsonRetryPolicy",
 ]

@@ -247,9 +247,8 @@ class FormattingStep(Protocol):
     ``pact_v4.phase5.formatting.FormattingOutcome``-shaped object
     (``formatted_text``, ``incidents``, ``to_payload()``). The strict driver
     injects a closure built over ``pact_v4.phase5.formatting.
-    run_formatting_align`` whose model-fallback tier goes through
-    ``BackendFormattingCaller`` over the coordinator ``CompletionBackend`` —
-    never a local lifecycle adapter. The result must preserve the PID map
+    run_formatting_align`` — deterministic only (card C: formatting = 0 model
+    calls; no injected caller). The result must preserve the PID map
     (formatting is wrap-only by contract).
     """
 

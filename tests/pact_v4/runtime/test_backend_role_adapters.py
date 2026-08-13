@@ -26,8 +26,6 @@ from pact_v4.runtime.backend_protocol import (
     Message,
 )
 from pact_v4.runtime.backend_role_adapters import (
-    BackendFormattingCaller,
-    BackendFormattingCallerConfig,
     BackendGemmaAuditEvaluator,
     BackendGemmaAuditEvaluatorConfig,
     BackendGemmaSelector,
@@ -162,6 +160,10 @@ def test_model_caller_returns_text_and_sends_rendered_prompt():
     assert request.response_schema is not None
     # Default reasoning=0 keeps the baseline: no request_options at all.
     assert request.request_options == {}
+    # AF: the generation request omits the neutral system prompt and the
+    # all-disabled tools map (serve 1.4.7 output-budget quirk — see
+    # CompletionRequest.omit_system_tools).
+    assert request.omit_system_tools is True
 
 
 def test_model_caller_transports_reasoning_via_request_options():
@@ -186,6 +188,64 @@ def test_model_caller_propagates_completion_error():
     caller = BackendModelCaller(_FailingBackend([]))
     with pytest.raises(CompletionError, match="network unreachable"):
         caller(_bundle())
+
+
+def test_model_caller_captures_reasoning_from_raw_metadata():
+    # V4.1 GEN-REASONING: BackendModelCaller exposes the last completion's
+    # reasoning text (raw_metadata['reasoning']) so the whole-chapter
+    # generation layer can persist it per attempt. A completion without
+    # reasoning reports ''; a transport failure resets it to ''.
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+    with_reasoning = CompletionResponse(
+        text=canned, model="gemma-4-26B",
+        raw_metadata={"reasoning": "обдумал род и регистр"},
+    )
+    without_reasoning = CompletionResponse(text=canned, model="gemma-4-26B")
+    backend = ScriptedBackend([with_reasoning, without_reasoning])
+    caller = BackendModelCaller(backend)
+
+    caller(_bundle())
+    assert caller.last_reasoning == "обдумал род и регистр"
+
+    caller(_bundle())
+    assert caller.last_reasoning == ""
+
+    class _FailingBackend(ScriptedBackend):
+        def complete(self, request):
+            raise CompletionError("network unreachable")
+
+    caller2 = BackendModelCaller(_FailingBackend([]))
+    with pytest.raises(CompletionError, match="network unreachable"):
+        caller2(_bundle())
+    # A transport failure leaves last_reasoning empty (never a stale value).
+    assert caller2.last_reasoning == ""
+
+
+def test_model_caller_reset_attempt_state_clears_reasoning():
+    # V4.1 GEN-REASONING (RV t_a790dbab): reset_attempt_state() is the
+    # explicit attempt-boundary reset the lifecycle wrappers invoke BEFORE
+    # model acquisition (ensure_resident). Direct callers keep the existing
+    # clear-at-start behavior inside __call__ — this API is additive.
+    canned = json.dumps({"p00001": "Один.", "p00002": "Два."})
+    with_reasoning = CompletionResponse(
+        text=canned, model="gemma-4-26B",
+        raw_metadata={"reasoning": "обдумал род и регистр"},
+    )
+    backend = ScriptedBackend([with_reasoning])
+    caller = BackendModelCaller(backend)
+
+    caller(_bundle())
+    assert caller.last_reasoning == "обдумал род и регистр"
+
+    caller.reset_attempt_state()
+    assert caller.last_reasoning == ""
+
+    # A subsequent successful completion still captures reasoning (the
+    # explicit reset does not disable capture for the next call).
+    backend2 = ScriptedBackend([with_reasoning])
+    caller2 = BackendModelCaller(backend2)
+    caller2(_bundle())
+    assert caller2.last_reasoning == "обдумал род и регистр"
 
 
 def test_model_caller_uses_role_model_ref_from_descriptor():
@@ -237,6 +297,9 @@ def test_qwen_evaluator_parses_verdict_and_sends_review_prompt():
     assert request.label == "phase2c/qwen_fidelity"
     # max_tokens scales with chunk size on top of the floor.
     assert request.max_output_tokens >= 16384
+    # AF: the omit_system_tools carve-out is generation-only — the Qwen
+    # fidelity gate keeps the historical system+tools body (default False).
+    assert request.omit_system_tools is False
 
 
 def test_qwen_evaluator_returns_failed_gate_on_completion_error():
@@ -856,53 +919,6 @@ def test_generation_cache_put_after_retried_success():
 # ---------------------------------------------------------------------------
 # B12: batched adapters (one backend call for several PIDs / regions)
 # ---------------------------------------------------------------------------
-
-
-def _formatting_batch_items() -> list:
-    return [
-        {
-            "pid": "p00001",
-            "source_text": "Hello world one.",
-            "translation": "Привет мир один.",
-            "spans": [{"span_id": "em01", "tag": "em", "text": "world", "occurrence": 1}],
-        },
-        {
-            "pid": "p00002",
-            "source_text": "Hello world two.",
-            "translation": "Привет мир два.",
-            "spans": [{"span_id": "em02", "tag": "em", "text": "world", "occurrence": 1}],
-        },
-    ]
-
-
-def test_formatting_caller_batch_sends_one_request_for_many_pids():
-    backend = ScriptedBackend([
-        _text_response(json.dumps({"mappings": [
-            {"pid": "p00001", "span_id": "em01", "target_text": "Привет", "occurrence": 1},
-            {"pid": "p00002", "span_id": "em02", "target_text": "Привет", "occurrence": 1},
-        ]}, ensure_ascii=False)),
-    ])
-    caller = BackendFormattingCaller(backend)
-    out = caller.batch(items=_formatting_batch_items())
-    assert "p00001" in out and "p00002" in out
-    assert len(backend.requests) == 1  # one call for the whole batch
-    sent = backend.requests[0].messages[0].content
-    assert "FORMAT_PID: p00001" in sent
-    assert "FORMAT_PID: p00002" in sent
-
-
-def test_formatting_caller_batch_propagates_transport_failure():
-    attempts = []
-
-    class _FailingBackend(ScriptedBackend):
-        def complete(self, request):
-            attempts.append(request)
-            raise CompletionError("connection refused")
-
-    caller = BackendFormattingCaller(_FailingBackend([]))
-    with pytest.raises(CompletionError, match="connection refused"):
-        caller.batch(items=_formatting_batch_items())
-    assert len(attempts) == 1
 
 
 def test_region_fidelity_gate_batch_sends_one_request_for_many_regions():

@@ -78,12 +78,19 @@ def _make_cfg(tmp_path: Path, *, n_paragraphs: int = 24) -> StrictRunConfig:
 
 
 def _render_translation(bundle, *, marker: str) -> Dict[str, str]:
-    """Translate like StubModelCaller but with a per-chunk marker prefix."""
+    """Translate like StubModelCaller but with a per-chunk marker prefix.
+
+    Card C: when the source paragraph carries the emphasized word, it is kept
+    inline in the translation (whole-chapter case), so the deterministic
+    formatting tiers can resolve the span with 0 model calls.
+    """
     out: Dict[str, str] = {}
     for index, (pid, text) in enumerate(bundle.owned_source, start=1):
         digits = "".join(ch for ch in text if ch.isdigit())
         digit_part = f" ({digits})" if digits else ""
         out[pid] = f"{marker} номер{index}{digit_part}"
+        if "emphasized" in text:
+            out[pid] = f"{out[pid]} (emphasized)"
     return out
 
 
@@ -167,31 +174,6 @@ class StubRepairCaller:
         )
 
 
-class CannedFormattingCaller:
-    """Fake Phase 5 ``FormattingCaller``: map each unresolved span to a word.
-
-    Mirrors ``test_v4_phase12_strict_runner_formatting``'s canned caller so a
-    formatting-aware retry run exercises the Phase 5 re-run path (the retry
-    re-runs formatting over the updated text and re-writes the artifacts).
-    """
-
-    def __init__(self, *, empty: bool = False) -> None:
-        self.empty = empty
-        self.calls: list = []
-
-    def __call__(self, *, pid, source_text, translation, spans) -> str:
-        self.calls.append((pid, translation))
-        words = translation.split()
-        mappings = []
-        for index, span in enumerate(spans):
-            target = "" if self.empty else (words[index] if index < len(words) else "")
-            mappings.append({
-                "pid": pid, "span_id": span["span_id"],
-                "target_text": target, "occurrence": 1,
-            })
-        return json.dumps({"mappings": mappings}, ensure_ascii=False)
-
-
 def _make_cfg_with_spans(tmp_path: Path, *, n_paragraphs: int = 24) -> StrictRunConfig:
     """Chapter whose paragraphs carry an inline ``<em>`` span (span contract)."""
     chapter_html = tmp_path / "046.html"
@@ -209,8 +191,7 @@ def _make_cfg_with_spans(tmp_path: Path, *, n_paragraphs: int = 24) -> StrictRun
     )
 
 
-def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None,
-                    formatting_adapters: Any = None):
+def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None):
     """Run the strict driver with Phase 4 repair adapters + the B6 stubs.
 
     The repair re-gate is forced to fail (``StubRegionGate(passed=False)``),
@@ -239,7 +220,6 @@ def _run_with_retry(cfg: StrictRunConfig, *, caller: Any = None,
             _LifecycleAwareQwenAudit(router, reaudit_qwen),
             _LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
         ),
-        formatting_adapters=formatting_adapters,
     )
     return result, router, inner, qwen_audit, reaudit_qwen
 
@@ -478,19 +458,18 @@ def test_quarantined_retry_not_fired_without_quarantined_debt(tmp_path: Path):
 
 
 def test_quarantined_retry_reruns_formatting_over_updated_text(tmp_path: Path):
-    # Phase 5 formatting (B3) is configured, so after the retry replaces the
-    # best-variant the formatting step re-runs over the updated chapter text;
-    # the repair report's formatting block and formatting_report.json must
-    # carry the re-run outcome (not the pre-retry one).
+    # Phase 5 formatting (B3, card C) is deterministic and configured by
+    # default, so after the retry replaces the best-variant the formatting
+    # step re-runs over the updated chapter text; the repair report's
+    # formatting block and formatting_report.json must carry the re-run
+    # outcome (not the pre-retry one). Formatting is model-free: no caller is
+    # injected, resolved_count comes from the deterministic tiers.
     cfg = _make_cfg_with_spans(tmp_path, n_paragraphs=24)
-    formatting_caller = CannedFormattingCaller()
-    result, _router, _caller, _audit, _reaudit = _run_with_retry(
-        cfg, formatting_adapters=(formatting_caller,),
-    )
+    result, _router, _caller, _audit, _reaudit = _run_with_retry(cfg)
     # The retry succeeded (chunk0001 unlocked) and formatting re-ran.
     assert result.step7["quarantined_retry"]["status"] == "ran"
     assert result.step7["quarantined_retry"]["selected_chunk_ids"] == ["chunk0001"]
-    assert formatting_caller.calls  # the formatting caller was actually invoked
+    assert result.step7["formatting"]["model_call_count"] == 0
 
     report = _load_report(cfg)
     assert report["status"] == result.step8["status"]

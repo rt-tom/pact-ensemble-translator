@@ -27,6 +27,14 @@ Pinned facts used here:
 * ``DELETE /session/{id}`` -> ``boolean``;
 * ``POST /session/{id}/message`` ``{model?, agent?, system?, tools?,
   format?, parts}`` -> ``{info: AssistantMessage, parts: Part[]}``;
+* **output-budget quirk (AF, 2026-08-10)**: a message body that carries
+  ``system`` and/or ``tools`` is served with a default ~32k output budget,
+  truncating whole-chapter generation reasoning at 32000 tokens
+  (``finish=length``, empty output). A body with only ``model``+``parts``
+  (+``reasoningEffort``) — the verbatim Gate 0 shape — is not capped
+  (measured 55915 reasoning tokens with ``finish=stop``). The generation
+  caller therefore sets ``CompletionRequest.omit_system_tools``; audit /
+  repair / formatting keep ``system``+``tools`` (out of scope).
 * ``GET /experimental/tool/ids`` -> ``string[]`` (used to build the
   all-tools-disabled map).
 
@@ -42,7 +50,10 @@ Design rules (plan §5, §7, §10, §12)
   provider connected, model exists, tool IDs for the disabled-tools map.
 * One isolated session per work unit: ``session_scope=per_request``,
   ``context_reuse=false``, every message carries an explicit
-  ``provider/model`` and ``tools`` (all disabled); ``close()`` deletes only
+  ``provider/model`` and ``tools`` (all disabled) — except generation
+  requests (``omit_system_tools``), which drop ``system``/``tools`` from
+  the body to escape the serve output-budget cap (see quirk above);
+  ``close()`` deletes only
   sessions this backend created, and only when the session policy allows.
 * ``BackendDescriptor`` includes everything that can change the model answer
   (model bindings, adapter/server contract version, endpoint family,
@@ -751,15 +762,16 @@ class OpenCodeServerBackend:
     ) -> dict:
         body: dict = {
             "model": {"providerID": provider_id, "modelID": model_id},
-            "system": self._cfg.system_prompt,
             "parts": [
                 {"type": "text", "text": msg.content}
                 for msg in request.messages
             ],
         }
+        if not request.omit_system_tools:
+            body["system"] = self._cfg.system_prompt
         if self._cfg.agent:
             body["agent"] = self._cfg.agent
-        if self._cfg.tools_disabled:
+        if self._cfg.tools_disabled and not request.omit_system_tools:
             body["tools"] = {tool_id: False for tool_id in self._tool_ids}
         if self._cfg.structured_output_mode == "json_schema" and request.response_schema is not None:
             body["format"] = {
@@ -832,6 +844,37 @@ class OpenCodeServerBackend:
             if part.get("type") != "text":
                 continue
             if part.get("synthetic") or part.get("ignored"):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+        return "".join(chunks)
+
+    def _extract_reasoning(self, parts: Sequence[Mapping[str, Any]]) -> str:
+        """Concatenate the model's thinking from message parts (v1.4.7).
+
+        Reasoning arrives either as dedicated ``type="reasoning"`` parts
+        (``ReasoningPart``, the canonical v1.4.7 shape) or as synthetic
+        text parts for providers that stream thinking through the text
+        channel. Both must be excluded from ``_extract_text`` (that
+        method keeps only non-synthetic ``text`` parts) and surfaced
+        separately via ``raw_metadata["reasoning"]`` so audit/repair
+        ``_reasoning.txt`` artifacts are not empty on the remote path.
+        """
+        chunks = []
+        for part in parts:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("ignored"):
+                continue
+            if part.get("type") == "reasoning":
+                text = part.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+                continue
+            if part.get("type") != "text":
+                continue
+            if not part.get("synthetic"):
                 continue
             text = part.get("text")
             if isinstance(text, str):
@@ -1028,19 +1071,39 @@ class OpenCodeServerBackend:
                 attempt_log.append(
                     _attempt_entry(message_error, session_id, request.model_ref)
                 )
-                if (
+                # R-RETRY (t_8ab8ab35, run_remote_002 chunk2): the message-
+                # level path retried ONLY structured-output failures, so a
+                # transport-class error surfacing through info.error
+                # ('Type validation failed: Value: {}' from a dead session,
+                # mapped to transport_network) fell straight to
+                # _raise_final and the chunk was lost. Transport-class
+                # message errors are now retried too — bounded like the
+                # HTTP path (same transport counter + backoff) — and the
+                # `continue` re-creates the session at the loop top (the
+                # old one is dead).
+                structured_retryable = (
                     message_error.error_class in _STRUCTURED_RETRYABLE_ERROR_CLASSES
                     and self._cfg.structured_output_mode == "json_schema"
                     and structured_attempts < max_structured_attempts - 1
-                ):
+                )
+                transport_retryable = (
+                    message_error.error_class in _RETRYABLE_ERROR_CLASSES
+                    and transport_attempts < max_transport_attempts - 1
+                )
+                if structured_retryable or transport_retryable:
                     if not self._can_retry():
                         if not self._cfg.retain_failed_sessions:
                             self._delete_own_session(session_id)
                         self._raise_budget_exhausted(
                             message_error, attempt_log, started, request
                         )
-                    structured_attempts += 1
-                    self._reserve_retry()
+                    if transport_retryable:
+                        transport_attempts += 1
+                        self._reserve_retry()
+                        self._backoff(message_error)
+                    else:
+                        structured_attempts += 1
+                        self._reserve_retry()
                     continue
                 if not self._cfg.retain_failed_sessions:
                     self._delete_own_session(session_id)
@@ -1049,6 +1112,25 @@ class OpenCodeServerBackend:
             # Success path.
             self._owned_sessions[session_id] = "success"
             text = self._extract_text(parts)
+            reasoning = self._extract_reasoning(parts)
+            # REASONING-STREAM: POST /session/{id}/message is NOT an SSE
+            # stream — serve 1.4.7 returns the complete message (info +
+            # parts) in one JSON response; opencode streams via the separate
+            # /event SSE endpoint (message.part.updated), which this
+            # transport does not consume. So reasoning is delivered once,
+            # AFTER completion, through the optional on_reasoning_chunk sink
+            # (documented fallback; the phase's *_reasoning.txt file is
+            # written after the call returns, not live). A raise inside the
+            # sink is best-effort — it must never fail the model call.
+            if request.on_reasoning_chunk is not None and reasoning:
+                try:
+                    request.on_reasoning_chunk(reasoning)
+                except Exception:  # noqa: BLE001 — a sink failure is best-effort
+                    LOG.warning(
+                        "OpenCodeServerBackend: on_reasoning_chunk callback "
+                        "raised; reasoning delivery is best-effort",
+                        exc_info=True,
+                    )
             structured = info.get("structured")
             if self._cfg.structured_output_mode == "json_schema":
                 if structured is None:
@@ -1108,6 +1190,12 @@ class OpenCodeServerBackend:
                     "server_version": self._server_version,
                     "attempts": attempt_log,
                     "structured_output_mode": self._cfg.structured_output_mode,
+                    "reasoning": reasoning,
+                    # REASONING-STREAM: the opencode message POST is batch —
+                    # reasoning is never streamed live on this transport (see
+                    # the comment at the delivery site). Marker for phases/
+                    # tests to distinguish live from post-completion writes.
+                    "reasoning_streamed": False,
                 },
             )
 

@@ -384,3 +384,132 @@ def test_whole_chapter_bundle_identity_hashes_full_chapter(tmp_path):
     # max_output_tokens=32768 lives in the bundle identity (Gate 0 §8.5).
     assert payload["params"]["max_tokens"] == 32768
     assert payload["params"]["reasoning"] == 2
+
+
+# ---------------------------------------------------------------------------
+# V4.1 GEN-REASONING: per-attempt reasoning transport (whole-chapter path)
+# ---------------------------------------------------------------------------
+
+
+class _ReasoningCaller:
+    """Echo caller that also reports per-call reasoning (``last_reasoning``).
+
+    Mirrors the production ``BackendModelCaller`` contract: the reasoning of
+    the most recent completion is exposed via a ``last_reasoning`` attribute
+    that ``generate_whole_chapter`` reads after each attempt.
+    """
+
+    def __init__(self, responses, reasonings) -> None:
+        self.responses = list(responses)
+        self.reasonings = list(reasonings)
+        self.calls = 0
+        self.last_reasoning = ""
+
+    def __call__(self, bundle) -> str:
+        self.calls += 1
+        if self.reasonings:
+            self.last_reasoning = self.reasonings.pop(0)
+        return self.responses.pop(0)
+
+
+def test_whole_chapter_reasoning_sink_receives_successful_attempt(tmp_path):
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ReasoningCaller(
+        [good],
+        ["model thought about register and gender here"],
+    )
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    # One attempt, its reasoning text delivered to the sink.
+    assert received == [(0, "model thought about register and gender here")]
+
+
+def test_whole_chapter_reasoning_sink_receives_truncated_retry(tmp_path):
+    # GEN-REASONING acceptance: a truncated first attempt's reasoning must be
+    # preserved (diagnosis of WHY the retry happened), and the retry's own
+    # reasoning must also arrive — each attempt is one sink call.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ReasoningCaller(
+        ["{truncated json", good],
+        ["attempt 0: thinking cut off mid-argument", "attempt 1: revised approach"],
+    )
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    assert caller.calls == 2
+    assert received == [
+        (0, "attempt 0: thinking cut off mid-argument"),
+        (1, "attempt 1: revised approach"),
+    ]
+
+
+def test_whole_chapter_reasoning_sink_absent_reasoning_is_empty(tmp_path):
+    # A caller that does NOT expose last_reasoning (e.g. a stub) yields "" —
+    # the sink still fires per attempt so the runner can record presence=0.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    caller = _ScriptedCaller([good])
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    assert outcome.status == "complete"
+    assert received == [(0, "")]
+
+
+def test_whole_chapter_reasoning_sink_empty_on_lifecycle_acquisition_abort(tmp_path):
+    # GEN-REASONING regression (RV t_a790dbab): a lifecycle acquisition
+    # failure (model load/swap raising CompletionError) aborts the attempt
+    # BEFORE the wrapped caller is entered. The abort attempt must emit ''
+    # to the reasoning sink — never the reasoning left over from a prior
+    # successful completion.
+    from pact_v4.runtime.model_lifecycle_adapters import LifecycleModelCaller
+
+    class _FailingRouter:
+        base_url = "http://router.invalid"
+
+        def ensure_resident(self, model_key: str):
+            raise CompletionError(f"{model_key} load failed (simulated)")
+
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+
+    caller = LifecycleModelCaller(_FailingRouter(), model_name="gemma-4-26B")
+    # Simulate a prior successful completion that populated last_reasoning.
+    caller._caller._impl._last_reasoning = "STALE prior reasoning"
+    assert caller.last_reasoning == "STALE prior reasoning"
+
+    received = []
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        reasoning_sink=lambda attempt, text: received.append((attempt, text)),
+    )
+    # Every attempt aborts at acquisition; each must report empty reasoning.
+    assert outcome.status == "incomplete"
+    assert received == [(0, ""), (1, ""), (2, "")]
+    assert caller.last_reasoning == ""

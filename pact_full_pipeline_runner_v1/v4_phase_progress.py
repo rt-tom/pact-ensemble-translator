@@ -51,6 +51,15 @@ from pact_full_pipeline_runner_v1.v4_usage import phase_for_label
 
 FRESHNESS_WINDOW_SECONDS = 300.0
 
+# V4.1 M (monitor card): the B3 production audit/repair stage appends its
+# own crash-safe journal (``audit_journal.ndjson``, written by
+# ``pact_v4.pipeline.b3_audit_repair.AuditJournal``) with fine-grained
+# audit-chunk / repair-round events. The monitor reads it READ-ONLY as a
+# secondary source so a whole-chapter run shows "AUDIT chunk N/8" and the
+# repair round live, without any pipeline change (the B3 events were already
+# emitted there — this card only surfaces them).
+B3_AUDIT_JOURNAL_FILENAME = "audit_journal.ndjson"
+
 # V4 monitor v2 (owner-approved spec, docs/plans/V4_PHASE12_..._RU.md,
 # "Дизайн обновлённого монитора"): usage-label group -> step-group mapping.
 # The label -> phase leg is delegated to phase_for_label() from v4_usage.py
@@ -166,6 +175,19 @@ def _load_events(out_dir: Path) -> List[Dict[str, Any]]:
     return _read_ndjson(out_dir / PHASE_PROGRESS_FILENAME)
 
 
+def _load_b3_events(out_dir: Path) -> List[Dict[str, Any]]:
+    """B3 audit/repair journal events (read-only, crash-safe).
+
+    The B3 stage (whole-chapter production audit/repair) appends fine-grained
+    ``audit_chunk_started``/``audit_chunk_done`` (chunk, total) and
+    ``repair_round`` (eligible/committed/passed/debt) events to its own
+    journal. Absent when B3 did not run (generation-only, chunked runs) —
+    the whole-chapter status then shows generation/validation without the
+    B-phase segments.
+    """
+    return _read_ndjson(out_dir / B3_AUDIT_JOURNAL_FILENAME)
+
+
 # ---------------------------------------------------------------------------
 # Identity / liveness
 # ---------------------------------------------------------------------------
@@ -235,6 +257,16 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
     recent_usage = usage_age is not None and usage_age <= FRESHNESS_WINDOW_SECONDS
     recent_event = bool(started) and bool(_recent_event_age(events) <= FRESHNESS_WINDOW_SECONDS)
 
+    # V4.1 M (RV fix): local whole-chapter B3 audit/repair calls never write
+    # usage.ndjson rows and do not update phase_progress per chunk/repair
+    # call — the only fresh activity during a long B3 pass is the audit
+    # journal's own events (audit_chunk_started/done, repair_round, ...).
+    # Read it read-only: a fresh journal event keeps the run alive, nothing
+    # more (no writing, no gating).
+    b3_events = _load_b3_events(out_dir)
+    b3_age = _recent_event_age(b3_events)
+    recent_b3 = b3_age <= FRESHNESS_WINDOW_SECONDS
+
     alive_basis: List[str] = []
     if record is not None:
         alive = False
@@ -243,13 +275,15 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         alive = False
         alive_basis.append("terminal event written (run finished)")
     else:
-        alive = bool(recent_usage or recent_event)
+        alive = bool(recent_usage or recent_event or recent_b3)
         if recent_usage:
             alive_basis.append(f"last usage.ndjson {usage_age:.0f}s ago")
         if recent_event:
             alive_basis.append(f"last progress event {_recent_event_age(events):.0f}s ago")
+        if recent_b3:
+            alive_basis.append(f"last audit_journal event {b3_age:.0f}s ago")
         if not alive_basis:
-            alive_basis.append("no recent usage.ndjson / progress events (stalled or unknown)")
+            alive_basis.append("no recent usage.ndjson / progress / audit_journal events (stalled or unknown)")
 
     return {
         "alive": alive,
@@ -306,6 +340,15 @@ def _detect_phase(out_dir: Path, events: List[Dict[str, Any]]) -> Tuple[str, str
     if _terminal_event(events) is not None:
         return "done", "terminal event written"
 
+    # V4.1 M: whole-chapter path first — a ``wc_generation_started`` event
+    # marks a whole-chapter run (one generation call per chapter), whose
+    # chunked-model heuristics below (chunk_plan.json + journal) would be
+    # misleading: the journal holds ONE whole_chapter entry while the plan
+    # holds N chunks, and the 10-minute generation has no journal entry at
+    # all yet.
+    if _whole_chapter_mode(events):
+        return _detect_whole_chapter_phase(out_dir, events)
+
     b2 = _read_json(out_dir / "b2_handoff.json")
     repair_report = _read_json(out_dir / "repair_report.json")
     chunk_plan = _read_json(out_dir / "chunk_plan.json")
@@ -325,6 +368,139 @@ def _detect_phase(out_dir: Path, events: List[Dict[str, Any]]) -> Tuple[str, str
     if total is not None:
         return "steps1-5", f"journal {len(journal)}/{total} chunks journaled"
     return "unknown", "no chunk_plan.json / journal found"
+
+
+def _whole_chapter_mode(events: List[Dict[str, Any]]) -> bool:
+    """True when the run's progress stream is a V4.1 whole-chapter flow."""
+    return any(e.get("event") == "wc_generation_started" for e in events)
+
+
+def _detect_whole_chapter_phase(
+    out_dir: Path, events: List[Dict[str, Any]]
+) -> Tuple[str, str]:
+    """Whole-chapter phase: gen -> step6 (B3 audit) -> step7 (repair) -> step8.
+
+    ``wc_*`` events drive the generation leg; the B3 audit/repair leg comes
+    from the B3 stage's own journal (``audit_journal.ndjson``) read-only —
+    the audit chunk and repair-round events were already being emitted there,
+    this monitor only surfaces them. A generation-only whole-chapter run (no
+    B3 journal) jumps from ``gen`` straight to the record/terminal ``done``.
+    """
+    done = [e for e in events if e.get("event") == "wc_generation_done"]
+    if not done:
+        gen = _wc_gen_status(events)
+        basis = (f"whole-chapter generation in flight; {gen['status']}"
+                 f" (думает {gen['thinking_seconds']:.0f} сек)" if gen else
+                 "whole-chapter generation started")
+        return "gen", basis
+
+    b3 = _load_b3_events(out_dir)
+    if not b3:
+        return "steps1-5", ("whole-chapter generation done; B3 audit/repair "
+                            "not running (generation-only or awaiting stage)")
+
+    b3_names = [e.get("event") for e in b3]
+    audit_chunk_started = [e for e in b3 if e.get("event") == "audit_chunk_started"]
+    audit_chunk_done = [e for e in b3 if e.get("event") == "audit_chunk_done"]
+    repair_rounds = [e for e in b3 if e.get("event") == "repair_round"]
+    reaudit = [e for e in b3 if e.get("event") == "reaudit_scope"]
+    gate = [e for e in b3 if e.get("event") == "gate"]
+
+    if gate:
+        return "step8", ("B3 gate written; final record not yet written "
+                         f"(released_as_audited={gate[-1].get('released_as_audited')})")
+    if repair_rounds or reaudit:
+        detail = _b3_repair_hint(b3)
+        return "step7", f"B3 repair in progress{detail}"
+
+    # RV fix: after ``audit_complete`` (audit=True) the repair model call may
+    # already be in flight while the repair_round/reaudit_scope event is not
+    # yet appended — the monitor must NOT keep reporting step6
+    # ``AUDIT chunk N/8`` for a finished audit. Transition to step7 until the
+    # repair_round/terminal gate lands. An incomplete audit (audit=False,
+    # gate not yet written — transient crash window) stays fail-closed on
+    # step6; step8 is shown only after the gate event.
+    audit_complete_events = [e for e in b3 if e.get("event") == "audit_complete"]
+    if audit_complete_events:
+        if audit_complete_events[-1].get("audit_complete") is True:
+            return "step7", ("B3 audit complete; repair in flight "
+                             "(awaiting repair_round/gate)")
+        return "step6", "B3 audit incomplete (fail-closed); awaiting gate"
+    if audit_chunk_started or audit_chunk_done:
+        total = ((audit_chunk_started[-1].get("total")
+                  if audit_chunk_started else None)
+                 or (audit_chunk_done[-1].get("total")
+                     if audit_chunk_done else None))
+        done_n = len(audit_chunk_done)
+        last = (audit_chunk_started or audit_chunk_done)[-1]
+        current = last.get("chunk") or done_n or len(audit_chunk_started)
+        return "step6", (f"B3 audit chunk {current}/{total or '?'} "
+                         f"(done={done_n})")
+    if "audit_started" in b3_names or "entity_context" in b3_names:
+        return "step6", "B3 audit started"
+    return "step6", "whole-chapter generation done; B3 audit pending"
+
+
+def _wc_gen_status(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Live whole-chapter generation state from ``wc_*`` events.
+
+    Returns the current attempt (1-based), the retry budget, the last retry
+    reason, and how many seconds the model has been thinking since the last
+    generation event. ``None`` when no whole-chapter generation is in flight.
+    """
+    started = [e for e in events if e.get("event") == "wc_generation_started"]
+    if not started:
+        return None
+    retries = [e for e in events if e.get("event") == "wc_retry_attempt"]
+    done = [e for e in events if e.get("event") == "wc_generation_done"]
+
+    last_started = started[-1]
+    max_attempts = int(last_started.get("max_attempts") or 1)
+    attempt = (int(retries[-1].get("attempt")) if retries else 1)
+    reason = (retries[-1].get("reason") if retries else None)
+    # Thinking time = age of the newest wc event (started or last retry).
+    latest_ts = last_started.get("ts") or ""
+    for retry in retries:
+        ts = retry.get("ts") or ""
+        if ts > latest_ts:
+            latest_ts = ts
+    thinking = _ts_age(latest_ts)
+
+    if done:
+        last_done = done[-1]
+        status = (f"attempt {attempt}/{max_attempts} done "
+                  f"finish_reason={last_done.get('finish_reason')}")
+    else:
+        status = f"attempt {attempt}/{max_attempts}"
+        if reason:
+            status += f" (reason: {reason})"
+    return {
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "reason": reason,
+        "thinking_seconds": thinking,
+        "status": status,
+        "pid_count": last_started.get("pid_count"),
+        "model": last_started.get("model"),
+        "reasoning_budget": last_started.get("reasoning_budget"),
+        "validated": [e for e in events if e.get("event") == "wc_validated"],
+    }
+
+
+def _b3_repair_hint(b3: List[Dict[str, Any]]) -> str:
+    """Live repair hint from the B3 journal's ``repair_round`` event."""
+    for event in reversed(b3):
+        if event.get("event") != "repair_round":
+            continue
+        committed = len(event.get("committed_pids") or [])
+        passed = len(event.get("passed_pids") or [])
+        debt = len(event.get("debt_trace") or [])
+        hint = (f"; round {event.get('round')} "
+                f"committed={committed} passed={passed} debt={debt}")
+        if event.get("repair_complete") is True:
+            hint += " (repair complete)"
+        return hint
+    return ""
 
 
 def _region_progress_hint(events: List[Dict[str, Any]]) -> str:
@@ -501,6 +677,13 @@ def _chunk_table(out_dir: Path, events: List[Dict[str, Any]]) -> List[Dict[str, 
     handoff_by_chunk = _handoff_by_chunk(out_dir)
     repair_state = _repair_state_by_chunk(out_dir, events)
 
+    # V4.1 whole-chapter mode: ONE processing unit (whole_chapter), not the
+    # planner's N chunks — the journal holds a single whole_chapter entry and
+    # the plan rows would all read "pending". Show the unit's own status from
+    # the wc_*/B3 events instead.
+    if _whole_chapter_mode(events):
+        return [_whole_chapter_chunk_row(out_dir, events)]
+
     chunk_ids = [row.get("chunk_id") for row in (chunk_plan or {}).get("chunks", []) if row.get("chunk_id")]
     rows: List[Dict[str, Any]] = []
     for chunk_id in chunk_ids:
@@ -517,6 +700,62 @@ def _chunk_table(out_dir: Path, events: List[Dict[str, Any]]) -> List[Dict[str, 
             "repair_basis": repair_basis,
         })
     return rows
+
+
+def _whole_chapter_chunk_row(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Single-row chunk table for whole-chapter runs (generation -> B3)."""
+    gen = _wc_gen_status(events)
+    if gen is None:
+        return {
+            "chunk_id": "whole_chapter",
+            "trial": "pending", "trial_basis": "no wc_generation_started event",
+            "audit": "not_started", "audit_basis": "no B3 audit events",
+            "repair": "not_started", "repair_basis": "no B3 repair events",
+        }
+    if gen["validated"]:
+        flags = gen["validated"][-1]
+        trial = ("generated" if flags.get("json_ok") and flags.get("pids_ok")
+                 and flags.get("order_ok") else "incomplete_generation")
+        trial_basis = (f"wc_validated json_ok={flags.get('json_ok')} "
+                       f"pids_ok={flags.get('pids_ok')} order_ok={flags.get('order_ok')}")
+    else:
+        trial = "generating" if not any(
+            e.get("event") == "wc_generation_done" for e in events
+        ) else "generated"
+        trial_basis = "wc_generation in flight / done (no wc_validated yet)"
+
+    b3 = _load_b3_events(out_dir)
+    if not b3:
+        return {
+            "chunk_id": "whole_chapter",
+            "trial": trial, "trial_basis": trial_basis,
+            "audit": "not_started", "audit_basis": "no B3 audit journal",
+            "repair": "not_started", "repair_basis": "no B3 audit journal",
+        }
+    audit_started = [e for e in b3 if e.get("event") == "audit_chunk_started"]
+    audit_done = [e for e in b3 if e.get("event") == "audit_chunk_done"]
+    audit = ("done" if audit_started and len(audit_done) >= len(audit_started)
+             else ("in_progress" if audit_started else "not_started"))
+    audit_total = (
+        (audit_done or audit_started)[-1].get("total")
+        if (audit_done or audit_started) else 0
+    ) or len(audit_started)
+    audit_basis = f"B3 audit chunks done={len(audit_done)}/{audit_total}"
+
+    repair_rounds = [e for e in b3 if e.get("event") == "repair_round"]
+    if repair_rounds and repair_rounds[-1].get("repair_complete") is True:
+        repair = "committed"
+    elif repair_rounds:
+        repair = "debt" if repair_rounds[-1].get("debt_trace") else "in_progress"
+    else:
+        repair = "not_started"
+    repair_basis = (_b3_repair_hint(b3) or "no repair_round event yet").lstrip("; ")
+    return {
+        "chunk_id": "whole_chapter",
+        "trial": trial, "trial_basis": trial_basis,
+        "audit": audit, "audit_basis": audit_basis,
+        "repair": repair, "repair_basis": repair_basis,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +838,18 @@ def _terminal_counts(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, A
 def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
     """Current ``*_started`` without its ``*_done``, the "now on X" signal."""
     in_flight: List[str] = []
+
+    # V4.1 whole-chapter generation: wc_generation_started without
+    # wc_generation_done is the single in-flight model call.
+    if _whole_chapter_mode(events) and not any(
+        e.get("event") == "wc_generation_done" for e in events
+    ):
+        gen = _wc_gen_status(events)
+        if gen is not None:
+            in_flight.append(
+                f"whole-chapter generation ({gen['status']}, "
+                f"думает {gen['thinking_seconds']:.0f} сек)"
+            )
 
     chunk_done = {e.get("chunk_id") for e in events if e.get("event") == "chunk_done"}
     for event in events:
@@ -790,6 +1041,64 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str:
+    """Compact one-line status (V4.1 M card)::
+
+        [0001] gen | GEN attempt 2/3 (reason: malformed) | AUDIT chunk 3/8 |
+        REPAIR regions done=2 committed=1 debt=1 | DONE
+
+    Segments appear only when the corresponding events exist; ``DONE`` only
+    at a terminal state. Works for both whole-chapter (wc_* + B3 journal)
+    and chunked runs (region events), so the book-run chapters table and the
+    single-chapter report share one vocabulary.
+    """
+    started = _run_started_event(events)
+    chapter = (started or {}).get("chapter_id") or out_dir.name
+    segments = [f"[{chapter}] {phase}"]
+
+    gen = _wc_gen_status(events)
+    if gen is not None:
+        segments.append(f"GEN {gen['status']}")
+    elif phase not in ("gen", "steps1-5", "unknown"):
+        # Chunked runs: show the chunked generation progress (journal) as the
+        # GEN segment so the status line stays meaningful outside whole-chapter.
+        journal = _read_ndjson(out_dir / "journal.ndjson")
+        chunk_plan = _read_json(out_dir / "chunk_plan.json")
+        total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
+        if total:
+            segments.append(f"GEN chunks {len(journal)}/{total}")
+
+    b3 = _load_b3_events(out_dir)
+    audit_chunks = [e for e in b3 if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
+    if audit_chunks:
+        last = audit_chunks[-1]
+        total = last.get("total")
+        # The card's "AUDIT chunk N/8" is the CURRENT chunk number, i.e. the
+        # newest event's chunk (the one being processed / just finished), not
+        # a count of events.
+        current = last.get("chunk") or sum(
+            1 for e in audit_chunks if e.get("event") == "audit_chunk_started"
+        )
+        segments.append(f"AUDIT chunk {current}/{total or '?'}")
+
+    region_counts = _region_counts(events)
+    repair_hint = _b3_repair_hint(b3)
+    if repair_hint or region_counts["done"]:
+        if repair_hint:
+            segments.append(f"REPAIR {repair_hint.lstrip('; ')}")
+        else:
+            segments.append(
+                f"REPAIR regions done={region_counts['done']} "
+                f"committed={region_counts['committed']} "
+                f"debt={region_counts['debt']}"
+            )
+
+    if phase == "done":
+        terminal = _terminal_counts(out_dir, events)
+        segments.append(f"DONE ({terminal['status']})" if terminal["status"] else "DONE")
+    return " | ".join(segments)
+
+
 def render_report(out_dir: Path) -> str:
     """Read-only text report over one run directory."""
     events = _load_events(out_dir)
@@ -800,6 +1109,7 @@ def render_report(out_dir: Path) -> str:
 
     identity = _identity(out_dir, events)
     phase, phase_basis = _detect_phase(out_dir, events)
+    wc_mode = _whole_chapter_mode(events)
     rows = _chunk_table(out_dir, events)
     chunk_plan = _read_json(out_dir / "chunk_plan.json")
     total_chunks = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
@@ -811,6 +1121,8 @@ def render_report(out_dir: Path) -> str:
     formatting = _formatting_counts(out_dir, events)
     terminal = _terminal_counts(out_dir, events)
     in_flight = _in_flight_model_activity(events)
+    gen = _wc_gen_status(events) if wc_mode else None
+    b3_events = _load_b3_events(out_dir)
 
     lines: List[str] = []
     lines.append(f"== V4 run progress: {out_dir} ==")
@@ -822,6 +1134,7 @@ def render_report(out_dir: Path) -> str:
         lines.append(f"elapsed: {identity['elapsed_seconds']:.0f}s")
     if identity["resumed_from_index"] is not None:
         lines.append(f"resumed_from_index: {identity['resumed_from_index']}")
+    lines.append(f"status: {_status_line(out_dir, events, phase)}")
     lines.append(f"phase: {phase} -- {phase_basis}")
 
     lines.append("")
@@ -837,11 +1150,43 @@ def render_report(out_dir: Path) -> str:
 
     lines.append("")
     lines.append("-- counters --")
-    lines.append(f"Steps 1-5: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
-                 f" (selected={trial_counts['selected']}, quarantined={trial_counts['quarantined']}, "
-                 f"needs_synthesis={trial_counts['needs_synthesis']}, "
-                 f"incomplete_generation={trial_counts['incomplete_generation']})")
-    if fine:
+    if wc_mode and gen is not None:
+        lines.append(
+            f"GEN: attempt {gen['attempt']}/{gen['max_attempts']} "
+            f"pid_count={gen['pid_count']} reasoning_budget={gen['reasoning_budget']} "
+            f"model={gen['model']}"
+        )
+        if gen["validated"]:
+            flags = gen["validated"][-1]
+            lines.append(
+                f"PID validation: json_ok={flags.get('json_ok')} "
+                f"pids_ok={flags.get('pids_ok')} order_ok={flags.get('order_ok')} "
+                "(wc_validated)"
+            )
+        else:
+            lines.append("PID validation: pending (wc_validated not written yet)")
+    else:
+        lines.append(f"Steps 1-5: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
+                     f" (selected={trial_counts['selected']}, quarantined={trial_counts['quarantined']}, "
+                     f"needs_synthesis={trial_counts['needs_synthesis']}, "
+                     f"incomplete_generation={trial_counts['incomplete_generation']})")
+    if wc_mode:
+        b3_audit_chunks = [e for e in b3_events
+                           if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
+        if b3_audit_chunks:
+            total = b3_audit_chunks[-1].get("total")
+            started_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_started")
+            done_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_done")
+            lines.append(f"Step 6 (B3): audit chunks started={started_n}/{total or '?'} "
+                         f"done={done_n} (audit_journal.ndjson)")
+        else:
+            lines.append("Step 6 (B3): no audit chunk events yet")
+        repair_hint = _b3_repair_hint(b3_events)
+        if repair_hint:
+            lines.append(f"Step 7 (B3): {repair_hint.lstrip('; ')}")
+        else:
+            lines.append("Step 7 (B3): repair not started")
+    elif fine:
         lines.append(
             f"Step 6: audit units done={audit_counts['done']}/{audit_counts['expected']} "
             f"(started={audit_counts['started']})"
@@ -857,7 +1202,7 @@ def render_report(out_dir: Path) -> str:
     # V4 monitor v2 (owner observation eff-a1a2): before Step 8 starts the
     # old text read as "formatting incidents=None ... terminal=None" — a
     # broken-looking Step 8 block. Show an explicit "not started" instead.
-    if phase in ("steps1-5", "step6", "step7", "unknown"):
+    if phase in ("steps1-5", "step6", "step7", "unknown", "gen"):
         lines.append("Step 8: not started (ожидание formatting/terminal)")
     else:
         lines.append(f"Step 8: formatting incidents={formatting['incidents']} blocking={formatting['blocking']}"
@@ -940,6 +1285,10 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
     elif phase == "step6":
         step = "6"
         status = "step6"
+    elif phase == "gen":
+        step = "1-5"
+        gen = _wc_gen_status(events)
+        status = f"gen {gen['attempt']}/{gen['max_attempts']}" if gen else "gen"
     elif phase == "steps1-5":
         step = "1-5"
         status = "steps1-5"

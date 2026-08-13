@@ -35,6 +35,8 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     _LifecycleAwareQwenAudit,
     _make_backend,
     _make_cfg,
+    _build_artifacts,
+    _run,
 )
 
 
@@ -128,6 +130,81 @@ def test_whole_chapter_mode_generates_one_call_full_pid_map(tmp_path):
     # max_output_tokens=32768 is in the run identity (Gate 0 §8.5).
     artifact = cfg.to_config_artifact(model_profile="test")
     assert artifact.values["generation"]["max_tokens"] == 32768
+
+
+def test_whole_chapter_run_emits_wc_progress_events(tmp_path):
+    # V4.1 M (monitor card): the whole-chapter run writes the wc_* generation
+    # events into phase_progress.ndjson — the monitor renders "GEN attempt
+    # N/M (reason)" live and the final PID validation from them.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+    caller = StubModelCaller()
+    _run_whole_chapter(cfg, model_caller=caller)
+
+    events = [
+        json.loads(line)
+        for line in (cfg.out_dir / "phase_progress.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    names = [e["event"] for e in events]
+    assert "wc_generation_started" in names
+    assert "wc_generation_done" in names
+    assert "wc_validated" in names
+
+    started = next(e for e in events if e["event"] == "wc_generation_started")
+    assert started["pid_count"] == 24
+    assert started["max_attempts"] == 3
+    assert started["model"]  # never empty
+    done = next(e for e in events if e["event"] == "wc_generation_done")
+    assert done["finish_reason"] == "complete"
+    assert done["pid_count"] == 24
+    validated = next(e for e in events if e["event"] == "wc_validated")
+    assert validated == {"schema": "pact-v4-phase-progress/ndjson/v1",
+                         "event": "wc_validated", "json_ok": True,
+                         "pids_ok": True, "order_ok": True,
+                         "ts": validated["ts"]}
+    # No retry events on a clean single-shot generation.
+    assert "wc_retry_attempt" not in names
+
+
+def test_whole_chapter_failed_generation_emits_retry_events(tmp_path):
+    # V4.1 M: a malformed-forever caller drives wc_retry_attempt per attempt
+    # with the "malformed" reason (the monitor's live "GEN attempt N/M
+    # (reason)"), and the final wc_validated honestly reports json_ok=False.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+
+    class _BrokenCaller:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, bundle):
+            self.calls.append(bundle)
+            return "{not json"
+
+    result = _run_whole_chapter(cfg, model_caller=_BrokenCaller())
+    assert result.incomplete_generation_count == 1
+
+    events = [
+        json.loads(line)
+        for line in (cfg.out_dir / "phase_progress.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    retries = [e for e in events if e["event"] == "wc_retry_attempt"]
+    assert [(e["attempt"], e["reason"]) for e in retries] == [
+        (1, "malformed"), (2, "malformed"), (3, "malformed"),
+    ]
+    validated = next(e for e in events if e["event"] == "wc_validated")
+    assert validated["json_ok"] is False
+    assert validated["pids_ok"] is False
+    done = next(e for e in events if e["event"] == "wc_generation_done")
+    assert done["finish_reason"] == "incomplete"
 
 
 def test_whole_chapter_resume_reads_raw_snapshot_not_final(tmp_path):
@@ -1257,6 +1334,18 @@ class _CloseTrackingProgress:
     def chunk_done(self, **kwargs):
         pass
 
+    def wc_generation_started(self, **kwargs):
+        pass
+
+    def wc_retry_attempt(self, **kwargs):
+        pass
+
+    def wc_generation_done(self, **kwargs):
+        pass
+
+    def wc_validated(self, **kwargs):
+        pass
+
     def close(self):
         self.closed = True
 
@@ -1520,3 +1609,243 @@ def test_whole_chapter_default_local_lifecycle_bounds_calls_to_max_attempts(tmp_
     assert result.selected_count == 0
     assert len(scripted.requests) == WholeChapterRetryPolicy().max_attempts
     assert not (cfg.out_dir / "translations_raw.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# V4.1 audit W (§14): whole-chapter artifacts — whole_chapter_pid_map.json is
+# the honest ordered-PID source of truth in whole-chapter mode; the persisted
+# chunk_plan.json is annotated (mode=whole-chapter-derived) instead of being
+# misread as an active chunking contract. Resume must not depend on
+# chunk_plan.json presence/absence.
+# ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_writes_pid_map_artifact(tmp_path):
+    from pact_v4.phase1.models import WholeChapterPidMap as _PidMapCls
+
+    from pact_v4.pipeline.v4_phase12_strict_runner import (
+        WHOLE_CHAPTER_PID_MAP_SCHEMA,
+    )
+    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _build_artifacts
+
+    # 400 paragraphs -> 400 PIDs (matches the audit acceptance on chapter 0001).
+    cfg = _make_cfg(tmp_path, n_paragraphs=400)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+    result = _run_whole_chapter(cfg)
+
+    pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
+    assert pid_map_path.exists(), "whole-chapter run must write whole_chapter_pid_map.json"
+    payload = json.loads(pid_map_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == WHOLE_CHAPTER_PID_MAP_SCHEMA
+    assert payload["chapter_id"] == cfg.chapter_id
+
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    pid_map = _PidMapCls.derive(chunk_plan, snapshot)
+
+    assert payload["snapshot_hash"] == snapshot.snapshot_hash
+    assert payload["source_hash"] == snapshot.source_hash
+    assert payload["chunk_plan_hash"] == chunk_plan.plan_hash
+    assert payload["map_hash"] == pid_map.map_hash
+    assert payload["pid_count"] == 400
+
+    entries = payload["entries"]
+    assert len(entries) == 400
+    # Exact source order: entry i is snapshot.pids[i] with order i.
+    for index, entry in enumerate(entries):
+        assert entry["pid"] == snapshot.pids[index]
+        assert entry["order"] == index
+
+    # The run record links the artifact hash to the same derived map.
+    assert result.record["identities"]["whole_chapter_pid_map_hash"] == pid_map.map_hash
+    assert result.record["artefacts"]["whole_chapter_pid_map"] == str(pid_map_path)
+
+
+def test_whole_chapter_chunk_plan_marked_whole_chapter_derived(tmp_path):
+    # The persisted chunk_plan.json in whole-chapter mode must be explicitly
+    # annotated (mode=whole-chapter-derived + note), never a silent-looking
+    # active chunking contract. The annotation is metadata: plan_hash is
+    # unchanged by it and the payload still round-trips through from_payload.
+    from pact_v4.phase1.models import ChunkPlanArtifact
+    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _build_artifacts
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    _run_whole_chapter(cfg)
+
+    plan_payload = json.loads(
+        (cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8")
+    )
+    assert plan_payload["mode"] == "whole-chapter-derived"
+    assert plan_payload["note"] == "chunk boundaries not used"
+
+    # Round-trip: the annotated payload is still a valid ChunkPlanArtifact and
+    # the annotation does not participate in the identity.
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    loaded = ChunkPlanArtifact.from_payload(plan_payload, snapshot=snapshot)
+    assert loaded == chunk_plan
+    assert loaded.plan_hash == plan_payload["plan_hash"]
+
+
+def test_chunked_run_chunk_plan_unchanged(tmp_path):
+    # Chunked mode keeps the plain chunk_plan.json (the chunk boundaries ARE
+    # used there) — the whole-chapter annotation must never leak into it.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    _run(cfg)
+    plan_payload = json.loads(
+        (cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8")
+    )
+    assert "mode" not in plan_payload
+    assert "note" not in plan_payload
+    assert not (cfg.out_dir / "whole_chapter_pid_map.json").exists()
+
+
+def test_whole_chapter_resume_does_not_depend_on_chunk_plan(tmp_path):
+    # Resume-логика НЕ зависит от наличия/отсутствия chunk_plan.json
+    # (V4.1 audit W §14, acceptance #3): a whole-chapter resume replays the
+    # journal and reconstructs from translations_raw.json — chunk_plan.json
+    # is not part of the resume path. Deleting it must not break resume.
+    cfg = _whole_chapter_cfg(tmp_path)
+    first = _run_whole_chapter(cfg)
+    assert first.resumed_from_index == 0
+    raw = json.loads((cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8"))
+
+    (cfg.out_dir / "chunk_plan.json").unlink()
+
+    caller2 = StubModelCaller()
+    resumed = _run_whole_chapter(cfg, model_caller=caller2)
+    assert len(caller2.calls) == 0
+    assert resumed.resumed_from_index == 1
+    final = json.loads(resumed.translations_path.read_text(encoding="utf-8"))
+    assert final == raw
+    # The pid-map artifact is deterministic and re-written on resume.
+    pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
+    assert pid_map_path.exists()
+    assert json.loads(pid_map_path.read_text(encoding="utf-8"))["pid_count"] == 24
+
+
+# ---------------------------------------------------------------------------
+# V4.1 GEN-REASONING: whole-chapter generation reasoning artifacts
+# ---------------------------------------------------------------------------
+
+
+class _ReasoningStubCaller(StubModelCaller):
+    """StubModelCaller that also reports per-call reasoning text."""
+
+    def __init__(self, reasoning: str = "gen-reasoning-diagnostics") -> None:
+        super().__init__()
+        self.last_reasoning = reasoning
+
+
+class _TruncatedThenGoodReasoningCaller:
+    """First attempt returns truncated JSON (with reasoning), then success."""
+
+    def __init__(self, good: str) -> None:
+        self.good = good
+        self.calls = []
+        self.last_reasoning = ""
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        if len(self.calls) == 1:
+            self.last_reasoning = "attempt 0: thought about register, then cut off"
+            return "{truncated"
+        self.last_reasoning = "attempt 1: decided on formal register"
+        return self.good
+
+
+def _whole_chapter_reasoning_cfg(tmp_path) -> StrictRunConfig:
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    return type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+
+
+def test_whole_chapter_reasoning_written_when_present(tmp_path):
+    # GEN-REASONING acceptance: a whole-chapter run whose generation reported
+    # reasoning>0 (usage) must leave whole_chapter_reasoning.txt on disk with
+    # the full text, and the generation record carries a compact marker.
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    caller = _ReasoningStubCaller(reasoning="pov and register analysis for ch 046")
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+
+    reasoning_path = cfg.out_dir / "whole_chapter_reasoning.txt"
+    assert reasoning_path.exists()
+    text = reasoning_path.read_text(encoding="utf-8")
+    assert text == "pov and register analysis for ch 046"
+    assert text.strip()  # non-empty when reasoning>0
+
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    rec = outcomes["outcomes"][0]
+    assert rec["reasoning"]["schema"] == "pact-v4-whole-chapter-reasoning/v1"
+    assert rec["reasoning"]["attempts"]["0"]["present"] is True
+    assert rec["reasoning"]["attempts"]["0"]["chars"] == len(text)
+
+    # The record advertises the reasoning artifact (F8: only when created).
+    assert result.record["artefacts"]["whole_chapter_reasoning"] == str(reasoning_path)
+
+    # Identity is untouched: reasoning is a text artifact only.
+    assert result.record["identities"]["whole_chapter_pid_map_hash"]
+    pid_map = json.loads(
+        (cfg.out_dir / "whole_chapter_pid_map.json").read_text(encoding="utf-8")
+    )
+    assert pid_map["pid_count"] == 24
+
+
+def test_whole_chapter_reasoning_truncated_retry_also_on_disk(tmp_path):
+    # GEN-REASONING acceptance: when attempt 0 is truncated, the failed
+    # attempt's reasoning is ALSO persisted (whole_chapter_retry1_reasoning.txt
+    # names the retry attempt) so the diagnosis of WHY the retry happened is
+    # recoverable; attempt 0's reasoning lives in whole_chapter_reasoning.txt.
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+    good = json.dumps(
+        {pid: f"Перевод {pid}" for pid in snapshot.pids},
+        ensure_ascii=False,
+    )
+    caller = _TruncatedThenGoodReasoningCaller(good)
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+
+    main_path = cfg.out_dir / "whole_chapter_reasoning.txt"
+    retry_path = cfg.out_dir / "whole_chapter_retry1_reasoning.txt"
+    assert main_path.read_text(encoding="utf-8") == (
+        "attempt 0: thought about register, then cut off"
+    )
+    assert retry_path.read_text(encoding="utf-8") == "attempt 1: decided on formal register"
+
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    marker = outcomes["outcomes"][0]["reasoning"]
+    assert marker["attempts"]["0"]["present"] is True
+    assert marker["attempts"]["1"]["present"] is True
+    assert marker["attempts"]["1"]["chars"] == len("attempt 1: decided on formal register")
+
+    # Identity is untouched by the retry/reasoning path (wc_validated honest).
+    assert result.record["identities"]["whole_chapter_pid_map_hash"]
+
+
+def test_whole_chapter_no_reasoning_writes_no_artifact(tmp_path):
+    # GEN-REASONING NON-GOAL check: when no attempt produced reasoning
+    # (reasoning=0 / transport reported none) the run writes NO reasoning file
+    # and the generation record stays byte-identical to the pre-GEN-REASONING
+    # shape (no marker key) — reasoning must not change cache/identity.
+    cfg = _whole_chapter_reasoning_cfg(tmp_path)
+    result = _run_whole_chapter(cfg)  # plain StubModelCaller: no last_reasoning
+    assert result.selected_count == 1
+
+    assert not (cfg.out_dir / "whole_chapter_reasoning.txt").exists()
+    assert not (cfg.out_dir / "whole_chapter_retry1_reasoning.txt").exists()
+    outcomes = json.loads(
+        (cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8")
+    )
+    assert "reasoning" not in outcomes["outcomes"][0]
+    assert "whole_chapter_reasoning" not in result.record["artefacts"]

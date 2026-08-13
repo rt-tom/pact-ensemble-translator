@@ -23,7 +23,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import requests
 
@@ -72,6 +72,14 @@ class CallRecord:
     # grammar-reject fallback and transient retries each count). Used to
     # derive an honest ``retry_count`` in backend provenance.
     attempt_count: int = 1
+    # llama-server reasoning stream (``message.reasoning_content``), kept for
+    # provenance / debug artifacts (audit ``_reasoning.txt``). Best-effort:
+    # may be empty when the server returns no reasoning block.
+    reasoning: str = ""
+    # Whether this call used the SSE streaming transport (``stream=True``)
+    # to collect reasoning live. False when the call fell back to the batch
+    # path (stream not supported / stream error). Provenance only.
+    streamed: bool = False
 
 
 class ApiClient:
@@ -119,6 +127,7 @@ class ApiClient:
         max_tokens: int,
         temperature: float,
         response_format_json: bool = True,
+        stream: bool = False,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self._cfg.model,
@@ -127,7 +136,7 @@ class ApiClient:
             "temperature": float(temperature),
             "top_p": float(self._cfg.top_p),
             "top_k": int(self._cfg.top_k),
-            "stream": False,
+            "stream": bool(stream),
         }
         if response_format_json and self._json_response_format_supported:
             payload["response_format"] = {"type": "json_object"}
@@ -145,30 +154,104 @@ class ApiClient:
         temperature: Optional[float] = None,
         response_format_json: bool = True,
         label: str = "v4-call",
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Send a single chat-completions request, return the model text.
 
         Returns the raw assistant ``content`` string. JSON validity is the
         caller's responsibility (Phase 2B's generation module already does
         strict validation). Retries handle transient errors only.
+
+        ``on_reasoning_chunk`` (REASONING-STREAM): when provided the call
+        uses the SSE streaming transport (``stream=True``) and the callback
+        receives each ``reasoning_content`` chunk as it arrives, so a phase
+        writer can grow the ``*_reasoning.txt`` file live. When the server
+        does not support streaming (or the stream fails), the call falls
+        back to the batch path and the callback receives the full reasoning
+        once after completion (documented fallback). The fallback is
+        transactional (RV2 t_a7c14251 HIGH): reasoning chunks already
+        delivered live before a mid-stream failure are tentative — the sink
+        is rolled back (when it exposes a callable ``rollback()``) so the
+        artifact ends up with ONLY the full batch reasoning, delivered
+        exactly once. Sinks without a ``rollback()`` keep the delivered
+        partial chunks (best-effort, documented limitation). Without a
+        callback the historical batch behaviour is preserved exactly.
         """
         if not messages:
             raise ApiClientError(f"{self._name}: empty messages list")
 
         temp = self._cfg.temperature if temperature is None else float(temperature)
-        payload = self.build_payload(
-            messages,
-            max_tokens=max_tokens,
-            temperature=temp,
-            response_format_json=response_format_json,
-        )
         started = time.perf_counter()
+        streamed = False
         try:
-            data, http_status, fmt_attempted, attempts = self._post_with_retry(payload)
+            if on_reasoning_chunk is not None:
+                try:
+                    (
+                        text,
+                        finish_reason,
+                        usage,
+                        reasoning,
+                        http_status,
+                        fmt_attempted,
+                        attempts,
+                    ) = self._post_stream(
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=temp,
+                        response_format_json=response_format_json,
+                        on_reasoning_chunk=on_reasoning_chunk,
+                    )
+                    streamed = True
+                except ApiClientError as exc:
+                    LOG.warning(
+                        "%s: SSE stream failed (%s); falling back to batch",
+                        self._name, exc,
+                    )
+                    payload = self.build_payload(
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=temp,
+                        response_format_json=response_format_json,
+                    )
+                    data, http_status, fmt_attempted, attempts = self._post_with_retry(
+                        payload
+                    )
+                    text, finish_reason, usage, reasoning = self._extract_message(data)
+                    # Transactional fallback (RV2 t_a7c14251 HIGH): the
+                    # stream may already have delivered tentative reasoning
+                    # chunks — roll the sink back so the artifact ends up
+                    # with ONLY the full batch reasoning delivered below,
+                    # exactly once (no partial+full duplicate). Only after
+                    # the batch POST succeeded: if IT failed too, the
+                    # exception propagates and the phase's TRANSPORT_ERROR
+                    # trail preserves the streamed partials (run_011).
+                    # Best-effort: a sink without rollback() keeps the
+                    # partial chunks (documented limitation).
+                    self._rollback_sink(on_reasoning_chunk)
+                    # Post-completion delivery of the full reasoning
+                    # (documented fallback: stream unavailable/failed).
+                    if reasoning:
+                        try:
+                            on_reasoning_chunk(reasoning)
+                        except Exception:  # noqa: BLE001 — a sink failure is best-effort
+                            LOG.warning(
+                                "%s: on_reasoning_chunk callback raised",
+                                self._name, exc_info=True,
+                            )
+            else:
+                payload = self.build_payload(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temp,
+                    response_format_json=response_format_json,
+                )
+                data, http_status, fmt_attempted, attempts = self._post_with_retry(
+                    payload
+                )
+                text, finish_reason, usage, reasoning = self._extract_message(data)
         finally:
             wall = time.perf_counter() - started
 
-        text, finish_reason, usage = self._extract_message(data)
         self.calls.append(CallRecord(
             label=label,
             model=self._cfg.model,
@@ -180,6 +263,8 @@ class ApiClient:
             usage=usage or {},
             wall_seconds=round(wall, 3),
             attempt_count=attempts,
+            reasoning=reasoning or "",
+            streamed=streamed,
         ))
         return text
 
@@ -319,9 +404,235 @@ class ApiClient:
             time.sleep(float(self._cfg.retry_delay_seconds))
 
     @staticmethod
+    def _rollback_sink(
+        on_reasoning_chunk: Optional[Callable[[str], None]],
+    ) -> None:
+        """Transactional rollback of a reasoning sink (RV2 t_a7c14251 HIGH).
+
+        Called when a stream attempt failed after delivering tentative
+        chunks: a sink exposing a callable ``rollback()`` (the phase
+        reasoning-file writer does) discards those chunks so a later
+        batch/retry delivery is the only content in the artifact. Best-effort
+        like the sink itself: a missing ``rollback`` or a raising one is
+        logged and swallowed — the model call must never fail because of it.
+        """
+        rollback = getattr(on_reasoning_chunk, "rollback", None)
+        if callable(rollback):
+            try:
+                rollback()
+            except Exception:  # noqa: BLE001 — rollback is best-effort
+                LOG.warning(
+                    "on_reasoning_chunk rollback() raised; "
+                    "tentative chunks may remain",
+                    exc_info=True,
+                )
+
+    def _post_stream(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        response_format_json: bool,
+        on_reasoning_chunk: Callable[[str], None],
+    ) -> tuple[str, Optional[str], Dict[str, Any], str, int, bool, int]:
+        """POST with ``stream=True`` and SSE-iterate ``reasoning_content``.
+
+        Returns ``(text, finish_reason, usage, reasoning, http_status,
+        response_format_attempted, attempts)``. Every reasoning delta is
+        forwarded to ``on_reasoning_chunk`` as it arrives (the caller's file
+        writer grows the artifact live). On ANY failure (HTTP error,
+        connection error, non-SSE body, malformed ``data:`` payload, or a
+        stream that ends before ``[DONE]``/terminal ``finish_reason``)
+        raises ``ApiClientError`` so the caller can fall back to the batch
+        path.
+
+        Transactional (RV2 t_a7c14251 HIGH): a mid-stream connection error
+        rolls the reasoning sink back before the retry, so a failed
+        attempt's tentative chunks never survive into the retry's artifact.
+        """
+        payload = self.build_payload(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format_json=response_format_json,
+            stream=True,
+        )
+        attempts = 0
+        last_error: Optional[Exception] = None
+        for attempt in range(1, int(self._cfg.http_retries) + 1):
+            attempts += 1
+            try:
+                response = self._session.post(
+                    self._cfg.chat_url,
+                    json=dict(payload),
+                    timeout=float(self._cfg.timeout_seconds),
+                    stream=True,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                LOG.warning(
+                    "%s SSE attempt %s failed: %s",
+                    self._name, attempt, exc,
+                )
+                self._backoff(attempt)
+                continue
+
+            status = response.status_code
+            if not 200 <= status < 300:
+                response.close()
+                if 500 <= status < 600:
+                    last_error = ApiClientError(
+                        f"{self._name}: HTTP {status} {response.reason}; "
+                        f"body={response.text[:500]!r}"
+                    )
+                    LOG.warning(
+                        "%s SSE attempt %s failed: %s",
+                        self._name, attempt, last_error,
+                    )
+                    self._backoff(attempt)
+                    continue
+                raise ApiClientError(
+                    f"{self._name}: HTTP {status} {response.reason}; "
+                    f"body={response.text[:500]!r}"
+                )
+
+            try:
+                return self._consume_sse(
+                    response,
+                    on_reasoning_chunk=on_reasoning_chunk,
+                    http_status=status,
+                    response_format_attempted="response_format" in payload,
+                    attempts=attempts,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                LOG.warning(
+                    "%s SSE attempt %s failed mid-stream: %s",
+                    self._name, attempt, exc,
+                )
+                # Transactional rule (RV2 t_a7c14251 HIGH): chunks already
+                # delivered by this failed attempt are tentative — roll the
+                # sink back so the retry's reasoning is the only content.
+                self._rollback_sink(on_reasoning_chunk)
+                self._backoff(attempt)
+                continue
+            finally:
+                response.close()
+
+        raise ApiClientError(
+            f"{self._name}: SSE API failed after "
+            f"{int(self._cfg.http_retries)} attempts: {last_error}"
+        )
+
+    def _consume_sse(
+        self,
+        response,
+        *,
+        on_reasoning_chunk: Callable[[str], None],
+        http_status: int,
+        response_format_attempted: bool,
+        attempts: int,
+    ) -> tuple[str, Optional[str], Dict[str, Any], str, int, bool, int]:
+        """Parse one SSE response body; accumulate text + reasoning.
+
+        Handles the OpenAI-compatible ``data: {json}`` lines that
+        ``llama-server`` emits for ``stream=True`` requests, including a
+        final ``data: [DONE]``. Reasoning deltas
+        (``choices[0].delta.reasoning_content``) are forwarded to
+        ``on_reasoning_chunk`` immediately. Content deltas accumulate into
+        the returned text. ``usage`` (when the server sends it, e.g. via
+        ``stream_options``) is captured from the last chunk.
+
+        Fail-closed (RV t_df24524d): a stream that ends without a terminal
+        marker — ``data: [DONE]`` or a chunk carrying a non-empty
+        ``finish_reason`` — is a truncated response and raises
+        ``ApiClientError``; a ``data:`` line that is neither ``[DONE]`` nor
+        valid JSON is a malformed payload and also raises. ``complete()``
+        then performs the declared batch fallback instead of surfacing a
+        partial/empty streamed response as success.
+
+        ``on_reasoning_chunk`` is a best-effort sink (same contract as the
+        batch fallback / OpenCode post-completion delivery): an exception
+        it raises is logged and swallowed — reasoning still accumulates into
+        the returned value / call record and the stream is NOT failed.
+        """
+        text_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        finish_reason: Optional[str] = None
+        usage: Dict[str, Any] = {}
+        saw_data_line = False
+        saw_terminal = False
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            saw_data_line = True
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                saw_terminal = True
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError as exc:
+                raise ApiClientError(
+                    f"{self._name}: malformed SSE data payload (not JSON): "
+                    f"{data[:200]!r}"
+                ) from exc
+            try:
+                choice = chunk["choices"][0]
+            except (KeyError, TypeError, IndexError):
+                continue
+            delta = choice.get("delta") if isinstance(choice, Mapping) else {}
+            rc = delta.get("reasoning_content") if isinstance(delta, Mapping) else None
+            if isinstance(rc, str) and rc:
+                reasoning_parts.append(rc)
+                try:
+                    on_reasoning_chunk(rc)
+                except Exception:  # noqa: BLE001 — sink is best-effort
+                    LOG.warning(
+                        "%s: on_reasoning_chunk callback raised; "
+                        "reasoning still accumulated",
+                        self._name, exc_info=True,
+                    )
+            content = delta.get("content") if isinstance(delta, Mapping) else None
+            if isinstance(content, str) and content:
+                text_parts.append(content)
+            fr = choice.get("finish_reason") if isinstance(choice, Mapping) else None
+            if isinstance(fr, str) and fr:
+                finish_reason = fr
+                saw_terminal = True
+            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                usage = chunk["usage"]
+        if not saw_data_line:
+            # The server answered 200 but did not emit an SSE stream — treat
+            # as stream-not-supported so the caller falls back to the batch
+            # path instead of silently returning empty text.
+            raise ApiClientError(
+                f"{self._name}: server returned a non-SSE response to a "
+                f"stream=True request"
+            )
+        if not saw_terminal:
+            raise ApiClientError(
+                f"{self._name}: truncated SSE stream: connection ended "
+                f"before [DONE] or a terminal finish_reason"
+            )
+        return (
+            "".join(text_parts),
+            finish_reason,
+            usage,
+            "".join(reasoning_parts),
+            http_status,
+            response_format_attempted,
+            attempts,
+        )
+
+    @staticmethod
     def _extract_message(
         data: Mapping[str, Any]
-    ) -> tuple[str, Optional[str], Dict[str, Any]]:
+    ) -> tuple[str, Optional[str], Dict[str, Any], str]:
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -332,4 +643,7 @@ class ApiClient:
             ) from exc
         finish_reason = choice.get("finish_reason") if isinstance(choice, Mapping) else None
         usage = data.get("usage") if isinstance(data, Mapping) else None
-        return content, finish_reason, usage if isinstance(usage, dict) else {}
+        # llama-server returns the reasoning stream in
+        # ``message.reasoning_content`` (kept separate from ``content``).
+        reasoning = message.get("reasoning_content") or ""
+        return content, finish_reason, usage if isinstance(usage, dict) else {}, reasoning

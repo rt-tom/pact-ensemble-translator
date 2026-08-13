@@ -1,22 +1,28 @@
-"""Strict-driver Phase 5 formatting (B3) integration tests.
+"""Strict-driver Phase 5 formatting (B3, card C) integration tests.
 
-These run the full ``run_chapter_strict`` driver with Phase 4 repair + Phase
-5 formatting adapters injected, verifying:
+These run the full ``run_chapter_strict`` driver with Phase 4 repair
+adapters injected (formatting is model-free — there is no formatting
+adapter), verifying:
 
   * formatting runs **between** Step 7 (convergence) and Step 8 (terminal):
     the formatting report and the repair report's ``final_translation`` carry
     the formatted text, so Step 8 and the terminal transition see the same
     text that goes into ``complete``;
+  * formatting is **deterministic** (0 model calls): the stub generation
+    keeps the emphasized fragment inline in the translated text (the
+    whole-chapter case), so the deterministic tiers resolve every span
+    without any model call — ``model_call_count`` is 0;
   * an unresolved required span is a blocking incident: with the production
     default ``max_formatting_incidents=0`` the chapter degrades to
-    ``accepted_degraded`` (valid PID map + debt trace), never ``failed`` from
-    a formatting transport failure alone;
-  * without formatting adapters the step is skipped (backward compatible);
+    ``accepted_degraded`` (valid PID map + debt trace), never ``failed``.
+    "0 model calls" alone is not success when formatting debt degraded the
+    chapter;
+  * without formatting required (``formatting_required=False``) the step is
+    skipped (master switch);
   * the formatting artifacts carry the backend identity;
   * dual-mode parity (§14.3): local fake backend vs fake OpenCode server —
-    the same canned formatting output produces identical formatted text and
-    final integrity result, and the model-fallback tier runs only through the
-    Backend boundary (no local lifecycle adapters).
+    both produce identical formatted text and final integrity result, and
+    neither ever issues a Phase 5 model call (model-free invariant).
 """
 from __future__ import annotations
 
@@ -30,7 +36,6 @@ from pact_v4.pipeline.v4_phase12_strict_runner import (
     run_chapter_strict,
 )
 from pact_v4.runtime.backend_role_adapters import (
-    BackendFormattingCaller,
     BackendGemmaAuditEvaluator,
     BackendGemmaSelector,
     BackendModelCaller,
@@ -66,8 +71,7 @@ WORDS_PER_PARAGRAPH = 35
 
 def _write_chapter_html(path: Path, n_paragraphs: int) -> None:
     # Every paragraph carries one inline <em> span so the formatting step has
-    # a span contract to restore (the stub generation drops the emphasised
-    # word, forcing the model-fallback tier deterministically).
+    # a span contract to restore.
     words = [f"word{i}" for i in range(WORDS_PER_PARAGRAPH)]
     words[5] = "<em>emphasized</em>"
     paragraph_text = " ".join(words)
@@ -102,38 +106,29 @@ def _make_cfg(tmp_path: Path, *, n_paragraphs: int = 8, backend: Any = None) -> 
     )
 
 
+class _PreservingModelCaller(StubModelCaller):
+    """Stub generator that KEEPS the emphasized fragment inline in the
+    translated text (the whole-chapter case, §11 "whole-chapter перевод
+    держит <em> 101/101").
+
+    Base ``StubModelCaller`` emits ``Перевод номерN`` (dropping the
+    emphasis); this subclass re-appends the source's emphasized word so the
+    deterministic ``exact`` tier resolves the span with 0 model calls.
+    """
+
+    def __call__(self, bundle) -> str:
+        out = json.loads(super().__call__(bundle))
+        for pid, text in bundle.owned_source:
+            if "emphasized" in text:
+                out[pid] = f"{out[pid]} (emphasized)"
+        return json.dumps(out, ensure_ascii=False)
+
+
 class StubRepairCaller:
     """Phase 4 repair caller; the audit produces no findings so it is unused."""
 
     def __call__(self, *, chunk_id, source, translation, region, findings) -> str:
         raise AssertionError("no findings expected in the formatting integration fixture")
-
-
-class CannedFormattingCaller:
-    """Fake ``FormattingCaller``: span i -> word i of the translation.
-
-    Mirrors ``tests.pact_v4.runtime.opencode_dynamic_fake._formatting_response``
-    so local and remote fake runs produce identical mappings.
-    """
-
-    def __init__(self, *, fail: Exception | None = None, empty: bool = False) -> None:
-        self.fail = fail
-        self.empty = empty
-        self.calls: list = []
-
-    def __call__(self, *, pid, source_text, translation, spans) -> str:
-        self.calls.append((pid, translation))
-        if self.fail is not None:
-            raise self.fail
-        words = translation.split()
-        mappings = []
-        for index, span in enumerate(spans):
-            target = "" if self.empty else (words[index] if index < len(words) else "")
-            mappings.append({
-                "pid": pid, "span_id": span["span_id"],
-                "target_text": target, "occurrence": 1,
-            })
-        return json.dumps({"mappings": mappings}, ensure_ascii=False)
 
 
 def _clean_repair_adapters() -> tuple:
@@ -156,27 +151,20 @@ def _clean_repair_adapters() -> tuple:
     )
 
 
-def _run_local(
-    cfg: StrictRunConfig,
-    *,
-    formatting_caller: Any = None,
-    formatting_adapters: Any = None,
-):
+def _run_local(cfg: StrictRunConfig, *, drop_emphasis: bool = False):
     router = _make_router()
-    model_caller = _LifecycleAwareModelCaller(router, StubModelCaller())
+    stub = StubModelCaller() if drop_emphasis else _PreservingModelCaller()
+    model_caller = _LifecycleAwareModelCaller(router, stub)
     qwen_evaluator = _LifecycleAwareQwen(router, StubQwen())
     gemma_selector = _LifecycleAwareGemmaSelector(router, StubGemma())
     qwen_audit_evaluator = _LifecycleAwareQwenAudit(router, StubQwenAudit())
     gemma_audit_evaluator = _LifecycleAwareGemmaAudit(router, StubGemmaAudit())
-    if formatting_adapters is None:
-        formatting_adapters = (formatting_caller,) if formatting_caller is not None else None
     result = run_chapter_strict(
         cfg, router=router, model_caller=model_caller,
         qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
         qwen_audit_evaluator=qwen_audit_evaluator,
         gemma_audit_evaluator=gemma_audit_evaluator,
         repair_adapters=_clean_repair_adapters(),
-        formatting_adapters=formatting_adapters,
     )
     return result
 
@@ -192,7 +180,7 @@ def _load_report(out_dir: Path, name: str) -> dict:
 
 def test_formatting_runs_between_step7_and_step8(tmp_path: Path):
     cfg = _make_cfg(tmp_path, n_paragraphs=8)
-    result = _run_local(cfg, formatting_caller=CannedFormattingCaller())
+    result = _run_local(cfg)
 
     assert result.step6["status"] == "complete"
     assert result.step7["status"] in ("complete", "accepted_degraded")
@@ -214,64 +202,43 @@ def test_formatting_runs_between_step7_and_step8(tmp_path: Path):
     assert fmt_report["outcome"]["schema"] == "pact-v4-formatting-outcome/v1"
     assert fmt_report["outcome"]["resolved_count"] > 0
     assert fmt_report["outcome"]["incident_count"] == 0
-    assert fmt_report["outcome"]["model_fallback_count"] > 0
+    # Card C: formatting is model-free — 0 model calls, always.
+    assert fmt_report["outcome"]["model_call_count"] == 0
+    assert fmt_report["outcome"]["model_fallback_count"] == 0
     # Terminal sees the same text: integrity's frozen hash covers formatted.
     assert result.step8["status"] == result.step7["terminal"]
 
 
 def test_formatting_incident_yields_accepted_degraded(tmp_path: Path):
-    # The formatting caller reports "no fragment" for every span -> blocking
-    # incidents -> with max_formatting_incidents=0 the chapter degrades to
-    # accepted_degraded (valid PID map + debt trace), never `failed`.
+    # The stub generation DROPS the emphasized fragment entirely (no
+    # preserved markup, no verbatim fragment) -> blocking incidents -> with
+    # max_formatting_incidents=0 the chapter degrades to accepted_degraded
+    # (valid PID map + debt trace), never `failed`. "0 model calls" alone is
+    # not success when formatting debt degraded the chapter.
     cfg = _make_cfg(tmp_path, n_paragraphs=8)
-    result = _run_local(cfg, formatting_caller=CannedFormattingCaller(empty=True))
+    result = _run_local(cfg, drop_emphasis=True)
     assert result.step7["status"] == "accepted_degraded"
     assert result.step8["status"] == "accepted_degraded"
     assert result.step7["formatting"]["status"] == "blocking"
     assert result.step7["formatting"]["incident_count"] > 0
+    assert result.step7["formatting"]["model_call_count"] == 0
     report = _load_report(cfg.out_dir, "repair_report.json")
     assert any("formatting:" in reason for reason in report["debt_trace"])
     fmt_report = _load_report(cfg.out_dir, "formatting_report.json")
     assert fmt_report["outcome"]["blocking"] is True
 
 
-def test_formatting_transport_failure_is_debt_not_failed(tmp_path: Path):
-    # A transport failure at the model fallback is recorded as debt, so the
-    # terminal is accepted_degraded (valid PID map), never `failed` because
-    # of transport — "transport failure != semantic gate failure".
-    cfg = _make_cfg(tmp_path, n_paragraphs=8)
-    result = _run_local(cfg, formatting_caller=CannedFormattingCaller(
-        fail=RuntimeError("network down"),
-    ))
-    assert result.step7["status"] == "accepted_degraded"
-    fmt_report = _load_report(cfg.out_dir, "formatting_report.json")
-    assert fmt_report["outcome"]["incidents"][0]["reason"] == "transport_error"
-    assert result.step8["status"] == "accepted_degraded"
-
-
-def test_formatting_skipped_without_formatting_adapters(tmp_path: Path):
-    # Backward compatibility: without formatting adapters the step is not run.
-    cfg = _make_cfg(tmp_path, n_paragraphs=8)
-    result = _run_local(cfg)
-    assert result.step7["formatting"] is None
-    assert result.step8["formatting"] is None
-    assert not (cfg.out_dir / "formatting_report.json").exists()
-    # And the repair report's final_translation is plain (unformatted).
-    report = _load_report(cfg.out_dir, "repair_report.json")
-    assert all("<em>" not in text for _pid, text in report["final_translation"])
-
-
 def test_formatting_skipped_when_formatting_not_required(tmp_path: Path):
     # ``formatting_required=False`` is the runtime master switch (§6.1
-    # ``formatting.required=true``): even with formatting adapters wired, the
-    # step is skipped entirely — adapters alone never trigger it.
+    # ``formatting.required=true``): the deterministic step is skipped
+    # entirely.
     cfg = _make_cfg(tmp_path, n_paragraphs=8)
     cfg = StrictRunConfig(
         chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
         formatting_required=False,
     )
-    result = _run_local(cfg, formatting_caller=CannedFormattingCaller())
+    result = _run_local(cfg)
     assert result.step7["formatting"] is None
     assert result.step8["formatting"] is None
     assert not (cfg.out_dir / "formatting_report.json").exists()
@@ -291,7 +258,6 @@ def test_formatting_skipped_when_repair_skipped(tmp_path: Path):
         gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
         qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
         gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
-        formatting_adapters=(CannedFormattingCaller(),),
     )
     assert result.step7["status"] == "skipped"
     assert result.step7["reason"] == "repair_adapters_not_configured"
@@ -302,7 +268,6 @@ def test_formatting_skipped_when_repair_skipped(tmp_path: Path):
 # Dual-mode parity (§14.3): local fake backend vs fake OpenCode server
 # ---------------------------------------------------------------------------
 
-
 ROLE_BINDINGS = {
     "default": "opencode-go/deepseek-v4-flash",
     "generator": "opencode-go/deepseek-v4-flash",
@@ -311,7 +276,6 @@ ROLE_BINDINGS = {
     "qwen_audit": "opencode-go/qwen3.7-plus",
     "gemma_audit": "opencode-go/qwen3.7-plus",
     "repair": "opencode-go/deepseek-v4-flash",
-    "formatting": "opencode-go/deepseek-v4-flash",
 }
 
 
@@ -326,9 +290,10 @@ def _remote_backend_config() -> OpenCodeServerBackendConfig:
 
 
 def test_formatting_dual_mode_parity_local_vs_remote(tmp_path: Path):
-    # Same chapter, same canned formatting behaviour; only the transport
-    # differs. The formatting step must produce byte-identical formatted text
-    # and the same final integrity result through local and remote fakes.
+    # Same chapter; only the transport differs. The formatting step is
+    # deterministic (card C), so local and remote produce byte-identical
+    # formatted text and the same final integrity result — and, being
+    # model-free, neither path ever issues a Phase 5 model call.
     chapter_html = tmp_path / "046.html"
     memory_dir = tmp_path / "memory"
     _write_chapter_html(chapter_html, 24)
@@ -342,7 +307,7 @@ def test_formatting_dual_mode_parity_local_vs_remote(tmp_path: Path):
 
     # --- local fake backend ---
     local_cfg = make(_make_backend(), tmp_path / "local_out")
-    local_result = _run_local(local_cfg, formatting_caller=CannedFormattingCaller())
+    local_result = _run_local(local_cfg)
     local_fmt = _load_report(local_cfg.out_dir, "formatting_report.json")
 
     # --- remote fake OpenCode server ---
@@ -364,7 +329,6 @@ def test_formatting_dual_mode_parity_local_vs_remote(tmp_path: Path):
             BackendQwenAuditEvaluator(backend),
             BackendGemmaAuditEvaluator(backend),
         ),
-        formatting_adapters=(BackendFormattingCaller(backend),),
     )
     remote_fmt = _load_report(remote_cfg.out_dir, "formatting_report.json")
 
@@ -386,6 +350,9 @@ def test_formatting_dual_mode_parity_local_vs_remote(tmp_path: Path):
     assert local_fmt["outcome"]["resolved_count"] == remote_fmt["outcome"]["resolved_count"]
     assert local_fmt["outcome"]["incident_count"] == 0
     assert remote_fmt["outcome"]["incident_count"] == 0
+    # Model-free invariant on BOTH paths.
+    assert local_fmt["outcome"]["model_call_count"] == 0
+    assert remote_fmt["outcome"]["model_call_count"] == 0
     # Same terminal status and final integrity checks.
     assert local_result.step8["status"] == remote_result.step8["status"]
     local_report = _load_report(local_cfg.out_dir, "repair_report.json")
@@ -396,10 +363,8 @@ def test_formatting_dual_mode_parity_local_vs_remote(tmp_path: Path):
             local_report["integrity"][key]
             == remote_report["integrity"][key]
         ), key
-    # The remote formatting report carries the remote backend identity; the
-    # model fallback went through the Backend boundary (fake OpenCode server
-    # answered the Phase 5 prompt).
+    # The remote formatting report carries the remote backend identity.
     assert remote_fmt["backend_identity_hash"] == remote_cfg.backend.identity_hash
     assert all(
         "<em>" in text for _pid, text in remote_fmt["outcome"]["formatted_text"]
-    ), "the remote fake server answered the formatting prompt"
+    ), "the deterministic tiers restored the markup on the remote path"

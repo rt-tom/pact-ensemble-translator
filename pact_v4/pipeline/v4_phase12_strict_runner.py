@@ -68,6 +68,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from pact_v4.audit.chunked_audit import (
+    DEFAULT_REASONING_BUDGET,
+    DEFAULT_TRANSPORT_MAX_RETRIES,
+    DEFAULT_TRANSPORT_BASE_DELAY_SECONDS,
+    HARNESS_VERSION,
+    PROMPT_VERSION,
+)
+from pact_v4.audit.entity_extractor import EXTRACTOR_VERSION
+from pact_v4.audit.russian_editor import (
+    RUSSIAN_EDITOR_HARNESS_VERSION,
+    RUSSIAN_EDITOR_PROMPT_VERSION,
+    SAFE_CLASSES as RUSSIAN_EDITOR_SAFE_CLASSES,
+    DEFAULT_CHUNK_SIZE as RUSSIAN_EDITOR_CHUNK_SIZE,
+    DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_MAX_TOKENS,
+    DEFAULT_OVERLAP_PAIRS as RUSSIAN_EDITOR_OVERLAP_PAIRS,
+    DEFAULT_RETRY_MAX_RETRIES as RUSSIAN_EDITOR_RETRY_MAX_RETRIES,
+    DEFAULT_RETRY_BASE_DELAY_SECONDS as RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS,
+    MAX_EDITS_PER_PID as RUSSIAN_EDITOR_MAX_EDITS_PER_PID,
+)
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
     DEFAULT_MAX_WORDS,
@@ -76,6 +95,8 @@ from pact_v4.phase1.chunker import (
     ChunkPlanner,
 )
 from pact_v4.phase1.models import (
+    CHUNK_PLAN_MODE_WHOLE_CHAPTER,
+    CHUNK_PLAN_NOTE_WHOLE_CHAPTER,
     Candidate,
     ChunkPlanArtifact,
     ConfigArtifact,
@@ -87,6 +108,7 @@ from pact_v4.phase1.models import (
 from pact_v4.phase2.cascade import DeterministicGateData, SelectionResult, select_candidate
 from pact_v4.phase2.generation import (
     GenerationCache,
+    GenerationErrorCode,
     GenerationParams,
     WholeChapterRetryPolicy,
     _GenerationValidationError,
@@ -127,6 +149,24 @@ from pact_v4.phase4.repair import (
 from pact_v4.phase5.formatting import (
     FORMATTING_REPORT_SCHEMA,
     run_formatting_align,
+)
+from pact_v4.repair.selective_repair import (
+    DEFAULT_REAUDIT_BASE_DELAY_SECONDS,
+    DEFAULT_REAUDIT_MAX_INPUT_TOKENS,
+    DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS,
+    DEFAULT_REAUDIT_MAX_RETRIES,
+    DEFAULT_REAUDIT_MAX_TOKENS,
+    DEFAULT_REAUDIT_MIN_OVERLAP_PAIRS,
+    DEFAULT_REAUDIT_NEIGHBOUR_WINDOW,
+    DEFAULT_REAUDIT_OVERLAP_TOKENS,
+    DEFAULT_REPAIR_CONTEXT_WINDOW,
+    DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
+    MICROBATCH_TARGET,
+    MICROBATCH_TRIGGER,
+    REAUDIT_DELTA_FORMAT,
+    REPAIR_FINDINGS_CAP,
+    REPAIR_HARNESS_VERSION,
+    REPAIR_PROMPT_VERSION,
 )
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
@@ -284,6 +324,128 @@ class StrictRunConfig:
     # a whole-chapter run is not resumable from a chunked run's out-dir and
     # vice versa.
     whole_chapter: bool = False
+    # V4.1 B3 (concept §10 B3, §9.4): production audit/repair after
+    # whole-chapter generation. When True (production default) AND the B3
+    # machinery is injected (``b3_audit_repair``), the whole-chapter path
+    # runs ChunkedAuditEvaluator -> apply_hard_filters -> selective repair
+    # -> re-audit and rewrites translations_repaired.json/translations.json
+    # with the repaired map; ``--skip-audit`` turns the stage off (the
+    # steps are then recorded as skipped, A1 behavior). Part of the config
+    # identity — flipping it invalidates cache/resume exactly like any
+    # other run setting.
+    run_audit: bool = True
+    # V4.1 B3 (owner decision 2026-08-10, B1.3 gate pending): the source-only
+    # entity prepass (B1.2) feeds both the auditor and the hard filters
+    # (entity-PID issues forced to TIER_B). Runtime config; default true;
+    # false audits without the entity block. Part of the config identity.
+    entity_context_enabled: bool = True
+    # V4.1 B3 audit input budget (card §10 B3 "max_input/max_tokens/overlap
+    # в config"); the Qwen audit server profile (MTP, reasoning 8192, 49k)
+    # lives in the runtime config server_args. Part of the config identity
+    # so a budget change invalidates cache/resume.
+    audit_max_input_tokens: int = 3600
+    audit_max_tokens: int = 12000
+    audit_overlap_tokens: int = 400
+    # R-RETRY (t_8ab8ab35, operator extension 2026-08-13, F5): the chunk-
+    # level TRANSPORT_ERROR bounded retry policy (NEW session per attempt)
+    # is identity-bearing and wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair — a cache written under a different
+    # transport-retry policy must never replay a failed chunk.
+    audit_transport_max_retries: int = DEFAULT_TRANSPORT_MAX_RETRIES
+    audit_transport_base_delay_seconds: float = DEFAULT_TRANSPORT_BASE_DELAY_SECONDS
+    # V4.1 B3 (review fix F5): EVERY authoritative B3 repair-policy knob and
+    # prompt/extractor version participates in the config identity and is
+    # wired into B3AuditRepairConfig by _build_b3_audit_repair. Before this
+    # fix the identity carried only the audit budgets and the repair policy
+    # silently used module defaults — flipping a repair knob could then
+    # reuse a stale cached repaired map. Values mirror the module defaults
+    # (pact_v4.audit.chunked_audit / entity_extractor / repair.selective_repair).
+    audit_reasoning_budget: int = DEFAULT_REASONING_BUDGET
+    audit_repair_findings_cap: int = REPAIR_FINDINGS_CAP
+    audit_repair_microbatch_trigger: int = MICROBATCH_TRIGGER
+    audit_repair_microbatch_target: int = MICROBATCH_TARGET
+    # REPAIR-CTX (card t_97b31f81, F5): the repair-batch local context
+    # window (±N neighbour pairs around each finding PID, default 3 — owner
+    # decision 2026-08-12) is identity-bearing: a window change invalidates
+    # cache/resume exactly like every other repair-policy knob, so a stale
+    # cached repaired map (full-chapter batches) can never replay under the
+    # local-context prompt. Wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair.
+    audit_repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW
+    # REPAIR-2 (card t_768537b9, F5): the per-category window overrides
+    # ({category: window}; categories not in the map fall back to
+    # ``audit_repair_context_window`` — invented_gender/referent/omission
+    # default ±10, changed_fact/addition stay ±3; owner decision 2026-08-12).
+    # Identity-bearing: a per-category window change invalidates cache/resume
+    # exactly like the scalar window, so a stale cached repaired map (narrow
+    # gender window) can never replay under a wide-gender-window prompt.
+    # Wired into B3AuditRepairConfig by _build_b3_audit_repair.
+    audit_repair_context_window_by_category: Mapping[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY)
+    )
+    audit_repair_reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
+    # REPAIR-CTX (t_97b31f81, owner decision 2026-08-12): the re-audit is a
+    # CHUNKED audit over the affected region — the whole-chapter re-audit
+    # mode (old full_threshold) is CANCELLED. The re-audit chunk/overlap
+    # settings and the REPAIRED CHANGES delta format are identity-bearing
+    # (F5): changing them invalidates cache/resume so a stale cached repaired
+    # map (full-chapter re-audit) can never replay under the chunked
+    # local-context prompt. Wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair.
+    audit_repair_reaudit_max_input_tokens: int = DEFAULT_REAUDIT_MAX_INPUT_TOKENS
+    audit_repair_reaudit_overlap_tokens: int = DEFAULT_REAUDIT_OVERLAP_TOKENS
+    audit_repair_reaudit_min_overlap_pairs: int = DEFAULT_REAUDIT_MIN_OVERLAP_PAIRS
+    audit_repair_reaudit_max_overlap_pairs: int = DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS
+    audit_repair_reaudit_delta_format: str = REAUDIT_DELTA_FORMAT
+    # V4.1 B3 (RV fix for 71b7cbc): the re-audit output budget and its
+    # bounded B4 JSON retry policy are identity-bearing like every other
+    # repair-policy knob (F5). The selective repair code sends the budget
+    # as max_output_tokens and retries empty/truncated re-audit JSON per
+    # the policy; WITHOUT these fields a cache produced under the old
+    # 12000-token re-audit could be replayed under the 20000-token policy.
+    # Defaults mirror the selective-repair module (20000 tokens; JsonRetryPolicy
+    # max_retries=2 -> 3 attempts, base_delay_seconds=1.0).
+    audit_repair_reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
+    audit_repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
+    audit_repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
+    audit_prompt_version: str = PROMPT_VERSION
+    audit_harness_version: str = HARNESS_VERSION
+    audit_extractor_version: str = EXTRACTOR_VERSION
+    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
+    # version (REPAIR_AS_VERIFIER_V1 v4 — the source_stage/merge contract)
+    # is identity-bearing like every other B3 prompt/extractor version (F5).
+    # Before this field, a cache written under the v3 repair prompt could
+    # replay under v4 — the repaired map is a function of the repair prompt,
+    # so its version MUST participate in the config identity and the B3
+    # payload/report. Values mirror the module defaults
+    # (pact_v4.repair.selective_repair); wired into B3AuditRepairConfig by
+    # _build_b3_audit_repair.
+    audit_repair_prompt_version: str = REPAIR_PROMPT_VERSION
+    audit_repair_harness_version: str = REPAIR_HARNESS_VERSION
+    # V4.2 R (card t_4707e6e5): Russian-only editor stage BEFORE the audit.
+    # On by default (owner decision 2026-08-11 — R is production-default);
+    # ``--no-russian-editor`` turns it off (scheme 4.1, backward compatible).
+    # Every knob below participates in the config identity (F5 lesson): the
+    # editor version, the chunk settings and the class threshold are all
+    # part of to_config_artifact, so flipping any of them invalidates the
+    # repaired cache — a repaired map produced under a different R policy
+    # never replays.
+    russian_editor_enabled: bool = True
+    russian_editor_version: str = RUSSIAN_EDITOR_PROMPT_VERSION
+    russian_editor_harness_version: str = RUSSIAN_EDITOR_HARNESS_VERSION
+    russian_editor_chunk_size: int = RUSSIAN_EDITOR_CHUNK_SIZE
+    russian_editor_overlap_pairs: int = RUSSIAN_EDITOR_OVERLAP_PAIRS
+    russian_editor_max_tokens: int = RUSSIAN_EDITOR_MAX_TOKENS
+    # Class threshold: SAFE classes (auto-applied with the diff-gate).
+    russian_editor_safe_classes: tuple = tuple(sorted(RUSSIAN_EDITOR_SAFE_CLASSES))
+    # R-RETRY (t_8ab8ab35, F5): the per-pid edit cap (duplicate pid is NOT
+    # an error — up to this many edits per pid; 11th+ drops per-edit with a
+    # WARNING) and the bounded retry policy (transport + empty/truncated
+    # JSON) are identity-bearing — a cache written under a different
+    # cap/retry policy must never replay the edited map.
+    russian_editor_max_edits_per_pid: int = RUSSIAN_EDITOR_MAX_EDITS_PER_PID
+    russian_editor_retry_max_retries: int = RUSSIAN_EDITOR_RETRY_MAX_RETRIES
+    russian_editor_retry_base_delay_seconds: float = RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -328,6 +490,93 @@ class StrictRunConfig:
                 # journal written under the other scheme must be refused on
                 # resume (same reasoning as glossary_budget_policy_version).
                 "efficiency": {"lazy_balanced": self.lazy_balanced},
+                # V4.1 B3: the production audit/repair stage is part of the
+                # run's config identity — flipping run_audit /
+                # entity_context_enabled / audit budget invalidates
+                # cache/resume exactly like any other generation setting.
+                # F5: every repair-policy knob and prompt/extractor/harness
+                # version is included, so changing the repair policy can
+                # never silently reuse a stale cached repaired map.
+                "audit": {
+                    "run": self.run_audit,
+                    "entity_context_enabled": self.entity_context_enabled,
+                    "max_input_tokens": self.audit_max_input_tokens,
+                    "max_tokens": self.audit_max_tokens,
+                    "overlap_tokens": self.audit_overlap_tokens,
+                    "reasoning_budget": self.audit_reasoning_budget,
+                    "audit_transport_retry": {
+                        "max_retries": self.audit_transport_max_retries,
+                        "base_delay_seconds": self.audit_transport_base_delay_seconds,
+                    },
+                    "repair_findings_cap": self.audit_repair_findings_cap,
+                    "repair_microbatch_trigger": self.audit_repair_microbatch_trigger,
+                    "repair_microbatch_target": self.audit_repair_microbatch_target,
+                    # REPAIR-CTX (t_97b31f81): the local-context window is
+                    # identity-bearing — a change invalidates cache/resume
+                    # (F5: an old full-chapter repaired map must never replay
+                    # under a local-context prompt).
+                    "repair_context_window": self.audit_repair_context_window,
+                    # REPAIR-2 (t_768537b9): the per-category window
+                    # overrides are identity-bearing — a change invalidates
+                    # cache/resume (F5: a stale repaired map written under a
+                    # narrow gender window must never replay under a
+                    # wide-gender-window prompt).
+                    "repair_context_window_by_category": dict(
+                        self.audit_repair_context_window_by_category
+                    ),
+                    "repair_reaudit_neighbour_window": self.audit_repair_reaudit_neighbour_window,
+                    # REPAIR-CTX (t_97b31f81): the re-audit chunk/overlap
+                    # settings and the REPAIRED CHANGES delta format are
+                    # identity-bearing — a change invalidates cache/resume
+                    # (F5: an old full-chapter re-audit must never replay
+                    # under the chunked local-context prompt).
+                    "repair_reaudit_chunk": {
+                        "max_input_tokens": self.audit_repair_reaudit_max_input_tokens,
+                        "overlap_tokens": self.audit_repair_reaudit_overlap_tokens,
+                        "min_overlap_pairs": self.audit_repair_reaudit_min_overlap_pairs,
+                        "max_overlap_pairs": self.audit_repair_reaudit_max_overlap_pairs,
+                        "delta_format": self.audit_repair_reaudit_delta_format,
+                    },
+                    # F5: the re-audit output budget and bounded retry policy
+                    # are identity-bearing — a cache written under the old
+                    # 12000-token re-audit must never replay under the
+                    # 20000-token policy (RV 71b7cbc finding).
+                    "repair_reaudit_max_tokens": self.audit_repair_reaudit_max_tokens,
+                    "repair_reaudit_retry": {
+                        "max_retries": self.audit_repair_reaudit_max_retries,
+                        "base_delay_seconds": self.audit_repair_reaudit_base_delay_seconds,
+                    },
+                    "prompt_version": self.audit_prompt_version,
+                    "harness_version": self.audit_harness_version,
+                    "extractor_version": self.audit_extractor_version,
+                    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
+                    # REPAIR prompt version participates in the identity —
+                    # a cache written under a different repair prompt must
+                    # never replay the repaired map.
+                    "repair_prompt_version": self.audit_repair_prompt_version,
+                    "repair_harness_version": self.audit_repair_harness_version,
+                },
+                # V4.2 R (card t_4707e6e5, F5 lesson): the Russian-only
+                # editor stage is part of the run's config identity — its
+                # version, chunk settings and class threshold are included,
+                # so a cache written under a different R policy can never
+                # replay the repaired map (same reasoning as the audit
+                # block). ``--no-russian-editor`` flips ``enabled`` and thus
+                # invalidates cache/resume (scheme 4.1 is a different run).
+                "russian_editor": {
+                    "enabled": self.russian_editor_enabled,
+                    "version": self.russian_editor_version,
+                    "harness_version": self.russian_editor_harness_version,
+                    "chunk_size": self.russian_editor_chunk_size,
+                    "overlap_pairs": self.russian_editor_overlap_pairs,
+                    "max_tokens": self.russian_editor_max_tokens,
+                    "safe_classes": list(self.russian_editor_safe_classes),
+                    "max_edits_per_pid": self.russian_editor_max_edits_per_pid,
+                    "r_editor_retry": {
+                        "max_retries": self.russian_editor_retry_max_retries,
+                        "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
+                    },
+                },
             },
         )
 
@@ -2198,7 +2447,7 @@ def run_chapter_strict(
     qwen_audit_evaluator: Any,
     gemma_audit_evaluator: Any,
     repair_adapters: Optional[Sequence[Any]] = None,
-    formatting_adapters: Optional[Sequence[Any]] = None,
+    b3_audit_repair: Optional[Any] = None,
     now: Optional[Any] = None,
     progress: Optional[Any] = None,
     usage_writer: Optional[Any] = None,
@@ -2240,13 +2489,25 @@ def run_chapter_strict(
     recorded as ``skipped`` (e.g. test stubs that only cover Phase 1-2 + Step
     6).
 
-    Phase 5 formatting (B3) runs between Step 7 convergence and Step 8 when
-    ``formatting_adapters`` (``(formatting_caller,)``, built by
-    ``pact_v4.runtime.runtime_config.build_formatting_adapters``) is also
-    provided. Its model-fallback tier goes through ``BackendFormattingCaller``
-    over the coordinator ``CompletionBackend`` — never a local lifecycle
-    adapter. The formatted text is what the Step 8 integrity check and the
-    terminal transition see.
+    Phase 5 formatting (B3, card C) runs between Step 7 convergence and
+    Step 8 when ``cfg.formatting_required`` is set. It is **model-free by
+    rule** ("formatting = 0 model calls"): the deterministic tiers
+    (``preserved`` / ``exact`` / ``occurrence_aware`` / ``fuzzy``) locate the
+    source inline spans in the repaired text — including the whole-chapter
+    case where the translation already carries the inline markup (the
+    ``preserved`` tier). There is no injected ``FormattingCaller``; a span
+    the deterministic tiers cannot locate becomes a blocking
+    ``FormattingIncident`` (debt), never a model call. The formatted text is
+    what the Step 8 integrity check and the terminal transition see.
+
+    V4.1 B3 (concept §10 B3): in whole-chapter mode, when ``cfg.run_audit``
+    AND ``b3_audit_repair`` (``pact_v4.pipeline.b3_audit_repair.B3AuditRepair``)
+    is injected, the generation is followed by the production audit/repair
+    stage (ChunkedAuditEvaluator -> apply_hard_filters -> selective repair ->
+    re-audit) and ``translations_repaired.json`` / ``translations.json`` are
+    rewritten with the repaired map. Without the injected machinery the
+    steps stay recorded as skipped (A1 behavior) even when ``run_audit`` is
+    True — the runner never fabricates an audit.
     """
     if runtime is None:
         if router is None:
@@ -2302,9 +2563,19 @@ def run_chapter_strict(
         if not plans:
             raise ValueError(f"Chapter {cfg.chapter_id}: planner returned no chunks")
         chunk_plan = ChunkPlanArtifact.create(snapshot, tuple(plans))
+        chunk_plan_payload = chunk_plan.to_payload()
+        if cfg.whole_chapter:
+            # V4.1 audit W (§14): whole-chapter generation does NOT use the
+            # real chunk boundaries — only the ordered PID map
+            # (WholeChapterPidMap) matters. Annotate the persisted plan
+            # explicitly (metadata only, never part of plan_hash) so it
+            # cannot be misread as an active chunking contract; the ordered
+            # PID source of truth is whole_chapter_pid_map.json.
+            chunk_plan_payload["mode"] = CHUNK_PLAN_MODE_WHOLE_CHAPTER
+            chunk_plan_payload["note"] = CHUNK_PLAN_NOTE_WHOLE_CHAPTER
         chunk_plan_path = cfg.out_dir / "chunk_plan.json"
         chunk_plan_path.write_text(
-            json.dumps(chunk_plan.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8",
+            json.dumps(chunk_plan_payload, ensure_ascii=False, indent=2), encoding="utf-8",
         )
 
         glossary = _glossary_entries(memory)
@@ -2335,6 +2606,7 @@ def run_chapter_strict(
             narrator_gender=narrator_gender, model_caller=model_caller,
             runtime=runtime, now_fn=now_fn, progress=progress_writer,
             usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+            b3_audit_repair=b3_audit_repair,
         )
 
     source_map = dict(source.source)
@@ -2969,32 +3241,27 @@ def run_chapter_strict(
         # was skipped) decides the final translations.json write below.
         repair_phase_result: Optional[RepairPhaseResult] = None
         if repair_adapters is not None and phase4_inputs is not None:
-            # Phase 5 formatting (B3): build the formatting step over the source
-            # blocks + the injected formatting caller (a Backend adapter over the
-            # coordinator CompletionBackend), so the model-fallback tier runs
-            # through the backend boundary in local/remote/composite profiles
-            # alike — never a local lifecycle adapter. Applied between Step 7
-            # convergence and Step 8 inside run_repair_phase.
+            # Phase 5 formatting (B3, card C): build the formatting step over
+            # the source blocks. Formatting is model-free by rule — there is
+            # no injected caller, only the deterministic tiers (preserved /
+            # exact / occurrence_aware / fuzzy). A span they cannot locate
+            # becomes a blocking incident (debt), never a model call. Applied
+            # between Step 7 convergence and Step 8 inside
+            # run_repair_phase.
             #
             # ``cfg.formatting_required`` is the runtime master switch (§6.1
-            # ``formatting.required=true``): even when formatting adapters are
-            # configured, the step is skipped entirely when the policy says
-            # formatting is not required — adapters alone never trigger it.
+            # ``formatting.required=true``): when the policy says formatting
+            # is not required, the step is skipped entirely.
             formatting_step = None
-            if formatting_adapters is not None and cfg.formatting_required:
-                formatting_caller = formatting_adapters[0]
+            if cfg.formatting_required:
 
                 def _formatting_step(*, translation):
                     return run_formatting_align(
                         blocks=blocks,
                         translation=translation,
-                        formatting_caller=formatting_caller,
                         backend_identity_hash=cfg.backend.identity_hash,
                         policy_version=cfg.formatting_policy_version,
                         max_formatting_incidents=cfg.max_formatting_incidents,
-                        pid_batches=[
-                            tuple(chunk.pids) for chunk in chunk_plan.chunks
-                        ],
                     )
 
                 formatting_step = _formatting_step
@@ -3351,6 +3618,14 @@ def translations_path_exists(out_dir: Path) -> bool:
 # whether the artifact is missing or selection simply did not run.
 WHOLE_CHAPTER_SELECTION_SCHEMA = "pact-v4-whole-chapter-selection/v1"
 
+# V4.1 audit W (§14): schema of the whole-chapter ordered PID map artifact
+# (whole_chapter_pid_map.json), the honest source of truth for the ordered
+# PID list in whole-chapter mode. Each entry is {pid, order} in exact source
+# order; the artifact header binds the map to the run's snapshot/source/
+# plan/whole-chapter-map identities (snapshot_hash, source_hash,
+# chunk_plan_hash, map_hash).
+WHOLE_CHAPTER_PID_MAP_SCHEMA = "pact-v4-whole-chapter-pid-map/v1"
+
 # Whole-chapter journal/count marker: the single journal entry's chunk_id and
 # the generation record's chunk_id (the whole chapter is one processing unit).
 WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
@@ -3360,6 +3635,103 @@ WHOLE_CHAPTER_CHUNK_ID = "whole_chapter"
 # whole-chapter generation record must declare exactly this role in
 # ``expected_roles`` and key its candidate/error maps to it.
 WHOLE_CHAPTER_ROLE = "balanced_literary"
+
+
+def _wc_generation_model(runtime: Any, cfg: StrictRunConfig) -> str:
+    """Model label for ``wc_generation_started`` (diagnostics only).
+
+    Prefers the backend descriptor's ``generator`` binding (the model that
+    actually serves whole-chapter generation); falls back to the backend
+    profile name, then to a stable ``<kind>:<hash>`` placeholder so the
+    event never carries an empty model field.
+    """
+    try:
+        bindings = runtime.backend_descriptor.model_bindings
+        if bindings:
+            name = bindings.get("generator") or bindings.get("default")
+            if name:
+                return str(name)
+    except Exception:  # noqa: BLE001 — diagnostics, never a crash
+        pass
+    try:
+        profile = cfg.backend.config_profile_name()
+        if profile:
+            return profile
+    except Exception:  # noqa: BLE001
+        pass
+    return f"{cfg.backend.build_descriptor().kind}:{cfg.backend.identity_hash[:8]}"
+
+
+def _wc_validation_flags(outcome: Any) -> Dict[str, bool]:
+    """PID-contract validation flags for ``wc_validated`` (diagnostics).
+
+    A completed whole-chapter outcome is by construction a fully validated
+    ``{pid: text}`` map (json_ok/pids_ok/order_ok all True). For an
+    incomplete outcome the flags reflect the LAST attempt's failure class:
+    invalid JSON -> json_ok False; a PID-set/order violation -> pids_ok /
+    order_ok False; a session abort -> nothing to validate (all False).
+    """
+    if outcome.status == "complete":
+        return {"json_ok": True, "pids_ok": True, "order_ok": True}
+    error = next(iter(outcome.errors.values()), None)
+    code = error.code if error is not None else None
+    if code == GenerationErrorCode.INVALID_JSON:
+        return {"json_ok": False, "pids_ok": False, "order_ok": False}
+    if code == GenerationErrorCode.PID_MISMATCH:
+        return {"json_ok": True, "pids_ok": False, "order_ok": False}
+    # SESSION_ABORT / CONTEXT_LEAKAGE / unknown: nothing validated.
+    return {"json_ok": False, "pids_ok": False, "order_ok": False}
+
+
+# V4.1 GEN-REASONING: schema of the compact per-attempt reasoning marker that
+# rides inside the whole-chapter generation record (full text lives in the
+# .txt files; the JSON carries only presence + char counts so the artifact
+# stays small — owner decision 2026-08-13).
+WHOLE_CHAPTER_REASONING_SCHEMA = "pact-v4-whole-chapter-reasoning/v1"
+
+
+def _persist_whole_chapter_reasoning(
+    out_dir: Path,
+    reasoning_by_attempt: Mapping[int, str],
+) -> Dict[str, Any]:
+    """Write per-attempt reasoning text files and return the compact marker.
+
+    For every attempt that produced reasoning text, the full text is written
+    to ``whole_chapter_reasoning.txt`` (attempt 0) or
+    ``whole_chapter_retry{N}_reasoning.txt`` (retry attempt N) — the same
+    diagnostic pattern as the audit layer's ``b3_audit_chunkN_reasoning.txt``.
+    The returned marker records, per attempt, only presence + char count
+    (never the full text), so ``generation_outcomes.json`` stays compact.
+
+    Reasoning is a diagnostics text artifact only: writing these files never
+    affects ``whole_chapter_pid_map`` / ``wc_validated`` / cache / resume
+    identity, and a write failure is a warning, not a gate.
+    """
+    attempts: Dict[str, Any] = {}
+    for attempt, reasoning in sorted(reasoning_by_attempt.items()):
+        attempts[str(attempt)] = {
+            "present": bool(reasoning),
+            "chars": len(reasoning),
+        }
+        if not reasoning:
+            continue
+        name = (
+            "whole_chapter_reasoning.txt"
+            if attempt == 0
+            else f"whole_chapter_retry{attempt}_reasoning.txt"
+        )
+        try:
+            (out_dir / name).write_text(reasoning, encoding="utf-8")
+        except OSError as exc:
+            LOG.warning(
+                "whole-chapter reasoning artifact write failed (%s); "
+                "reasoning is diagnostics-only, continuing",
+                exc,
+            )
+    return {
+        "schema": WHOLE_CHAPTER_REASONING_SCHEMA,
+        "attempts": attempts,
+    }
 
 
 def _validate_whole_chapter_generation_record(
@@ -3634,6 +4006,7 @@ def _run_whole_chapter_strict(
     usage_writer: Any,
     started_at: str,
     wall_t0: float,
+    b3_audit_repair: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """V4.1 A1 whole-chapter generation: one call per chapter.
 
@@ -3661,6 +4034,7 @@ def _run_whole_chapter_strict(
             narrator_gender=narrator_gender, model_caller=model_caller,
             runtime=runtime, now_fn=now_fn, progress=progress,
             usage_writer=usage_writer, started_at=started_at, wall_t0=wall_t0,
+            b3_audit_repair=b3_audit_repair,
         )
     finally:
         # Terminal teardown on EVERY path (success, resume-validation
@@ -3691,6 +4065,7 @@ def _run_whole_chapter_strict_impl(
     usage_writer: Any,
     started_at: str,
     wall_t0: float,
+    b3_audit_repair: Optional[Any] = None,
 ) -> StrictChapterRunResult:
     """Whole-chapter generation/provenance body (see the wrapper above).
 
@@ -3702,6 +4077,20 @@ def _run_whole_chapter_strict_impl(
     recorded as skipped.
     """
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    pid_map_path = cfg.out_dir / "whole_chapter_pid_map.json"
+    pid_map_path.write_text(json.dumps({
+        "schema": WHOLE_CHAPTER_PID_MAP_SCHEMA,
+        "chapter_id": cfg.chapter_id,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "source_hash": source.source_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "map_hash": pid_map.map_hash,
+        "pid_count": len(pid_map.pids),
+        "entries": [
+            {"pid": pid, "order": order}
+            for order, pid in enumerate(pid_map.pids)
+        ],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     journal_path = cfg.out_dir / "journal.ndjson"
     translations_path = cfg.out_dir / "translations.json"
     raw_translations_path = cfg.out_dir / "translations_raw.json"
@@ -3982,6 +4371,28 @@ def _run_whole_chapter_strict_impl(
         }
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
+        # V4.1 M (monitor card): whole-chapter generation telemetry — the
+        # phase-progress CLI renders "GEN attempt N/M (reason)" live from
+        # these events. Diagnostics only: a write failure is swallowed by
+        # the writer and never affects generation.
+        wc_retry_policy = WholeChapterRetryPolicy()
+        progress.wc_generation_started(
+            pid_count=len(pid_map.pids),
+            reasoning_budget=cfg.reasoning,
+            model=_wc_generation_model(runtime, cfg),
+            max_attempts=wc_retry_policy.max_attempts,
+        )
+        wc_t0 = time.monotonic()
+        # V4.1 GEN-REASONING: per-attempt reasoning text collector for the
+        # whole-chapter generation call. Reasoning is a diagnostics TEXT
+        # artifact only — it never enters cache/resume identity (the record
+        # below carries only presence/char-count markers; the full text lives
+        # in whole_chapter_reasoning.txt / whole_chapter_retryN_reasoning.txt).
+        reasoning_by_attempt: Dict[int, str] = {}
+
+        def _wc_reasoning_sink(attempt: int, reasoning: str) -> None:
+            reasoning_by_attempt[attempt] = reasoning
+
         outcome = generate_whole_chapter(
             role="balanced_literary",
             source=source,
@@ -3994,9 +4405,31 @@ def _run_whole_chapter_strict_impl(
             params=params,
             model_caller=model_caller,
             cache=GenerationCache(),
-            retry=WholeChapterRetryPolicy(),
+            retry=wc_retry_policy,
+            on_retry=lambda attempt, reason: progress.wc_retry_attempt(
+                attempt=attempt, reason=reason
+            ),
+            reasoning_sink=_wc_reasoning_sink,
         )
-        generation_records.append(_serialize_generation_outcome(outcome))
+        progress.wc_generation_done(
+            finish_reason="complete" if outcome.status == "complete" else "incomplete",
+            pid_count=len(pid_map.pids),
+            duration=time.monotonic() - wc_t0,
+        )
+        progress.wc_validated(**_wc_validation_flags(outcome))
+        generation_record = _serialize_generation_outcome(outcome)
+        if any(reasoning_by_attempt.values()):
+            # GEN-REASONING: persist the full reasoning text per attempt and
+            # carry a compact presence/char-count marker in the record so the
+            # artifact stays small (the spec's decision: full text in the
+            # .txt files, JSON gets length/presence only). When NO attempt
+            # produced reasoning (reasoning=0 / transport reported none) the
+            # record stays byte-identical to the pre-GEN-REASONING shape.
+            reasoning_marker = _persist_whole_chapter_reasoning(
+                cfg.out_dir, reasoning_by_attempt
+            )
+            generation_record["reasoning"] = reasoning_marker
+        generation_records.append(generation_record)
 
         if outcome.status == "complete":
             candidate = outcome.candidates["balanced_literary"]
@@ -4057,6 +4490,42 @@ def _run_whole_chapter_strict_impl(
         "outcomes": generation_records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # ------------------------------------------------------------------
+    # V4.1 B3 (concept §10 B3, §9.4): production audit/repair after
+    # whole-chapter generation. Runs when ``cfg.run_audit`` AND the B3
+    # machinery is injected; the repaired map becomes the final
+    # translations.json alias and the raw->repaired diff stage becomes
+    # real. Without the injected machinery the steps stay recorded as
+    # skipped (A1 behavior) — the runner never fabricates an audit.
+    # A B3 failure is recorded (step6/7/8 status "failed"), never a
+    # crash of the completed generation run.
+    # ------------------------------------------------------------------
+    raw_final_text_by_pid = dict(final_text_by_pid)
+    b3_audit_result: Optional[Any] = None
+    b3_failed: Optional[str] = None
+    if (
+        cfg.run_audit
+        and cfg.stop_after != "generation"
+        and b3_audit_repair is not None
+        and raw_final_text_by_pid
+    ):
+        try:
+            b3_audit_result = b3_audit_repair.run(
+                chapter_id=cfg.chapter_id,
+                source=source,
+                snapshot_hash=snapshot.snapshot_hash,
+                translation=raw_final_text_by_pid,
+                book_memory=memory.book_memory,
+                out_dir=cfg.out_dir,
+                config_identity=config.config_identity,
+                backend_identity_hash=cfg.backend.identity_hash,
+            )
+        except Exception as exc:  # noqa: BLE001 — a B3 failure is a record, not a crash
+            LOG.exception("B3 audit/repair failed for %s", cfg.chapter_id)
+            b3_failed = str(exc)
+        if b3_audit_result is not None:
+            final_text_by_pid = dict(b3_audit_result.translations_repaired)
+
     # Final alias. In A1 there is no repair/formatting, so the final chapter
     # equals the raw generator snapshot; the two files remain distinct so a
     # later A2/B stage can diverge them without losing the raw contract.
@@ -4067,8 +4536,8 @@ def _run_whole_chapter_strict_impl(
     # `translations.json` remains the FINAL alias — these files are
     # attribution snapshots, never a competing source of truth. In A2 the
     # whole-chapter flow has no repair/formatting yet (B/B2/C), so
-    # repaired == raw and the diff stages are empty; the files establish
-    # the mechanism B2/C will populate.
+    # repaired == raw and the diff stages are empty; B3 makes the
+    # raw->repaired stage real when the production audit/repair ran.
     if final_text_by_pid:
         repaired_path = cfg.out_dir / "translations_repaired.json"
         diffs_path = cfg.out_dir / "translation_diffs.json"
@@ -4093,7 +4562,7 @@ def _run_whole_chapter_strict_impl(
                 "config_identity": config.config_identity,
                 "diffs": {
                     "raw->repaired": _pid_diffs(
-                        final_text_by_pid, final_text_by_pid
+                        raw_final_text_by_pid, final_text_by_pid
                     ),
                     "repaired->final": _pid_diffs(
                         final_text_by_pid, final_text_by_pid
@@ -4134,9 +4603,25 @@ def _run_whole_chapter_strict_impl(
         "generation_record_id": generation_record_id,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    step6 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
-    step7 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
-    step8 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+    if b3_audit_result is not None:
+        step6 = b3_audit_result.step6
+        step7 = b3_audit_result.step7
+        step8 = b3_audit_result.step8
+    elif b3_failed is not None:
+        # The B3 machinery was configured but crashed — recorded honestly
+        # as failed, never silently downgraded to "skipped".
+        step6 = {"status": "failed", "error": b3_failed}
+        step7 = {"status": "failed", "error": b3_failed}
+        step8 = {"status": "failed", "error": b3_failed}
+    else:
+        # No B3 machinery was injected (or run_audit=False / generation
+        # incomplete) — the steps are recorded as skipped (A1 behavior),
+        # never fabricated as complete. Without machinery the run IS
+        # generation-only, so the A1 reason stays accurate even when the
+        # run_audit flag is on.
+        step6 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+        step7 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
+        step8 = {"status": "skipped", "reason": "whole_chapter_generation_only"}
 
     wall_clock_seconds = time.monotonic() - wall_t0
     processed_count = len(_load_journal(journal_path))
@@ -4147,6 +4632,40 @@ def _run_whole_chapter_strict_impl(
     remote_calls = runtime_summary.get("remote_calls")
     backend_block = dict(runtime.backend_descriptor.public_record())
     backend_block["config_identity_hash"] = cfg.backend.identity_hash
+    artefacts: Dict[str, Any] = {
+        "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
+        "whole_chapter_pid_map": str(pid_map_path),
+        "generation_outcomes": str(generation_path),
+        "selection_results": str(selection_path),
+        "translations_raw": str(raw_translations_path),
+        "translations_repaired": str(cfg.out_dir / "translations_repaired.json"),
+        "translation_diffs": str(cfg.out_dir / "translation_diffs.json"),
+        "translations": str(translations_path),
+        "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
+        "journal": str(journal_path),
+    }
+    # F8 (B3 review): the manifest advertises ONLY artifacts that were
+    # actually created. When the B3 stage is skipped or failed, the B3
+    # journal/cache/entity files do not exist — advertising their paths
+    # would claim provenance/state the run never produced.
+    for key, name in (
+        ("b3_audit_journal", "audit_journal.ndjson"),
+        ("b3_audit_cache", "audit_cache_b3.json"),
+        ("b3_entity_context_cache", "entity_context_cache.json"),
+        ("b3_entity_validation_report", "entity_context_validation_report.json"),
+        # V4.2 R: the Russian-editor artifacts are advertised only when the
+        # stage actually produced them (a full cache hit / disabled stage
+        # leaves them absent — F8: never advertise nonexistent provenance).
+        ("translations_edited", "translations_edited.json"),
+        ("edit_candidates", "edit_candidates.json"),
+        # V4.1 GEN-REASONING: the whole-chapter reasoning text artifact is
+        # advertised only when reasoning>0 produced it (a reasoning=0 run or
+        # a transport that reported no reasoning leaves it absent — F8).
+        ("whole_chapter_reasoning", "whole_chapter_reasoning.txt"),
+    ):
+        candidate = cfg.out_dir / name
+        if candidate.exists():
+            artefacts[key] = str(candidate)
     record: Dict[str, Any] = {
         "schema": RECORD_SCHEMA,
         "run_label": cfg.run_label,
@@ -4179,6 +4698,68 @@ def _run_whole_chapter_strict_impl(
             "whole_chapter_retry": {
                 "max_attempts": WholeChapterRetryPolicy().max_attempts,
             },
+            # V4.1 B3: the production audit/repair stage policy (the audit
+            # input budget is part of the config identity too). F5: the
+            # repair-policy knobs and prompt/extractor versions are recorded
+            # alongside the identity so the record reflects what the stage
+            # actually ran with.
+            "audit": {
+                "run": cfg.run_audit,
+                "entity_context_enabled": cfg.entity_context_enabled,
+                "max_input_tokens": cfg.audit_max_input_tokens,
+                "max_tokens": cfg.audit_max_tokens,
+                "overlap_tokens": cfg.audit_overlap_tokens,
+                "reasoning_budget": cfg.audit_reasoning_budget,
+                "audit_transport_retry": {
+                    "max_retries": cfg.audit_transport_max_retries,
+                    "base_delay_seconds": cfg.audit_transport_base_delay_seconds,
+                },
+                "repair_findings_cap": cfg.audit_repair_findings_cap,
+                "repair_microbatch_trigger": cfg.audit_repair_microbatch_trigger,
+                "repair_microbatch_target": cfg.audit_repair_microbatch_target,
+                "repair_context_window": cfg.audit_repair_context_window,
+                "repair_reaudit_neighbour_window": cfg.audit_repair_reaudit_neighbour_window,
+                # REPAIR-CTX (t_97b31f81): the re-audit chunk/overlap
+                # settings and the REPAIRED CHANGES delta format are
+                # recorded alongside the identity so the record reflects
+                # what the re-audit actually ran with.
+                "repair_reaudit_chunk": {
+                    "max_input_tokens": cfg.audit_repair_reaudit_max_input_tokens,
+                    "overlap_tokens": cfg.audit_repair_reaudit_overlap_tokens,
+                    "min_overlap_pairs": cfg.audit_repair_reaudit_min_overlap_pairs,
+                    "max_overlap_pairs": cfg.audit_repair_reaudit_max_overlap_pairs,
+                    "delta_format": cfg.audit_repair_reaudit_delta_format,
+                },
+                "repair_reaudit_max_tokens": cfg.audit_repair_reaudit_max_tokens,
+                "repair_reaudit_retry": {
+                    "max_retries": cfg.audit_repair_reaudit_max_retries,
+                    "base_delay_seconds": cfg.audit_repair_reaudit_base_delay_seconds,
+                },
+                "prompt_version": cfg.audit_prompt_version,
+                "harness_version": cfg.audit_harness_version,
+                "extractor_version": cfg.audit_extractor_version,
+                # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR
+                # prompt version rides the record alongside the identity so
+                # the report reflects what the repair stage actually ran with.
+                "repair_prompt_version": cfg.audit_repair_prompt_version,
+                "repair_harness_version": cfg.audit_repair_harness_version,
+            },
+            # V4.2 R: the Russian-editor stage policy is recorded alongside
+            # the identity (the config artifact carries the same keys).
+            "russian_editor": {
+                "enabled": cfg.russian_editor_enabled,
+                "version": cfg.russian_editor_version,
+                "harness_version": cfg.russian_editor_harness_version,
+                "chunk_size": cfg.russian_editor_chunk_size,
+                "overlap_pairs": cfg.russian_editor_overlap_pairs,
+                "max_tokens": cfg.russian_editor_max_tokens,
+                "safe_classes": list(cfg.russian_editor_safe_classes),
+                "max_edits_per_pid": cfg.russian_editor_max_edits_per_pid,
+                "r_editor_retry": {
+                    "max_retries": cfg.russian_editor_retry_max_retries,
+                    "base_delay_seconds": cfg.russian_editor_retry_base_delay_seconds,
+                },
+            },
         },
         "resumed_from_index": resumed_from_index,
         "halted_early": halted_early,
@@ -4195,21 +4776,17 @@ def _run_whole_chapter_strict_impl(
         "step6": step6,
         "step7": step7,
         "step8": step8,
+        # V4.2 R: the Russian-editor stage report (edit_candidates +
+        # accept/reject journal) recorded in the trial record; absent when
+        # the R stage is disabled (4.1 scheme).
+        "russian_editor": (
+            b3_audit_result.r_editor if b3_audit_result is not None else None
+        ),
         "lifecycle": local_lifecycle or {
             "startup_count": 0, "restart_count": 0,
             "switches": [], "aggregates_by_model": {},
         },
-        "artefacts": {
-            "chunk_plan": str(cfg.out_dir / "chunk_plan.json"),
-            "generation_outcomes": str(generation_path),
-            "selection_results": str(selection_path),
-            "translations_raw": str(raw_translations_path),
-            "translations_repaired": str(cfg.out_dir / "translations_repaired.json"),
-            "translation_diffs": str(cfg.out_dir / "translation_diffs.json"),
-            "translations": str(translations_path),
-            "glossary_budget_report": str(cfg.out_dir / "glossary_budget_report.json"),
-            "journal": str(journal_path),
-        },
+        "artefacts": artefacts,
     }
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 

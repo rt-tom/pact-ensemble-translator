@@ -784,6 +784,8 @@ def generate_whole_chapter(
     model_caller: ModelCaller,
     cache: Optional[GenerationCache] = None,
     retry: WholeChapterRetryPolicy = WholeChapterRetryPolicy(),
+    on_retry: Optional[Callable[[int, str], None]] = None,
+    reasoning_sink: Optional[Callable[[int, str], None]] = None,
 ) -> GenerationOutcome:
     """Generate the whole chapter in ONE model call (V4.1 A1).
 
@@ -801,9 +803,45 @@ def generate_whole_chapter(
     exactly one candidate role, so the strict runner serializes the chapter's
     generation record with the standard ``_serialize_generation_outcome``
     shape (candidate_id ``whole_chapter:<role>:<hash>``).
+
+    ``on_retry`` (optional, diagnostics-only) is invoked as
+    ``on_retry(attempt, reason)`` after EVERY failed attempt with the 1-based
+    attempt number and a classification of the failure (``malformed`` /
+    ``missing_pid`` / ``truncated`` / ``abort``) — the same reason vocabulary
+    the phase-progress monitor renders as "GEN attempt N/M (reason)". It is
+    purely observational: a raise inside the hook is swallowed (logged) and
+    never changes retry behavior.
+
+    ``reasoning_sink`` (optional, GEN-REASONING, diagnostics-only) is invoked
+    as ``reasoning_sink(attempt_index, reasoning_text)`` after EVERY model
+    call attempt (0-based attempt index; the successful attempt AND any
+    truncated/aborted retry), with the reasoning text the caller reported for
+    that attempt (``''`` when the transport or provider produced none). The
+    text is read from the caller's ``last_reasoning`` attribute (production
+    callers capture ``response.raw_metadata['reasoning']``), so a stub caller
+    without the attribute yields ``''``. Purely observational: a raise inside
+    the sink is swallowed (logged) and never changes generation behavior.
+    Reasoning is a text artifact only — it never enters cache/resume identity.
     """
     if cache is None:
         cache = GenerationCache()
+
+    def _notify_retry(attempt: int, reason: str) -> None:
+        if on_retry is None:
+            return
+        try:
+            on_retry(attempt, reason)
+        except Exception:  # noqa: BLE001 — diagnostics hook, never breaks generation
+            LOG.debug("whole-chapter on_retry hook failed", exc_info=True)
+
+    def _emit_reasoning(attempt: int) -> None:
+        if reasoning_sink is None:
+            return
+        try:
+            reasoning = getattr(model_caller, "last_reasoning", None)
+            reasoning_sink(attempt, str(reasoning or ""))
+        except Exception:  # noqa: BLE001 — diagnostics sink, never breaks generation
+            LOG.debug("whole-chapter reasoning_sink failed", exc_info=True)
 
     template = _TEMPLATES[role]
     risk = _whole_chapter_risk(source, glossary)
@@ -863,6 +901,8 @@ def generate_whole_chapter(
                 GenerationErrorCode.SESSION_ABORT,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _emit_reasoning(attempt)
+            _notify_retry(attempt + 1, "abort")
             if attempt < retry.max_attempts - 1:
                 time.sleep(retry.delay_for(attempt))
                 continue
@@ -882,10 +922,14 @@ def generate_whole_chapter(
                 GenerationErrorCode.INVALID_JSON,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _emit_reasoning(attempt)
+            _notify_retry(attempt + 1, "truncated")
             if attempt < retry.max_attempts - 1:
                 time.sleep(retry.delay_for(attempt))
                 continue
             break
+
+        _emit_reasoning(attempt)
 
         try:
             translation = validate_whole_chapter_raw(raw, pid_map)
@@ -895,11 +939,22 @@ def generate_whole_chapter(
                 GenerationErrorCode.INVALID_JSON,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc}",
             )
+            _notify_retry(attempt + 1, "malformed")
         except _GenerationValidationError as exc:
             last_error = GenerationError(
                 role,
                 exc.code,
                 f"whole-chapter attempt {attempt + 1}/{retry.max_attempts}: {exc.detail}",
+            )
+            # The A1 contract retries every PID-contract violation
+            # (missing/extra/reordered/duplicate) with the same "missing_pid"
+            # reason; CONTEXT_LEAKAGE cannot fire here (whole-chapter has no
+            # context PIDs) but falls back to malformed for completeness.
+            _notify_retry(
+                attempt + 1,
+                "missing_pid"
+                if exc.code is GenerationErrorCode.PID_MISMATCH
+                else "malformed",
             )
         else:
             candidate = Candidate.create(

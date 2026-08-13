@@ -50,7 +50,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Optional
 
 LOG = logging.getLogger(__name__)
 
@@ -97,8 +97,9 @@ class JsonRetryPolicy:
 def classify_response_text(raw: str) -> None:
     """Raise the matching retryable error for an empty/truncated body.
 
-    Returns ``None`` when the body is non-empty and parseable JSON (even if
-    it is semantically the wrong shape — that is a downstream validation
+    Returns ``None`` when the body is non-empty and parseable JSON after
+    stripping markdown fences / BOM / surrounding prose (even if it is
+    semantically the wrong shape — that is a downstream validation
     concern, not a retry trigger). Raises ``EmptyResponseError`` /
     ``TruncatedJSONError`` otherwise.
     """
@@ -108,11 +109,125 @@ def classify_response_text(raw: str) -> None:
             "visible content)"
         )
     try:
-        json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise TruncatedJSONError(
-            f"response is not complete JSON (truncated or malformed): {exc}"
-        ) from exc
+        parse_json_response(raw)
+    except TruncatedJSONError:
+        raise
+    except ValueError:
+        # Valid JSON of the wrong shape (e.g. a bare string) is NOT a
+        # retry trigger (B4: retry only empty/truncated JSON).
+        return
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove one markdown code-fence wrapper (`````json ... `````) if present.
+
+    Mirrors the entity extractor's historical ``_strip_fences``: a leading
+    fence line (````` or `````json) and a trailing fence line are cut; the
+    body between them is returned trimmed. Non-fenced text is returned
+    unchanged.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return text
+
+
+def _first_balanced_json_block(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` block in ``text``, or ``None``.
+
+    String-aware: braces inside a JSON string literal (and escaped quotes)
+    never unbalance the scan, so prose like ``Here is the JSON: {...}``
+    yields the object. Returns ``None`` when no balanced block exists —
+    i.e. the body is truncated mid-object (the B4 retry zone) or contains
+    no object at all.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    return None  # unbalanced -> truncated
+
+
+def parse_json_response(text: str) -> dict:
+    """Parse a model response into a JSON dict, tolerating the formatting
+    noise models wrap their answers in.
+
+    RESILIENCE (t_406fc48c, run_remote_001): R / repair / re-audit used
+    bare ``json.loads`` and failed when the model wrapped the payload in
+    markdown fences (`````json ... `````), a BOM, or prose
+    (``Here is the JSON: {...}``). This is the single tolerant parse for
+    every phase:
+
+    1. BOM + surrounding whitespace are stripped;
+    2. markdown fences are removed;
+    3. if the whole body is not directly JSON, the FIRST balanced ``{...}``
+       block is extracted (string-aware, so braces inside strings never
+       unbalance it);
+    4. ``json.loads``; on failure a ``TruncatedJSONError`` (a
+       ``ValueError``) with a clear message is raised — fail-closed, the
+       retry zone stays unchanged (broken/truncated JSON is NOT repaired
+       here, it is retried by B4).
+
+    Raises:
+      * ``EmptyResponseError`` — empty body (B4 retryable);
+      * ``TruncatedJSONError`` — not complete JSON even after
+        fence/prose stripping (B4 retryable);
+      * ``ValueError`` — valid JSON but not an object (not a retry
+        trigger; wrong shape is a downstream validation concern).
+    """
+    if not text or not text.strip():
+        raise EmptyResponseError(
+            "empty response body (likely max_tokens exhausted before any "
+            "visible content)"
+        )
+    cleaned = _strip_markdown_fences(text.strip().lstrip("\ufeff"))
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        block = _first_balanced_json_block(cleaned)
+        if block is None:
+            raise TruncatedJSONError(
+                "response is not complete JSON (no balanced {...} object "
+                "found after stripping fences/prose — truncated or "
+                "missing)"
+            )
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError as exc:
+            raise TruncatedJSONError(
+                f"response is not complete JSON: {exc}"
+            ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"response is valid JSON but not an object: "
+            f"{type(parsed).__name__}"
+        )
+    return parsed
 
 
 _RETRYABLE = (EmptyResponseError, TruncatedJSONError)
@@ -168,5 +283,6 @@ __all__ = [
     "TruncatedJSONError",
     "JsonRetryPolicy",
     "classify_response_text",
+    "parse_json_response",
     "retry_json_call",
 ]

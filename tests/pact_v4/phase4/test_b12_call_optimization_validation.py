@@ -131,41 +131,24 @@ def test_b12_full_cycle_fits_500_budget():
     )
 
 
-class _EmptyBatchCaller:
-    """Batch-capable formatting caller that returns no mappings (parity probe)."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def __call__(self, *, pid, source_text, translation, spans) -> str:
-        self.calls += 1
-        return json.dumps({"mappings": []}, ensure_ascii=False)
-
-    def batch(self, items) -> str:
-        self.calls += 1
-        return json.dumps({"mappings": []}, ensure_ascii=False)
-
-
 def test_b12_formatting_batched_parity_and_fewer_calls():
-    # Light smoke on the real chapter: the batched path resolves exactly the
-    # same spans/incidents as the per-PID path (parity) with fewer calls.
+    # Card C: formatting is model-free — run_formatting_align takes no
+    # caller and makes 0 model calls; the deterministic tiers resolve every
+    # span the whole-chapter translation already carries inline.
     assert _CHAPTER_HTML is not None, "external chapter HTML must be resolved"
-    chunk_plan = _load("chunk_plan.json")
     blocks = parse_source_html(_CHAPTER_HTML.read_text(encoding="utf-8"))
     translations = _load("translations.json")
 
-    per_pid_caller = _EmptyBatchCaller()
-    per_pid = fmt.run_formatting_align(
+    outcome = fmt.run_formatting_align(
         blocks=blocks, translation=translations,
-        formatting_caller=per_pid_caller, backend_identity_hash="x" * 32,
+        backend_identity_hash="x" * 32,
     )
-    batched_caller = _EmptyBatchCaller()
-    batched = fmt.run_formatting_align(
-        blocks=blocks, translation=translations,
-        formatting_caller=batched_caller, backend_identity_hash="x" * 32,
-        pid_batches=[tuple(chunk["pids"]) for chunk in chunk_plan["chunks"]],
-    )
-    assert per_pid.model_fallback_count == batched.model_fallback_count
-    assert batched.model_call_count < per_pid.model_call_count
-    assert batched.incidents == per_pid.incidents
-    assert batched.formatted_text == per_pid.formatted_text
+    # Model-free invariant: no caller, no model calls.
+    assert outcome.model_call_count == 0
+    assert outcome.model_fallback_count == 0
+    # The frozen whole-chapter translation keeps the emphasis inline, so the
+    # deterministic tiers resolve the span contract without a model.
+    assert outcome.resolved_count >= 0
+    # Any span the deterministic tiers could not locate is debt (blocking
+    # incidents), never a silent loss.
+    assert outcome.incident_count == len(outcome.incidents)

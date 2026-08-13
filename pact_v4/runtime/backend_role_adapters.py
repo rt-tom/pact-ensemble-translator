@@ -39,7 +39,6 @@ from pact_v4.runtime.json_resilience import (
     retry_json_call,
 )
 from pact_v4.runtime.prompts_runtime import (
-    FORMAT_SPANS_V1,
     GEMMA_AUDIT_V1,
     GEMMA_RUSSIAN_PREFERENCE_V1,
     QWEN_AUDIT_V1,
@@ -48,8 +47,6 @@ from pact_v4.runtime.prompts_runtime import (
     REGION_FIDELITY_GATE_V1,
     REPAIR_REGION_V1,
     ReviewerPrompt,
-    render_formatting_prompt,
-    render_formatting_prompt_batch,
     render_gemma_audit_prompt,
     render_gemma_preference_prompt,
     render_qwen_audit_prompt,
@@ -183,10 +180,34 @@ class BackendModelCaller:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
         self._max_tokens = int(self._config.max_tokens)
+        # V4.1 GEN-REASONING: the reasoning text of the most recent backend
+        # completion (raw_metadata['reasoning'], '' when the transport or
+        # provider reported none). Exposed for the whole-chapter generation
+        # layer to persist per-attempt reasoning diagnostics — never part of
+        # cache/resume identity.
+        self._last_reasoning: str = ""
 
     @property
     def backend(self) -> CompletionBackend:
         return self._backend
+
+    @property
+    def last_reasoning(self) -> str:
+        """Reasoning text of the most recent backend completion ('' when none)."""
+        return self._last_reasoning
+
+    def reset_attempt_state(self) -> None:
+        """Clear the per-attempt reasoning diagnostic at a call-attempt boundary.
+
+        V4.1 GEN-REASONING (RV t_a790dbab): the lifecycle wrappers invoke
+        this BEFORE model acquisition (``ensure_resident``) so that an
+        acquisition failure (``CompletionError`` from a model load/swap)
+        never exposes the previous successful completion's reasoning — the
+        wrapped ``__call__`` is never entered in that case, so its
+        clear-at-start reset cannot run. Direct callers keep the existing
+        clear-at-start behavior inside ``__call__``.
+        """
+        self._last_reasoning = ""
 
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
@@ -226,7 +247,27 @@ class BackendModelCaller:
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,
+            # AF (2026-08-10): serve 1.4.7 applies a default ~32k output
+            # budget to message bodies that carry system/tools (agentic
+            # mode), truncating whole-chapter reasoning at 32000 tokens
+            # (finish=length, empty output — 2/3 remote whole-chapter
+            # attempts). The neutral system prompt and the all-disabled
+            # tools map do not change the model answer, so the generation
+            # request omits both — the verbatim Gate 0 body
+            # (model+parts+reasoningEffort) that measured 55915 reasoning
+            # tokens with finish=stop. Generation-only: the Qwen audit /
+            # repair / formatting adapters keep the historical
+            # system+tools body. Inert for local llama-server transports
+            # (they never read the field).
+            omit_system_tools=True,
         )
+
+        # V4.1 GEN-REASONING: each model-call attempt starts with a clean
+        # reasoning slate. On a transport failure no response ever arrives,
+        # so last_reasoning stays '' (never a stale value from a previous
+        # attempt); on a completed backend call _complete() records the
+        # reasoning text from raw_metadata.
+        self._last_reasoning = ""
 
         def _complete() -> str:
             # Re-issues the identical request on a retry: same prompt, same
@@ -234,10 +275,18 @@ class BackendModelCaller:
             # reasoning) — so retry never changes cache/resume identity and
             # never switches the reasoning budget mid-request (B1).
             try:
-                return self._backend.complete(request).text
+                response = self._backend.complete(request)
             except CompletionError as exc:
                 LOG.error("BackendModelCaller: backend failure: %s", exc)
                 raise
+            # GEN-REASONING: capture the reasoning text of THIS completion
+            # (open-code backend: type=reasoning parts; local: the server's
+            # reported reasoning field). Diagnostics only — never part of
+            # the returned text, cache, or resume identity.
+            metadata = response.raw_metadata if isinstance(response.raw_metadata, Mapping) else {}
+            reasoning = metadata.get("reasoning")
+            self._last_reasoning = str(reasoning) if reasoning is not None else ""
+            return response.text
 
         return retry_json_call(
             _complete, self._config.retry, label=request.label,
@@ -870,120 +919,6 @@ class BackendRegionFidelityGate:
         return _parse_qwen_verdicts(raw, count=len(items))
 
 
-@dataclass(frozen=True)
-class BackendFormattingCallerConfig:
-    """Phase 5 span-mapping call settings.
-
-    The formatting output is a ``{"mappings": [{"pid", "span_id",
-    "target_text", "occurrence"}]}`` JSON object for one PID's unresolved
-    spans. ``max_tokens`` is a floor with per-PID headroom (same Qwen fix as
-    the fidelity gate) so a long PID with several spans is not truncated
-    mid-JSON — a truncation would otherwise surface as a spurious incident
-    instead of a transport/format problem.
-    """
-
-    max_tokens: int = 8192
-    template: ReviewerPrompt = FORMAT_SPANS_V1
-    label: str = "phase5/formatting_align"
-
-
-class BackendFormattingCaller:
-    """Phase 5 §8.14 span-mapping model fallback over a ``CompletionBackend``.
-
-    Transport-only role adapter (V4 A1 pattern): renders the formatting
-    prompt (source text + unresolved source spans + Russian translation),
-    sends it through ``backend.complete(request)``, and returns the raw
-    assistant text. Output parsing/validation (strict JSON, PID/span-set
-    enforcement, substring verification) lives in
-    ``pact_v4.phase5.formatting`` — this class never invents a mapping on its
-    own. A transport failure raises ``CompletionError``; the formatting
-    module converts it into a blocking incident recorded as debt, never a
-    semantic terminal status (rule "transport failure != semantic gate
-    failure"; no silent fallback).
-    """
-
-    def __init__(
-        self,
-        backend: CompletionBackend,
-        *,
-        config: Optional[BackendFormattingCallerConfig] = None,
-    ) -> None:
-        self._backend = backend
-        self._config = config or BackendFormattingCallerConfig()
-        self._max_tokens = int(self._config.max_tokens)
-
-    @property
-    def backend(self) -> CompletionBackend:
-        return self._backend
-
-    def __call__(
-        self,
-        *,
-        pid: str,
-        source_text: str,
-        translation: str,
-        spans: Sequence[Mapping[str, Any]],
-    ) -> str:
-        prompt = render_formatting_prompt(
-            pid=pid,
-            source_text=source_text,
-            translation=translation,
-            spans=[dict(item) for item in spans],
-            template=self._config.template,
-        )
-        request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("formatting", "repair", "generator")
-            ),
-            messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens,
-            temperature=0.0,
-            response_schema=JSON_OBJECT_SCHEMA,
-            label=self._config.label,
-        )
-        try:
-            response = self._backend.complete(request)
-        except CompletionError as exc:
-            LOG.error("BackendFormattingCaller: backend failure: %s", exc)
-            raise
-        return response.text
-
-    def batch(
-        self,
-        items: Sequence[Mapping[str, Any]],
-    ) -> str:
-        """Map several PIDs' unresolved spans in one backend call (B12).
-
-        ``items`` is a list of ``{pid, source_text, translation, spans}``
-        payloads; the batched prompt renders one ``FORMAT_PID`` block per
-        item and the response is the same ``{"mappings": [...]}`` schema with
-        a ``pid`` per entry. Transport-only: output parsing/validation stays
-        in ``pact_v4.phase5.formatting``. ``max_output_tokens`` scales with
-        the batch size so a long multi-PID response is not truncated
-        mid-JSON (same per-PID headroom rationale as the single call).
-        """
-        prompt = render_formatting_prompt_batch(
-            items=[dict(item) for item in items],
-            template=self._config.template,
-        )
-        request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("formatting", "repair", "generator")
-            ),
-            messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens * max(1, len(items)),
-            temperature=0.0,
-            response_schema=JSON_OBJECT_SCHEMA,
-            label=self._config.label,
-        )
-        try:
-            response = self._backend.complete(request)
-        except CompletionError as exc:
-            LOG.error("BackendFormattingCaller.batch: backend failure: %s", exc)
-            raise
-        return response.text
-
-
 __all__ = [
     "DEFAULT_MAX_TOKENS",
     "BackendModelCallerConfig",
@@ -1000,6 +935,4 @@ __all__ = [
     "BackendRepairCaller",
     "BackendRegionFidelityGateConfig",
     "BackendRegionFidelityGate",
-    "BackendFormattingCallerConfig",
-    "BackendFormattingCaller",
 ]
