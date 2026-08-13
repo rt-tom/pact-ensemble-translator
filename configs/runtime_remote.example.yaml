@@ -39,6 +39,14 @@ auth:
   username_env: OPENCODE_SERVER_USERNAME
   password_env: OPENCODE_SERVER_PASSWORD
 structured_output_mode: prompt_only
+# TIMEOUT-FIX (2026-08-13): whole-chapter generation with --reasoning 3
+# (high) routinely takes >10 min (run_remote_003: attempt 2 was cut at
+# exactly 600s, 003 streamed for 10+ min). 2400s = 40 min transport budget
+# per HTTP request so long generations are not aborted. This is an
+# IDENTITY parameter (build_opencode_descriptor serializes timeout_seconds):
+# changing it invalidates cache/resume — change it only BETWEEN runs (like
+# --run-label), never mid-run.
+timeout_seconds: 2400
 # Remote budget (B11): max_requests_per_chapter caps model requests per
 # chapter (full cycle ~350-400 incl. convergence/repair/formatting/
 # quarantined-retry; default 500 keeps a reserve). This is an

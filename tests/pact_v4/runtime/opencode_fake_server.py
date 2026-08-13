@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,13 @@ class FakeOpenCodeServer:
         self.session_create_response: Optional[Any] = None
 
         self.requests_log: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
+        # Per-request ``timeout`` kwarg forwarded by the backend (TIMEOUT-FIX:
+        # proves the transport budget passed to the session is the configured
+        # timeout_seconds, so a long generation is not cut at an old default).
+        self.timeouts_log: List[Optional[float]] = []
+        # Optional artificial delay per POST message (seconds) to simulate a
+        # long-running generation request offline.
+        self.message_delay_seconds: float = 0.0
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self.created_titles: List[str] = []
         self._session_seq = 0
@@ -148,6 +156,7 @@ class FakeOpenCodeServer:
         path = _path_of(url)
         body = kwargs.get("json")
         self.requests_log.append((method, path, body))
+        self.timeouts_log.append(kwargs.get("timeout"))
         if method == "GET" and path == "/global/health":
             return FakeResponse(200, {"healthy": self.healthy, "version": self.version})
         if method == "GET" and path == "/provider":
@@ -219,6 +228,8 @@ class FakeOpenCodeServer:
         session_id = _session_id_of(path)
         if not self.message_responses:
             return FakeResponse(500, {"error": "no scripted message response"})
+        if self.message_delay_seconds > 0:
+            time.sleep(self.message_delay_seconds)
         item = self.message_responses.pop(0)
         if isinstance(item, BaseException):
             raise item

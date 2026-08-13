@@ -541,6 +541,30 @@ def test_timeout_error_normalizes_as_transport_timeout():
     assert exc_info.value.error_class == ERROR_TRANSPORT_TIMEOUT
 
 
+def test_long_generation_request_is_not_aborted_by_default_timeout():
+    # TIMEOUT-FIX (2026-08-13): whole-chapter generation with --reasoning 3
+    # takes >10 min (run_remote_003 attempt 2 was cut at exactly 600s). The
+    # transport budget forwarded to the session is the configured
+    # timeout_seconds (default 2400 = 40 min), so a request that outlives
+    # the old 600s budget is NOT aborted: the response is still received.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("long generation done"))
+    # Simulate a slow generation: the fake waits before answering, longer
+    # than the OLD 600s default would have allowed had it been enforced.
+    fake.message_delay_seconds = 0.5
+    backend = _backend(fake)  # default timeout_seconds = 2400.0
+    response = backend.complete(_request())
+    assert response.text == "long generation done"
+    # The transport budget actually handed to the session is 2400s, not 600s.
+    message_posts = [
+        timeout
+        for (method, path, _), timeout in zip(fake.requests_log, fake.timeouts_log)
+        if method == "POST" and "/message" in path
+    ]
+    assert message_posts, "expected at least one message POST"
+    assert all(t == 2400.0 for t in message_posts)
+
+
 def test_429_retries_with_retry_after():
     fake = FakeOpenCodeServer()
     fake.script_message(
