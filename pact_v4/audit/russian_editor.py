@@ -34,13 +34,16 @@ harmful):
    edits become ``translations_edited.json``; REVIEW edits become
    ``edit_candidates.json`` and are NEVER auto-applied (they are later
    verified by the B2 repair-as-verifier against the ORIGINAL).
-6. **Fail-closed** — a structurally invalid chunk (unknown pid, pid outside
-   the chunk, ``original`` not a verbatim substring of the current text,
-   unknown class, non-string/missing fields, duplicate pid) makes the WHOLE
-   chunk FAILED, and the stage is recorded ``complete=False`` — the caller
-   must then NOT apply a partial editor pass (the B3 integration treats an
-   incomplete R stage as debt and proceeds with the raw map, exactly like a
-   failed repair batch: the audit still protects the chapter).
+6. **Fail-closed (per-chunk)** — a structurally invalid chunk (unknown pid,
+   pid outside the chunk, ``original`` not a verbatim substring of the
+   current text, unknown class, non-string/missing fields, duplicate pid)
+   makes the WHOLE chunk FAILED, and the stage is recorded ``complete=False``.
+   Fail-closed is per-chunk: a failed chunk contributes NO edits to
+   ``edits``/``applied``/``candidates``, so the caller applies exactly the
+   successful chunks' work (RESILIENCE t_406fc48c, run_remote_001: 17 valid
+   edits from 5 GOOD chunks are no longer discarded because 3 chunks failed;
+   the B3 integration journals ``partial=true`` and the audit still protects
+   the chapter, like a failed repair batch).
 
 Transport: the evaluator is backend-neutral over ``CompletionBackend`` (the
 same boundary the B1 chunked audit uses); it resolves the model ref via
@@ -52,7 +55,6 @@ This module is pure and deterministic except for the injected model calls.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +67,7 @@ from pact_v4.runtime.backend_protocol import (
     CompletionRequest,
     Message,
 )
+from pact_v4.runtime.json_resilience import parse_json_response
 from pact_v4.runtime.prompts_runtime import (
     RUSSIAN_EDITOR_V4_2_R1,
     ReviewerPrompt,
@@ -183,8 +186,11 @@ class RussianEditorOutcome:
     once by ``rewritten`` (R-FIX2 substring-replace — the rest of the PID is
     preserved); ``candidates`` is the REVIEW subset (never auto-applied).
     ``dropped`` counts no-op edits (rewritten == original) cut by the
-    diff-gate. ``complete`` is False when ANY chunk failed (fail-closed: the
-    caller must not apply a partial pass).
+    diff-gate. ``complete`` is False when ANY chunk failed — fail-closed is
+    per-chunk: ``edits``/``applied``/``candidates`` contain ONLY the
+    successful chunks' content, so a partial pass applies exactly the GOOD
+    chunks' work (RESILIENCE t_406fc48c, run_remote_001) and the caller
+    never sees a failed chunk's edits.
     """
 
     schema: str
@@ -310,7 +316,7 @@ def parse_editor_edits(
     """
     errors: list = []
     try:
-        parsed = json.loads(text)
+        parsed = parse_json_response(text)
     except Exception as exc:
         return (), (f"response is not valid JSON: {exc}",)
     if not isinstance(parsed, dict) or "edits" not in parsed:
