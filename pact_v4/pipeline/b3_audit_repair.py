@@ -582,6 +582,19 @@ _ISSUE_KEYS = frozenset({
     "id", "category", "severity", "confidence", "note", "excerpt", "_debug",
 })
 
+# Report-level statuses produced by _build_r_editor_report (b3_audit_repair.py).
+_R_EDITOR_REPORT_STATUSES = frozenset({
+    "disabled", "failed", "partial", "incomplete", "complete",
+})
+
+# Statuses under which the R stage actually RAN (outcome REQUIRED).
+_R_EDITOR_RAN_STATUSES = frozenset({"partial", "incomplete", "complete"})
+
+# Exact persisted key sets (RussianEditorOutcome chunk records / edit
+# payloads). A record with a foreign key is a schema violation — never
+# tolerated, never coerced.
+_R_CHUNK_KEYS = frozenset({"chunk", "first_pid", "last_pid", "status", "edits"})
+_R_EDIT_KEYS = frozenset({"pid", "original", "rewritten", "reason", "class"})
 
 def _validate_partial_payload(
     payload: Mapping[str, Any],
@@ -605,11 +618,16 @@ def _validate_partial_payload(
       translation map), ``_debug.chunk`` attribution inside the covered
       chunk indices, and PID membership inside the ACTUAL covered chunk
       span of the attributed chunk (first_pid..last_pid boundaries);
-    * R report schema / chunk coverage (contiguous 1..M, known status,
-      boundaries);
+    * R report schema: when the R stage RAN (status partial/incomplete/
+      complete) the ``outcome`` is REQUIRED with a non-empty, coherently
+      tiled ``chunks`` list (contiguous 1..M, chunk_size-boundary
+      coverage); when R was disabled/failed the ``outcome`` must be null —
+      a malformed/missing R outcome is a full miss, never a partial replay
+      while audit issues stay reusable;
     * every cached R edit: object shape, exact string types, PID
-      membership, known class, and (when ``current_text`` is available)
-      the verbatim current-text substring constraint.
+      membership (in the translation map AND inside the chunk's own
+      boundary span), known class, and (when ``current_text`` is
+      available) the verbatim current-text substring constraint.
 
     Malformed fields are NEVER stringified/coerced — a violation is a full
     cache miss. ``expected_pids`` / ``current_text`` may be None only when
@@ -729,93 +747,168 @@ def _validate_partial_payload(
     if r_editor is not None and not isinstance(r_editor, dict):
         return "r_editor is not an object or null"
     if isinstance(r_editor, dict):
+        # FIX RV2-B (t_aa3ee032): the R report is validated COMPLETELY before
+        # either resume plan is built. When the R stage RAN (status partial/
+        # incomplete/complete) the outcome is REQUIRED with a non-empty,
+        # coherently tiled chunks list; when R was disabled/failed the
+        # outcome must be null. A malformed/missing R outcome is a FULL
+        # cache miss, never a partial replay while audit issues stay
+        # reusable.
+        report_status = r_editor.get("status")
+        if (
+            not isinstance(report_status, str)
+            or report_status not in _R_EDITOR_REPORT_STATUSES
+        ):
+            return f"r_editor.status is missing or unknown {report_status!r}"
+        if not isinstance(r_editor.get("enabled"), bool):
+            return "r_editor.enabled is not a bool"
         outcome = r_editor.get("outcome")
-        if outcome is not None:
+        if report_status in _R_EDITOR_RAN_STATUSES:
+            # R ran: outcome REQUIRED with a non-empty chunks list.
             if not isinstance(outcome, dict):
-                return "r_editor.outcome is not an object or null"
+                return (
+                    f"r_editor.outcome is required when status is "
+                    f"{report_status!r} (got {type(outcome).__name__})"
+                )
             r_chunks = outcome.get("chunks")
-            if r_chunks is not None:
-                if not isinstance(r_chunks, list) or not r_chunks:
-                    return "r_editor.outcome.chunks is missing, not a list, or empty"
-                for position, item in enumerate(r_chunks, start=1):
-                    if not isinstance(item, dict):
-                        return f"r_editor chunk at position {position}: not an object"
-                    chunk_index = item.get("chunk")
-                    if chunk_index != position:
-                        return (
-                            f"r_editor chunk coverage/order mismatch: stored index "
-                            f"{chunk_index!r} at position {position} (expected "
-                            f"contiguous 1..M)"
-                        )
-                    status = item.get("status")
-                    if not isinstance(status, str) or status not in _R_EDITOR_CHUNK_STATUSES:
-                        return f"r_editor chunk {chunk_index}: unknown status {status!r}"
-                    first_pid = item.get("first_pid")
-                    last_pid = item.get("last_pid")
-                    if not isinstance(first_pid, str) or not first_pid:
-                        return f"r_editor chunk {chunk_index}: first_pid is missing or not a string"
-                    if not isinstance(last_pid, str) or not last_pid:
-                        return f"r_editor chunk {chunk_index}: last_pid is missing or not a string"
-                    if expected_pid_set is not None and (
-                        first_pid not in expected_pid_set
-                        or last_pid not in expected_pid_set
+            if not isinstance(r_chunks, list) or not r_chunks:
+                return "r_editor.outcome.chunks is missing, not a list, or empty"
+            chunk_size = r_editor.get("chunk_size")
+            if (
+                not isinstance(chunk_size, int)
+                or isinstance(chunk_size, bool)
+                or chunk_size < 1
+            ):
+                return f"r_editor.chunk_size {chunk_size!r} is not a positive int"
+            if expected_pids is not None:
+                expected_count = (
+                    len(expected_pids) + chunk_size - 1
+                ) // chunk_size
+                if len(r_chunks) != expected_count:
+                    return (
+                        f"r_editor chunk coverage mismatch: {len(r_chunks)} "
+                        f"chunk(s) persisted for {len(expected_pids)} pids at "
+                        f"chunk_size {chunk_size} (expected {expected_count})"
+                    )
+            for position, item in enumerate(r_chunks, start=1):
+                if not isinstance(item, dict):
+                    return f"r_editor chunk at position {position}: not an object"
+                if set(item) != _R_CHUNK_KEYS:
+                    return (
+                        f"r_editor chunk at position {position}: foreign key "
+                        f"set {sorted(item)!r} (expected {sorted(_R_CHUNK_KEYS)})"
+                    )
+                chunk_index = item.get("chunk")
+                if chunk_index != position:
+                    return (
+                        f"r_editor chunk coverage/order mismatch: stored index "
+                        f"{chunk_index!r} at position {position} (expected "
+                        f"contiguous 1..M)"
+                    )
+                status = item.get("status")
+                if not isinstance(status, str) or status not in _R_EDITOR_CHUNK_STATUSES:
+                    return f"r_editor chunk {chunk_index}: unknown status {status!r}"
+                first_pid = item.get("first_pid")
+                last_pid = item.get("last_pid")
+                if not isinstance(first_pid, str) or not first_pid:
+                    return f"r_editor chunk {chunk_index}: first_pid is missing or not a string"
+                if not isinstance(last_pid, str) or not last_pid:
+                    return f"r_editor chunk {chunk_index}: last_pid is missing or not a string"
+                if expected_pids is not None:
+                    # Coherent tiling: chunk k must cover exactly the k-th
+                    # chunk_size span of the ordered translation map — chunk 1
+                    # starts at map[0], chunk k+1 starts right after chunk k
+                    # ends, the last chunk ends at map[-1]. A duplicate /
+                    # missing / extra / foreign chunk record breaks the
+                    # tiling and is a full miss.
+                    start = (position - 1) * chunk_size
+                    end = min(position * chunk_size, len(expected_pids))
+                    if (
+                        first_pid != expected_pids[start]
+                        or last_pid != expected_pids[end - 1]
                     ):
                         return (
-                            f"r_editor chunk {chunk_index}: boundary pids "
-                            f"{first_pid!r}/{last_pid!r} are not in the translation map"
+                            f"r_editor chunk {chunk_index}: boundary span "
+                            f"{first_pid!r}/{last_pid!r} does not tile the "
+                            f"translation map (expected "
+                            f"{expected_pids[start]!r}/{expected_pids[end - 1]!r} "
+                            f"at positions {start}..{end - 1})"
                         )
-                    edits = item.get("edits")
-                    if not isinstance(edits, list):
-                        return f"r_editor chunk {chunk_index}: edits is not a list"
-                    for edit_index, edit in enumerate(edits):
-                        if not isinstance(edit, dict):
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index}: "
-                                f"not an object"
-                            )
-                        edit_pid = edit.get("pid")
-                        if not isinstance(edit_pid, str) or not edit_pid:
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index}: "
-                                f"pid is missing or not a string"
-                            )
-                        if expected_pid_set is not None and edit_pid not in expected_pid_set:
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index}: "
-                                f"pid {edit_pid!r} is not in the translation map"
-                            )
-                        original = edit.get("original")
-                        if not isinstance(original, str) or not original:
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index} "
-                                f"pid {edit_pid}: original is missing or not a string"
-                            )
-                        rewritten = edit.get("rewritten")
-                        if not isinstance(rewritten, str) or not rewritten.strip():
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index} "
-                                f"pid {edit_pid}: rewritten is missing or not a string"
-                            )
-                        if not isinstance(edit.get("reason"), str) or not edit.get("reason").strip():
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index} "
-                                f"pid {edit_pid}: reason is missing or not a string"
-                            )
-                        klass = edit.get("class")
-                        if not isinstance(klass, str) or klass not in ALL_CLASSES:
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index} "
-                                f"pid {edit_pid}: unknown edit class {klass!r} "
-                                f"(allowed: {sorted(ALL_CLASSES)})"
-                            )
-                        if current_text is not None and original not in str(
-                            current_text.get(edit_pid, "")
-                        ):
-                            return (
-                                f"r_editor chunk {chunk_index} edit {edit_index} "
-                                f"pid {edit_pid}: original is not a substring of the "
-                                f"current text (tampered cache edit)"
-                            )
+                edits = item.get("edits")
+                if not isinstance(edits, list):
+                    return f"r_editor chunk {chunk_index}: edits is not a list"
+                chunk_pids = None
+                if expected_pids is not None:
+                    start = (position - 1) * chunk_size
+                    end = min(position * chunk_size, len(expected_pids))
+                    chunk_pids = frozenset(expected_pids[start:end])
+                for edit_index, edit in enumerate(edits):
+                    if not isinstance(edit, dict):
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"not an object"
+                        )
+                    if set(edit) != _R_EDIT_KEYS:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"foreign key set {sorted(edit)!r} "
+                            f"(expected {sorted(_R_EDIT_KEYS)})"
+                        )
+                    edit_pid = edit.get("pid")
+                    if not isinstance(edit_pid, str) or not edit_pid:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"pid is missing or not a string"
+                        )
+                    if expected_pid_set is not None and edit_pid not in expected_pid_set:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"pid {edit_pid!r} is not in the translation map"
+                        )
+                    if chunk_pids is not None and edit_pid not in chunk_pids:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"pid {edit_pid!r} is outside the chunk boundary "
+                            f"span {first_pid!r}..{last_pid!r}"
+                        )
+                    original = edit.get("original")
+                    if not isinstance(original, str) or not original:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: original is missing or not a string"
+                        )
+                    rewritten = edit.get("rewritten")
+                    if not isinstance(rewritten, str) or not rewritten.strip():
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: rewritten is missing or not a string"
+                        )
+                    if not isinstance(edit.get("reason"), str) or not edit.get("reason").strip():
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: reason is missing or not a string"
+                        )
+                    klass = edit.get("class")
+                    if not isinstance(klass, str) or klass not in ALL_CLASSES:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: unknown edit class {klass!r} "
+                            f"(allowed: {sorted(ALL_CLASSES)})"
+                        )
+                    if current_text is not None and original not in str(
+                        current_text.get(edit_pid, "")
+                    ):
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: original is not a substring of the "
+                            f"current text (tampered cache edit)"
+                        )
+        elif outcome is not None:
+            # R disabled/failed: a non-null outcome is a schema violation.
+            return (
+                f"r_editor: outcome must be null when status is "
+                f"{report_status!r} (got {type(outcome).__name__})"
+            )
 
     # Canonical integrity binding: the whole partial replay payload must
     # match the hash persisted at save() time. A missing field (old
