@@ -53,6 +53,7 @@ from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.opencode_backend import (
+    OPENCODE_PINNED_SERVER_VERSION,
     OpenCodeServerBackend,
     OpenCodeServerBackendConfig,
     RemoteBudget,
@@ -962,7 +963,8 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             hostname=managed.get("hostname", DEFAULT_HOSTNAME),
             port=int(managed.get("port", 4096)),
             pinned_server_version=managed.get(
-                "pinned_server_version", payload.get("pinned_server_version", "1.4.7")
+                "pinned_server_version",
+                payload.get("pinned_server_version", OPENCODE_PINNED_SERVER_VERSION),
             ),
             server_version_policy=managed.get(
                 "server_version_policy",
@@ -1012,7 +1014,7 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             payload.get("server_version_policy", "compatible_minor")
         ),
         pinned_server_version=str(
-            payload.get("pinned_server_version", "1.4.7")
+            payload.get("pinned_server_version", OPENCODE_PINNED_SERVER_VERSION)
         ),
         username_env=str(username_env or "OPENCODE_SERVER_USERNAME"),
         password_env=str(password_env or "OPENCODE_SERVER_PASSWORD"),

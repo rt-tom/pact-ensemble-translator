@@ -6,47 +6,65 @@ A ``CompletionBackend`` implementation (V4 integration plan, PR 2 / Поток C
 server directly. No TypeScript sidecar / Node SDK: the Python client speaks
 the REST contract of the installed server.
 
-Version pin (mandatory, plan §7.1)
-----------------------------------
+Version policy (version-agnostic, owner 2026-08-14)
+---------------------------------------------------
 
-This adapter is contract-pinned to **opencode 1.4.7**. The request/response
-fields were verified against three sources, not just the web docs:
+The adapter is **not** pinned to a specific opencode version. The
+request/response contract was verified against three sources and re-checked
+on each supported server line (1.4.7 in 2026-08-01, 1.18.18 in 2026-08-14):
 
-* the generated SDK types at tag ``v1.4.7``
+* the generated SDK types at the tag
   (``packages/sdk/js/src/gen/types.gen.ts``);
-* the server source at tag ``v1.4.7``
+* the server source at the tag
   (``packages/opencode/src/session/prompt.ts``, ``message-v2.ts``,
   ``llm.ts``);
 * a live ``opencode serve`` probe (health/provider/agent/tool-ids).
 
-Pinned facts used here:
+The wire contract below is stable across both verified lines (the same
+endpoints, the same body fields, the same response shape); the only
+difference found on 1.18.18 is that the server schema no longer lists a
+top-level ``reasoningEffort`` field (reasoning effort moved to the model
+``variant``), and the Effect Struct decoder silently ignores unknown body
+keys — so sending ``reasoningEffort`` is accepted but has no effect on
+1.18.18 (verified empirically 2026-08-14: request accepted, response fine).
 
-* ``GET /global/health`` -> ``{"healthy": true, "version": "1.4.7"}``;
+Contract facts used here:
+
+* ``GET /global/health`` -> ``{"healthy": true, "version": "..."}``;
 * ``GET /provider`` -> ``{all: [Provider], default: {...}, connected: [...]}``;
 * ``POST /session`` ``{title?}`` -> ``Session{id, ...}``;
 * ``DELETE /session/{id}`` -> ``boolean``;
 * ``POST /session/{id}/message`` ``{model?, agent?, system?, tools?,
   format?, parts}`` -> ``{info: AssistantMessage, parts: Part[]}``;
-* **output-budget quirk (AF, 2026-08-10)**: a message body that carries
-  ``system`` and/or ``tools`` is served with a default ~32k output budget,
-  truncating whole-chapter generation reasoning at 32000 tokens
-  (``finish=length``, empty output). A body with only ``model``+``parts``
-  (+``reasoningEffort``) — the verbatim Gate 0 shape — is not capped
-  (measured 55915 reasoning tokens with ``finish=stop``). The generation
-  caller therefore sets ``CompletionRequest.omit_system_tools``; audit /
-  repair / formatting keep ``system``+``tools`` (out of scope).
+* **output-budget quirk (AF, 2026-08-10, serve 1.4.7)**: a message body
+  that carries ``system`` and/or ``tools`` was served with a default ~32k
+  output budget, truncating whole-chapter generation reasoning at 32000
+  tokens (``finish=length``, empty output). A body with only
+  ``model``+``parts`` (+``reasoningEffort``) — the verbatim Gate 0 shape —
+  was not capped (measured 55915 reasoning tokens with ``finish=stop``).
+  The generation caller therefore sets
+  ``CompletionRequest.omit_system_tools``; audit / repair / formatting keep
+  ``system``+``tools`` (out of scope). The flag is harmless on server lines
+  without the cap, so it is kept.
 * ``GET /experimental/tool/ids`` -> ``string[]`` (used to build the
   all-tools-disabled map).
 
 ``json_schema`` structured output is sent via the message-body ``format``
-field. v1.4.7 accepts ``retryCount`` in ``format`` but performs a single
-attempt (``StructuredOutputError`` with ``retries: 0`` on failure), so this
-backend implements the bounded structured-output retry itself (§7.4).
+field. The verified servers accept ``retryCount`` in ``format`` but perform
+a single attempt (``StructuredOutputError`` with ``retries: 0`` on
+failure), so this backend implements the bounded structured-output retry
+itself (§7.4).
+
+The version returned by ``GET /global/health`` is recorded in the backend
+identity and the preflight report (so runs know what they ran on) but is
+never a hard gate: a different server version logs a warning and proceeds.
+The fake-server contract suite (``tests/pact_v4/runtime/``) is the gate —
+after every opencode upgrade, run it against the new version.
 
 Design rules (plan §5, §7, §10, §12)
 -------------------------------------
 
-* Read-only preflight before the first model call: health + version policy,
+* Read-only preflight before the first model call: health + version (log),
   provider connected, model exists, tool IDs for the disabled-tools map.
 * One isolated session per work unit: ``session_scope=per_request``,
   ``context_reuse=false``, every message carries an explicit
@@ -60,8 +78,8 @@ Design rules (plan §5, §7, §10, §12)
   agent/system identity, structured-output mode + schema version, effective
   options, retry policy) and excludes credentials and local paths.
 * Per-request ``temperature``/``max_output_tokens`` are recorded in identity
-  but *not* sent in the v1.4.7 message body (the server has no per-request
-  sampling fields; agent/model defaults apply). Non-empty
+  but *not* sent in the message body (the verified server lines have no
+  per-request sampling fields; agent/model defaults apply). Non-empty
   ``request_options`` are rejected loudly rather than silently ignored —
   except the V4.1 ``reasoning`` option, which maps to the server's
   top-level ``reasoningEffort`` field (1=low, 2=medium, 3=high).
@@ -94,8 +112,8 @@ from pact_v4.runtime.backend_protocol import (
 LOG = logging.getLogger(__name__)
 
 # Adapter / transport version of this opencode-server HTTP adapter. Bump
-# when the pinned request/response contract changes. The "v1.4" suffix
-# mirrors the server minor the adapter is contract-pinned to.
+# when the request/response contract changes. The suffix reflects the wire
+# contract generation, not a server pin (version-agnostic since 2026-08-14).
 OPENCODE_SERVER_TRANSPORT_VERSION = "opencode-server-http/v1.4"
 
 # Endpoint family discriminates request/response interpretation (and thus
@@ -103,8 +121,12 @@ OPENCODE_SERVER_TRANSPORT_VERSION = "opencode-server-http/v1.4"
 # tests/pact_v4/runtime/test_backend_protocol.py.
 ENDPOINT_FAMILY_OPENCODE_HTTP = "opencode_http"
 
-# Server version this adapter was developed and verified against.
-OPENCODE_PINNED_SERVER_VERSION = "1.4.7"
+# Server version this adapter was developed and verified against. Since the
+# version-agnostic decision (owner 2026-08-14) this is an informational
+# default ("latest" = no pin; any running `opencode serve` is accepted and
+# its version is logged into identity/preflight). A config may still set an
+# explicit value for exact/compatible_minor logging.
+OPENCODE_PINNED_SERVER_VERSION = "latest"
 
 # Short neutral system prompt (plan §7.3) sent with every message so the
 # model receives no agentic/coding instructions beyond the Pact prompt.
@@ -246,8 +268,8 @@ class OpenCodeServerBackendConfig:
     """
 
     base_url: str = "http://127.0.0.1:4096"
-    server_version_policy: str = "compatible_minor"  # exact | compatible_minor
-    pinned_server_version: str = OPENCODE_PINNED_SERVER_VERSION
+    server_version_policy: str = "compatible_minor"  # exact | compatible_minor (log-only)
+    pinned_server_version: str = OPENCODE_PINNED_SERVER_VERSION  # "latest" = no pin
     username_env: str = "OPENCODE_SERVER_USERNAME"
     password_env: str = "OPENCODE_SERVER_PASSWORD"
     username: Optional[str] = None
@@ -289,10 +311,11 @@ class OpenCodeServerBackendConfig:
     # Role -> provider/model bindings (part of backend identity).
     model_bindings: Mapping[str, str] = field(default_factory=dict)
 
-    # Effective sampling settings (plan §5.4). v1.4.7 cannot send these in
-    # the message body, but they belong in backend identity so a change in
-    # requested sampling invalidates cache/resume instead of silently reusing
-    # a candidate generated with different settings.
+    # Effective sampling settings (plan §5.4). The verified server lines
+    # cannot send these in the message body, but they belong in backend
+    # identity so a change in requested sampling invalidates cache/resume
+    # instead of silently reusing a candidate generated with different
+    # settings.
     default_temperature: Optional[float] = None
     default_max_output_tokens: Optional[int] = None
 
@@ -415,7 +438,15 @@ def _major_minor(version: str) -> Tuple[int, int]:
 def _version_compatible(
     server_version: str, *, policy: str, pinned: str
 ) -> bool:
-    """Version-policy check against the pinned adapter version."""
+    """Version-policy check against the adapter's reference version.
+
+    Version-agnostic since 2026-08-14: the default pin is ``"latest"``
+    (nothing to compare against -> always compatible). A config that pins
+    an explicit version still gets exact/compatible_minor comparison, used
+    only for logging (a mismatch never fails the preflight).
+    """
+    if pinned == "latest":
+        return True
     if policy == "exact":
         return server_version == pinned
     return _major_minor(server_version) == _major_minor(pinned)
@@ -603,8 +634,10 @@ class OpenCodeServerBackend:
         """Run the read-only preflight checks once and cache the result.
 
         Raises ``OpenCodeError`` (before any model call) when the server is
-        unavailable, the version is unsupported, the provider is not
-        connected, or the model is missing. No silent fallback.
+        unavailable, the provider is not connected, or the model is missing.
+        A server version that differs from the configured pin is logged as a
+        warning and does NOT fail (version-agnostic, owner 2026-08-14). No
+        silent fallback.
         """
         if self._preflight_done:
             return self._preflight_report()
@@ -629,11 +662,16 @@ class OpenCodeServerBackend:
             policy=self._cfg.server_version_policy,
             pinned=self._cfg.pinned_server_version,
         ):
-            raise OpenCodeError(
-                ERROR_SERVER_VERSION_UNSUPPORTED,
-                f"opencode server version {version!r} is not compatible with "
-                f"adapter policy {self._cfg.server_version_policy!r} pinned to "
-                f"{self._cfg.pinned_server_version!r}",
+            # Version-agnostic (owner 2026-08-14): a different server version
+            # is a warning, never a gate. The version is already recorded in
+            # the preflight report / backend identity so runs know what they
+            # ran on; the fake-server contract suite is the actual gate.
+            LOG.warning(
+                "OpenCodeServerBackend: server version %r does not match "
+                "configured policy %r / pinned %r; proceeding version-agnostic",
+                version,
+                self._cfg.server_version_policy,
+                self._cfg.pinned_server_version,
             )
 
         # 2. Provider connection + model existence (authoritative /provider).
@@ -781,12 +819,16 @@ class OpenCodeServerBackend:
             }
         reasoning = request.request_options.get("reasoning")
         if reasoning:
-            # V4.1: opencode serve 1.4.7 honours a top-level
-            # ``reasoningEffort`` on POST /session/{id}/message (empirically
-            # verified 2026-08-08: high -> 23 reasoning tokens, absent -> 0).
-            # The GenerationParams contract restricts reasoning to {0,1,2,3},
-            # so an out-of-range value here is a programming error — fail
-            # loudly instead of silently dropping the budget.
+            # V4.1: top-level ``reasoningEffort`` on POST /session/{id}/message
+            # was honoured by serve 1.4.7 (empirically verified 2026-08-08:
+            # high -> 23 reasoning tokens, absent -> 0); on 1.18.18 the field
+            # is no longer in the request schema and is silently ignored
+            # (Effect Struct strips unknown keys) while the request still
+            # succeeds (verified 2026-08-14). Sending it stays harmless and
+            # keeps 1.4.7-line behaviour, so it is kept. The GenerationParams
+            # contract restricts reasoning to {0,1,2,3}, so an out-of-range
+            # value here is a programming error — fail loudly instead of
+            # silently dropping the budget.
             effort = {1: "low", 2: "medium", 3: "high"}.get(reasoning)
             if effort is None:
                 raise OpenCodeError(
@@ -836,7 +878,7 @@ class OpenCodeServerBackend:
         return info, parts, resp.status_code
 
     def _extract_text(self, parts: Sequence[Mapping[str, Any]]) -> str:
-        """Concatenate non-synthetic assistant ``text`` parts (v1.4.7)."""
+        """Concatenate non-synthetic assistant ``text`` parts (verified lines)."""
         chunks = []
         for part in parts:
             if not isinstance(part, Mapping):
@@ -851,12 +893,12 @@ class OpenCodeServerBackend:
         return "".join(chunks)
 
     def _extract_reasoning(self, parts: Sequence[Mapping[str, Any]]) -> str:
-        """Concatenate the model's thinking from message parts (v1.4.7).
+        """Concatenate the model's thinking from message parts.
 
         Reasoning arrives either as dedicated ``type="reasoning"`` parts
-        (``ReasoningPart``, the canonical v1.4.7 shape) or as synthetic
-        text parts for providers that stream thinking through the text
-        channel. Both must be excluded from ``_extract_text`` (that
+        (``ReasoningPart`` — the canonical shape on the verified lines) or
+        as synthetic text parts for providers that stream thinking through
+        the text channel. Both must be excluded from ``_extract_text`` (that
         method keeps only non-synthetic ``text`` parts) and surfaced
         separately via ``raw_metadata["reasoning"]`` so audit/repair
         ``_reasoning.txt`` artifacts are not empty on the remote path.
@@ -984,16 +1026,16 @@ class OpenCodeServerBackend:
                 "OpenCodeServerBackend: backend is closed; cannot complete a request"
             )
         if request.request_options:
-            # v1.4.7 has no per-request sampling fields except the top-level
-            # ``reasoningEffort`` (V4.1, transported via request_options
-            # key "reasoning"); silently dropping any other option would
-            # change behaviour without being honest (plan §5.1).
+            # The verified server lines have no per-request sampling fields
+            # except the top-level ``reasoningEffort`` (V4.1, transported via
+            # request_options key "reasoning"); silently dropping any other
+            # option would change behaviour without being honest (plan §5.1).
             unsupported = set(request.request_options) - {"reasoning"}
             if unsupported:
                 raise OpenCodeError(
                     ERROR_REQUEST_NOT_SUPPORTED,
                     "OpenCodeServerBackend: request_options are not supported by "
-                    f"opencode-server-http/v1.4 (got {sorted(request.request_options)})",
+                    f"{OPENCODE_SERVER_TRANSPORT_VERSION} (got {sorted(request.request_options)})",
                 )
         if self._cfg.structured_output_mode == "json_schema" and request.response_schema is None:
             # json_schema mode without a schema would silently ignore a
@@ -1114,9 +1156,9 @@ class OpenCodeServerBackend:
             text = self._extract_text(parts)
             reasoning = self._extract_reasoning(parts)
             # REASONING-STREAM: POST /session/{id}/message is NOT an SSE
-            # stream — serve 1.4.7 returns the complete message (info +
-            # parts) in one JSON response; opencode streams via the separate
-            # /event SSE endpoint (message.part.updated), which this
+            # stream — the verified server lines return the complete message
+            # (info + parts) in one JSON response; opencode streams via the
+            # separate /event SSE endpoint (message.part.updated), which this
             # transport does not consume. So reasoning is delivered once,
             # AFTER completion, through the optional on_reasoning_chunk sink
             # (documented fallback; the phase's *_reasoning.txt file is

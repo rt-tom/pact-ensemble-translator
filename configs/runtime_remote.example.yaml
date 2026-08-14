@@ -32,8 +32,12 @@ server_mode: external
 # must be free: 4096 is commonly taken by other tools' opencode servers, so
 # the example uses 4097.
 base_url: http://127.0.0.1:4097
+# Version-agnostic since 2026-08-14 (owner decision): no version pin.
+# Any `opencode serve` (PATH shim or managed) is accepted; the running
+# version is logged into the preflight report / backend identity. The
+# fields below are informational (log-only) and keep config compatibility.
 server_version_policy: compatible_minor
-pinned_server_version: 1.4.7
+pinned_server_version: latest
 auth:
   type: basic_env
   username_env: OPENCODE_SERVER_USERNAME

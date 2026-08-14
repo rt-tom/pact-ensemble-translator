@@ -179,12 +179,12 @@ class CompletionRequest:
     request_options: Mapping[str, Any] = field(default_factory=dict)
     # OpenCode transport body shape: when True, the neutral system prompt
     # and the all-disabled tools map are omitted from the message body
-    # (serve 1.4.7 applies a default ~32k output budget to requests that
+    # (serve 1.4.7 applied a default ~32k output budget to requests that
     # carry system/tools, truncating whole-chapter generation reasoning at
-    # 32000 tokens with finish=length). Generation-only by design — audit/
-    # repair/formatting keep the historical system+tools body. No-op for
-    # every other transport (local llama-server never reads it). Defaults
-    # to False so the historical body shape is preserved.
+    # 32000 tokens with finish=length; verified 2026-08-10). Generation-only
+    # by design — audit/repair/formatting keep the historical system+tools
+    # body. No-op for every other transport (local llama-server never reads
+    # it). Defaults to False so the historical body shape is preserved.
     omit_system_tools: bool = False
     # Optional live-reasoning sink: called with each reasoning chunk as it
     # is produced (REASONING-STREAM). Phases pass a writer that appends to

@@ -57,13 +57,13 @@ class _HealthResponse:
         return self._payload
 
 
-def _healthy_payload(version: str = "1.4.7") -> Dict[str, Any]:
+def _healthy_payload(version: str = "1.18.18") -> Dict[str, Any]:
     return {"healthy": True, "version": version}
 
 
 def _make_process(
     *,
-    version: str = "1.4.7",
+    version: str = "1.18.18",
     process: Optional[_FakeProcess] = None,
     popen_calls: Optional[List[Dict[str, Any]]] = None,
     healthy_after_start: bool = True,
@@ -99,7 +99,10 @@ def _make_process(
     return proc, fake_proc, capture
 
 
-def test_start_launches_pinned_pure_server_with_ephemeral_creds(tmp_path):
+def test_start_launches_pure_server_via_path_shim_with_ephemeral_creds(tmp_path, monkeypatch):
+    from pact_v4.runtime import opencode_server_lifecycle as life
+
+    monkeypatch.setattr(life, "_find_opencode_shim", lambda: "C:/opencode/opencode.exe")
     popen_calls: List[Dict[str, Any]] = []
     health_auth_calls: List[Any] = []
     proc, _fake_proc, capture = _make_process(
@@ -111,22 +114,23 @@ def test_start_launches_pinned_pure_server_with_ephemeral_creds(tmp_path):
     assert proc.base_url == "http://127.0.0.1:4096"
     assert len(capture) == 1
     args = capture[0]["args"]
-    # On Windows the npx shim is npx.CMD, which CreateProcess cannot launch
-    # directly, so the launch is routed through cmd.exe /d /s /c; the actual
-    # npx invocation is the same on every platform.
+    # On Windows the opencode shim is opencode.CMD, which CreateProcess
+    # cannot launch directly, so the launch is routed through cmd.exe /d /s
+    # /c; the actual opencode invocation is the same on every platform.
     if sys.platform == "win32":
         assert os.path.basename(args[0]).lower() == "cmd.exe"
         assert args[1:4] == ["/d", "/s", "/c"]
-        npx_args = args[4:]
+        shim_args = args[4:]
     else:
-        npx_args = args
-    # PACT raises its OWN pinned server via npx, with --pure.
-    assert npx_args[0] == "npx"
-    assert "-y" in npx_args
-    assert "opencode-ai@1.4.7" in npx_args
-    assert npx_args[npx_args.index("--hostname") + 1] == "127.0.0.1"
-    assert npx_args[npx_args.index("--port") + 1] == "4096"
-    assert "--pure" in npx_args
+        shim_args = args
+    # PACT raises its OWN server via the PATH opencode shim, with --pure,
+    # no version pin (version-agnostic, owner 2026-08-14).
+    assert shim_args[0] == "opencode"
+    assert shim_args[1] == "serve"
+    assert "opencode-ai@" not in " ".join(shim_args)
+    assert shim_args[shim_args.index("--hostname") + 1] == "127.0.0.1"
+    assert shim_args[shim_args.index("--port") + 1] == "4096"
+    assert "--pure" in shim_args
     # Ephemeral basic-auth creds go into the subprocess env...
     env = capture[0]["env"]
     username, password = proc.credentials
@@ -140,6 +144,29 @@ def test_start_launches_pinned_pure_server_with_ephemeral_creds(tmp_path):
     # auth). The pre-start port probe has no creds yet (None).
     assert health_auth_calls[0] is None
     assert health_auth_calls[-1] == (username, password)
+    proc.close()
+
+
+def test_start_falls_back_to_unpinned_npx_when_no_path_shim(tmp_path, monkeypatch):
+    # No `opencode` on PATH -> spawn via unpinned `npx -y opencode-ai`
+    # (no version pin; version-agnostic).
+    from pact_v4.runtime import opencode_server_lifecycle as life
+
+    monkeypatch.setattr(life, "_find_opencode_shim", lambda: None)
+    popen_calls: List[Dict[str, Any]] = []
+    proc, _fake_proc, capture = _make_process(popen_calls=popen_calls)
+    proc.start()
+    args = capture[0]["args"]
+    if sys.platform == "win32":
+        shim_args = args[4:]
+    else:
+        shim_args = args
+    assert shim_args[0] == "npx"
+    assert "-y" in shim_args
+    assert shim_args[shim_args.index("-y") + 1] == "opencode-ai"
+    assert "opencode-ai@" not in " ".join(shim_args)
+    assert "serve" in shim_args
+    assert "--pure" in shim_args
     proc.close()
 
 
@@ -210,14 +237,20 @@ def test_start_fails_when_process_exits_during_startup():
         raise AssertionError("expected ManagedServerError for early exit")
 
 
-def test_start_fails_when_version_incompatible():
-    proc = _make_process(version="1.18.9")[0]
-    try:
-        proc.start()
-    except ManagedServerError as exc:
-        assert "not compatible" in str(exc)
-    else:
-        raise AssertionError("expected version-incompatible ManagedServerError")
+def test_start_proceeds_when_version_differs_from_explicit_pin():
+    # Version-agnostic (owner 2026-08-14): a healthy server whose version
+    # differs from an explicit pin is NOT a startup failure — the version is
+    # logged and the server is used. (Default pin "latest" never mismatches.)
+    from pact_v4.runtime import opencode_server_lifecycle as life
+
+    proc = _make_process(version="1.18.18")[0]
+    proc._spec = life.ManagedServerSpec(
+        hostname="127.0.0.1", port=4096,
+        pinned_server_version="1.4.7", server_version_policy="exact",
+    )
+    proc.start()
+    assert proc.is_running
+    proc.close()
 
 
 def test_close_stops_only_own_process_and_is_idempotent():
@@ -256,13 +289,14 @@ def test_credentials_unavailable_before_start():
 
 
 # ---------------------------------------------------------------------------
-# Launch-arg construction (regression for the Windows npx.CMD failure)
+# Launch-arg construction (regression for the Windows shim .CMD failure)
 # ---------------------------------------------------------------------------
 
 
-def test_launch_args_route_npx_through_cmd_exe_on_windows(monkeypatch):
+def test_launch_args_route_opencode_through_cmd_exe_on_windows(monkeypatch):
     from pact_v4.runtime import opencode_server_lifecycle as life
 
+    monkeypatch.setattr(life, "_find_opencode_shim", lambda: "C:/opencode/opencode.exe")
     monkeypatch.setattr(life.sys, "platform", "win32")
     monkeypatch.setenv("COMSPEC", "C:\\Windows\\System32\\cmd.exe")
     args = life._build_launch_args(
@@ -270,20 +304,34 @@ def test_launch_args_route_npx_through_cmd_exe_on_windows(monkeypatch):
     )
     assert args[0] == "C:\\Windows\\System32\\cmd.exe"
     assert args[1:4] == ["/d", "/s", "/c"]
-    assert args[4] == "npx"
-    assert "opencode-ai@1.4.7" in args
+    assert args[4] == "opencode"
+    assert "opencode-ai@" not in " ".join(args)
     assert "--hostname" in args and "--pure" in args
 
 
-def test_launch_args_keep_direct_npx_on_non_windows(monkeypatch):
+def test_launch_args_keep_direct_opencode_on_non_windows(monkeypatch):
     from pact_v4.runtime import opencode_server_lifecycle as life
 
+    monkeypatch.setattr(life, "_find_opencode_shim", lambda: "/usr/bin/opencode")
+    monkeypatch.setattr(life.sys, "platform", "linux")
+    args = life._build_launch_args(ManagedServerSpec())
+    assert args[0] == "opencode"
+    assert args[1] == "serve"
+    assert "--pure" in args
+    assert not any("cmd.exe" in arg.lower() for arg in args)
+
+
+def test_launch_args_use_unpinned_npx_fallback_when_no_shim(monkeypatch):
+    from pact_v4.runtime import opencode_server_lifecycle as life
+
+    monkeypatch.setattr(life, "_find_opencode_shim", lambda: None)
     monkeypatch.setattr(life.sys, "platform", "linux")
     args = life._build_launch_args(ManagedServerSpec())
     assert args[0] == "npx"
     assert "-y" in args
+    assert "opencode-ai" in args
+    assert "opencode-ai@" not in " ".join(args)
     assert "--pure" in args
-    assert not any("cmd.exe" in arg.lower() for arg in args)
 
 
 def test_kill_tree_uses_taskkill_tree_on_windows(monkeypatch):

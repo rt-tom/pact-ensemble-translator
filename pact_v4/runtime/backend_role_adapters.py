@@ -279,7 +279,7 @@ class BackendModelCaller:
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,
-            # AF (2026-08-10): serve 1.4.7 applies a default ~32k output
+            # AF (2026-08-10): serve 1.4.7 applied a default ~32k output
             # budget to message bodies that carry system/tools (agentic
             # mode), truncating whole-chapter reasoning at 32000 tokens
             # (finish=length, empty output — 2/3 remote whole-chapter
