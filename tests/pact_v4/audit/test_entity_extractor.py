@@ -199,6 +199,29 @@ def test_chapter_0001_prompt_is_source_only_and_whole_chapter():
     assert "BIBLE" not in prompt and "BOOK CONTEXT" not in prompt
 
 
+def test_prompt_lists_valid_pids_explicitly():
+    # Dead-PID regression (book-run 1-3: 25/25 claims dropped because the
+    # model invented PIDs): the prompt must list every REAL pid of the
+    # chapter so the model copies instead of guesses.
+    source = _source_0001()
+    prompt = render_entity_extraction_prompt(
+        chapter_id=source.chapter_id, source=dict(source.source)
+    )
+    assert "VALID PIDS" in prompt
+    for pid, _text in source.source:
+        assert pid in prompt
+    # The model is told the list is exhaustive and non-guessable.
+    assert "use ONLY these" in prompt
+    assert "not guessable" in prompt.lower() or "NOT guessable" in prompt
+
+
+def test_prompt_empty_source_omits_pids_section():
+    prompt = render_entity_extraction_prompt(chapter_id="0001", source={})
+    # The rule text mentions the section; the actual section header + list
+    # must be absent when there are no PIDs.
+    assert "VALID PIDS (use ONLY these" not in prompt
+
+
 # ---------------------------------------------------------------------------
 # 8-point validation: invalid output is dropped/downgraded, never accepted
 # ---------------------------------------------------------------------------
@@ -247,6 +270,21 @@ def test_point2_dead_pid_drops_claim():
     # The vehicle entity survives with its anchor but no claims.
     assert len(context.entities) == 2
     assert context.entities[0].claims == ()
+
+
+def test_dead_pid_regression_valid_pids_retained():
+    # Acceptance regression (book-run 1-3): the model invented PIDs and
+    # 25/25 claims were dropped. The dead-PID fix lists the chapter's real
+    # PIDs in the prompt; the equivalent code-side regression is that a
+    # payload whose claims reference ONLY valid chapter PIDs is fully
+    # retained (dropped == 0, retained > 0).
+    source = _source_0001()
+    context, report = _validate(_gold_payload_0001(source), source)
+    assert report.is_clean()
+    assert len(context.entities) == 2
+    assert any(c.status == "verified" for e in context.entities for c in e.claims)
+    # The two entities with their anchors/aliases are all retained.
+    assert {e.entity for e in context.entities} == {"Blake's vehicle", "Rich"}
 
 
 def test_point3_span_not_in_source_drops_claim():

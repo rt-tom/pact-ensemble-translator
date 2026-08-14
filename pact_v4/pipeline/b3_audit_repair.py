@@ -93,11 +93,14 @@ from pact_v4.audit.chunked_audit import (
 )
 from pact_v4.audit.entity_extractor import (
     EXTRACTOR_VERSION,
+    STATUS_VERIFIED,
+    AliasRef,
     BackendEntityExtractor,
     BackendEntityExtractorConfig,
     ChapterEntityContext,
     EntityContextCache,
     EntityExtractionResult,
+    EntityRecord,
     extract_entity_context,
 )
 from pact_v4.audit.hard_filters import FilteredIssue, apply_hard_filters
@@ -173,7 +176,29 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_entity_context_block(context: ChapterEntityContext) -> str:
+def _alias_is_source_apposed(record: EntityRecord, alias: AliasRef) -> bool:
+    """Code-proven source-established alias (RV3 HIGH, 2026-08-14).
+
+    A same-entity alias is a semantic coreference hypothesis the code
+    cannot confirm (point 8 of §8.3 downgrades every alias_relation /
+    object_identity claim to candidate). The ONLY alias whose coreference
+    is provable is one the source itself apposes to the canonical type:
+    the alias surface appears INSIDE the anchor span that names the
+    canonical type (same PID), e.g. ``"the woman, Rose"``. Any other
+    alias may reach the audit block but never the generation prompt.
+    """
+    if alias.pid != record.anchor.pid:
+        return False
+    anchor_norm = " ".join(record.anchor.span.lower().split())
+    surface_norm = " ".join(alias.surface.lower().split())
+    return bool(surface_norm) and surface_norm in anchor_norm
+
+
+def render_entity_context_block(
+    context: ChapterEntityContext,
+    *,
+    verified_only: bool = False,
+) -> str:
     """Render a validated ``ChapterEntityContext`` into the audit prompt's
     ``CHAPTER ENTITY FACTS - SOURCE-DERIVED`` block.
 
@@ -181,22 +206,42 @@ def render_entity_context_block(context: ChapterEntityContext) -> str:
     auditor (evidence level 3: source > adjacent > chapter facts), never
     an instruction. Empty context -> empty string (caller omits the
     block).
+
+    ``verified_only=True`` (generation-prompt variant, owner decision
+    2026-08-14): only claims whose status is ``verified`` are rendered —
+    candidate claims are semantic hypotheses and go ONLY to the audit
+    block, never to the translator's prompt. The anchor is code-verified
+    by construction and always shown. Aliases are filtered the same way
+    (RV3 HIGH): a same-entity alias is a semantic hypothesis unless the
+    source apposes it to the canonical type inside the anchor span, so
+    only ``_alias_is_source_apposed`` aliases are rendered here; every
+    other alias stays in the full audit block.
     """
     if not context.entities:
         return ""
     lines: list = []
     for record in sorted(context.entities, key=lambda r: r.entity):
+        claims = (
+            [c for c in record.claims if c.status == STATUS_VERIFIED]
+            if verified_only
+            else list(record.claims)
+        )
+        aliases = record.aliases
+        if verified_only:
+            aliases = tuple(
+                a for a in record.aliases if _alias_is_source_apposed(record, a)
+            )
         lines.append(f"- entity: {record.entity}")
         lines.append(f"  established_type: {record.canonical_type}")
         anchor = record.anchor
         lines.append(
             f"  anchor: \"{anchor.span}\" (pid {anchor.pid}, {anchor.status})"
         )
-        for alias in record.aliases:
+        for alias in aliases:
             lines.append(
                 f"  alias: \"{alias.surface}\" (pid {alias.pid}, {alias.status})"
             )
-        for claim in record.claims:
+        for claim in claims:
             evidence = ", ".join(
                 f"{ev.pid} \"{ev.span}\"" for ev in claim.evidence
             )
@@ -1458,6 +1503,66 @@ class B3AuditRepair:
         finally:
             journal.close()
 
+    def entity_context_prepass(
+        self,
+        *,
+        source: SourceArtifact,
+        out_dir: Path,
+    ) -> EntityExtractionResult:
+        """Run the source-only entity prepass (B1.2), cache-aware.
+
+        P0 owner decision 2026-08-14 (entity_extractor ДО перевода): the
+        runner invokes this BEFORE whole-chapter generation so the verified
+        claims reach the translator's prompt as the CHAPTER ENTITY FACTS
+        block; B3's own ``_run_impl`` step 1 calls the same method again
+        AFTER generation, which then hits the persisted
+        ``entity_context_cache.json`` (identity = source_hash +
+        extractor_version) with 0 extra model calls.
+
+        Fail-closed: a failed extraction raises ``RuntimeError`` (never a
+        silent skip). The cache and the validation report are persisted by
+        this method, so a resume that skips generation still has the
+        validated context for the audit.
+
+        Returns ``None`` when the machinery's own config disables the
+        entity context (``entity_context_enabled=False``) — the runner
+        then renders the generation prompt without the entity block.
+        """
+        cfg = self._config
+        if not cfg.entity_context_enabled:
+            return None
+        entity_cache = _load_entity_cache(out_dir)
+        try:
+            extraction = extract_entity_context(
+                source_artifact=source,
+                extractor=BackendEntityExtractor(
+                    self._entity_backend,
+                    config=BackendEntityExtractorConfig(),
+                ),
+                cache=entity_cache,
+                extractor_version=cfg.extractor_version,
+                out_dir=out_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed, never silent skip
+            LOG.exception(
+                "B3: entity context extraction failed for %s",
+                getattr(source, "chapter_id", "?"),
+            )
+            raise RuntimeError(
+                f"B3 entity context extraction failed: {exc}"
+            ) from exc
+        _save_entity_cache(out_dir, entity_cache)
+        # B3-DIAG transparency: what the model proposed vs what the code
+        # accepted. A fresh extraction's validation report is persisted next
+        # to the cache; a cache hit reuses the previously validated context
+        # (validation report empty), so the original report is kept, never
+        # overwritten with an empty one.
+        if not extraction.from_cache:
+            _save_entity_validation_report(
+                out_dir, extraction.validation.to_payload()
+            )
+        return extraction
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
@@ -1673,37 +1778,13 @@ class B3AuditRepair:
         entity_payload: Optional[Mapping[str, Any]] = None
         entity_from_cache = False
         if cfg.entity_context_enabled:
-            entity_cache = _load_entity_cache(out_dir)
-            try:
-                extraction = extract_entity_context(
-                    source_artifact=source,
-                    extractor=BackendEntityExtractor(
-                        self._entity_backend,
-                        config=BackendEntityExtractorConfig(),
-                    ),
-                    cache=entity_cache,
-                    extractor_version=cfg.extractor_version,
-                    out_dir=out_dir,
-                )
-            except Exception as exc:  # noqa: BLE001 — fail-closed, never silent skip
-                LOG.exception("B3: entity context extraction failed for %s", chapter_id)
-                raise RuntimeError(
-                    f"B3 entity context extraction failed: {exc}"
-                ) from exc
+            extraction = self.entity_context_prepass(
+                source=source, out_dir=out_dir,
+            )
             entity_from_cache = extraction.from_cache
             entity_payload = extraction.context.to_payload()
             entity_hash = canonical_json_hash(entity_payload)
             entity_context = render_entity_context_block(extraction.context)
-            _save_entity_cache(out_dir, entity_cache)
-            # B3-DIAG transparency: what the model proposed vs what the code
-            # accepted. A fresh extraction's validation report is persisted
-            # next to the cache; a cache hit reuses the previously validated
-            # context (validation report empty), so the original report is
-            # kept, never overwritten with an empty one.
-            if not extraction.from_cache:
-                _save_entity_validation_report(
-                    out_dir, extraction.validation.to_payload()
-                )
             journal.emit(
                 "entity_context",
                 enabled=True,

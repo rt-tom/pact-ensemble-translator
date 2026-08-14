@@ -87,6 +87,7 @@ from pact_v4.audit.russian_editor import (
     DEFAULT_RETRY_BASE_DELAY_SECONDS as RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS,
     MAX_EDITS_PER_PID as RUSSIAN_EDITOR_MAX_EDITS_PER_PID,
 )
+from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
     DEFAULT_MAX_WORDS,
@@ -4370,6 +4371,41 @@ def _run_whole_chapter_strict_impl(
             "dropped": list(chapter_dropped),
             "dropped_count": len(chapter_dropped),
         }
+
+        # V4.1 SAFE-MEMORY (owner decision 2026-08-14, P0): the source-only
+        # entity prepass (B1.2) runs BEFORE translation — verified claims
+        # reach the generation prompt as a CHAPTER ENTITY FACTS block
+        # (candidate claims go ONLY to the audit; they are semantic
+        # hypotheses, never prompt commands). The cache is persisted to
+        # entity_context_cache.json so the B3 audit/repair stage later hits
+        # the SAME cache with 0 extra model calls. The gate mirrors the B3
+        # invocation below (run_audit + stop_after + machinery present +
+        # entity context enabled), so a run that would not audit also does
+        # not pay the prepass; without the machinery generation proceeds
+        # without the entity block.
+        entity_gen_block = ""
+        if (
+            cfg.entity_context_enabled
+            and cfg.run_audit
+            and cfg.stop_after != "generation"
+            and b3_audit_repair is not None
+        ):
+            extraction = b3_audit_repair.entity_context_prepass(
+                source=source, out_dir=cfg.out_dir,
+            )
+            if extraction is not None:
+                entity_gen_block = render_entity_context_block(
+                    extraction.context, verified_only=True,
+                )
+        # The generation prompt carries the verified entity facts as part of
+        # the book-context block (deterministic, source-derived).
+        gen_bible_text = bible_text
+        if entity_gen_block:
+            gen_bible_text = (
+                f"{bible_text}\nCHAPTER ENTITY FACTS - SOURCE-DERIVED\n"
+                f"{entity_gen_block}"
+            )
+
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
         # V4.1 M (monitor card): whole-chapter generation telemetry — the
@@ -4438,7 +4474,7 @@ def _run_whole_chapter_strict_impl(
             chunk_plan=chunk_plan,
             pid_map=pid_map,
             glossary=chapter_glossary,
-            bible_text=bible_text,
+            bible_text=gen_bible_text,
             config=config,
             params=params,
             model_caller=model_caller,

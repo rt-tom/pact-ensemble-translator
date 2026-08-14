@@ -149,9 +149,27 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "'motorcycle' established earlier) is a 'candidate' relation, not "
         "'verified'.\n"
         "6. If the chapter has no persistent long-range entities, return "
-        '{"entities": []}.'
+        '{"entities": []}.\n'
+        "7. PIDs are NOT guessable: the only valid PIDs are the ones listed "
+        "in the VALID PIDS section below. Every pid you reference (anchor, "
+        "alias, evidence, evidence_windows) must come from that list — a "
+        "PID that is not in the list does not exist and the claim will be "
+        "discarded."
     ),
 )
+
+
+# Valid-PID prompt section. The model repeatedly invented plausible PIDs
+# (25/25 claims dropped in book-run 1-3 because every referenced PID was
+# dead); the harness lists the chapter's real PIDs explicitly so the model
+# can copy instead of guess.
+def _valid_pids_section(valid_pids) -> str:
+    pids = list(valid_pids or ())
+    if not pids:
+        return ""
+    return "VALID PIDS (use ONLY these; every pid below exists):\n" + "\n".join(
+        f"  {pid}" for pid in pids
+    )
 
 
 @dataclass(frozen=True)
@@ -321,12 +339,18 @@ def render_entity_extraction_prompt(
     Deterministic input: the FULL chapter source PID map in PID order — the
     extractor must see the whole chapter (anchor and alias far apart) to
     establish long-range identity. No translation, no bible, no memory.
+
+    The VALID PIDS section lists every PID of the chapter explicitly
+    (dead-PID fix, book-run 1-3: the model invented PIDs and 25/25 claims
+    were dropped; with the real list the model can copy instead of guess).
     """
     src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
+    pids_block = _valid_pids_section(source)
     return (
         f"{ENTITY_EXTRACTION_V1.instructions}\n\n"
         f"CHAPTER: {chapter_id}\n\n"
-        f"SOURCE (PID -> English text, whole chapter):\n{src_lines}\n"
+        f"SOURCE (PID -> English text, whole chapter):\n{src_lines}\n\n"
+        f"{pids_block}\n"
     )
 
 

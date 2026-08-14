@@ -540,13 +540,155 @@ def test_b3_entity_enabled_runs_prepass_and_feeds_filters(tmp_path: Path) -> Non
     backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
     result = _run_with_b3(cfg, backend, entity_context_enabled=True)
 
-    # Entity prepass ran exactly once (cache hit on resume would be 0).
+    # Entity prepass ran exactly once (cache hit on resume would be 0) —
+    # the SAME cache is reused by B3's step 1 after generation, so the
+    # prepass-before-generation does not double the model calls.
     assert backend.entity_calls() == 1
     assert result.step6["entity_context_enabled"] is True
     assert result.step6["entity_context_hash"] is not None
     cache = _read_json(cfg.out_dir / "audit_cache_b3.json")
     assert cache["entity_context_hash"] is not None
     assert cache["entity_context_enabled"] is True
+    # The generation prompt carried the CHAPTER ENTITY FACTS block (the
+    # whole-chapter raw snapshot request is what the translator saw).
+    assert (cfg.out_dir / "entity_context_cache.json").exists()
+
+
+def test_b3_entity_facts_verified_in_gen_prompt_candidate_only_audit(
+    tmp_path: Path,
+) -> None:
+    # P0 owner decision 2026-08-14: verified entity claims reach the
+    # generation prompt as CHAPTER ENTITY FACTS; candidate claims (semantic
+    # hypotheses) go ONLY to the audit. Exercise the renderer contract
+    # directly with a context carrying both a verified gender claim and a
+    # candidate same_entity relation.
+    from pact_v4.audit.entity_extractor import (
+        ENTITY_CONTEXT_SCHEMA,
+        EXTRACTOR_VERSION,
+        AnchorRef,
+        AliasRef,
+        ChapterEntityContext,
+        EvidenceRef,
+        EntityClaim,
+        EntityRecord,
+    )
+    from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
+
+    context = ChapterEntityContext(
+        schema=ENTITY_CONTEXT_SCHEMA,
+        extractor_version=EXTRACTOR_VERSION,
+        chapter_id="0001",
+        source_hash="abc",
+        entities=(
+            EntityRecord(
+                entity="the nurse",
+                canonical_type="nurse",
+                anchor=AnchorRef(pid="p00001", span="the nurse"),
+                aliases=(AliasRef(surface="Rich", pid="p00002", span="Rich"),),
+                claims=(
+                    EntityClaim(
+                        kind="gender", value="male", status="verified",
+                        evidence=(EvidenceRef(pid="p00001", span="he smiled"),),
+                        evidence_windows=(("p00001", "p00002"),),
+                    ),
+                    EntityClaim(
+                        kind="alias_relation", value="nurse = Rich",
+                        status="candidate",
+                        evidence=(
+                            EvidenceRef(pid="p00001", span="the nurse"),
+                            EvidenceRef(pid="p00002", span="Rich"),
+                        ),
+                        evidence_windows=(("p00001", "p00002"),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    full_block = render_entity_context_block(context)
+    verified_block = render_entity_context_block(context, verified_only=True)
+    # Verified claim present in both; candidate claim ONLY in the audit
+    # (full) block.
+    assert "gender='male'" in full_block and "gender='male'" in verified_block
+    assert "alias_relation" in full_block
+    assert "alias_relation" not in verified_block
+    # RV3 HIGH: the alias of a candidate semantic relation ("Rich" is the
+    # nurse only because the model hypothesized it) must NOT reach the
+    # generation prompt either — the alias is the hypothesis expressed.
+    assert 'alias: "Rich"' in full_block
+    assert 'alias: "Rich"' not in verified_block
+
+
+def test_b3_verified_only_alias_source_apposed_only(tmp_path: Path) -> None:
+    """RV3 HIGH regression (P0 2026-08-14): in verified_only mode ONLY
+    code-proven source-apposed aliases reach the generation prompt; a
+    candidate-derived alias (canonical motorcycle, alias bike, candidate
+    object_identity bike=motorcycle) stays in the full audit block.
+
+    The anchor is the fragment that names the canonical type; an alias
+    whose surface appears INSIDE that same span (same PID, e.g. ``"the
+    woman, Rose"``) is apposed by the source itself — code-proven
+    coreference. Any other alias is a semantic hypothesis (point 8 of
+    §8.3), so rendering it as ``verified`` in the translator's prompt
+    would be a hypothesis leak.
+    """
+    from pact_v4.audit.entity_extractor import (
+        ENTITY_CONTEXT_SCHEMA,
+        EXTRACTOR_VERSION,
+        AnchorRef,
+        AliasRef,
+        ChapterEntityContext,
+        EvidenceRef,
+        EntityClaim,
+        EntityRecord,
+    )
+    from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
+
+    context = ChapterEntityContext(
+        schema=ENTITY_CONTEXT_SCHEMA,
+        extractor_version=EXTRACTOR_VERSION,
+        chapter_id="0001",
+        source_hash="abc",
+        entities=(
+            # Blake's vehicle: alias "bike" at a LATER PID is only a
+            # hypothesized same-object relation (candidate claim) — must
+            # never appear in the verified-only generation block.
+            EntityRecord(
+                entity="Blake's vehicle",
+                canonical_type="motorcycle",
+                anchor=AnchorRef(pid="p00001", span="the motorcycle"),
+                aliases=(AliasRef(surface="bike", pid="p00003", span="the bike"),),
+                claims=(
+                    EntityClaim(
+                        kind="object_identity", value="bike = motorcycle",
+                        status="candidate",
+                        evidence=(EvidenceRef(pid="p00003", span="the bike"),),
+                        evidence_windows=(("p00003", "p00003"),),
+                    ),
+                ),
+            ),
+            # "the woman, Rose": the source apposes "Rose" to the
+            # canonical type inside the anchor span (same PID) — the
+            # coreference is code-proven, so the alias survives in the
+            # verified-only block.
+            EntityRecord(
+                entity="Rose",
+                canonical_type="woman",
+                anchor=AnchorRef(pid="p00002", span="the woman, Rose"),
+                aliases=(AliasRef(surface="Rose", pid="p00002", span="Rose"),),
+                claims=(),
+            ),
+        ),
+    )
+    full_block = render_entity_context_block(context)
+    verified_block = render_entity_context_block(context, verified_only=True)
+    # Candidate-derived alias: audit block keeps it, generation block not.
+    assert 'alias: "bike"' in full_block
+    assert 'alias: "bike"' not in verified_block
+    assert "object_identity" in full_block
+    assert "object_identity" not in verified_block
+    # Source-apposed alias: present in BOTH blocks.
+    assert 'alias: "Rose"' in full_block
+    assert 'alias: "Rose"' in verified_block
 
 
 def test_b3_entity_disabled_skips_prepass(tmp_path: Path) -> None:
@@ -669,18 +811,21 @@ def test_b3_entity_validation_report_records_drop_and_downgrade(
     assert cache["schema"] == "pact-v4-entity-context-cache/v1"
 
 
-def test_b3_entity_extractor_failure_writes_no_validation_report(
+def test_b3_entity_extractor_failure_fails_closed_before_generation(
     tmp_path: Path,
 ) -> None:
     cfg = _whole_chapter_cfg(tmp_path)
     backend = _B3MockBackend(
         audit_issues=[], reaudit_issues=[], fail_entity=True,
     )
-    result = _run_with_b3(cfg, backend)
-
-    # The extractor never reached validation -> B3 failed; neither the
-    # entity cache nor the validation report exists.
-    assert result.step6["status"] == "failed"
+    # P0 owner decision 2026-08-14 (entity_extractor ДО перевода): the
+    # prepass runs BEFORE whole-chapter generation, so an extraction
+    # failure is a pre-generation failure — the verified entity facts are
+    # part of the generation input contract, and a run that cannot provide
+    # them fails closed instead of silently generating without them.
+    # Neither the entity cache nor the validation report exists.
+    with pytest.raises(RuntimeError, match="entity context extraction failed"):
+        _run_with_b3(cfg, backend)
     assert not (cfg.out_dir / "entity_context_cache.json").exists()
     assert not (cfg.out_dir / "entity_context_validation_report.json").exists()
 
