@@ -188,11 +188,20 @@ def render_chapter_body(
                 f"h{len(headings) + 1}"
             element_id = anchor
             heading_text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+            substituted = _substitute_arc_name(heading_text, arc_names)
             headings.append({
                 "level": level,
-                "text": _substitute_arc_name(heading_text, arc_names),
+                "text": substituted,
                 "anchor": anchor,
             })
+            # RV finding 3 (MEDIUM): the RENDERED heading body must carry
+            # the SAME deterministic arc substitution as the TOC metadata —
+            # never a divergent raw model text. The substitution is applied
+            # markup-preservingly to the raw heading text (inline <em>/<a>
+            # survive) and render_block_html below sanitizes it as usual, so
+            # body and TOC agree on one substitution and the inline-markup
+            # contract is unchanged.
+            text = _substitute_arc_name_html(text, arc_names)
         body_parts.append(render_block_html(block, text, element_id=element_id))
     report = {
         "blocks_total": len(blocks),
@@ -226,6 +235,44 @@ def _substitute_arc_name(
         if lowered == key.casefold() or lowered.startswith(key.casefold() + " "):
             return f"{russian}{heading_text[len(key):]}"
     return heading_text
+
+
+def _substitute_arc_name_html(
+    raw_text: str,
+    arc_names: Optional[Mapping[str, str]],
+) -> str:
+    """Apply the arc substitution to RAW heading text (markup-preserving).
+
+    Same deterministic match as ``_substitute_arc_name`` (leading arc key,
+    case-insensitive), but applied to the raw translation string so inline
+    markup survives: ``<em>Bonds</em> 1.3`` -> ``<em>Узы</em> 1.3``. The
+    result still flows through ``render_block_html``'s sanitizer, so the
+    sanitization/inline-markup contract is unchanged. No mapping / no match
+    => the text is returned unchanged.
+    """
+    if not arc_names or not raw_text:
+        return raw_text
+    lowered = BeautifulSoup(raw_text, "html.parser").get_text(" ", strip=True).casefold()
+    for key, russian in arc_names.items():
+        if not key:
+            continue
+        if lowered == key.casefold() or lowered.startswith(key.casefold() + " "):
+            # Replace the leading arc key token in the RAW text (allowing
+            # leading whitespace / inline tags before it), preserving the
+            # rest of the markup: "<em>Bonds</em> 1.3" -> "<em>Узы</em> 1.3".
+            pattern = re.compile(
+                r"^(\s*(?:<[^>]*>\s*)*)" + re.escape(key) + r"(?=\s|$|<)",
+                re.IGNORECASE,
+            )
+            match = pattern.match(raw_text)
+            if match:
+                return f"{match.group(1)}{russian}{raw_text[match.end():]}"
+            # The key is not a literal leading token in the raw text (e.g.
+            # it is entity-encoded or nested oddly) — degrade to the plain
+            # substitution so body and TOC still agree deterministically.
+            plain = BeautifulSoup(raw_text, "html.parser").get_text(" ", strip=True)
+            return f"{russian}{plain[len(key):]}"
+    return raw_text
 
 
 def _load_arc_names(path: Optional[Path]) -> Optional[Dict[str, str]]:

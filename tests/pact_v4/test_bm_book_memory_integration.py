@@ -92,6 +92,7 @@ def _make_chapter_artifacts(
     translations: dict,
     chunk_plan: dict = _PLAN,
     entity_cache_payload: dict | None = None,
+    record_source_hash: str = "test-hash",
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     chunk_ids = [c["chunk_id"] for c in chunk_plan["chunks"]]
@@ -108,10 +109,16 @@ def _make_chapter_artifacts(
                    ensure_ascii=False),
         encoding="utf-8",
     )
+    record = {"chapter_id": chapter_id,
+              "step8": {"status": terminal_status}}
+    # SAFE-MEMORY (RV finding 2): the strict runner records the exact
+    # source hash (identities.source_hash) of the chapter it consumed; the
+    # book-run promotion verifies a cache entry's source_hash against it
+    # (fail-closed provenance). Mirror that in the fixture.
+    if entity_cache_payload is not None:
+        record["identities"] = {"source_hash": record_source_hash}
     out_dir.joinpath("strict_chapter_trial_record.json").write_text(
-        json.dumps({"chapter_id": chapter_id,
-                    "step8": {"status": terminal_status}},
-                   ensure_ascii=False),
+        json.dumps(record, ensure_ascii=False),
         encoding="utf-8",
     )
     out_dir.joinpath("translations.json").write_text(
@@ -139,6 +146,7 @@ def _entity_cache_entry(
     anchor_pid: str = "p00002",
     anchor_span: str = "She was running late that day.",
     claims: list | None = None,
+    source_hash: str = "test-hash",
 ) -> dict:
     """Build a valid single-entry ``entity_context_cache.json`` payload.
 
@@ -146,6 +154,10 @@ def _entity_cache_entry(
     carries the chapter id + source hash, and the runner keys entries by
     source_hash + extractor_version. ``source_text`` is the chapter source
     PID map (the anchor span must be verbatim in ``anchor_pid``).
+    ``source_hash`` defaults to ``"test-hash"``; a caller that needs to
+    exercise provenance mismatch passes a distinct value (it is used in
+    BOTH the context stamp and the cache key, keeping the payload
+    internally consistent).
     """
     from pact_v4.audit.entity_extractor import (
         ENTITY_CONTEXT_SCHEMA,
@@ -163,7 +175,7 @@ def _entity_cache_entry(
         "schema": ENTITY_CONTEXT_SCHEMA,
         "extractor_version": EXTRACTOR_VERSION,
         "chapter_id": chapter_id,
-        "source_hash": "test-hash",
+        "source_hash": source_hash,
         "entities": [
             {
                 "entity": entity,
@@ -179,7 +191,7 @@ def _entity_cache_entry(
         "entries": [
             {
                 "key": entity_context_cache_key(
-                    source_hash="test-hash",
+                    source_hash=source_hash,
                     extractor_version=EXTRACTOR_VERSION,
                 ),
                 "context": context,
@@ -206,14 +218,19 @@ class TestBookMemoryAccumulation:
             if len(spec) == 4:
                 html, terminal, quarantined, translations = spec
                 entity_cache_payload = None
-            else:
+                record_source_hash = "test-hash"
+            elif len(spec) == 5:
                 html, terminal, quarantined, translations, entity_cache_payload = spec
+                record_source_hash = "test-hash"
+            else:
+                html, terminal, quarantined, translations, entity_cache_payload, record_source_hash = spec
             _write_chapter_html(src_dir, chapter_id, html)
             _make_chapter_artifacts(
                 out_base / f"chapter_{chapter_id}", chapter_id,
                 terminal_status=terminal, quarantined=quarantined,
                 translations=translations,
                 entity_cache_payload=entity_cache_payload,
+                record_source_hash=record_source_hash,
             )
 
         result = v4_book_run.run_book(
@@ -327,6 +344,98 @@ class TestBookMemoryAccumulation:
         promo = ch2_rec["book_memory_promotions"][0]
         assert promo["source"] == "Rose"
         assert promo["gender"] == "female"
+
+    def test_foreign_entity_cache_entry_never_promoted(
+        self, tmp_path, monkeypatch,
+    ):
+        """RV finding 2 (HIGH): a VALID cache entry of ANOTHER chapter (or a
+        stale cache left by an out_dir reuse) is never promoted into the
+        current chapter's book_memory. The promotion is fail-closed on
+        provenance: the entry must belong to the CURRENT chapter_id AND its
+        source_hash must equal the source hash the strict run recorded
+        (identities.source_hash). A foreign entry would otherwise be stamped
+        with the current chapter_id, corrupting causal memory and chapter
+        accumulation."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        # Two VALID cache entries in ONE payload: the current chapter (0001,
+        # matching record source hash) and a foreign chapter (0099, different
+        # chapter_id AND different source_hash). Both pass
+        # EntityContextCache.from_payload — the cache itself is not corrupt.
+        current = _entity_cache_entry(
+            "0001", source_text,
+            source_hash="current-source-hash",
+        )
+        foreign = _entity_cache_entry(
+            "0099", source_text,
+            entity="Zed", canonical_type="man",
+            anchor_pid="p00001", anchor_span="Blake met Rose",
+            source_hash="foreign-source-hash",
+            claims=[{
+                "kind": "gender", "value": "male", "status": "verified",
+                "evidence": [{"pid": "p00001", "span": "Blake met Rose"}],
+                "evidence_windows": [["p00001", "p00001"]],
+            }],
+        )
+        payload = {
+            "schema": "pact-v4-entity-context-cache/v1",
+            "entries": current["entries"] + foreign["entries"],
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, payload,
+                     "current-source-hash"),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        # The current chapter's verified entity promotes...
+        assert "Rose" in bm["characters"]
+        # ...but the foreign/stale entry is NEVER promoted (fail-closed).
+        assert "Zed" not in bm.get("characters", {})
+        assert "Zed" not in bm.get("entities", {})
+        assert "Zed" not in [f.get("fact", "") for f in bm.get("facts", [])]
+        assert result["chapters"][0]["book_memory_promotions"][0]["source"] == "Rose"
+
+    def test_stale_source_hash_never_promoted(self, tmp_path, monkeypatch):
+        """RV finding 2, stale-cache branch: a cache entry whose chapter_id
+        matches the current chapter but whose source_hash differs from the
+        source the strict run consumed is NOT promoted (out_dir reuse with a
+        changed source). Fail-closed on provenance — never promote a context
+        extracted from a different source under the current chapter."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        stale = _entity_cache_entry(
+            "0001", source_text,
+            source_hash="stale-source-hash",
+        )
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, stale,
+                     "current-source-hash"),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "Rose" not in bm.get("characters", {})
+        assert "Rose" not in bm.get("entities", {})
+        assert result["chapters"][0]["book_memory_candidates"]["committed"] == 0
 
     def test_gender_fail_closed_without_explicit_source_confirmation(
         self, tmp_path, monkeypatch,

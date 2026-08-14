@@ -1055,14 +1055,27 @@ def run_book(
                     # The chapter's context entry (keyed source_hash +
                     # extractor_version); the run may carry several chapters'
                     # entries when resuming — pick the one for THIS chapter
-                    # (chapter_id is stamped on every context). Iterate the
-                    # PUBLIC payload shape (never the private store).
-                    contexts = [
-                        ChapterEntityContext.from_payload(entry["context"])
-                        for entry in cache.to_payload().get("entries", [])
-                        if isinstance(entry, dict) and "context" in entry
-                    ]
-                    for context in contexts:
+                    # (RV finding 2, fail-closed provenance): the entry must
+                    # belong to the CURRENT chapter_id AND its source_hash
+                    # must equal the source hash the strict run recorded
+                    # (identities.source_hash — the exact SourceArtifact hash
+                    # the extractor stamped the context with). A valid cache
+                    # entry of ANOTHER chapter — or a stale cache left by an
+                    # out_dir reuse — is NEVER promoted under the current
+                    # chapter_id: a foreign chapter would corrupt causal
+                    # memory/chapter accumulation. No record / no identity /
+                    # any mismatch => no promotion (fail-closed).
+                    run_source_hash = str(
+                        (run_record.get("identities") or {}).get("source_hash") or ""
+                    )
+                    for entry in cache.to_payload().get("entries", []):
+                        if not isinstance(entry, dict) or "context" not in entry:
+                            continue
+                        context = ChapterEntityContext.from_payload(entry["context"])
+                        if context.chapter_id != chapter_id:
+                            continue
+                        if not run_source_hash or context.source_hash != run_source_hash:
+                            continue
                         obs = book_memory_observations_from_entity_context(
                             context, chapter_id=chapter_id,
                         )

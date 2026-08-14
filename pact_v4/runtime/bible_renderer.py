@@ -11,7 +11,7 @@ and passes the parsed structure in.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional
 
 __all__ = ["render_bible_section", "extract_narrator_gender"]
 
@@ -168,6 +168,16 @@ def render_bible_section(
 def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
     """Render a per-chapter index entry (narrator always; no caps).
 
+    Causal-memory invariant (P0 owner decision 2026-08-14, RV finding 1):
+    the character lines are rendered ONLY from data present in the
+    chapter-scoped entry — never enriched with gender/role attributes read
+    from the full accumulated ``book_memory``. The chapter index carries
+    the names that were visible in THIS chapter; attributes that were
+    learned in a LATER chapter (e.g. role ``future-only``) must not leak
+    into an early chapter's prompt. A chapter-scoped entry item may carry
+    an explicit attrs snapshot (``{name, gender, role}``) — those attrs
+    are rendered from the entry itself, still never from book_memory.
+
     The explicit ``seed: true`` facts from book_memory are ALWAYS included
     in addition to the entry's own facts (deduplicated by text): they are
     global immutable world knowledge (owner decision 2026-08-14) that must
@@ -199,15 +209,15 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
     if not narrator and not characters and not facts and not address:
         return ""
 
-    char_lookup = _character_lookup(book_memory)
-
     parts: List[str] = ["BIBLE:"]
     if narrator:
         parts.append(f"  - Narrator: {narrator}")
     if characters:
         parts.append("  - Characters:")
-        for name in characters:
-            parts.append(_render_character_line(str(name), char_lookup))
+        for item in characters:
+            line = _render_character_line(item)
+            if line:
+                parts.append(line)
     if facts:
         parts.append("  - Facts:")
         for fact in facts:
@@ -219,38 +229,32 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
     return "\n".join(parts) + "\n"
 
 
-def _character_lookup(book_memory: Mapping) -> Dict[str, Mapping]:
-    """name -> attrs for characters/entities (both dict and list shapes)."""
-    lookup: Dict[str, Mapping] = {}
-    for section in ("characters", "entities"):
-        data = book_memory.get(section)
-        if isinstance(data, Mapping):
-            for name, attrs in data.items():
-                if isinstance(attrs, Mapping):
-                    lookup.setdefault(str(name), attrs)
-        elif isinstance(data, list):
-            for entry in data:
-                if not isinstance(entry, Mapping):
-                    continue
-                name = (
-                    _norm_str(entry.get("name", ""))
-                    or _norm_str(entry.get("source", ""))
-                    or _norm_str(entry.get("english", ""))
-                )
-                if name:
-                    lookup.setdefault(name, entry)
-    return lookup
+def _render_character_line(item: Any) -> str:
+    """Render one character line from a chapter-scoped index entry item.
 
-
-def _render_character_line(name: str, lookup: Mapping[str, Mapping]) -> str:
-    attrs = lookup.get(name)
-    if isinstance(attrs, Mapping):
-        gender = _norm_str(attrs.get("gender", ""))
-        role = _norm_str(attrs.get("role", "")) or _norm_str(attrs.get("description", ""))
+    Causal-memory invariant (RV finding 1, 2026-08-14): the line is built
+    ONLY from the entry item itself — a plain name string, or an explicit
+    attrs snapshot ``{name, gender, role}`` carried by the entry. The full
+    ``book_memory`` is NEVER consulted here: an attribute learned in a
+    future chapter must not leak into an earlier chapter's prompt.
+    """
+    if isinstance(item, Mapping):
+        name = (
+            _norm_str(item.get("name", ""))
+            or _norm_str(item.get("source", ""))
+            or _norm_str(item.get("english", ""))
+        )
+        if not name:
+            return ""
+        gender = _norm_str(item.get("gender", ""))
+        role = _norm_str(item.get("role", "")) or _norm_str(item.get("description", ""))
         parts = [name]
         if gender:
             parts.append(gender)
         if role:
             parts.append(role)
         return f"  * {', '.join(parts)}"
+    name = _norm_str(item)
+    if not name:
+        return ""
     return f"  * {name}"

@@ -116,6 +116,29 @@ class TestRenderBibleSection:
         assert "tattoo" not in fallback
         assert "motorcycle" in fallback
 
+    def test_future_character_attrs_never_visible_earlier(self):
+        # P0 future-leakage regression (RV finding 1): chapter 0001's index
+        # entry lists the NAME "Future" (it appeared in the chapter source),
+        # but the character's gender/role attributes were only LEARNED in a
+        # later chapter (full book_memory carries role "future-only"). The
+        # renderer must NOT enrich the chapter-scoped name from the full
+        # accumulated book_memory — the future attribute would leak into the
+        # early prompt.
+        memory = {
+            "pov": {"gender": "male"},
+            "characters": {
+                "Future": {"gender": "female", "role": "future-only"},
+            },
+        }
+        index = {
+            "0001": {"characters": ["Future"], "facts": [], "address": []},
+        }
+        rendered = render_bible_section("0001", index, memory)
+        assert "Future" in rendered
+        assert "future-only" not in rendered
+        assert "female" not in rendered
+        assert "Characters:" in rendered
+
     def test_deterministic(self):
         memory = {
             "pov": {"gender": "male"},

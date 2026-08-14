@@ -212,6 +212,40 @@ def test_arc_names_none_and_unknown_key_unchanged():
     assert report["headings"][0]["text"] == "Узы 1.1"
 
 
+def test_arc_names_rendered_heading_body_matches_toc():
+    """RV finding 3 (MEDIUM): the arc substitution must reach the RENDERED
+    <h1> body, not just the TOC metadata. The model produced 'Bonds 1.3'
+    (kept the English arc name); the renderer substitutes it to 'Узы 1.3'
+    deterministically in BOTH the TOC and the heading body — one
+    substitution, no divergence."""
+    arc_names = {"Bonds": "Узы", "Execution": "Казнь"}
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>Text.</p>",
+        {"p00001": "Bonds 1.3", "p00002": "Текст."},
+        chapter_id="0001", arc_names=arc_names,
+    )
+    assert report["headings"] == [
+        {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
+    ]
+    # The RENDERED heading body carries the substituted arc name too.
+    assert "Узы 1.3" in body
+    assert "Bonds 1.3" not in body
+    assert "<h1" in body
+
+
+def test_arc_names_rendered_heading_body_preserves_inline_markup():
+    """RV finding 3: the substitution applied to the raw heading text must
+    preserve inline markup (the sanitization/inline-markup contract): an
+    <em> around the arc name survives the substitution."""
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>X.</p>",
+        {"p00001": "<em>Bonds</em> 1.3", "p00002": "Икс."},
+        chapter_id="0001", arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"][0]["text"] == "Узы 1.3"
+    assert "<em>Узы</em> 1.3" in body
+
+
 # ---------------------------------------------------------------------------
 # Disk assembly (render_book) + missing-pid reporting
 # ---------------------------------------------------------------------------

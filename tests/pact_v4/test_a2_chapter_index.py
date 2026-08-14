@@ -189,7 +189,17 @@ def test_render_bible_section_chapter_id_renders_entry():
     rendered = render_bible_section("0001", _chapter_index(), _book_memory())
     assert "BIBLE:" in rendered
     assert "Narrator: male" in rendered
-    assert "Blake Thorburn, male, Protagonist" in rendered
+    # Causal-memory contract (RV finding 1, 2026-08-14): the chapter index
+    # entry carries only the NAMES visible in this chapter. The renderer
+    # NEVER enriches them with gender/role from the full accumulated
+    # book_memory — an attribute learned in a LATER chapter must not leak
+    # into an early prompt. The name renders as-is (or with attrs the
+    # chapter-scoped entry itself snapshots, never from book_memory).
+    assert "Blake Thorburn" in rendered
+    # No gender/role enrichment in the character lines (causal contract).
+    char_lines = rendered.split("Characters:")[1].split("Facts:")[0]
+    assert "Blake Thorburn, male" not in char_lines
+    assert "Protagonist" not in char_lines
     assert "Duncan Behaim" in rendered
     # No caps / no "(showing first N of M)" — the index is already filtered.
     assert "showing first" not in rendered
