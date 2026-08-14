@@ -345,6 +345,70 @@ def _req(model_ref: str) -> CompletionRequest:
     )
 
 
+def _text_message(text: str) -> dict:
+    return {
+        "info": {
+            "role": "assistant",
+            "providerID": "opencode-go",
+            "modelID": "deepseek-v4-flash",
+            "finish": "end_turn",
+        },
+        "parts": [{"id": "p1", "type": "text", "text": text}],
+    }
+
+
+def test_composite_coordinator_descriptor_reflects_observed_server_version():
+    # UPGRADE-SERVE-1.18 RV2 follow-up (t_0b45f3be): the authoritative
+    # composite coordinator descriptor must propagate the observed OpenCode
+    # health version from the remote sub-backend after a real preflight —
+    # not remain a config-time None — while identity stays stable (the
+    # observed version is provenance only and excluded from identity_hash).
+    from tests.pact_v4.runtime.opencode_fake_server import FakeOpenCodeServer
+
+    fake = FakeOpenCodeServer(version="1.18.18")
+    fake.script_message(_text_message("ok"))
+    remote_cfg = _remote_cfg()
+    remote_backend = OpenCodeServerBackend(config=remote_cfg.server, session=fake)
+    remote_coord = RemoteRuntimeCoordinator(remote_backend)
+
+    local_cfg = _local_cfg()
+    router = _make_router()
+    local = LocalLifecycleCoordinator(router, descriptor=local_cfg.build_descriptor())
+    local_routing = LocalRoutingBackend(router, local_cfg)
+
+    composite_cfg = CompositeBackendConfig(
+        backends={"local": local_cfg, "opencode": remote_cfg},
+        role_backend_map={
+            "generator": "opencode",
+            "fidelity_reviewer": "opencode",
+            "russian_selector": "local",
+        },
+    )
+    descriptor = composite_cfg.build_descriptor()
+    composite_backend = CompositeCompletionBackend(
+        {"local": local_routing, "opencode": remote_backend}, descriptor,
+    )
+    runtime = CompositeRuntimeCoordinator(
+        local, remote_coord, descriptor, backend=composite_backend,
+    )
+
+    # Before preflight: no observed version (config-time descriptor).
+    assert runtime.backend_descriptor.public_record()["observed_server_version"] is None
+
+    # Real composite runtime path: a request routed to the OpenCode
+    # sub-backend runs the real preflight (fake server health 1.18.18).
+    resp = composite_backend.complete(_req("opencode-go/deepseek-v4-flash"))
+    assert resp.text == "ok"
+
+    record = runtime.backend_descriptor.public_record()
+    assert record["observed_server_version"] == "1.18.18"
+    # Identity stability: the observed version is provenance only.
+    assert record["identity_hash"] == composite_cfg.identity_hash
+    assert record["identity_hash"] == descriptor.identity_hash
+    # The config-time descriptor stays None (identity base untouched).
+    assert composite_cfg.build_descriptor().observed_server_version is None
+
+
 # ---------------------------------------------------------------------------
 # BackendModelCaller generator-alias resolution (plan §8 config shape)
 # ---------------------------------------------------------------------------

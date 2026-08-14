@@ -1,9 +1,10 @@
 """Managed ``opencode serve`` process lifecycle (V4 C2 / PR 3).
 
-Per the owner's decision (``DECISIONS.md`` 2026-08-01) PACT raises its
-**own** ``opencode serve`` via ``npx -y opencode-ai@<pin> serve`` on a
-separate port, independent of any pin embedded in other tools. This module
-owns exactly that subprocess:
+Per the owner's decision (``DECISIONS.md`` 2026-08-01, version-agnostic
+2026-08-14) PACT raises its **own** ``opencode serve`` via the ``opencode``
+PATH shim (fallback: unpinned ``npx -y opencode-ai serve``) on a separate
+port, independent of any pin embedded in other tools. This module owns
+exactly that subprocess:
 
 * ``start()`` first runs ``assert_port_free_or_owned`` -- if the configured
   port is already served, it **fails fast** rather than attaching to or
@@ -11,8 +12,8 @@ owns exactly that subprocess:
 * launches ``opencode serve --hostname 127.0.0.1 --port <port> --pure`` with
   ephemeral basic-auth credentials generated here and injected into the
   subprocess environment (``OPENCODE_SERVER_USERNAME`` / ``OPENCODE_SERVER_PASSWORD``);
-* health-waits on ``GET /global/health`` (with the adapter's version policy)
-  and returns once the server is ready;
+* health-waits on ``GET /global/health`` (the running version is logged,
+  never gated) and returns once the server is ready;
 * ``close()`` stops **only** the process this instance started (never a
   foreign one).
 
@@ -45,8 +46,9 @@ LOG = logging.getLogger(__name__)
 DEFAULT_HOSTNAME = "127.0.0.1"
 DEFAULT_USERNAME = "pact"
 
-# Health endpoint payload keys the adapter contract is pinned to (C1,
-# opencode 1.4.7): ``GET /global/health`` -> ``{"healthy": true, "version": "..."}``.
+# Health endpoint payload keys the adapter contract is verified against
+# (C1, opencode 1.4.7 / 1.18.18): ``GET /global/health`` ->
+# ``{"healthy": true, "version": "..."}``.
 _HEALTH_PATH = "/global/health"
 
 
@@ -62,7 +64,14 @@ def _default_http_get(
 
 @dataclass(frozen=True)
 class ManagedServerSpec:
-    """Identity-relevant settings for a managed ``opencode serve``."""
+    """Identity-relevant settings for a managed ``opencode serve``.
+
+    ``pinned_server_version`` defaults to ``"latest"`` (no pin, owner
+    2026-08-14): the server is spawned from the ``opencode`` PATH shim or
+    via unpinned ``npx -y opencode-ai``; the version actually running is
+    read from health and logged, never gated. An explicit pin is kept only
+    for the informational version log.
+    """
 
     hostname: str = DEFAULT_HOSTNAME
     port: int = 4096
@@ -75,20 +84,36 @@ class ManagedServerSpec:
 def _build_launch_args(spec: ManagedServerSpec) -> list:
     """The subprocess args for one managed ``opencode serve``.
 
-    On Windows the ``npx`` shim is ``npx.CMD`` (a batch file): Windows
-    ``CreateProcess`` only resolves ``.exe`` and cannot execute a ``.cmd``
-    directly, so a bare ``Popen(["npx", ...])`` fails with
+    Version-agnostic since 2026-08-14 (owner decision): PACT spawns the
+    ``opencode`` binary from PATH (whatever version the operator has
+    installed — the version is logged from health, never pinned), falling
+    back to unpinned ``npx -y opencode-ai`` when no ``opencode`` shim is on
+    PATH. The old ``npx -y opencode-ai@<pin>`` form is gone.
+
+    On Windows the ``opencode``/``npx`` shims are ``.cmd`` batch files:
+    Windows ``CreateProcess`` only resolves ``.exe`` and cannot execute a
+    ``.cmd`` directly, so a bare ``Popen(["opencode", ...])`` fails with
     ``[WinError 2]``. The launch is routed through ``cmd.exe /d /s /c``,
     which performs the ``PATHEXT`` lookup and runs the shim. Non-Windows
-    keeps the direct ``npx`` invocation (a native/scripted binary).
+    keeps the direct invocation (a native/scripted binary).
     """
-    args = [
-        "npx", "-y", f"opencode-ai@{spec.pinned_server_version}",
-        "serve",
-        "--hostname", spec.hostname,
-        "--port", str(spec.port),
-        "--pure",
-    ]
+    if _find_opencode_shim() is not None:
+        args = [
+            "opencode",
+            "serve",
+            "--hostname", spec.hostname,
+            "--port", str(spec.port),
+            "--pure",
+        ]
+    else:
+        # Fallback: latest opencode-ai via npx, no version pin.
+        args = [
+            "npx", "-y", "opencode-ai",
+            "serve",
+            "--hostname", spec.hostname,
+            "--port", str(spec.port),
+            "--pure",
+        ]
     if sys.platform == "win32":
         return [
             os.environ.get("COMSPEC", "cmd.exe"),
@@ -96,6 +121,18 @@ def _build_launch_args(spec: ManagedServerSpec) -> list:
             *args,
         ]
     return args
+
+
+def _find_opencode_shim() -> Optional[str]:
+    """Locate the ``opencode`` executable on PATH (or None).
+
+    Used by ``_build_launch_args`` to pick ``opencode serve`` over the
+    ``npx -y opencode-ai`` fallback. Kept as a module-level helper so tests
+    can monkeypatch it instead of relying on the operator's PATH.
+    """
+    from shutil import which
+
+    return which("opencode")
 
 
 class OpenCodeServerProcess:
@@ -240,7 +277,16 @@ class OpenCodeServerProcess:
         self._username = username
         self._password = password
 
-        self._wait_healthy()
+        try:
+            self._wait_healthy()
+        except BaseException:
+            # Guarantee (review UPGRADE-SERVE-1.18 HIGH): ANY startup
+            # failure — including an unexpected exception inside the health
+            # probe/version check — must not leave the managed process
+            # running. ``_force_kill`` is idempotent and also covers the
+            # cases ``_wait_healthy`` already cleans up (timeout, exit).
+            self._force_kill()
+            raise
         return self
 
     def _wait_healthy(self) -> None:
@@ -271,14 +317,23 @@ class OpenCodeServerProcess:
                     )
                     return
                 else:
-                    # Fail fast: a healthy server of the wrong version will not
-                    # become compatible by waiting.
-                    self._force_kill()
-                    raise ManagedServerError(
-                        f"managed opencode serve version {version!r} is not "
-                        f"compatible with policy {spec.server_version_policy!r} "
-                        f"pinned to {spec.pinned_server_version!r}"
+                    # Version-agnostic (owner 2026-08-14): a healthy server
+                    # of a different version is NOT a startup failure — the
+                    # version is logged (info below) and the server is used.
+                    # The contract suite, not the version string, is the gate.
+                    LOG.warning(
+                        "Managed opencode serve version %r does not match "
+                        "configured policy %r / pinned %r; proceeding "
+                        "version-agnostic",
+                        version,
+                        spec.server_version_policy,
+                        spec.pinned_server_version,
                     )
+                    LOG.info(
+                        "Managed opencode serve ready on %s (version %s, pid %s)",
+                        self.base_url, version, self.pid,
+                    )
+                    return
             else:
                 last_error = "not healthy yet"
             time.sleep(spec.health_interval)

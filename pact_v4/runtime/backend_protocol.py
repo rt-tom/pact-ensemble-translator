@@ -179,12 +179,12 @@ class CompletionRequest:
     request_options: Mapping[str, Any] = field(default_factory=dict)
     # OpenCode transport body shape: when True, the neutral system prompt
     # and the all-disabled tools map are omitted from the message body
-    # (serve 1.4.7 applies a default ~32k output budget to requests that
+    # (serve 1.4.7 applied a default ~32k output budget to requests that
     # carry system/tools, truncating whole-chapter generation reasoning at
-    # 32000 tokens with finish=length). Generation-only by design — audit/
-    # repair/formatting keep the historical system+tools body. No-op for
-    # every other transport (local llama-server never reads it). Defaults
-    # to False so the historical body shape is preserved.
+    # 32000 tokens with finish=length; verified 2026-08-10). Generation-only
+    # by design — audit/repair/formatting keep the historical system+tools
+    # body. No-op for every other transport (local llama-server never reads
+    # it). Defaults to False so the historical body shape is preserved.
     omit_system_tools: bool = False
     # Optional live-reasoning sink: called with each reasoning chunk as it
     # is produced (REASONING-STREAM). Phases pass a writer that appends to
@@ -323,6 +323,13 @@ class BackendDescriptor:
     model_bindings: Mapping[str, str]
     effective_options: Mapping[str, Any]
     identity_hash: str = field(init=False)
+    # Version the connected server reported via its health endpoint
+    # (``GET /global/health`` -> ``version``). Persisted as runtime
+    # provenance in ``public_record()`` so runs record what they actually
+    # ran on (review UPGRADE-SERVE-1.18 MEDIUM). It is deliberately NOT
+    # part of ``identity_hash``: identity stays config-deterministic and
+    # version-agnostic (a server upgrade must not invalidate cache/resume).
+    observed_server_version: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or not self.kind:
@@ -370,7 +377,13 @@ class BackendDescriptor:
         }
 
     def public_record(self) -> Mapping[str, Any]:
-        """Sanitized record safe for artifacts/logs (no credentials)."""
+        """Sanitized record safe for artifacts/logs (no credentials).
+
+        Includes ``observed_server_version`` (runtime provenance, filled by
+        the backend after preflight reads the health endpoint) — never part
+        of ``identity_hash``, so it is safe to persist and does not affect
+        cache/resume identity.
+        """
         return {
             "kind": self.kind,
             "transport_version": self.transport_version,
@@ -378,6 +391,7 @@ class BackendDescriptor:
             "public_endpoint": _canonical_endpoint(self.public_endpoint, drop_port=False),
             "model_bindings": dict(sorted(self.model_bindings.items())),
             "effective_options": _sanitize_secrets(dict(self.effective_options)),
+            "observed_server_version": self.observed_server_version,
             "identity_hash": self.identity_hash,
         }
 
