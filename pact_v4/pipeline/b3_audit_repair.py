@@ -629,7 +629,12 @@ def _validate_partial_payload(
       None/missing (an enabled run always persists a report dict, even for
       a failed stage) is a full miss BEFORE either resume plan is built;
       ``r_editor`` None is legitimate only when R is disabled (save()
-      writes null for the disabled stage);
+      writes null for the disabled stage); FIX RV2-B (t_aa3ee032): the
+      report ``enabled`` flag and ``status`` must be mutually consistent —
+      status ``disabled`` is written ONLY by a disabled R config, so
+      ``enabled=True`` with status ``disabled`` (or ``enabled=False`` with
+      a ran/failed status) is an impossible combination (tampered) and a
+      full miss;
     * every cached R edit: object shape, exact string types, PID
       membership (in the translation map AND inside the chunk's own
       boundary span), known class, and (when ``current_text`` is
@@ -789,6 +794,25 @@ def _validate_partial_payload(
             return (
                 "r_editor.enabled must be true when the R stage is enabled "
                 "(stored disabled report in an enabled-R partial cache)"
+            )
+        # FIX RV2-B (t_aa3ee032): the report's own enabled flag and status
+        # must agree — _build_r_editor_report writes status "disabled" ONLY
+        # when the stage was disabled (enabled=False); an enabled stage
+        # always persists failed/partial/incomplete/complete. A report
+        # claiming enabled=True with status "disabled" (or enabled=False
+        # with a ran/failed status) is an impossible combination (tampered)
+        # and fails closed BEFORE either resume plan is built — never a
+        # partial replay while GOOD audit chunks stay reusable.
+        enabled = r_editor.get("enabled")
+        if enabled and report_status == "disabled":
+            return (
+                "r_editor.status 'disabled' contradicts enabled=True — a "
+                "disabled status is only written by a disabled R config"
+            )
+        if not enabled and report_status != "disabled":
+            return (
+                f"r_editor.status {report_status!r} contradicts "
+                "enabled=False — a disabled R config never runs the stage"
             )
         outcome = r_editor.get("outcome")
         if report_status in _R_EDITOR_RAN_STATUSES:

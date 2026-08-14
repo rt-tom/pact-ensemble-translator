@@ -3314,3 +3314,84 @@ def test_b3_partial_cache_rehashed_disabled_report_in_enabled_run_is_full_miss(
     assert second.step6["partial_resume"] is False
     edited = _read_json(cfg.out_dir / "translations_edited.json")
     assert edited["translations"]["p00001"] == "Перевод номер1 номер1 — исправлено"
+
+
+def test_b3_partial_cache_rehashed_enabled_status_disabled_report_is_full_miss(
+    tmp_path: Path,
+) -> None:
+    """FIX RV2-B (t_aa3ee032): an enabled-R partial cache whose report
+    claims enabled=True with status='disabled' (outcome nulled) is an
+    IMPOSSIBLE combination — _build_r_editor_report writes status
+    'disabled' only when the stage itself was disabled (enabled=False) —
+    and is a FULL miss even with the canonical hash recomputed over the
+    tampered payload: both resume plans are dropped, all 8 R + 8 audit
+    chunks re-run fresh (partial_resume=False), and the malformed report
+    is never reused or published (the fresh run rebuilds a valid enabled
+    report). Closes the HIGH finding that the enabled-flag check ran only
+    in the current-enabled -> stored-enabled direction while
+    enabled=True/status=disabled/outcome=null still replayed GOOD audit
+    chunks."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = B3AuditRepairConfig(
+        entity_context_enabled=False,
+        russian_editor_enabled=True,
+        russian_editor_chunk_size=1,  # 8 single-pid R chunks
+        russian_editor_overlap_pairs=0,
+        russian_editor_retry_max_retries=0,
+        russian_editor_retry_base_delay_seconds=0,
+        max_input_tokens=1,  # 8 single-pair audit chunks
+        audit_transport_max_retries=0,
+        audit_transport_base_delay_seconds=0,
+    )
+    _run_with_b3(
+        cfg,
+        _FlakyStageBackend(
+            fail_r_editor_calls=(6, 7, 8),
+            fail_audit_calls=(5, 6),
+            r_editor_edits=[("p00001", "typo", " — исправлено")],
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        ),
+        config_override=override,
+    )
+    cache_path = cfg.out_dir / "audit_cache_b3.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["audit_complete"] is False  # partial cache exists
+    assert payload["r_editor"]["status"] == "partial"  # R ran (1 GOOD, 7 FAILED)
+    # Tamper: rewrite the report as the impossible enabled-R disabled
+    # report — enabled stays True, status flipped to "disabled", outcome
+    # nulled (exactly the state the HIGH finding probed). Recompute the
+    # canonical hash so only the enabled/status consistency check can
+    # reject it — the hash binding alone would pass.
+    payload["r_editor"]["status"] = "disabled"
+    payload["r_editor"]["outcome"] = None
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "chunks": payload["chunks"],
+        "issues": payload["issues"],
+        "r_editor": payload["r_editor"],
+    })
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resume = _B3MockBackend(
+        r_editor_edits=[("p00001", "typo", " — исправлено")],
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    second = _run_with_b3(cfg, resume, config_override=override)
+    # Full miss BEFORE either resume plan: ALL 8 R chunks + ALL 8 audit
+    # chunks re-run fresh — the GOOD audit chunks are NOT reused.
+    assert resume.r_editor_calls() == 8
+    assert resume.audit_calls() == 8
+    assert second.step6["partial_resume"] is False
+    assert second.step8["released_as_audited"] is True
+    # The malformed report is never published: the fresh run rebuilt a
+    # valid enabled R report (trial record + persisted cache) and
+    # re-applied the legit edit.
+    published = second.record["russian_editor"]
+    assert isinstance(published, dict)
+    assert published["enabled"] is True
+    assert published["status"] != "disabled"
+    assert isinstance(published["outcome"], dict)
+    edited = _read_json(cfg.out_dir / "translations_edited.json")
+    assert edited["translations"]["p00001"] == "Перевод номер1 номер1 — исправлено"
+    cache2 = _read_json(cache_path)
+    assert isinstance(cache2["r_editor"], dict)
+    assert isinstance(cache2["r_editor"]["outcome"], dict)
