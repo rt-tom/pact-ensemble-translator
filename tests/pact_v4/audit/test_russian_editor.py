@@ -239,6 +239,76 @@ def test_parse_all_context_edits_chunk_stays_good() -> None:
     assert all("not in the current chunk" in w for w in warnings)
 
 
+def test_parse_out_of_scope_unknown_class_fails_closed() -> None:
+    """RV t_f4111b48: an out-of-scope (context-only) pid edit carrying an
+    UNKNOWN class is a structural error — the scope check must not mask
+    malformed fields. errors, NO warning, whole chunk FAILED."""
+    current = {"p00001": "текст один", "p00002": "текст два"}
+    edits, errors, warnings = parse_editor_edits(
+        _ok([_edit("p00002", "текст два", "текст два испр", "r", "bogus")]),
+        ["p00001"], current,  # chunk owns ONLY p00001; p00002 is context
+    )
+    assert edits == ()
+    assert any("unknown edit class" in e for e in errors)
+    assert warnings == ()
+
+
+def test_parse_out_of_scope_missing_or_non_string_original_fails_closed() -> None:
+    """RV t_f4111b48: a foreign pid edit with a MISSING or NON-STRING
+    original is fail-closed (errors, no warning) — never a WARNING drop."""
+    current = {"p00001": "текст"}
+    # missing original
+    edits, errors, warnings = parse_editor_edits(
+        _ok([{"pid": "p99999", "rewritten": "другой", "reason": "r",
+              "class": "typo"}]),
+        ["p00001"], current,
+    )
+    assert edits == ()
+    assert any("original is missing or not a string" in e for e in errors)
+    assert warnings == ()
+    # non-string original
+    edits, errors, warnings = parse_editor_edits(
+        _ok([{"pid": "p99999", "original": 123, "rewritten": "другой",
+              "reason": "r", "class": "typo"}]),
+        ["p00001"], current,
+    )
+    assert edits == ()
+    assert any("original is missing or not a string" in e for e in errors)
+    assert warnings == ()
+
+
+def test_parse_out_of_scope_non_substring_original_fails_closed() -> None:
+    """RV t_f4111b48: an out-of-scope pid whose text IS known (a context
+    pid of the same chapter) is still held to the verbatim original-
+    substring rule — an invented original is a structural error, not a
+    WARNING drop."""
+    current = {"p00001": "текст один", "p00002": "текст два"}
+    edits, errors, warnings = parse_editor_edits(
+        _ok([_edit("p00002", "совсем другой текст", "фикс", "r", "typo")]),
+        ["p00001"], current,  # p00002 is context, its text IS known
+    )
+    assert edits == ()
+    assert any("not a substring" in e for e in errors)
+    assert warnings == ()
+
+
+def test_parse_mixed_owned_valid_foreign_malformed_fails_closed() -> None:
+    """RV t_f4111b48: ONE malformed out-of-scope edit in a chunk that also
+    carries a VALID owned edit fails the WHOLE chunk — the valid owned edit
+    is NOT retained (edits == (), errors present)."""
+    current = {"p00001": "текст один", "p00002": "текст два"}
+    edits, errors, warnings = parse_editor_edits(
+        _ok([
+            _edit("p00001", "текст один", "текст один испр", "r", "typo"),
+            _edit("p99999", "текст два", "текст два испр", "r", "bogus"),
+        ]),
+        ["p00001"], current,
+    )
+    assert edits == ()
+    assert any("unknown edit class" in e for e in errors)
+    assert warnings == ()
+
+
 def test_parse_rejects_original_mismatch() -> None:
     current = {"p00001": "текст А"}
     edits, errors, _ = parse_editor_edits(
@@ -1041,6 +1111,63 @@ def test_evaluator_owned_and_context_mixed_drops_context() -> None:
     assert done[1][1]["status"] == "GOOD"
     assert done[1][1]["edit_count"] == 1
     assert done[1][1]["warning_count"] == 1
+
+
+def test_evaluator_mixed_owned_valid_foreign_malformed_chunk_failed() -> None:
+    """RV t_f4111b48: a chunk whose edit list mixes a VALID owned edit with
+    a MALFORMED foreign-pid edit (unknown class) is FAILED — the whole
+    chunk contributes NO edits, the valid owned edit is NOT applied."""
+    translation = {
+        "p00001": "текст один", "p00002": "текст два",
+        "p00003": "текст три", "p00004": "текст четыре",
+    }
+    backend = _MockBackend(
+        _ok([
+            _edit("p00001", "текст один", "текст один испр", "r", "typo"),
+            _edit("p00003", "текст три", "текст три испр", "r", "bogus"),
+        ]),
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(chunk_size=2),
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is False
+    assert outcome.failed_chunks == (1,)
+    assert outcome.edits == ()
+    assert outcome.applied == ()
+    assert outcome.candidates == ()
+    assert outcome.warning_count == 0
+    done = [e for e in events if e[0] == "done"]
+    assert done[0][1]["status"] == "FAILED"
+    assert "unknown edit class" in done[0][1]["error"]
+    # chunk 2 (p00003's owner) was never asked to apply the foreign edit —
+    # the malformed record failed chunk 1, nothing was transferred.
+    assert done[1][1]["status"] == "GOOD"
+
+
+def test_evaluator_out_of_scope_missing_original_chunk_failed() -> None:
+    """RV t_f4111b48: an out-of-scope edit with a MISSING required field
+    is fail-closed at the evaluator level — the chunk is FAILED (errors,
+    no warning drop), nothing from it is applied."""
+    translation = {
+        "p00001": "текст один", "p00002": "текст два",
+        "p00003": "текст три", "p00004": "текст четыре",
+    }
+    backend = _MockBackend(
+        _ok({"pid": "p00003", "rewritten": "другой", "reason": "r",
+             "class": "typo"}),
+    )
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(chunk_size=2)
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is False
+    assert outcome.failed_chunks == (1,)
+    assert outcome.edits == ()
+    assert outcome.applied == ()
+    assert outcome.warning_count == 0
 
 
 class _FlakyTransportBackend(_MockBackend):

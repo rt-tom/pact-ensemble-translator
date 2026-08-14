@@ -43,11 +43,15 @@ harmful):
    returns 2+ problems for one pid, run_remote_002 chunk4 p00180), the
    11th+ drops per-edit with a WARNING; TRANSPORT failures and
    INVALID_JSON/empty bodies get a bounded retry (3 attempts, backoff).
-   R-PID-SCOPE (t_db376195, owner 2026-08-13): an edit for a pid that is
-   NOT owned by the current chunk (a CONTEXT_ONLY pid given for continuity,
-   or a foreign pid) is dropped per-edit with a WARNING — the chunk stays
-   GOOD and the owned edits survive (run_remote_007 chunk5 p00195), it is
-   never applied and never forwarded to another chunk.
+   R-PID-SCOPE (t_db376195, owner 2026-08-13): a WELL-FORMED edit for a
+   pid that is NOT owned by the current chunk (a CONTEXT_ONLY pid given for
+   continuity, or a foreign pid) is dropped per-edit with a WARNING — the
+   chunk stays GOOD and the owned edits survive (run_remote_007 chunk5
+   p00195), it is never applied and never forwarded to another chunk.
+   Structural validation runs before the scope check (RV t_f4111b48): a
+   MALFORMED out-of-scope edit (unknown class, missing/non-string fields,
+   non-substring original against a known pid text) still fails the WHOLE
+   chunk — the scope drop never masks malformed payloads.
    Fail-closed is per-chunk: a failed chunk contributes NO edits to
    ``edits``/``applied``/``candidates``, so the caller applies exactly the
    successful chunks' work (RESILIENCE t_406fc48c, run_remote_001: 17 valid
@@ -390,6 +394,11 @@ def parse_editor_edits(
     KNOWN class. Any structural violation (original not a
     substring, unknown class, missing/non-string fields) fails the WHOLE
     chunk — a bad chunk is never silently read as ``edits=[]``.
+    Structural validation runs FIRST for every edit (RV t_f4111b48): the
+    pid-scope drop below only applies to a WELL-FORMED out-of-scope edit.
+    A malformed context/foreign edit (unknown class, missing/non-string
+    required fields, or a non-substring original against a pid text that IS
+    known) fails the chunk exactly as an owned-pid edit does.
 
     R-RETRY (t_8ab8ab35, owner contract 2026-08-13): a DUPLICATE pid is NOT
     a structural violation anymore — the model legitimately returns 2+
@@ -402,8 +411,10 @@ def parse_editor_edits(
     R-PID-SCOPE (t_db376195, owner contract 2026-08-13): an edit for a pid
     that is NOT owned by the current chunk is NOT a structural violation
     either. The model sees CONTEXT_ONLY pids (continuity) and may edit one
-    (run_remote_007 chunk5 p00195) or invent a foreign pid. Such an edit is
-    not applicable in this chunk — it is dropped per-edit and reported as a
+    (run_remote_007 chunk5 p00195) or invent a foreign pid. Such a
+    WELL-FORMED edit (all fields valid, known class — structural
+    validation above runs first, RV t_f4111b48) is not applicable in this
+    chunk — it is dropped per-edit and reported as a
     WARNING, the chunk stays GOOD, the owned edits survive. The edit is
     never transferred to the chunk where the pid is owned (no duplication
     risk) — the model will propose it there itself.
@@ -444,35 +455,25 @@ def parse_editor_edits(
         if not isinstance(pid, str) or not pid:
             errors.append(f"edit has invalid pid {pid!r}")
             continue
-        if pid not in chunk_pid_set:
-            # R-PID-SCOPE (t_db376195, owner contract 2026-08-13): the model
-            # may edit a CONTEXT_ONLY pid (given only for continuity) or a
-            # completely foreign one. Such an edit is NOT applicable here —
-            # it is dropped per-edit with a WARNING (journal warning_count),
-            # NEVER a structural error: the chunk stays GOOD and the owned
-            # edits survive (run_remote_007 chunk5 p00195 context-only edit
-            # used to fail the whole chunk). The edit is NOT transferred to
-            # another chunk — where the pid is owned, the model will propose
-            # it again (no duplication risk).
-            warnings.append(
-                f"edit pid {pid!r} dropped (not in the current chunk "
-                f"— context-only)"
-            )
-            continue
-        # R-RETRY: duplicate pid is allowed up to the cap. The 11th+ edit
-        # of the same pid is dropped per-edit with a WARNING (journal),
-        # never a structural error — the chunk stays GOOD.
-        if pid_count.get(pid, 0) >= max_edits_per_pid:
-            warnings.append(
-                f"duplicate edit pid {pid} dropped "
-                f"(over MAX_EDITS_PER_PID={max_edits_per_pid})"
-            )
-            continue
-        pid_count[pid] = pid_count.get(pid, 0) + 1
+        # Structural validation runs FIRST for EVERY edit (RV t_f4111b48,
+        # R-PID-SCOPE follow-up): the pid-scope drop below must NEVER mask
+        # malformed fields. A context-only/foreign edit is dropped per-edit
+        # with a WARNING only when it is WELL-FORMED — unknown class,
+        # missing/non-string required fields, or an original that is not a
+        # verbatim substring of a KNOWN pid text fail the WHOLE chunk
+        # exactly as they do for an owned pid.
         if not isinstance(original, str) or original == "":
             errors.append(f"pid {pid}: original is missing or not a string")
             continue
-        if original not in str(current_by_pid.get(pid, "")):
+        # Original-substring rule: enforced whenever the pid's current text
+        # is known (an owned pid OR a CONTEXT_ONLY pid of the same chapter).
+        # A pid completely unknown to the chapter has no text to verify the
+        # original against — such a foreign edit is structurally
+        # well-formed if the remaining fields pass (R-PID-SCOPE drops it
+        # below with a WARNING, it is never applied).
+        if original not in str(current_by_pid.get(pid, "")) and (
+            pid in chunk_pid_set or pid in current_by_pid
+        ):
             errors.append(
                 f"pid {pid}: original is not a substring of the current text "
                 f"(model must quote the exact fragment verbatim from the "
@@ -491,6 +492,33 @@ def parse_editor_edits(
                 f"(allowed: {sorted(ALL_CLASSES)})"
             )
             continue
+        # R-PID-SCOPE (t_db376195, owner contract 2026-08-13): the model
+        # may edit a CONTEXT_ONLY pid (given only for continuity) or a
+        # completely foreign one. Such a WELL-FORMED edit is NOT applicable
+        # here — it is dropped per-edit with a WARNING (journal
+        # warning_count), NEVER a structural error: the chunk stays GOOD and
+        # the owned edits survive (run_remote_007 chunk5 p00195 context-only
+        # edit used to fail the whole chunk). The edit is NOT transferred to
+        # another chunk — where the pid is owned, the model will propose it
+        # again (no duplication risk). Malformed fields / unknown class were
+        # ALREADY rejected above (RV t_f4111b48), so this drop path only
+        # ever sees well-formed edits.
+        if pid not in chunk_pid_set:
+            warnings.append(
+                f"edit pid {pid!r} dropped (not in the current chunk "
+                f"— context-only)"
+            )
+            continue
+        # R-RETRY: duplicate pid is allowed up to the cap. The 11th+ edit
+        # of the same pid is dropped per-edit with a WARNING (journal),
+        # never a structural error — the chunk stays GOOD.
+        if pid_count.get(pid, 0) >= max_edits_per_pid:
+            warnings.append(
+                f"duplicate edit pid {pid} dropped "
+                f"(over MAX_EDITS_PER_PID={max_edits_per_pid})"
+            )
+            continue
+        pid_count[pid] = pid_count.get(pid, 0) + 1
         out.append(
             EditorEdit(
                 pid=pid,
