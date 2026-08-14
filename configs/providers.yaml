@@ -1,0 +1,61 @@
+# Provider registry for remote model roles (PROVIDERS-REGISTRY card, 2026-08-14).
+#
+# A NEW file — deliberately separate from the runtime transport profiles
+# (configs/runtime_*.example.yaml): the runtime config describes HOW to talk
+# to a server (endpoint, auth env names, budgets, structured output), while
+# this registry is the model SPRAVOCHNIK (aliases -> full provider/model refs)
+# plus the per-model reasoning contract, so a run command can say
+# `--translator opencode-go/deepseek4flash` instead of the full model id.
+#
+# CLI usage (v4_phase12_strict_run.py):
+#   --translator <provider>/<alias>   e.g. opencode-go/deepseek4flash
+#   --reviewer   <provider>/<alias>   e.g. openai/luna
+#
+# Role mapping (owner decision 2026-08-14):
+#   --translator -> generator + repair (repair falls back to generator)
+#   --reviewer   -> qwen_audit + fidelity_reviewer + russian_selector
+#                   + entity_extractor (all audit roles)
+# Defaults are NOT changed: when the flags are absent the runtime config's
+# model_bindings are used verbatim (deepseek-v4-flash + qwen3.7-plus via
+# opencode-go). Switching a flag changes the backend identity (new cache).
+#
+# reasoning_contract.variants: the reasoningEffort values the model declares
+# in the opencode provider catalog (checked 2026-08-14 against `opencode
+# models <provider> --verbose`, serve 1.18.18). The serve relay does NOT
+# validate reasoningEffort (any string is accepted and proxied), so this
+# contract is the authoritative mapping guide: --reasoning N is mapped to the
+# nearest declared variant when the canonical value is not declared
+# (e.g. deepseek-v4-flash: 2 -> high). Adding a model REQUIRES verifying its
+# variants from the catalog and fixing them here (acceptance criterion).
+providers:
+  opencode-go:
+    kind: opencode_server
+    models:
+      # Default Translator (alias deepseek4flash).
+      deepseek4flash:
+        ref: opencode-go/deepseek-v4-flash
+        reasoning_contract:
+          variants: [low, high, max]
+      # Default Reviewer (alias qwen37). Catalog variants are
+      # thinking-budget based (high/max); reasoningEffort wire behavior for
+      # qwen is to be verified at the first live run (the serve relay still
+      # accepts any reasoningEffort string).
+      qwen37:
+        ref: opencode-go/qwen3.7-plus
+        reasoning_contract:
+          variants: [high, max]
+  openai:
+    kind: opencode_server
+    models:
+      luna:
+        ref: openai/gpt-5.6-luna
+        reasoning_contract:
+          variants: [none, low, medium, high, xhigh, max]
+      sol:
+        ref: openai/gpt-5.6-sol
+        reasoning_contract:
+          variants: [none, low, medium, high, xhigh, max]
+      terra:
+        ref: openai/gpt-5.6-terra
+        reasoning_contract:
+          variants: [none, low, medium, high, xhigh, max]

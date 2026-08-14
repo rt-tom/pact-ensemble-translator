@@ -311,11 +311,21 @@ class OpenCodeServerBackendConfig:
     # Role -> provider/model bindings (part of backend identity).
     model_bindings: Mapping[str, str] = field(default_factory=dict)
 
+    # PROVIDERS-REGISTRY (2026-08-14): the --reasoning level (1/2/3) ->
+    # reasoningEffort map for the model(s) this backend serves, from the
+    # provider registry's reasoning contract. None keeps the historical
+    # transport default {1: low, 2: medium, 3: high} and is NOT serialized
+    # into the descriptor (existing configs keep their exact identity).
+    # When set, the wire value changes with the model contract (e.g.
+    # deepseek-v4-flash {low, high, max}: 2 -> high) and the map IS part of
+    # backend identity — a contract change invalidates cache/resume.
+    reasoning_effort_map: Optional[Mapping[int, str]] = None
+
     # Effective sampling settings (plan §5.4). The verified server lines
     # cannot send these in the message body, but they belong in backend
     # identity so a change in requested sampling invalidates cache/resume
     # instead of silently reusing a candidate generated with different
-    # settings.
+    # settings. origin/dev/v4.1-reasoning-transport
     default_temperature: Optional[float] = None
     default_max_output_tokens: Optional[int] = None
 
@@ -364,6 +374,21 @@ class OpenCodeServerBackendConfig:
             raise ValueError(
                 "OpenCodeServerBackendConfig: default_max_output_tokens must be positive"
             )
+        if self.reasoning_effort_map is not None:
+            effort_map = dict(self.reasoning_effort_map)
+            unknown = set(effort_map) - {1, 2, 3}
+            if unknown:
+                raise ValueError(
+                    "OpenCodeServerBackendConfig: reasoning_effort_map keys must be "
+                    f"--reasoning levels 1/2/3, got {sorted(unknown)}"
+                )
+            empty = [k for k, v in effort_map.items() if not isinstance(v, str) or not v]
+            if empty:
+                raise ValueError(
+                    "OpenCodeServerBackendConfig: reasoning_effort_map values must be "
+                    f"non-empty reasoningEffort strings (bad levels: {empty})"
+                )
+            object.__setattr__(self, "reasoning_effort_map", effort_map)
 
 
 def _parse_model_ref(model_ref: str) -> Tuple[str, str]:
@@ -426,6 +451,15 @@ def build_opencode_descriptor(
             "max_wait_seconds_on_rate_limit": cfg.remote_budget.max_wait_seconds_on_rate_limit,
         },
     }
+    # PROVIDERS-REGISTRY: the reasoning-effort map is serialized ONLY when
+    # set — a None (registry not consulted) must keep the exact historical
+    # descriptor identity, so an existing remote profile's cache/resume is
+    # unaffected by this feature. When set, it changes the wire
+    # reasoningEffort and therefore participates in identity.
+    if cfg.reasoning_effort_map is not None:
+        effective_options["reasoning_effort_map"] = dict(
+            sorted(cfg.reasoning_effort_map.items())
+        )
     return BackendDescriptor(
         kind=KIND_OPENCODE_SERVER,
         transport_version=cfg.transport_version,
@@ -842,7 +876,7 @@ class OpenCodeServerBackend:
             }
         reasoning = request.request_options.get("reasoning")
         if reasoning:
-            # V4.1: top-level ``reasoningEffort`` on POST /session/{id}/message
+            # V4.1: top-level reasoningEffort on POST /session/{id}/message
             # was honoured by serve 1.4.7 (empirically verified 2026-08-08:
             # high -> 23 reasoning tokens, absent -> 0); on 1.18.18 the field
             # is no longer in the request schema and is silently ignored
@@ -852,7 +886,18 @@ class OpenCodeServerBackend:
             # contract restricts reasoning to {0,1,2,3}, so an out-of-range
             # value here is a programming error — fail loudly instead of
             # silently dropping the budget.
-            effort = {1: "low", 2: "medium", 3: "high"}.get(reasoning)
+            #
+            # PROVIDERS-REGISTRY (2026-08-14): the level -> effort mapping is
+            # taken from the config's reasoning_effort_map when set (the
+            # provider registry's per-model reasoning contract, e.g.
+            # deepseek-v4-flash {low, high, max}: 2 -> high); otherwise the
+            # historical transport default {1: low, 2: medium, 3: high} is
+            # used. The serve relay does NOT validate the value (any string
+            # is accepted and proxied), so the contract is the authoritative
+            # guide, not a server-side constraint.
+            effort = (self._cfg.reasoning_effort_map or {1: "low", 2: "medium", 3: "high"}).get(
+                reasoning
+            )
             if effort is None:
                 raise OpenCodeError(
                     ERROR_REQUEST_NOT_SUPPORTED,
@@ -925,6 +970,15 @@ class OpenCodeServerBackend:
         method keeps only non-synthetic ``text`` parts) and surfaced
         separately via ``raw_metadata["reasoning"]`` so audit/repair
         ``_reasoning.txt`` artifacts are not empty on the remote path.
+
+        OpenAI (gpt-5.6-*, PROVIDERS-REGISTRY, verified on serve 1.18.18):
+        the FULL reasoning is delivered encrypted —
+        ``metadata.openai.reasoningEncryptedContent`` (the variant carries
+        ``include: ["reasoning.encrypted_content"]``). This method therefore
+        only ever sees the OPEN part.text (the summary / any unencrypted
+        slice); the encrypted blob is NOT decrypted here — documented
+        limitation, deliberately not fixed (the transport never held an
+        OpenAI decryption key).
         """
         chunks = []
         for part in parts:
