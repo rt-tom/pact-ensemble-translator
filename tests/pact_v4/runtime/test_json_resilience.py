@@ -16,7 +16,7 @@ Covers the B4 acceptance criteria (``docs/plans/V4_B4_JSON_RESILIENCE_TASK_RU.md
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, get_type_hints
 
 import pytest
 
@@ -37,8 +37,8 @@ from pact_v4.runtime.json_resilience import (
     JsonRetryPolicy,
     TruncatedJSONError,
     classify_response_text,
+    extract_pid_pairs,
     parse_json_response,
-    repair_pid_colon_comma,
     retry_json_call,
 )
 from tests.pact_v4.phase3.test_audit import _env as _audit_env
@@ -136,6 +136,24 @@ def test_parse_json_response_plain_dict():
     assert parse_json_response('{"edits": []}') == {"edits": []}
 
 
+def test_parse_json_response_clean_json_does_not_call_extractor(monkeypatch):
+    # REPAIR-RECEIVER acceptance: clean JSON takes the DIRECT json.loads
+    # path — the pair extractor must not even be invoked (no degradation,
+    # no overhead on the common case).
+    import pact_v4.runtime.json_resilience as jr
+
+    called = []
+
+    def _spy(raw, **kwargs):
+        called.append(raw)
+        return None
+
+    monkeypatch.setattr(jr, "extract_pid_pairs", _spy)
+    assert parse_json_response('{"edits": []}') == {"edits": []}
+    assert parse_json_response('{"issues": []}') == {"issues": []}
+    assert called == []  # direct path, extractor untouched
+
+
 def test_parse_json_response_strips_markdown_fences():
     good = '{"edits": []}'
     assert parse_json_response(f"```json\n{good}\n```") == {"edits": []}
@@ -222,7 +240,8 @@ def test_parse_json_response_regression_run_remote_001_chunk1_raw(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# JSON-REPAIR: deterministic pid-colon fix (t_34ceca50, run_remote_004)
+# REPAIR-RECEIVER: single tolerant pid-pair extractor (t_b590c24f,
+# run_remote_007) — replaces the pid-colon point repair (PR #178)
 # ---------------------------------------------------------------------------
 
 
@@ -241,8 +260,8 @@ def _whole_chapter_400_pids(*, broken: Sequence[str], sep: str = ": ") -> str:
 
 def test_parse_json_response_repairs_pid_colon_replay_400(caplog):
     # run_remote_004 replay: a 400-PID whole-chapter body with one
-    # `"p00082", "` (comma instead of colon) is repaired deterministically
-    # and parses; the WARNING records the substitution count.
+    # `"p00082", "` (comma instead of colon) is repaired by the pair
+    # extractor and parses; the WARNING records the recovery.
     raw = _whole_chapter_400_pids(broken=("p00082",))
     with caplog.at_level("WARNING", logger="pact_v4.runtime.json_resilience"):
         parsed = parse_json_response(raw)
@@ -253,14 +272,14 @@ def test_parse_json_response_repairs_pid_colon_replay_400(caplog):
     assert parsed["p00399"] == "текст 399"
     assert any(
         record.levelname == "WARNING"
-        and "json repair: 1 substitution(s) pid-colon" in record.message
+        and "json repair: pid-pair extractor recovered 400 pair(s)" in record.message
         for record in caplog.records
     )
 
 
 def test_parse_json_response_repairs_all_pid_colon_occurrences(caplog):
-    # Two errors in one text -> BOTH substituted (the model can err in two
-    # places; a partial repair would leave the body unparseable).
+    # Two errors in one text -> BOTH recovered (the model can err in two
+    # places; a partial extraction would fail the coverage check).
     raw = _whole_chapter_400_pids(broken=("p00082", "p00153"))
     with caplog.at_level("WARNING", logger="pact_v4.runtime.json_resilience"):
         parsed = parse_json_response(raw)
@@ -270,29 +289,27 @@ def test_parse_json_response_repairs_all_pid_colon_occurrences(caplog):
     assert parsed["p00153"] == "текст 153"
     assert any(
         record.levelname == "WARNING"
-        and "json repair: 2 substitution(s) pid-colon" in record.message
+        and "json repair: pid-pair extractor recovered 400 pair(s)" in record.message
         for record in caplog.records
     )
 
 
-def test_parse_json_response_pid_colon_repair_stays_fail_closed():
-    # The repair must not mask real damage: a body that still does not
-    # parse AFTER the substitution goes through the unchanged fail-closed
-    # path (TruncatedJSONError), exactly as before the fix.
-    with pytest.raises(TruncatedJSONError):
-        parse_json_response('{"p00082", "текст"')  # unbalanced after repair
-    with pytest.raises(TruncatedJSONError):
-        parse_json_response('{"p00082", "текст", "p00083": "т"')  # still truncated
-    # No pid pattern at all -> unchanged rejection.
+def test_parse_json_response_pid_receiver_stays_fail_closed():
+    # The extractor is fail-closed: a body that is not a top-level
+    # pid-keyed object, or whose values are suspicious (unbalanced
+    # quotes), goes through the unchanged TruncatedJSONError path.
     with pytest.raises(TruncatedJSONError):
         parse_json_response('{"edits": [')
+    # An interior quote with no typographic partner is suspicious.
+    with pytest.raises(TruncatedJSONError):
+        parse_json_response('{"p00001": "Он сказал "привет"}')
 
 
-def test_parse_json_response_pid_colon_repair_leaves_valid_bodies_untouched():
+def test_parse_json_response_pid_receiver_leaves_valid_bodies_untouched():
     # Ordinary fenced / prose-wrapped answers (R/repair/re-audit) must parse
     # unchanged: PIDs inside {"edits": [...]} / {"issues": [...]} arrays are
-    # values, not top-level keys, and the comma-after-value form is valid
-    # JSON that the first json.loads already accepts (no substitution path).
+    # values, not top-level keys, so the extractor refuses them (first key
+    # after `{` is not a PID) and the existing fences/prose path handles them.
     valid = (
         "```json\n"
         '{"edits": [{"pid": "p00082", "original": "A", "rewritten": "Б", '
@@ -307,65 +324,113 @@ def test_parse_json_response_pid_colon_repair_leaves_valid_bodies_untouched():
     assert parse_json_response(good)["p00082"] == "текст 82"
 
 
-def test_repair_pid_colon_comma_is_json_string_aware():
-    # F1 regression (t_0626267d): the repair must not mutate legitimate
-    # JSON string VALUES that contain the same literal `"p12345", "` — the
-    # old global regex rewrote it to `"p12345": "` inside the value,
-    # silently corrupting translation text. The probe from the review:
-    # the value of p00001 is `quote "p12345", "` (with escaped quotes),
-    # and p00002 is a genuinely broken top-level key.
-    raw = '{"p00001": "quote \\"p12345\\", \\"", "p00002", "normal"}'
-    repaired, n_subs = repair_pid_colon_comma(raw)
-    assert n_subs == 1
-    assert repaired == '{"p00001": "quote \\"p12345\\", \\"", "p00002": "normal"}'
+def test_extract_pid_pairs_type_hints_resolve():
+    # RV2 finding (t_a6f84d75): `expected_pids: Optional[Sequence[str]]`
+    # referenced Sequence without importing it. With `from __future__ import
+    # annotations` ordinary calls pass, but get_type_hints() evaluates the
+    # postponed annotation and raised NameError. The import must exist so
+    # introspection (and static analyzers) can resolve the signature.
+    hints = get_type_hints(extract_pid_pairs)
+    assert hints["expected_pids"] == Optional[Sequence[str]]
+    assert hints["min_coverage"] is float
 
 
-def test_repair_pid_colon_comma_fixes_all_top_level_broken_keys():
-    # F1 regression (t_0626267d): every REAL broken top-level PID key in
-    # one whole-chapter object is still repaired (criterion 2) — here
-    # THREE broken keys (p00001, p00002, p00003) plus a value containing
-    # the colliding literal, which must stay untouched.
+def test_extract_pid_pairs_replay_007_p00087_ascii_quote():
+    # run_remote_007 attempt0: the model closed a typographic „ with an
+    # ASCII `"` inside a value (p00087) — json.loads breaks at the interior
+    # quote. The pair extractor splits on keys and keeps the interior quote.
     raw = (
-        '{"p00001", "quote \\"p12345\\", \\"", '
-        '"p00002", "normal", "p00003", "also broken"}'
+        '{"p00086": "«Ты сбежал».", '
+        '"p00087": "«Когда я думаю о „побеге из дома", я всегда '
+        'представляю маленьких детей, уходящих с узелком на палке».", '
+        '"p00088": "Я пожал плечами."}'
     )
-    repaired, n_subs = repair_pid_colon_comma(raw)
-    assert n_subs == 3
-    assert repaired == (
-        '{"p00001": "quote \\"p12345\\", \\"", '
-        '"p00002": "normal", "p00003": "also broken"}'
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)  # the defect really breaks strict JSON
+    extracted = extract_pid_pairs(
+        raw, expected_pids=("p00086", "p00087", "p00088")
     )
+    assert extracted is not None
+    assert extracted["p00087"] == (
+        "«Когда я думаю о „побеге из дома\", я всегда представляю "
+        "маленьких детей, уходящих с узелком на палке»."
+    )
+    assert extracted["p00086"] == "«Ты сбежал»."
+    assert extracted["p00088"] == "Я пожал плечами."
 
 
-def test_parse_json_response_pid_colon_repair_skips_embedded_literals(caplog):
-    # F1 end-to-end (t_0626267d): parse_json_response must return the
-    # translation value `quote "p12345", "` UNCHANGED while repairing the
-    # broken p00002 key — the probe from the review t_cdf26dd2.
+def test_extract_pid_pairs_ascii_quote_is_string_aware():
+    # F1 regression (t_0626267d), now on the extractor: a translation VALUE
+    # that legitimately contains the literal `"p12345", "` (with escaped
+    # quotes) must survive byte-for-byte, while a real broken key
+    # (`"p00002", "`) in the SAME object is still recovered. The extractor
+    # never rewrites values — it only splits on keys and cleans separators.
     raw = '{"p00001": "quote \\"p12345\\", \\"", "p00002", "normal"}'
-    with caplog.at_level("WARNING", logger="pact_v4.runtime.json_resilience"):
-        parsed = parse_json_response(raw)
-    assert parsed["p00001"] == 'quote "p12345", "'
-    assert parsed["p00002"] == "normal"
-    assert any(
-        record.levelname == "WARNING"
-        and "json repair: 1 substitution(s) pid-colon" in record.message
-        for record in caplog.records
-    )
+    extracted = extract_pid_pairs(raw, expected_pids=("p00001", "p00002"))
+    assert extracted == {"p00001": 'quote "p12345", "', "p00002": "normal"}
 
 
-def test_parse_json_response_pid_colon_repair_ignores_non_key_positions():
-    # F1 regression (t_0626267d): the pattern at a VALUE position (a PID
-    # that is a value, followed by the comma separator of the NEXT key) is
-    # legitimate JSON — it must never be rewritten. `"p00082", "p00002"` is
-    # `value p00082, key p00002`, i.e. a valid comma after a value inside an
-    # object; the whole body already parses (no substitution path), and a
-    # direct helper call must also leave it alone (the scanner only fixes
-    # key positions right after `{` or `,`).
+def test_extract_pid_pairs_ignores_non_key_positions():
+    # A PID that is a VALUE (not a top-level key) must never be split on:
+    # the first key after `{` is "a", so the extractor refuses the body and
+    # the existing direct parse handles it (already-valid JSON).
     valid = '{"a": "p00082", "p00002": "normal"}'
     assert parse_json_response(valid) == {"a": "p00082", "p00002": "normal"}
-    repaired, n_subs = repair_pid_colon_comma(valid)
-    assert n_subs == 0
-    assert repaired == valid
+    assert extract_pid_pairs(valid) is None
+
+
+def test_extract_pid_pairs_cleans_garbage_between_values():
+    # Garbage between values (a stray token the model inserted between the
+    # closing quote of one pair and the next key) is dropped; the pairs
+    # survive and the order is the source order.
+    raw = (
+        '{"p00001": "Первый", какой-то мусор "p00002": "Второй", '
+        '"p00003": "Третий"}'
+    )
+    extracted = extract_pid_pairs(
+        raw, expected_pids=("p00001", "p00002", "p00003")
+    )
+    assert extracted == {
+        "p00001": "Первый",
+        "p00002": "Второй",
+        "p00003": "Третий",
+    }
+
+
+def test_extract_pid_pairs_truncation_coverage_fail_closed():
+    # Truncation mid-object: 350 of 400 keys -> 87.5% coverage < 90% ->
+    # honest fail (None) -> bounded retry, never a partial PID map.
+    parts = [
+        f'"p{i:05d}": "текст {i}"' for i in range(350)
+    ]
+    truncated = "{" + ", ".join(parts) + "}"
+    pids = tuple(f"p{i:05d}" for i in range(400))
+    assert extract_pid_pairs(truncated, expected_pids=pids) is None
+    # Without the expected set (generic parse path) the extractor uses the
+    # keys it found — 350/350 -> coverage 100% (the generation layer passes
+    # the pid_map and enforces the 90% gate there).
+    assert len(extract_pid_pairs(truncated)) == 350
+
+
+def test_extract_pid_pairs_missing_key_fails_below_coverage():
+    # One key dropped from a small set: 2 of 3 -> 66.7% < 90% -> fail.
+    raw = '{"p00001": "a", "p00003": "c"}'
+    assert (
+        extract_pid_pairs(raw, expected_pids=("p00001", "p00002", "p00003"))
+        is None
+    )
+
+
+def test_extract_pid_pairs_399_of_400_accepted_but_last_value_checked():
+    # 399 of 400 keys (one missing at the end) -> 99.75% >= 90% -> accepted;
+    # the LAST value is still sanity-checked (must be non-empty/balanced).
+    parts = [f'"p{i:05d}": "текст {i}"' for i in range(399)]
+    raw = "{" + ", ".join(parts) + "}"
+    pids = tuple(f"p{i:05d}" for i in range(400))
+    extracted = extract_pid_pairs(raw, expected_pids=pids)
+    assert extracted is not None
+    assert len(extracted) == 399
+    assert extracted["p00398"] == "текст 398"
 
 
 def test_retry_json_call_pid_colon_replay_does_not_retry():

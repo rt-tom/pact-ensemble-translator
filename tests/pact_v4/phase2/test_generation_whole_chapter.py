@@ -331,6 +331,119 @@ def test_whole_chapter_pid_colon_repair_skips_embedded_literals(tmp_path):
     assert translation["p00001"] == 'Перевод p00001: цитата "p12345", "закрыто"'
 
 
+def test_whole_chapter_ascii_quote_defect_repaired_without_retry(tmp_path):
+    # REPAIR-RECEIVER (t_b590c24f, run_remote_007): the THIRD whole-chapter
+    # JSON defect class — a typographic „ inside a value closed with an
+    # ASCII `"` (p00087: `«Когда я думаю о „побеге из дома", ...»`) breaks
+    # json.loads. The pair extractor splits on the keys and keeps the
+    # interior quote, so a 400-PID body with the defect validates on the
+    # FIRST attempt — no retry, no wasted 92k-token regeneration.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    parts = []
+    for pid in pid_map.pids:
+        if pid == "p00087":
+            value = "«Когда я думаю о „побеге из дома\", я всегда представляю детей»."
+        else:
+            value = f"Перевод {pid}"
+        parts.append(f'"{pid}": "{value}"')
+    broken_raw = "{" + ", ".join(parts) + "}"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(broken_raw)  # the defect really breaks strict JSON
+    caller = _ScriptedCaller([broken_raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "complete"
+    assert len(caller.calls) == 1  # recovered on the first attempt, no retry
+    translation = dict(outcome.candidates["balanced_literary"].translation)
+    assert translation["p00087"] == (
+        "«Когда я думаю о „побеге из дома\", я всегда представляю детей»."
+    )
+
+
+def test_whole_chapter_truncation_below_coverage_fails_closed(tmp_path):
+    # REPAIR-RECEIVER fail-closed: a 400-key body cut off mid-object after
+    # key 350 (unclosed JSON) -> the extractor finds 350 keys, 350/400 =
+    # 87.5% < 90% coverage -> honest INVALID_JSON (bounded retry), never a
+    # partial PID map.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    parts = [
+        f'"{pid}": "Перевод {pid}"' for pid in pid_map.pids[:350]
+    ]
+    truncated_raw = "{" + ", ".join(parts)  # cut mid-object: no closing brace
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(truncated_raw)  # genuinely unclosed body
+    caller = _ScriptedCaller([truncated_raw, truncated_raw, truncated_raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "incomplete"
+    assert outcome.candidates == {}
+    err = outcome.errors["balanced_literary"]
+    assert err.code == GenerationErrorCode.INVALID_JSON
+    assert len(caller.calls) == 3  # bounded retry
+
+
+def test_whole_chapter_single_missing_key_99_pct_then_pid_mismatch(tmp_path):
+    # REPAIR-RECEIVER: 399 of 400 keys (body cut mid-object after the last
+    # key, so json.loads fails and the extractor runs) -> 399/400 = 99.75%
+    # >= 90% -> the extractor accepts, then the exact PID-set validation
+    # catches the missing key (PID_MISMATCH) — the last value is
+    # sanity-checked and the missing PID is never silently accepted as a
+    # partial map.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    parts = [
+        f'"{pid}": "Перевод {pid}"' for pid in pid_map.pids[:399]
+    ]
+    raw = "{" + ", ".join(parts)  # cut mid-object after key 399
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+    caller = _ScriptedCaller([raw, raw, raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "incomplete"
+    err = outcome.errors["balanced_literary"]
+    assert err.code == GenerationErrorCode.PID_MISMATCH
+    assert len(caller.calls) == 3
+
+
+def test_whole_chapter_missing_key_below_coverage_fails_closed(tmp_path):
+    # REPAIR-RECEIVER: a small map with keys dropped mid-body (unclosed) —
+    # 8 of 10 keys = 80% < 90% -> honest INVALID_JSON -> bounded retry.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=10)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    parts = [
+        f'"{pid}": "Перевод {pid}"' for pid in pid_map.pids[:8]
+    ]
+    raw = "{" + ", ".join(parts)  # cut mid-object: no closing brace
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+    caller = _ScriptedCaller([raw, raw, raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "incomplete"
+    err = outcome.errors["balanced_literary"]
+    assert err.code == GenerationErrorCode.INVALID_JSON
+    assert len(caller.calls) == 3
+
+
 def test_whole_chapter_session_abort_retried_then_honest_error(tmp_path):
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
