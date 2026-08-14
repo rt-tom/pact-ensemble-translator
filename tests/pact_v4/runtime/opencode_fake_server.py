@@ -1,11 +1,12 @@
 """Offline fake OpenCode server harness (plan §14.2).
 
-A scriptable, in-process stand-in for ``opencode serve`` v1.4.7 used by the
-contract suite and the pipeline-parity tests. It exposes the same
-request/response contract the backend speaks (health/provider/session/
-message/tool-ids) and records every request so tests can assert exact
-wire-level behaviour (tools disabled, explicit model, session cleanup,
-etc.). It never touches the network and never makes a paid call.
+A scriptable, in-process stand-in for ``opencode serve`` (verified against
+1.4.7 and 1.18.18) used by the contract suite and the pipeline-parity
+tests. It exposes the same request/response contract the backend speaks
+(health/provider/session/message/tool-ids) and records every request so
+tests can assert exact wire-level behaviour (tools disabled, explicit
+model, session cleanup, etc.). It never touches the network and never
+makes a paid call.
 
 The harness implements the small slice of ``requests.Session`` the
 ``OpenCodeServerBackend`` uses (``request(method, url, ...)`` and
@@ -98,7 +99,7 @@ def _default_tool_ids() -> List[str]:
 
 
 class FakeOpenCodeServer:
-    """Scriptable in-process stand-in for ``opencode serve`` v1.4.7.
+    """Scriptable in-process stand-in for ``opencode serve`` (1.18.18).
 
     Behaviour is controlled by:
 
@@ -120,7 +121,7 @@ class FakeOpenCodeServer:
     def __init__(
         self,
         *,
-        version: str = "1.4.7",
+        version: str = "1.18.18",
         healthy: bool = True,
         providers: Optional[List[Dict[str, Any]]] = None,
         connected: Optional[List[str]] = None,

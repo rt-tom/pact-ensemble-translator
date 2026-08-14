@@ -26,7 +26,6 @@ from pact_v4.runtime.opencode_backend import (
     ERROR_PROVIDER_MODEL_UNAVAILABLE,
     ERROR_REMOTE_BUDGET_EXHAUSTED,
     ERROR_REQUEST_NOT_SUPPORTED,
-    ERROR_SERVER_VERSION_UNSUPPORTED,
     ERROR_STRUCTURED_OUTPUT_FAILED,
     ERROR_TRANSPORT_NETWORK,
     ERROR_TRANSPORT_TIMEOUT,
@@ -107,36 +106,105 @@ def test_health_success_preflights_and_completes():
     assert gets.count("/provider") == 1
 
 
-def test_version_mismatch_fails_preflight_with_specific_error():
-    fake = FakeOpenCodeServer(version="1.5.0")
-    backend = _backend(fake)
-    with pytest.raises(OpenCodeError) as exc_info:
-        backend.complete(_request())
-    assert exc_info.value.error_class == ERROR_SERVER_VERSION_UNSUPPORTED
-    assert "1.5.0" in str(exc_info.value)
-    # No model call was made.
-    posts = [p for m, p, _ in fake.requests_log if m == "POST"]
-    assert posts == []
-
-
-def test_exact_version_policy_accepts_pinned_rejects_patch():
-    fake = FakeOpenCodeServer(version="1.4.7")
+def test_version_mismatch_warns_but_proceeds(caplog):
+    # Version-agnostic (owner 2026-08-14): a different server version is a
+    # warning, never a gate. The call proceeds and the version is recorded.
+    fake = FakeOpenCodeServer(version="1.18.18")
     fake.script_message(_text_message("ok"))
-    backend = _backend(fake, server_version_policy="exact")
-    assert backend.complete(_request()).text == "ok"
+    backend = _backend(fake)  # default pinned_server_version="latest" -> compatible
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.opencode_backend"):
+        resp = backend.complete(_request())
+    assert resp.text == "ok"
+    assert resp.raw_metadata["server_version"] == "1.18.18"
+    assert fake.requests_log  # a model call was made
 
-    fake2 = FakeOpenCodeServer(version="1.4.8")
-    backend2 = _backend(fake2, server_version_policy="exact")
-    with pytest.raises(OpenCodeError) as exc_info:
-        backend2.complete(_request())
-    assert exc_info.value.error_class == ERROR_SERVER_VERSION_UNSUPPORTED
+
+def test_version_mismatch_against_explicit_pin_warns_but_proceeds(caplog):
+    # Even with an explicit pin + exact policy, a different version no longer
+    # fails preflight; it logs a warning and proceeds (version-agnostic).
+    fake = FakeOpenCodeServer(version="1.18.18")
+    fake.script_message(_text_message("ok"))
+    backend = _backend(
+        fake,
+        server_version_policy="exact",
+        pinned_server_version="1.4.7",
+    )
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.opencode_backend"):
+        resp = backend.complete(_request())
+    assert resp.text == "ok"
+    assert "1.18.18" in resp.raw_metadata["server_version"]
+    assert any("does not match" in r.message for r in caplog.records)
+
+
+def test_exact_version_policy_accepts_pinned():
+    fake = FakeOpenCodeServer(version="1.18.18")
+    fake.script_message(_text_message("ok"))
+    backend = _backend(
+        fake,
+        server_version_policy="exact",
+        pinned_server_version="1.18.18",
+    )
+    assert backend.complete(_request()).text == "ok"
 
 
 def test_compatible_minor_accepts_patch_release():
-    fake = FakeOpenCodeServer(version="1.4.8")
+    fake = FakeOpenCodeServer(version="1.18.19")
     fake.script_message(_text_message("ok"))
-    backend = _backend(fake, server_version_policy="compatible_minor")
+    backend = _backend(
+        fake,
+        server_version_policy="compatible_minor",
+        pinned_server_version="1.18.18",
+    )
     assert backend.complete(_request()).text == "ok"
+
+
+@pytest.mark.parametrize("health_version", ["nightly", "dev", "canary"])
+def test_non_semver_health_version_with_explicit_pin_warns_and_proceeds(
+    health_version, caplog
+):
+    # HIGH (review UPGRADE-SERVE-1.18): a non-semver health version with an
+    # explicit pin + compatible_minor used to raise an unhandled ValueError
+    # ("cannot parse version 'nightly'"). The observed server version is
+    # never a fail-path: it logs a warning and the preflight/call proceed.
+    fake = FakeOpenCodeServer(version=health_version)
+    fake.script_message(_text_message("ok"))
+    backend = _backend(
+        fake,
+        server_version_policy="compatible_minor",
+        pinned_server_version="1.4.7",
+    )
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.opencode_backend"):
+        resp = backend.complete(_request())
+    assert resp.text == "ok"
+    assert resp.raw_metadata["server_version"] == health_version
+    assert fake.requests_log  # a model call was made
+
+
+def test_observed_server_version_lands_in_descriptor_public_record():
+    # MEDIUM (review UPGRADE-SERVE-1.18): the observed server version must
+    # be persisted in the authoritative backend identity (descriptor
+    # public_record), not only in per-call raw_metadata. Before preflight
+    # it is unknown (None); after preflight it carries the health version.
+    fake = FakeOpenCodeServer(version="1.18.18")
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+
+    # Before preflight: no observed version known yet.
+    assert backend.descriptor.public_record()["observed_server_version"] is None
+
+    backend.complete(_request())
+    record = backend.descriptor.public_record()
+    assert record["observed_server_version"] == "1.18.18"
+    assert record["identity_hash"] == backend.descriptor.identity_hash
+    # The observed version is provenance only: it must NOT change identity.
+    from pact_v4.runtime.opencode_backend import build_opencode_descriptor
+    cfg = backend._cfg
+    no_version = build_opencode_descriptor(cfg).identity_hash
+    with_version = build_opencode_descriptor(
+        cfg, observed_server_version="1.18.18"
+    ).identity_hash
+    assert no_version == with_version
+    assert no_version == record["identity_hash"]
 
 
 def test_unhealthy_server_fails_preflight():
@@ -237,7 +305,7 @@ def test_tools_really_disabled():
 
 
 def test_omit_system_tools_drops_system_and_tools_from_body():
-    # AF: serve 1.4.7 serves a body carrying system/tools with a default
+    # AF: serve 1.4.7 served a body carrying system/tools with a default
     # ~32k output budget, truncating whole-chapter generation reasoning.
     # Generation requests omit both (verbatim Gate 0 body shape); the
     # default keeps the historical system+tools body.
@@ -410,9 +478,9 @@ def test_multiple_text_parts_are_concatenated():
 
 
 def test_reasoning_part_populates_raw_metadata_not_text():
-    """Regression (run_remote_001, 2026-08-13): serve 1.4.7 returns the
-    model's thinking as ``type=\"reasoning\"`` parts; they must land in
-    ``raw_metadata[\"reasoning\"]`` (so audit/repair ``_reasoning.txt``
+    """Regression (run_remote_001, 2026-08-13): serve returns the
+    model's thinking as ``type="reasoning"`` parts; they must land in
+    ``raw_metadata["reasoning"]`` (so audit/repair ``_reasoning.txt``
     artifacts are not empty on the remote path) while ``_extract_text``
     keeps returning only the answer text."""
     fake = FakeOpenCodeServer()
@@ -436,7 +504,7 @@ def test_reasoning_part_populates_raw_metadata_not_text():
     response = backend.complete(_request())
     assert response.text == "the answer"
     assert response.raw_metadata["reasoning"] == "step one step two"
-    assert response.raw_metadata["server_version"] == "1.4.7"
+    assert response.raw_metadata["server_version"] == "1.18.18"
     assert len(response.raw_metadata["attempts"]) == 1
     assert response.raw_metadata["attempts"][0]["error_class"] is None
     assert response.raw_metadata["structured_output_mode"] == "prompt_only"
@@ -481,9 +549,9 @@ def test_no_reasoning_parts_yield_empty_reasoning_metadata():
 
 def test_on_reasoning_chunk_delivered_once_after_completion():
     """REASONING-STREAM acceptance (opencode): POST /session/{id}/message is
-    NOT an SSE stream — serve 1.4.7 returns the complete message in one
-    response. So on_reasoning_chunk is delivered ONCE with the full reasoning
-    AFTER completion (documented), and raw_metadata marks
+    NOT an SSE stream — the verified server lines return the complete message
+    in one response. So on_reasoning_chunk is delivered ONCE with the full
+    reasoning AFTER completion (documented), and raw_metadata marks
     reasoning_streamed=False."""
     fake = FakeOpenCodeServer()
     fake.script_message(

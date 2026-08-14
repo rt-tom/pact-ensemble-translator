@@ -38,10 +38,16 @@ from pact_v4.runtime.opencode_backend import (
 )
 from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
+    CompositeCompletionBackend,
     LocalLlamaBackendConfig,
+    LocalRoutingBackend,
     OpenCodeBackendConfig,
 )
-from pact_v4.runtime.runtime_coordinator import RemoteRuntimeCoordinator
+from pact_v4.runtime.runtime_coordinator import (
+    CompositeRuntimeCoordinator,
+    LocalLifecycleCoordinator,
+    RemoteRuntimeCoordinator,
+)
 from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     FakeLifecycleAdapter,
     StubGemma,
@@ -198,6 +204,10 @@ def test_remote_record_v2_has_backend_and_runtime_blocks(tmp_path: Path):
     assert record["backend"]["identity_hash"] == remote_cfg.backend.identity_hash
     assert record["backend"]["public_endpoint"] == "http://127.0.0.1:4096"
     assert record["backend"]["model_bindings"]["generator"] == "opencode-go/deepseek-v4-flash"
+    # UPGRADE-SERVE-1.18 MEDIUM: the observed server version (health) is
+    # persisted in the run record's backend identity/provenance block, so
+    # runs record what they actually ran on (not only the configured pin).
+    assert record["backend"]["observed_server_version"] == "1.18.18"
     # Runtime block: local_lifecycle null for remote, remote_calls aggregated.
     assert record["runtime"]["local_lifecycle"] is None
     remote_calls = record["runtime"]["remote_calls"]
@@ -329,6 +339,68 @@ def test_composite_does_not_reuse_artifacts_of_other_routing_map(tmp_path: Path)
         raise AssertionError(
             "expected Foreign identity ValueError when routing map changes"
         )
+
+
+def test_composite_record_backend_carries_observed_server_version(tmp_path: Path):
+    # UPGRADE-SERVE-1.18 RV2 follow-up (t_0b45f3be): the authoritative
+    # persisted backend record of a COMPOSITE run must carry the observed
+    # OpenCode health version after the real remote preflight — not a
+    # config-time None. Exercises the real composite runtime/record path
+    # (CompositeRuntimeCoordinator over a real OpenCodeServerBackend wired
+    # to the fake server), not only the direct remote backend.
+    remote_sub = OpenCodeBackendConfig(server=_remote_backend_config())
+    local_sub = _local_backend()
+    composite_cfg = CompositeBackendConfig(
+        # remote first so its role bindings win the first-wins descriptor
+        # merge; every role then resolves to an opencode ref and routes to
+        # the remote sub-backend (the local sub stays wired but idle).
+        backends={"remote": remote_sub, "local": local_sub},
+        role_backend_map={
+            "generator": "remote", "fidelity_reviewer": "remote",
+            "russian_selector": "remote", "qwen_audit": "remote",
+            "gemma_audit": "remote",
+        },
+    )
+    cfg = _make_cfg(tmp_path, backend=composite_cfg)
+    fake = DynamicFakeOpenCodeServer()
+    # Build the composite runtime exactly like CompositeBackendConfig
+    # .build_runtime() does, but with the fake session injected into the
+    # OpenCode sub-backend (build_runtime has no fake-injection hook).
+    remote_backend = OpenCodeServerBackend(config=remote_sub.server, session=fake)
+    remote_coord = RemoteRuntimeCoordinator(remote_backend)
+    router = _make_router()
+    local = LocalLifecycleCoordinator(router, descriptor=local_sub.build_descriptor())
+    local_routing = LocalRoutingBackend(router, local_sub)
+    descriptor = composite_cfg.build_descriptor()
+    composite_backend = CompositeCompletionBackend(
+        {"remote": remote_backend, "local": local_routing}, descriptor,
+    )
+    runtime = CompositeRuntimeCoordinator(
+        local, remote_coord, descriptor, backend=composite_backend,
+    )
+    model_caller = BackendModelCaller(composite_backend)
+    qwen_evaluator = BackendQwenEvaluator(composite_backend)
+    gemma_selector = BackendGemmaSelector(composite_backend)
+    qwen_audit = BackendQwenAuditEvaluator(composite_backend)
+    gemma_audit = BackendGemmaAuditEvaluator(composite_backend)
+    result = run_chapter_strict(
+        cfg, runtime=runtime, model_caller=model_caller,
+        qwen_evaluator=qwen_evaluator, gemma_selector=gemma_selector,
+        qwen_audit_evaluator=qwen_audit, gemma_audit_evaluator=gemma_audit,
+    )
+    record = result.record
+    assert record["backend"]["kind"] == "composite"
+    # The observed OpenCode health version (fake server) flows into the
+    # composite coordinator's authoritative descriptor -> run record.
+    assert record["backend"]["observed_server_version"] == "1.18.18"
+    # Identity stability: the observed version is provenance only — the
+    # persisted identity still equals the composite config identity.
+    assert record["backend"]["identity_hash"] == composite_cfg.identity_hash
+    # The config-time composite descriptor stays None (identity base);
+    # the observed version comes from the runtime, never the config.
+    assert composite_cfg.build_descriptor().observed_server_version is None
+    # Every model call went through the real OpenCode wire contract.
+    assert fake.message_count() >= 4
 
 
 # ---------------------------------------------------------------------------

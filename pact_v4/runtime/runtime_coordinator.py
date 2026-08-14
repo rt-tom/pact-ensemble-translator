@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import logging
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Mapping, Optional, Protocol, Sequence
 
 from pact_v4.runtime.backend_protocol import (
@@ -500,7 +500,50 @@ class CompositeRuntimeCoordinator:
 
     @property
     def backend_descriptor(self) -> BackendDescriptor:
-        return self._descriptor
+        """Composite descriptor refreshed with observed server provenance.
+
+        The config-time descriptor (``self._descriptor``) is
+        identity-authoritative: it is what ``CompositeBackendConfig``
+        built and what ``identity_hash``/routing are derived from. After
+        the remote OpenCode sub-backend's preflight observes the live
+        health version, that observed version is propagated into the
+        composite descriptor so the authoritative persisted runtime/run-
+        record backend provenance records what the run actually ran on
+        (review UPGRADE-SERVE-1.18 MEDIUM, composite follow-up). The
+        observed version is deliberately excluded from ``identity_hash``
+        (version-agnostic policy), so the refresh never changes cache/
+        resume identity.
+
+        The descriptor is rebuilt via ``dataclasses.replace`` (identity
+        fields unchanged, ``identity_hash`` recomputed from the same
+        identity payload). Sub-backends that never observed a version
+        (local backends, or a preflight not yet run) leave it ``None``.
+        """
+        observed = self._observed_server_version()
+        if observed is None or observed == self._descriptor.observed_server_version:
+            return self._descriptor
+        return replace(self._descriptor, observed_server_version=observed)
+
+    def _observed_server_version(self) -> Optional[str]:
+        """The observed server version of the OpenCode sub-backend, if any.
+
+        When a composite ``CompletionBackend`` is attached it is the
+        authoritative source (it owns every sub-backend); otherwise fall
+        back to the first remote sub-coordinator's backend descriptor.
+        """
+        if self._backend is not None:
+            getter = getattr(self._backend, "observed_server_version", None)
+            if getter is not None:
+                version = getter()
+                if version:
+                    return version
+        if self._remote is not None:
+            descriptor = getattr(
+                getattr(self._remote, "backend", None), "descriptor", None,
+            )
+            if descriptor is not None:
+                return getattr(descriptor, "observed_server_version", None)
+        return None
 
     def event_count(self) -> int:
         return (self._local.event_count() if self._local else 0) + (

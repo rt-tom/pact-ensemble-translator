@@ -53,6 +53,7 @@ from pact_v4.runtime.json_resilience import JsonRetryPolicy
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.opencode_backend import (
+    OPENCODE_PINNED_SERVER_VERSION,
     OpenCodeServerBackend,
     OpenCodeServerBackendConfig,
     RemoteBudget,
@@ -516,6 +517,26 @@ class CompositeCompletionBackend:
     @property
     def descriptor(self) -> BackendDescriptor:
         return self._descriptor
+
+    def observed_server_version(self) -> Optional[str]:
+        """The observed OpenCode health version of the sub-backend, if any.
+
+        Composite shape today is at most one remote OpenCode sub-backend
+        (1-local + 1-remote, per ``CompositeBackendConfig.build_runtime``
+        docs), so the first non-``None`` observed version among the
+        sub-backends is authoritative for the composite descriptor. Local
+        sub-backends never observe a server version (their descriptors
+        carry ``None``).
+        """
+        for backend in self._sub.values():
+            version = getattr(
+                getattr(backend, "descriptor", None),
+                "observed_server_version",
+                None,
+            )
+            if version:
+                return version
+        return None
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         name = self._ref_to_name.get(request.model_ref)
@@ -1520,7 +1541,8 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             hostname=managed.get("hostname", DEFAULT_HOSTNAME),
             port=int(managed.get("port", 4096)),
             pinned_server_version=managed.get(
-                "pinned_server_version", payload.get("pinned_server_version", "1.4.7")
+                "pinned_server_version",
+                payload.get("pinned_server_version", OPENCODE_PINNED_SERVER_VERSION),
             ),
             server_version_policy=managed.get(
                 "server_version_policy",
@@ -1570,7 +1592,7 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             payload.get("server_version_policy", "compatible_minor")
         ),
         pinned_server_version=str(
-            payload.get("pinned_server_version", "1.4.7")
+            payload.get("pinned_server_version", OPENCODE_PINNED_SERVER_VERSION)
         ),
         username_env=str(username_env or "OPENCODE_SERVER_USERNAME"),
         password_env=str(password_env or "OPENCODE_SERVER_PASSWORD"),
