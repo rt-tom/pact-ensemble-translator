@@ -1150,6 +1150,51 @@ def build_reasoning_effort_map(
     return {level: nearest_declared_effort(level, variants) for level in (1, 2, 3)}
 
 
+# Roles the runtime resolves through a documented fallback when a composite
+# profile omits them: ``repair`` rides the generator binding
+# (``backend_role_adapters`` resolves ("repair", "generator");
+# ``selective_repair.repair_model_ref`` uses ("generator", "default")) and
+# ``entity_extractor`` is derived from the audit (Qwen) model at runtime
+# (B3 ``_EntityRoleView``). The provider override follows the same chain so
+# ``--translator``/``--reviewer`` do not turn a valid composite into a
+# "role is not routed" error.
+_COMPOSITE_ROLE_FALLBACKS = {
+    ROLE_REPAIR: ROLE_GENERATOR,
+    ROLE_ENTITY_EXTRACTOR: ROLE_QWEN_AUDIT,
+}
+
+
+def _composite_role_backend_name(
+    cfg: CompositeBackendConfig, role: str
+) -> Optional[str]:
+    """The sub-backend serving ``role`` in a composite profile (or ``None``).
+
+    Resolution order mirrors the runtime: an explicit ``role_backend_map``
+    entry wins; else the first sub-backend whose descriptor declares the
+    role; else the documented role fallback (``repair`` -> ``generator``,
+    ``entity_extractor`` -> ``qwen_audit``) resolved the same way (explicit
+    route first, then a sub-backend declaring the fallback role or
+    ``default`` — the same first-wins rule ``_generator_backend_name`` uses).
+    """
+    backend_name = cfg.role_backend_map.get(role)
+    if backend_name is not None:
+        return backend_name
+    for name, sub in cfg.backends.items():
+        if role in (sub.build_descriptor().model_bindings or {}):
+            return name
+    fallback_role = _COMPOSITE_ROLE_FALLBACKS.get(role)
+    if fallback_role is None:
+        return None
+    backend_name = cfg.role_backend_map.get(fallback_role)
+    if backend_name is not None:
+        return backend_name
+    for name, sub in cfg.backends.items():
+        bindings = sub.build_descriptor().model_bindings or {}
+        if fallback_role in bindings or "default" in bindings:
+            return name
+    return None
+
+
 def apply_role_models(
     cfg: Any,
     role_models: Mapping[str, str],
@@ -1160,10 +1205,12 @@ def apply_role_models(
     OpenCode backend(s) get their ``model_bindings`` updated for the mapped
     roles. A composite profile routes each role to its backend via
     ``role_backend_map`` (falling back to the first sub-backend declaring
-    the role), so the override is applied per-role to the routing backend;
-    a role that routes to a LOCAL backend fails loudly — local models are
-    bound by name and cannot serve a remote provider ref, and silently
-    dropping the override would make the flag a no-op.
+    the role, then to the documented runtime fallback role — ``repair`` ->
+    ``generator``, ``entity_extractor`` -> ``qwen_audit``), so the override
+    is applied per-role to the routing backend; a role that routes to a
+    LOCAL backend fails loudly — local models are bound by name and cannot
+    serve a remote provider ref, and silently dropping the override would
+    make the flag a no-op.
     """
     if not role_models:
         return cfg
@@ -1176,21 +1223,13 @@ def apply_role_models(
     if isinstance(cfg, CompositeBackendConfig):
         new_backends = dict(cfg.backends)
         for role, ref in role_models.items():
-            backend_name = cfg.role_backend_map.get(role)
-            if backend_name is None:
-                backend_name = next(
-                    (
-                        name
-                        for name, sub in cfg.backends.items()
-                        if role in (sub.build_descriptor().model_bindings or {})
-                    ),
-                    None,
-                )
+            backend_name = _composite_role_backend_name(cfg, role)
             if backend_name is None:
                 raise ValueError(
                     f"apply_role_models: role {role!r} is not routed by the "
-                    "composite profile (role_backend_map has no entry and no "
-                    "sub-backend declares it)"
+                    "composite profile (role_backend_map has no entry, no "
+                    "sub-backend declares it, and no documented runtime "
+                    "fallback role resolves it)"
                 )
             sub = new_backends[backend_name]
             if isinstance(sub, LocalLlamaBackendConfig):

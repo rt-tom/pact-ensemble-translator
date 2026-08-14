@@ -16,6 +16,7 @@ cache/resume is not replayed.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -303,6 +304,197 @@ def test_apply_role_models_rejects_local_backend():
     )
     with pytest.raises(ValueError, match="local_llama"):
         apply_role_models(local, {"generator": "opencode-go/deepseek-v4-flash"})
+
+
+# ---------------------------------------------------------------------------
+# Composite fallbacks (RV t_43b5e788 findings on 394e38e)
+# ---------------------------------------------------------------------------
+
+
+def _composite_cfg(
+    *, include_repair: bool = False, include_entity_extractor: bool = False,
+) -> Any:
+    """A valid composite: translator/audit roles on a remote opencode
+    sub-backend, gemma_audit on a local sub-backend.
+
+    ``repair``/``entity_extractor`` are omitted from BOTH the routing map
+    and the sub-backend bindings unless requested — the runtime resolves
+    them via documented fallbacks (repair -> generator, entity_extractor ->
+    qwen_audit via B3 _EntityRoleView).
+    """
+    from pact_v4.runtime.runtime_config import (
+        CompositeBackendConfig,
+        LocalLlamaBackendConfig,
+    )
+
+    bindings = {
+        "generator": "opencode-go/deepseek-v4-flash",
+        "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+        "russian_selector": "opencode-go/qwen3.7-plus",
+        "qwen_audit": "opencode-go/qwen3.7-plus",
+        "gemma_audit": "opencode-go/deepseek-v4-flash",
+    }
+    if include_repair:
+        bindings["repair"] = "opencode-go/deepseek-v4-flash"
+    if include_entity_extractor:
+        bindings["entity_extractor"] = "opencode-go/qwen3.7-plus"
+    remote = OpenCodeBackendConfig(
+        server=OpenCodeServerBackendConfig(
+            base_url="http://127.0.0.1:4096",
+            username="pact",
+            password="secret",
+            model_bindings=bindings,
+            structured_output_mode="prompt_only",
+        )
+    )
+    local = LocalLlamaBackendConfig(
+        exe=Path("C:/fake/llama-server.exe"), device="FAKE0", host="127.0.0.1",
+        model_paths={"gemma": Path("C:/fake/gemma.gguf")},
+        model_names={"gemma": "gemma-fake"},
+        server_args={"gemma": []},
+    )
+    role_backend_map = {
+        "generator": "opencode",
+        "fidelity_reviewer": "opencode",
+        "russian_selector": "opencode",
+        "qwen_audit": "opencode",
+        "gemma_audit": "local",
+    }
+    if include_repair:
+        role_backend_map["repair"] = "opencode"
+    if include_entity_extractor:
+        role_backend_map["entity_extractor"] = "opencode"
+    return CompositeBackendConfig(
+        backends={"opencode": remote, "local": local},
+        role_backend_map=role_backend_map,
+    )
+
+
+def test_translator_composite_repair_falls_back_to_generator(
+    registry: ProvidersRegistry,
+):
+    # RV finding 1: a composite routing generator to a remote sub-backend and
+    # omitting repair must allow --translator — repair resolves to the same
+    # remote backend/model as generator (documented repair -> generator
+    # fallback), NOT a ValueError.
+    cfg = _composite_cfg()
+    applied = apply_provider_flags(
+        cfg, registry, translator="opencode-go/deepseek4flash"
+    )
+    opencode = applied.backends["opencode"]
+    bindings = opencode.server.model_bindings
+    assert bindings["generator"] == "opencode-go/deepseek-v4-flash"
+    assert bindings["repair"] == "opencode-go/deepseek-v4-flash"
+    # Reasoning contract stays correct on the generator backend.
+    assert opencode.server.reasoning_effort_map == {1: "low", 2: "high", 3: "high"}
+    # Identity changed (flag = new backend identity, cache not replayed).
+    assert applied.identity_hash != cfg.identity_hash
+
+
+def test_translator_composite_explicit_repair_route_still_wins(
+    registry: ProvidersRegistry,
+):
+    # Explicit repair route/binding keeps working (fallback must not shadow it).
+    cfg = _composite_cfg(include_repair=True)
+    applied = apply_provider_flags(
+        cfg, registry, translator="opencode-go/deepseek4flash"
+    )
+    bindings = applied.backends["opencode"].server.model_bindings
+    assert bindings["generator"] == "opencode-go/deepseek-v4-flash"
+    assert bindings["repair"] == "opencode-go/deepseek-v4-flash"
+
+
+def test_reviewer_composite_entity_extractor_falls_back_to_qwen_audit(
+    registry: ProvidersRegistry,
+):
+    # RV finding 2: --reviewer on a composite whose audit roles route to a
+    # remote backend but entity_extractor is absent must resolve it from
+    # qwen_audit (the B3 _EntityRoleView path), not raise "not routed".
+    cfg = _composite_cfg()
+    applied = apply_provider_flags(cfg, registry, reviewer="openai/luna")
+    opencode = applied.backends["opencode"]
+    bindings = opencode.server.model_bindings
+    assert bindings["qwen_audit"] == "openai/gpt-5.6-luna"
+    assert bindings["fidelity_reviewer"] == "openai/gpt-5.6-luna"
+    assert bindings["russian_selector"] == "openai/gpt-5.6-luna"
+    assert bindings["entity_extractor"] == "openai/gpt-5.6-luna"
+    # Generator/repair/gemma_audit untouched by --reviewer.
+    assert bindings["generator"] == "opencode-go/deepseek-v4-flash"
+    assert bindings["gemma_audit"] == "opencode-go/deepseek-v4-flash"
+    assert applied.identity_hash != cfg.identity_hash
+
+
+def test_reviewer_composite_explicit_entity_extractor_route_still_wins(
+    registry: ProvidersRegistry,
+):
+    cfg = _composite_cfg(include_entity_extractor=True)
+    applied = apply_provider_flags(cfg, registry, reviewer="openai/luna")
+    bindings = applied.backends["opencode"].server.model_bindings
+    assert bindings["entity_extractor"] == "openai/gpt-5.6-luna"
+    assert bindings["qwen_audit"] == "openai/gpt-5.6-luna"
+
+
+def test_composite_role_routed_to_local_backend_fails_loudly():
+    # Fail-closed preserved: a role that routes to a LOCAL backend (here
+    # russian_selector) cannot serve a remote provider ref.
+    from pact_v4.runtime.runtime_config import (
+        CompositeBackendConfig,
+        LocalLlamaBackendConfig,
+    )
+
+    remote = OpenCodeBackendConfig(
+        server=OpenCodeServerBackendConfig(
+            base_url="http://127.0.0.1:4096",
+            username="pact",
+            password="secret",
+            model_bindings={
+                "generator": "opencode-go/deepseek-v4-flash",
+                "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+                "qwen_audit": "opencode-go/qwen3.7-plus",
+            },
+            structured_output_mode="prompt_only",
+        )
+    )
+    local = LocalLlamaBackendConfig(
+        exe=Path("C:/fake/llama-server.exe"), device="FAKE0", host="127.0.0.1",
+        model_paths={"gemma": Path("C:/fake/gemma.gguf")},
+        model_names={"gemma": "gemma-fake"},
+        server_args={"gemma": []},
+    )
+    cfg = CompositeBackendConfig(
+        backends={"opencode": remote, "local": local},
+        role_backend_map={
+            "generator": "opencode",
+            "fidelity_reviewer": "opencode",
+            "qwen_audit": "opencode",
+            "russian_selector": "local",
+        },
+    )
+    with pytest.raises(ValueError, match="local backend"):
+        apply_role_models(cfg, {"russian_selector": "openai/gpt-5.6-luna"})
+
+
+def test_composite_fallback_resolving_to_local_backend_fails_loudly():
+    # RV requirement 3: the resolved FALLBACK backend may be local — that
+    # stays fail-closed (no silent no-op). A composite whose only generator
+    # binding lives on a local backend must refuse the repair override.
+    from pact_v4.runtime.runtime_config import (
+        CompositeBackendConfig,
+        LocalLlamaBackendConfig,
+    )
+
+    local = LocalLlamaBackendConfig(
+        exe=Path("C:/fake/llama-server.exe"), device="FAKE0", host="127.0.0.1",
+        model_paths={"gemma": Path("C:/fake/gemma.gguf")},
+        model_names={"gemma": "gemma-fake"},
+        server_args={"gemma": []},
+    )
+    cfg = CompositeBackendConfig(
+        backends={"local": local},
+        role_backend_map={"generator": "local"},
+    )
+    with pytest.raises(ValueError, match="local backend"):
+        apply_role_models(cfg, {"repair": "opencode-go/deepseek-v4-flash"})
 
 
 def test_provider_model_validation():
