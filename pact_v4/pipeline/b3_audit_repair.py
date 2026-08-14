@@ -601,6 +601,7 @@ def _validate_partial_payload(
     *,
     expected_pids: Optional[Sequence[str]],
     current_text: Optional[Mapping[str, str]],
+    r_editor_enabled: bool,
 ) -> Optional[str]:
     """Validate the complete PARTIAL-RESUME replay payload.
 
@@ -623,7 +624,12 @@ def _validate_partial_payload(
       tiled ``chunks`` list (contiguous 1..M, chunk_size-boundary
       coverage); when R was disabled/failed the ``outcome`` must be null —
       a malformed/missing R outcome is a full miss, never a partial replay
-      while audit issues stay reusable;
+      while audit issues stay reusable; FIX RV2-B (t_a4f8f2b2): when the
+      CURRENT run enables R the report itself is REQUIRED — ``r_editor``
+      None/missing (an enabled run always persists a report dict, even for
+      a failed stage) is a full miss BEFORE either resume plan is built;
+      ``r_editor`` None is legitimate only when R is disabled (save()
+      writes null for the disabled stage);
     * every cached R edit: object shape, exact string types, PID
       membership (in the translation map AND inside the chunk's own
       boundary span), known class, and (when ``current_text`` is
@@ -744,6 +750,19 @@ def _validate_partial_payload(
                 )
 
     r_editor = payload.get("r_editor")
+    # FIX RV2-B (t_a4f8f2b2): an enabled-R partial cache ALWAYS carries a
+    # report dict (_build_r_editor_report persists one on every enabled run,
+    # including a failed stage), so r_editor None/missing means the report
+    # was deleted or is a foreign-schema payload — a FULL miss BEFORE either
+    # resume plan is built, never a partial replay while the audit GOOD
+    # chunks stay reusable. When the CURRENT run has R disabled, r_editor
+    # None is the legitimate disabled representation (save() writes null)
+    # and is accepted by design.
+    if r_editor is None and r_editor_enabled:
+        return (
+            "r_editor is required when the R stage is enabled "
+            "(missing/None report)"
+        )
     if r_editor is not None and not isinstance(r_editor, dict):
         return "r_editor is not an object or null"
     if isinstance(r_editor, dict):
@@ -762,6 +781,15 @@ def _validate_partial_payload(
             return f"r_editor.status is missing or unknown {report_status!r}"
         if not isinstance(r_editor.get("enabled"), bool):
             return "r_editor.enabled is not a bool"
+        # FIX RV2-B (t_a4f8f2b2): an enabled-R run always persists a report
+        # with enabled=True (_build_r_editor_report records the config flag
+        # verbatim) — a stored disabled report inside an enabled-R partial
+        # cache is internally inconsistent (tampered) and fails closed.
+        if r_editor_enabled and not r_editor.get("enabled"):
+            return (
+                "r_editor.enabled must be true when the R stage is enabled "
+                "(stored disabled report in an enabled-R partial cache)"
+            )
         outcome = r_editor.get("outcome")
         if report_status in _R_EDITOR_RAN_STATUSES:
             # R ran: outcome REQUIRED with a non-empty chunks list.
@@ -960,6 +988,11 @@ class B3AuditCache:
         harness_version: str,
         entity_context_hash: Optional[str],
         entity_context_enabled: bool,
+        # FIX RV2-B (t_a4f8f2b2): the CURRENT run's R enablement decides
+        # whether a missing/None stored r_editor is a schema violation
+        # (R enabled — the report is REQUIRED) or the legitimate disabled
+        # representation (R disabled — save() writes null).
+        r_editor_enabled: bool,
         expected_pids: Optional[Sequence[str]] = None,
         current_text: Optional[Mapping[str, str]] = None,
     ) -> Optional["B3AuditCache"]:
@@ -1052,11 +1085,15 @@ class B3AuditCache:
             # (the audit re-runs), never a partial replay. A tampered
             # payload can no longer publish unauthorized issues/edits with
             # 0 model calls while identity and translations_repaired_hash
-            # stay intact.
+            # stay intact. FIX RV2-B (t_a4f8f2b2): for an enabled-R cache
+            # the R report itself is part of that required payload —
+            # a missing/None stored r_editor is rejected here (full miss)
+            # before either resume plan is built.
             reason = _validate_partial_payload(
                 payload,
                 expected_pids=expected_pids,
                 current_text=current_text,
+                r_editor_enabled=r_editor_enabled,
             )
             if reason is not None:
                 LOG.warning(
@@ -1671,6 +1708,11 @@ class B3AuditRepair:
             harness_version=cfg.harness_version,
             entity_context_hash=entity_hash,
             entity_context_enabled=cfg.entity_context_enabled,
+            # FIX RV2-B (t_a4f8f2b2): the current run's R enablement decides
+            # whether a missing stored r_editor is a full miss (R enabled —
+            # the report is REQUIRED) or the legitimate disabled null (R
+            # disabled, save() writes null).
+            r_editor_enabled=cfg.russian_editor_enabled,
             # F4: exact PID set/order validation — a cache whose
             # translations_repaired has missing/extra/reordered PIDs is a miss.
             expected_pids=tuple(translation_map),
