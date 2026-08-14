@@ -360,19 +360,52 @@ def _edit_to_payload(edit: EditorEdit) -> Dict[str, Any]:
     }
 
 
-def _edit_from_payload(item: Mapping[str, Any]) -> EditorEdit:
-    """Rebuild one ``EditorEdit`` from a cached payload (PARTIAL-RESUME).
+def _edit_from_payload(
+    item: Mapping[str, Any],
+    *,
+    chunk_pids: Sequence[str],
+    current_by_pid: Mapping[str, str],
+) -> Optional[EditorEdit]:
+    """Strictly rebuild one ``EditorEdit`` from a cached payload.
 
-    The payload was produced by ``_edit_to_payload`` from a parse-validated
-    edit (already structurally valid at write time — the resume contract
-    does NOT re-validate replayed GOOD-chunk edits).
+    PARTIAL-RESUME integrity (t_ec6bb8bc): the cached edit is re-validated
+    with the SAME fail-closed contract as ``parse_editor_edits`` — exact
+    string types, PID membership in the current chunk, the verbatim
+    current-text substring constraint, and a known class. A malformed /
+    non-object / mismatched edit returns None and the caller RE-RUNS the
+    chunk instead of replaying it; fields are never stringified or coerced,
+    so a tampered cache payload can never be promoted into an applied edit.
+    (The audit cache additionally binds the whole partial payload to a
+    canonical hash in ``B3AuditCache.load`` — this consumer-side check is
+    the second line of defense for direct evaluator use.)
     """
+    if not isinstance(item, Mapping):
+        return None
+    pid = item.get("pid")
+    original = item.get("original")
+    rewritten = item.get("rewritten")
+    reason = item.get("reason")
+    klass = item.get("class")
+    if not isinstance(pid, str) or not pid:
+        return None
+    if pid not in chunk_pids:
+        return None
+    if not isinstance(original, str) or not original:
+        return None
+    if original not in str(current_by_pid.get(pid, "")):
+        return None
+    if not isinstance(rewritten, str) or not rewritten.strip():
+        return None
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    if not isinstance(klass, str) or klass not in ALL_CLASSES:
+        return None
     return EditorEdit(
-        pid=str(item.get("pid", "")),
-        original=str(item.get("original", "")),
-        rewritten=str(item.get("rewritten", "")),
-        reason=str(item.get("reason", "")),
-        klass=str(item.get("class", "")),
+        pid=pid,
+        original=original,
+        rewritten=rewritten,
+        reason=reason.strip(),
+        klass=klass,
     )
 
 
@@ -696,31 +729,53 @@ class RussianEditorEvaluator:
             cached = (cached_chunks or {}).get(chunk_index)
             if cached is not None and cached.get("status") == "GOOD":
                 if str(cached.get("first_pid")) == chunk_pids[0]:
-                    cached_edits = tuple(
-                        _edit_from_payload(item)
-                        for item in (cached.get("edits") or ())
+                    # PARTIAL-RESUME integrity (t_ec6bb8bc): every cached
+                    # edit is re-validated with the SAME fail-closed contract
+                    # as a fresh parse (types, chunk-PID membership, verbatim
+                    # current-text substring, known class). A single
+                    # malformed/non-object/mismatched edit fails the WHOLE
+                    # chunk replay — the chunk is re-run, never partially
+                    # replayed, and never stringified/coerced into an edit.
+                    cached_edits: Optional[List[EditorEdit]] = []
+                    for item in (cached.get("edits") or ()):
+                        edit = _edit_from_payload(
+                            item,
+                            chunk_pids=chunk_pids,
+                            current_by_pid=dict(translation),
+                        )
+                        if edit is None:
+                            cached_edits = None
+                            break
+                        cached_edits.append(edit)
+                    if cached_edits is not None:
+                        all_edits.extend(cached_edits)
+                        chunk_records.append({
+                            "chunk": chunk_index,
+                            "first_pid": chunk_pids[0],
+                            "last_pid": chunk_pids[-1],
+                            "status": "GOOD",
+                            "edits": [
+                                _edit_to_payload(e) for e in cached_edits
+                            ],
+                        })
+                        self._emit_chunk_event(
+                            "done", chunk=chunk_index, total=len(chunks),
+                            status="GOOD", edit_count=len(cached_edits),
+                            reused=True,
+                        )
+                        continue
+                    LOG.warning(
+                        "russian_editor chunk %d: cached GOOD chunk edits "
+                        "are malformed or mismatched — re-running this "
+                        "chunk (fail-closed, never replayed)",
+                        chunk_index,
                     )
-                    all_edits.extend(cached_edits)
-                    chunk_records.append({
-                        "chunk": chunk_index,
-                        "first_pid": chunk_pids[0],
-                        "last_pid": chunk_pids[-1],
-                        "status": "GOOD",
-                        "edits": [
-                            _edit_to_payload(e) for e in cached_edits
-                        ],
-                    })
-                    self._emit_chunk_event(
-                        "done", chunk=chunk_index, total=len(chunks),
-                        status="GOOD", edit_count=len(cached_edits),
-                        reused=True,
+                else:
+                    LOG.warning(
+                        "russian_editor chunk %d: cached GOOD chunk first_pid "
+                        "mismatch (%r vs %r) — re-running this chunk (fail-closed)",
+                        chunk_index, cached.get("first_pid"), chunk_pids[0],
                     )
-                    continue
-                LOG.warning(
-                    "russian_editor chunk %d: cached GOOD chunk first_pid "
-                    "mismatch (%r vs %r) — re-running this chunk (fail-closed)",
-                    chunk_index, cached.get("first_pid"), chunk_pids[0],
-                )
             context_pairs = get_editor_overlap(
                 pairs, chunk_pairs[0].pid, cfg.overlap_pairs
             )
