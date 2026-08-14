@@ -525,6 +525,51 @@ class ApiClient:
             f"{int(self._cfg.http_retries)} attempts: {last_error}"
         )
 
+    @staticmethod
+    def _escape_controls_in_strings(text: str) -> str:
+        """Escape raw control characters inside JSON string literals.
+
+        llama.cpp's SSE writer emits ``reasoning_content`` with RAW newlines
+        (and other control chars) inside the JSON string — invalid JSON that
+        ``json.loads`` rejects with ``Invalid control character``. This
+        string-aware scan walks the text tracking string/escape state and
+        replaces a raw ``\\n``/``\\r``/``\\t`` ONLY inside a string literal
+        with the escaped ``\\\\n`` form (so the decoded value keeps the
+        original line break). Characters outside strings are left untouched.
+        """
+        out: List[str] = []
+        in_string = False
+        escaped = False
+        for ch in text:
+            if in_string:
+                if escaped:
+                    out.append(ch)
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    escaped = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                    out.append(ch)
+                    continue
+                if ch == "\n":
+                    out.append("\\n")
+                    continue
+                if ch == "\r":
+                    out.append("\\r")
+                    continue
+                if ch == "\t":
+                    out.append("\\t")
+                    continue
+                out.append(ch)
+            else:
+                if ch == '"':
+                    in_string = True
+                out.append(ch)
+        return "".join(out)
+
     def _consume_sse(
         self,
         response,
@@ -563,24 +608,59 @@ class ApiClient:
         usage: Dict[str, Any] = {}
         saw_data_line = False
         saw_terminal = False
-        for raw_line in response.iter_lines(decode_unicode=True):
+        # SSE-fix (architect, book_run 2026-08-13): llama-server streams
+        # reasoning_content as UTF-8 WITHOUT a charset in Content-Type, and
+        # the reasoning text may contain raw newlines that split a JSON
+        # event across lines. `iter_lines(decode_unicode=True)` decodes each
+        # line with the response encoding (Latin-1 default) AND treats every
+        # physical line as a complete event — both corrupt the payload:
+        # Cyrillic becomes mojibake ("Ñ ÑÐµÐ") and a JSON event broken by an
+        # embedded newline fails json.loads (malformed SSE -> batch
+        # fallback -> the whole-chapter prompt is re-processed from scratch).
+        # Fix: iterate BYTES, decode UTF-8 explicitly, and ACCUMULATE a
+        # buffer until the accumulated data parses as one JSON event
+        # (bounded, fail-closed on runaway garbage).
+        _sse_buffer = ""
+        _SSE_BUFFER_LIMIT = 1_000_000  # sanity cap for a single event
+        for raw_line in response.iter_lines(decode_unicode=False):
             if not raw_line:
                 continue
-            line = raw_line.strip()
+            # Robust to both bytes (production: requests iter_lines) and str
+            # (unit-test mocks): decode bytes as UTF-8 explicitly.
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+            else:
+                line = raw_line.strip()
             if not line.startswith("data:"):
-                continue
-            saw_data_line = True
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                saw_terminal = True
-                break
-            try:
-                chunk = json.loads(data)
-            except ValueError as exc:
+                # Continuation of a JSON event split by a raw newline inside
+                # reasoning_content (llama-server): the physical line after
+                # the break has NO "data:" prefix. Only append when we are
+                # mid-event (buffer non-empty); a bare unrelated line is
+                # ignored as before. The lost newline is restored so the
+                # reasoning text keeps its line breaks (escaped below).
+                if _sse_buffer:
+                    _sse_buffer += "\n" + line
+                else:
+                    continue
+            else:
+                saw_data_line = True
+                piece = line[len("data:"):].strip()
+                if piece == "[DONE]":
+                    saw_terminal = True
+                    break
+                _sse_buffer += piece
+            if len(_sse_buffer) > _SSE_BUFFER_LIMIT:
                 raise ApiClientError(
-                    f"{self._name}: malformed SSE data payload (not JSON): "
-                    f"{data[:200]!r}"
-                ) from exc
+                    f"{self._name}: SSE data payload exceeds "
+                    f"{_SSE_BUFFER_LIMIT} chars without forming valid JSON"
+                )
+            try:
+                chunk = json.loads(self._escape_controls_in_strings(_sse_buffer))
+            except ValueError:
+                # The event is split across lines (embedded newline in
+                # reasoning_content) — keep accumulating.
+                continue
+            _sse_buffer = ""
             try:
                 choice = chunk["choices"][0]
             except (KeyError, TypeError, IndexError):
@@ -615,6 +695,13 @@ class ApiClient:
                 f"stream=True request"
             )
         if not saw_terminal:
+            if _sse_buffer:
+                # Accumulated data that never formed valid JSON: fail closed
+                # as malformed (the historical contract), not truncated.
+                raise ApiClientError(
+                    f"{self._name}: malformed SSE data payload (not JSON): "
+                    f"{_sse_buffer[:200]!r}"
+                )
             raise ApiClientError(
                 f"{self._name}: truncated SSE stream: connection ended "
                 f"before [DONE] or a terminal finish_reason"

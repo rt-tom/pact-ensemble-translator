@@ -429,6 +429,50 @@ def test_complete_streams_reasoning_live_via_callback():
     assert session.posts[0]["stream"] is True
 
 
+def test_complete_streams_cyrillic_reasoning_with_embedded_newline():
+    """SSE-fix (architect, book_run 2026-08-13): llama-server streams
+    reasoning_content as raw UTF-8 (no charset) and the reasoning may embed
+    real newlines that split one JSON event across physical lines. The old
+    per-line json.loads treated each line as a complete event: Cyrillic
+    decoded as Latin-1 became mojibake and an embedded newline broke JSON
+    (malformed SSE -> batch fallback -> whole-chapter prompt re-processed).
+    The buffer-based reader must reconstruct the split event, decode UTF-8
+    correctly, and deliver the full reasoning to the sink."""
+    # One JSON event physically split by a RAW newline inside reasoning:
+    # llama-server emits data: {json} where reasoning_content contains real
+    # line breaks, so iter_lines yields two physical lines for one event.
+    event = (
+        'data: {"choices": [{"delta": {"reasoning_content": "Думаю о '
+        'переводе главы,'
+    )
+    event2 = 'перенося строку"}, "finish_reason": null}]}'
+    lines = [
+        event,
+        event2,
+        'data: {"choices": [{"delta": {"content": "{\\"ok\\": true}"}, "finish_reason": null}]}',
+        'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}',
+        "data: [DONE]",
+    ]
+    session = _FakeSession([
+        _FakeStreamResponse(status_code=200, lines=lines)
+    ])
+    client = ApiClient(ApiClientConfig(), session=session)
+    received: List[str] = []
+
+    out = client.complete(
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+        label="stream-cyrillic",
+        on_reasoning_chunk=received.append,
+    )
+
+    assert out == '{"ok": true}'
+    assert received == ["Думаю о переводе главы,\nперенося строку"]
+    record = client.calls[0]
+    assert record.reasoning == "Думаю о переводе главы,\nперенося строку"
+    assert record.streamed is True
+
+
 def test_complete_without_callback_stays_batch():
     """No on_reasoning_chunk -> historical batch behaviour (stream=False),
     reasoning still captured from the batch message body."""
