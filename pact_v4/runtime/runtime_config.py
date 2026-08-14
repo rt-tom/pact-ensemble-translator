@@ -32,7 +32,6 @@ resolved at backend construction from the environment and never persisted
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
