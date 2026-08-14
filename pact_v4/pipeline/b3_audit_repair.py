@@ -94,11 +94,13 @@ from pact_v4.audit.chunked_audit import (
 from pact_v4.audit.entity_extractor import (
     EXTRACTOR_VERSION,
     STATUS_VERIFIED,
+    AliasRef,
     BackendEntityExtractor,
     BackendEntityExtractorConfig,
     ChapterEntityContext,
     EntityContextCache,
     EntityExtractionResult,
+    EntityRecord,
     extract_entity_context,
 )
 from pact_v4.audit.hard_filters import FilteredIssue, apply_hard_filters
@@ -174,6 +176,24 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _alias_is_source_apposed(record: EntityRecord, alias: AliasRef) -> bool:
+    """Code-proven source-established alias (RV3 HIGH, 2026-08-14).
+
+    A same-entity alias is a semantic coreference hypothesis the code
+    cannot confirm (point 8 of §8.3 downgrades every alias_relation /
+    object_identity claim to candidate). The ONLY alias whose coreference
+    is provable is one the source itself apposes to the canonical type:
+    the alias surface appears INSIDE the anchor span that names the
+    canonical type (same PID), e.g. ``"the woman, Rose"``. Any other
+    alias may reach the audit block but never the generation prompt.
+    """
+    if alias.pid != record.anchor.pid:
+        return False
+    anchor_norm = " ".join(record.anchor.span.lower().split())
+    surface_norm = " ".join(alias.surface.lower().split())
+    return bool(surface_norm) and surface_norm in anchor_norm
+
+
 def render_entity_context_block(
     context: ChapterEntityContext,
     *,
@@ -190,8 +210,12 @@ def render_entity_context_block(
     ``verified_only=True`` (generation-prompt variant, owner decision
     2026-08-14): only claims whose status is ``verified`` are rendered —
     candidate claims are semantic hypotheses and go ONLY to the audit
-    block, never to the translator's prompt. Anchor/alias spans are
-    code-verified by construction and always shown.
+    block, never to the translator's prompt. The anchor is code-verified
+    by construction and always shown. Aliases are filtered the same way
+    (RV3 HIGH): a same-entity alias is a semantic hypothesis unless the
+    source apposes it to the canonical type inside the anchor span, so
+    only ``_alias_is_source_apposed`` aliases are rendered here; every
+    other alias stays in the full audit block.
     """
     if not context.entities:
         return ""
@@ -202,13 +226,18 @@ def render_entity_context_block(
             if verified_only
             else list(record.claims)
         )
+        aliases = record.aliases
+        if verified_only:
+            aliases = tuple(
+                a for a in record.aliases if _alias_is_source_apposed(record, a)
+            )
         lines.append(f"- entity: {record.entity}")
         lines.append(f"  established_type: {record.canonical_type}")
         anchor = record.anchor
         lines.append(
             f"  anchor: \"{anchor.span}\" (pid {anchor.pid}, {anchor.status})"
         )
-        for alias in record.aliases:
+        for alias in aliases:
             lines.append(
                 f"  alias: \"{alias.surface}\" (pid {alias.pid}, {alias.status})"
             )

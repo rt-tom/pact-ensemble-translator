@@ -693,6 +693,84 @@ def test_b3_entity_facts_verified_in_gen_prompt_candidate_only_audit(
     assert "gender='male'" in full_block and "gender='male'" in verified_block
     assert "alias_relation" in full_block
     assert "alias_relation" not in verified_block
+    # RV3 HIGH: the alias of a candidate semantic relation ("Rich" is the
+    # nurse only because the model hypothesized it) must NOT reach the
+    # generation prompt either — the alias is the hypothesis expressed.
+    assert 'alias: "Rich"' in full_block
+    assert 'alias: "Rich"' not in verified_block
+
+
+def test_b3_verified_only_alias_source_apposed_only(tmp_path: Path) -> None:
+    """RV3 HIGH regression (P0 2026-08-14): in verified_only mode ONLY
+    code-proven source-apposed aliases reach the generation prompt; a
+    candidate-derived alias (canonical motorcycle, alias bike, candidate
+    object_identity bike=motorcycle) stays in the full audit block.
+
+    The anchor is the fragment that names the canonical type; an alias
+    whose surface appears INSIDE that same span (same PID, e.g. ``"the
+    woman, Rose"``) is apposed by the source itself — code-proven
+    coreference. Any other alias is a semantic hypothesis (point 8 of
+    §8.3), so rendering it as ``verified`` in the translator's prompt
+    would be a hypothesis leak.
+    """
+    from pact_v4.audit.entity_extractor import (
+        ENTITY_CONTEXT_SCHEMA,
+        EXTRACTOR_VERSION,
+        AnchorRef,
+        AliasRef,
+        ChapterEntityContext,
+        EvidenceRef,
+        EntityClaim,
+        EntityRecord,
+    )
+    from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
+
+    context = ChapterEntityContext(
+        schema=ENTITY_CONTEXT_SCHEMA,
+        extractor_version=EXTRACTOR_VERSION,
+        chapter_id="0001",
+        source_hash="abc",
+        entities=(
+            # Blake's vehicle: alias "bike" at a LATER PID is only a
+            # hypothesized same-object relation (candidate claim) — must
+            # never appear in the verified-only generation block.
+            EntityRecord(
+                entity="Blake's vehicle",
+                canonical_type="motorcycle",
+                anchor=AnchorRef(pid="p00001", span="the motorcycle"),
+                aliases=(AliasRef(surface="bike", pid="p00003", span="the bike"),),
+                claims=(
+                    EntityClaim(
+                        kind="object_identity", value="bike = motorcycle",
+                        status="candidate",
+                        evidence=(EvidenceRef(pid="p00003", span="the bike"),),
+                        evidence_windows=(("p00003", "p00003"),),
+                    ),
+                ),
+            ),
+            # "the woman, Rose": the source apposes "Rose" to the
+            # canonical type inside the anchor span (same PID) — the
+            # coreference is code-proven, so the alias survives in the
+            # verified-only block.
+            EntityRecord(
+                entity="Rose",
+                canonical_type="woman",
+                anchor=AnchorRef(pid="p00002", span="the woman, Rose"),
+                aliases=(AliasRef(surface="Rose", pid="p00002", span="Rose"),),
+                claims=(),
+            ),
+        ),
+    )
+    full_block = render_entity_context_block(context)
+    verified_block = render_entity_context_block(context, verified_only=True)
+    # Candidate-derived alias: audit block keeps it, generation block not.
+    assert 'alias: "bike"' in full_block
+    assert 'alias: "bike"' not in verified_block
+    assert "object_identity" in full_block
+    assert "object_identity" not in verified_block
+    # Source-apposed alias: present in BOTH blocks.
+    assert 'alias: "Rose"' in full_block
+    assert 'alias: "Rose"' in verified_block
 
 
 def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:

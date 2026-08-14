@@ -703,8 +703,11 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
     here and threading it into every adapter at construction time is the
     only point where the v4 model actually sees narrator
     gender/characters/facts — everywhere ``run_chapter_strict`` would not
-    re-render the bible. When no ``chapter_index.json`` exists the
-    renderer falls back to the legacy full-memory render.
+    re-render the bible. When ``chapter_index.json`` is missing or has no
+    entry for the chapter, the renderer fails SOFT to the minimum —
+    narrator + explicit ``seed: true`` global facts — NEVER the legacy
+    full-memory dump (owner decision 2026-08-14: no future-chapter
+    leakage).
     """
     from pact_v4.runtime.bible_renderer import render_bible_section
     from pact_v4.runtime.snapshot_factory import ChapterMemory
