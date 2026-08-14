@@ -87,6 +87,7 @@ from pact_v4.audit.russian_editor import (
     DEFAULT_RETRY_BASE_DELAY_SECONDS as RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS,
     MAX_EDITS_PER_PID as RUSSIAN_EDITOR_MAX_EDITS_PER_PID,
 )
+from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
 from pact_v4.phase0b.source_html import SourceBlock, load_source
 from pact_v4.phase1.chunker import (
     DEFAULT_MAX_WORDS,
@@ -283,6 +284,13 @@ class StrictRunConfig:
     deterministic_glossary_terms: Tuple[Tuple[str, str], ...] = ()
     deterministic_names: Tuple[Tuple[str, str], ...] = ()
     deterministic_mixed_script_allow: Tuple[str, ...] = ()
+    # P1 АРКИ (owner decision 2026-08-14): deterministic English→Russian
+    # arc-name mapping (arc_names.json), e.g. ("Bonds", "Узы"). Rendered as
+    # an "АРКИ:" block in the whole-chapter generation prompt so chapter
+    # headings translate consistently (Bonds = Узы in every chapter). Part
+    # of the config identity (to_config_artifact) — changing the mapping
+    # invalidates cache/resume exactly like any other prompt input.
+    deterministic_arc_names: Tuple[Tuple[str, str], ...] = ()
     config_version: str = "pact-v4-driver/phase12/strict/v1"
     run_label: str = "v4-phase12-strict"
     # Operational policy pinned before the run (see module docstring #4),
@@ -475,6 +483,13 @@ class StrictRunConfig:
                 # input, so it is part of the run's config identity — changing it
                 # invalidates cache/resume exactly like a memory/source change.
                 "deterministic_mixed_script_allow": list(self.deterministic_mixed_script_allow),
+                # P1 АРКИ (owner decision 2026-08-14): the deterministic arc
+                # mapping renders an "АРКИ:" block into the generation prompt,
+                # so it is part of the config identity — a changed mapping
+                # invalidates cache/resume exactly like a glossary change.
+                "deterministic_arc_names": [
+                    list(pair) for pair in self.deterministic_arc_names
+                ],
                 # V4 Efficiency A1.1 (review fix, HIGH): the glossary budgeter
                 # changes the actual generation prompts, so the policy version
                 # MUST be part of the config identity. Without it, a journal
@@ -4370,6 +4385,50 @@ def _run_whole_chapter_strict_impl(
             "dropped": list(chapter_dropped),
             "dropped_count": len(chapter_dropped),
         }
+
+        # V4.1 SAFE-MEMORY (owner decision 2026-08-14, P0): the source-only
+        # entity prepass (B1.2) runs BEFORE translation — verified claims
+        # reach the generation prompt as a CHAPTER ENTITY FACTS block
+        # (candidate claims go ONLY to the audit; they are semantic
+        # hypotheses, never prompt commands). The cache is persisted to
+        # entity_context_cache.json so the B3 audit/repair stage later hits
+        # the SAME cache with 0 extra model calls. The gate mirrors the B3
+        # invocation below (run_audit + stop_after + machinery present +
+        # entity context enabled), so a run that would not audit also does
+        # not pay the prepass; without the machinery generation proceeds
+        # without the entity block.
+        entity_gen_block = ""
+        if (
+            cfg.entity_context_enabled
+            and cfg.run_audit
+            and cfg.stop_after != "generation"
+            and b3_audit_repair is not None
+        ):
+            extraction = b3_audit_repair.entity_context_prepass(
+                source=source, out_dir=cfg.out_dir,
+            )
+            if extraction is not None:
+                entity_gen_block = render_entity_context_block(
+                    extraction.context, verified_only=True,
+                )
+        # The generation prompt carries the verified entity facts as part of
+        # the book-context block (deterministic, source-derived).
+        gen_bible_text = bible_text
+        if entity_gen_block:
+            gen_bible_text = (
+                f"{bible_text}\nCHAPTER ENTITY FACTS - SOURCE-DERIVED\n"
+                f"{entity_gen_block}"
+            )
+        # P1 АРКИ (owner decision 2026-08-14): deterministic arc-name block
+        # from arc_names.json so chapter headings translate consistently
+        # (Bonds = Узы in every chapter). Part of the bundle identity via
+        # bible_text — a changed mapping invalidates the generation cache.
+        if cfg.deterministic_arc_names:
+            arcs_block = "\n".join(
+                f"- {en} → {ru}" for en, ru in cfg.deterministic_arc_names
+            )
+            gen_bible_text = f"{gen_bible_text}\nАРКИ:\n{arcs_block}"
+
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
         # V4.1 M (monitor card): whole-chapter generation telemetry — the
@@ -4438,7 +4497,7 @@ def _run_whole_chapter_strict_impl(
             chunk_plan=chunk_plan,
             pid_map=pid_map,
             glossary=chapter_glossary,
-            bible_text=bible_text,
+            bible_text=gen_bible_text,
             config=config,
             params=params,
             model_caller=model_caller,

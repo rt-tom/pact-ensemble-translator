@@ -138,6 +138,7 @@ class BookRunRecord:
     candidates: Dict[str, int] = field(default_factory=dict)
     book_memory_candidates: Dict[str, int] = field(default_factory=dict)
     book_memory_promotions: List[Dict[str, Any]] = field(default_factory=list)
+    index_built: bool = False
     error: Optional[str] = None
 
     def to_payload(self) -> Dict[str, Any]:
@@ -156,6 +157,7 @@ class BookRunRecord:
                 "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
             },
             "book_memory_promotions": self.book_memory_promotions,
+            "index_built": self.index_built,
             "error": self.error,
         }
 
@@ -475,17 +477,20 @@ def _auto_promote_glossary(
     term_min_occurrences: int,
     proper_name_min_occurrences: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """B9: v3-threshold auto-promotion via ``MemoryManager.add_observation``.
+    """B9: proper-name auto-promotion via ``MemoryManager.add_observation``.
 
-    For every candidate aligned in THIS chapter, look up its cumulative
-    ledger record (``merged_ledger``) and check the kind-specific thresholds
-    (B9 card, v3 mechanics; owner decision 2026-08-04 — V-final):
+    P0 owner decision 2026-08-14: ONLY ``proper_name`` candidates
+    auto-promote (threshold: ``proper_name_min_occurrences``, default 2).
+    Generic ``term`` candidates are NEVER promoted by frequency/stability
+    (door → дверь is stable but not terminology; a real term may translate
+    unstably early on) — they remain ledger observations only.
+
+    For every proper-name candidate aligned in THIS chapter, look up its
+    cumulative ledger record (``merged_ledger``) and check the kind-specific
+    threshold (B9 card, v3 mechanics; owner decision 2026-08-04 — V-final):
 
       * ``proper_name``: ``total_occurrences >= proper_name_min_occurrences``
         and a single aligned target;
-      * ``term``: ``len(chapters) >= term_min_chapters`` AND
-        ``total_occurrences >= term_min_occurrences`` and a single aligned
-        target.
 
     Promotion additionally requires the cumulative ledger record to retain
     exactly one unambiguous target consistent with the current chapter's
@@ -512,6 +517,14 @@ def _auto_promote_glossary(
         source = str(aligned.get("source") or "")
         kind = str(aligned.get("kind") or "term")
         if not source:
+            continue
+        # P0 owner decision 2026-08-14 (term auto-promotion OFF): only
+        # proper_name auto-promotes (threshold: 2 occurrences). Generic
+        # terms are NEVER promoted by frequency/stability — door → дверь is
+        # stable but not terminology, and a real term may translate
+        # unstably early on (Other → другой/иной/Иной). Generic terms stay
+        # in the observation ledger only (never in the prompt).
+        if kind != "proper_name":
             continue
         if aligned.get("conflicts"):
             # Several notable variants — no single target (alignment conflict).
@@ -1004,20 +1017,19 @@ def run_book(
                 str(p.get("source")) for p in proposed_recs if p.get("source")
             }
 
-        # BM (V4.1 §15): deterministic book_memory candidate generation ->
-        # ledger -> threshold auto-promotion via MemoryManager.add_observation,
+        # SAFE-MEMORY (P0 owner decision 2026-08-14, B7 → entity_extractor):
+        # the deterministic book_memory_candidates script (B7) is OFF —
+        # characters/facts come ONLY from the source-only entity extractor's
+        # VERIFIED claims (LLM, prompt "only explicit, evidence quote"),
         # strictly after the chapter and BEFORE MemoryManager.promote (GATE),
         # only for chapters with an accepted terminal result (complete /
-        # accepted_degraded). Candidates are proper-name characters from the
-        # chapter SOURCE with gender only when the source explicitly confirms
-        # it (fail-closed); quarantined-chunk evidence is excluded BEFORE
-        # generation (B9-RV3 pattern with BM-F5/F6 fail-closed on unavailable
-        # or ambiguous PID->chunk provenance). The actual book_memory write
-        # happens through the existing promote(status, quarantined_chunks)
-        # below: section-scoped observations (characters:<name>,
-        # facts:<name>:...) merge into book_memory.json with conflict
-        # resolution (established/locked never overwritten) and the B7
-        # quarantined-chunk filter.
+        # accepted_degraded). The chapter's strict run already persisted the
+        # validated context to entity_context_cache.json (the runner ran the
+        # prepass before generation); the run reads that cache — 0 extra
+        # model calls. Verified claims → add_observation("book_memory") with
+        # extreme-conservative gender (verified only when the extractor's
+        # 8-point validation linked pronoun + referent in the same PID);
+        # candidate claims are never promoted (audit-only, TIER_B).
         book_memory_before = _load_json(memory_dir / "book_memory.json", {})
         bm_candidates_block = {
             "generated": 0,
@@ -1026,43 +1038,85 @@ def run_book(
             "conflicts": 0,
         }
         bm_promotions: List[Dict[str, Any]] = []
+        entity_obs: Dict[str, Any] = {}
         if terminal_status in _PROMOTING_STATUSES:
-            bm_candidates = _generate_book_memory_candidates_chapter(
-                chapter_html,
-                out_dir,
-                memory_dir,
-                excluded_chunk_ids=quarantined,
-                mixed_script_allow=mixed_script_allow,
-            )
-            if bm_candidates:
-                bm_ledger.append_chapter(chapter_id, bm_candidates)
-            bm_candidates_block["generated"] = len(bm_candidates)
-            bm_proposed_recs, bm_conflict_recs = _auto_promote_book_memory(
-                manager,
-                bm_candidates,
-                bm_ledger.load(),
-                book_memory_before,
-                min_name_occurrences=bm_min_name_occurrences,
-                min_name_chapters=bm_min_name_chapters,
-            )
-            bm_candidates_block["proposed"] = len(bm_proposed_recs)
-            bm_candidates_block["conflicts"] = len(bm_conflict_recs)
+            entity_payload = _load_json(out_dir / "entity_context_cache.json", None)
+            if isinstance(entity_payload, dict) and entity_payload.get("entries"):
+                from pact_v4.audit.entity_extractor import (
+                    ChapterEntityContext,
+                    EntityContextCache,
+                )
+                from pact_v4.pipeline.b3_audit_repair import (
+                    book_memory_observations_from_entity_context,
+                )
+
+                try:
+                    cache = EntityContextCache.from_payload(entity_payload)
+                    # The chapter's context entry (keyed source_hash +
+                    # extractor_version); the run may carry several chapters'
+                    # entries when resuming — pick the one for THIS chapter
+                    # (chapter_id is stamped on every context). Iterate the
+                    # PUBLIC payload shape (never the private store).
+                    contexts = [
+                        ChapterEntityContext.from_payload(entry["context"])
+                        for entry in cache.to_payload().get("entries", [])
+                        if isinstance(entry, dict) and "context" in entry
+                    ]
+                    for context in contexts:
+                        obs = book_memory_observations_from_entity_context(
+                            context, chapter_id=chapter_id,
+                        )
+                        entity_obs.update(obs.get("book_memory", {}))
+                except Exception as exc:  # noqa: BLE001 — never break a run
+                    LOG.warning(
+                        "SAFE-MEMORY: entity_context_cache.json for %s "
+                        "unreadable/foreign (%s: %s); no book_memory promote",
+                        chapter_id, type(exc).__name__, exc,
+                    )
+            for key, value in entity_obs.items():
+                # Chapter accumulation: a character/entity seen in earlier
+                # chapters keeps its cumulative `chapters` list (the entity
+                # cache holds only THIS chapter's context; union with the
+                # already-promoted entry so `chapters` never shrinks).
+                section, _, entry_key = key.partition(":")
+                if section in ("characters", "entities") and isinstance(value, dict):
+                    existing = book_memory_before.get(section, {}).get(entry_key)
+                    if isinstance(existing, dict):
+                        merged = dict(value)
+                        merged["chapters"] = sorted({
+                            str(c) for c in (
+                                list(existing.get("chapters") or [])
+                                + list(value.get("chapters") or [])
+                            )
+                        })
+                        # Cross-chapter gender disagreement fails closed
+                        # (owner decision 2026-08-08, BM): a verified gender
+                        # contradicted by a LATER chapter is unknown forever
+                        # — never pick a winner.
+                        existing_gender = existing.get("gender")
+                        new_gender = value.get("gender")
+                        if (
+                            existing_gender
+                            and new_gender
+                            and existing_gender != new_gender
+                        ):
+                            merged.pop("gender", None)
+                        elif existing_gender and not new_gender:
+                            merged["gender"] = existing_gender
+                        value = merged
+                manager.add_observation("book_memory", key, value)
+            bm_candidates_block["generated"] = len(entity_obs)
+            bm_candidates_block["proposed"] = len(entity_obs)
             bm_promotions = [
                 {
-                    "source": str(p.get("source")),
-                    "kind": str(p.get("kind") or "character"),
-                    "gender": p.get("gender"),
-                    "chapters": list(p.get("chapters") or []),
-                    "evidence_pids": list(p.get("evidence_pids") or []),
-                    "chunk_ids": sorted({
-                        str(c) for c in (p.get("chunk_ids") or [])
-                    }),
-                    "cumulative_chunk_ids": sorted({
-                        str(c) for c in (p.get("cumulative_chunk_ids") or [])
-                    }),
-                    "context": str(p.get("context") or ""),
+                    "source": str(key.partition(":")[2]),
+                    "kind": str(value.get("type") or "entity"),
+                    "gender": value.get("gender"),
+                    "chapters": list(value.get("chapters") or []),
+                    "evidence_pids": list(value.get("source_pids") or []),
+                    "context": str(value.get("fact") or ""),
                 }
-                for p in bm_proposed_recs
+                for key, value in entity_obs.items()
             ]
 
         promoted = False
@@ -1099,6 +1153,36 @@ def run_book(
         # promoted; bytes preserved).
         _strip_book_memory_observation_fields(memory_dir)
 
+        # A2 (causal <N, P0 2026-08-14): after an ACCEPTED chapter, rebuild
+        # the chapter's entry in chapter_index.json so the causal bible
+        # renderer (`render_bible_section`) serves the NEXT chapter from
+        # fresh memory (promoted entities/facts from THIS chapter) — and so
+        # the current chapter's own entry reflects the pre-promotion state
+        # of THIS chapter only. 0 model calls, deterministic (B9-A2 card).
+        # Failed chapters never touch the index.
+        if terminal_status in _PROMOTING_STATUSES:
+            try:
+                from pact_full_pipeline_runner_v1.build_chapter_index import (
+                    build_index_file,
+                )
+
+                build_index_file(
+                    memory_dir=str(memory_dir),
+                    chapter_html=str(chapter_html),
+                    chapter_id=chapter_id,
+                    out_path=str(memory_dir / "chapter_index.json"),
+                )
+                index_built = True
+            except Exception as exc:  # noqa: BLE001 — never break a run
+                LOG.warning(
+                    "A2: chapter_index build failed for %s (%s: %s); "
+                    "causal bible will fail-soft to narrator+seed",
+                    chapter_id, type(exc).__name__, exc,
+                )
+                index_built = False
+        else:
+            index_built = False
+
         # B9: committed = how many of the proposed candidates actually
         # landed in glossary.json after promote. Counted as the glossary key
         # diff (before/after promote). For B9-generated observations
@@ -1113,23 +1197,35 @@ def run_book(
         new_glossary_keys = set(glossary_after) - set(glossary_before)
         candidates_block["committed"] = len(proposed_sources & new_glossary_keys)
 
-        # BM: committed = how many of the proposed character sources actually
-        # landed in book_memory.json["characters"] after promote (key diff).
-        # For BM-generated observations committed == proposed for BOTH
-        # complete and accepted_degraded (valid plan): quarantined pids are
-        # excluded BEFORE generation (BM-F5/F6 fail-closed), so proposed
-        # observations carry accepted chunk_ids the B7 filter keeps; the
-        # filter is defense-in-depth and can only lower committed for
-        # independent observations carrying a quarantined chunk_id.
+        # BM: committed = how many of the proposed entity observations
+        # actually landed in book_memory.json after promote (SAFE-MEMORY,
+        # P0 2026-08-14 — the deterministic B7 script is OFF; the proposed
+        # set is the entity extractor's verified observations). A
+        # character/entity whose entry exists in its section (with the
+        # proposed value, chapter accumulation included) and a fact whose
+        # text is present in the facts list count as committed. An entry
+        # blocked by established/locked conflict resolution does not count.
         book_memory_after = _load_json(memory_dir / "book_memory.json", {})
-        bm_proposed_sources = {
-            str(p.get("source")) for p in bm_promotions if p.get("source")
-        }
-        chars_before = set((book_memory_before.get("characters") or {}))
-        chars_after = set((book_memory_after.get("characters") or {}))
-        bm_candidates_block["committed"] = len(
-            bm_proposed_sources & (chars_after - chars_before)
-        )
+        committed = 0
+        for key, value in entity_obs.items():
+            section, _, entry_key = key.partition(":")
+            if section in ("characters", "entities") and isinstance(value, dict):
+                stored = (book_memory_after.get(section) or {}).get(entry_key)
+                if not isinstance(stored, dict):
+                    continue
+                if stored.get("gender") != value.get("gender"):
+                    continue
+                stored_chapters = stored.get("chapters") or []
+                if set(stored_chapters) >= set(value.get("chapters") or []):
+                    committed += 1
+            elif section == "facts" and isinstance(value, dict):
+                fact_text = value.get("fact")
+                if fact_text and any(
+                    isinstance(f, dict) and f.get("fact") == fact_text
+                    for f in book_memory_after.get("facts", [])
+                ):
+                    committed += 1
+        bm_candidates_block["committed"] = committed
 
         hash_after = _book_memory_hash(memory_dir)
         records.append(BookRunRecord(
@@ -1143,6 +1239,7 @@ def run_book(
             candidates=candidates_block,
             book_memory_candidates=bm_candidates_block,
             book_memory_promotions=bm_promotions,
+            index_built=index_built,
             error=error_msg,
         ))
 

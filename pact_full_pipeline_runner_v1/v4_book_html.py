@@ -157,6 +157,7 @@ def render_chapter_body(
     translations: Mapping[str, str],
     *,
     chapter_id: str = "",
+    arc_names: Optional[Mapping[str, str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Render one chapter body from its source HTML and translations.
 
@@ -164,6 +165,12 @@ def render_chapter_body(
     ``rendered``, ``missing_pids`` (skipped, never fatal) and ``headings``
     (``{level, text, anchor}`` for the rendered heading blocks, in source
     order).
+
+    P1 АРКИ (owner decision 2026-08-14): when ``arc_names`` (the
+    ``arc_names.json`` mapping, e.g. ``{"Bonds": "Узы", ...}``) is given, a
+    heading whose text starts with an arc key gets the deterministic Russian
+    arc name substituted — «Узы 1.3» instead of whatever the model produced
+    for «Bonds 1.3». 0 tokens, 0 stochasticity, 100% consistency.
     """
     blocks = parse_source_html(source_html_text)
     body_parts: List[str] = []
@@ -180,9 +187,10 @@ def render_chapter_body(
             anchor = f"ch-{chapter_id}-h{len(headings) + 1}" if chapter_id else \
                 f"h{len(headings) + 1}"
             element_id = anchor
+            heading_text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
             headings.append({
                 "level": level,
-                "text": BeautifulSoup(text, "html.parser").get_text(" ", strip=True),
+                "text": _substitute_arc_name(heading_text, arc_names),
                 "anchor": anchor,
             })
         body_parts.append(render_block_html(block, text, element_id=element_id))
@@ -193,6 +201,54 @@ def render_chapter_body(
         "headings": headings,
     }
     return "\n".join(body_parts), report
+
+
+def _substitute_arc_name(
+    heading_text: str,
+    arc_names: Optional[Mapping[str, str]],
+) -> str:
+    """Replace a leading arc key in ``heading_text`` with its Russian name.
+
+    Deterministic metadata (P1 АРКИ, owner decision 2026-08-14): a heading
+    like ``Bonds 1.3`` becomes ``Узы 1.3`` when ``arc_names`` maps
+    ``Bonds -> Узы``. Case-insensitive on the arc key; the rest of the
+    heading (chapter number, subtitle) is preserved. No mapping / no match
+    => the text is returned unchanged.
+    """
+    if not arc_names or not heading_text:
+        return heading_text
+    lowered = heading_text.casefold()
+    for key, russian in arc_names.items():
+        if not key:
+            continue
+        # Match the arc key as a leading token (followed by a space or the
+        # end of the string), case-insensitive — "Bonds 1.3" or "Bonds".
+        if lowered == key.casefold() or lowered.startswith(key.casefold() + " "):
+            return f"{russian}{heading_text[len(key):]}"
+    return heading_text
+
+
+def _load_arc_names(path: Optional[Path]) -> Optional[Dict[str, str]]:
+    """Load ``arc_names.json`` (P1 АРКИ) or ``None`` when unavailable.
+
+    ``path`` is the explicit ``--arc-names`` argument; when None, the
+    current working directory's ``arc_names.json`` is tried. A missing or
+    unreadable file yields ``None`` (headings are rendered unchanged — the
+    arc substitution is an enhancement, never a failure). Non-str values
+    are dropped; a malformed payload yields ``None``.
+    """
+    candidates = [path] if path is not None else [Path.cwd() / "arc_names.json"]
+    for candidate in candidates:
+        if candidate is None or not candidate.exists():
+            continue
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +422,7 @@ def render_book(
     title: str = "Книга",
     report_path: Optional[Path] = None,
     run_dirs: Optional[Sequence[Any]] = None,
+    arc_names: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assemble ``book.html`` from per-chapter artifacts on disk.
 
@@ -437,6 +494,7 @@ def render_book(
                 ),
                 translations_path=run_dir / "translations.json",
                 translations_label=str(run_dir / "translations.json"),
+                arc_names=arc_names,
             )
     else:
         for chapter_id in chapter_ids:
@@ -450,6 +508,7 @@ def render_book(
                 translations_label=str(
                     out_base / f"chapter_{chapter_id}" / "translations.json"
                 ),
+                arc_names=arc_names,
             )
 
     book_html = build_book_html(chapters, title=title)
@@ -484,6 +543,7 @@ def _append_rendered_chapter(
     source_path: Path,
     translations_path: Path,
     translations_label: str,
+    arc_names: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Render one chapter from disk and append its record to ``chapters``.
 
@@ -516,7 +576,7 @@ def _append_rendered_chapter(
         chapter_record["warnings"] = [load_error]
 
     body_html, render_report = render_chapter_body(
-        source_text, translations, chapter_id=chapter_id,
+        source_text, translations, chapter_id=chapter_id, arc_names=arc_names,
     )
     chapter_record.update(render_report)
     for pid in render_report["missing_pids"]:
@@ -554,6 +614,10 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="заголовок книги (default: Книга)")
     parser.add_argument("--report", type=Path, default=None,
                         help="путь к отчёту (default: <out-base>/book_html_report.json)")
+    parser.add_argument("--arc-names", type=Path, default=None,
+                        help="arc_names.json (P1 АРКИ): детерминированная "
+                             "подстановка русских названий арков в заголовки "
+                             "(default: <cwd>/arc_names.json если существует)")
     return parser
 
 
@@ -563,6 +627,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("нужно указать --chapters (v4) или --run-dirs (v4.1)",
               file=sys.stderr)
         return 2
+    arc_names = _load_arc_names(args.arc_names)
     report = render_book(
         out_base=args.out_base,
         chapter_ids=args.chapters or [],
@@ -571,6 +636,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         title=args.title,
         report_path=args.report,
         run_dirs=args.run_dirs,
+        arc_names=arc_names,
     )
     rendered = sum(1 for ch in report["chapters"] if ch.get("rendered", 0) > 0)
     print(

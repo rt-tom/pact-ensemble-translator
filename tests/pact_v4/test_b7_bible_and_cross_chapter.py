@@ -38,60 +38,83 @@ class TestRenderBibleSection:
         assert "BIBLE:" in result
         assert "Narrator: male" in result
 
-    def test_characters_dict(self):
+    def test_positional_form_renders_only_narrator_and_seed(self):
+        # P0 causal-memory contract (2026-08-14): the positional/legacy form
+        # must NEVER dump the full book_memory. Only the narrator + explicit
+        # ``seed: true`` facts are safe for an unknown chapter.
         memory = {
+            "pov": {"gender": "male"},
+            "characters": {
+                "John": {"gender": "male", "role": "protagonist"},
+                "Mary": {"gender": "female", "role": "sister"},
+            },
+            "facts": [
+                {"text": "The story takes place in London."},
+                {"fact": "Blake's vehicle is a motorcycle.", "seed": True},
+            ],
+            "address_register": [{"text": 'Use "ты" for family members'}],
+        }
+        result = render_bible_section(memory)
+        assert "Narrator: male" in result
+        # Seed fact IS rendered (global immutable world knowledge).
+        assert "motorcycle" in result
+        # Non-seed facts / characters / address are NOT dumped.
+        assert "London" not in result
+        assert "John" not in result
+        assert "Mary" not in result
+        assert "ты" not in result
+        assert "Characters:" not in result
+        assert "Facts:" not in result
+
+    def test_chapter_entry_renders_characters_facts_address(self):
+        # With a deterministic per-chapter index entry the chapter-scoped
+        # content renders (characters/facts/address) — the chapter-based API.
+        memory = {
+            "pov": {"gender": "male"},
             "characters": {
                 "John": {"gender": "male", "role": "protagonist"},
                 "Mary": {"gender": "female", "role": "sister"},
             },
         }
-        result = render_bible_section(memory)
-        assert "Characters:" in result
-        assert "John" in result
-        assert "Mary" in result
-
-    def test_characters_list(self):
-        memory = {
-            "characters": [
-                {"name": "John", "gender": "male", "role": "protagonist"},
-            ],
+        index = {
+            "0001": {
+                "characters": ["John"],
+                "facts": ["The story takes place in London."],
+                "address": ['Use "ты" for family members'],
+            },
         }
-        result = render_bible_section(memory)
+        result = render_bible_section("0001", index, memory)
+        assert "BIBLE:" in result
+        assert "Narrator: male" in result
         assert "John" in result
-
-    def test_facts_list(self):
-        memory = {
-            "facts": [
-                {"text": "The story takes place in London."},
-                "John inherited the estate.",
-            ],
-        }
-        result = render_bible_section(memory)
-        assert "Facts:" in result
         assert "London" in result
-        assert "inherited" in result
+        assert "ты" in result
+        # The index entry is the only content source — no caps, no dump.
+        assert "showing first" not in result
+        assert "Mary" not in result
 
-    def test_address_register(self):
+    def test_future_chapter_fact_never_visible_earlier(self):
+        # P0 future-leakage regression: a fact belonging to chapter 0148
+        # must NEVER appear in the bible rendered for chapter 0001 — neither
+        # via the chapter entry (index is chapter-scoped) nor via the
+        # fail-soft path (only seed facts).
         memory = {
-            "address_register": [
-                {"text": 'Use "ты" for family members'},
+            "pov": {"gender": "male"},
+            "facts": [
+                {"fact": "Blake's vehicle is a motorcycle.", "seed": True},
+                {"fact": "Alexis wants a custom iron tattoo gun.", "chapter": "0148"},
             ],
         }
-        result = render_bible_section(memory)
-        assert "Address register:" in result
-
-    def test_full_render(self):
-        memory = {
-            "pov": {"gender": "female"},
-            "characters": {"Anna": {"gender": "female", "role": "heroine"}},
-            "facts": [{"text": "Set in Moscow."}],
-            "address_register": [{"text": "ты for close friends"}],
+        index = {
+            "0001": {"characters": [], "facts": [], "address": []},
         }
-        result = render_bible_section(memory)
-        assert "Narrator: female" in result
-        assert "Anna" in result
-        assert "Moscow" in result
-        assert "ты" in result
+        rendered = render_bible_section("0001", index, memory)
+        assert "tattoo" not in rendered
+        assert "motorcycle" in rendered
+        # And the unknown-chapter path also never dumps the future fact.
+        fallback = render_bible_section("9999", index, memory)
+        assert "tattoo" not in fallback
+        assert "motorcycle" in fallback
 
     def test_deterministic(self):
         memory = {
@@ -102,26 +125,19 @@ class TestRenderBibleSection:
         r2 = render_bible_section(memory)
         assert r1 == r2
 
-    def test_truncation_suffix_on_characters(self):
+    def test_fail_soft_missing_index_never_dumps(self):
+        # P0 causal contract: no chapter_index entry -> narrator + seed only,
+        # never a full book_memory dump (the pre-fix leak of chapters 46-148).
         memory = {
+            "pov": {"gender": "male"},
             "characters": {f"c{i}": {"gender": "male"} for i in range(50)},
-        }
-        result = render_bible_section(memory)
-        assert "(showing first 20 of 50)" in result
-
-    def test_truncation_suffix_on_facts(self):
-        memory = {
             "facts": [{"text": f"fact {i}"} for i in range(50)],
         }
-        result = render_bible_section(memory)
-        assert "(showing first 30 of 50)" in result
-
-    def test_no_truncation_suffix_under_limit(self):
-        memory = {
-            "characters": {f"c{i}": {"gender": "male"} for i in range(5)},
-        }
-        result = render_bible_section(memory)
-        assert "showing first" not in result
+        result = render_bible_section("9999", {}, memory)
+        assert "Narrator: male" in result
+        assert "c0" not in result
+        assert "fact 0" not in result
+        assert "(showing first" not in result
 
 
 class TestExtractNarratorGender:

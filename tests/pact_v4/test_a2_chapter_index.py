@@ -197,17 +197,29 @@ def test_render_bible_section_chapter_id_renders_entry():
     assert "currency" not in rendered
 
 
-def test_render_bible_section_missing_chapter_falls_back_to_legacy():
-    # No index entry for the chapter: the renderer falls back to the legacy
-    # full-memory render (pre-A2 behaviour), so runs without an index work.
-    rendered = render_bible_section("9999", _chapter_index(), _book_memory())
+def test_render_bible_section_missing_chapter_fails_soft_to_seed():
+    # P0 causal-memory contract (2026-08-14): no index entry for the chapter
+    # -> narrator + explicit seed facts ONLY. The legacy full-memory dump
+    # (which leaked facts from chapters 46-148 into Bonds 1.1-1.3 prompts)
+    # is removed — never restored.
+    memory = {
+        "pov": {"gender": "male"},
+        "characters": {"Aimon Behaim": {"gender": "male"}},
+        "facts": [
+            {"fact": "Blake's vehicle is a motorcycle.", "seed": True},
+        ],
+    }
+    rendered = render_bible_section("9999", _chapter_index(), memory)
     assert "BIBLE:" in rendered
-    assert "Aimon Behaim" in rendered  # legacy renders the full memory
+    assert "Narrator: male" in rendered
+    assert "motorcycle" in rendered
+    assert "Aimon Behaim" not in rendered  # NOT a full memory dump
 
 
 def test_render_bible_section_legacy_form_still_supported():
-    # Backward compatibility: render_bible_section(book_memory) keeps the
-    # legacy full-memory render with caps.
+    # Backward compatibility of the call SHAPE (positional book_memory /
+    # keyword book_memory) is preserved; the CONTENT is the fail-soft seed
+    # render, never a full dump.
     memory = {"pov": {"gender": "male"}}
     assert "Narrator: male" in render_bible_section(memory)
     assert render_bible_section({}) == ""
@@ -217,7 +229,7 @@ def test_render_bible_section_legacy_form_still_supported():
 def test_render_bible_section_keyword_book_memory_compatible():
     # A2 RV fix (MEDIUM): render_bible_section(book_memory=m) — the KEYWORD
     # legacy form — used to return an empty string (chapter_id=None clobbered
-    # the explicit book_memory). It must render the legacy bible exactly like
+    # the explicit book_memory). It must render the seed bible exactly like
     # the positional form.
     memory = {"pov": {"gender": "male"}, "characters": {"Blake": {"gender": "male"}}}
     positional = render_bible_section(memory)
@@ -328,3 +340,129 @@ def test_build_index_file_includes_locked_terms_from_flat_glossary(tmp_path):
     # Aimon Behaim is a glossary conflict -> locked, present even though the
     # chapter text never mentions him.
     assert "Aimon Behaim" in entry["characters"]
+
+
+# ---------------------------------------------------------------------------
+# A2 causal <N: v4_book_run builds chapter_index.json after accepted chapters
+# (P0 2026-08-14: the causal bible renderer needs a fresh per-chapter entry;
+# a failed chapter never touches the index).
+# ---------------------------------------------------------------------------
+
+
+def test_book_run_builds_chapter_index_after_accepted_chapter(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1 import v4_book_run
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "book_memory.json").write_text(
+        json.dumps(_book_memory(), ensure_ascii=False), encoding="utf-8",
+    )
+    (memory / "glossary.json").write_text("{}", encoding="utf-8")
+    (memory / "observations.json").write_text("{}", encoding="utf-8")
+
+    out_base = tmp_path / "out"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "0001.html").write_text(
+        "<html><body><p id='p1'>Blake walked to the June clearing.</p>"
+        "<p id='p2'>He saw the gate.</p></body></html>",
+        encoding="utf-8",
+    )
+    out_dir = out_base / "chapter_0001"
+    out_dir.mkdir(parents=True)
+    (out_dir / "selection_results.json").write_text(
+        json.dumps({"chapter_id": "0001", "results": [
+            {"chunk_id": "chunk0001", "status": "selected"},
+        ]}),
+        encoding="utf-8",
+    )
+    (out_dir / "strict_chapter_trial_record.json").write_text(
+        json.dumps({"chapter_id": "0001", "step8": {"status": "complete"}}),
+        encoding="utf-8",
+    )
+    (out_dir / "translations.json").write_text(
+        json.dumps({"p00001": "Блэйк шёл к июньской поляне.",
+                    "p00002": "Он увидел ворота."}),
+        encoding="utf-8",
+    )
+    (out_dir / "chunk_plan.json").write_text(
+        json.dumps({"artifact": "pact-v4-chunk-plan/v1", "snapshot_hash": "t",
+                    "plan_hash": "t", "chunks": [
+                        {"chunk_id": "chunk0001", "snapshot_hash": "t",
+                         "pids": ["p00001", "p00002"], "word_counts": [],
+                         "context": {"left_ru": "", "right_en": []},
+                         "undersized_exception": False},
+                    ]}),
+        encoding="utf-8",
+    )
+
+    def fake_run_one(*args, **kwargs):
+        return {"status": "ok"}
+
+    monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+    result = v4_book_run.run_book(
+        memory_dir=memory,
+        chapter_ids=["0001"],
+        chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+        out_base=out_base,
+    )
+
+    # Accepted chapter -> index built and recorded.
+    assert result["chapters"][0]["terminal_status"] == "complete"
+    assert result["chapters"][0]["index_built"] is True
+    index_path = memory / "chapter_index.json"
+    assert index_path.exists()
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert "0001" in index
+    assert "Blake Thorburn" in index["0001"]["characters"]
+
+
+def test_book_run_skips_chapter_index_for_failed_chapter(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1 import v4_book_run
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "book_memory.json").write_text(
+        json.dumps(_book_memory(), ensure_ascii=False), encoding="utf-8",
+    )
+    (memory / "glossary.json").write_text("{}", encoding="utf-8")
+    (memory / "observations.json").write_text("{}", encoding="utf-8")
+
+    out_base = tmp_path / "out"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "0001.html").write_text(
+        "<html><body><p id='p1'>Blake walked alone.</p></body></html>",
+        encoding="utf-8",
+    )
+    out_dir = out_base / "chapter_0001"
+    out_dir.mkdir(parents=True)
+    (out_dir / "selection_results.json").write_text(
+        json.dumps({"chapter_id": "0001", "results": []}), encoding="utf-8",
+    )
+    (out_dir / "strict_chapter_trial_record.json").write_text(
+        json.dumps({"chapter_id": "0001", "step8": {"status": "failed"}}),
+        encoding="utf-8",
+    )
+    (out_dir / "translations.json").write_text("{}", encoding="utf-8")
+    (out_dir / "chunk_plan.json").write_text(
+        json.dumps({"artifact": "pact-v4-chunk-plan/v1", "snapshot_hash": "t",
+                    "plan_hash": "t", "chunks": []}), encoding="utf-8",
+    )
+
+    def fake_run_one(*args, **kwargs):
+        return {"status": "ok"}
+
+    monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+    result = v4_book_run.run_book(
+        memory_dir=memory,
+        chapter_ids=["0001"],
+        chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+        out_base=out_base,
+    )
+
+    assert result["chapters"][0]["terminal_status"] == "failed"
+    assert result["chapters"][0]["index_built"] is False
+    assert not (memory / "chapter_index.json").exists()

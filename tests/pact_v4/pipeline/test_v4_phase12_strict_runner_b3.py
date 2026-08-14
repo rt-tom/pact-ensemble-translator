@@ -535,18 +535,204 @@ def test_b3_audit_incomplete_fail_closed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_b3_p10_regressions_verified_only_promote(tmp_path: Path) -> None:
+    """Card p.10 acceptance (P0 2026-08-14): the book_memory promote from
+    the entity cache is VERIFIED-only and high-precision — Rosalyn is never
+    male (candidate gender claim), English/Shamanism are never characters
+    (no verified claims), Blake's vehicle = motorcycle survives as a
+    verified entity fact. This is the same conversion v4_book_run runs
+    after an accepted chapter."""
+    from pact_v4.audit.entity_extractor import (
+        AnchorRef,
+        ChapterEntityContext,
+        EvidenceRef,
+        EntityClaim,
+        EntityRecord,
+    )
+    from pact_v4.pipeline.b3_audit_repair import (
+        book_memory_observations_from_entity_context,
+    )
+
+    context = ChapterEntityContext(
+        schema="pact-v4-entity-context/v1", extractor_version="test",
+        chapter_id="0001", source_hash="abc",
+        entities=(
+            # Rosalyn: CANDIDATE gender claim -> never promoted as male.
+            EntityRecord(
+                entity="Rosalyn", canonical_type="woman",
+                anchor=AnchorRef(pid="p00001", span="Rosalyn"),
+                aliases=(),
+                claims=(
+                    EntityClaim(
+                        kind="gender", value="male", status="candidate",
+                        evidence=(EvidenceRef(pid="p00001", span="Rosalyn"),),
+                        evidence_windows=(("p00001", "p00002"),),
+                    ),
+                ),
+            ),
+            # English: capitalized token, NO claims -> NOT a character.
+            EntityRecord(
+                entity="English", canonical_type="language",
+                anchor=AnchorRef(pid="p00002", span="English"),
+                aliases=(), claims=(),
+            ),
+            # Shamanism: same — no verified claims -> NOT a character.
+            EntityRecord(
+                entity="Shamanism", canonical_type="concept",
+                anchor=AnchorRef(pid="p00003", span="Shamanism"),
+                aliases=(), claims=(),
+            ),
+            # Blake's vehicle: VERIFIED object_identity -> survives.
+            EntityRecord(
+                entity="Blake's vehicle", canonical_type="motorcycle",
+                anchor=AnchorRef(pid="p00004", span="motorcycle"),
+                aliases=(),
+                claims=(
+                    EntityClaim(
+                        kind="object_identity", value="motorcycle",
+                        status="verified",
+                        evidence=(EvidenceRef(pid="p00004", span="motorcycle"),),
+                        evidence_windows=(("p00004", "p00004"),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    obs = book_memory_observations_from_entity_context(
+        context, chapter_id="0001",
+    )["book_memory"]
+
+    # Rosalyn never male; lands as an entity (no verified gender).
+    assert "characters:Rosalyn" not in obs
+    assert obs.get("entities:Rosalyn", {}).get("gender") is None
+    # English / Shamanism never characters.
+    assert "characters:English" not in obs
+    assert "characters:Shamanism" not in obs
+    # Blake's vehicle promotes as an entity with the motorcycle fact.
+    assert "entities:Blake's vehicle" in obs
+    assert obs["entities:Blake's vehicle"]["type"] == "motorcycle"
+    assert any(
+        "motorcycle" in str(v.get("fact"))
+        for k, v in obs.items() if k.startswith("facts:")
+    )
+
+
 def test_b3_entity_enabled_runs_prepass_and_feeds_filters(tmp_path: Path) -> None:
     cfg = _whole_chapter_cfg(tmp_path)
     backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
     result = _run_with_b3(cfg, backend, entity_context_enabled=True)
 
-    # Entity prepass ran exactly once (cache hit on resume would be 0).
+    # Entity prepass ran exactly once (cache hit on resume would be 0) —
+    # the SAME cache is reused by B3's step 1 after generation, so the
+    # prepass-before-generation does not double the model calls.
     assert backend.entity_calls() == 1
     assert result.step6["entity_context_enabled"] is True
     assert result.step6["entity_context_hash"] is not None
     cache = _read_json(cfg.out_dir / "audit_cache_b3.json")
     assert cache["entity_context_hash"] is not None
     assert cache["entity_context_enabled"] is True
+    # The generation prompt carried the CHAPTER ENTITY FACTS block (the
+    # whole-chapter raw snapshot request is what the translator saw).
+    assert (cfg.out_dir / "entity_context_cache.json").exists()
+
+
+def test_b3_entity_facts_verified_in_gen_prompt_candidate_only_audit(
+    tmp_path: Path,
+) -> None:
+    # P0 owner decision 2026-08-14: verified entity claims reach the
+    # generation prompt as CHAPTER ENTITY FACTS; candidate claims (semantic
+    # hypotheses) go ONLY to the audit. Exercise the renderer contract
+    # directly with a context carrying both a verified gender claim and a
+    # candidate same_entity relation.
+    from pact_v4.audit.entity_extractor import (
+        ENTITY_CONTEXT_SCHEMA,
+        EXTRACTOR_VERSION,
+        AnchorRef,
+        AliasRef,
+        ChapterEntityContext,
+        EvidenceRef,
+        EntityClaim,
+        EntityRecord,
+    )
+    from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
+
+    context = ChapterEntityContext(
+        schema=ENTITY_CONTEXT_SCHEMA,
+        extractor_version=EXTRACTOR_VERSION,
+        chapter_id="0001",
+        source_hash="abc",
+        entities=(
+            EntityRecord(
+                entity="the nurse",
+                canonical_type="nurse",
+                anchor=AnchorRef(pid="p00001", span="the nurse"),
+                aliases=(AliasRef(surface="Rich", pid="p00002", span="Rich"),),
+                claims=(
+                    EntityClaim(
+                        kind="gender", value="male", status="verified",
+                        evidence=(EvidenceRef(pid="p00001", span="he smiled"),),
+                        evidence_windows=(("p00001", "p00002"),),
+                    ),
+                    EntityClaim(
+                        kind="alias_relation", value="nurse = Rich",
+                        status="candidate",
+                        evidence=(
+                            EvidenceRef(pid="p00001", span="the nurse"),
+                            EvidenceRef(pid="p00002", span="Rich"),
+                        ),
+                        evidence_windows=(("p00001", "p00002"),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    full_block = render_entity_context_block(context)
+    verified_block = render_entity_context_block(context, verified_only=True)
+    # Verified claim present in both; candidate claim ONLY in the audit
+    # (full) block.
+    assert "gender='male'" in full_block and "gender='male'" in verified_block
+    assert "alias_relation" in full_block
+    assert "alias_relation" not in verified_block
+
+
+def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:
+    """P1 АРКИ (owner decision 2026-08-14): when the run config carries a
+    deterministic arc mapping, the whole-chapter generation prompt includes
+    an 'АРКИ:' block (Bonds → Узы). The block rides inside the book-context
+    text, so it is part of the bundle identity (a changed mapping
+    invalidates the generation cache)."""
+    cfg = _whole_chapter_cfg(
+        tmp_path,
+        deterministic_arc_names=(("Bonds", "Узы"), ("Execution", "Казнь")),
+    )
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    caller = _DefectiveWholeChapterCaller()
+    result = _run_with_b3(
+        cfg, backend, caller=caller, entity_context_enabled=True,
+    )
+    assert result.step6["entity_context_enabled"] is True
+
+    # The whole-chapter generation bundle carried the АРКИ block (the
+    # prompt is rendered from bundle.bible_text; render_prompt is the same
+    # text the model saw).
+    from pact_v4.phase2.prompts import render_prompt
+
+    assert caller.calls
+    prompts = [render_prompt(b) for b in caller.calls]
+    assert any("АРКИ:" in p and "- Bonds → Узы" in p for p in prompts)
+
+
+def test_b3_no_arc_names_no_arc_block(tmp_path: Path) -> None:
+    cfg = _whole_chapter_cfg(tmp_path)  # deterministic_arc_names=()
+    backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
+    caller = _DefectiveWholeChapterCaller()
+    _run_with_b3(cfg, backend, caller=caller, entity_context_enabled=True)
+
+    from pact_v4.phase2.prompts import render_prompt
+
+    assert caller.calls
+    prompts = [render_prompt(b) for b in caller.calls]
+    assert all("АРКИ:" not in p for p in prompts)
 
 
 def test_b3_entity_disabled_skips_prepass(tmp_path: Path) -> None:
@@ -669,18 +855,21 @@ def test_b3_entity_validation_report_records_drop_and_downgrade(
     assert cache["schema"] == "pact-v4-entity-context-cache/v1"
 
 
-def test_b3_entity_extractor_failure_writes_no_validation_report(
+def test_b3_entity_extractor_failure_fails_closed_before_generation(
     tmp_path: Path,
 ) -> None:
     cfg = _whole_chapter_cfg(tmp_path)
     backend = _B3MockBackend(
         audit_issues=[], reaudit_issues=[], fail_entity=True,
     )
-    result = _run_with_b3(cfg, backend)
-
-    # The extractor never reached validation -> B3 failed; neither the
-    # entity cache nor the validation report exists.
-    assert result.step6["status"] == "failed"
+    # P0 owner decision 2026-08-14 (entity_extractor ДО перевода): the
+    # prepass runs BEFORE whole-chapter generation, so an extraction
+    # failure is a pre-generation failure — the verified entity facts are
+    # part of the generation input contract, and a run that cannot provide
+    # them fails closed instead of silently generating without them.
+    # Neither the entity cache nor the validation report exists.
+    with pytest.raises(RuntimeError, match="entity context extraction failed"):
+        _run_with_b3(cfg, backend)
     assert not (cfg.out_dir / "entity_context_cache.json").exists()
     assert not (cfg.out_dir / "entity_context_validation_report.json").exists()
 
