@@ -1,4 +1,4 @@
-# AGENTS.md — справочник деталей и уроков (вынесено из ядра)
+﻿# AGENTS.md — справочник деталей и уроков (вынесено из ядра)
 
 > Этот документ — **справочный**. Нормативные правила — в `AGENTS.md` (ядро,
 > авто-загружается воркерами). Сюда вынесены исторические уроки, примеры и
@@ -96,3 +96,9 @@ numeric-валидация, duplicate-header, top-5 heading). Правило с�
 - Полный suite: `C:\Python314\python.exe -m pytest tests --ignore=deployment_backups -q -p no:cacheprovider --basetemp=<tmp>` (для параллельных прогонов — отдельный --basetemp).
 - Kanban статус-чек: `hermes kanban list` + `hermes kanban diagnostics`.
 - Watcher: `profiles/architect/logs/kanban_cycle_watch.log` (cron 15m).
+
+### Финальные файлы перевода главы и сборка книги (2026-08-14)
+- Иерархия: translations_raw.json (выход генератора) → translations_edited.json (после R-редактора) → translations_repaired.json (после repair, ФИНАЛЬНЫЙ) → translations.json (копия финала, пишется в конце step7).
+- v4_book_html.py читает ИМЕННО translations.json из run-dir — это корректный финальный перевод (== repaired).
+- v4_book_run.py НЕ собирает книгу (только book_run.json + кандидаты глоссария/памяти + promote). Склейка глав в book.html — отдельный шаг:
+  python -m pact_full_pipeline_runner_v1.v4_book_html --out-base <out-base> --run-dirs chapter_*_bonds-1-* --chapter-html-pattern 'D:/pact/pact_chapters/{chapter_id}.html' --title 'Книга'
