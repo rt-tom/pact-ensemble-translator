@@ -56,7 +56,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, AbstractSet
 
 from pact_v4.runtime.backend_protocol import (
     JSON_OBJECT_SCHEMA,
@@ -695,6 +695,8 @@ class ChunkedAuditEvaluator:
         entity_context: str = "",
         out_dir: Optional[Path] = None,
         out_base: str = "audit",
+        cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        resume_changed_pids: Optional[AbstractSet[str]] = None,
     ) -> ChunkedAuditOutcome:
         cfg = self._config
         model_ref = audit_model_ref(self._backend)
@@ -722,6 +724,68 @@ class ChunkedAuditEvaluator:
 
         for chunk_index, chunk_pairs in enumerate(chunks, start=1):
             chunk_pids = [p.pid for p in chunk_pairs]
+            # PARTIAL-RESUME (t_a58dd881): a cached GOOD/GOOD_RETRIED chunk
+            # for this chunk index is reused with 0 model calls — its stored
+            # issues (validated at write time) are replayed verbatim. The
+            # cached chunk must have identical chunk boundaries (first_pid /
+            # last_pid / pair_count) — identity guarantees the same greedy
+            # chunking under the same input, so an index match with matching
+            # boundaries is a safe full-chunk replay (the owner's rule:
+            # "chunk_id -> cached chunk по индексу чанка").
+            cached = (cached_chunks or {}).get(chunk_index)
+            if cached is not None and cached.get("status") in ("GOOD", "GOOD_RETRIED"):
+                if (
+                    str(cached.get("first_pid")) == chunk_pids[0]
+                    and str(cached.get("last_pid")) == chunk_pids[-1]
+                    and int(cached.get("pair_count") or 0) == len(chunk_pairs)
+                    # PARTIAL-RESUME (t_a58dd881): the cached audit outcome
+                    # was computed on the ORIGINAL edited map; a chunk over
+                    # PIDs whose text changed in the R re-run is stale and
+                    # MUST be re-audited (fail-closed, never replay an audit
+                    # verdict for changed input).
+                    and not (
+                        resume_changed_pids
+                        and any(pid in resume_changed_pids for pid in chunk_pids)
+                    )
+                ):
+                    cached_issues = tuple(
+                        dict(item) for item in (cached.get("issues") or ())
+                    )
+                    meta = ChunkMeta(
+                        chunk=chunk_index,
+                        first_pid=chunk_pids[0],
+                        last_pid=chunk_pids[-1],
+                        pair_count=len(chunk_pairs),
+                        context_count=int(cached.get("context_count") or 0),
+                        status=str(cached.get("status")),
+                        finish_reason=cached.get("finish_reason"),
+                        content_chars=0,
+                        reasoning_chars=int(cached.get("reasoning_chars") or 0),
+                        json_parse="cached",
+                        validation_errors=(),
+                        reasoning_file=str(cached.get("reasoning_file") or ""),
+                        issues=cached_issues,
+                    )
+                    self._emit_chunk_event(
+                        "done",
+                        chunk=chunk_index,
+                        total=len(chunks),
+                        status=meta.status,
+                        issue_count=len(cached_issues),
+                        reused=True,
+                    )
+                    all_meta.append(meta)
+                    all_issues.extend(cached_issues)
+                    continue
+                LOG.warning(
+                    "audit chunk %s: cached GOOD chunk boundaries mismatch "
+                    "(first_pid=%r last_pid=%r pair_count=%r vs %r/%r/%d) — "
+                    "re-auditing this chunk (fail-closed)",
+                    chunk_index,
+                    cached.get("first_pid"), cached.get("last_pid"),
+                    cached.get("pair_count"),
+                    chunk_pids[0], chunk_pids[-1], len(chunk_pairs),
+                )
             context_pairs = get_overlap_context(
                 pairs, chunk_pairs[0].pid, cfg.overlap_tokens,
                 cfg.min_overlap_pairs, cfg.max_overlap_pairs,
