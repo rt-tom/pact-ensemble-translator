@@ -114,6 +114,22 @@ def _sanitize_translation(text: str) -> str:
     return str(soup)
 
 
+def _sanitized_visible_text(text: str) -> str:
+    """The visible text the body will ACTUALLY render for ``text``.
+
+    Single source of truth for heading text (TOC metadata + arc-key match):
+    ``BeautifulSoup(...).get_text()`` on the RAW translation silently drops
+    the contents of ``<script>``/``<style>`` while the allowlist sanitizer
+    unwraps those tags into visible text — so the raw text and the rendered
+    body diverge for disallowed-markup-wrapped keys (RV2 finding 2,
+    MEDIUM). Sanitizing first (then flattening) yields exactly what the
+    body renders: ``'<script>Bonds</script> 1.3'`` -> ``'Bonds 1.3'``.
+    """
+    return BeautifulSoup(
+        _sanitize_translation(text), "html.parser"
+    ).get_text(" ", strip=True)
+
+
 # ---------------------------------------------------------------------------
 # Chapter rendering
 # ---------------------------------------------------------------------------
@@ -187,7 +203,7 @@ def render_chapter_body(
             anchor = f"ch-{chapter_id}-h{len(headings) + 1}" if chapter_id else \
                 f"h{len(headings) + 1}"
             element_id = anchor
-            heading_text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+            heading_text = _sanitized_visible_text(text)
             substituted = _substitute_arc_name(heading_text, arc_names)
             headings.append({
                 "level": level,
@@ -252,7 +268,13 @@ def _substitute_arc_name_html(
     """
     if not arc_names or not raw_text:
         return raw_text
-    lowered = BeautifulSoup(raw_text, "html.parser").get_text(" ", strip=True).casefold()
+    # Match against the SANITIZED visible text — what the body will
+    # ACTUALLY render after the allowlist sanitizer. A raw
+    # ``BeautifulSoup(...).get_text()`` silently drops <script>/<style>
+    # contents, so a key wrapped in disallowed markup would be skipped
+    # while the sanitizer unwraps it into the visible heading (RV2 finding
+    # 2, MEDIUM): '<script>Bonds</script> 1.3' must match like 'Bonds 1.3'.
+    lowered = _sanitized_visible_text(raw_text).casefold()
     for key, russian in arc_names.items():
         if not key:
             continue
@@ -270,7 +292,7 @@ def _substitute_arc_name_html(
             # The key is not a literal leading token in the raw text (e.g.
             # it is entity-encoded or nested oddly) — degrade to the plain
             # substitution so body and TOC still agree deterministically.
-            plain = BeautifulSoup(raw_text, "html.parser").get_text(" ", strip=True)
+            plain = _sanitized_visible_text(raw_text)
             return f"{russian}{plain[len(key):]}"
     return raw_text
 

@@ -246,6 +246,50 @@ def test_arc_names_rendered_heading_body_preserves_inline_markup():
     assert "<em>Узы</em> 1.3" in body
 
 
+def test_arc_names_disallowed_markup_wrapper_still_substitutes():
+    """RV2 finding 2 (MEDIUM): a heading whose arc key is wrapped in
+    DISALLOWED markup (``<script>``) must still get the deterministic arc
+    substitution, and the TOC must agree with the rendered body.
+
+    Repro (reviewer): translation '<script>Bonds</script> 1.3' previously
+    rendered body '<h1>Bonds 1.3</h1>' while TOC said '1.3' — the raw
+    ``BeautifulSoup.get_text()`` drops <script> contents (so the key never
+    matched) while the allowlist sanitizer unwraps the tag into visible
+    text. The match and the TOC text are now both derived from the
+    SANITIZED visible text, so the key matches and body/TOC agree — and
+    the sanitizer allowlist is unchanged (no live <script> in the output).
+    """
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>X.</p>",
+        {"p00001": "<script>Bonds</script> 1.3", "p00002": "Икс."},
+        chapter_id="0001", arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"] == [
+        {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
+    ]
+    # The rendered body carries the substituted arc name (script unwrapped
+    # to inert text by the sanitizer, NOT weakened into a live tag).
+    assert "Узы 1.3" in body
+    assert "Bonds 1.3" not in body
+    assert "<script>" not in body
+    assert "</script>" not in body
+    assert "<h1" in body
+
+
+def test_arc_names_disallowed_style_wrapper_toc_matches_body():
+    """RV2 finding 2 (MEDIUM), <style> variant: same sanitized-visible-text
+    path for a key wrapped in a style tag — TOC and body agree on one
+    substitution and no <style> reaches the output."""
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>X.</p>",
+        {"p00001": "<style>Bonds</style> 1.3", "p00002": "Икс."},
+        chapter_id="0001", arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"][0]["text"] == "Узы 1.3"
+    assert "Узы 1.3" in body
+    assert "<style>" not in body and "</style>" not in body
+
+
 # ---------------------------------------------------------------------------
 # Disk assembly (render_book) + missing-pid reporting
 # ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from pact_v4.audit.entity_extractor import EXTRACTOR_VERSION
 from pact_v4.phase1.book_memory_candidates import BookMemoryCandidateLedger
 
 _PLAN = {
@@ -93,6 +94,7 @@ def _make_chapter_artifacts(
     chunk_plan: dict = _PLAN,
     entity_cache_payload: dict | None = None,
     record_source_hash: str = "test-hash",
+    record_extractor_version: str = EXTRACTOR_VERSION,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     chunk_ids = [c["chunk_id"] for c in chunk_plan["chunks"]]
@@ -115,8 +117,18 @@ def _make_chapter_artifacts(
     # source hash (identities.source_hash) of the chapter it consumed; the
     # book-run promotion verifies a cache entry's source_hash against it
     # (fail-closed provenance). Mirror that in the fixture.
+    # SAFE-MEMORY (RV2 finding 1, HIGH): the runner also records the
+    # extractor_version the prepass actually ran with
+    # (operational_policy.audit.extractor_version — see
+    # v4_phase12_strict_runner.py record build); the book-run promotion
+    # now verifies a cache entry's extractor_version against it, so a
+    # stale entry of the same chapter/source_hash written by an older
+    # extractor_version is never promoted. Mirror that too.
     if entity_cache_payload is not None:
         record["identities"] = {"source_hash": record_source_hash}
+        record["operational_policy"] = {
+            "audit": {"extractor_version": record_extractor_version},
+        }
     out_dir.joinpath("strict_chapter_trial_record.json").write_text(
         json.dumps(record, ensure_ascii=False),
         encoding="utf-8",
@@ -147,6 +159,7 @@ def _entity_cache_entry(
     anchor_span: str = "She was running late that day.",
     claims: list | None = None,
     source_hash: str = "test-hash",
+    extractor_version: str = EXTRACTOR_VERSION,
 ) -> dict:
     """Build a valid single-entry ``entity_context_cache.json`` payload.
 
@@ -157,11 +170,12 @@ def _entity_cache_entry(
     ``source_hash`` defaults to ``"test-hash"``; a caller that needs to
     exercise provenance mismatch passes a distinct value (it is used in
     BOTH the context stamp and the cache key, keeping the payload
-    internally consistent).
+    internally consistent). ``extractor_version`` defaults to the current
+    ``EXTRACTOR_VERSION``; a caller exercising RV2 finding 1 (stale
+    extractor-version entries in one cache) passes an older value.
     """
     from pact_v4.audit.entity_extractor import (
         ENTITY_CONTEXT_SCHEMA,
-        EXTRACTOR_VERSION,
         entity_context_cache_key,
     )
 
@@ -173,7 +187,7 @@ def _entity_cache_entry(
         }]
     context = {
         "schema": ENTITY_CONTEXT_SCHEMA,
-        "extractor_version": EXTRACTOR_VERSION,
+        "extractor_version": extractor_version,
         "chapter_id": chapter_id,
         "source_hash": source_hash,
         "entities": [
@@ -192,7 +206,7 @@ def _entity_cache_entry(
             {
                 "key": entity_context_cache_key(
                     source_hash=source_hash,
-                    extractor_version=EXTRACTOR_VERSION,
+                    extractor_version=extractor_version,
                 ),
                 "context": context,
             },
@@ -219,11 +233,20 @@ class TestBookMemoryAccumulation:
                 html, terminal, quarantined, translations = spec
                 entity_cache_payload = None
                 record_source_hash = "test-hash"
+                record_extractor_version = EXTRACTOR_VERSION
             elif len(spec) == 5:
                 html, terminal, quarantined, translations, entity_cache_payload = spec
                 record_source_hash = "test-hash"
-            else:
+                record_extractor_version = EXTRACTOR_VERSION
+            elif len(spec) == 6:
                 html, terminal, quarantined, translations, entity_cache_payload, record_source_hash = spec
+                record_extractor_version = EXTRACTOR_VERSION
+            else:
+                (
+                    html, terminal, quarantined, translations,
+                    entity_cache_payload, record_source_hash,
+                    record_extractor_version,
+                ) = spec
             _write_chapter_html(src_dir, chapter_id, html)
             _make_chapter_artifacts(
                 out_base / f"chapter_{chapter_id}", chapter_id,
@@ -231,6 +254,7 @@ class TestBookMemoryAccumulation:
                 translations=translations,
                 entity_cache_payload=entity_cache_payload,
                 record_source_hash=record_source_hash,
+                record_extractor_version=record_extractor_version,
             )
 
         result = v4_book_run.run_book(
@@ -430,6 +454,94 @@ class TestBookMemoryAccumulation:
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (html, "complete", [], translations, stale,
                      "current-source-hash"),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "Rose" not in bm.get("characters", {})
+        assert "Rose" not in bm.get("entities", {})
+        assert result["chapters"][0]["book_memory_candidates"]["committed"] == 0
+
+    def test_stale_extractor_version_never_promoted(self, tmp_path, monkeypatch):
+        """RV2 finding 1 (HIGH): the entity cache identity is source_hash +
+        extractor_version — a STALE entry for the same chapter/source_hash
+        written by an OLDER extractor_version is never promoted alongside
+        the current one (an out_dir reuse where the extractor code changed
+        must not replay old-version entities into book_memory). The run
+        record (operational_policy.audit.extractor_version — the version
+        the prepass actually ran with) is the expected identity; entries
+        stamped with any other version fail closed."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        # Two VALID cache entries in ONE payload: the current chapter (0001)
+        # with the SAME source_hash but DIFFERENT extractor_versions — the
+        # current EXTRACTOR_VERSION (Rose) and a stale older one (OldEntity).
+        current = _entity_cache_entry(
+            "0001", source_text,
+            entity="Rose", source_hash="same-source-hash",
+        )
+        stale = _entity_cache_entry(
+            "0001", source_text,
+            entity="OldEntity", canonical_type="man",
+            anchor_pid="p00001", anchor_span="Blake met Rose",
+            source_hash="same-source-hash",
+            extractor_version="pact-v4-entity-extractor/v0",
+            claims=[{
+                "kind": "gender", "value": "male", "status": "verified",
+                "evidence": [{"pid": "p00001", "span": "Blake met Rose"}],
+                "evidence_windows": [["p00001", "p00001"]],
+            }],
+        )
+        payload = {
+            "schema": "pact-v4-entity-context-cache/v1",
+            "entries": stale["entries"] + current["entries"],
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, payload,
+                     "same-source-hash", EXTRACTOR_VERSION),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        # The current-version verified entity promotes...
+        assert "Rose" in bm["characters"]
+        # ...the stale extractor_version entry is NEVER promoted (fail-closed).
+        assert "OldEntity" not in bm.get("characters", {})
+        assert "OldEntity" not in bm.get("entities", {})
+        assert "OldEntity" not in [f.get("fact", "") for f in bm.get("facts", [])]
+        assert result["chapters"][0]["book_memory_promotions"][0]["source"] == "Rose"
+        assert result["chapters"][0]["book_memory_promotions"][0]["gender"] == "female"
+
+    def test_record_missing_extractor_version_fails_closed(self, tmp_path, monkeypatch):
+        """RV2 finding 1 (HIGH), fail-closed branch: a run record that does
+        NOT carry operational_policy.audit.extractor_version (a legacy
+        out_dir / pre-record build) promotes NOTHING — the expected
+        extractor_version is unknown, and unknown provenance is safer than
+        wrong promotion (mirrors the source_hash fail-closed rule)."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        cache = _entity_cache_entry("0001", source_text)
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, cache,
+                     "test-hash", ""),
         })
 
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))

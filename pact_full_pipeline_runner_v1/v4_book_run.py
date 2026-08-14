@@ -1068,6 +1068,21 @@ def run_book(
                     run_source_hash = str(
                         (run_record.get("identities") or {}).get("source_hash") or ""
                     )
+                    # RV2 finding 1 (HIGH): the cache identity is
+                    # source_hash + extractor_version (pact_v4/audit/
+                    # entity_extractor.py:entity_context_cache_key) — a
+                    # STALE entry of the same chapter/source_hash written by
+                    # an older extractor_version must never be promoted
+                    # alongside the current one. The expected version is the
+                    # one the strict run actually ran with:
+                    # run_record.operational_policy.audit.extractor_version
+                    # (the runner records it at record build). No record /
+                    # no identity / any mismatch => no promotion
+                    # (fail-closed), mirroring the source_hash rule above.
+                    run_extractor_version = str(
+                        ((run_record.get("operational_policy") or {})
+                         .get("audit") or {}).get("extractor_version") or ""
+                    )
                     for entry in cache.to_payload().get("entries", []):
                         if not isinstance(entry, dict) or "context" not in entry:
                             continue
@@ -1075,6 +1090,11 @@ def run_book(
                         if context.chapter_id != chapter_id:
                             continue
                         if not run_source_hash or context.source_hash != run_source_hash:
+                            continue
+                        if (
+                            not run_extractor_version
+                            or context.extractor_version != run_extractor_version
+                        ):
                             continue
                         obs = book_memory_observations_from_entity_context(
                             context, chapter_id=chapter_id,
