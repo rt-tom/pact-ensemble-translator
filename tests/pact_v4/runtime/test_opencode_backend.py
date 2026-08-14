@@ -158,6 +158,55 @@ def test_compatible_minor_accepts_patch_release():
     assert backend.complete(_request()).text == "ok"
 
 
+@pytest.mark.parametrize("health_version", ["nightly", "dev", "canary"])
+def test_non_semver_health_version_with_explicit_pin_warns_and_proceeds(
+    health_version, caplog
+):
+    # HIGH (review UPGRADE-SERVE-1.18): a non-semver health version with an
+    # explicit pin + compatible_minor used to raise an unhandled ValueError
+    # ("cannot parse version 'nightly'"). The observed server version is
+    # never a fail-path: it logs a warning and the preflight/call proceed.
+    fake = FakeOpenCodeServer(version=health_version)
+    fake.script_message(_text_message("ok"))
+    backend = _backend(
+        fake,
+        server_version_policy="compatible_minor",
+        pinned_server_version="1.4.7",
+    )
+    with caplog.at_level("WARNING", logger="pact_v4.runtime.opencode_backend"):
+        resp = backend.complete(_request())
+    assert resp.text == "ok"
+    assert resp.raw_metadata["server_version"] == health_version
+    assert fake.requests_log  # a model call was made
+
+
+def test_observed_server_version_lands_in_descriptor_public_record():
+    # MEDIUM (review UPGRADE-SERVE-1.18): the observed server version must
+    # be persisted in the authoritative backend identity (descriptor
+    # public_record), not only in per-call raw_metadata. Before preflight
+    # it is unknown (None); after preflight it carries the health version.
+    fake = FakeOpenCodeServer(version="1.18.18")
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+
+    # Before preflight: no observed version known yet.
+    assert backend.descriptor.public_record()["observed_server_version"] is None
+
+    backend.complete(_request())
+    record = backend.descriptor.public_record()
+    assert record["observed_server_version"] == "1.18.18"
+    assert record["identity_hash"] == backend.descriptor.identity_hash
+    # The observed version is provenance only: it must NOT change identity.
+    from pact_v4.runtime.opencode_backend import build_opencode_descriptor
+    cfg = backend._cfg
+    no_version = build_opencode_descriptor(cfg).identity_hash
+    with_version = build_opencode_descriptor(
+        cfg, observed_server_version="1.18.18"
+    ).identity_hash
+    assert no_version == with_version
+    assert no_version == record["identity_hash"]
+
+
 def test_unhealthy_server_fails_preflight():
     fake = FakeOpenCodeServer(healthy=False)
     backend = _backend(fake)

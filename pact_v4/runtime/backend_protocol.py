@@ -323,6 +323,13 @@ class BackendDescriptor:
     model_bindings: Mapping[str, str]
     effective_options: Mapping[str, Any]
     identity_hash: str = field(init=False)
+    # Version the connected server reported via its health endpoint
+    # (``GET /global/health`` -> ``version``). Persisted as runtime
+    # provenance in ``public_record()`` so runs record what they actually
+    # ran on (review UPGRADE-SERVE-1.18 MEDIUM). It is deliberately NOT
+    # part of ``identity_hash``: identity stays config-deterministic and
+    # version-agnostic (a server upgrade must not invalidate cache/resume).
+    observed_server_version: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or not self.kind:
@@ -370,7 +377,13 @@ class BackendDescriptor:
         }
 
     def public_record(self) -> Mapping[str, Any]:
-        """Sanitized record safe for artifacts/logs (no credentials)."""
+        """Sanitized record safe for artifacts/logs (no credentials).
+
+        Includes ``observed_server_version`` (runtime provenance, filled by
+        the backend after preflight reads the health endpoint) — never part
+        of ``identity_hash``, so it is safe to persist and does not affect
+        cache/resume identity.
+        """
         return {
             "kind": self.kind,
             "transport_version": self.transport_version,
@@ -378,6 +391,7 @@ class BackendDescriptor:
             "public_endpoint": _canonical_endpoint(self.public_endpoint, drop_port=False),
             "model_bindings": dict(sorted(self.model_bindings.items())),
             "effective_options": _sanitize_secrets(dict(self.effective_options)),
+            "observed_server_version": self.observed_server_version,
             "identity_hash": self.identity_hash,
         }
 

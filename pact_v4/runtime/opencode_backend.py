@@ -379,6 +379,8 @@ def _parse_model_ref(model_ref: str) -> Tuple[str, str]:
 
 def build_opencode_descriptor(
     cfg: "OpenCodeServerBackendConfig",
+    *,
+    observed_server_version: Optional[str] = None,
 ) -> BackendDescriptor:
     """Build the backend identity descriptor for an OpenCode config.
 
@@ -388,6 +390,13 @@ def build_opencode_descriptor(
     adapter/server contract version, endpoint family, agent/system
     identity, structured-output mode + schema version, effective options,
     retry policy) and excludes credentials (plan §5.4, §12).
+
+    ``observed_server_version`` is runtime provenance (the version the
+    connected server reported via health); it is persisted in
+    ``public_record()`` but deliberately excluded from ``identity_hash``
+    (version-agnostic policy, owner 2026-08-14: a server upgrade must not
+    invalidate cache/resume identity). Config loaders that build the
+    descriptor before any server contact leave it ``None``.
     """
     bindings = dict(cfg.model_bindings) or {"default": ""}
     effective_options = {
@@ -424,6 +433,7 @@ def build_opencode_descriptor(
         public_endpoint=cfg.base_url,
         model_bindings=bindings,
         effective_options=effective_options,
+        observed_server_version=observed_server_version,
     )
 
 
@@ -443,13 +453,22 @@ def _version_compatible(
     Version-agnostic since 2026-08-14: the default pin is ``"latest"``
     (nothing to compare against -> always compatible). A config that pins
     an explicit version still gets exact/compatible_minor comparison, used
-    only for logging (a mismatch never fails the preflight).
+    only for logging (a mismatch never fails the preflight). An observed
+    version that is not parseable as semver (``nightly``, ``dev``,
+    ``canary``) is treated as "not compatible" so the callers log a
+    warning and proceed — the observed server version is never a
+    fail-path (review UPGRADE-SERVE-1.18 HIGH).
     """
     if pinned == "latest":
         return True
     if policy == "exact":
         return server_version == pinned
-    return _major_minor(server_version) == _major_minor(pinned)
+    try:
+        return _major_minor(server_version) == _major_minor(pinned)
+    except ValueError:
+        # Non-semver observed or pinned version: cannot compare by minor.
+        # Version-agnostic policy: warn-only, never a gate.
+        return False
 
 
 def _normalize_usage(info: Mapping[str, Any]) -> dict:
@@ -657,6 +676,10 @@ class OpenCodeServerBackend:
                 "opencode server health did not report a version",
             )
         self._server_version = version
+        # The descriptor is cached; invalidate it so the next access picks
+        # up the observed server version as runtime provenance (review
+        # UPGRADE-SERVE-1.18 MEDIUM). identity_hash is unaffected.
+        self._descriptor = None
         if not _version_compatible(
             version,
             policy=self._cfg.server_version_policy,
@@ -1018,7 +1041,13 @@ class OpenCodeServerBackend:
         return self._descriptor
 
     def _build_descriptor(self) -> BackendDescriptor:
-        return build_opencode_descriptor(self._cfg)
+        # Runtime provenance: the observed server version (health) is
+        # recorded in the descriptor's public record once preflight has
+        # run (review UPGRADE-SERVE-1.18 MEDIUM). Never affects
+        # identity_hash (version-agnostic).
+        return build_opencode_descriptor(
+            self._cfg, observed_server_version=self._server_version
+        )
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         if self._closed:

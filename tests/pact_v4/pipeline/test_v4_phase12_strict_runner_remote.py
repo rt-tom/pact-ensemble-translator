@@ -198,6 +198,10 @@ def test_remote_record_v2_has_backend_and_runtime_blocks(tmp_path: Path):
     assert record["backend"]["identity_hash"] == remote_cfg.backend.identity_hash
     assert record["backend"]["public_endpoint"] == "http://127.0.0.1:4096"
     assert record["backend"]["model_bindings"]["generator"] == "opencode-go/deepseek-v4-flash"
+    # UPGRADE-SERVE-1.18 MEDIUM: the observed server version (health) is
+    # persisted in the run record's backend identity/provenance block, so
+    # runs record what they actually ran on (not only the configured pin).
+    assert record["backend"]["observed_server_version"] == "1.18.18"
     # Runtime block: local_lifecycle null for remote, remote_calls aggregated.
     assert record["runtime"]["local_lifecycle"] is None
     remote_calls = record["runtime"]["remote_calls"]

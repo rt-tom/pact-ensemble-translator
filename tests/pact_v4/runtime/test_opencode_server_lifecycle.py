@@ -253,6 +253,50 @@ def test_start_proceeds_when_version_differs_from_explicit_pin():
     proc.close()
 
 
+def test_start_proceeds_when_health_version_is_non_semver():
+    # HIGH (review UPGRADE-SERVE-1.18): a non-semver health version
+    # ("nightly"/"dev"/"canary") with an explicit pin + compatible_minor
+    # used to raise an unhandled ValueError inside _wait_healthy, which
+    # left the launched process running (proc_ref retained). The observed
+    # version is never a fail-path: it is logged and the managed start
+    # returns a healthy process.
+    from pact_v4.runtime import opencode_server_lifecycle as life
+
+    proc = _make_process(version="nightly")[0]
+    proc._spec = life.ManagedServerSpec(
+        hostname="127.0.0.1", port=4096,
+        pinned_server_version="1.4.7", server_version_policy="compatible_minor",
+    )
+    proc.start()
+    assert proc.is_running
+    proc.close()
+
+
+def test_startup_probe_error_never_leaves_managed_process(monkeypatch):
+    # HIGH (review UPGRADE-SERVE-1.18): ANY real startup error must not
+    # leave the managed process running. Simulate an exception inside the
+    # health-wait (as the old version check did) and verify start() kills
+    # the spawned process before re-raising.
+    from pact_v4.runtime import opencode_server_lifecycle as life
+
+    def _boom_version(*args, **kwargs):
+        raise ValueError("cannot parse version 'nightly'")
+
+    monkeypatch.setattr(life, "_version_compatible", _boom_version)
+    proc, fake_proc, _capture = _make_process(version="nightly")
+    try:
+        proc.start()
+    except ValueError as exc:
+        assert "cannot parse version" in str(exc)
+    else:
+        raise AssertionError("expected ValueError from the version check")
+    # The managed process must have been killed and released.
+    assert fake_proc.terminated or fake_proc.killed
+    assert proc._proc is None
+    assert not proc.is_running
+    assert proc.pid is None
+
+
 def test_close_stops_only_own_process_and_is_idempotent():
     fake_proc = _FakeProcess()
     proc, fake_proc, _capture = _make_process(process=fake_proc)

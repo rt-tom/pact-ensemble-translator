@@ -277,7 +277,16 @@ class OpenCodeServerProcess:
         self._username = username
         self._password = password
 
-        self._wait_healthy()
+        try:
+            self._wait_healthy()
+        except BaseException:
+            # Guarantee (review UPGRADE-SERVE-1.18 HIGH): ANY startup
+            # failure — including an unexpected exception inside the health
+            # probe/version check — must not leave the managed process
+            # running. ``_force_kill`` is idempotent and also covers the
+            # cases ``_wait_healthy`` already cleans up (timeout, exit).
+            self._force_kill()
+            raise
         return self
 
     def _wait_healthy(self) -> None:
