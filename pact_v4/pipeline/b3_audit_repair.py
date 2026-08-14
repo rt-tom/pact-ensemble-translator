@@ -37,9 +37,14 @@ Provenance / cache contract:
   entity_context_hash`` (the card's identity, plus the exact translation
   content — the audit outcome is a function of both source and translation;
   entity hash present only when entity context is enabled). A full cache
-  hit reuses the stored outcome (0 model calls); a cached
-  ``audit_complete=False`` is NEVER reused — the audit re-runs (fail-closed,
-  "resume does not skip an incomplete audit").
+  hit reuses the stored outcome (0 model calls). A cached
+  ``audit_complete=False`` with an intact identity is a PARTIAL hit
+  (PARTIAL-RESUME t_a58dd881): GOOD/GOOD_RETRIED audit chunks and GOOD
+  R-editor chunks are replayed with 0 model calls (their stored issues /
+  parse-validated edits reused verbatim), the TRANSPORT_ERROR/EMPTY/FAILED
+  chunks are re-run; the fail-closed gate stays — the chapter is never
+  released as passed audit until EVERY chunk has a status, a cache is never
+  downgraded, and an identity mismatch is still a full miss.
 * ``entity_context_cache.json`` (schema from ``entity_extractor``) — the
   B1.2 per-chapter entity cache (``source_hash + extractor_version``).
 * ``entity_context_validation_report.json`` (schema
@@ -65,7 +70,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, AbstractSet
 
 from pact_v4.audit.chunked_audit import (
     DEFAULT_MAX_INPUT_TOKENS,
@@ -550,8 +555,12 @@ class B3AuditCache:
     Identity = snapshot_hash + translation_hash + config_identity +
     backend_identity_hash + prompt_version + harness_version +
     entity_context_hash (present only when entity context is enabled).
-    ``audit_complete=False`` is NEVER a reusable state: on resume an
-    incomplete audit re-runs (fail-closed).
+    ``audit_complete=True`` is a FULL hit (the stored repaired map is
+    replayed, 0 model calls). ``audit_complete=False`` with an intact
+    identity is a PARTIAL hit (PARTIAL-RESUME t_a58dd881): GOOD chunks are
+    replayed per-chunk, failed chunks re-run — never a full replay of an
+    incomplete audit (fail-closed), and never a replay across an identity
+    mismatch (full miss, as before).
     """
 
     def __init__(self, path: Path, payload: Optional[Mapping[str, Any]] = None) -> None:
@@ -606,19 +615,15 @@ class B3AuditCache:
         if payload.get("schema") != B3_AUDIT_CACHE_SCHEMA:
             LOG.info("B3: audit cache schema mismatch; re-running audit")
             return None
-        if payload.get("audit_complete") is not True:
-            LOG.info(
-                "B3: cached audit is incomplete (audit_complete=%r); "
-                "re-running audit (fail-closed, never skip an incomplete audit)",
-                payload.get("audit_complete"),
-            )
-            return None
         # F4 (B3 review): the cached repaired map is validated before it can
         # ever be reused/publicized. A structurally tampered cache (extra /
         # missing / reordered PIDs, non-string values, or a repaired-map hash
         # that does not bind to the stored map) is a MISS — the audit re-runs
         # and the tampered map is never published. Old-schema caches (no
-        # ``translations_repaired_hash`` field) also miss.
+        # ``translations_repaired_hash`` field) also miss. The check also
+        # guards the PARTIAL path: the edited-map fail-closed guard reads
+        # ``stored_translations_repaired``, so a tampered map must be a miss
+        # there too.
         repaired = payload.get("translations_repaired")
         if not isinstance(repaired, dict):
             LOG.warning(
@@ -651,6 +656,21 @@ class B3AuditCache:
                 stored_hash, computed_hash,
             )
             return None
+        if payload.get("audit_complete") is not True:
+            # PARTIAL-RESUME (t_a58dd881): identity matched but the cached
+            # audit did not complete. NOT a full miss anymore — the cache is
+            # returned as a PARTIAL hit: GOOD chunks (status GOOD/GOOD_RETRIED,
+            # valid JSON confirmed at write) and their top-level issues are
+            # reused; TRANSPORT_ERROR/EMPTY/FAILED chunks are marked for
+            # re-run. Fail-closed is preserved: the cached repaired map is
+            # never replayed, the gate stays at audit_complete=False until
+            # EVERY chunk has a status, and a cache is never downgraded.
+            LOG.info(
+                "B3: cached audit is incomplete (audit_complete=%r); "
+                "PARTIAL resume — GOOD chunks reused, failed chunks re-run",
+                payload.get("audit_complete"),
+            )
+            return cls(path, payload)
         return cls(path, payload)
 
     def is_hit(self) -> bool:
@@ -703,6 +723,99 @@ class B3AuditCache:
         if not isinstance(value, dict):
             return None
         return dict(value)
+
+    # ------------------------------------------------------------------
+    # PARTIAL-RESUME (t_a58dd881): per-chunk reuse plans
+    # ------------------------------------------------------------------
+
+    _GOOD_STATUSES = ("GOOD", "GOOD_RETRIED")
+
+    def is_partial(self) -> bool:
+        """True when the cached audit is a PARTIAL hit (identity matched,
+        audit did not complete) — GOOD chunks reusable, failed re-run."""
+        return bool(self._payload and self._payload.get("audit_complete") is not True)
+
+    def audit_resume_plan(self) -> Dict[int, Dict[str, Any]]:
+        """Per-chunk audit reuse plan for a partial cache.
+
+        Returns ``{chunk_index: {status, first_pid, last_pid, pair_count,
+        context_count, reasoning_chars, reasoning_file, finish_reason,
+        issues}}`` for every cached chunk whose status is GOOD/GOOD_RETRIED
+        (valid JSON was confirmed at write time — never re-validated here).
+        ``issues`` are the top-level cached issues attributed to this chunk
+        via their ``_debug.chunk`` (the deduped top-level list is the
+        authoritative issue set; a GOOD_RETRIED chunk's sub-issues carry the
+        parent chunk index). Empty when the cache is not a partial hit or
+        has no reusable chunks.
+        """
+        if not self._payload:
+            return {}
+        chunk_payloads = self._payload.get("chunks")
+        if not isinstance(chunk_payloads, list):
+            return {}
+        issues_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
+        for issue in self._payload.get("issues") or ():
+            if not isinstance(issue, dict):
+                continue
+            debug = issue.get("_debug")
+            chunk = debug.get("chunk") if isinstance(debug, dict) else None
+            if isinstance(chunk, int):
+                issues_by_chunk.setdefault(chunk, []).append(dict(issue))
+        plan: Dict[int, Dict[str, Any]] = {}
+        for chunk_payload in chunk_payloads:
+            if not isinstance(chunk_payload, dict):
+                continue
+            if chunk_payload.get("status") not in self._GOOD_STATUSES:
+                continue
+            chunk_index = chunk_payload.get("chunk")
+            if not isinstance(chunk_index, int):
+                continue
+            plan[chunk_index] = {
+                "status": str(chunk_payload.get("status")),
+                "first_pid": chunk_payload.get("first_pid"),
+                "last_pid": chunk_payload.get("last_pid"),
+                "pair_count": chunk_payload.get("pair_count"),
+                "context_count": chunk_payload.get("context_count"),
+                "reasoning_chars": chunk_payload.get("reasoning_chars", 0),
+                "reasoning_file": chunk_payload.get("reasoning_file", ""),
+                "finish_reason": chunk_payload.get("finish_reason"),
+                "issues": issues_by_chunk.get(chunk_index, []),
+            }
+        return plan
+
+    def r_editor_resume_plan(self) -> Dict[int, Dict[str, Any]]:
+        """Per-chunk Russian-editor reuse plan for a partial cache.
+
+        Returns ``{chunk_index: {status, first_pid, edits}}`` for every
+        cached R chunk whose status is GOOD — ``edits`` are the parse-
+        validated per-chunk edit payloads stored in the R report (replayed
+        with 0 model calls on resume; the caller re-runs only the failed
+        chunks). Empty when R was disabled / the cache predates R / the R
+        stage had no GOOD chunks.
+        """
+        if not self._payload:
+            return {}
+        report = self._payload.get("r_editor")
+        if not isinstance(report, dict):
+            return {}
+        outcome = report.get("outcome")
+        if not isinstance(outcome, dict):
+            return {}
+        plan: Dict[int, Dict[str, Any]] = {}
+        for chunk_payload in outcome.get("chunks") or ():
+            if not isinstance(chunk_payload, dict):
+                continue
+            if chunk_payload.get("status") != "GOOD":
+                continue
+            chunk_index = chunk_payload.get("chunk")
+            if not isinstance(chunk_index, int):
+                continue
+            plan[chunk_index] = {
+                "status": "GOOD",
+                "first_pid": chunk_payload.get("first_pid"),
+                "edits": list(chunk_payload.get("edits") or ()),
+            }
+        return plan
 
     def save(
         self,
@@ -863,6 +976,7 @@ class B3AuditRepair:
         translation: Mapping[str, str],
         journal: AuditJournal,
         out_dir: Optional[Path],
+        cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> Tuple[Dict[str, str], Tuple[ReviewCandidate, ...], Optional[RussianEditorOutcome]]:
         """V4.2 R stage: run the Russian-only editor over the raw map.
 
@@ -883,6 +997,13 @@ class B3AuditRepair:
         ``partial=true`` + ``applied_count`` + ``failed_chunks``. The
         failure is debt (journal + outcome), exactly like a failed repair
         batch: the audit still protects the chapter.
+
+        PARTIAL-RESUME (t_a58dd881): ``cached_chunks`` (from the audit
+        cache's r_editor report) replays GOOD chunks with 0 model calls —
+        their parse-validated edits are re-applied to the raw map
+        (idempotent: R applies edits to the RAW map at run time, so a
+        replayed GOOD chunk reproduces the exact same edited text); the
+        failed chunks are re-run.
         """
         cfg = self._config
         if not cfg.russian_editor_enabled:
@@ -921,6 +1042,9 @@ class B3AuditRepair:
                     edit_count=fields.get("edit_count", 0),
                     warning_count=fields.get("warning_count", 0),
                     error=fields.get("error"),
+                    # PARTIAL-RESUME: the chunk was replayed from the partial
+                    # cache (0 model calls), not freshly edited.
+                    reused=fields.get("reused"),
                 )
 
         evaluator = RussianEditorEvaluator(
@@ -950,6 +1074,7 @@ class B3AuditRepair:
             outcome = evaluator(
                 chapter_id=chapter_id, translation=translation,
                 out_dir=out_dir, out_base="r_editor",
+                cached_chunks=cached_chunks,
             )
         except Exception as exc:  # noqa: BLE001 — R failure is debt, never a crash
             LOG.exception("B3: russian_editor failed for %s", chapter_id)
@@ -1100,8 +1225,9 @@ class B3AuditRepair:
             )
 
         # ------------------------------------------------------------------
-        # 2. Audit cache: full hit -> reuse (0 model calls); incomplete
-        #    cached audit -> re-run (fail-closed).
+        # 2. Audit cache: FULL hit -> reuse (0 model calls); PARTIAL hit
+        #    (identity matched, audit incomplete) -> GOOD chunks reused,
+        #    failed chunks re-run (PARTIAL-RESUME t_a58dd881).
         # ------------------------------------------------------------------
         cache = B3AuditCache.load(
             cache_path,
@@ -1117,7 +1243,30 @@ class B3AuditRepair:
             # translations_repaired has missing/extra/reordered PIDs is a miss.
             expected_pids=tuple(translation_map),
         )
-        if cache is not None and cache.is_hit():
+        # PARTIAL-RESUME: build the per-chunk reuse plans from a partial
+        # cache (identity matched, audit_complete=False). GOOD audit chunks
+        # and GOOD R chunks are replayed with 0 model calls; the failed ones
+        # are re-run. The plans are consumed by the R stage and the audit
+        # evaluator below.
+        partial_cache = (
+            cache if (cache is not None and cache.is_hit() and not cache.audit_complete())
+            else None
+        )
+        audit_resume: Dict[int, Dict[str, Any]] = {}
+        r_editor_resume: Dict[int, Dict[str, Any]] = {}
+        # PARTIAL-RESUME: PIDs whose edited text changed in the R re-run vs
+        # the cached edited map — cached audit chunks over those PIDs are
+        # re-audited (per-chunk fail-closed). None when no partial reuse.
+        resume_changed_pids: Optional[AbstractSet[str]] = None
+        if partial_cache is not None:
+            audit_resume = partial_cache.audit_resume_plan()
+            r_editor_resume = partial_cache.r_editor_resume_plan()
+            LOG.info(
+                "B3: partial audit cache for %s — reusing %d GOOD audit "
+                "chunk(s) + %d GOOD R chunk(s), re-running the failed ones",
+                chapter_id, len(audit_resume), len(r_editor_resume),
+            )
+        if cache is not None and cache.is_hit() and cache.audit_complete():
             repaired = cache.stored_translations_repaired()
             issues = cache.stored_issues()
             filtered = cache.stored_filtered()
@@ -1180,6 +1329,11 @@ class B3AuditRepair:
             entity_context_hash=entity_hash,
             prompt_version=cfg.prompt_version,
             harness_version=cfg.harness_version,
+            # PARTIAL-RESUME (t_a58dd881): the audit started from a partial
+            # cache — GOOD chunks replayed, failed chunks re-run.
+            partial_resume=bool(audit_resume or r_editor_resume),
+            reused_audit_chunks=sorted(audit_resume),
+            reused_r_editor_chunks=sorted(r_editor_resume),
         )
 
         # ------------------------------------------------------------------
@@ -1199,6 +1353,7 @@ class B3AuditRepair:
                     translation=translation_map,
                     journal=journal,
                     out_dir=out_dir,
+                    cached_chunks=r_editor_resume or None,
                 )
             )
             # The audit/repair consume the R-EDITED map (raw + SAFE edits).
@@ -1209,6 +1364,40 @@ class B3AuditRepair:
                 review_journal=(),
                 from_cache=False,
             )
+            # PARTIAL-RESUME fail-closed guard: the cached audit chunks were
+            # computed on the R-EDITED map of the ORIGINAL run (the partial
+            # cache's translations_repaired IS that edited map). If the R
+            # re-run of previously-failed chunks changed the edited text, the
+            # cached audit chunks that CONTAIN those PIDs are stale — the
+            # evaluator refuses to replay a cached chunk whose own pids
+            # intersect ``changed_pids`` (re-audits it) while chunks over
+            # untouched PIDs are still replayed (per-chunk fail-closed, the
+            # owner's "не пересматриваем GOOD" with input-identity honesty).
+            # A missing cached edited map (legacy/tampered cache) drops the
+            # whole reuse plan.
+            if audit_resume:
+                cached_edited = partial_cache.stored_translations_repaired()
+                new_edited = dict(translation_map)
+                if cached_edited is None:
+                    LOG.warning(
+                        "B3: partial audit cache for %s — no cached edited "
+                        "map to verify audit input; full re-audit (fail-closed)",
+                        chapter_id,
+                    )
+                    audit_resume = {}
+                else:
+                    resume_changed_pids = {
+                        pid for pid, text in new_edited.items()
+                        if cached_edited.get(pid) != text
+                    }
+                    if resume_changed_pids:
+                        LOG.warning(
+                            "B3: partial audit cache for %s — R re-run "
+                            "changed %d PID(s); cached audit chunks over "
+                            "those PIDs will be re-audited (per-chunk "
+                            "fail-closed)",
+                            chapter_id, len(resume_changed_pids),
+                        )
             # Artifacts are written when the R stage produced ANY edited map
             # (complete pass, or a partial pass whose successful chunks
             # applied edits / forwarded candidates) — the audit/repair
@@ -1280,6 +1469,9 @@ class B3AuditRepair:
                         status=fields.get("status"),
                         issue_count=fields.get("issue_count", 0),
                         error=fields.get("error"),
+                        # PARTIAL-RESUME: the chunk was replayed from the
+                        # partial cache (0 model calls), not freshly audited.
+                        reused=fields.get("reused"),
                     )
 
             evaluator = ChunkedAuditEvaluator(
@@ -1306,6 +1498,10 @@ class B3AuditRepair:
                 entity_context=entity_context,
                 out_dir=out_dir,
                 out_base="b3_audit",
+                # PARTIAL-RESUME: replay GOOD cached chunks (0 model calls);
+                # chunks whose pids changed in the R re-run are re-audited.
+                cached_chunks=audit_resume or None,
+                resume_changed_pids=resume_changed_pids,
             )
         except Exception as exc:  # noqa: BLE001 — fail-closed: a pre/model-call
             # audit failure is TERMINAL. The strict runner records the failed
@@ -1332,6 +1528,9 @@ class B3AuditRepair:
             issue_count=outcome.issue_count,
             failed_chunks=list(outcome.failed_chunks),
             from_cache=False,
+            # PARTIAL-RESUME (t_a58dd881): how many GOOD chunks were replayed
+            # from the partial cache (0 model calls for them).
+            reused_chunks=sorted(audit_resume) if audit_resume else [],
         )
         self._emit_progress(
             "b3_audit_done",
@@ -1364,6 +1563,12 @@ class B3AuditRepair:
                 filtered=(),
                 repair=None,
                 translations_repaired=dict(translation_map),
+                # PARTIAL-RESUME (t_a58dd881): the R report (with per-chunk
+                # statuses + parse-validated edits) rides the partial cache so
+                # the NEXT resume reuses GOOD R chunks too (previously it was
+                # dropped on the fail-closed path — r_editor stayed None and
+                # run_remote_007-style caches lost all R reuse data).
+                r_editor=r_editor_report,
             )
             step6 = {
                 "status": "incomplete",
@@ -1375,6 +1580,11 @@ class B3AuditRepair:
                 "entity_context_enabled": cfg.entity_context_enabled,
                 "entity_context_hash": entity_hash,
                 "from_cache": False,
+                # PARTIAL-RESUME (t_a58dd881): GOOD chunks were replayed from
+                # the partial cache (0 model calls); only the failed ones were
+                # re-run (and failed again — fail-closed preserved).
+                "partial_resume": bool(audit_resume),
+                "reused_chunks": sorted(audit_resume) if audit_resume else [],
             }
             step7 = {"status": "skipped", "reason": "audit_incomplete_fail_closed"}
             step8 = {
@@ -1579,6 +1789,10 @@ class B3AuditRepair:
             "entity_context_enabled": cfg.entity_context_enabled,
             "entity_context_hash": entity_hash,
             "from_cache": False,
+            # PARTIAL-RESUME (t_a58dd881): GOOD chunks were replayed from the
+            # partial cache (0 model calls); only the failed ones re-run.
+            "partial_resume": bool(audit_resume),
+            "reused_chunks": sorted(audit_resume) if audit_resume else [],
         }
         step7 = {
             "status": (

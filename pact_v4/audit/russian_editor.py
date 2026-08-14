@@ -256,6 +256,12 @@ class RussianEditorOutcome:
     # chunk (edits over MAX_EDITS_PER_PID dropped with a WARNING; SAFE edits
     # whose fragment stopped being a substring after earlier same-pid edits).
     warning_count: int = 0
+    # PARTIAL-RESUME (t_a58dd881): per-chunk records — {chunk, first_pid,
+    # last_pid, status (GOOD|FAILED), edits: [payload]} — so a partial
+    # resume can reuse GOOD chunks' parse-validated edits with 0 model calls
+    # and re-run only the failed chunks (the audit-cache payload carries
+    # this in ``r_editor.outcome.chunks``).
+    chunks: Tuple[Dict[str, Any], ...] = ()
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -292,6 +298,7 @@ class RussianEditorOutcome:
             ],
             "dropped": self.dropped,
             "warning_count": self.warning_count,
+            "chunks": [dict(c) for c in self.chunks],
         }
 
 
@@ -340,6 +347,33 @@ def get_editor_overlap(
 # ---------------------------------------------------------------------------
 # Response parsing (fail-closed)
 # ---------------------------------------------------------------------------
+
+
+def _edit_to_payload(edit: EditorEdit) -> Dict[str, Any]:
+    """Serialize one parsed ``EditorEdit`` for the audit-cache payload."""
+    return {
+        "pid": edit.pid,
+        "original": edit.original,
+        "rewritten": edit.rewritten,
+        "reason": edit.reason,
+        "class": edit.klass,
+    }
+
+
+def _edit_from_payload(item: Mapping[str, Any]) -> EditorEdit:
+    """Rebuild one ``EditorEdit`` from a cached payload (PARTIAL-RESUME).
+
+    The payload was produced by ``_edit_to_payload`` from a parse-validated
+    edit (already structurally valid at write time — the resume contract
+    does NOT re-validate replayed GOOD-chunk edits).
+    """
+    return EditorEdit(
+        pid=str(item.get("pid", "")),
+        original=str(item.get("original", "")),
+        rewritten=str(item.get("rewritten", "")),
+        reason=str(item.get("reason", "")),
+        klass=str(item.get("class", "")),
+    )
 
 
 def _is_retryable_json_error(errors: Sequence[str]) -> bool:
@@ -625,6 +659,7 @@ class RussianEditorEvaluator:
         translation: Mapping[str, str],
         out_dir: Optional[Path] = None,
         out_base: str = "r_editor",
+        cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> RussianEditorOutcome:
         cfg = self._config
         model_ref = audit_model_ref(self._backend)
@@ -646,9 +681,46 @@ class RussianEditorEvaluator:
         # Per-chunk parse warnings (over MAX_EDITS_PER_PID drops) — counted
         # separately from route warnings in the outcome.
         chunk_warning_counts: List[int] = []
+        # PARTIAL-RESUME (t_a58dd881): per-chunk records (status + parsed
+        # edits) so the audit cache can replay GOOD chunks with 0 model calls.
+        chunk_records: List[Dict[str, Any]] = []
 
         for chunk_index, chunk_pairs in enumerate(chunks, start=1):
             chunk_pids = [p.pid for p in chunk_pairs]
+            # PARTIAL-RESUME: a cached GOOD chunk for this index is reused —
+            # its parse-validated edits (stored in the audit cache payload)
+            # are replayed with 0 model calls. Identity (raw translation
+            # hash + R config) guarantees the same fixed-count chunking, so
+            # an index match with a matching first_pid is a safe replay; a
+            # boundary mismatch re-runs the chunk (fail-closed).
+            cached = (cached_chunks or {}).get(chunk_index)
+            if cached is not None and cached.get("status") == "GOOD":
+                if str(cached.get("first_pid")) == chunk_pids[0]:
+                    cached_edits = tuple(
+                        _edit_from_payload(item)
+                        for item in (cached.get("edits") or ())
+                    )
+                    all_edits.extend(cached_edits)
+                    chunk_records.append({
+                        "chunk": chunk_index,
+                        "first_pid": chunk_pids[0],
+                        "last_pid": chunk_pids[-1],
+                        "status": "GOOD",
+                        "edits": [
+                            _edit_to_payload(e) for e in cached_edits
+                        ],
+                    })
+                    self._emit_chunk_event(
+                        "done", chunk=chunk_index, total=len(chunks),
+                        status="GOOD", edit_count=len(cached_edits),
+                        reused=True,
+                    )
+                    continue
+                LOG.warning(
+                    "russian_editor chunk %d: cached GOOD chunk first_pid "
+                    "mismatch (%r vs %r) — re-running this chunk (fail-closed)",
+                    chunk_index, cached.get("first_pid"), chunk_pids[0],
+                )
             context_pairs = get_editor_overlap(
                 pairs, chunk_pairs[0].pid, cfg.overlap_pairs
             )
@@ -721,6 +793,13 @@ class RussianEditorEvaluator:
                         )
                         append_error_marker(reason_path, exc)
                     failed_chunks.append(chunk_index)
+                    chunk_records.append({
+                        "chunk": chunk_index,
+                        "first_pid": chunk_pids[0],
+                        "last_pid": chunk_pids[-1],
+                        "status": "FAILED",
+                        "edits": [],
+                    })
                     self._emit_chunk_event(
                         "done", chunk=chunk_index, status="FAILED",
                         error=f"{type(exc).__name__}: {exc}",
@@ -766,6 +845,13 @@ class RussianEditorEvaluator:
                         chunk_index, "; ".join(errors),
                     )
                     failed_chunks.append(chunk_index)
+                    chunk_records.append({
+                        "chunk": chunk_index,
+                        "first_pid": chunk_pids[0],
+                        "last_pid": chunk_pids[-1],
+                        "status": "FAILED",
+                        "edits": [],
+                    })
                     self._emit_chunk_event(
                         "done", chunk=chunk_index, status="FAILED",
                         error="; ".join(errors),
@@ -780,6 +866,13 @@ class RussianEditorEvaluator:
                 continue
             all_edits.extend(chunk_edits)
             chunk_warning_counts.append(len(chunk_warnings))
+            chunk_records.append({
+                "chunk": chunk_index,
+                "first_pid": chunk_pids[0],
+                "last_pid": chunk_pids[-1],
+                "status": "GOOD",
+                "edits": [_edit_to_payload(e) for e in chunk_edits],
+            })
             self._emit_chunk_event(
                 "done", chunk=chunk_index, status="GOOD",
                 edit_count=len(chunk_edits),
@@ -812,6 +905,7 @@ class RussianEditorEvaluator:
             candidates=tuple(candidates),
             dropped=dropped,
             warning_count=parse_warning_count + len(route_warnings),
+            chunks=tuple(chunk_records),
         )
 
 
