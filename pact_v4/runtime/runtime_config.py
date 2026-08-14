@@ -457,6 +457,26 @@ class CompositeCompletionBackend:
     def descriptor(self) -> BackendDescriptor:
         return self._descriptor
 
+    def observed_server_version(self) -> Optional[str]:
+        """The observed OpenCode health version of the sub-backend, if any.
+
+        Composite shape today is at most one remote OpenCode sub-backend
+        (1-local + 1-remote, per ``CompositeBackendConfig.build_runtime``
+        docs), so the first non-``None`` observed version among the
+        sub-backends is authoritative for the composite descriptor. Local
+        sub-backends never observe a server version (their descriptors
+        carry ``None``).
+        """
+        for backend in self._sub.values():
+            version = getattr(
+                getattr(backend, "descriptor", None),
+                "observed_server_version",
+                None,
+            )
+            if version:
+                return version
+        return None
+
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         name = self._ref_to_name.get(request.model_ref)
         if name is None:
