@@ -497,6 +497,164 @@ def test_composite_fallback_resolving_to_local_backend_fails_loudly():
         apply_role_models(cfg, {"repair": "opencode-go/deepseek-v4-flash"})
 
 
+# ---------------------------------------------------------------------------
+# Composite explicit-role routing (RV2 t_7b26974e HIGH on eb1396d)
+# ---------------------------------------------------------------------------
+
+
+def _opencode(name: str, bindings: dict) -> OpenCodeBackendConfig:
+    """A remote opencode sub-backend declaring exactly ``bindings``."""
+    port = {"a": 4101, "b": 4102}.get(name, 4103)
+    return OpenCodeBackendConfig(
+        server=OpenCodeServerBackendConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            username="pact",
+            password="secret",
+            model_bindings=dict(bindings),
+            structured_output_mode="prompt_only",
+        )
+    )
+
+
+def _dual_generator_composite() -> Any:
+    """A valid composite where TWO sub-backends declare the generator role
+    with DIFFERENT refs, and the role map routes generator/repair (and the
+    audit roles) to ``b``.
+
+    ``a`` also declares generator — so the pre-fix first-wins flatten
+    advertised ``a``'s generator ref while requests were routed to the
+    wrong concrete backend; the explicit role map must now be
+    authoritative in BOTH the descriptor and the serving backend.
+    """
+    from pact_v4.runtime.runtime_config import CompositeBackendConfig
+
+    a = _opencode("a", {
+        "generator": "opencode-go/deepseek-v4-flash",
+        "qwen_audit": "opencode-go/qwen3.7-plus",
+    })
+    b = _opencode("b", {
+        "generator": "opencode-go/qwen3.7-plus",
+        "qwen_audit": "opencode-go/qwen3.7-plus",
+        "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+        "russian_selector": "opencode-go/qwen3.7-plus",
+    })
+    return CompositeBackendConfig(
+        backends={"a": a, "b": b},
+        role_backend_map={
+            "generator": "b",
+            "repair": "b",
+            "qwen_audit": "b",
+            "fidelity_reviewer": "b",
+            "russian_selector": "b",
+        },
+    )
+
+
+def _dual_audit_composite() -> Any:
+    """A valid composite where TWO sub-backends declare the qwen_audit role
+    with DIFFERENT refs and the role map routes the audit roles to ``b``;
+    entity_extractor is declared by NOBODY (the documented fallback to
+    qwen_audit must resolve it to the same concrete backend).
+    """
+    from pact_v4.runtime.runtime_config import CompositeBackendConfig
+
+    a = _opencode("a", {
+        "generator": "opencode-go/deepseek-v4-flash",
+        "qwen_audit": "opencode-go/qwen3.7-plus",
+    })
+    b = _opencode("b", {
+        "generator": "opencode-go/deepseek-v4-flash",
+        "qwen_audit": "opencode-go/deepseek-v4-flash",
+        "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+        "russian_selector": "opencode-go/qwen3.7-plus",
+    })
+    return CompositeBackendConfig(
+        backends={"a": a, "b": b},
+        role_backend_map={
+            "generator": "b",
+            "qwen_audit": "b",
+            "fidelity_reviewer": "b",
+            "russian_selector": "b",
+        },
+    )
+
+
+def test_composite_duplicate_role_descriptor_follows_role_map():
+    # RV2 finding (descriptor side): with the generator role declared by
+    # TWO sub-backends, the flattened descriptor must advertise the MAPPED
+    # backend's ref — not the first declarer's — so the role adapters never
+    # resolve a ref that routes elsewhere.
+    cfg = _dual_generator_composite()
+    bindings = cfg.build_descriptor().model_bindings
+    assert bindings["generator"] == "opencode-go/qwen3.7-plus"  # backend "b"
+    assert bindings["qwen_audit"] == "opencode-go/qwen3.7-plus"
+    assert bindings["fidelity_reviewer"] == "opencode-go/qwen3.7-plus"
+    assert bindings["russian_selector"] == "opencode-go/qwen3.7-plus"
+    # The first declarer's generator ref is NOT advertised for the role.
+    assert bindings["generator"] != "opencode-go/deepseek-v4-flash"
+    # Routing map stays part of descriptor identity (plan §14.4).
+    assert cfg.build_descriptor().effective_options["routing"]["generator"] == "b"
+
+
+def test_translator_repair_fallback_on_duplicate_generator_routes_to_mapped_backend(
+    registry: ProvidersRegistry,
+):
+    # --translator on a composite where TWO sub-backends declare generator:
+    # the override lands on the role-mapped backend, the repair -> generator
+    # fallback resolves to the SAME concrete backend, and the descriptor
+    # advertises the mapped backend's refs (identity changes with the flag).
+    cfg = _dual_generator_composite()
+    applied = apply_provider_flags(
+        cfg, registry, translator="opencode-go/deepseek4flash"
+    )
+    b = applied.backends["b"]
+    assert b.server.model_bindings["generator"] == "opencode-go/deepseek-v4-flash"
+    assert b.server.model_bindings["repair"] == "opencode-go/deepseek-v4-flash"
+    # a untouched by the translator override.
+    assert applied.backends["a"].server.model_bindings[
+        "generator"
+    ] == "opencode-go/deepseek-v4-flash"
+    desc = applied.build_descriptor().model_bindings
+    assert desc["generator"] == "opencode-go/deepseek-v4-flash"
+    assert desc["repair"] == "opencode-go/deepseek-v4-flash"
+    assert applied.identity_hash != cfg.identity_hash
+
+
+def test_reviewer_entity_extractor_fallback_on_duplicate_audit_routes_to_mapped_backend(
+    registry: ProvidersRegistry,
+):
+    # --reviewer on a composite where TWO sub-backends declare qwen_audit:
+    # the override lands on the role-mapped audit backend; entity_extractor
+    # (documented fallback to qwen_audit) resolves to the SAME concrete
+    # backend and the descriptor advertises the mapped refs.
+    cfg = _dual_audit_composite()
+    applied = apply_provider_flags(cfg, registry, reviewer="openai/luna")
+    b = applied.backends["b"]
+    assert b.server.model_bindings["qwen_audit"] == "openai/gpt-5.6-luna"
+    assert b.server.model_bindings["entity_extractor"] == "openai/gpt-5.6-luna"
+    assert b.server.model_bindings["fidelity_reviewer"] == "openai/gpt-5.6-luna"
+    assert b.server.model_bindings["russian_selector"] == "openai/gpt-5.6-luna"
+    desc = applied.build_descriptor().model_bindings
+    assert desc["qwen_audit"] == "openai/gpt-5.6-luna"
+    assert desc["entity_extractor"] == "openai/gpt-5.6-luna"
+    # Generator/gemma_audit untouched by --reviewer.
+    assert desc["generator"] == "opencode-go/deepseek-v4-flash"
+    assert applied.identity_hash != cfg.identity_hash
+
+
+def test_composite_descriptor_keeps_fallback_roles_unbound_when_undeclared():
+    # repair/entity_extractor undeclared by every sub-backend stay ABSENT
+    # from the descriptor: no synthetic bindings are introduced, so the
+    # identity of existing composites does not change (no cache/resume
+    # regression). The runtime resolves them via the generator / qwen_audit
+    # refs at request time (_EntityRoleView / repair -> generator fallback).
+    cfg = _composite_cfg()
+    bindings = cfg.build_descriptor().model_bindings
+    assert "repair" not in bindings
+    assert "entity_extractor" not in bindings
+    assert bindings["generator"] == "opencode-go/deepseek-v4-flash"
+
+
 def test_provider_model_validation():
     with pytest.raises(ValueError, match="provider/model"):
         ProviderModel(ref="no-slash", reasoning_variants=("low",))

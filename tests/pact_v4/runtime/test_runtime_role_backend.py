@@ -31,6 +31,7 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendModelCaller,
     BackendQwenAuditEvaluator,
     BackendQwenEvaluator,
+    _model_ref_for,
 )
 from pact_v4.runtime.model_lifecycle import ModelRouter
 from pact_v4.runtime.opencode_backend import (
@@ -343,6 +344,147 @@ def _req(model_ref: str) -> CompletionRequest:
         response_schema=None,
         label="test",
     )
+
+
+def _composite_descriptor(
+    routing: Mapping[str, str], bindings: Mapping[str, str]
+) -> BackendDescriptor:
+    """A composite descriptor carrying the role map in effective_options.
+
+    Mirrors ``CompositeBackendConfig.build_descriptor`` (the routing map is
+    part of ``effective_options``); ``CompositeCompletionBackend`` reads it
+    to route each model_ref to the backend that actually serves the role.
+    """
+    return BackendDescriptor(
+        kind="composite",
+        transport_version="composite/v1",
+        endpoint_family="pact_composite",
+        public_endpoint="",
+        model_bindings=dict(bindings),
+        effective_options={"routing": dict(routing)},
+    )
+
+
+def test_composite_backend_duplicate_role_routes_to_mapped_backend():
+    # RV2 t_7b26974e HIGH: generator is declared by BOTH sub-backends with
+    # DIFFERENT refs and the role map routes it to ``b``. The role adapters
+    # must resolve the MAPPED backend's ref (via the descriptor) and the
+    # request must reach that backend — not the first declarer.
+    a = _FakeCompletionBackend("a", {"generator": "m-a-gen", "qwen_audit": "m-a-qa"})
+    b = _FakeCompletionBackend(
+        "b", {"generator": "m-b-gen", "fidelity_reviewer": "m-b-fid"}
+    )
+    routing = {"generator": "b", "qwen_audit": "a", "fidelity_reviewer": "b"}
+    composite = CompositeCompletionBackend(
+        {"a": a, "b": b},
+        _composite_descriptor(routing, {
+            "generator": "m-b-gen",
+            "qwen_audit": "m-a-qa",
+            "fidelity_reviewer": "m-b-fid",
+        }),
+    )
+    # _model_ref_for (what the role adapters consume) resolves generator to
+    # the mapped backend's ref.
+    ref = _model_ref_for(composite, ("generator", "fidelity_first"))
+    assert ref == "m-b-gen"
+    composite.complete(_req(ref))
+    assert b.seen == ["m-b-gen"]
+    assert a.seen == []
+    # The other sub-backend's generator ref stays routable to it directly.
+    composite.complete(_req("m-a-gen"))
+    assert a.seen == ["m-a-gen"]
+    # serving_backend (reasoning-transport decision) follows the same map.
+    assert composite.serving_backend("m-b-gen") is b
+    assert composite.serving_backend("m-a-gen") is a
+
+
+def test_composite_backend_collision_routes_to_mapped_backend():
+    # Model-ref collision: the SAME ref is bound to the SAME role by both
+    # sub-backends. The role map — not last-wins — decides which backend
+    # serves it, so a CompletionRequest carrying the ref reaches the
+    # mapped backend.
+    a = _FakeCompletionBackend("a", {"generator": "m-shared"})
+    b = _FakeCompletionBackend("b", {"generator": "m-shared", "qwen_audit": "m-qa"})
+    routing = {"generator": "a", "qwen_audit": "b"}
+    composite = CompositeCompletionBackend(
+        {"a": a, "b": b},
+        _composite_descriptor(routing, {
+            "generator": "m-shared", "qwen_audit": "m-qa",
+        }),
+    )
+    composite.complete(_req("m-shared"))
+    composite.complete(_req("m-qa"))
+    assert a.seen == ["m-shared"]
+    assert b.seen == ["m-qa"]
+    assert composite.serving_backend("m-shared") is a
+    assert composite.serving_backend("m-qa") is b
+
+
+def test_composite_backend_fallback_role_reaches_generator_backend():
+    # Documented fallbacks (repair -> generator, entity_extractor ->
+    # qwen_audit): a role declared by NO sub-backend resolves its model_ref
+    # through the fallback binding, and the request reaches the SAME
+    # concrete backend that serves the fallback role.
+    a = _FakeCompletionBackend("a", {"generator": "m-gen", "qwen_audit": "m-qa"})
+    b = _FakeCompletionBackend("b", {"fidelity_reviewer": "m-fid"})
+    routing = {"generator": "a", "qwen_audit": "a", "fidelity_reviewer": "b"}
+    composite = CompositeCompletionBackend(
+        {"a": a, "b": b},
+        _composite_descriptor(routing, {
+            "generator": "m-gen", "qwen_audit": "m-qa", "fidelity_reviewer": "m-fid",
+        }),
+    )
+    # Descriptor carries no synthetic repair binding.
+    assert "repair" not in composite.descriptor.model_bindings
+    repair_ref = _model_ref_for(composite, ("repair", "generator"))
+    assert repair_ref == "m-gen"
+    composite.complete(_req(repair_ref))
+    assert a.seen == ["m-gen"]
+    assert b.seen == []
+    # entity_extractor resolves via the qwen_audit binding on the same
+    # audit backend ("a" here) — B3 _EntityRoleView does the same.
+    entity_ref = _model_ref_for(composite, ("entity_extractor", "qwen_audit"))
+    assert entity_ref == "m-qa"
+    composite.complete(_req(entity_ref))
+    assert a.seen == ["m-gen", "m-qa"]
+
+
+def test_composite_backend_non_ambiguous_routing_unchanged_with_map():
+    # Preserve existing model-ref routing: with every role declared by
+    # exactly one sub-backend, adding the routing map changes nothing —
+    # each ref still reaches the only backend that declares it.
+    remote = _FakeCompletionBackend("remote", {
+        "generator": "opencode-go/deepseek-v4-flash",
+        "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+    })
+    local = _FakeCompletionBackend("local", {
+        "russian_selector": "gemma-fake",
+        "gemma_audit": "gemma-fake",
+    })
+    routing = {
+        "generator": "remote",
+        "fidelity_reviewer": "remote",
+        "russian_selector": "local",
+        "gemma_audit": "local",
+    }
+    composite = CompositeCompletionBackend(
+        {"remote": remote, "local": local},
+        _composite_descriptor(routing, {
+            "generator": "opencode-go/deepseek-v4-flash",
+            "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+            "russian_selector": "gemma-fake",
+            "gemma_audit": "gemma-fake",
+        }),
+    )
+    composite.complete(_req("opencode-go/deepseek-v4-flash"))
+    composite.complete(_req("opencode-go/qwen3.7-plus"))
+    composite.complete(_req("gemma-fake"))
+    assert remote.seen == [
+        "opencode-go/deepseek-v4-flash", "opencode-go/qwen3.7-plus",
+    ]
+    assert local.seen == ["gemma-fake"]
+    with pytest.raises(CompletionError, match="no backend serves model_ref"):
+        composite.complete(_req("somewhere/else"))
 
 
 # ---------------------------------------------------------------------------

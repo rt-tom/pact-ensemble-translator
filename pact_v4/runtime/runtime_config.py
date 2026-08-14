@@ -468,10 +468,37 @@ class CompositeCompletionBackend:
         self._sub = dict(sub_backends)
         self._descriptor = descriptor
         self._ref_to_name: Dict[str, str] = {}
+        # Role-authoritative routing (RV t_7b26974e HIGH): a model ref is
+        # routed to the sub-backend that actually serves the role(s) it is
+        # bound to, resolved exactly like ``build_descriptor``/``apply_role_models``
+        # — explicit routing map first, then the first sub-backend declaring
+        # the role, then the documented runtime fallback (``repair`` ->
+        # ``generator``, ``entity_extractor`` -> ``qwen_audit``). Without
+        # this a composite whose sub-backends declare the same role (or
+        # share a model ref) routed last-wins, so ``--translator``/
+        # ``--reviewer`` overrides could be served by a different concrete
+        # backend than the one the descriptor advertised. Refs that no
+        # declared role resolves (e.g. a lone ``default`` binding) keep the
+        # historical last-wins union, so non-ambiguous composites route
+        # exactly as before.
+        routing = dict(descriptor.effective_options.get("routing") or {})
+        refs_by_backend = {
+            name: dict(backend.descriptor.model_bindings or {})
+            for name, backend in self._sub.items()
+        }
+        assigned: Dict[str, str] = {}
+        for role in sorted({r for mb in refs_by_backend.values() for r in mb}):
+            backend_name = _resolve_role_backend(routing, refs_by_backend, role)
+            if backend_name is None or backend_name not in refs_by_backend:
+                continue
+            ref = refs_by_backend[backend_name].get(role)
+            if ref:
+                assigned[ref] = backend_name
+        self._ref_to_name.update(assigned)
         for name, backend in self._sub.items():
             bindings = backend.descriptor.model_bindings or {}
             for ref in set(bindings.values()):
-                if ref:
+                if ref and ref not in self._ref_to_name:
                     self._ref_to_name[ref] = name
 
     @property
@@ -543,11 +570,30 @@ class CompositeBackendConfig:
         return self.build_descriptor().identity_hash
 
     def build_descriptor(self) -> BackendDescriptor:
+        # Role-authoritative flattening (RV t_7b26974e HIGH): each role's
+        # binding comes from the sub-backend that actually serves the role
+        # (explicit role_backend_map first, then the first sub-backend
+        # declaring it, then the documented runtime fallback — the same
+        # resolution ``_resolve_role_backend`` applies at request time), so
+        # the descriptor the role adapters read never advertises a ref that
+        # routes to a different concrete backend than the role map selects.
+        # For non-ambiguous composites (every role declared by exactly one
+        # sub-backend) this is byte-identical to the historical first-wins
+        # flatten.
+        refs_by_backend = {
+            name: (cfg.build_descriptor().model_bindings or {})
+            for name, cfg in self.backends.items()
+        }
         bindings: Dict[str, str] = {}
-        for cfg in self.backends.values():
-            for role, ref in (cfg.build_descriptor().model_bindings or {}).items():
-                if ref and role not in bindings:
-                    bindings[role] = ref
+        for role in sorted({r for mb in refs_by_backend.values() for r in mb}):
+            backend_name = _resolve_role_backend(
+                self.role_backend_map, refs_by_backend, role
+            )
+            if backend_name is None or backend_name not in refs_by_backend:
+                continue
+            ref = refs_by_backend[backend_name].get(role)
+            if ref:
+                bindings[role] = ref
         return BackendDescriptor(
             kind=KIND_COMPOSITE,
             transport_version=COMPOSITE_TRANSPORT_VERSION,
@@ -634,15 +680,17 @@ def _generator_backend_cfg(backend: Any) -> Any:
     a reasoning-policy error).
     """
     if isinstance(backend, CompositeBackendConfig):
-        gen_name = backend.role_backend_map.get(ROLE_GENERATOR)
+        gen_name = _composite_role_backend_name(backend, ROLE_GENERATOR)
         if gen_name is not None:
             return backend.backends.get(gen_name)
-        # No explicit generator routing: the composite descriptor binds the
-        # generator role to the first sub-backend declaring it (same
-        # first-wins rule as CompositeBackendConfig.build_descriptor).
+        # No explicit generator route and no sub-backend declaring the
+        # generator role: fall back to a sub-backend with a ``default``
+        # binding (the ``_model_ref_for`` default fallback) so the
+        # reasoning policy keeps inspecting the model that would actually
+        # serve generation.
         for sub in backend.backends.values():
             bindings = sub.build_descriptor().model_bindings or {}
-            if ROLE_GENERATOR in bindings or "default" in bindings:
+            if "default" in bindings:
                 return sub
         return None
     return backend
@@ -1164,35 +1212,56 @@ _COMPOSITE_ROLE_FALLBACKS = {
 }
 
 
-def _composite_role_backend_name(
-    cfg: CompositeBackendConfig, role: str
+def _resolve_role_backend(
+    role_backend_map: Mapping[str, str],
+    bindings_by_backend: Mapping[str, Mapping[str, str]],
+    role: str,
 ) -> Optional[str]:
-    """The sub-backend serving ``role`` in a composite profile (or ``None``).
+    """The sub-backend serving ``role`` (or ``None`` when unrouted).
 
     Resolution order mirrors the runtime: an explicit ``role_backend_map``
     entry wins; else the first sub-backend whose descriptor declares the
     role; else the documented role fallback (``repair`` -> ``generator``,
     ``entity_extractor`` -> ``qwen_audit``) resolved the same way (explicit
     route first, then a sub-backend declaring the fallback role or
-    ``default`` — the same first-wins rule ``_generator_backend_name`` uses).
+    ``default``). This is the single source of truth shared by
+    ``CompositeBackendConfig.build_descriptor`` (which model ref the role
+    adapters resolve), ``CompositeCompletionBackend`` (which concrete
+    backend serves that ref) and ``apply_role_models`` (where a
+    ``--translator``/``--reviewer`` override lands), so the three can never
+    disagree about which backend serves a role.
     """
-    backend_name = cfg.role_backend_map.get(role)
+    backend_name = role_backend_map.get(role)
     if backend_name is not None:
         return backend_name
-    for name, sub in cfg.backends.items():
-        if role in (sub.build_descriptor().model_bindings or {}):
+    for name, bindings in bindings_by_backend.items():
+        if role in bindings:
             return name
     fallback_role = _COMPOSITE_ROLE_FALLBACKS.get(role)
     if fallback_role is None:
         return None
-    backend_name = cfg.role_backend_map.get(fallback_role)
+    backend_name = role_backend_map.get(fallback_role)
     if backend_name is not None:
         return backend_name
-    for name, sub in cfg.backends.items():
-        bindings = sub.build_descriptor().model_bindings or {}
+    for name, bindings in bindings_by_backend.items():
         if fallback_role in bindings or "default" in bindings:
             return name
     return None
+
+
+def _composite_role_backend_name(
+    cfg: CompositeBackendConfig, role: str
+) -> Optional[str]:
+    """The sub-backend serving ``role`` in a composite profile (or ``None``).
+
+    Thin wrapper over ``_resolve_role_backend``; see it for the resolution
+    order.
+    """
+    refs_by_backend = {
+        name: (sub.build_descriptor().model_bindings or {})
+        for name, sub in cfg.backends.items()
+    }
+    return _resolve_role_backend(cfg.role_backend_map, refs_by_backend, role)
 
 
 def apply_role_models(
