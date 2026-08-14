@@ -32,6 +32,7 @@ resolved at backend construction from the environment and never persisted
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
@@ -88,6 +89,28 @@ ROLE_GEMMA_AUDIT = "gemma_audit"
 # want a dedicated model for span restoration; otherwise it falls back to
 # the repair/generator binding.
 ROLE_FORMATTING = "formatting"
+# Phase 4A region repair (B2). Falls back to the `generator` binding when
+# unset (backend_role_adapters resolves ("repair", "generator")).
+ROLE_REPAIR = "repair"
+# B1.2 entity-extractor role (ChapterEntityContext prepass). Resolved by
+# BackendEntityExtractor via a runtime _EntityRoleView when the descriptor
+# lacks it; the providers registry maps it explicitly under --reviewer so a
+# reviewer model can serve every audit role.
+ROLE_ENTITY_EXTRACTOR = "entity_extractor"
+
+# Roles bound by the --translator CLI flag (owner decision 2026-08-14):
+# generation + region repair (repair falls back to generator anyway).
+TRANSLATOR_ROLES = (ROLE_GENERATOR, ROLE_REPAIR)
+
+# Roles bound by the --reviewer CLI flag: every audit role (Qwen audit,
+# fidelity reviewer, Russian selector, entity extractor). Gemma audit is
+# NOT included — it stays on the local/generator model by design.
+REVIEWER_ROLES = (
+    ROLE_QWEN_AUDIT,
+    ROLE_FIDELITY_REVIEWER,
+    ROLE_RUSSIAN_SELECTOR,
+    ROLE_ENTITY_EXTRACTOR,
+)
 
 
 class BackendRuntimeConfig(Protocol):
@@ -910,6 +933,370 @@ def build_repair_adapters(
 
 
 # ---------------------------------------------------------------------------
+# Providers registry (PROVIDERS-REGISTRY card): providers.yaml model catalog
+# + --translator/--reviewer role mapping (owner decision 2026-08-14).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProviderModel:
+    """One model entry in the registry: full ``provider/model`` ref + contract.
+
+    ``reasoning_variants`` are the ``reasoningEffort`` values the model
+    declares in the opencode provider catalog (verified against
+    ``opencode models <provider> --verbose`` on serve 1.18.18, 2026-08-14).
+    The serve relay does NOT validate ``reasoningEffort`` (any string is
+    accepted and proxied), so this contract is the authoritative mapping
+    guide for ``--reasoning N`` (1/2/3 -> nearest declared variant).
+    """
+
+    ref: str
+    reasoning_variants: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, str) or "/" not in self.ref:
+            raise ValueError(
+                f"ProviderModel: ref {self.ref!r} must be 'provider/model'"
+            )
+        if not isinstance(self.reasoning_variants, tuple) or not self.reasoning_variants:
+            raise ValueError(
+                "ProviderModel: reasoning_variants must be a non-empty list of "
+                f"reasoningEffort values (model {self.ref!r})"
+            )
+
+
+# Canonical reasoningEffort ladder (declared order across the opencode
+# catalog). Used to map --reasoning 1/2/3 to the nearest DECLARED variant
+# when the model's contract does not list the canonical value itself
+# (e.g. deepseek-v4-flash declares {low, high, max}: 2 -> high).
+REASONING_EFFORT_LADDER = ("none", "low", "medium", "high", "xhigh", "max")
+
+# Canonical --reasoning level -> reasoningEffort value (the B1/opencode
+# transport default when the model declares no contract).
+DEFAULT_REASONING_EFFORT = {1: "low", 2: "medium", 3: "high"}
+
+
+@dataclass(frozen=True)
+class ProvidersRegistry:
+    """Loaded ``providers.yaml``: provider id -> alias -> model."""
+
+    providers: Mapping[str, Mapping[str, ProviderModel]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "providers", dict(self.providers))
+
+    def resolve(self, spec: str) -> ProviderModel:
+        """Resolve ``<provider>/<alias>`` (CLI flag value) to a model entry.
+
+        The flag format uses a SLASH (not a dash) because model ids already
+        contain dashes (``deepseek-v4-flash``) — a dash separator would be
+        ambiguous (owner decision 2026-08-14).
+        """
+        if not isinstance(spec, str):
+            raise ValueError(f"providers registry: spec must be a string, got {spec!r}")
+        parts = spec.split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(
+                f"providers registry: {spec!r} is not '<provider>/<alias>' "
+                "(slash separator; e.g. opencode-go/deepseek4flash)"
+            )
+        provider, alias = parts
+        models = self.providers.get(provider)
+        if models is None:
+            raise ValueError(
+                f"providers registry: unknown provider {provider!r} "
+                f"(known: {sorted(self.providers)})"
+            )
+        model = models.get(alias)
+        if model is None:
+            raise ValueError(
+                f"providers registry: unknown alias {provider!r}/{alias!r} "
+                f"(known: {sorted(models)})"
+            )
+        return model
+
+
+def load_providers_registry(path: Path) -> ProvidersRegistry:
+    """Load ``providers.yaml`` into a ``ProvidersRegistry``.
+
+    Fail-closed on malformed entries (unknown kind, missing/invalid model
+    ref, missing reasoning variants) so a typo in the registry can never
+    silently resolve to the wrong model.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(
+            f"{path}: providers registry file not found (expected a "
+            "providers.yaml with 'providers:' / kind / models / "
+            "reasoning_contract.variants)"
+        )
+    raw = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise ValueError(
+            f"{path}: providers.yaml requires PyYAML (pip install pyyaml)"
+        ) from exc
+    payload = yaml.safe_load(raw)
+    if not isinstance(payload, Mapping) or not isinstance(
+        payload.get("providers"), Mapping
+    ):
+        raise ValueError(
+            f"{path}: providers.yaml must contain a 'providers:' mapping"
+        )
+    providers: Dict[str, Dict[str, ProviderModel]] = {}
+    for provider_id, provider_entry in payload["providers"].items():
+        if not isinstance(provider_entry, Mapping):
+            raise ValueError(
+                f"{path}: provider {provider_id!r} must be a mapping "
+                f"(kind + models), got {type(provider_entry).__name__}"
+            )
+        kind = provider_entry.get("kind")
+        if kind != "opencode_server":
+            raise ValueError(
+                f"{path}: provider {provider_id!r} has unsupported kind {kind!r} "
+                "(only 'opencode_server' is supported)"
+            )
+        raw_models = provider_entry.get("models")
+        if not isinstance(raw_models, Mapping) or not raw_models:
+            raise ValueError(
+                f"{path}: provider {provider_id!r} must declare a non-empty "
+                "'models:' mapping"
+            )
+        models: Dict[str, ProviderModel] = {}
+        for alias, raw_model in raw_models.items():
+            if not isinstance(raw_model, Mapping):
+                raise ValueError(
+                    f"{path}: model {provider_id!r}/{alias!r} must be a mapping "
+                    "with 'ref' and 'reasoning_contract.variants'"
+                )
+            ref = raw_model.get("ref")
+            if not isinstance(ref, str) or "/" not in ref:
+                raise ValueError(
+                    f"{path}: model {provider_id!r}/{alias!r} has invalid ref "
+                    f"{ref!r} (must be 'provider/model')"
+                )
+            contract = raw_model.get("reasoning_contract") or {}
+            variants = contract.get("variants") if isinstance(contract, Mapping) else None
+            if not isinstance(variants, list) or not variants:
+                raise ValueError(
+                    f"{path}: model {provider_id!r}/{alias!r} must declare "
+                    "reasoning_contract.variants (the reasoningEffort values "
+                    "the model supports, checked against the opencode provider "
+                    "catalog — see configs/providers.yaml)"
+                )
+            bad = [v for v in variants if v not in REASONING_EFFORT_LADDER]
+            if bad:
+                raise ValueError(
+                    f"{path}: model {provider_id!r}/{alias!r} has unknown "
+                    f"reasoning variant(s) {bad} (ladder: {REASONING_EFFORT_LADDER})"
+                )
+            models[alias] = ProviderModel(
+                ref=ref,
+                reasoning_variants=tuple(str(v) for v in variants),
+            )
+        providers[provider_id] = models
+    return ProvidersRegistry(providers=providers)
+
+
+def resolve_role_model(registry: ProvidersRegistry, spec: str) -> ProviderModel:
+    """Resolve a CLI role flag value (``<provider>/<alias>``) via the registry."""
+    return registry.resolve(spec)
+
+
+def nearest_declared_effort(
+    level: int, variants: Sequence[str]
+) -> str:
+    """Map ``--reasoning N`` (1/2/3) to the model's nearest DECLARED variant.
+
+    When the canonical value for the level (1=low, 2=medium, 3=high) is not
+    declared by the model contract, the nearest declared value on the
+    canonical ladder is used (e.g. deepseek-v4-flash {low, high, max}:
+    2 -> high). Ties resolve toward the HIGHER declared value (a stronger
+    reasoning level is closer to the user's intent than a weaker one).
+    """
+    target = DEFAULT_REASONING_EFFORT[level]
+    if target in variants:
+        return target
+    target_index = REASONING_EFFORT_LADDER.index(target)
+    best: Optional[str] = None
+    best_distance = 10**9
+    for variant in variants:
+        index = REASONING_EFFORT_LADDER.index(variant)
+        distance = abs(index - target_index)
+        if distance < best_distance or (
+            distance == best_distance
+            and index > REASONING_EFFORT_LADDER.index(best or "")
+        ):
+            best = variant
+            best_distance = distance
+    assert best is not None
+    return best
+
+
+def build_reasoning_effort_map(
+    model: ProviderModel,
+) -> Dict[int, str]:
+    """The ``--reasoning`` level -> ``reasoningEffort`` map for a model.
+
+    Returns ``DEFAULT_REASONING_EFFORT`` when every canonical value is
+    declared (the common case for openai models); otherwise the nearest
+    declared value per level (the reasoning contract, owner decision
+    2026-08-14: use the nearest declared variant rather than sending an
+    undeclared string).
+    """
+    variants = tuple(model.reasoning_variants)
+    if all(DEFAULT_REASONING_EFFORT[level] in variants for level in (1, 2, 3)):
+        return dict(DEFAULT_REASONING_EFFORT)
+    return {level: nearest_declared_effort(level, variants) for level in (1, 2, 3)}
+
+
+def apply_role_models(
+    cfg: Any,
+    role_models: Mapping[str, str],
+) -> Any:
+    """Override the model refs of the named roles in a backend config.
+
+    Used by ``--translator``/``--reviewer``: the loaded runtime config's
+    OpenCode backend(s) get their ``model_bindings`` updated for the mapped
+    roles. A composite profile routes each role to its backend via
+    ``role_backend_map`` (falling back to the first sub-backend declaring
+    the role), so the override is applied per-role to the routing backend;
+    a role that routes to a LOCAL backend fails loudly — local models are
+    bound by name and cannot serve a remote provider ref, and silently
+    dropping the override would make the flag a no-op.
+    """
+    if not role_models:
+        return cfg
+    if isinstance(cfg, OpenCodeBackendConfig):
+        server = replace(
+            cfg.server,
+            model_bindings={**dict(cfg.server.model_bindings), **dict(role_models)},
+        )
+        return replace(cfg, server=server)
+    if isinstance(cfg, CompositeBackendConfig):
+        new_backends = dict(cfg.backends)
+        for role, ref in role_models.items():
+            backend_name = cfg.role_backend_map.get(role)
+            if backend_name is None:
+                backend_name = next(
+                    (
+                        name
+                        for name, sub in cfg.backends.items()
+                        if role in (sub.build_descriptor().model_bindings or {})
+                    ),
+                    None,
+                )
+            if backend_name is None:
+                raise ValueError(
+                    f"apply_role_models: role {role!r} is not routed by the "
+                    "composite profile (role_backend_map has no entry and no "
+                    "sub-backend declares it)"
+                )
+            sub = new_backends[backend_name]
+            if isinstance(sub, LocalLlamaBackendConfig):
+                raise ValueError(
+                    f"apply_role_models: role {role!r} routes to local backend "
+                    f"{backend_name!r}; --translator/--reviewer cannot override "
+                    "a local model (bind the role to an opencode_server backend)"
+                )
+            new_backends[backend_name] = apply_role_models(sub, {role: ref})
+        return replace(cfg, backends=new_backends)
+    if isinstance(cfg, LocalLlamaBackendConfig):
+        raise ValueError(
+            "role model overrides (--translator/--reviewer) cannot be applied to "
+            "a local_llama backend; use an opencode_server or composite profile"
+        )
+    raise ValueError(
+        f"apply_role_models: unsupported config kind {type(cfg).__name__}"
+    )
+
+
+def _generator_backend_name(cfg: CompositeBackendConfig) -> Optional[str]:
+    """The sub-backend that serves the generator role (or ``None``)."""
+    name = cfg.role_backend_map.get(ROLE_GENERATOR)
+    if name is not None:
+        return name
+    for name, sub in cfg.backends.items():
+        bindings = sub.build_descriptor().model_bindings or {}
+        if ROLE_GENERATOR in bindings or "default" in bindings:
+            return name
+    return None
+
+
+def _set_generator_reasoning_effort_map(cfg: Any, effort_map: Mapping[int, str]) -> Any:
+    """Set the reasoning-effort map on the backend serving the generator role.
+
+    Generation is the only phase that carries a ``reasoning`` request
+    option, so the contract-derived effort map belongs on the generator's
+    backend. A local generator keeps ``None`` (its reasoning travels via
+    server args, never request_options).
+    """
+    if isinstance(cfg, OpenCodeBackendConfig):
+        return replace(
+            cfg,
+            server=replace(cfg.server, reasoning_effort_map=dict(effort_map)),
+        )
+    if isinstance(cfg, CompositeBackendConfig):
+        name = _generator_backend_name(cfg)
+        if name is None:
+            return cfg
+        sub = cfg.backends[name]
+        if isinstance(sub, LocalLlamaBackendConfig):
+            return cfg
+        new_backends = dict(cfg.backends)
+        new_backends[name] = _set_generator_reasoning_effort_map(sub, effort_map)
+        return replace(cfg, backends=new_backends)
+    return cfg
+
+
+def apply_provider_flags(
+    cfg: Any,
+    registry: ProvidersRegistry,
+    *,
+    translator: Optional[str] = None,
+    reviewer: Optional[str] = None,
+) -> Any:
+    """Apply ``--translator``/``--reviewer`` role model overrides to a config.
+
+    ``translator``/``reviewer`` are registry specs (``<provider>/<alias>``).
+    Returns a NEW config (the input is untouched):
+
+    * ``--translator`` binds the resolved model to generator + repair;
+    * ``--reviewer`` binds it to every audit role (qwen_audit,
+      fidelity_reviewer, russian_selector, entity_extractor);
+    * when a translator is given, the reasoning-effort map is derived from
+      the translator model's reasoning contract (nearest declared variant)
+      and set on the backend serving the generator role — so
+      ``--reasoning 2`` on deepseek-v4-flash ({low, high, max}) sends
+      ``high``, the contract-correct value.
+
+    Defaults are NOT changed when the flags are absent: the caller only
+    invokes this when at least one flag is given, and the resolved
+    model/provider refs enter the backend descriptor (identity) — a flag
+    change invalidates cache/resume.
+    """
+    role_models: Dict[str, str] = {}
+    if translator:
+        model = registry.resolve(translator)
+        for role in TRANSLATOR_ROLES:
+            role_models[role] = model.ref
+    if reviewer:
+        model = registry.resolve(reviewer)
+        for role in REVIEWER_ROLES:
+            role_models[role] = model.ref
+    if not role_models:
+        return cfg
+    cfg = apply_role_models(cfg, role_models)
+    if translator:
+        model = registry.resolve(translator)
+        cfg = _set_generator_reasoning_effort_map(
+            cfg, build_reasoning_effort_map(model)
+        )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
 # Loader (dict -> tagged config). Values of secrets are never read here:
 # only env-var *names* are recorded (plan §12).
 # ---------------------------------------------------------------------------
@@ -1066,6 +1453,10 @@ __all__ = [
     "ROLE_QWEN_AUDIT",
     "ROLE_GEMMA_AUDIT",
     "ROLE_FORMATTING",
+    "ROLE_REPAIR",
+    "ROLE_ENTITY_EXTRACTOR",
+    "TRANSLATOR_ROLES",
+    "REVIEWER_ROLES",
     "BackendRuntimeConfig",
     "LocalLlamaBackendConfig",
     "StrictBackendConfig",
@@ -1073,6 +1464,16 @@ __all__ = [
     "LocalRoutingBackend",
     "CompositeCompletionBackend",
     "CompositeBackendConfig",
+    "ProviderModel",
+    "ProvidersRegistry",
+    "REASONING_EFFORT_LADDER",
+    "DEFAULT_REASONING_EFFORT",
+    "load_providers_registry",
+    "resolve_role_model",
+    "nearest_declared_effort",
+    "build_reasoning_effort_map",
+    "apply_role_models",
+    "apply_provider_flags",
     "load_runtime_config",
     "build_role_backend",
     "build_role_adapters",

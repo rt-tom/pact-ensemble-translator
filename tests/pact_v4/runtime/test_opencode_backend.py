@@ -995,6 +995,27 @@ def test_reasoning_request_option_maps_to_reasoning_effort(level, expected):
     assert body["reasoningEffort"] == expected
 
 
+def test_reasoning_effort_map_contract_overrides_wire_value():
+    # PROVIDERS-REGISTRY: a config carrying the registry's reasoning contract
+    # (deepseek-v4-flash {low, high, max} -> level 2 maps to high) must send
+    # the contract value on the wire, not the transport default "medium".
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake, reasoning_effort_map={1: "low", 2: "high", 3: "high"})
+    backend.complete(_request(request_options={"reasoning": 2}))
+    assert fake.last_message_body()["reasoningEffort"] == "high"
+
+
+def test_reasoning_effort_map_absent_keeps_transport_default():
+    # A config WITHOUT the contract map (registry not consulted) keeps the
+    # historical transport default {1: low, 2: medium, 3: high}.
+    fake = FakeOpenCodeServer()
+    fake.script_message(_text_message("ok"))
+    backend = _backend(fake)
+    backend.complete(_request(request_options={"reasoning": 2}))
+    assert fake.last_message_body()["reasoningEffort"] == "medium"
+
+
 def test_reasoning_zero_does_not_add_reasoning_effort():
     # reasoning=0 means off: the field must NOT appear in the body
     # (historical baseline body shape preserved).

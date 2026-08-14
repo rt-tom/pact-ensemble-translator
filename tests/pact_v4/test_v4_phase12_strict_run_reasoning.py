@@ -242,6 +242,170 @@ def test_run_local_default_whole_chapter_wires_single_retry_owner(
 
 
 # ---------------------------------------------------------------------------
+# PROVIDERS-REGISTRY (owner decision 2026-08-14): --translator/--reviewer
+# resolve provider/alias model specs through providers.yaml and bind them to
+# roles; changing a flag changes the backend identity (cache not replayed).
+# ---------------------------------------------------------------------------
+
+PROVIDERS_YAML = """\
+providers:
+  opencode-go:
+    kind: opencode_server
+    models:
+      deepseek4flash:
+        ref: opencode-go/deepseek-v4-flash
+        reasoning_contract:
+          variants: [low, high, max]
+      qwen37:
+        ref: opencode-go/qwen3.7-plus
+        reasoning_contract:
+          variants: [high, max]
+  openai:
+    kind: opencode_server
+    models:
+      luna:
+        ref: openai/gpt-5.6-luna
+        reasoning_contract:
+          variants: [none, low, medium, high, xhigh, max]
+"""
+
+REMOTE_PROFILE_YAML = """\
+kind: opencode_server
+server_mode: external
+base_url: http://127.0.0.1:4097
+server_version_policy: compatible_minor
+pinned_server_version: 1.4.7
+auth:
+  type: basic_env
+  username_env: OPENCODE_SERVER_USERNAME
+  password_env: OPENCODE_SERVER_PASSWORD
+structured_output_mode: prompt_only
+remote_budget:
+  max_requests_per_chapter: 500
+model_bindings:
+  generator: opencode-go/deepseek-v4-flash
+  fidelity_reviewer: opencode-go/qwen3.7-plus
+  russian_selector: opencode-go/qwen3.7-plus
+  qwen_audit: opencode-go/qwen3.7-plus
+  gemma_audit: opencode-go/deepseek-v4-flash
+  repair: opencode-go/deepseek-v4-flash
+"""
+
+
+def _write_provider_files(tmp_path: Path):
+    providers = tmp_path / "providers.yaml"
+    providers.write_text(PROVIDERS_YAML, encoding="utf-8")
+    profile = tmp_path / "runtime_remote.yaml"
+    profile.write_text(REMOTE_PROFILE_YAML, encoding="utf-8")
+    return providers, profile
+
+
+def test_provider_flags_parse_and_apply(tmp_path: Path):
+    # REAL argparse parse + real registry file + real profile: the exact
+    # wiring the owner runs --translator opencode-go/deepseek4flash
+    # --reviewer openai/luna (acceptance).
+    providers, profile = _write_provider_files(tmp_path)
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path, runtime_config=str(profile), providers_config=str(providers))
+        + ["--translator", "opencode-go/deepseek4flash", "--reviewer", "openai/luna"]
+    )
+    assert args.translator == "opencode-go/deepseek4flash"
+    assert args.reviewer == "openai/luna"
+
+    backend = cli._load_runtime_config_file(profile)
+    applied = cli._apply_provider_flags(args, backend)
+    bindings = applied.server.model_bindings
+    # translator -> generator + repair on deepseek (Go)
+    assert bindings["generator"] == "opencode-go/deepseek-v4-flash"
+    assert bindings["repair"] == "opencode-go/deepseek-v4-flash"
+    # reviewer -> every audit role on luna (openai subscription)
+    assert bindings["qwen_audit"] == "openai/gpt-5.6-luna"
+    assert bindings["fidelity_reviewer"] == "openai/gpt-5.6-luna"
+    assert bindings["russian_selector"] == "openai/gpt-5.6-luna"
+    assert bindings["entity_extractor"] == "openai/gpt-5.6-luna"
+    # identity changed -> cache not replayed
+    assert applied.identity_hash != backend.identity_hash
+
+
+def test_reviewer_not_given_keeps_default_audit(tmp_path: Path):
+    # Acceptance: --reviewer not given -> audit stays on qwen3.7-plus
+    # (default, current behavior).
+    providers, profile = _write_provider_files(tmp_path)
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path, runtime_config=str(profile), providers_config=str(providers))
+        + ["--translator", "opencode-go/deepseek4flash"]
+    )
+    backend = cli._load_runtime_config_file(profile)
+    applied = cli._apply_provider_flags(args, backend)
+    assert applied.server.model_bindings["qwen_audit"] == "opencode-go/qwen3.7-plus"
+    assert applied.server.model_bindings["generator"] == "opencode-go/deepseek-v4-flash"
+
+
+def test_provider_flags_require_runtime_config(tmp_path: Path):
+    providers, _ = _write_provider_files(tmp_path)
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path, providers_config=str(providers))
+        + ["--translator", "opencode-go/deepseek4flash"]
+    )
+    with pytest.raises(ValueError, match="require --runtime-config"):
+        cli.main(["--chapter-id", "x", "--chapter-html", "x.html",
+                  "--memory-dir", str(tmp_path), "--out-dir", str(tmp_path / "o"),
+                  "--translator", "opencode-go/deepseek4flash"])
+
+
+def test_provider_flags_unknown_alias_fails_loudly(tmp_path: Path):
+    providers, profile = _write_provider_files(tmp_path)
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path, runtime_config=str(profile), providers_config=str(providers))
+        + ["--translator", "opencode-go/nope"]
+    )
+    backend = cli._load_runtime_config_file(profile)
+    with pytest.raises(ValueError, match="unknown alias"):
+        cli._apply_provider_flags(args, backend)
+
+
+def test_provider_flags_missing_registry_fails_loudly(tmp_path: Path):
+    _, profile = _write_provider_files(tmp_path)
+    missing = tmp_path / "no-such-providers.yaml"
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path, runtime_config=str(profile), providers_config=str(missing))
+        + ["--translator", "opencode-go/deepseek4flash"]
+    )
+    backend = cli._load_runtime_config_file(profile)
+    with pytest.raises(ValueError, match="providers registry"):
+        cli._apply_provider_flags(args, backend)
+
+
+def test_provider_flags_local_profile_rejected(tmp_path: Path):
+    # A local_llama profile cannot serve remote provider/model refs: the
+    # role override fails loudly instead of silently doing nothing.
+    providers = tmp_path / "providers.yaml"
+    providers.write_text(PROVIDERS_YAML, encoding="utf-8")
+    profile = tmp_path / "runtime_local.yaml"
+    profile.write_text(
+        "kind: local_llama\n"
+        "exe: C:/fake/llama-server.exe\n"
+        "device: FAKE0\n"
+        "host: 127.0.0.1\n"
+        "port: 8094\n"
+        "model_paths:\n"
+        "  gemma: C:/fake/gemma.gguf\n"
+        "model_names:\n"
+        "  gemma: gemma-fake\n"
+        "server_args:\n"
+        "  gemma: []\n",
+        encoding="utf-8",
+    )
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path, runtime_config=str(profile), providers_config=str(providers))
+        + ["--reviewer", "openai/luna"]
+    )
+    backend = cli._load_runtime_config_file(profile)
+    with pytest.raises(ValueError, match="local_llama"):
+        cli._apply_provider_flags(args, backend)
+
+
+# ---------------------------------------------------------------------------
 # F2 (B3 review): CLI exit semantics — B3 fail-closed/failed must exit
 # non-zero; intentional --skip-audit / generation-only stays successful.
 # ---------------------------------------------------------------------------

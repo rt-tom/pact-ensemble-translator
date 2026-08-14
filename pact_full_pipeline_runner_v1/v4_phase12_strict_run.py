@@ -51,9 +51,15 @@ from pact_v4.runtime.runtime_config import (
     CompositeBackendConfig,
     LocalLlamaBackendConfig,
     OpenCodeBackendConfig,
+    REVIEWER_ROLES,
+    TRANSLATOR_ROLES,
+    apply_provider_flags,
+    apply_role_models,
+    build_reasoning_effort_map,
     build_repair_adapters,
     build_role_adapters,
     build_role_backend,
+    load_providers_registry,
     load_runtime_config,
     validate_reasoning_backend,
 )
@@ -265,6 +271,30 @@ def build_argparser() -> argparse.ArgumentParser:
                         "directly). Part of the config identity — use a "
                         "NEW --out-dir when flipping it against an existing "
                         "run.")
+    p.add_argument("--translator", default=None, metavar="PROVIDER/ALIAS",
+                   help="PROVIDERS-REGISTRY (owner decision 2026-08-14): model "
+                        "for the Translator role from configs/providers.yaml, "
+                        "e.g. opencode-go/deepseek4flash. Resolves the alias "
+                        "through the registry and binds it to generator + "
+                        "repair. The model/provider is part of the backend "
+                        "identity — changing the flag invalidates "
+                        "cache/resume, so use a NEW --out-dir. Slash "
+                        "separator (not dash): model ids already contain "
+                        "dashes (deepseek-v4-flash).")
+    p.add_argument("--reviewer", default=None, metavar="PROVIDER/ALIAS",
+                   help="PROVIDERS-REGISTRY (owner decision 2026-08-14): model "
+                        "for the Reviewer role from configs/providers.yaml, "
+                        "e.g. openai/luna. Resolves the alias through the "
+                        "registry and binds it to every audit role "
+                        "(qwen_audit + fidelity_reviewer + russian_selector "
+                        "+ entity_extractor). The model/provider is part of "
+                        "the backend identity — changing the flag "
+                        "invalidates cache/resume, so use a NEW --out-dir. "
+                        "Slash separator (not dash).")
+    p.add_argument("--providers-config", type=Path, default=None, metavar="FILE",
+                   help="PROVIDERS-REGISTRY: path to providers.yaml (default: "
+                        "configs/providers.yaml next to this module). Only "
+                        "read when --translator or --reviewer is given.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -586,6 +616,38 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
     )
 
 
+def _default_providers_config() -> Path:
+    """Default ``providers.yaml`` location: ``configs/`` next to this module."""
+    return Path(__file__).resolve().parent.parent / "configs" / "providers.yaml"
+
+
+def _apply_provider_flags(args: argparse.Namespace, backend: Any) -> Any:
+    """Resolve ``--translator``/``--reviewer`` through providers.yaml.
+
+    Returns a NEW backend config (the loaded profile is untouched) with the
+    resolved model refs bound to the mapped roles, or the input unchanged
+    when neither flag is given. The resolved model/provider refs enter the
+    backend descriptor, so changing a flag changes the backend identity
+    (cache/resume is not replayed — use a NEW --out-dir).
+    """
+    if args.translator is None and args.reviewer is None:
+        return backend
+    registry_path = args.providers_config or _default_providers_config()
+    if not registry_path.is_file():
+        raise ValueError(
+            f"--translator/--reviewer require the providers registry at "
+            f"{registry_path} (create it from configs/providers.yaml or pass "
+            f"--providers-config FILE)"
+        )
+    registry = load_providers_registry(registry_path)
+    return apply_provider_flags(
+        backend,
+        registry,
+        translator=args.translator,
+        reviewer=args.reviewer,
+    )
+
+
 def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
     """Render the bible for adapter injection (B7, V4.1 A2).
 
@@ -818,6 +880,12 @@ def run_local_default(args: argparse.Namespace) -> int:
 def run_with_runtime_config(args: argparse.Namespace) -> int:
     """Generic backend path: load profile -> runtime -> role adapters."""
     backend = _load_runtime_config_file(args.runtime_config)
+    # PROVIDERS-REGISTRY (owner decision 2026-08-14): --translator/--reviewer
+    # resolve provider/alias model specs through providers.yaml and bind the
+    # resolved refs to the mapped roles (translator -> generator + repair;
+    # reviewer -> all audit roles). Changing a flag changes the backend
+    # identity — cache/resume is not replayed, use a NEW --out-dir.
+    backend = _apply_provider_flags(args, backend)
     if args.managed_server:
         backend = force_managed(backend)
     # V4.1 A2: local no longer blocks --reasoning > 0 — reasoning for local
@@ -868,6 +936,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                          format="%(asctime)s %(levelname)s %(message)s")
 
+    # PROVIDERS-REGISTRY: --translator/--reviewer resolve models through
+    # providers.yaml and bind them to remote roles — they only make sense on
+    # the runtime-config path (an opencode_server/composite profile). The
+    # historical local-only path has no remote model refs, so the flags
+    # there are a configuration error, not a silent no-op.
+    if (args.translator or args.reviewer) and args.runtime_config is None:
+        raise ValueError(
+            "--translator/--reviewer require --runtime-config (an "
+            "opencode_server or composite profile); the historical local "
+            "llama-server path has no remote model bindings"
+        )
     if args.runtime_config is not None:
         return run_with_runtime_config(args)
     return run_local_default(args)
