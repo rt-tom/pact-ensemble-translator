@@ -37,9 +37,14 @@ Provenance / cache contract:
   entity_context_hash`` (the card's identity, plus the exact translation
   content — the audit outcome is a function of both source and translation;
   entity hash present only when entity context is enabled). A full cache
-  hit reuses the stored outcome (0 model calls); a cached
-  ``audit_complete=False`` is NEVER reused — the audit re-runs (fail-closed,
-  "resume does not skip an incomplete audit").
+  hit reuses the stored outcome (0 model calls). A cached
+  ``audit_complete=False`` with an intact identity is a PARTIAL hit
+  (PARTIAL-RESUME t_a58dd881): GOOD/GOOD_RETRIED audit chunks and GOOD
+  R-editor chunks are replayed with 0 model calls (their stored issues /
+  parse-validated edits reused verbatim), the TRANSPORT_ERROR/EMPTY/FAILED
+  chunks are re-run; the fail-closed gate stays — the chapter is never
+  released as passed audit until EVERY chunk has a status, a cache is never
+  downgraded, and an identity mismatch is still a full miss.
 * ``entity_context_cache.json`` (schema from ``entity_extractor``) — the
   B1.2 per-chapter entity cache (``source_hash + extractor_version``).
 * ``entity_context_validation_report.json`` (schema
@@ -65,9 +70,12 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, AbstractSet
 
 from pact_v4.audit.chunked_audit import (
+    AUDIT_V4_CATEGORIES,
+    AUDIT_V4_CONFIDENCES,
+    AUDIT_V4_SEVERITIES,
     DEFAULT_MAX_INPUT_TOKENS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_TOKENS,
@@ -97,6 +105,7 @@ from pact_v4.audit.russian_editor import (
     RUSSIAN_EDITOR_HARNESS_VERSION,
     RUSSIAN_EDITOR_PROMPT_VERSION,
     SAFE_CLASSES,
+    ALL_CLASSES,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_TOKENS as RUSSIAN_EDITOR_DEFAULT_MAX_TOKENS,
     DEFAULT_OVERLAP_PAIRS,
@@ -544,14 +553,444 @@ def _save_entity_validation_report(
     )
 
 
+# ---------------------------------------------------------------------------
+# PARTIAL-RESUME integrity (t_ec6bb8bc): the partial cache replay payload
+# (chunks / issues / r_editor) is validated AND bound to a canonical
+# integrity hash BEFORE any resume plan is built. A cache can preserve
+# identity + translations_repaired_hash while its GOOD-chunk evidence or
+# R edits are altered; without this gate resume would publish tampered
+# payloads with 0 model calls. Any malformed / missing / duplicate /
+# extra / mismatched partial payload is a FULL cache miss (recompute) —
+# never a partial replay (fail-closed).
+# ---------------------------------------------------------------------------
+
+
+# Statuses the chunked audit can persist per chunk (classify_chunk + the
+# TRANSPORT_ERROR / retry-shrink paths — see chunked_audit.py).
+_AUDIT_CHUNK_STATUSES = frozenset({
+    "GOOD", "GOOD_RETRIED", "FAILED_RETRIED", "TRANSPORT_ERROR",
+    "LENGTH", "EMPTY", "SPILL", "INVALID_JSON",
+})
+
+# Statuses the Russian editor can persist per chunk (russian_editor.py).
+_R_EDITOR_CHUNK_STATUSES = frozenset({"GOOD", "FAILED"})
+
+# Exact persisted key set of an audit issue record (chunked_audit.py
+# collection + ``_attach_debug_and_dedupe``). A record with a missing or
+# extra key is a schema violation — never tolerated (RV2-A t_c84b6f13).
+_ISSUE_KEYS = frozenset({
+    "id", "category", "severity", "confidence", "note", "excerpt", "_debug",
+})
+
+# Report-level statuses produced by _build_r_editor_report (b3_audit_repair.py).
+_R_EDITOR_REPORT_STATUSES = frozenset({
+    "disabled", "failed", "partial", "incomplete", "complete",
+})
+
+# Statuses under which the R stage actually RAN (outcome REQUIRED).
+_R_EDITOR_RAN_STATUSES = frozenset({"partial", "incomplete", "complete"})
+
+# Exact persisted key sets (RussianEditorOutcome chunk records / edit
+# payloads). A record with a foreign key is a schema violation — never
+# tolerated, never coerced.
+_R_CHUNK_KEYS = frozenset({"chunk", "first_pid", "last_pid", "status", "edits"})
+_R_EDIT_KEYS = frozenset({"pid", "original", "rewritten", "reason", "class"})
+
+def _validate_partial_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected_pids: Optional[Sequence[str]],
+    current_text: Optional[Mapping[str, str]],
+    r_editor_enabled: bool,
+) -> Optional[str]:
+    """Validate the complete PARTIAL-RESUME replay payload.
+
+    Runs inside ``B3AuditCache.load`` BEFORE either resume plan is
+    constructed (audit_resume_plan / r_editor_resume_plan). Returns None
+    when the payload is valid, or a reason string naming the first
+    violation. Checks, fail-closed:
+
+    * exact audit chunk coverage/order (contiguous 1..N, no duplicate /
+      missing / extra indices) and a known status per chunk;
+    * audit chunk boundaries (first_pid/last_pid strings) and pair counts
+      (+ the int fields the evaluator replays verbatim);
+    * issue schema (exact key set, non-empty string id/note/excerpt,
+      category/severity/confidence vocab, PID membership in the
+      translation map), ``_debug.chunk`` attribution inside the covered
+      chunk indices, and PID membership inside the ACTUAL covered chunk
+      span of the attributed chunk (first_pid..last_pid boundaries);
+    * R report schema: when the R stage RAN (status partial/incomplete/
+      complete) the ``outcome`` is REQUIRED with a non-empty, coherently
+      tiled ``chunks`` list (contiguous 1..M, chunk_size-boundary
+      coverage); when R was disabled/failed the ``outcome`` must be null —
+      a malformed/missing R outcome is a full miss, never a partial replay
+      while audit issues stay reusable; FIX RV2-B (t_a4f8f2b2): when the
+      CURRENT run enables R the report itself is REQUIRED — ``r_editor``
+      None/missing (an enabled run always persists a report dict, even for
+      a failed stage) is a full miss BEFORE either resume plan is built;
+      ``r_editor`` None is legitimate only when R is disabled (save()
+      writes null for the disabled stage); FIX RV2-B (t_aa3ee032): the
+      report ``enabled`` flag and ``status`` must be mutually consistent —
+      status ``disabled`` is written ONLY by a disabled R config, so
+      ``enabled=True`` with status ``disabled`` (or ``enabled=False`` with
+      a ran/failed status) is an impossible combination (tampered) and a
+      full miss;
+    * every cached R edit: object shape, exact string types, PID
+      membership (in the translation map AND inside the chunk's own
+      boundary span), known class, and (when ``current_text`` is
+      available) the verbatim current-text substring constraint.
+
+    Malformed fields are NEVER stringified/coerced — a violation is a full
+    cache miss. ``expected_pids`` / ``current_text`` may be None only when
+    the caller has no map (PID-membership / text-substring checks are then
+    skipped; the canonical hash below still binds the whole payload).
+    """
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return "chunks is missing, not a list, or empty"
+    expected_pid_set = frozenset(expected_pids) if expected_pids is not None else None
+    for position, item in enumerate(chunks, start=1):
+        if not isinstance(item, dict):
+            return f"chunk at position {position}: not an object"
+        chunk_index = item.get("chunk")
+        if chunk_index != position:
+            return (
+                f"chunk coverage/order mismatch: stored index {chunk_index!r} "
+                f"at position {position} (expected contiguous 1..N)"
+            )
+        status = item.get("status")
+        if not isinstance(status, str) or status not in _AUDIT_CHUNK_STATUSES:
+            return f"chunk {chunk_index}: unknown status {status!r}"
+        first_pid = item.get("first_pid")
+        last_pid = item.get("last_pid")
+        if not isinstance(first_pid, str) or not first_pid:
+            return f"chunk {chunk_index}: first_pid is missing or not a string"
+        if not isinstance(last_pid, str) or not last_pid:
+            return f"chunk {chunk_index}: last_pid is missing or not a string"
+        if expected_pid_set is not None and (
+            first_pid not in expected_pid_set or last_pid not in expected_pid_set
+        ):
+            return (
+                f"chunk {chunk_index}: boundary pids {first_pid!r}/{last_pid!r} "
+                f"are not in the translation map"
+            )
+        pair_count = item.get("pair_count")
+        if not isinstance(pair_count, int) or isinstance(pair_count, bool) or pair_count < 1:
+            return f"chunk {chunk_index}: pair_count {pair_count!r} is not a positive int"
+        context_count = item.get("context_count")
+        if not isinstance(context_count, int) or isinstance(context_count, bool) or context_count < 0:
+            return f"chunk {chunk_index}: context_count {context_count!r} is not a non-negative int"
+        reasoning_chars = item.get("reasoning_chars")
+        if not isinstance(reasoning_chars, int) or isinstance(reasoning_chars, bool) or reasoning_chars < 0:
+            return (
+                f"chunk {chunk_index}: reasoning_chars {reasoning_chars!r} "
+                f"is not a non-negative int"
+            )
+        if not isinstance(item.get("reasoning_file"), str):
+            return f"chunk {chunk_index}: reasoning_file is not a string"
+        finish_reason = item.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            return f"chunk {chunk_index}: finish_reason is not a string or null"
+
+    issues = payload.get("issues")
+    if not isinstance(issues, list):
+        return "issues is not a list"
+    chunk_count = len(chunks)
+    # RV2-A (t_c84b6f13): a position map over the ordered PID list lets the
+    # validator enforce that every issue sits inside the ACTUAL pid span of
+    # the chunk it claims (_debug.chunk), not merely inside the global
+    # translation map.
+    pid_positions = None
+    if expected_pids is not None:
+        pid_positions = {pid: position for position, pid in enumerate(expected_pids)}
+    for issue_index, issue in enumerate(issues):
+        if not isinstance(issue, dict):
+            return f"issue {issue_index}: not an object"
+        if set(issue) != _ISSUE_KEYS:
+            return (
+                f"issue {issue_index}: key set mismatch "
+                f"(expected {sorted(_ISSUE_KEYS)}, got {sorted(issue)})"
+            )
+        pid = issue.get("id")
+        if not isinstance(pid, str) or not pid:
+            return f"issue {issue_index}: id is missing or not a string"
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"issue {issue_index}: id {pid!r} is not in the translation map"
+        if issue.get("category") not in AUDIT_V4_CATEGORIES:
+            return f"issue {pid}: invalid category {issue.get('category')!r}"
+        if issue.get("severity") not in AUDIT_V4_SEVERITIES:
+            return f"issue {pid}: invalid severity {issue.get('severity')!r}"
+        if issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
+            return f"issue {pid}: invalid confidence {issue.get('confidence')!r}"
+        note = issue.get("note")
+        if not isinstance(note, str) or not note.strip():
+            return f"issue {pid}: note is missing, not a string, or empty"
+        excerpt = issue.get("excerpt")
+        if not isinstance(excerpt, str) or not excerpt.strip():
+            return f"issue {pid}: excerpt is missing, not a string, or empty"
+        debug = issue.get("_debug")
+        if not isinstance(debug, dict):
+            return f"issue {pid}: _debug is missing or not an object"
+        chunk = debug.get("chunk")
+        if not isinstance(chunk, int) or isinstance(chunk, bool) or not (1 <= chunk <= chunk_count):
+            return (
+                f"issue {pid}: _debug.chunk {chunk!r} is not inside the "
+                f"covered chunk indices 1..{chunk_count}"
+            )
+        if not isinstance(debug.get("reasoning_file"), str):
+            return f"issue {pid}: _debug.reasoning_file is not a string"
+        if pid_positions is not None:
+            chunk_record = chunks[chunk - 1]
+            first_pos = pid_positions.get(chunk_record.get("first_pid"))
+            last_pos = pid_positions.get(chunk_record.get("last_pid"))
+            pid_pos = pid_positions.get(pid)
+            if (
+                first_pos is None or last_pos is None or pid_pos is None
+                or not (first_pos <= pid_pos <= last_pos)
+            ):
+                return (
+                    f"issue {pid}: id is not inside the actual pid span of "
+                    f"chunk {chunk} ({chunk_record.get('first_pid')!r}.."
+                    f"{chunk_record.get('last_pid')!r})"
+                )
+
+    r_editor = payload.get("r_editor")
+    # FIX RV2-B (t_a4f8f2b2): an enabled-R partial cache ALWAYS carries a
+    # report dict (_build_r_editor_report persists one on every enabled run,
+    # including a failed stage), so r_editor None/missing means the report
+    # was deleted or is a foreign-schema payload — a FULL miss BEFORE either
+    # resume plan is built, never a partial replay while the audit GOOD
+    # chunks stay reusable. When the CURRENT run has R disabled, r_editor
+    # None is the legitimate disabled representation (save() writes null)
+    # and is accepted by design.
+    if r_editor is None and r_editor_enabled:
+        return (
+            "r_editor is required when the R stage is enabled "
+            "(missing/None report)"
+        )
+    if r_editor is not None and not isinstance(r_editor, dict):
+        return "r_editor is not an object or null"
+    if isinstance(r_editor, dict):
+        # FIX RV2-B (t_aa3ee032): the R report is validated COMPLETELY before
+        # either resume plan is built. When the R stage RAN (status partial/
+        # incomplete/complete) the outcome is REQUIRED with a non-empty,
+        # coherently tiled chunks list; when R was disabled/failed the
+        # outcome must be null. A malformed/missing R outcome is a FULL
+        # cache miss, never a partial replay while audit issues stay
+        # reusable.
+        report_status = r_editor.get("status")
+        if (
+            not isinstance(report_status, str)
+            or report_status not in _R_EDITOR_REPORT_STATUSES
+        ):
+            return f"r_editor.status is missing or unknown {report_status!r}"
+        if not isinstance(r_editor.get("enabled"), bool):
+            return "r_editor.enabled is not a bool"
+        # FIX RV2-B (t_a4f8f2b2): an enabled-R run always persists a report
+        # with enabled=True (_build_r_editor_report records the config flag
+        # verbatim) — a stored disabled report inside an enabled-R partial
+        # cache is internally inconsistent (tampered) and fails closed.
+        if r_editor_enabled and not r_editor.get("enabled"):
+            return (
+                "r_editor.enabled must be true when the R stage is enabled "
+                "(stored disabled report in an enabled-R partial cache)"
+            )
+        # FIX RV2-B (t_aa3ee032): the report's own enabled flag and status
+        # must agree — _build_r_editor_report writes status "disabled" ONLY
+        # when the stage was disabled (enabled=False); an enabled stage
+        # always persists failed/partial/incomplete/complete. A report
+        # claiming enabled=True with status "disabled" (or enabled=False
+        # with a ran/failed status) is an impossible combination (tampered)
+        # and fails closed BEFORE either resume plan is built — never a
+        # partial replay while GOOD audit chunks stay reusable.
+        enabled = r_editor.get("enabled")
+        if enabled and report_status == "disabled":
+            return (
+                "r_editor.status 'disabled' contradicts enabled=True — a "
+                "disabled status is only written by a disabled R config"
+            )
+        if not enabled and report_status != "disabled":
+            return (
+                f"r_editor.status {report_status!r} contradicts "
+                "enabled=False — a disabled R config never runs the stage"
+            )
+        outcome = r_editor.get("outcome")
+        if report_status in _R_EDITOR_RAN_STATUSES:
+            # R ran: outcome REQUIRED with a non-empty chunks list.
+            if not isinstance(outcome, dict):
+                return (
+                    f"r_editor.outcome is required when status is "
+                    f"{report_status!r} (got {type(outcome).__name__})"
+                )
+            r_chunks = outcome.get("chunks")
+            if not isinstance(r_chunks, list) or not r_chunks:
+                return "r_editor.outcome.chunks is missing, not a list, or empty"
+            chunk_size = r_editor.get("chunk_size")
+            if (
+                not isinstance(chunk_size, int)
+                or isinstance(chunk_size, bool)
+                or chunk_size < 1
+            ):
+                return f"r_editor.chunk_size {chunk_size!r} is not a positive int"
+            if expected_pids is not None:
+                expected_count = (
+                    len(expected_pids) + chunk_size - 1
+                ) // chunk_size
+                if len(r_chunks) != expected_count:
+                    return (
+                        f"r_editor chunk coverage mismatch: {len(r_chunks)} "
+                        f"chunk(s) persisted for {len(expected_pids)} pids at "
+                        f"chunk_size {chunk_size} (expected {expected_count})"
+                    )
+            for position, item in enumerate(r_chunks, start=1):
+                if not isinstance(item, dict):
+                    return f"r_editor chunk at position {position}: not an object"
+                if set(item) != _R_CHUNK_KEYS:
+                    return (
+                        f"r_editor chunk at position {position}: foreign key "
+                        f"set {sorted(item)!r} (expected {sorted(_R_CHUNK_KEYS)})"
+                    )
+                chunk_index = item.get("chunk")
+                if chunk_index != position:
+                    return (
+                        f"r_editor chunk coverage/order mismatch: stored index "
+                        f"{chunk_index!r} at position {position} (expected "
+                        f"contiguous 1..M)"
+                    )
+                status = item.get("status")
+                if not isinstance(status, str) or status not in _R_EDITOR_CHUNK_STATUSES:
+                    return f"r_editor chunk {chunk_index}: unknown status {status!r}"
+                first_pid = item.get("first_pid")
+                last_pid = item.get("last_pid")
+                if not isinstance(first_pid, str) or not first_pid:
+                    return f"r_editor chunk {chunk_index}: first_pid is missing or not a string"
+                if not isinstance(last_pid, str) or not last_pid:
+                    return f"r_editor chunk {chunk_index}: last_pid is missing or not a string"
+                if expected_pids is not None:
+                    # Coherent tiling: chunk k must cover exactly the k-th
+                    # chunk_size span of the ordered translation map — chunk 1
+                    # starts at map[0], chunk k+1 starts right after chunk k
+                    # ends, the last chunk ends at map[-1]. A duplicate /
+                    # missing / extra / foreign chunk record breaks the
+                    # tiling and is a full miss.
+                    start = (position - 1) * chunk_size
+                    end = min(position * chunk_size, len(expected_pids))
+                    if (
+                        first_pid != expected_pids[start]
+                        or last_pid != expected_pids[end - 1]
+                    ):
+                        return (
+                            f"r_editor chunk {chunk_index}: boundary span "
+                            f"{first_pid!r}/{last_pid!r} does not tile the "
+                            f"translation map (expected "
+                            f"{expected_pids[start]!r}/{expected_pids[end - 1]!r} "
+                            f"at positions {start}..{end - 1})"
+                        )
+                edits = item.get("edits")
+                if not isinstance(edits, list):
+                    return f"r_editor chunk {chunk_index}: edits is not a list"
+                chunk_pids = None
+                if expected_pids is not None:
+                    start = (position - 1) * chunk_size
+                    end = min(position * chunk_size, len(expected_pids))
+                    chunk_pids = frozenset(expected_pids[start:end])
+                for edit_index, edit in enumerate(edits):
+                    if not isinstance(edit, dict):
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"not an object"
+                        )
+                    if set(edit) != _R_EDIT_KEYS:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"foreign key set {sorted(edit)!r} "
+                            f"(expected {sorted(_R_EDIT_KEYS)})"
+                        )
+                    edit_pid = edit.get("pid")
+                    if not isinstance(edit_pid, str) or not edit_pid:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"pid is missing or not a string"
+                        )
+                    if expected_pid_set is not None and edit_pid not in expected_pid_set:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"pid {edit_pid!r} is not in the translation map"
+                        )
+                    if chunk_pids is not None and edit_pid not in chunk_pids:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index}: "
+                            f"pid {edit_pid!r} is outside the chunk boundary "
+                            f"span {first_pid!r}..{last_pid!r}"
+                        )
+                    original = edit.get("original")
+                    if not isinstance(original, str) or not original:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: original is missing or not a string"
+                        )
+                    rewritten = edit.get("rewritten")
+                    if not isinstance(rewritten, str) or not rewritten.strip():
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: rewritten is missing or not a string"
+                        )
+                    if not isinstance(edit.get("reason"), str) or not edit.get("reason").strip():
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: reason is missing or not a string"
+                        )
+                    klass = edit.get("class")
+                    if not isinstance(klass, str) or klass not in ALL_CLASSES:
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: unknown edit class {klass!r} "
+                            f"(allowed: {sorted(ALL_CLASSES)})"
+                        )
+                    if current_text is not None and original not in str(
+                        current_text.get(edit_pid, "")
+                    ):
+                        return (
+                            f"r_editor chunk {chunk_index} edit {edit_index} "
+                            f"pid {edit_pid}: original is not a substring of the "
+                            f"current text (tampered cache edit)"
+                        )
+        elif outcome is not None:
+            # R disabled/failed: a non-null outcome is a schema violation.
+            return (
+                f"r_editor: outcome must be null when status is "
+                f"{report_status!r} (got {type(outcome).__name__})"
+            )
+
+    # Canonical integrity binding: the whole partial replay payload must
+    # match the hash persisted at save() time. A missing field (old
+    # schema), any tamper, reorder, duplicate, or extra element — even
+    # while identity and translations_repaired_hash are untouched — is a
+    # full cache miss, never a partial replay.
+    stored_hash = payload.get("partial_resume_hash")
+    computed_hash = canonical_json_hash({
+        "chunks": chunks, "issues": issues, "r_editor": r_editor,
+    })
+    if not isinstance(stored_hash, str) or stored_hash != computed_hash:
+        return (
+            "partial_resume_hash mismatch (old schema or tampered partial "
+            "payload; stored=%r computed=%r)"
+        ) % (stored_hash, computed_hash)
+    return None
+
+
 class B3AuditCache:
     """Persistent audit cache with resume identity (card §10 B3 item 3).
 
     Identity = snapshot_hash + translation_hash + config_identity +
     backend_identity_hash + prompt_version + harness_version +
     entity_context_hash (present only when entity context is enabled).
-    ``audit_complete=False`` is NEVER a reusable state: on resume an
-    incomplete audit re-runs (fail-closed).
+    ``audit_complete=True`` is a FULL hit (the stored repaired map is
+    replayed, 0 model calls). ``audit_complete=False`` with an intact
+    identity is a PARTIAL hit (PARTIAL-RESUME t_a58dd881): GOOD chunks are
+    replayed per-chunk, failed chunks re-run — never a full replay of an
+    incomplete audit (fail-closed), and never a replay across an identity
+    mismatch (full miss, as before).
     """
 
     def __init__(self, path: Path, payload: Optional[Mapping[str, Any]] = None) -> None:
@@ -573,7 +1012,13 @@ class B3AuditCache:
         harness_version: str,
         entity_context_hash: Optional[str],
         entity_context_enabled: bool,
+        # FIX RV2-B (t_a4f8f2b2): the CURRENT run's R enablement decides
+        # whether a missing/None stored r_editor is a schema violation
+        # (R enabled — the report is REQUIRED) or the legitimate disabled
+        # representation (R disabled — save() writes null).
+        r_editor_enabled: bool,
         expected_pids: Optional[Sequence[str]] = None,
+        current_text: Optional[Mapping[str, str]] = None,
     ) -> Optional["B3AuditCache"]:
         if not Path(path).exists():
             return None
@@ -606,19 +1051,15 @@ class B3AuditCache:
         if payload.get("schema") != B3_AUDIT_CACHE_SCHEMA:
             LOG.info("B3: audit cache schema mismatch; re-running audit")
             return None
-        if payload.get("audit_complete") is not True:
-            LOG.info(
-                "B3: cached audit is incomplete (audit_complete=%r); "
-                "re-running audit (fail-closed, never skip an incomplete audit)",
-                payload.get("audit_complete"),
-            )
-            return None
         # F4 (B3 review): the cached repaired map is validated before it can
         # ever be reused/publicized. A structurally tampered cache (extra /
         # missing / reordered PIDs, non-string values, or a repaired-map hash
         # that does not bind to the stored map) is a MISS — the audit re-runs
         # and the tampered map is never published. Old-schema caches (no
-        # ``translations_repaired_hash`` field) also miss.
+        # ``translations_repaired_hash`` field) also miss. The check also
+        # guards the PARTIAL path: the edited-map fail-closed guard reads
+        # ``stored_translations_repaired``, so a tampered map must be a miss
+        # there too.
         repaired = payload.get("translations_repaired")
         if not isinstance(repaired, dict):
             LOG.warning(
@@ -651,6 +1092,46 @@ class B3AuditCache:
                 stored_hash, computed_hash,
             )
             return None
+        if payload.get("audit_complete") is not True:
+            # PARTIAL-RESUME (t_a58dd881): identity matched but the cached
+            # audit did not complete. NOT a full miss anymore — the cache is
+            # returned as a PARTIAL hit: GOOD chunks (status GOOD/GOOD_RETRIED,
+            # valid JSON confirmed at write) and their top-level issues are
+            # reused; TRANSPORT_ERROR/EMPTY/FAILED chunks are marked for
+            # re-run. Fail-closed is preserved: the cached repaired map is
+            # never replayed, the gate stays at audit_complete=False until
+            # EVERY chunk has a status, and a cache is never downgraded.
+            # PARTIAL-RESUME integrity (t_ec6bb8bc): BEFORE either resume
+            # plan is constructed the complete replay payload (chunks /
+            # issues / r_editor) is structurally validated and bound to its
+            # persisted canonical hash — any malformed, missing, duplicate,
+            # extra, or mismatched partial payload is a FULL cache miss
+            # (the audit re-runs), never a partial replay. A tampered
+            # payload can no longer publish unauthorized issues/edits with
+            # 0 model calls while identity and translations_repaired_hash
+            # stay intact. FIX RV2-B (t_a4f8f2b2): for an enabled-R cache
+            # the R report itself is part of that required payload —
+            # a missing/None stored r_editor is rejected here (full miss)
+            # before either resume plan is built.
+            reason = _validate_partial_payload(
+                payload,
+                expected_pids=expected_pids,
+                current_text=current_text,
+                r_editor_enabled=r_editor_enabled,
+            )
+            if reason is not None:
+                LOG.warning(
+                    "B3: audit cache partial payload rejected (%s); "
+                    "re-running the full audit (fail-closed)",
+                    reason,
+                )
+                return None
+            LOG.info(
+                "B3: cached audit is incomplete (audit_complete=%r); "
+                "PARTIAL resume — GOOD chunks reused, failed chunks re-run",
+                payload.get("audit_complete"),
+            )
+            return cls(path, payload)
         return cls(path, payload)
 
     def is_hit(self) -> bool:
@@ -704,6 +1185,113 @@ class B3AuditCache:
             return None
         return dict(value)
 
+    # ------------------------------------------------------------------
+    # PARTIAL-RESUME (t_a58dd881): per-chunk reuse plans
+    # ------------------------------------------------------------------
+
+    _GOOD_STATUSES = ("GOOD", "GOOD_RETRIED")
+
+    def is_partial(self) -> bool:
+        """True when the cached audit is a PARTIAL hit (identity matched,
+        audit did not complete) — GOOD chunks reusable, failed re-run."""
+        return bool(self._payload and self._payload.get("audit_complete") is not True)
+
+    def audit_resume_plan(self) -> Dict[int, Dict[str, Any]]:
+        """Per-chunk audit reuse plan for a partial cache.
+
+        Returns ``{chunk_index: {status, first_pid, last_pid, pair_count,
+        context_count, reasoning_chars, reasoning_file, finish_reason,
+        issues}}`` for every cached chunk whose status is GOOD/GOOD_RETRIED
+        (valid JSON was confirmed at write time — never re-validated here).
+        ``issues`` are the top-level cached issues attributed to this chunk
+        via their ``_debug.chunk`` (the deduped top-level list is the
+        authoritative issue set; a GOOD_RETRIED chunk's sub-issues carry the
+        parent chunk index). Empty when the cache is not a partial hit or
+        has no reusable chunks.
+        """
+        if not self._payload:
+            return {}
+        chunk_payloads = self._payload.get("chunks")
+        if not isinstance(chunk_payloads, list):
+            return {}
+        issues_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
+        for issue in self._payload.get("issues") or ():
+            if not isinstance(issue, dict):
+                continue
+            debug = issue.get("_debug")
+            chunk = debug.get("chunk") if isinstance(debug, dict) else None
+            if isinstance(chunk, int):
+                issues_by_chunk.setdefault(chunk, []).append(dict(issue))
+        plan: Dict[int, Dict[str, Any]] = {}
+        for chunk_payload in chunk_payloads:
+            if not isinstance(chunk_payload, dict):
+                continue
+            if chunk_payload.get("status") not in self._GOOD_STATUSES:
+                continue
+            chunk_index = chunk_payload.get("chunk")
+            if not isinstance(chunk_index, int):
+                continue
+            plan[chunk_index] = {
+                "status": str(chunk_payload.get("status")),
+                "first_pid": chunk_payload.get("first_pid"),
+                "last_pid": chunk_payload.get("last_pid"),
+                "pair_count": chunk_payload.get("pair_count"),
+                "context_count": chunk_payload.get("context_count"),
+                "reasoning_chars": chunk_payload.get("reasoning_chars", 0),
+                "reasoning_file": chunk_payload.get("reasoning_file", ""),
+                "finish_reason": chunk_payload.get("finish_reason"),
+                "issues": issues_by_chunk.get(chunk_index, []),
+            }
+        return plan
+
+    def r_editor_resume_plan(self) -> Dict[int, Dict[str, Any]]:
+        """Per-chunk Russian-editor reuse plan for a partial cache.
+
+        Returns ``{chunk_index: {status, first_pid, edits}}`` for every
+        cached R chunk whose status is GOOD — ``edits`` are the parse-
+        validated per-chunk edit payloads stored in the R report (replayed
+        with 0 model calls on resume; the caller re-runs only the failed
+        chunks). Empty when R was disabled / the cache predates R / the R
+        stage had no GOOD chunks.
+        """
+        if not self._payload:
+            return {}
+        report = self._payload.get("r_editor")
+        if not isinstance(report, dict):
+            return {}
+        outcome = report.get("outcome")
+        if not isinstance(outcome, dict):
+            return {}
+        plan: Dict[int, Dict[str, Any]] = {}
+        for chunk_payload in outcome.get("chunks") or ():
+            if not isinstance(chunk_payload, dict):
+                continue
+            if chunk_payload.get("status") != "GOOD":
+                continue
+            chunk_index = chunk_payload.get("chunk")
+            if not isinstance(chunk_index, int):
+                continue
+            # PARTIAL-RESUME integrity (t_ec6bb8bc): never coerce a
+            # malformed edits field — a non-list is a payload violation and
+            # the chunk is re-run (fail-closed per chunk), not stringified
+            # into a replayable plan. The authoritative rejection happens in
+            # B3AuditCache.load (full miss); this guard only keeps the plan
+            # method safe when called on an unvalidated cache.
+            edits = chunk_payload.get("edits")
+            if not isinstance(edits, list):
+                LOG.warning(
+                    "B3: partial cache r_editor chunk %d edits is not a "
+                    "list (%r) — chunk re-run (fail-closed)",
+                    chunk_index, type(edits).__name__,
+                )
+                continue
+            plan[chunk_index] = {
+                "status": "GOOD",
+                "first_pid": chunk_payload.get("first_pid"),
+                "edits": list(edits),
+            }
+        return plan
+
     def save(
         self,
         *,
@@ -719,6 +1307,15 @@ class B3AuditCache:
         translations_repaired: Mapping[str, str],
         r_editor: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        # PARTIAL-RESUME integrity (t_ec6bb8bc): the replay payload slices
+        # are computed ONCE and both written and bound to a canonical hash.
+        # load() recomputes the hash over the same slices before any resume
+        # plan is built, so a tampered chunks/issues/r_editor payload — even
+        # with identity and translations_repaired_hash preserved — is a full
+        # cache miss, never a partial replay.
+        chunks_payload = outcome.to_payload()["chunks"]
+        issues_payload = [dict(issue) for issue in outcome.issues]
+        r_editor_payload = dict(r_editor) if r_editor is not None else None
         payload = {
             "schema": B3_AUDIT_CACHE_SCHEMA,
             "snapshot_hash": snapshot_hash,
@@ -731,8 +1328,8 @@ class B3AuditCache:
             "entity_context_hash": entity_context_hash,
             "audit_complete": outcome.audit_complete,
             "issue_count": outcome.issue_count,
-            "issues": [dict(issue) for issue in outcome.issues],
-            "chunks": outcome.to_payload()["chunks"],
+            "issues": issues_payload,
+            "chunks": chunks_payload,
             "filtered": [
                 {
                     "issue": dict(f.issue),
@@ -751,7 +1348,7 @@ class B3AuditCache:
             # V4.2 R: the Russian-editor report rides the audit cache so a
             # full cache hit restores the R outcome (edit_candidates +
             # accept/reject journal) with 0 model calls.
-            "r_editor": dict(r_editor) if r_editor is not None else None,
+            "r_editor": r_editor_payload,
             # F4: canonical hash of the repaired map binds the map to this
             # cache record. load() recomputes it and rejects a mismatch (old
             # schema / tampered map), so a structurally tampered
@@ -759,6 +1356,15 @@ class B3AuditCache:
             "translations_repaired_hash": canonical_json_hash(
                 dict(sorted(translations_repaired.items()))
             ),
+            # PARTIAL-RESUME integrity (t_ec6bb8bc): canonical hash of the
+            # partial replay payload (chunks + issues + r_editor). load()
+            # recomputes it on the partial branch and rejects a mismatch —
+            # a tampered GOOD-chunk evidence/edit set is a full miss.
+            "partial_resume_hash": canonical_json_hash({
+                "chunks": chunks_payload,
+                "issues": issues_payload,
+                "r_editor": r_editor_payload,
+            }),
         }
         _atomic_write_json(self.path, payload)
         self._payload = payload
@@ -863,6 +1469,7 @@ class B3AuditRepair:
         translation: Mapping[str, str],
         journal: AuditJournal,
         out_dir: Optional[Path],
+        cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> Tuple[Dict[str, str], Tuple[ReviewCandidate, ...], Optional[RussianEditorOutcome]]:
         """V4.2 R stage: run the Russian-only editor over the raw map.
 
@@ -883,6 +1490,13 @@ class B3AuditRepair:
         ``partial=true`` + ``applied_count`` + ``failed_chunks``. The
         failure is debt (journal + outcome), exactly like a failed repair
         batch: the audit still protects the chapter.
+
+        PARTIAL-RESUME (t_a58dd881): ``cached_chunks`` (from the audit
+        cache's r_editor report) replays GOOD chunks with 0 model calls —
+        their parse-validated edits are re-applied to the raw map
+        (idempotent: R applies edits to the RAW map at run time, so a
+        replayed GOOD chunk reproduces the exact same edited text); the
+        failed chunks are re-run.
         """
         cfg = self._config
         if not cfg.russian_editor_enabled:
@@ -921,6 +1535,9 @@ class B3AuditRepair:
                     edit_count=fields.get("edit_count", 0),
                     warning_count=fields.get("warning_count", 0),
                     error=fields.get("error"),
+                    # PARTIAL-RESUME: the chunk was replayed from the partial
+                    # cache (0 model calls), not freshly edited.
+                    reused=fields.get("reused"),
                 )
 
         evaluator = RussianEditorEvaluator(
@@ -950,6 +1567,7 @@ class B3AuditRepair:
             outcome = evaluator(
                 chapter_id=chapter_id, translation=translation,
                 out_dir=out_dir, out_base="r_editor",
+                cached_chunks=cached_chunks,
             )
         except Exception as exc:  # noqa: BLE001 — R failure is debt, never a crash
             LOG.exception("B3: russian_editor failed for %s", chapter_id)
@@ -1100,8 +1718,9 @@ class B3AuditRepair:
             )
 
         # ------------------------------------------------------------------
-        # 2. Audit cache: full hit -> reuse (0 model calls); incomplete
-        #    cached audit -> re-run (fail-closed).
+        # 2. Audit cache: FULL hit -> reuse (0 model calls); PARTIAL hit
+        #    (identity matched, audit incomplete) -> GOOD chunks reused,
+        #    failed chunks re-run (PARTIAL-RESUME t_a58dd881).
         # ------------------------------------------------------------------
         cache = B3AuditCache.load(
             cache_path,
@@ -1113,11 +1732,44 @@ class B3AuditRepair:
             harness_version=cfg.harness_version,
             entity_context_hash=entity_hash,
             entity_context_enabled=cfg.entity_context_enabled,
+            # FIX RV2-B (t_a4f8f2b2): the current run's R enablement decides
+            # whether a missing stored r_editor is a full miss (R enabled —
+            # the report is REQUIRED) or the legitimate disabled null (R
+            # disabled, save() writes null).
+            r_editor_enabled=cfg.russian_editor_enabled,
             # F4: exact PID set/order validation — a cache whose
             # translations_repaired has missing/extra/reordered PIDs is a miss.
             expected_pids=tuple(translation_map),
+            # PARTIAL-RESUME integrity (t_ec6bb8bc): the current (raw)
+            # translation text lets the partial-payload validator enforce the
+            # verbatim current-text substring constraint on every cached R
+            # edit before any resume plan is built.
+            current_text=translation_map,
         )
-        if cache is not None and cache.is_hit():
+        # PARTIAL-RESUME: build the per-chunk reuse plans from a partial
+        # cache (identity matched, audit_complete=False). GOOD audit chunks
+        # and GOOD R chunks are replayed with 0 model calls; the failed ones
+        # are re-run. The plans are consumed by the R stage and the audit
+        # evaluator below.
+        partial_cache = (
+            cache if (cache is not None and cache.is_hit() and not cache.audit_complete())
+            else None
+        )
+        audit_resume: Dict[int, Dict[str, Any]] = {}
+        r_editor_resume: Dict[int, Dict[str, Any]] = {}
+        # PARTIAL-RESUME: PIDs whose edited text changed in the R re-run vs
+        # the cached edited map — cached audit chunks over those PIDs are
+        # re-audited (per-chunk fail-closed). None when no partial reuse.
+        resume_changed_pids: Optional[AbstractSet[str]] = None
+        if partial_cache is not None:
+            audit_resume = partial_cache.audit_resume_plan()
+            r_editor_resume = partial_cache.r_editor_resume_plan()
+            LOG.info(
+                "B3: partial audit cache for %s — reusing %d GOOD audit "
+                "chunk(s) + %d GOOD R chunk(s), re-running the failed ones",
+                chapter_id, len(audit_resume), len(r_editor_resume),
+            )
+        if cache is not None and cache.is_hit() and cache.audit_complete():
             repaired = cache.stored_translations_repaired()
             issues = cache.stored_issues()
             filtered = cache.stored_filtered()
@@ -1180,6 +1832,11 @@ class B3AuditRepair:
             entity_context_hash=entity_hash,
             prompt_version=cfg.prompt_version,
             harness_version=cfg.harness_version,
+            # PARTIAL-RESUME (t_a58dd881): the audit started from a partial
+            # cache — GOOD chunks replayed, failed chunks re-run.
+            partial_resume=bool(audit_resume or r_editor_resume),
+            reused_audit_chunks=sorted(audit_resume),
+            reused_r_editor_chunks=sorted(r_editor_resume),
         )
 
         # ------------------------------------------------------------------
@@ -1199,6 +1856,7 @@ class B3AuditRepair:
                     translation=translation_map,
                     journal=journal,
                     out_dir=out_dir,
+                    cached_chunks=r_editor_resume or None,
                 )
             )
             # The audit/repair consume the R-EDITED map (raw + SAFE edits).
@@ -1209,6 +1867,40 @@ class B3AuditRepair:
                 review_journal=(),
                 from_cache=False,
             )
+            # PARTIAL-RESUME fail-closed guard: the cached audit chunks were
+            # computed on the R-EDITED map of the ORIGINAL run (the partial
+            # cache's translations_repaired IS that edited map). If the R
+            # re-run of previously-failed chunks changed the edited text, the
+            # cached audit chunks that CONTAIN those PIDs are stale — the
+            # evaluator refuses to replay a cached chunk whose own pids
+            # intersect ``changed_pids`` (re-audits it) while chunks over
+            # untouched PIDs are still replayed (per-chunk fail-closed, the
+            # owner's "не пересматриваем GOOD" with input-identity honesty).
+            # A missing cached edited map (legacy/tampered cache) drops the
+            # whole reuse plan.
+            if audit_resume:
+                cached_edited = partial_cache.stored_translations_repaired()
+                new_edited = dict(translation_map)
+                if cached_edited is None:
+                    LOG.warning(
+                        "B3: partial audit cache for %s — no cached edited "
+                        "map to verify audit input; full re-audit (fail-closed)",
+                        chapter_id,
+                    )
+                    audit_resume = {}
+                else:
+                    resume_changed_pids = {
+                        pid for pid, text in new_edited.items()
+                        if cached_edited.get(pid) != text
+                    }
+                    if resume_changed_pids:
+                        LOG.warning(
+                            "B3: partial audit cache for %s — R re-run "
+                            "changed %d PID(s); cached audit chunks over "
+                            "those PIDs will be re-audited (per-chunk "
+                            "fail-closed)",
+                            chapter_id, len(resume_changed_pids),
+                        )
             # Artifacts are written when the R stage produced ANY edited map
             # (complete pass, or a partial pass whose successful chunks
             # applied edits / forwarded candidates) — the audit/repair
@@ -1280,6 +1972,9 @@ class B3AuditRepair:
                         status=fields.get("status"),
                         issue_count=fields.get("issue_count", 0),
                         error=fields.get("error"),
+                        # PARTIAL-RESUME: the chunk was replayed from the
+                        # partial cache (0 model calls), not freshly audited.
+                        reused=fields.get("reused"),
                     )
 
             evaluator = ChunkedAuditEvaluator(
@@ -1306,6 +2001,10 @@ class B3AuditRepair:
                 entity_context=entity_context,
                 out_dir=out_dir,
                 out_base="b3_audit",
+                # PARTIAL-RESUME: replay GOOD cached chunks (0 model calls);
+                # chunks whose pids changed in the R re-run are re-audited.
+                cached_chunks=audit_resume or None,
+                resume_changed_pids=resume_changed_pids,
             )
         except Exception as exc:  # noqa: BLE001 — fail-closed: a pre/model-call
             # audit failure is TERMINAL. The strict runner records the failed
@@ -1332,6 +2031,9 @@ class B3AuditRepair:
             issue_count=outcome.issue_count,
             failed_chunks=list(outcome.failed_chunks),
             from_cache=False,
+            # PARTIAL-RESUME (t_a58dd881): how many GOOD chunks were replayed
+            # from the partial cache (0 model calls for them).
+            reused_chunks=sorted(audit_resume) if audit_resume else [],
         )
         self._emit_progress(
             "b3_audit_done",
@@ -1364,6 +2066,12 @@ class B3AuditRepair:
                 filtered=(),
                 repair=None,
                 translations_repaired=dict(translation_map),
+                # PARTIAL-RESUME (t_a58dd881): the R report (with per-chunk
+                # statuses + parse-validated edits) rides the partial cache so
+                # the NEXT resume reuses GOOD R chunks too (previously it was
+                # dropped on the fail-closed path — r_editor stayed None and
+                # run_remote_007-style caches lost all R reuse data).
+                r_editor=r_editor_report,
             )
             step6 = {
                 "status": "incomplete",
@@ -1375,6 +2083,11 @@ class B3AuditRepair:
                 "entity_context_enabled": cfg.entity_context_enabled,
                 "entity_context_hash": entity_hash,
                 "from_cache": False,
+                # PARTIAL-RESUME (t_a58dd881): GOOD chunks were replayed from
+                # the partial cache (0 model calls); only the failed ones were
+                # re-run (and failed again — fail-closed preserved).
+                "partial_resume": bool(audit_resume),
+                "reused_chunks": sorted(audit_resume) if audit_resume else [],
             }
             step7 = {"status": "skipped", "reason": "audit_incomplete_fail_closed"}
             step8 = {
@@ -1579,6 +2292,10 @@ class B3AuditRepair:
             "entity_context_enabled": cfg.entity_context_enabled,
             "entity_context_hash": entity_hash,
             "from_cache": False,
+            # PARTIAL-RESUME (t_a58dd881): GOOD chunks were replayed from the
+            # partial cache (0 model calls); only the failed ones re-run.
+            "partial_resume": bool(audit_resume),
+            "reused_chunks": sorted(audit_resume) if audit_resume else [],
         }
         step7 = {
             "status": (
