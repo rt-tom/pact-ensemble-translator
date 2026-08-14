@@ -2,8 +2,9 @@
 
 Covers: the 25-edit run_010 scenario reproduction (SAFE auto-applied with
 the diff-gate, REVIEW never applied), chunking (50 PIDs + CONTEXT_ONLY),
-fail-closed parsing (unknown pid / original mismatch / unknown class /
-no-op diff-gate), and the evaluator over a scripted in-memory backend
+fail-closed parsing (original mismatch / unknown class / no-op diff-gate),
+context-only pid edits dropped per-edit with a WARNING (R-PID-SCOPE), and
+the evaluator over a scripted in-memory backend
 (0 real Qwen calls anywhere in this file).
 """
 from __future__ import annotations
@@ -181,14 +182,61 @@ def test_parse_valid_edits() -> None:
     assert edits[1].pid == "p00002"
 
 
-def test_parse_rejects_unknown_pid_and_context_only() -> None:
+def test_parse_drops_context_only_pid_with_warning() -> None:
+    """R-PID-SCOPE (t_db376195, owner contract 2026-08-13): an edit for a
+    pid that is NOT owned by the current chunk (a CONTEXT_ONLY pid given
+    for continuity, run_remote_007 chunk5 p00195, or a completely foreign
+    pid) is dropped per-edit with a WARNING — never a structural error: the
+    chunk stays GOOD, the owned edits survive, the dropped edit is never
+    applied and never forwarded to another chunk."""
     current = {"p00001": "текст"}
-    edits, errors, _ = parse_editor_edits(
+    edits, errors, warnings = parse_editor_edits(
         _ok([_edit("p00099", "текст", "другой", "r", "typo")]),
         ["p00001"], current,
     )
     assert edits == ()
-    assert any("not in the current chunk" in e for e in errors)
+    assert errors == ()
+    assert len(warnings) == 1
+    assert "p00099" in warnings[0]
+    assert "not in the current chunk" in warnings[0]
+
+
+def test_parse_owned_plus_context_edit_keeps_owned() -> None:
+    """R-PID-SCOPE acceptance: a chunk whose edit list mixes ONE owned pid
+    edit with ONE context-only pid edit is GOOD — the owned edit is
+    accepted, the context edit is dropped with a WARNING and never applied
+    (edit_count=1, warning_count=1)."""
+    current = {"p00001": "текст один", "p00002": "текст два"}
+    edits, errors, warnings = parse_editor_edits(
+        _ok([
+            _edit("p00001", "текст один", "текст один испр", "r", "typo"),
+            _edit("p00002", "текст два", "текст два испр", "r", "typo"),
+        ]),
+        ["p00001"], current,  # chunk owns ONLY p00001; p00002 is context
+    )
+    assert errors == ()
+    assert [e.pid for e in edits] == ["p00001"]
+    assert len(warnings) == 1
+    assert "p00002" in warnings[0]
+    # The context-only edit is NOT applied and NOT forwarded anywhere.
+    assert all(e.pid != "p00002" for e in edits)
+
+
+def test_parse_all_context_edits_chunk_stays_good() -> None:
+    """R-PID-SCOPE acceptance: a chunk whose edits are ALL context-only
+    pids is GOOD with 0 edits and warning_count=N — NOT FAILED."""
+    current = {"p00001": "текст один", "p00002": "текст два"}
+    edits, errors, warnings = parse_editor_edits(
+        _ok([
+            _edit("p00002", "текст два", "текст два испр", "r", "typo"),
+            _edit("p00003", "нет", "такого", "r", "typo"),
+        ]),
+        ["p00001"], current,  # chunk owns ONLY p00001; both edits are foreign
+    )
+    assert edits == ()
+    assert errors == ()
+    assert len(warnings) == 2
+    assert all("not in the current chunk" in w for w in warnings)
 
 
 def test_parse_rejects_original_mismatch() -> None:
@@ -318,8 +366,9 @@ def test_parse_accepts_duplicate_pid_up_to_cap() -> None:
 def test_parse_drops_over_cap_duplicate_with_warning() -> None:
     """R-RETRY (t_8ab8ab35): the 11th+ edit of the same pid is dropped
     per-edit with a WARNING (journal), never a structural error — the chunk
-    stays GOOD (fail-closed preserved only for pid outside chunk / unknown
-    class / original not substring / invalid JSON)."""
+    stays GOOD (fail-closed preserved only for unknown class / original
+    not substring / invalid JSON; a pid outside the chunk is a per-edit
+    WARNING drop since R-PID-SCOPE)."""
     current = {"p00001": "текст " + " ".join(f"слово{i}" for i in range(1, 13))}
     edits = [
         _edit("p00001", f"слово{i}", f"слово{i}Испр", "r", "typo")
@@ -690,11 +739,12 @@ def test_evaluator_chunk_failure_marks_incomplete() -> None:
 
 
 def test_evaluator_partial_apply_isolates_failed_chunks_5of8() -> None:
-    """RESILIENCE acceptance (run_remote_001 shape): with 8 chunks where 3
-    fail (fences / broken JSON / foreign pid) and 5 are GOOD carrying 17
-    edits, the outcome carries ONLY the 5 GOOD chunks' edits — a failed
-    chunk contributes none (per-chunk fail-closed), so the B3 partial-apply
-    can safely apply the successful work."""
+    """RESILIENCE acceptance (run_remote_001 shape): with 8 chunks where 2
+    fail (broken JSON) and 6 are GOOD carrying 17 edits, the outcome
+    carries ONLY the GOOD chunks' edits — a failed chunk contributes none
+    (per-chunk fail-closed), so the B3 partial-apply can safely apply the
+    successful work. The chunk whose edit names a foreign pid (p99999) is
+    GOOD with 0 edits + a WARNING (R-PID-SCOPE) — never applied either."""
     translation = _translation(40)  # 8 chunks of 5 (chunk_size=5)
     backend = _MockBackend(
         # chunk 1 GOOD — 2 SAFE edits
@@ -747,13 +797,17 @@ def test_evaluator_partial_apply_isolates_failed_chunks_5of8() -> None:
     outcome = evaluator(chapter_id="0001", translation=translation)
     assert outcome.complete is False
     assert outcome.chunk_count == 8
-    assert outcome.successful_chunks == 5
-    assert outcome.failed_chunks == (2, 4, 6)
-    # 2+3+4+5+3 = 17 edits from the GOOD chunks only.
+    assert outcome.successful_chunks == 6
+    assert outcome.failed_chunks == (2, 6)
+    # 2+3+4+5+3 = 17 edits from the GOOD chunks only (chunk 4 is GOOD but
+    # its only edit named a foreign pid — dropped, 0 edits).
     assert len(outcome.edits) == 17
+    # The foreign-pid edit of chunk 4 is a per-edit WARNING, not an error
+    # (R-PID-SCOPE) — the chunk stays GOOD, the edit is never applied.
+    assert outcome.warning_count == 1
     applied_pids = {pid for pid, _ in outcome.applied}
-    # Failed-chunk pids never appear (chunk2: p00006-p00010, chunk4:
-    # p99999, chunk6: p00026-p00030).
+    # Failed-chunk pids never appear (chunk2: p00006-p00010, chunk6:
+    # p00026-p00030).
     assert not (applied_pids & {"p00006", "p00007", "p00008", "p00009", "p00010"})
     assert not (applied_pids & {"p00026", "p00027", "p00028", "p00029", "p00030"})
     assert not (applied_pids & {"p99999"})
@@ -904,11 +958,11 @@ def test_evaluator_transport_retry_exhausted_still_fails() -> None:
 
 
 def test_evaluator_structural_error_not_retried() -> None:
-    """R-RETRY (t_8ab8ab35): a STRUCTURAL error (pid outside the chunk) is
+    """R-RETRY (t_8ab8ab35): a STRUCTURAL error (unknown edit class) is
     NOT retried — it is not randomness, fail-closed as-is (single call)."""
     translation = _translation(10)
     backend = _MockBackend(
-        _ok([_edit("p99999", "нет такого", "фикс", "r", "typo")]),
+        _ok([_edit("p00001", "Русский текст абзаца 1.", "фикс", "r", "нет_такого_класса")]),
     )
     events: list = []
     evaluator = RussianEditorEvaluator(
@@ -920,6 +974,73 @@ def test_evaluator_structural_error_not_retried() -> None:
     assert outcome.failed_chunks == (1,)
     assert backend.call_count() == 1  # NO retry for structural errors
     assert not [e for e in events if e[0] == "retry"]
+
+
+def test_evaluator_context_only_edit_dropped_chunk_good() -> None:
+    """R-PID-SCOPE acceptance (run_remote_007 chunk5 shape): the model
+    edits a CONTEXT_ONLY pid — a pid shown to it for continuity but owned
+    by ANOTHER chunk (or foreign). The edit is dropped per-edit with a
+    WARNING, the chunk stays GOOD (0 edits + warning_count=1), the outcome
+    is complete — never FAILED, and the owned chunk where the pid lives is
+    untouched (the edit is not transferred; the model proposes it there)."""
+    # chunk_size=1: chunk 1 owns p00001, chunk 2 owns p00002; chunk 2's
+    # context_pairs include p00001 (get_editor_overlap walks backwards).
+    translation = {"p00001": "текст один", "p00002": "текст два"}
+    backend = _MockBackend(
+        '{"edits": []}',
+        _ok([_edit("p00001", "текст один", "текст один испр", "r", "typo")]),
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(chunk_size=1),
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is True
+    assert outcome.failed_chunks == ()
+    assert outcome.successful_chunks == 2
+    assert outcome.edits == ()
+    assert outcome.applied == ()
+    assert outcome.warning_count == 1
+    done = [e for e in events if e[0] == "done"]
+    # chunk 2's event: GOOD, 0 edits, 1 warning (the context-only edit).
+    assert done[1][1]["status"] == "GOOD"
+    assert done[1][1]["edit_count"] == 0
+    assert done[1][1]["warning_count"] == 1
+    # chunk 1 (the pid's owner) was NOT asked to apply it here — the edit
+    # is dropped, never transferred to the owning chunk.
+    assert not any("p00001" in (e[1].get("error") or "") for e in done)
+
+
+def test_evaluator_owned_and_context_mixed_drops_context() -> None:
+    """R-PID-SCOPE acceptance: a chunk whose edit list mixes an OWNED pid
+    edit with a CONTEXT_ONLY pid edit — the owned edit is applied, the
+    context edit is dropped with a WARNING, edit_count=1 warning_count=1."""
+    # chunk_size=1: chunk 2 owns p00002; the model returns BOTH an owned
+    # edit (p00002) and a context edit (p00001).
+    translation = {"p00001": "текст один", "p00002": "текст два"}
+    backend = _MockBackend(
+        '{"edits": []}',
+        _ok([
+            _edit("p00001", "текст один", "текст один испр", "r", "typo"),
+            _edit("p00002", "текст два", "текст два испр", "r", "typo"),
+        ]),
+    )
+    events: list = []
+    evaluator = RussianEditorEvaluator(
+        backend, config=RussianEditorConfig(chunk_size=1),
+        on_chunk_event=lambda kind, fields: events.append((kind, fields)),
+    )
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.complete is True
+    assert outcome.failed_chunks == ()
+    assert [e.pid for e in outcome.edits] == ["p00002"]
+    assert dict(outcome.applied) == {"p00002": "текст два испр"}
+    assert outcome.warning_count == 1
+    done = [e for e in events if e[0] == "done"]
+    assert done[1][1]["status"] == "GOOD"
+    assert done[1][1]["edit_count"] == 1
+    assert done[1][1]["warning_count"] == 1
 
 
 class _FlakyTransportBackend(_MockBackend):
