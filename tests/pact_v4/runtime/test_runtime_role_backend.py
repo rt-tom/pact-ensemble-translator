@@ -420,6 +420,41 @@ def test_composite_backend_collision_routes_to_mapped_backend():
     assert composite.serving_backend("m-qa") is b
 
 
+def test_composite_backend_cross_role_collision_fails_closed():
+    # RV t_edb1033a HIGH: the SAME ref bound to DIFFERENT roles served by
+    # DIFFERENT concrete backends (role map generator->b, qwen_audit->a,
+    # both advertising m-shared) cannot be routed coherently — a request
+    # carries only model_ref, never the role. The historical sorted-role
+    # loop silently routed m-shared to whichever role sorted last (a),
+    # ignoring generator's explicit map to b. Now the composite fails
+    # closed at construction instead of serving one role's requests from
+    # another role's backend.
+    a = _FakeCompletionBackend("a", {"qwen_audit": "m-shared"})
+    b = _FakeCompletionBackend("b", {"generator": "m-shared"})
+    routing = {"generator": "b", "qwen_audit": "a"}
+    with pytest.raises(ValueError, match="different concrete backends"):
+        CompositeCompletionBackend(
+            {"a": a, "b": b},
+            _composite_descriptor(routing, {
+                "generator": "m-shared", "qwen_audit": "m-shared",
+            }),
+        )
+    # Same-role duplicates stay fine (see test above): the ref is claimed
+    # by a single resolved role, so no ambiguity.
+    a2 = _FakeCompletionBackend("a2", {"generator": "m-shared"})
+    b2 = _FakeCompletionBackend("b2", {"generator": "m-shared", "qwen_audit": "m-qa"})
+    composite = CompositeCompletionBackend(
+        {"a2": a2, "b2": b2},
+        _composite_descriptor(
+            {"generator": "a2", "qwen_audit": "b2"},
+            {"generator": "m-shared", "qwen_audit": "m-qa"},
+        ),
+    )
+    composite.complete(_req("m-shared"))
+    assert a2.seen == ["m-shared"]
+    assert b2.seen == []
+
+
 def test_composite_backend_fallback_role_reaches_generator_backend():
     # Documented fallbacks (repair -> generator, entity_extractor ->
     # qwen_audit): a role declared by NO sub-backend resolves its model_ref

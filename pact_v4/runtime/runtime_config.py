@@ -486,6 +486,18 @@ class CompositeCompletionBackend:
             name: dict(backend.descriptor.model_bindings or {})
             for name, backend in self._sub.items()
         }
+        # Fail-closed on cross-role model_ref collisions (RV t_edb1033a):
+        # when the same ref is bound to roles served by DIFFERENT concrete
+        # backends, routing by ref alone cannot be coherent — the composite
+        # must not be constructed at all. Never silently route one role's
+        # requests to another role's backend (the historical sorted-role
+        # last-wins pick).
+        ambiguity = _composite_ref_ambiguity(routing, refs_by_backend)
+        if ambiguity:
+            raise ValueError(
+                "CompositeCompletionBackend: "
+                + _composite_ambiguity_message(ambiguity)
+            )
         assigned: Dict[str, str] = {}
         for role in sorted({r for mb in refs_by_backend.values() for r in mb}):
             backend_name = _resolve_role_backend(routing, refs_by_backend, role)
@@ -584,6 +596,17 @@ class CompositeBackendConfig:
             name: (cfg.build_descriptor().model_bindings or {})
             for name, cfg in self.backends.items()
         }
+        # Fail-closed on cross-role model_ref collisions (RV t_edb1033a):
+        # when the same ref is bound to roles served by DIFFERENT concrete
+        # backends, the composite cannot serve that ref coherently (requests
+        # carry only the ref, never the role), so the descriptor must not be
+        # built at all — the config is rejected loudly instead of advertising
+        # a ref whose concrete routing silently picks one role's backend.
+        ambiguity = _composite_ref_ambiguity(self.role_backend_map, refs_by_backend)
+        if ambiguity:
+            raise ValueError(
+                "CompositeBackendConfig: " + _composite_ambiguity_message(ambiguity)
+            )
         bindings: Dict[str, str] = {}
         for role in sorted({r for mb in refs_by_backend.values() for r in mb}):
             backend_name = _resolve_role_backend(
@@ -1247,6 +1270,47 @@ def _resolve_role_backend(
         if fallback_role in bindings or "default" in bindings:
             return name
     return None
+
+
+def _composite_ref_ambiguity(
+    role_backend_map: Mapping[str, str],
+    refs_by_backend: Mapping[str, Mapping[str, str]],
+) -> Dict[str, Tuple[str, ...]]:
+    """Model refs whose selected roles resolve to different concrete backends.
+
+    Returns ``{ref: (backend, ...)}`` for every ref claimed by roles that
+    resolve to MORE THAN ONE backend. A composite routes by ``model_ref``
+    alone (requests carry no role), so such a ref can never be served
+    coherently: whichever single backend the ref maps to, at least one
+    role's requests would silently reach the wrong backend. Callers fail
+    closed instead of picking a sorted-role winner (RV t_edb1033a HIGH).
+    """
+    ref_to_backends: Dict[str, set] = {}
+    for role in sorted({r for mb in refs_by_backend.values() for r in mb}):
+        backend_name = _resolve_role_backend(role_backend_map, refs_by_backend, role)
+        if backend_name is None or backend_name not in refs_by_backend:
+            continue
+        ref = refs_by_backend[backend_name].get(role)
+        if ref:
+            ref_to_backends.setdefault(ref, set()).add(backend_name)
+    return {
+        ref: tuple(sorted(backends))
+        for ref, backends in ref_to_backends.items()
+        if len(backends) > 1
+    }
+
+
+def _composite_ambiguity_message(ambiguity: Mapping[str, Tuple[str, ...]]) -> str:
+    return (
+        "model_ref(s) claimed by roles on different concrete backends: "
+        + "; ".join(
+            f"{ref} ({', '.join(backends)})"
+            for ref, backends in sorted(ambiguity.items())
+        )
+        + " — a composite routes by model_ref alone and cannot serve one ref "
+        "from two backends; bind the colliding roles to the same backend or "
+        "give them distinct model refs"
+    )
 
 
 def _composite_role_backend_name(
