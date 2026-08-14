@@ -2666,6 +2666,173 @@ def test_b3_partial_cache_tampered_issues_is_full_miss(tmp_path: Path) -> None:
     )
 
 
+def test_b3_partial_cache_rehashed_malformed_issue_note_is_full_miss(
+    tmp_path: Path,
+) -> None:
+    """RV2-A (t_c84b6f13): the RV2 probe — mutate ONLY ``issues[0].note`` to
+    a dict AND recompute ``partial_resume_hash`` (identity fields and
+    ``translations_repaired_hash`` preserved), then resume. The recomputed
+    hash defeats the plain-hash gate, so only the complete issues schema
+    validation can reject the malformed evidence: the resume must be a FULL
+    miss (every audit chunk re-runs fresh, 0 replayed), the malformed note
+    is never replayed into the outcome, and nothing is stringified/coerced.
+    """
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = B3AuditRepairConfig(
+        entity_context_enabled=False,
+        russian_editor_enabled=False,
+        max_input_tokens=1,  # 8 single-pair audit chunks
+        audit_transport_max_retries=0,
+        audit_transport_base_delay_seconds=0,
+    )
+    _run_with_b3(
+        cfg,
+        _FlakyStageBackend(
+            fail_audit_calls=(5, 6),
+            audit_issues=[{
+                "id": "p00001", "category": "addition", "severity": "major",
+                "confidence": "high", "note": "дублирование слова",
+                "excerpt": "номер1 номер1",
+            }],
+            reaudit_issues=[], repair_results=[],
+        ),
+        config_override=override,
+    )
+    cache_path = cfg.out_dir / "audit_cache_b3.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["audit_complete"] is False  # partial cache exists
+    assert payload["issues"], "the partial cache must carry a real issue"
+
+    from pact_v4.phase1.models import canonical_json_hash
+
+    # RV2 probe: only note -> dict, then rebind the canonical hash so the
+    # hash gate no longer catches it — only schema validation can.
+    payload["issues"][0]["note"] = {"tampered": True}
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "chunks": payload["chunks"],
+        "issues": payload["issues"],
+        "r_editor": payload["r_editor"],
+    })
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resume = _B3MockBackend(audit_issues=[], repair_results=[], reaudit_issues=[])
+    second = _run_with_b3(cfg, resume, config_override=override)
+    # FULL miss: ALL 8 audit chunks re-run fresh (0 replayed), the
+    # malformed issue is not part of the outcome.
+    assert resume.audit_calls() == 8
+    assert second.step6["partial_resume"] is False
+    assert second.step6["issue_count"] == 0
+    assert second.step8["released_as_audited"] is True
+    # The fresh computation persisted no dict-typed note evidence.
+    cache2 = _read_json(cache_path)
+    assert all(
+        isinstance(issue.get("note"), str)
+        for issue in cache2.get("issues", [])
+    )
+
+
+def test_b3_partial_cache_rehashed_issue_pid_outside_chunk_span_is_full_miss(
+    tmp_path: Path,
+) -> None:
+    """RV2-A (t_c84b6f13): an issue whose PID is inside the global
+    translation map but OUTSIDE the actual pid span of the chunk it claims
+    (``_debug.chunk`` 1 covers only p00001) is malformed evidence — with a
+    recomputed ``partial_resume_hash`` the resume must still be a FULL miss
+    (never a partial replay of the misplaced issue)."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = B3AuditRepairConfig(
+        entity_context_enabled=False,
+        russian_editor_enabled=False,
+        max_input_tokens=1,  # 8 single-pair audit chunks
+        audit_transport_max_retries=0,
+        audit_transport_base_delay_seconds=0,
+    )
+    _run_with_b3(
+        cfg,
+        _FlakyStageBackend(
+            fail_audit_calls=(5, 6),
+            audit_issues=[{
+                "id": "p00001", "category": "addition", "severity": "major",
+                "confidence": "high", "note": "дублирование слова",
+                "excerpt": "номер1 номер1",
+            }],
+            reaudit_issues=[], repair_results=[],
+        ),
+        config_override=override,
+    )
+    cache_path = cfg.out_dir / "audit_cache_b3.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["audit_complete"] is False
+
+    from pact_v4.phase1.models import canonical_json_hash
+
+    # p00002 IS in the translation map (global membership passes) but chunk
+    # 1's actual span is p00001..p00001 — the issue is misplaced.
+    payload["issues"][0]["id"] = "p00002"
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "chunks": payload["chunks"],
+        "issues": payload["issues"],
+        "r_editor": payload["r_editor"],
+    })
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resume = _B3MockBackend(audit_issues=[], repair_results=[], reaudit_issues=[])
+    second = _run_with_b3(cfg, resume, config_override=override)
+    assert resume.audit_calls() == 8  # full miss, nothing replayed
+    assert second.step6["partial_resume"] is False
+    assert second.step6["issue_count"] == 0
+    assert second.step8["released_as_audited"] is True
+
+
+def test_b3_partial_cache_rehashed_issue_excerpt_wrong_type_is_full_miss(
+    tmp_path: Path,
+) -> None:
+    """RV2-A (t_c84b6f13): a non-string ``excerpt`` (list) in a cached issue
+    with a recomputed ``partial_resume_hash`` is a FULL miss — the malformed
+    field is never stringified/coerced into replayed evidence."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = B3AuditRepairConfig(
+        entity_context_enabled=False,
+        russian_editor_enabled=False,
+        max_input_tokens=1,  # 8 single-pair audit chunks
+        audit_transport_max_retries=0,
+        audit_transport_base_delay_seconds=0,
+    )
+    _run_with_b3(
+        cfg,
+        _FlakyStageBackend(
+            fail_audit_calls=(5, 6),
+            audit_issues=[{
+                "id": "p00001", "category": "addition", "severity": "major",
+                "confidence": "high", "note": "дублирование слова",
+                "excerpt": "номер1 номер1",
+            }],
+            reaudit_issues=[], repair_results=[],
+        ),
+        config_override=override,
+    )
+    cache_path = cfg.out_dir / "audit_cache_b3.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["audit_complete"] is False
+
+    from pact_v4.phase1.models import canonical_json_hash
+
+    payload["issues"][0]["excerpt"] = ["номер1 номер1"]
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "chunks": payload["chunks"],
+        "issues": payload["issues"],
+        "r_editor": payload["r_editor"],
+    })
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    resume = _B3MockBackend(audit_issues=[], repair_results=[], reaudit_issues=[])
+    second = _run_with_b3(cfg, resume, config_override=override)
+    assert resume.audit_calls() == 8  # full miss, nothing replayed
+    assert second.step6["partial_resume"] is False
+    assert second.step6["issue_count"] == 0
+    assert second.step8["released_as_audited"] is True
+
+
 def test_b3_partial_cache_tampered_r_editor_edits_is_full_miss(tmp_path: Path) -> None:
     """FIX (t_ec6bb8bc): mutating ONLY a cached GOOD R chunk's edits into a
     valid-looking SAFE edit with unauthorized text (identity and

@@ -575,6 +575,13 @@ _AUDIT_CHUNK_STATUSES = frozenset({
 # Statuses the Russian editor can persist per chunk (russian_editor.py).
 _R_EDITOR_CHUNK_STATUSES = frozenset({"GOOD", "FAILED"})
 
+# Exact persisted key set of an audit issue record (chunked_audit.py
+# collection + ``_attach_debug_and_dedupe``). A record with a missing or
+# extra key is a schema violation — never tolerated (RV2-A t_c84b6f13).
+_ISSUE_KEYS = frozenset({
+    "id", "category", "severity", "confidence", "note", "excerpt", "_debug",
+})
+
 
 def _validate_partial_payload(
     payload: Mapping[str, Any],
@@ -593,9 +600,11 @@ def _validate_partial_payload(
       missing / extra indices) and a known status per chunk;
     * audit chunk boundaries (first_pid/last_pid strings) and pair counts
       (+ the int fields the evaluator replays verbatim);
-    * issue schema (category/severity/confidence vocab, non-empty string
-      id), PID membership in the translation map, and ``_debug.chunk``
-      attribution inside the covered chunk indices;
+    * issue schema (exact key set, non-empty string id/note/excerpt,
+      category/severity/confidence vocab, PID membership in the
+      translation map), ``_debug.chunk`` attribution inside the covered
+      chunk indices, and PID membership inside the ACTUAL covered chunk
+      span of the attributed chunk (first_pid..last_pid boundaries);
     * R report schema / chunk coverage (contiguous 1..M, known status,
       boundaries);
     * every cached R edit: object shape, exact string types, PID
@@ -658,9 +667,21 @@ def _validate_partial_payload(
     if not isinstance(issues, list):
         return "issues is not a list"
     chunk_count = len(chunks)
+    # RV2-A (t_c84b6f13): a position map over the ordered PID list lets the
+    # validator enforce that every issue sits inside the ACTUAL pid span of
+    # the chunk it claims (_debug.chunk), not merely inside the global
+    # translation map.
+    pid_positions = None
+    if expected_pids is not None:
+        pid_positions = {pid: position for position, pid in enumerate(expected_pids)}
     for issue_index, issue in enumerate(issues):
         if not isinstance(issue, dict):
             return f"issue {issue_index}: not an object"
+        if set(issue) != _ISSUE_KEYS:
+            return (
+                f"issue {issue_index}: key set mismatch "
+                f"(expected {sorted(_ISSUE_KEYS)}, got {sorted(issue)})"
+            )
         pid = issue.get("id")
         if not isinstance(pid, str) or not pid:
             return f"issue {issue_index}: id is missing or not a string"
@@ -672,6 +693,12 @@ def _validate_partial_payload(
             return f"issue {pid}: invalid severity {issue.get('severity')!r}"
         if issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
             return f"issue {pid}: invalid confidence {issue.get('confidence')!r}"
+        note = issue.get("note")
+        if not isinstance(note, str) or not note.strip():
+            return f"issue {pid}: note is missing, not a string, or empty"
+        excerpt = issue.get("excerpt")
+        if not isinstance(excerpt, str) or not excerpt.strip():
+            return f"issue {pid}: excerpt is missing, not a string, or empty"
         debug = issue.get("_debug")
         if not isinstance(debug, dict):
             return f"issue {pid}: _debug is missing or not an object"
@@ -683,6 +710,20 @@ def _validate_partial_payload(
             )
         if not isinstance(debug.get("reasoning_file"), str):
             return f"issue {pid}: _debug.reasoning_file is not a string"
+        if pid_positions is not None:
+            chunk_record = chunks[chunk - 1]
+            first_pos = pid_positions.get(chunk_record.get("first_pid"))
+            last_pos = pid_positions.get(chunk_record.get("last_pid"))
+            pid_pos = pid_positions.get(pid)
+            if (
+                first_pos is None or last_pos is None or pid_pos is None
+                or not (first_pos <= pid_pos <= last_pos)
+            ):
+                return (
+                    f"issue {pid}: id is not inside the actual pid span of "
+                    f"chunk {chunk} ({chunk_record.get('first_pid')!r}.."
+                    f"{chunk_record.get('last_pid')!r})"
+                )
 
     r_editor = payload.get("r_editor")
     if r_editor is not None and not isinstance(r_editor, dict):
