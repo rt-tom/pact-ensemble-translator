@@ -773,6 +773,66 @@ def test_b3_verified_only_alias_source_apposed_only(tmp_path: Path) -> None:
     assert 'alias: "Rose"' in verified_block
 
 
+def test_b3_verified_only_alias_rejects_substring_of_anchor(tmp_path: Path) -> None:
+    """RV finding 2 HIGH regression (SAFE-MEMORY, 2026-08-14): the
+    apposition check is BOUNDARY-SAFE.
+
+    Real counterexample: anchor ``the woman, Rosemary``, alias surface
+    ``Rose``, alias span ``Rosemary``. The old ``surface in anchor``
+    substring test accepted ``Rose`` because ``rose`` is a substring of
+    ``rosemary``, and the short form leaked into the verified-only
+    Translator block. The surface must occur as an INDEPENDENT word in the
+    anchor span — ``Rose`` inside ``Rosemary`` is not an apposition, so the
+    alias stays in the audit block only. The existing positive case
+    ``the woman, Rose`` (surface == independent word) must keep passing.
+    """
+    from pact_v4.audit.entity_extractor import (
+        ENTITY_CONTEXT_SCHEMA,
+        EXTRACTOR_VERSION,
+        AnchorRef,
+        AliasRef,
+        ChapterEntityContext,
+        EntityRecord,
+    )
+    from pact_v4.pipeline.b3_audit_repair import render_entity_context_block
+
+    context = ChapterEntityContext(
+        schema=ENTITY_CONTEXT_SCHEMA,
+        extractor_version=EXTRACTOR_VERSION,
+        chapter_id="0001",
+        source_hash="abc",
+        entities=(
+            # Substring of the anchor's own word: surface "Rose" vs anchor
+            # "the woman, Rosemary" — the source apposes "Rosemary", NOT
+            # "Rose". Must stay in audit, never reach verified-only.
+            EntityRecord(
+                entity="Rose",
+                canonical_type="woman",
+                anchor=AnchorRef(pid="p00002", span="the woman, Rosemary"),
+                aliases=(AliasRef(surface="Rose", pid="p00002", span="Rosemary"),),
+                claims=(),
+            ),
+            # Control positive: the surface IS an independent apposed word
+            # inside the anchor — must reach verified-only.
+            EntityRecord(
+                entity="Rose",
+                canonical_type="woman",
+                anchor=AnchorRef(pid="p00004", span="the woman, Rose"),
+                aliases=(AliasRef(surface="Rose", pid="p00004", span="Rose"),),
+                claims=(),
+            ),
+        ),
+    )
+    full_block = render_entity_context_block(context)
+    verified_block = render_entity_context_block(context, verified_only=True)
+    # Substring alias: audit keeps it, verified-only does NOT.
+    assert 'alias: "Rose" (pid p00002' in full_block
+    assert 'alias: "Rose" (pid p00002' not in verified_block
+    # Independent-word alias: present in BOTH blocks (positive control).
+    assert 'alias: "Rose" (pid p00004' in full_block
+    assert 'alias: "Rose" (pid p00004' in verified_block
+
+
 def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:
     """P1 АРКИ (owner decision 2026-08-14): when the run config carries a
     deterministic arc mapping, the whole-chapter generation prompt includes

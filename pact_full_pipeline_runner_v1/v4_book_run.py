@@ -252,6 +252,24 @@ def _load_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+def _next_chapter_id(chapter_id: str, chapter_ids: Sequence[str]) -> Optional[str]:
+    """The chapter that runs right after ``chapter_id`` in this book run.
+
+    ``chapter_ids`` is the run's ordered chapter list; the NEXT chapter's
+    index entry is pre-built when the current one is accepted (RV finding
+    1, SAFE-MEMORY 2026-08-14) so its FIRST run already sees the memory of
+    accepted chapters < it. Returns ``None`` when ``chapter_id`` is the
+    last chapter (or absent from the list).
+    """
+    try:
+        idx = list(chapter_ids).index(chapter_id)
+    except ValueError:
+        return None
+    if idx + 1 >= len(chapter_ids):
+        return None
+    return str(chapter_ids[idx + 1])
+
+
 def _source_by_pid(chapter_html: Path) -> Dict[str, str]:
     """``{pid: text}`` for a chapter HTML file via the Phase 0B parser."""
     blocks = parse_source_html(chapter_html.read_text(encoding="utf-8-sig"))
@@ -1186,13 +1204,24 @@ def run_book(
         # promoted; bytes preserved).
         _strip_book_memory_observation_fields(memory_dir)
 
-        # A2 (causal <N, P0 2026-08-14): after an ACCEPTED chapter, rebuild
-        # the chapter's entry in chapter_index.json so the causal bible
-        # renderer (`render_bible_section`) serves the NEXT chapter from
-        # fresh memory (promoted entities/facts from THIS chapter) — and so
-        # the current chapter's own entry reflects the pre-promotion state
-        # of THIS chapter only. 0 model calls, deterministic (B9-A2 card).
-        # Failed chapters never touch the index.
+        # A2 (causal <N, P0 2026-08-14; RV finding 1 SAFE-MEMORY
+        # 2026-08-14): after an ACCEPTED chapter N, write chapter_index
+        # entries for BOTH the current chapter N and the NEXT chapter N+1
+        # (when it exists in this run), each built from PRE-chapter memory
+        # ONLY — facts of chapters < the entry's chapter id
+        # (pre_chapter_book_memory). The strict runner reads
+        # chapter_index[X] before generating X, so:
+        #   * entry[N] (re)built from pre-N memory: a rerun of N never
+        #     sees N's own post-promotion facts (the old post-promotion
+        #     build leaked them into N's own prompt);
+        #   * entry[N+1] pre-built NOW from the post-N memory (= the
+        #     pre-chapter memory of N+1): the FIRST run of N+1 already
+        #     sees the memory of accepted chapters < N+1 (the old code
+        #     built only the current chapter's entry after acceptance, so
+        #     N+1's first run failed soft to narrator+seed and saw none of
+        #     the prior chapters' memory).
+        # 0 model calls, deterministic (B9-A2 card). Failed chapters never
+        # touch the index.
         if terminal_status in _PROMOTING_STATUSES:
             try:
                 from pact_full_pipeline_runner_v1.build_chapter_index import (
@@ -1213,6 +1242,32 @@ def run_book(
                     chapter_id, type(exc).__name__, exc,
                 )
                 index_built = False
+            # RV finding 1: pre-build the NEXT chapter's entry so its
+            # FIRST run sees the memory of accepted chapters < N+1
+            # (best-effort — a missing next-html or build error must
+            # never fail the run; the next chapter then fails soft).
+            next_chapter_id = _next_chapter_id(chapter_id, chapter_ids)
+            if next_chapter_id:
+                try:
+                    from pact_full_pipeline_runner_v1.build_chapter_index import (
+                        build_index_file,
+                    )
+
+                    build_index_file(
+                        memory_dir=str(memory_dir),
+                        chapter_html=str(
+                            chapter_html_pattern.format(chapter_id=next_chapter_id)
+                        ),
+                        chapter_id=next_chapter_id,
+                        out_path=str(memory_dir / "chapter_index.json"),
+                    )
+                except Exception as exc:  # noqa: BLE001 — never break a run
+                    LOG.warning(
+                        "A2: next-chapter index prebuild failed for %s "
+                        "(%s: %s); %s will fail-soft to narrator+seed",
+                        next_chapter_id, type(exc).__name__, exc,
+                        next_chapter_id,
+                    )
         else:
             index_built = False
 

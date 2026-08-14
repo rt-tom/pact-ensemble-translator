@@ -139,6 +139,90 @@ def _glossary_conflict_sources(glossary: Sequence[GlossaryEntry]) -> set[str]:
     return {key for key, targets in by_source.items() if len(targets) > 1}
 
 
+def _chapter_before(a: str, b: str) -> bool:
+    """Numeric-aware ``a < b`` for chapter ids (``0001``..``0148``).
+
+    Plain string comparison is safe for zero-padded ids of equal width, but
+    a tolerant compare keeps the boundary correct if ids are ever
+    unpadded/mixed (``2`` < ``10`` must hold numerically).
+    """
+    try:
+        return int(a) < int(b)
+    except (TypeError, ValueError):
+        return str(a).casefold() < str(b).casefold()
+
+
+def _entry_chapters(entry: Any) -> List[str]:
+    """The chapter provenance list of a book_memory entry (``chapters``)."""
+    if isinstance(entry, Mapping):
+        chapters = entry.get("chapters")
+        if isinstance(chapters, (list, tuple)):
+            return [str(c) for c in chapters if c]
+    return []
+
+
+def pre_chapter_book_memory(
+    book_memory: Mapping,
+    chapter_id: str,
+) -> Dict[str, Any]:
+    """Return the PRE-chapter view of ``book_memory`` for chapter ``N``.
+
+    RV finding 1 (SAFE-MEMORY, 2026-08-14): the per-chapter index entry for
+    chapter N must be built from PRE-chapter memory — ONLY facts and
+    entities that were known before chapter N (provenance chapter < N) —
+    never from the post-promotion state of chapter N itself. A rerun of an
+    already-accepted chapter must not show that chapter its own promoted
+    facts (causal ``< N`` boundary).
+
+    Rules (fail-closed; global knowledge always survives):
+
+    * facts: kept when the entry is a global seed fact (``seed: true``), has
+      NO ``chapter`` provenance (manual/global), or its ``chapter`` is
+      strictly before ``chapter_id``; a fact attributed to chapter N or a
+      LATER chapter is dropped;
+    * characters/entities: kept when the entry has NO ``chapters``
+      provenance (seed/manual) or its FIRST chapter is strictly before
+      ``chapter_id``; an entity first seen in chapter N or later is dropped;
+    * ``pov`` (narrator) and ``address_register`` are kept verbatim — the
+      narrator is always known, and address forms are already
+      participant-presence-filtered by ``build_chapter_index``.
+
+    Returns a shallow copy; list sections are rebuilt, dict sections are
+    copied per-entry, everything else is shared.
+    """
+    out: Dict[str, Any] = {}
+    for key, value in book_memory.items():
+        if key == "facts":
+            kept_facts: List[Any] = []
+            if isinstance(value, list):
+                for fact in value:
+                    if not isinstance(fact, Mapping):
+                        kept_facts.append(fact)
+                        continue
+                    if fact.get("seed") is True:
+                        kept_facts.append(fact)
+                        continue
+                    chapter = str(fact.get("chapter") or "")
+                    if not chapter or _chapter_before(chapter, chapter_id):
+                        kept_facts.append(fact)
+            out[key] = kept_facts
+        elif key in ("characters", "entities"):
+            if isinstance(value, Mapping):
+                kept_entries: Dict[str, Any] = {}
+                for name, entry in value.items():
+                    chapters = _entry_chapters(entry)
+                    if not chapters or any(
+                        _chapter_before(ch, chapter_id) for ch in chapters
+                    ):
+                        kept_entries[name] = entry
+                out[key] = kept_entries
+            else:
+                out[key] = value
+        else:
+            out[key] = value
+    return out
+
+
 def build_chapter_index(
     *,
     chapter_id: str,
@@ -317,12 +401,28 @@ def build_index_file(
     chapter_html: str,
     chapter_id: str,
     out_path: str,
+    book_memory: Optional[Mapping] = None,
 ) -> Dict[str, Any]:
-    """Build one chapter's index entry and merge it into ``chapter_index.json``."""
+    """Build one chapter's index entry and merge it into ``chapter_index.json``.
+
+    RV finding 1 (SAFE-MEMORY, 2026-08-14): the entry for chapter N is
+    ALWAYS built from PRE-chapter memory — ``pre_chapter_book_memory``
+    keeps only facts/entities with provenance ``chapter < N`` (plus
+    seeds/narrator). The strict runner reads ``chapter_index[N]`` before
+    generating N, so the entry under N must never contain N's own
+    post-promotion facts: a rerun of N would otherwise leak N's own
+    memory into its prompt. Pass ``book_memory`` to build from a caller
+    snapshot; default loads the on-disk ``book_memory.json`` (the filter
+    still applies to it).
+    """
     memory_dir_path = Path(memory_dir)
     memory_dir_path.mkdir(parents=True, exist_ok=True)
     manager = MemoryManager(memory_dir)
-    book_memory = load_json(manager.book_memory_path, {})
+    if book_memory is None:
+        book_memory = load_json(manager.book_memory_path, {})
+    if not isinstance(book_memory, Mapping):
+        book_memory = {}
+    book_memory = pre_chapter_book_memory(book_memory, chapter_id)
     glossary = load_glossary(memory_dir)
 
     blocks, _raw_sha = load_source(Path(chapter_html))

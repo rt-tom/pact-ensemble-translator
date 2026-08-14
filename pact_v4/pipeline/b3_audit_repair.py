@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -186,12 +187,25 @@ def _alias_is_source_apposed(record: EntityRecord, alias: AliasRef) -> bool:
     the alias surface appears INSIDE the anchor span that names the
     canonical type (same PID), e.g. ``"the woman, Rose"``. Any other
     alias may reach the audit block but never the generation prompt.
+
+    RV finding 2 (SAFE-MEMORY, 2026-08-14): the apposition check must be
+    BOUNDARY-SAFE — ``"Rose"`` inside ``"the woman, Rosemary"`` is NOT an
+    apposition, only a substring of the anchor's own word. The old
+    ``surface_norm in anchor_norm`` substring test let a short form
+    (surface ``Rose``, span ``Rosemary``) leak into the verified-only
+    Translator block. The surface must occur as an independent word
+    (``(?<!\\w)`` / ``(?!\\w)``) in the anchor text.
     """
     if alias.pid != record.anchor.pid:
         return False
     anchor_norm = " ".join(record.anchor.span.lower().split())
     surface_norm = " ".join(alias.surface.lower().split())
-    return bool(surface_norm) and surface_norm in anchor_norm
+    if not surface_norm:
+        return False
+    return (
+        re.search(rf"(?<!\w){re.escape(surface_norm)}(?!\w)", anchor_norm)
+        is not None
+    )
 
 
 def render_entity_context_block(

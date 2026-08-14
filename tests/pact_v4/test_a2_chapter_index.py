@@ -476,3 +476,147 @@ def test_book_run_skips_chapter_index_for_failed_chapter(tmp_path, monkeypatch):
     assert result["chapters"][0]["terminal_status"] == "failed"
     assert result["chapters"][0]["index_built"] is False
     assert not (memory / "chapter_index.json").exists()
+
+
+def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
+    tmp_path, monkeypatch,
+):
+    """RV finding 1 HIGH regression (SAFE-MEMORY, 2026-08-14): with two
+    ACCEPTED chapters, chapter 0002's prompt must be built from PRE-chapter
+    memory — the memory of chapter 0001 only — and a rerun of 0002 must
+    NEVER show 0002 its own facts.
+
+    The book_memory.json below already carries facts for BOTH chapters
+    (post-promotion state, exactly what a rerun would see): fact A is
+    attributed to chapter 0001, fact B to chapter 0002. ``build_index_file``
+    filters book_memory through ``pre_chapter_book_memory(memory, "0002")``
+    (facts with ``chapter < "0002"`` only), so chapter_index["0002"] keeps
+    fact A and drops fact B. The old code built the entry from POST-
+    promotion memory under the current chapter's key, so 0002's first run
+    saw nothing and a rerun saw 0002's own facts.
+    """
+    from pact_full_pipeline_runner_v1 import v4_book_run
+
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    book_memory = {
+        "pov": {"gender": "male", "source_name": "Blake Thorburn"},
+        "characters": {
+            "Blake Thorburn": {
+                "gender": "male", "chapters": ["0001"], "variants": {"Blake": 1},
+            },
+            "Rose": {
+                "gender": "female", "chapters": ["0002"], "variants": {"Rose": 1},
+            },
+        },
+        "facts": [
+            {
+                "fact": "Blake is the narrator.",
+                "keys": ["Blake Thorburn"], "chapter": "0001",
+            },
+            {
+                "fact": "Rose is Blake's sister.",
+                "keys": ["Rose"], "chapter": "0002",
+            },
+        ],
+    }
+    (memory / "book_memory.json").write_text(
+        json.dumps(book_memory, ensure_ascii=False), encoding="utf-8",
+    )
+    (memory / "glossary.json").write_text("{}", encoding="utf-8")
+    (memory / "observations.json").write_text("{}", encoding="utf-8")
+
+    out_base = tmp_path / "out"
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+
+    def _write_chapter(chapter_id: str, html: str) -> None:
+        (src_dir / f"{chapter_id}.html").write_text(
+            html, encoding="utf-8",
+        )
+        out_dir = out_base / f"chapter_{chapter_id}"
+        out_dir.mkdir(parents=True)
+        (out_dir / "selection_results.json").write_text(
+            json.dumps({"chapter_id": chapter_id, "results": [
+                {"chunk_id": f"chunk{chapter_id}", "status": "selected"},
+            ]}),
+            encoding="utf-8",
+        )
+        (out_dir / "strict_chapter_trial_record.json").write_text(
+            json.dumps({"chapter_id": chapter_id,
+                        "step8": {"status": "complete"}}),
+            encoding="utf-8",
+        )
+        (out_dir / "translations.json").write_text(
+            json.dumps({"p00001": "Блэйк шёл.", "p00002": "Роуз улыбнулась."}),
+            encoding="utf-8",
+        )
+        (out_dir / "chunk_plan.json").write_text(
+            json.dumps({"artifact": "pact-v4-chunk-plan/v1",
+                        "snapshot_hash": "t", "plan_hash": "t", "chunks": [
+                            {"chunk_id": f"chunk{chapter_id}",
+                             "snapshot_hash": "t", "pids": ["p00001", "p00002"],
+                             "word_counts": [],
+                             "context": {"left_ru": "", "right_en": []},
+                             "undersized_exception": False},
+                        ]}),
+            encoding="utf-8",
+        )
+
+    # 0002's source names BOTH Blake and Rose: without the pre-chapter
+    # filter BOTH facts would be present in the 0002 entry (both keys occur
+    # in the chapter source) — the causal <N filter is the only thing that
+    # keeps fact B out.
+    _write_chapter("0001", "<html><body><p id='p1'>Blake walked.</p></body></html>")
+    _write_chapter(
+        "0002",
+        "<html><body><p id='p1'>Blake saw Rose at the gate.</p></body></html>",
+    )
+
+    def fake_run_one(*args, **kwargs):
+        return {"status": "ok"}
+
+    monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+    def _run_and_check() -> None:
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001", "0002"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+        )
+        assert [r["terminal_status"] for r in result["chapters"]] == [
+            "complete", "complete",
+        ]
+        index_path = memory / "chapter_index.json"
+        assert index_path.exists()
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert "0002" in index
+        entry_0002 = index["0002"]
+        # 0001's fact survived (chapter 0001 < 0002)...
+        assert "Blake is the narrator." in entry_0002["facts"]
+        # ...0002's OWN fact is NOT in 0002's entry (chapter 0002 not < 0002)
+        assert "Rose is Blake's sister." not in entry_0002["facts"]
+        # 0002's own character is not in 0002's entry either.
+        assert "Rose" not in entry_0002["characters"]
+        assert "Blake Thorburn" in entry_0002["characters"]
+        # The PROMPT for 0002 (what render_bible_section produces) carries
+        # 0001's memory and never 0002's own facts — the acceptance proof.
+        from pact_v4.runtime.bible_renderer import render_bible_section
+
+        prompt_0002 = render_bible_section(
+            "0002", index, json.loads(
+                (memory / "book_memory.json").read_text(encoding="utf-8")
+            )
+        )
+        assert "Blake is the narrator." in prompt_0002
+        assert "Rose is Blake's sister." not in prompt_0002
+        # 0001's own entry reflects its PRE-chapter state: 0001's fact is
+        # NOT in 0001's entry either (chapter 0001 not < 0001).
+        assert "Blake is the narrator." not in index["0001"]["facts"]
+
+    # First run (both chapters accepted) and a RERUN: the authoritative
+    # chapter_index must be identical — 0002's prompt never sees its own
+    # facts, on either run.
+    _run_and_check()
+    _run_and_check()
