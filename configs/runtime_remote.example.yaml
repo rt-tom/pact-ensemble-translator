@@ -16,12 +16,21 @@
 #   --reasoning {0,1,2,3}  -- Phase 2B generation reasoning budget only
 #       (0=off baseline, 1=low, 2=medium, 3=high). Sent to the remote
 #       provider as the top-level `reasoningEffort` on each generation
-#       request; the Qwen audit / repair / formatting phases are untouched.
+#       request; the Qwen audit / formatting phases are untouched.
 #   --stop-after-generation -- halt right after Phase 1-2 (generation +
 #       selection): the chunked translation lands in translations.json and
 #       step6/step7/step8 are recorded as skipped_stop_after_generation.
 #   Both flags are part of the run's config identity, so such a run needs a
 #   NEW --out-dir (a prior out-base is NOT resumable under the new identity).
+#
+# Repair batches (B2) run with reasoning low (1) by default (REPAIR-ROBUST,
+# card t_b6fd6cbd): deepseek high burned 32k reasoning tokens on a repair
+# batch and exhausted max_tokens before content (run_0005 batch1). The
+# effort is a run-config knob (audit_repair_reasoning, identity-bearing),
+# NOT this file; it is sent via request_options ONLY to remote transports
+# (opencode reasoningEffort). Local llama-server transports receive their
+# budget from the server args (--reasoning-budget) and reject
+# request_options, so the local path is untouched.
 #
 # Running this profile sends the chapter text to the remote provider(s)
 # referenced by the model_bindings (plan §12 acknowledgement).

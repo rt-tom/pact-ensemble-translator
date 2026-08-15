@@ -163,6 +163,7 @@ from pact_v4.repair.selective_repair import (
     DEFAULT_REPAIR_CONTEXT_WINDOW,
     DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     DEFAULT_REPAIR_MAX_TOKENS,
+    DEFAULT_REPAIR_REASONING,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
     REAUDIT_DELTA_FORMAT,
@@ -423,6 +424,15 @@ class StrictRunConfig:
     # (F5): wired through _build_b3_audit_repair so a budget change
     # invalidates a stale cached repaired map.
     audit_repair_max_tokens: int = DEFAULT_REPAIR_MAX_TOKENS
+    # REPAIR-ROBUST (card t_b6fd6cbd, run_0005): the per-batch repair
+    # reasoning effort (0=off, 1=low, 2=medium, 3=high) for REMOTE
+    # transports only — default 1 (low): deepseek high burned 32k reasoning
+    # tokens on a repair batch and exhausted max_tokens before content
+    # (run_0005 batch1: raw=0, finish=length). Identity-bearing (F5): wired
+    # through _build_b3_audit_repair so a reasoning change invalidates a
+    # stale cached repaired map. Inert locally (local server args govern;
+    # LocalOpenAIBackend rejects request_options).
+    audit_repair_reasoning: int = DEFAULT_REPAIR_REASONING
     audit_repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
     audit_repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
     audit_prompt_version: str = PROMPT_VERSION
@@ -572,6 +582,11 @@ class StrictRunConfig:
                     # responses, run_0004-0005) must never replay under
                     # 16000. F5: budget change invalidates cache/resume.
                     "repair_max_tokens": self.audit_repair_max_tokens,
+                    # REPAIR-ROBUST (t_b6fd6cbd, F5): the repair reasoning
+                    # effort is identity-bearing — a change invalidates a
+                    # stale cached repaired map (old high-reasoning repairs
+                    # must never replay under low).
+                    "repair_reasoning": self.audit_repair_reasoning,
                     "repair_reaudit_retry": {
                         "max_retries": self.audit_repair_reaudit_max_retries,
                         "base_delay_seconds": self.audit_repair_reaudit_base_delay_seconds,
@@ -4868,6 +4883,10 @@ def _run_whole_chapter_strict_impl(
                 },
                 "repair_reaudit_max_tokens": cfg.audit_repair_reaudit_max_tokens,
                 "repair_max_tokens": cfg.audit_repair_max_tokens,
+                # REPAIR-ROBUST (t_b6fd6cbd): the repair reasoning effort is
+                # recorded alongside the identity so the report reflects
+                # what the repair stage actually ran with.
+                "repair_reasoning": cfg.audit_repair_reasoning,
                 "repair_reaudit_retry": {
                     "max_retries": cfg.audit_repair_reaudit_max_retries,
                     "base_delay_seconds": cfg.audit_repair_reaudit_base_delay_seconds,

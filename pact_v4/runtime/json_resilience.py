@@ -151,18 +151,13 @@ def _strip_markdown_fences(text: str) -> str:
     return text
 
 
-def _first_balanced_json_block(text: str) -> Optional[str]:
-    """Return the first balanced ``{...}`` block in ``text``, or ``None``.
+def _matching_brace_end(text: str, start: int) -> Optional[int]:
+    """Return the index of the ``}`` matching the ``{`` at ``start``.
 
-    String-aware: braces inside a JSON string literal (and escaped quotes)
-    never unbalance the scan, so prose like ``Here is the JSON: {...}``
-    yields the object. Returns ``None`` when no balanced block exists —
-    i.e. the body is truncated mid-object (the B4 retry zone) or contains
-    no object at all.
+    String-aware (braces inside string literals and escaped quotes never
+    unbalance the scan). ``None`` when no matching brace exists — the body
+    is truncated mid-object or the brace sits inside a string.
     """
-    start = text.find("{")
-    if start == -1:
-        return None
     depth = 0
     in_string = False
     escaped = False
@@ -183,8 +178,54 @@ def _first_balanced_json_block(text: str) -> Optional[str]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[start : i + 1]
+                    return i
     return None  # unbalanced -> truncated
+
+
+def _first_balanced_json_block(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` block in ``text``, or ``None``.
+
+    String-aware: braces inside a JSON string literal (and escaped quotes)
+    never unbalance the scan, so prose like ``Here is the JSON: {...}``
+    yields the object. Returns ``None`` when no balanced block exists —
+    i.e. the body is truncated mid-object (the B4 retry zone) or contains
+    no object at all.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    end = _matching_brace_end(text, start)
+    if end is None:
+        return None
+    return text[start : end + 1]
+
+
+def extract_json_blocks(text: str) -> Tuple[str, ...]:
+    """Extract EVERY balanced ``{...}`` block from ``text`` (string-aware).
+
+    REPAIR-ROBUST (card t_b6fd6cbd): unlike ``_first_balanced_json_block``
+    this returns all balanced blocks, so a TRUNCATED outer object (e.g. the
+    model dropped the final ``}`` of ``{"results": [...]}``) still yields
+    its complete inner record objects. Blocks are found by scanning for a
+    ``{`` and matching its ``}`` (string-aware); when the outer object is
+    unbalanced the scan continues past it to the inner balanced blocks.
+    """
+    blocks: list[str] = []
+    i = 0
+    while True:
+        start = text.find("{", i)
+        if start == -1:
+            break
+        end = _matching_brace_end(text, start)
+        if end is None:
+            # Unbalanced from here (truncated outer object) — skip this
+            # brace and keep scanning so inner balanced blocks are still
+            # recovered.
+            i = start + 1
+            continue
+        blocks.append(text[start : end + 1])
+        i = end + 1
+    return tuple(blocks)
 
 
 _PID_KEY_RE = re.compile(r'"p(\d{5})"')
@@ -538,6 +579,7 @@ __all__ = [
     "TruncatedJSONError",
     "JsonRetryPolicy",
     "classify_response_text",
+    "extract_json_blocks",
     "extract_pid_pairs",
     "parse_json_response",
     "retry_json_call",

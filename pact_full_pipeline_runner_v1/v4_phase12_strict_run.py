@@ -564,8 +564,14 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
     or when the audit machinery would have nothing to do (generation-only).
 
     Remote audit through ``opencode serve`` is a CONTRACT, NOT tested yet
-    (owner decision: test remote audit after the B-phase); the evaluators
-    never emit ``request_options`` — the reasoning budget is a server arg.
+    (owner decision: test remote audit after the B-phase); the AUDIT
+    evaluators never emit ``request_options`` — the audit reasoning budget
+    is a server arg. The REPAIR evaluator is the one exception
+    (REPAIR-ROBUST, card t_b6fd6cbd): its per-batch reasoning effort
+    (default 1 = low) travels via request_options ONLY to remote transports
+    that support it (opencode ``reasoningEffort``); local llama-server
+    transports receive the budget from their server args and reject
+    request_options, so the local path is untouched.
     """
     from pact_v4.pipeline.b3_audit_repair import (
         B3AuditRepair,
@@ -631,6 +637,14 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             # identity-bearing — a budget change invalidates the cached
             # repaired map.
             repair_max_tokens=cfg.audit_repair_max_tokens,
+            # REPAIR-ROBUST (card t_b6fd6cbd, F5): the per-batch repair
+            # reasoning effort is wired from the run config (never silently
+            # left at module defaults) and is identity-bearing — a change
+            # invalidates the cached repaired map. Remote-only: the
+            # Evaluator sends it via request_options ONLY when the backend
+            # transports reasoning that way (local llama-server transports
+            # receive the budget from their server args).
+            repair_reasoning=cfg.audit_repair_reasoning,
             repair_reaudit_max_retries=cfg.audit_repair_reaudit_max_retries,
             repair_reaudit_base_delay_seconds=cfg.audit_repair_reaudit_base_delay_seconds,
             prompt_version=cfg.audit_prompt_version,

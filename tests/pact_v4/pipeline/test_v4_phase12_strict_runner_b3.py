@@ -1168,6 +1168,9 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         },
         "repair_reaudit_max_tokens": 20000,
         "repair_max_tokens": 16000,
+        # REPAIR-ROBUST (t_b6fd6cbd): the per-batch repair reasoning effort
+        # is identity-bearing (F5) — flipping it invalidates cache/resume.
+        "repair_reasoning": 1,
         "repair_reaudit_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
         "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
         "harness_version": "4.1",
@@ -1214,6 +1217,10 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "reaudit_max_tokens": dict(audit_repair_reaudit_max_tokens=25000),
         "reaudit_max_retries": dict(audit_repair_reaudit_max_retries=5),
         "reaudit_base_delay_seconds": dict(audit_repair_reaudit_base_delay_seconds=2.5),
+        # REPAIR-ROBUST (t_b6fd6cbd, F5): the per-batch repair reasoning
+        # effort is identity-bearing — flipping it (low → off/medium)
+        # invalidates a stale cached repaired map.
+        "repair_reasoning": dict(audit_repair_reasoning=0),
         # R-RETRY (t_8ab8ab35): the chunk-level TRANSPORT_ERROR retry policy
         # is identity-bearing — flipping it invalidates the cached audit.
         "audit_transport_max_retries": dict(audit_transport_max_retries=5),
@@ -1260,6 +1267,41 @@ def test_b3_reaudit_budget_and_retry_wired_from_run_config(
     assert bundle._config.repair_reaudit_max_tokens == 25000
     assert bundle._config.repair_reaudit_max_retries == 5
     assert bundle._config.repair_reaudit_base_delay_seconds == 2.5
+
+
+def test_b3_repair_reasoning_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # REPAIR-ROBUST (t_b6fd6cbd, F5): the per-batch repair reasoning effort
+    # is carried from the run config through B3AuditRepairConfig into
+    # SelectiveRepairConfig — a cache produced under a different reasoning
+    # level must never replay (default 1 = low; run_0005 batch1: deepseek
+    # high burned 32k reasoning tokens before content).
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(tmp_path, audit_repair_reasoning=3)
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_reasoning == 3
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.repair_reasoning == 1  # low
+
+
+def test_b3_config_payload_carries_repair_reasoning() -> None:
+    # REPAIR-ROBUST (t_b6fd6cbd, F5): the repair reasoning effort is part of
+    # the B3 config payload/report (identity) — default 1 (low) and
+    # explicit overrides are preserved.
+    from pact_v4.repair.selective_repair import DEFAULT_REPAIR_REASONING
+    assert DEFAULT_REPAIR_REASONING == 1
+    payload = B3AuditRepairConfig().to_payload()
+    assert payload["repair_reasoning"] == 1
+    custom = B3AuditRepairConfig(repair_reasoning=2).to_payload()
+    assert custom["repair_reasoning"] == 2
 
 
 def test_b3_r_retry_and_cap_wired_from_run_config(
@@ -1659,6 +1701,76 @@ def test_b3_repair_failed_never_released(tmp_path: Path) -> None:
     # terminal state is honest.
     repaired = _read_json(cfg.out_dir / "translations_repaired.json")
     assert repaired["translations"]["p00001"] == "Перевод номер1 номер1"
+
+
+def test_b3_tolerant_two_of_four_never_released(tmp_path: Path) -> None:
+    """REPAIR-ROBUST-PARTIAL (t_c0cb8e3c, review finding): a truncated
+    2-of-4 tolerant repair response (only indices 1,2 of 4 recovered) must
+    NOT release the chapter as audited. The recovered repairs are retained
+    (salvage policy preserved — committed/passed), but the batch is PARTIAL:
+    repair_complete=False and the B3 gate degrades the release to
+    accepted_degraded with released_as_audited=False; the missing findings
+    are explicit in the debt trace (never a silent complete/PASS)."""
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _TruncatedRepairBackend(_B3MockBackend):
+        """Serves a TRUNCATED repair batch body (the model dropped the final
+        '}' after returning only indices 1,2 of 4) — the tolerant salvage
+        path, mirroring the run_0005 batch3/5/7/9 defect class."""
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            label = request.label or ""
+            if "selective_repair" in label:
+                # 2 of 4 answers, outer object truncated (no closing '}').
+                body = '{"results": [' + ",".join([
+                    json.dumps({"index": 1, "decision": "pass", "reason": "ok"},
+                               ensure_ascii=False),
+                    json.dumps({"index": 2, "decision": "pass", "reason": "ok"},
+                               ensure_ascii=False),
+                ]) + "]"  # truncated: no closing '}' after the ']'
+                return CompletionResponse(
+                    text=body, model="qwen-3.6-35b", finish_reason="stop",
+                )
+            return super().complete(request)
+
+    backend = _TruncatedRepairBackend(
+        audit_issues=[
+            {
+                "id": f"p{i:05d}", "category": "addition", "severity": "major",
+                "confidence": "high", "note": f"дублирование слова {i}",
+                "excerpt": f"номер{i} номер{i}",
+            }
+            for i in range(1, 5)
+        ],
+        repair_results=[],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+
+    # Audit completed; repair did NOT complete (partial tolerant recovery).
+    assert result.step6["audit_complete"] is True
+    assert result.step7["repair_complete"] is False
+    assert result.step7["status"] == "incomplete"
+    # Terminal B3 gate: NOT released as audited (fail-closed).
+    assert result.step8["status"] == "accepted_degraded"
+    assert result.step8["released_as_audited"] is False
+    assert result.step8["repair_complete"] is False
+    assert result.step8["reason"] == "repair_incomplete"
+    # The missing findings (p00003, p00004) are explicit in the debt trace.
+    debt = " ".join(result.step8["debt_trace"])
+    assert "p00003" in debt and "p00004" in debt
+    # The recovered passes (p00001, p00002) are retained — salvage kept.
+    assert result.step7["passed_pids"] == ["p00001", "p00002"]
+
+    # Journal gate agrees: not released.
+    journal = [
+        json.loads(line)
+        for line in (cfg.out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    gate = next(e for e in journal if e["event"] == "gate")
+    assert gate["released_as_audited"] is False
+    assert gate["repair_complete"] is False
 
 
 def test_b3_reaudit_failed_never_released(tmp_path: Path) -> None:

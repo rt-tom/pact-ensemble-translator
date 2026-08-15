@@ -60,8 +60,13 @@ Transport: audit/repair/entity calls go through ``CompletionBackend``
 (``build_role_backend``), so the same pipeline serves local, remote and
 composite profiles. Remote audit through ``opencode serve`` is a
 CONTRACT, NOT tested yet (owner decision: test remote audit after the
-B-phase; the evaluators never emit ``request_options`` — the reasoning
-budget is a server arg).
+B-phase; the AUDIT evaluators never emit ``request_options`` — the audit
+reasoning budget is a server arg). The REPAIR evaluator is the one
+exception (REPAIR-ROBUST, card t_b6fd6cbd): its per-batch reasoning
+effort (default 1 = low) travels via request_options ONLY to remote
+transports that support it (opencode ``reasoningEffort``); local
+llama-server transports receive the budget from their server args and
+reject request_options, so the local path is untouched.
 """
 from __future__ import annotations
 
@@ -134,6 +139,7 @@ from pact_v4.repair.selective_repair import (
     DEFAULT_REPAIR_CONTEXT_WINDOW,
     DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     DEFAULT_REPAIR_MAX_TOKENS,
+    DEFAULT_REPAIR_REASONING,
     REAUDIT_DELTA_FORMAT,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
@@ -478,6 +484,17 @@ class B3AuditRepairConfig:
     # cached repaired map, so it rides the run config identity and is
     # wired into SelectiveRepairConfig below.
     repair_max_tokens: int = DEFAULT_REPAIR_MAX_TOKENS
+    # REPAIR-ROBUST (card t_b6fd6cbd, run_0005): the per-batch repair
+    # reasoning effort (0=off, 1=low, 2=medium, 3=high) for REMOTE
+    # transports only — default 1 (low): deepseek high burned 32k reasoning
+    # tokens on a repair batch and exhausted max_tokens before content
+    # (run_0005 batch1: raw=0, finish=length). Identity-bearing (F5): wired
+    # into SelectiveRepairConfig below, so a change invalidates a stale
+    # cached repaired map. Inert locally — the local llama-server receives
+    # its reasoning budget from the server args (--reasoning-budget) and
+    # LocalOpenAIBackend rejects request_options (owner rule: local servers
+    # always run with the same args).
+    repair_reasoning: Optional[int] = DEFAULT_REPAIR_REASONING
     repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
     repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
     prompt_version: str = PROMPT_VERSION
@@ -545,6 +562,10 @@ class B3AuditRepairConfig:
             },
             "repair_reaudit_max_tokens": self.repair_reaudit_max_tokens,
             "repair_max_tokens": self.repair_max_tokens,
+            # REPAIR-ROBUST (t_b6fd6cbd): the per-batch repair reasoning
+            # effort is identity-bearing (F5) — the payload/report carries
+            # it so the record reflects what the repair stage ran with.
+            "repair_reasoning": self.repair_reasoning,
             "repair_reaudit_retry": {
                 "max_retries": self.repair_reaudit_max_retries,
                 "base_delay_seconds": self.repair_reaudit_base_delay_seconds,
@@ -2492,6 +2513,12 @@ class B3AuditRepair:
                     # from the B3 config (identity carries it) — the repair
                     # output budget is never a silent module default.
                     max_tokens=cfg.repair_max_tokens,
+                    # REPAIR-ROBUST (t_b6fd6cbd, F5): the repair reasoning
+                    # effort is wired from the B3 config (identity carries
+                    # it) — the evaluator can never silently fall back to a
+                    # module default, and a reasoning change invalidates the
+                    # repaired map cache.
+                    repair_reasoning=cfg.repair_reasoning,
                     # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
                     # REPAIR prompt/harness version is wired from the B3
                     # config (the run identity carries it) — the evaluator

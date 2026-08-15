@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import List, Mapping, Optional, Sequence
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import pytest
 
@@ -45,6 +45,7 @@ from pact_v4.repair.selective_repair import (
     SelectiveRepairEvaluator,
     SelectiveRepairOutcome,
     apply_findings_cap,
+    extract_json_blocks,
     make_microbatches,
     merge_candidates_by_pid,
     parse_repair_batch,
@@ -595,6 +596,148 @@ def test_parse_repair_full_length_rewrite_accepted():
     assert results[0].repaired_translation == repaired
 
 
+def _four_findings() -> Tuple:
+    """Four eligible findings (indices 1..4) for the tolerant-parser tests."""
+    return (
+        _eligible("p00001", 1),
+        _eligible("p00002", 2),
+        _eligible("p00003", 3),
+        _eligible("p00004", 4),
+    )
+
+
+def test_parse_repair_top_level_list_wrapped() -> None:
+    """REPAIR-ROBUST (run_0005 batch2): the model returned a top-level LIST
+    ``[...]`` instead of ``{"results": [...]}`` — the tolerant parser wraps
+    it and accepts all 4 complete records (previously 4 records were lost)."""
+    findings = _four_findings()
+    text = json.dumps([
+        {"index": 1, "decision": "pass", "reason": "ok"},
+        {"index": 2, "decision": "repair", "pid": "p00002",
+         "repaired_translation": "полный исправленный текст второй", "reason": "r"},
+        {"index": 3, "decision": "pass", "reason": "ok"},
+        {"index": 4, "decision": "repair", "pid": "p00004",
+         "repaired_translation": "полный исправленный текст четвёртый", "reason": "r"},
+    ], ensure_ascii=False)
+    results, errors, _ = parse_repair_batch(text, findings, {
+        "p00002": "старый текст", "p00004": "старый текст",
+    })
+    assert not errors
+    assert len(results) == 4
+    assert [r.index for r in results] == [1, 2, 3, 4]
+
+
+def test_parse_repair_truncated_missing_brace_recovers_records() -> None:
+    """REPAIR-ROBUST (run_0005 batch3/5/7/9): the model dropped the final
+    ``}`` (``...}]`` instead of ``...}]}``) — string-aware extraction of all
+    balanced ``{..}`` blocks recovers every complete record (prototype:
+    15/15), so the batch is GOOD instead of losing 15 records."""
+    findings = _four_findings()
+    payload = [
+        {"index": 1, "decision": "pass", "reason": "ok"},
+        {"index": 2, "decision": "repair", "pid": "p00002",
+         "repaired_translation": "полный исправленный текст второй", "reason": "r"},
+        {"index": 3, "decision": "pass", "reason": "ok"},
+        {"index": 4, "decision": "repair", "pid": "p00004",
+         "repaired_translation": "полный исправленный текст четвёртый", "reason": "r"},
+    ]
+    # The outer object is truncated: no closing '}' after the ']'.
+    text = '{"results": [' + ",".join(json.dumps(x, ensure_ascii=False) for x in payload) + "]"
+    results, errors, warnings = parse_repair_batch(text, findings, {
+        "p00002": "старый текст", "p00004": "старый текст",
+    })
+    assert not errors
+    assert len(results) == 4
+    assert [r.index for r in results] == [1, 2, 3, 4]
+    assert not warnings
+
+
+def test_parse_repair_tolerant_skips_broken_record_keeps_batch() -> None:
+    """REPAIR-ROBUST: in the tolerant path ONE broken record (bad pid) is
+    SKIPPED with a warning, the other complete records are accepted — the
+    whole batch is NOT failed for a single corrupt entry."""
+    findings = _four_findings()
+    text = '{"results": [' + ",".join([
+        json.dumps({"index": 1, "decision": "pass", "reason": "ok"}, ensure_ascii=False),
+        # broken: pid does not match finding p00002
+        json.dumps({"index": 2, "decision": "repair", "pid": "p99999",
+                    "repaired_translation": "чужой пид", "reason": "bad"}, ensure_ascii=False),
+        json.dumps({"index": 3, "decision": "pass", "reason": "ok"}, ensure_ascii=False),
+        json.dumps({"index": 4, "decision": "repair", "pid": "p00004",
+                    "repaired_translation": "полный исправленный текст четвёртый",
+                    "reason": "r"}, ensure_ascii=False),
+    ]) + "]"
+    results, errors, warnings = parse_repair_batch(text, findings, {
+        "p00002": "старый текст", "p00004": "старый текст",
+    })
+    assert not errors
+    assert [r.index for r in results] == [1, 3, 4]
+    assert any("does not match finding pid" in w for w in warnings)
+
+
+def test_parse_repair_tolerant_coverage_below_threshold_fails() -> None:
+    """REPAIR-ROBUST: recovering 1 of 4 findings (25% < 50% coverage) is a
+    sign of serious corruption — the batch FAILS as before (never accept 1
+    record of 4)."""
+    findings = _four_findings()
+    text = '{"results": [' + json.dumps({"index": 1, "decision": "pass"}) + "]"
+    results, errors, warnings = parse_repair_batch(text, findings, {})
+    assert results == ()
+    assert errors and "coverage" in errors[0]
+    assert errors and "not valid JSON" in errors[0]
+    assert any("no answer recovered" in w for w in warnings)
+
+
+def test_parse_repair_tolerant_two_of_four_recovers_records() -> None:
+    """REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): a truncated 2-of-4 response
+    (only indices 1,2 present, no closing ``}``) still returns the recovered
+    records with NO errors — the 50% salvage policy is preserved at the
+    PARSER level. The PARTIAL state (missing indices surfaced, batch never
+    GOOD/complete) is decided by the caller (``_run_batch`` / evaluator),
+    not here: the parser keeps its ``(results, errors, warnings)`` contract
+    and the recovered records are retained for commit."""
+    findings = _four_findings()
+    text = '{"results": [' + ",".join([
+        json.dumps({"index": 1, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+        json.dumps({"index": 2, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+    ]) + "]"  # truncated: no closing '}' after the ']'
+    results, errors, warnings = parse_repair_batch(text, findings, {})
+    assert not errors
+    assert [r.index for r in results] == [1, 2]
+    assert any("no answer recovered" in w and "[3, 4]" in w for w in warnings)
+
+
+def test_parse_repair_empty_body_remains_failed() -> None:
+    """REPAIR-ROBUST (run_0005 batch1: raw=0, finish=length): an EMPTY body
+    has no content to salvage — the batch stays FAILED (the fix for batch1
+    is reasoning low so the NEXT run does not burn out)."""
+    findings = _four_findings()
+    results, errors, _ = parse_repair_batch("", findings, {})
+    assert results == ()
+    assert errors and "not valid JSON" in errors[0]
+
+
+def test_extract_json_blocks_string_aware_and_truncation_safe() -> None:
+    """REPAIR-ROBUST: ``extract_json_blocks`` yields EVERY balanced ``{..}``
+    block, string-aware (braces inside string literals never unbalance the
+    scan), and keeps scanning past an unbalanced outer object so the inner
+    records of a truncated body are still recovered."""
+    blocks = extract_json_blocks(
+        '{"results": [{"index": 1, "note": "a { b"}, {"index": 2}]'
+    )
+    assert len(blocks) == 2
+    assert json.loads(blocks[0])["index"] == 1
+    assert json.loads(blocks[1])["index"] == 2
+    # A complete outer object is returned as one block (normal path).
+    complete = extract_json_blocks('{"results": [{"index": 1}]}')
+    assert len(complete) == 1
+    assert json.loads(complete[0])["results"][0]["index"] == 1
+    # Garbage with no balanced block -> nothing.
+    assert extract_json_blocks("not json {") == ()
+
+
 def test_repair_prompt_requires_full_pid_text_not_fragment():
     """B2 (run_011): REPAIR_AS_VERIFIER_V1 must instruct the model that
     repaired_translation is the FULL corrected PID text — never a fragment
@@ -705,6 +848,115 @@ def test_repair_and_reaudit_write_raw_reasoning_artifacts(tmp_path):
     assert "внук-" in batch_raw.read_text(encoding="utf-8")
     assert batch_reason.read_text(encoding="utf-8") == "reasoning-call-1"
     assert reaudit_reason.read_text(encoding="utf-8") == "reasoning-call-2"
+
+
+def test_repair_batch_sends_request_options_reasoning_for_remote(
+    tmp_path, monkeypatch,
+) -> None:
+    """REPAIR-ROBUST (t_b6fd6cbd): the Evaluator transports the configured
+    repair reasoning effort (default 1 = low) via request_options for
+    REMOTE-capable backends (opencode maps it to reasoningEffort) — the
+    run_0005 batch1 fix (deepseek high burned 32k reasoning tokens before
+    content)."""
+    issue = _issue(
+        "p00193", "invented_gender",
+        note="gender-neutral grandchild translated as female внучка",
+        excerpt="внучка", severity="minor", confidence="high",
+    )
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00193",
+            "repaired_translation": "А потом заявила, что это должен быть внук-",
+            "reason": "source is gender-neutral grandchild",
+        }]),
+        _reaudit_response([]),  # clean re-audit
+    ])
+    # ScriptedRepairBackend is a plain CompletionBackend (not local) → the
+    # reasoning transport guard resolves to True (request_options path).
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(repair_reasoning=1),
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
+    )
+    assert outcome.repair_complete is True
+    repair_requests = [
+        r for r in backend.requests if "selective_repair" in (r.label or "")
+    ]
+    assert repair_requests, "a repair batch request is expected"
+    assert repair_requests[0].request_options == {"reasoning": 1}
+
+
+def test_repair_batch_reasoning_off_sends_no_request_options(
+    tmp_path, monkeypatch,
+) -> None:
+    """REPAIR-ROBUST: ``repair_reasoning=0`` (off) keeps the historical
+    request — no request_options at all."""
+    issue = _issue("p00193", "invented_gender")
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "pass", "reason": "verified",
+        }]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(repair_reasoning=0),
+    )
+    evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
+    )
+    repair_requests = [
+        r for r in backend.requests if "selective_repair" in (r.label or "")
+    ]
+    assert repair_requests[0].request_options == {}
+
+
+def test_repair_batch_local_backend_never_gets_request_options(
+    tmp_path, monkeypatch,
+) -> None:
+    """REPAIR-ROBUST: a LOCAL backend (LocalOpenAIBackend and friends) must
+    NEVER receive reasoning request_options — the local llama-server gets
+    its reasoning budget from the server args (--reasoning-budget) and
+    LocalOpenAIBackend rejects request_options as a library guard (owner
+    rule: local servers always run with the same args)."""
+    issue = _issue("p00193", "invented_gender")
+    source = {"p00193": "Then you say it has to be a grandchild-"}
+    translation = {"p00193": "А потом заявила, что это должна быть внучка-"}
+    filtered = _hard_filtered([issue], source, translation)
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "pass", "reason": "verified",
+        }]),
+    ])
+    # Simulate the local transport guard: the reasoning decision follows
+    # the concrete transport, and a local backend resolves to False.
+    monkeypatch.setattr(
+        repair_module,
+        "_reasoning_transported_via_request_options",
+        lambda _backend, _model_ref: False,
+    )
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(repair_reasoning=1),
+    )
+    evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
+    )
+    repair_requests = [
+        r for r in backend.requests if "selective_repair" in (r.label or "")
+    ]
+    assert repair_requests[0].request_options == {}
 
 
 def test_repair_streams_reasoning_live_during_call(tmp_path):
@@ -1150,6 +1402,56 @@ def test_invalid_batch_response_debt():
     assert outcome.batches[0].status == "FAILED"
     assert outcome.repair_complete is False
     assert outcome.committed == ()
+
+
+def test_tolerant_two_of_four_partial_never_complete() -> None:
+    """REPAIR-ROBUST-PARTIAL (t_c0cb8e3c, review finding): a truncated
+    2-of-4 tolerant response (only indices 1,2 recovered for 4 findings)
+    must NOT be published as complete. The recovered records are retained
+    (salvage policy preserved) but the batch is PARTIAL: the missing
+    indices 3,4 are surfaced in ``missing_indices`` and routed to debt, and
+    ``repair_complete`` stays False — the 50% threshold is a recovery floor,
+    never a publication-complete threshold."""
+    issues = [
+        _issue(f"p{i:05d}", "invented_gender", note="n", confidence="high")
+        for i in range(1, 5)
+    ]
+    source = {f"p{i:05d}": f"source {i}" for i in range(1, 5)}
+    translation = {f"p{i:05d}": f"перевод {i}" for i in range(1, 5)}
+    filtered = _hard_filtered(issues, source, translation)
+    assert all(f.verdict == TIER_B for f in filtered)
+
+    # Truncated outer object: the model returned only indices 1,2 and
+    # dropped the closing '}' (the exact 2-of-4 reproducer).
+    text = '{"results": [' + ",".join([
+        json.dumps({"index": 1, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+        json.dumps({"index": 2, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+    ]) + "]"  # no closing '}' — tolerant salvage path
+    backend = ScriptedRepairBackend([
+        CompletionResponse(text=text, model="gemma-4-26b", finish_reason="stop"),
+    ])
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+
+    # Recovered records retained (salvage policy), but the batch is PARTIAL.
+    assert len(outcome.batches) == 1
+    assert outcome.batches[0].status == "PARTIAL"
+    assert outcome.batches[0].missing_indices == (3, 4)
+    assert [r.index for r in outcome.batches[0].results] == [1, 2]
+    # The recovered passes are retained as passed_pids (p00001, p00002).
+    assert outcome.passed_pids == ("p00001", "p00002")
+    # Missing findings are surfaced in debt, not silently accepted.
+    assert any("p00003" in d and "index 3" in d for d in outcome.debt_trace)
+    assert any("p00004" in d and "index 4" in d for d in outcome.debt_trace)
+    assert any("partial tolerant repair" in d for d in outcome.debt_trace)
+    # Never complete, never released.
+    assert outcome.repair_complete is False
+    assert outcome.skipped is False
 
 
 def test_mismatched_index_pid_debt_no_commit():

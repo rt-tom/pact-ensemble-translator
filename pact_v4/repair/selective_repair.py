@@ -66,10 +66,11 @@ This module is pure and deterministic except for the injected model calls.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
     DEFAULT_MAX_INPUT_TOKENS,
@@ -98,10 +99,12 @@ from pact_v4.runtime.backend_protocol import (
     CompletionRequest,
     Message,
 )
+from pact_v4.runtime.backend_role_adapters import _reasoning_transported_via_request_options
 from pact_v4.runtime.json_resilience import (
     EmptyResponseError,
     JsonRetryPolicy,
     TruncatedJSONError,
+    extract_json_blocks,
     parse_json_response,
     retry_json_call,
 )
@@ -178,6 +181,29 @@ REAUDIT_DELTA_FORMAT = "pact-v4-reaudit-delta/v1"
 DEFAULT_REPAIR_MAX_TOKENS = 16000
 DEFAULT_REAUDIT_MAX_TOKENS = 20000
 
+# REPAIR-ROBUST (card t_b6fd6cbd, run_0005): the per-batch repair reasoning
+# effort for REMOTE transports. run_0005 batch1: deepseek (max variant)
+# burned 32k tokens of reasoning on a repair batch and exhausted max_tokens
+# BEFORE emitting content (raw=0, finish=length) — the default is low (1),
+# high reasoning on a mechanical repair pass is always excessive. The
+# Evaluator sends it via request_options ONLY when the backend transports
+# reasoning that way (_reasoning_transported_via_request_options): local
+# llama-server transports receive the budget from their server args
+# (--reasoning-budget) and LocalOpenAIBackend rejects request_options, so
+# the field is inert locally (owner rule: local servers always run with the
+# same args). Identity-bearing (F5): a change must invalidate a stale
+# cached repaired map, so it rides the config chain
+# (StrictRunConfig -> B3AuditRepairConfig -> SelectiveRepairConfig).
+DEFAULT_REPAIR_REASONING = 1
+
+# REPAIR-ROBUST (card t_b6fd6cbd): the tolerant repair parser's minimum
+# coverage — the fraction of a batch's findings that must be recovered from
+# a "dirty" response for the batch to be GOOD. Below it the batch FAILS as
+# before: accepting 1 record of 4 (25%) is a sign of serious corruption,
+# not salvage. run_0005 batches recovered 15/15 (100%) via block
+# extraction, so the default 50% only guards against accepting garbage.
+REPAIR_PARSE_MIN_COVERAGE = 0.5
+
 # The re-audit retry policy is identity-bearing (F5: a policy change must
 # invalidate a stale cached repaired map), so the production config chain
 # (StrictRunConfig -> B3AuditRepairConfig -> SelectiveRepairConfig) carries
@@ -206,6 +232,14 @@ class SelectiveRepairConfig:
     label: str = "phase3/selective_repair_v4"
     harness_version: str = REPAIR_HARNESS_VERSION
     prompt_version: str = REPAIR_PROMPT_VERSION
+    # REPAIR-ROBUST (card t_b6fd6cbd, run_0005, F5): the per-batch repair
+    # reasoning effort (0=off, 1=low, 2=medium, 3=high) for REMOTE
+    # transports only. Default 1 (low) — deepseek high burns 32k reasoning
+    # tokens on a repair batch and exhausts max_tokens before content
+    # (run_0005 batch1: raw=0, finish=length). Identity-bearing: wired from
+    # the run config (StrictRunConfig -> B3AuditRepairConfig), so a change
+    # invalidates a stale cached repaired map.
+    repair_reasoning: Optional[int] = DEFAULT_REPAIR_REASONING
     # REPAIR-CTX (card t_97b31f81, owner decision 2026-08-12): local context
     # window for repair batches — ONLY the findings PIDs plus ±N neighbour
     # pairs are rendered (NOT the full chapter maps). Default ±3 (3 назад +
@@ -296,7 +330,7 @@ class RepairBatchOutcome:
     """Outcome of one repair batch (one model call)."""
 
     batch_index: int
-    status: str  # "GOOD" | "FAILED"
+    status: str  # "GOOD" | "PARTIAL" | "FAILED"
     findings: Tuple[EligibleFinding, ...] = ()
     results: Tuple[RepairResult, ...] = ()
     error: str = ""
@@ -304,6 +338,12 @@ class RepairBatchOutcome:
     # batch — e.g. no-op repairs converted to per-index pass (the batch stays
     # GOOD when they are the only issue). Never a batch-killing error.
     warnings: Tuple[str, ...] = ()
+    # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): finding indices the TOLERANT
+    # salvage did NOT recover (``seen != expected``, coverage >= 50%) — the
+    # batch is PARTIAL: the valid recovered repairs are retained, the missing
+    # findings are routed to debt by the evaluator, and ``repair_complete``
+    # can never become True (a partial response is never published complete).
+    missing_indices: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -417,6 +457,10 @@ class SelectiveRepairOutcome:
                     "error": b.error,
                     # REPAIR-2 (t_768537b9): per-index non-fatal notices.
                     "warnings": list(b.warnings),
+                    # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): indices the tolerant
+                    # salvage did not recover — surfaced in diagnostics so a
+                    # partial batch is never mistaken for complete.
+                    "missing_indices": list(b.missing_indices),
                 }
                 for b in self.batches
             ],
@@ -656,20 +700,43 @@ def parse_repair_batch(
     If EVERY index of the batch is a no-op the batch is GOOD with no repairs
     committed (the model honestly decided nothing needed changing).
 
+    REPAIR-ROBUST (card t_b6fd6cbd, run_0005): the NORMAL path is unchanged —
+    ``parse_json_response`` accepts a complete ``{"results": [...]}`` object
+    (fences/prose tolerated as before). Only when the strict parse FAILS does
+    the tolerant parser take over (``_parse_repair_tolerant``): a top-level
+    LIST (batch2) is wrapped as ``{"results": list}`` and validated like the
+    normal path; a TRUNCATED outer object (batch3/5/7/9: the model dropped
+    the final ``}``) has every balanced ``{..}`` record extracted
+    string-aware and each complete record accepted individually, with a
+    coverage gate (< ``REPAIR_PARSE_MIN_COVERAGE`` of findings recovered →
+    the batch FAILS as before, never 1 record of 4).
+
+    REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): the 50% salvage threshold is a
+    RECOVERY threshold, never a publication-complete threshold. A tolerant
+    response that recovered SOME but not ALL findings (``seen != expected``,
+    coverage >= 50%) still returns its valid recovered records (they are
+    committed), but the caller marks the batch PARTIAL and routes every
+    missing index to debt — a partial response must never set
+    ``repair_complete=True`` or ``released_as_audited=True``. A warning alone
+    is not sufficient evidence for a fail-closed repair/release gate.
+
     Returns ``(results, errors, warnings)``:
     * ``errors`` — FATAL for the batch (debt, never a silent PASS): invalid
       JSON, unknown/duplicate/missing index, invalid decision, repair pid not
       matching the finding's pid, empty repaired_translation, truncated
       repair. ANY error fails the whole batch.
     * ``warnings`` — per-index NON-FATAL notices (no-op repairs converted to
-      pass); the batch stays GOOD when they are the only issue.
+      pass, tolerant-parse skips); the batch stays GOOD when they are the
+      only issue.
     """
     errors: list = []
     warnings: list = []
     try:
         parsed = parse_json_response(text)
     except Exception as exc:
-        return (), (f"response is not valid JSON: {exc}",), ()
+        # REPAIR-ROBUST: the strict parse failed (top-level LIST, truncated
+        # object, empty/broken body) — try the tolerant salvage path.
+        return _parse_repair_tolerant(text, findings, current_by_pid, exc)
     if not isinstance(parsed, dict) or "results" not in parsed:
         return (), ("root object has no 'results' array",), ()
     results = parsed.get("results")
@@ -765,6 +832,159 @@ def parse_repair_batch(
     if missing:
         errors.append(f"missing answer(s) for finding index(es) {missing}")
     return tuple(out), tuple(errors), tuple(warnings)
+
+
+def _parse_repair_tolerant(
+    text: str,
+    findings: Sequence[EligibleFinding],
+    current_by_pid: Mapping[str, str],
+    exc: Exception,
+) -> Tuple[Tuple[RepairResult, ...], Tuple[str, ...], Tuple[str, ...]]:
+    """REPAIR-ROBUST (card t_b6fd6cbd, run_0005): salvage a dirty batch body.
+
+    Two failure classes the strict parser cannot accept:
+
+    * **Top-level LIST** (batch2): valid JSON, but the model returned
+      ``[...]`` instead of ``{"results": [...]}`` — wrap and validate with
+      the SAME strict per-record rules as the normal dict path.
+    * **Truncated outer object** (batch3/5/7/9): the model dropped the final
+      ``}`` (``...}]`` instead of ``...}]}``) — every balanced ``{..}`` block
+      is extracted string-aware (``extract_json_blocks``) and each COMPLETE
+      repair record is accepted individually.
+
+    Fail-closed PER RECORD (never the whole batch for one bad record): only
+    complete records are accepted — a record with a broken index/PID
+    contract, an invalid decision, an empty repair or a truncated repair is
+    SKIPPED with a warning (the index/PID contract, no-op conversion and 40%
+    gate are the same rules as the strict path, so a record accepted through
+    either path passes the same gates). The COVERAGE GATE still fails the
+    batch when fewer than ``REPAIR_PARSE_MIN_COVERAGE`` of the findings were
+    recovered (accepting 1 record of 4 is a sign of serious corruption, not
+    salvage).
+
+    REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): when coverage >= 50% but ``seen !=
+    expected`` (the model answered only part of the batch), the recovered
+    records are still returned (``errors`` stays empty — the salvage policy
+    is preserved), but the caller (``SelectiveRepairEvaluator._run_batch``)
+    marks the batch PARTIAL and routes every missing finding index to debt.
+    The 50% threshold is a RECOVERY floor, NOT a publication-complete
+    threshold: a partial response must never set ``repair_complete=True`` or
+    ``released_as_audited=True`` (a warning is not sufficient evidence for a
+    fail-closed repair/release gate).
+    """
+    errors: list = []
+    warnings: list = []
+    # 2. Valid JSON, top-level LIST (batch2): wrap and validate like the
+    #    normal path (fail-closed per-record rules unchanged).
+    try:
+        direct = json.loads(text.strip().lstrip("\ufeff"))
+    except json.JSONDecodeError:
+        direct = None
+    if isinstance(direct, list):
+        return parse_repair_batch(
+            json.dumps({"results": direct}, ensure_ascii=False),
+            findings,
+            current_by_pid,
+        )
+    # 3. Truncated outer object (batch3/5/7/9) / prose / fences: extract
+    #    every balanced {..} block and validate each record individually.
+    expected = {f.index for f in findings}
+    finding_by_index = {f.index: f for f in findings}
+    seen: set = set()
+    out: list = []
+    for block in extract_json_blocks(text):
+        try:
+            item = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            warnings.append(f"tolerant parse skipped a non-object block")
+            continue
+        # Same per-record rules as the strict path; violations SKIP the
+        # record (fail-closed per record, never the whole batch).
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            warnings.append(
+                f"tolerant parse skipped a record with invalid index "
+                f"{item.get('index')!r}"
+            )
+            continue
+        if index not in expected:
+            warnings.append(f"tolerant parse skipped unknown finding index {index}")
+            continue
+        if index in seen:
+            warnings.append(f"tolerant parse skipped duplicate finding index {index}")
+            continue
+        decision = item.get("decision")
+        if decision not in ("pass", "repair"):
+            warnings.append(f"index {index}: invalid decision {decision!r}")
+            continue
+        reason = str(item.get("reason", ""))
+        if decision == "pass":
+            seen.add(index)
+            out.append(RepairResult(index=index, decision="pass", reason=reason))
+            continue
+        pid = item.get("pid")
+        repaired = item.get("repaired_translation")
+        expected_pid = finding_by_index[index].pid
+        if not isinstance(pid, str) or pid != expected_pid:
+            warnings.append(
+                f"index {index}: repair pid {pid!r} does not match finding "
+                f"pid {expected_pid!r} (index/PID contract)"
+            )
+            continue
+        if not isinstance(repaired, str) or not repaired.strip():
+            warnings.append(f"index {index}: repair has empty repaired_translation")
+            continue
+        if repaired.strip() == str(current_by_pid.get(pid, "")).strip():
+            warnings.append(
+                f"index {index}: no-op repair converted to pass "
+                f"(repaired_translation equals the current text for pid {pid})"
+            )
+            seen.add(index)
+            out.append(
+                RepairResult(
+                    index=index,
+                    decision="pass",
+                    pid=pid,
+                    reason="no-op repair converted to pass",
+                )
+            )
+            continue
+        current_text = str(current_by_pid.get(pid, ""))
+        if len(repaired.strip()) < 0.4 * len(current_text.strip()):
+            warnings.append(
+                f"index {index}: truncated repair skipped — repaired_translation "
+                f"is {len(repaired.strip())} chars vs {len(current_text.strip())} "
+                f"chars current text (<40% preserved)"
+            )
+            continue
+        seen.add(index)
+        out.append(
+            RepairResult(
+                index=index,
+                decision="repair",
+                pid=pid,
+                repaired_translation=repaired,
+                reason=reason,
+            )
+        )
+    missing = sorted(expected - seen)
+    if missing:
+        warnings.append(
+            f"tolerant parse: no answer recovered for finding index(es) {missing}"
+        )
+    # 5. Coverage gate: < REPAIR_PARSE_MIN_COVERAGE of findings recovered is
+    #    serious corruption — the batch FAILS as before.
+    coverage = len(seen) / len(expected) if expected else 1.0
+    if coverage < REPAIR_PARSE_MIN_COVERAGE:
+        return (), (
+            f"response is not valid JSON: {exc}; tolerant parse recovered "
+            f"{len(seen)}/{len(expected)} finding(s) "
+            f"(<{int(REPAIR_PARSE_MIN_COVERAGE * 100)}% coverage)",
+        ), tuple(warnings)
+    return tuple(out), (), tuple(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1408,21 @@ class SelectiveRepairEvaluator:
                     # The model answers PASS by index without echoing the PID;
                     # resolve it from the batch finding (the index contract).
                     passed_pids.append(finding_by_index[result.index].pid)
+            # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): a tolerant response that
+            # recovered SOME but not ALL of the batch's findings keeps its
+            # valid recovered repairs (committed above), but every missing
+            # finding is routed to debt — a partial response is NEVER
+            # published as complete (repair_complete stays False via the
+            # PARTIAL batch status).
+            if outcome.status == "PARTIAL":
+                for index in outcome.missing_indices:
+                    finding = finding_by_index.get(index)
+                    pid = finding.pid if finding is not None else f"index {index}"
+                    debt.append(
+                        f"pid {pid}: no repair answer recovered for finding "
+                        f"index {index} (partial tolerant repair — recovered "
+                        f"{len(outcome.results)}/{len(outcome.findings)})"
+                    )
 
         review_journal = _build_review_journal(batch_outcomes, review_candidates)
         # REPAIR-2 (t_768537b9): aggregate per-index non-fatal notices from
@@ -1298,6 +1533,18 @@ class SelectiveRepairEvaluator:
         reason_path: Optional[Path] = None
         if out_dir is not None:
             reason_path = out_dir / f"{out_base}_batch{batch_index}_reasoning.txt"
+        # REPAIR-ROBUST (card t_b6fd6cbd, run_0005): the repair reasoning
+        # effort (default 1 = low) is transported via request_options ONLY
+        # to remote-capable backends (opencode maps it to reasoningEffort).
+        # Local llama-server transports receive the budget from their server
+        # args (--reasoning-budget) and LocalOpenAIBackend rejects any
+        # request_options (library guard) — the local path is untouched
+        # (owner rule: local servers always run with the same args).
+        request_options: Dict[str, Any] = {}
+        if cfg.repair_reasoning and _reasoning_transported_via_request_options(
+            self._repair_backend, model_ref
+        ):
+            request_options["reasoning"] = cfg.repair_reasoning
         request = CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
@@ -1306,7 +1553,7 @@ class SelectiveRepairEvaluator:
             response_schema=JSON_OBJECT_SCHEMA,
             label=cfg.label,
             on_reasoning_chunk=open_reasoning_writer(reason_path),
-            # NOTE: no request_options — the reasoning budget is a server arg.
+            request_options=request_options,
         )
         try:
             response = self._repair_backend.complete(request)
@@ -1351,6 +1598,25 @@ class SelectiveRepairEvaluator:
                 results=results,
                 error="; ".join(errors),
                 warnings=warnings,
+            )
+        # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): a response that did NOT answer
+        # every finding (the tolerant salvage recovered some but not all of
+        # the batch) is PARTIAL — the recovered repairs are retained, but the
+        # missing indices are surfaced in the outcome and routed to debt by
+        # the evaluator, so ``repair_complete`` can never become True for a
+        # partial response. A warning alone is not enough: the 50% salvage
+        # threshold must never act as a publication-complete threshold.
+        answered = {r.index for r in results}
+        expected = {f.index for f in findings}
+        missing = sorted(expected - answered)
+        if missing:
+            return RepairBatchOutcome(
+                batch_index=batch_index,
+                status="PARTIAL",
+                findings=tuple(findings),
+                results=results,
+                warnings=warnings,
+                missing_indices=tuple(missing),
             )
         return RepairBatchOutcome(
             batch_index=batch_index,
