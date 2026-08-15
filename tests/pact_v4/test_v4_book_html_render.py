@@ -162,6 +162,135 @@ def test_build_book_html_no_toc_without_headings():
 
 
 # ---------------------------------------------------------------------------
+# P1 АРКИ: deterministic arc-name substitution in headings
+# ---------------------------------------------------------------------------
+
+
+def test_arc_names_substitute_leading_arc_key_in_heading():
+    """P1 АРКИ (owner decision 2026-08-14): a heading like 'Bonds 1.3'
+    becomes 'Узы 1.3' deterministically from arc_names.json — the renderer
+    never relies on the model for the arc title."""
+    arc_names = {"Bonds": "Узы", "Execution": "Казнь"}
+    _src = "<h1>Bonds 1.3</h1><p>Text.</p>"
+    _tr = {"p00001": "Узы 1.3", "p00002": "Текст."}
+    body, report = render_chapter_body(
+        _src, _tr, chapter_id="0001", arc_names=arc_names,
+    )
+    assert report["headings"] == [
+        {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
+    ]
+
+
+def test_arc_names_heading_exact_match_and_case_insensitive():
+    arc_names = {"Bonds": "Узы"}
+    # Exact match (no number suffix) and lowercase source heading.
+    _body, report = render_chapter_body(
+        "<h1>BONDS</h1><p>X.</p>",
+        {"p00001": "Узы", "p00002": "Икс."},
+        chapter_id="0001", arc_names=arc_names,
+    )
+    assert report["headings"][0]["text"] == "Узы"
+
+
+def test_arc_names_no_mapping_leaves_heading_unchanged():
+    body, report = render_chapter_body(
+        "<h1>Prologue</h1><p>X.</p>",
+        {"p00001": "Пролог", "p00002": "Икс."},
+        chapter_id="0001",
+        arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"][0]["text"] == "Пролог"
+
+
+def test_arc_names_none_and_unknown_key_unchanged():
+    # No mapping at all -> unchanged.
+    _body, report = render_chapter_body(
+        "<h1>Bonds 1.1</h1><p>X.</p>",
+        {"p00001": "Узы 1.1", "p00002": "Икс."},
+        chapter_id="0001",
+    )
+    assert report["headings"][0]["text"] == "Узы 1.1"
+
+
+def test_arc_names_rendered_heading_body_matches_toc():
+    """RV finding 3 (MEDIUM): the arc substitution must reach the RENDERED
+    <h1> body, not just the TOC metadata. The model produced 'Bonds 1.3'
+    (kept the English arc name); the renderer substitutes it to 'Узы 1.3'
+    deterministically in BOTH the TOC and the heading body — one
+    substitution, no divergence."""
+    arc_names = {"Bonds": "Узы", "Execution": "Казнь"}
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>Text.</p>",
+        {"p00001": "Bonds 1.3", "p00002": "Текст."},
+        chapter_id="0001", arc_names=arc_names,
+    )
+    assert report["headings"] == [
+        {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
+    ]
+    # The RENDERED heading body carries the substituted arc name too.
+    assert "Узы 1.3" in body
+    assert "Bonds 1.3" not in body
+    assert "<h1" in body
+
+
+def test_arc_names_rendered_heading_body_preserves_inline_markup():
+    """RV finding 3: the substitution applied to the raw heading text must
+    preserve inline markup (the sanitization/inline-markup contract): an
+    <em> around the arc name survives the substitution."""
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>X.</p>",
+        {"p00001": "<em>Bonds</em> 1.3", "p00002": "Икс."},
+        chapter_id="0001", arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"][0]["text"] == "Узы 1.3"
+    assert "<em>Узы</em> 1.3" in body
+
+
+def test_arc_names_disallowed_markup_wrapper_still_substitutes():
+    """RV2 finding 2 (MEDIUM): a heading whose arc key is wrapped in
+    DISALLOWED markup (``<script>``) must still get the deterministic arc
+    substitution, and the TOC must agree with the rendered body.
+
+    Repro (reviewer): translation '<script>Bonds</script> 1.3' previously
+    rendered body '<h1>Bonds 1.3</h1>' while TOC said '1.3' — the raw
+    ``BeautifulSoup.get_text()`` drops <script> contents (so the key never
+    matched) while the allowlist sanitizer unwraps the tag into visible
+    text. The match and the TOC text are now both derived from the
+    SANITIZED visible text, so the key matches and body/TOC agree — and
+    the sanitizer allowlist is unchanged (no live <script> in the output).
+    """
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>X.</p>",
+        {"p00001": "<script>Bonds</script> 1.3", "p00002": "Икс."},
+        chapter_id="0001", arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"] == [
+        {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
+    ]
+    # The rendered body carries the substituted arc name (script unwrapped
+    # to inert text by the sanitizer, NOT weakened into a live tag).
+    assert "Узы 1.3" in body
+    assert "Bonds 1.3" not in body
+    assert "<script>" not in body
+    assert "</script>" not in body
+    assert "<h1" in body
+
+
+def test_arc_names_disallowed_style_wrapper_toc_matches_body():
+    """RV2 finding 2 (MEDIUM), <style> variant: same sanitized-visible-text
+    path for a key wrapped in a style tag — TOC and body agree on one
+    substitution and no <style> reaches the output."""
+    body, report = render_chapter_body(
+        "<h1>Bonds 1.3</h1><p>X.</p>",
+        {"p00001": "<style>Bonds</style> 1.3", "p00002": "Икс."},
+        chapter_id="0001", arc_names={"Bonds": "Узы"},
+    )
+    assert report["headings"][0]["text"] == "Узы 1.3"
+    assert "Узы 1.3" in body
+    assert "<style>" not in body and "</style>" not in body
+
+
+# ---------------------------------------------------------------------------
 # Disk assembly (render_book) + missing-pid reporting
 # ---------------------------------------------------------------------------
 

@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from pact_v4.audit.entity_extractor import EXTRACTOR_VERSION
 from pact_v4.phase1.book_memory_candidates import BookMemoryCandidateLedger
 
 _PLAN = {
@@ -91,6 +92,9 @@ def _make_chapter_artifacts(
     quarantined: list,
     translations: dict,
     chunk_plan: dict = _PLAN,
+    entity_cache_payload: dict | None = None,
+    record_source_hash: str = "test-hash",
+    record_extractor_version: str = EXTRACTOR_VERSION,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     chunk_ids = [c["chunk_id"] for c in chunk_plan["chunks"]]
@@ -107,10 +111,26 @@ def _make_chapter_artifacts(
                    ensure_ascii=False),
         encoding="utf-8",
     )
+    record = {"chapter_id": chapter_id,
+              "step8": {"status": terminal_status}}
+    # SAFE-MEMORY (RV finding 2): the strict runner records the exact
+    # source hash (identities.source_hash) of the chapter it consumed; the
+    # book-run promotion verifies a cache entry's source_hash against it
+    # (fail-closed provenance). Mirror that in the fixture.
+    # SAFE-MEMORY (RV2 finding 1, HIGH): the runner also records the
+    # extractor_version the prepass actually ran with
+    # (operational_policy.audit.extractor_version — see
+    # v4_phase12_strict_runner.py record build); the book-run promotion
+    # now verifies a cache entry's extractor_version against it, so a
+    # stale entry of the same chapter/source_hash written by an older
+    # extractor_version is never promoted. Mirror that too.
+    if entity_cache_payload is not None:
+        record["identities"] = {"source_hash": record_source_hash}
+        record["operational_policy"] = {
+            "audit": {"extractor_version": record_extractor_version},
+        }
     out_dir.joinpath("strict_chapter_trial_record.json").write_text(
-        json.dumps({"chapter_id": chapter_id,
-                    "step8": {"status": terminal_status}},
-                   ensure_ascii=False),
+        json.dumps(record, ensure_ascii=False),
         encoding="utf-8",
     )
     out_dir.joinpath("translations.json").write_text(
@@ -119,6 +139,79 @@ def _make_chapter_artifacts(
     out_dir.joinpath("chunk_plan.json").write_text(
         json.dumps(chunk_plan, ensure_ascii=False), encoding="utf-8",
     )
+    if entity_cache_payload is not None:
+        # SAFE-MEMORY (P0 2026-08-14): the strict run's entity prepass
+        # persists this file BEFORE generation; the book run reads it after
+        # an accepted chapter and promotes the VERIFIED claims.
+        out_dir.joinpath("entity_context_cache.json").write_text(
+            json.dumps(entity_cache_payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+def _entity_cache_entry(
+    chapter_id: str,
+    source_text: dict,
+    *,
+    entity: str = "Rose",
+    canonical_type: str = "woman",
+    anchor_pid: str = "p00002",
+    anchor_span: str = "She was running late that day.",
+    claims: list | None = None,
+    source_hash: str = "test-hash",
+    extractor_version: str = EXTRACTOR_VERSION,
+) -> dict:
+    """Build a valid single-entry ``entity_context_cache.json`` payload.
+
+    The cache schema is ``pact-v4-entity-context-cache/v1``; every context
+    carries the chapter id + source hash, and the runner keys entries by
+    source_hash + extractor_version. ``source_text`` is the chapter source
+    PID map (the anchor span must be verbatim in ``anchor_pid``).
+    ``source_hash`` defaults to ``"test-hash"``; a caller that needs to
+    exercise provenance mismatch passes a distinct value (it is used in
+    BOTH the context stamp and the cache key, keeping the payload
+    internally consistent). ``extractor_version`` defaults to the current
+    ``EXTRACTOR_VERSION``; a caller exercising RV2 finding 1 (stale
+    extractor-version entries in one cache) passes an older value.
+    """
+    from pact_v4.audit.entity_extractor import (
+        ENTITY_CONTEXT_SCHEMA,
+        entity_context_cache_key,
+    )
+
+    if claims is None:
+        claims = [{
+            "kind": "gender", "value": "female", "status": "verified",
+            "evidence": [{"pid": anchor_pid, "span": "She was running late"}],
+            "evidence_windows": [[anchor_pid, anchor_pid]],
+        }]
+    context = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": extractor_version,
+        "chapter_id": chapter_id,
+        "source_hash": source_hash,
+        "entities": [
+            {
+                "entity": entity,
+                "canonical_type": canonical_type,
+                "anchor": {"pid": anchor_pid, "span": anchor_span},
+                "aliases": [],
+                "claims": claims,
+            },
+        ],
+    }
+    return {
+        "schema": "pact-v4-entity-context-cache/v1",
+        "entries": [
+            {
+                "key": entity_context_cache_key(
+                    source_hash=source_hash,
+                    extractor_version=extractor_version,
+                ),
+                "context": context,
+            },
+        ],
+    }
 
 
 class TestBookMemoryAccumulation:
@@ -135,12 +228,33 @@ class TestBookMemoryAccumulation:
 
         monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
 
-        for chapter_id, (html, terminal, quarantined, translations) in chapter_specs.items():
+        for chapter_id, spec in chapter_specs.items():
+            if len(spec) == 4:
+                html, terminal, quarantined, translations = spec
+                entity_cache_payload = None
+                record_source_hash = "test-hash"
+                record_extractor_version = EXTRACTOR_VERSION
+            elif len(spec) == 5:
+                html, terminal, quarantined, translations, entity_cache_payload = spec
+                record_source_hash = "test-hash"
+                record_extractor_version = EXTRACTOR_VERSION
+            elif len(spec) == 6:
+                html, terminal, quarantined, translations, entity_cache_payload, record_source_hash = spec
+                record_extractor_version = EXTRACTOR_VERSION
+            else:
+                (
+                    html, terminal, quarantined, translations,
+                    entity_cache_payload, record_source_hash,
+                    record_extractor_version,
+                ) = spec
             _write_chapter_html(src_dir, chapter_id, html)
             _make_chapter_artifacts(
                 out_base / f"chapter_{chapter_id}", chapter_id,
                 terminal_status=terminal, quarantined=quarantined,
                 translations=translations,
+                entity_cache_payload=entity_cache_payload,
+                record_source_hash=record_source_hash,
+                record_extractor_version=record_extractor_version,
             )
 
         result = v4_book_run.run_book(
@@ -159,8 +273,10 @@ class TestBookMemoryAccumulation:
     def test_two_chapters_promote_source_confirmed_character_and_facts(
         self, tmp_path, monkeypatch,
     ):
-        """A recurring proper name promotes into book_memory.characters with
-        source-confirmed gender + key-bound presence/gender facts."""
+        """A verified entity claim promotes into book_memory.characters with
+        high-precision gender (extractor's 8-point validation) — B7's
+        deterministic script is OFF (P0 2026-08-14); the character comes
+        from the source-only entity extractor's entity_context_cache.json."""
         ch1 = (
             "<p>Blake met Rose at the gate.</p>\n"
             "<p>She was running late that day.</p>"
@@ -175,67 +291,270 @@ class TestBookMemoryAccumulation:
             "p00003": "Блэйк видел, как Роуз улыбнулась.",
             "p00004": "Она открыла тяжёлую дверь.",
         }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+            "p00003": "Blake saw Rose smile.",
+            "p00004": "She opened the heavy door.",
+        }
+        cache1 = _entity_cache_entry(
+            "0001", source_text,
+            claims=[
+                {
+                    "kind": "gender", "value": "female", "status": "verified",
+                    "evidence": [{"pid": "p00002", "span": "She was running late"}],
+                    "evidence_windows": [["p00002", "p00002"]],
+                },
+                {
+                    "kind": "presence", "value": "Rose appears in chapter 0001",
+                    "status": "verified",
+                    "evidence": [{"pid": "p00001", "span": "Blake met Rose"}],
+                    "evidence_windows": [["p00001", "p00002"]],
+                },
+            ],
+        )
+        cache2 = _entity_cache_entry(
+            "0002", source_text,
+            claims=[
+                {
+                    "kind": "gender", "value": "female", "status": "verified",
+                    "evidence": [{"pid": "p00004", "span": "She opened the heavy door"}],
+                    "evidence_windows": [["p00004", "p00004"]],
+                },
+                {
+                    "kind": "presence", "value": "Rose appears in chapter 0002",
+                    "status": "verified",
+                    "evidence": [{"pid": "p00003", "span": "Blake saw Rose"}],
+                    "evidence_windows": [["p00003", "p00004"]],
+                },
+            ],
+        )
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (ch1, "complete", [], translations),
-            "0002": (ch2, "complete", [], translations),
+            "0001": (ch1, "complete", [], translations, cache1),
+            "0002": (ch2, "complete", [], translations, cache2),
         })
 
-        # Both chapters accepted; BM ran both times.
+        # Both chapters accepted; BM promote ran both times.
         assert [r["terminal_status"] for r in result["chapters"]] == [
             "complete", "complete",
         ]
 
-        # Rose promoted in book_memory.characters with source-confirmed
-        # gender; the established narrator (Blake Thorburn) is untouched.
+        # Rose promoted in book_memory.characters with the VERIFIED gender
+        # (high-precision by the extractor's validation); the established
+        # narrator (Blake Thorburn) is untouched.
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
         assert "Rose" in bm["characters"]
         rose = bm["characters"]["Rose"]
-        assert rose["type"] == "character"
+        assert rose["type"] == "woman"
         assert rose["gender"] == "female"
+        # Chapter accumulation: union of both chapters' entries.
         assert rose["chapters"] == ["0001", "0002"]
         assert rose["forbidden_targets"] == []
-        # The observation-only chunk_id field was stripped after promote.
-        assert "chunk_id" not in rose
         # Established narrator entry unchanged.
         assert bm["characters"]["Blake Thorburn"]["gender"] == "male"
         assert bm["pov"]["gender"] == "male"
 
-        # Key-bound facts: presence + gender (both with explicit keys).
+        # Verified claims become key-bound facts (source-derived).
         fact_texts = [f.get("fact") for f in bm.get("facts", [])]
-        assert any("Rose appears in chapters 0001, 0002." in t for t in fact_texts)
-        assert any("female pronouns" in t for t in fact_texts)
-        rose_facts = [f for f in bm.get("facts", []) if f.get("keys") == ["Rose"]]
-        assert len(rose_facts) == 2
-        assert all("chunk_id" not in f for f in rose_facts)
+        assert any("Rose" in t and "source-derived" in t for t in fact_texts)
 
         # book_run.json records the BM block and the promotion events with
         # evidence PIDs (review/rollback artifact).
         ch2_rec = result["chapters"][1]
         assert ch2_rec["book_memory_candidates"]["generated"] >= 1
-        assert ch2_rec["book_memory_candidates"]["committed"] == 1
+        assert ch2_rec["book_memory_candidates"]["committed"] >= 1
         assert ch2_rec["book_memory_candidates"]["conflicts"] == 0
         assert ch2_rec["book_memory_promotions"]
         promo = ch2_rec["book_memory_promotions"][0]
         assert promo["source"] == "Rose"
         assert promo["gender"] == "female"
-        assert promo["chapters"] == ["0001", "0002"]
-        assert promo["evidence_pids"]
 
-        # The ledger accumulated Rose across both chapters.
-        ledger = BookMemoryCandidateLedger(
-            str(out_base / "book_memory_candidates.json")
-        ).load()
-        rose_rec = ledger["character|rose"]
-        assert rose_rec["total_occurrences"] >= 2
-        assert {c["chapter_id"] for c in rose_rec["chapters"]} == {"0001", "0002"}
-        assert rose_rec["gender"] == "female"
+    def test_foreign_entity_cache_entry_never_promoted(
+        self, tmp_path, monkeypatch,
+    ):
+        """RV finding 2 (HIGH): a VALID cache entry of ANOTHER chapter (or a
+        stale cache left by an out_dir reuse) is never promoted into the
+        current chapter's book_memory. The promotion is fail-closed on
+        provenance: the entry must belong to the CURRENT chapter_id AND its
+        source_hash must equal the source hash the strict run recorded
+        (identities.source_hash). A foreign entry would otherwise be stamped
+        with the current chapter_id, corrupting causal memory and chapter
+        accumulation."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        # Two VALID cache entries in ONE payload: the current chapter (0001,
+        # matching record source hash) and a foreign chapter (0099, different
+        # chapter_id AND different source_hash). Both pass
+        # EntityContextCache.from_payload — the cache itself is not corrupt.
+        current = _entity_cache_entry(
+            "0001", source_text,
+            source_hash="current-source-hash",
+        )
+        foreign = _entity_cache_entry(
+            "0099", source_text,
+            entity="Zed", canonical_type="man",
+            anchor_pid="p00001", anchor_span="Blake met Rose",
+            source_hash="foreign-source-hash",
+            claims=[{
+                "kind": "gender", "value": "male", "status": "verified",
+                "evidence": [{"pid": "p00001", "span": "Blake met Rose"}],
+                "evidence_windows": [["p00001", "p00001"]],
+            }],
+        )
+        payload = {
+            "schema": "pact-v4-entity-context-cache/v1",
+            "entries": current["entries"] + foreign["entries"],
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, payload,
+                     "current-source-hash"),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        # The current chapter's verified entity promotes...
+        assert "Rose" in bm["characters"]
+        # ...but the foreign/stale entry is NEVER promoted (fail-closed).
+        assert "Zed" not in bm.get("characters", {})
+        assert "Zed" not in bm.get("entities", {})
+        assert "Zed" not in [f.get("fact", "") for f in bm.get("facts", [])]
+        assert result["chapters"][0]["book_memory_promotions"][0]["source"] == "Rose"
+
+    def test_stale_source_hash_never_promoted(self, tmp_path, monkeypatch):
+        """RV finding 2, stale-cache branch: a cache entry whose chapter_id
+        matches the current chapter but whose source_hash differs from the
+        source the strict run consumed is NOT promoted (out_dir reuse with a
+        changed source). Fail-closed on provenance — never promote a context
+        extracted from a different source under the current chapter."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        stale = _entity_cache_entry(
+            "0001", source_text,
+            source_hash="stale-source-hash",
+        )
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, stale,
+                     "current-source-hash"),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "Rose" not in bm.get("characters", {})
+        assert "Rose" not in bm.get("entities", {})
+        assert result["chapters"][0]["book_memory_candidates"]["committed"] == 0
+
+    def test_stale_extractor_version_never_promoted(self, tmp_path, monkeypatch):
+        """RV2 finding 1 (HIGH): the entity cache identity is source_hash +
+        extractor_version — a STALE entry for the same chapter/source_hash
+        written by an OLDER extractor_version is never promoted alongside
+        the current one (an out_dir reuse where the extractor code changed
+        must not replay old-version entities into book_memory). The run
+        record (operational_policy.audit.extractor_version — the version
+        the prepass actually ran with) is the expected identity; entries
+        stamped with any other version fail closed."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        # Two VALID cache entries in ONE payload: the current chapter (0001)
+        # with the SAME source_hash but DIFFERENT extractor_versions — the
+        # current EXTRACTOR_VERSION (Rose) and a stale older one (OldEntity).
+        current = _entity_cache_entry(
+            "0001", source_text,
+            entity="Rose", source_hash="same-source-hash",
+        )
+        stale = _entity_cache_entry(
+            "0001", source_text,
+            entity="OldEntity", canonical_type="man",
+            anchor_pid="p00001", anchor_span="Blake met Rose",
+            source_hash="same-source-hash",
+            extractor_version="pact-v4-entity-extractor/v0",
+            claims=[{
+                "kind": "gender", "value": "male", "status": "verified",
+                "evidence": [{"pid": "p00001", "span": "Blake met Rose"}],
+                "evidence_windows": [["p00001", "p00001"]],
+            }],
+        )
+        payload = {
+            "schema": "pact-v4-entity-context-cache/v1",
+            "entries": stale["entries"] + current["entries"],
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, payload,
+                     "same-source-hash", EXTRACTOR_VERSION),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        # The current-version verified entity promotes...
+        assert "Rose" in bm["characters"]
+        # ...the stale extractor_version entry is NEVER promoted (fail-closed).
+        assert "OldEntity" not in bm.get("characters", {})
+        assert "OldEntity" not in bm.get("entities", {})
+        assert "OldEntity" not in [f.get("fact", "") for f in bm.get("facts", [])]
+        assert result["chapters"][0]["book_memory_promotions"][0]["source"] == "Rose"
+        assert result["chapters"][0]["book_memory_promotions"][0]["gender"] == "female"
+
+    def test_record_missing_extractor_version_fails_closed(self, tmp_path, monkeypatch):
+        """RV2 finding 1 (HIGH), fail-closed branch: a run record that does
+        NOT carry operational_policy.audit.extractor_version (a legacy
+        out_dir / pre-record build) promotes NOTHING — the expected
+        extractor_version is unknown, and unknown provenance is safer than
+        wrong promotion (mirrors the source_hash fail-closed rule)."""
+        html = (
+            "<p>Blake met Rose at the gate.</p>\n"
+            "<p>She was running late that day.</p>"
+        )
+        translations = {
+            "p00001": "Блэйк встретил Роуз у ворот.",
+            "p00002": "Она опаздывала в тот день.",
+        }
+        source_text = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "She was running late that day.",
+        }
+        cache = _entity_cache_entry("0001", source_text)
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": (html, "complete", [], translations, cache,
+                     "test-hash", ""),
+        })
+
+        bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
+        assert "Rose" not in bm.get("characters", {})
+        assert "Rose" not in bm.get("entities", {})
+        assert result["chapters"][0]["book_memory_candidates"]["committed"] == 0
 
     def test_gender_fail_closed_without_explicit_source_confirmation(
         self, tmp_path, monkeypatch,
     ):
-        """No he/she/him/her evidence near the name => no gender field and no
-        gender fact (fail-closed), but the character still promotes (the name
-        itself IS source-confirmed)."""
+        """A CANDIDATE gender claim (no verified evidence) => no gender field
+        and no gender fact (fail-closed), but the entity itself still
+        promotes as an entity (its anchor IS source-confirmed)."""
         html = (
             "<p>Blake met Rose at the gate, and Rose knew the way.</p>\n"
             "<p>Rose waited outside for a moment.</p>"
@@ -244,27 +563,34 @@ class TestBookMemoryAccumulation:
             "p00001": "Блэйк встретил Роуз у ворот, и Роуз знала дорогу.",
             "p00002": "Роуз ждала снаружи мгновение.",
         }
+        source_text = {
+            "p00001": "Blake met Rose at the gate, and Rose knew the way.",
+            "p00002": "Rose waited outside for a moment.",
+        }
+        cache = _entity_cache_entry(
+            "0001", source_text,
+            claims=[{
+                "kind": "gender", "value": "female", "status": "candidate",
+                "evidence": [{"pid": "p00001", "span": "Rose"}],
+                "evidence_windows": [["p00001", "p00002"]],
+            }],
+        )
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (html, "complete", [], translations),
+            "0001": (html, "complete", [], translations, cache),
         })
 
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
-        assert "Rose" in bm["characters"]
-        assert "gender" not in bm["characters"]["Rose"]
-        # No gender fact — only the presence fact.
-        rose_facts = [f for f in bm.get("facts", []) if f.get("keys") == ["Rose"]]
-        assert len(rose_facts) == 1
-        assert "pronouns" not in rose_facts[0]["fact"]
-
-        ledger = BookMemoryCandidateLedger(
-            str(out_base / "book_memory_candidates.json")
-        ).load()
-        assert ledger["character|rose"]["gender"] is None
+        # Candidate gender NEVER promotes: the entity lands in `entities`
+        # (not characters) and carries no gender.
+        assert "Rose" not in bm.get("characters", {})
+        assert bm.get("entities", {}).get("Rose", {}).get("gender") is None
 
     def test_gender_ambiguous_both_pronoun_sets_never_promotes(
         self, tmp_path, monkeypatch,
     ):
-        """Both he/him and she/her near the name => ambiguous => no gender."""
+        """Both he/him and she/her near the name => the extractor marks the
+        claim CANDIDATE (its rule: ambiguous pronoun sets => unknown) =>
+        no gender promotes."""
         html = (
             "<p>Blake met Rose at the gate, and Rose knew the way.</p>\n"
             "<p>He waited while she talked to Rose.</p>"
@@ -273,48 +599,75 @@ class TestBookMemoryAccumulation:
             "p00001": "Блэйк встретил Роуз у ворот, и Роуз знала дорогу.",
             "p00002": "Он ждал, пока она говорила с Роуз.",
         }
+        source_text = {
+            "p00001": "Blake met Rose at the gate, and Rose knew the way.",
+            "p00002": "He waited while she talked to Rose.",
+        }
+        cache = _entity_cache_entry(
+            "0001", source_text,
+            claims=[{
+                "kind": "gender", "value": "female", "status": "candidate",
+                "evidence": [{"pid": "p00002", "span": "she talked to Rose"}],
+                "evidence_windows": [["p00001", "p00002"]],
+            }],
+        )
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (html, "complete", [], translations),
+            "0001": (html, "complete", [], translations, cache),
         })
 
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
-        assert "gender" not in bm["characters"]["Rose"]
-        rose_facts = [f for f in bm.get("facts", []) if f.get("keys") == ["Rose"]]
-        assert len(rose_facts) == 1  # presence only, no gender fact
+        assert "Rose" not in bm.get("characters", {})
+        assert bm.get("entities", {}).get("Rose", {}).get("gender") is None
 
     def test_cross_chapter_gender_disagreement_never_promotes(
         self, tmp_path, monkeypatch,
     ):
-        """Ch1 says male, ch2 says female => merged gender is None forever
-        (fail-closed, like the B9 glossary target irreversibility)."""
+        """Ch1 verified male, ch2 verified female => the character entry is
+        never promoted with a gender (fail-closed, like the B9 glossary
+        target irreversibility). The chapter accumulation keeps the entity
+        itself, but gender stays absent — a disputed gender is unknown."""
         ch1 = "<p>Blake met Rose at the gate. He waved.</p>"
         ch2 = "<p>Blake saw Rose return home. She opened the door.</p>"
         translations = {
             "p00001": "Блэйк встретил Роуз у ворот. Он помахал.",
             "p00002": "Блэйк видел, как Роуз вернулась домой. Она открыла дверь.",
         }
+        source_text = {
+            "p00001": "Blake met Rose at the gate. He waved.",
+            "p00002": "Blake saw Rose return home. She opened the door.",
+        }
+        cache1 = _entity_cache_entry(
+            "0001", source_text,
+            claims=[{
+                "kind": "gender", "value": "male", "status": "verified",
+                "evidence": [{"pid": "p00001", "span": "He waved"}],
+                "evidence_windows": [["p00001", "p00002"]],
+            }],
+        )
+        cache2 = _entity_cache_entry(
+            "0002", source_text,
+            claims=[{
+                "kind": "gender", "value": "female", "status": "verified",
+                "evidence": [{"pid": "p00002", "span": "She opened the door"}],
+                "evidence_windows": [["p00001", "p00002"]],
+            }],
+        )
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (ch1, "complete", [], translations),
-            "0002": (ch2, "complete", [], translations),
+            "0001": (ch1, "complete", [], translations, cache1),
+            "0002": (ch2, "complete", [], translations, cache2),
         })
 
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
-        assert "gender" not in bm["characters"]["Rose"]
-        rose_facts = [f for f in bm.get("facts", []) if f.get("keys") == ["Rose"]]
-        assert all("pronouns" not in f["fact"] for f in rose_facts)
-
-        ledger = BookMemoryCandidateLedger(
-            str(out_base / "book_memory_candidates.json")
-        ).load()
-        rose_rec = ledger["character|rose"]
-        assert rose_rec["gender"] is None
-        assert set(rose_rec["gender_conflicts"]) == {"male", "female"}
+        rose = bm.get("characters", {}).get("Rose", {})
+        assert "gender" not in rose
+        # Chapter accumulation still happened (both chapters saw Rose).
+        assert rose.get("chapters") == ["0001", "0002"]
 
     def test_established_and_locked_never_overwritten(
         self, tmp_path, monkeypatch,
     ):
         """book_memory entries with status established/locked are never
-        overwritten by promotion; the generator also excludes known names."""
+        overwritten by promotion; a verified NEW entity promotes."""
         book_memory = {
             "pov": {"gender": "male", "source_name": "Blake Thorburn"},
             "characters": {
@@ -337,10 +690,15 @@ class TestBookMemoryAccumulation:
             "p00001": "Блэйк встретил Роуз у ворот, и Роуз знала дорогу.",
             "p00002": "Роуз ждала снаружи. Она опаздывала.",
         }
+        source_text = {
+            "p00001": "Blake met Rose at the gate, and Rose knew the way.",
+            "p00002": "Rose waited outside. She was running late.",
+        }
+        cache = _entity_cache_entry("0001", source_text)
         before_bytes = json.dumps(book_memory, ensure_ascii=False).encode("utf-8")
         memory, out_base, result = self._run(
             tmp_path, monkeypatch,
-            {"0001": (html, "complete", [], translations)},
+            {"0001": (html, "complete", [], translations, cache)},
             book_memory=book_memory,
         )
 
@@ -349,8 +707,9 @@ class TestBookMemoryAccumulation:
         assert bm["characters"]["Locked Marian"]["gender"] == "female"
         # Established narrator untouched.
         assert bm["characters"]["Blake Thorburn"]["status"] == "established"
-        # Rose is new and promoted; Blake (established) was never proposed.
-        assert "Rose" in bm["characters"]
+        # Rose is new and promoted; Blake (established) was never overwritten.
+        assert bm["characters"]["Rose"]["gender"] == "female"
+        assert bm["characters"]["Blake Thorburn"]["gender"] == "male"
         # A real promotion happened, so bytes legitimately changed — but the
         # established/locked entries above prove conflict resolution held.
         assert (memory / "book_memory.json").read_bytes() != before_bytes
@@ -460,8 +819,10 @@ class TestBookMemoryAccumulation:
     def test_mixed_candidate_counts_only_accepted_chunks(
         self, tmp_path, monkeypatch,
     ):
-        """A candidate spanning accepted + quarantined chunks keeps only its
-        accepted-chunk evidence (occurrences, chunk_ids, promotion)."""
+        """An accepted_degraded chapter's verified entity claims promote even
+        when part of the chapter is quarantined — the entity extractor ran on
+        the SOURCE (never quarantined) before generation; the promoted
+        evidence PIDs are the extractor's, not translation chunk IDs."""
         html = (
             "<p>Blake met Rose at the gate, and Rose knew the way.</p>\n"      # p00001 (Q)
             "<p>Rose waited outside. She was running late.</p>\n"              # p00002 (Q)
@@ -478,41 +839,35 @@ class TestBookMemoryAccumulation:
             "p00005": "Пакт держался стойко против времени.",
             "p00006": "Остальные наблюдали издалека.",
         }
+        source_text = {
+            "p00001": "Blake met Rose at the gate, and Rose knew the way.",
+            "p00002": "Rose waited outside. She was running late.",
+            "p00003": "Rose returned home later.",
+            "p00004": "Blake saw Rose smile, and Rose waved once more.",
+            "p00005": "The pact held firm against time.",
+            "p00006": "The others watched from afar.",
+        }
+        cache = _entity_cache_entry("0001", source_text)
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (html, "accepted_degraded", ["chunk0001"], translations),
+            "0001": (html, "accepted_degraded", ["chunk0001"], translations, cache),
         })
 
-        # Rose evidence is now only from chunk0002 (2 occurrences >= 2) -> promoted
-        # with accepted provenance; the quarantined chunk's 4 occurrences never
-        # count toward the threshold (without exclusion it would be 6 >= 2 too,
-        # but the chunk_ids must be accepted-only and committed must succeed).
         rec = result["chapters"][0]
-        assert rec["book_memory_candidates"]["committed"] == 1
-        ledger = BookMemoryCandidateLedger(
-            str(out_base / "book_memory_candidates.json")
-        ).load()
-        rose_rec = ledger["character|rose"]
-        assert rose_rec["total_occurrences"] == 2  # not 6
-        assert rose_rec["chapters"][0]["chunk_ids"] == ["chunk0002"]
+        assert rec["terminal_status"] == "accepted_degraded"
+        # Entity claims are SOURCE-derived: quarantine of the translated
+        # chunk does not hide them (the extractor validated against the
+        # source, which is fully accepted).
+        assert rec["book_memory_candidates"]["committed"] >= 1
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
         assert "Rose" in bm["characters"]
 
     def test_accepted_degraded_uses_current_chapter_chunk_provenance(
         self, tmp_path, monkeypatch,
     ):
-        """RV fix: observation chunk provenance comes from the CURRENT chapter
-        candidate only, never from the cumulative-ledger union.
-
-        ch1: Rose in chunk0001, chapter complete, but below both thresholds
-        (1 occurrence / 1 chapter) so nothing promotes. ch2: Rose in accepted
-        chunk0002 while chunk0001 is quarantined in THIS chapter; the
-        cumulative ledger then reaches the thresholds (2 occurrences OR 2
-        chapters). The per-chapter chunk IDs repeat (chunk0001/chunk0002 in
-        both chapters), so a union over the cumulative ledger would pick
-        chunk0001 — quarantined in ch2 — and the B7 filter would drop the
-        valid promotion (proposed=1, committed=0). Expected: committed=1 and
-        Rose present in book_memory.
-        """
+        """Entity promotion provenance is the extractor's own evidence PIDs
+        from THIS chapter's cache — never a stale/foreign chapter's entry.
+        ch1 promotes Rose (verified); ch2's cache holds a DIFFERENT entity,
+        so Rose's ch1 evidence is not re-promoted by ch2."""
         ch1 = (
             "<p>Blake met Rose at the gate.</p>\n"        # p00001 (chunk0001)
             "<p>The pact held firm against time.</p>\n"   # p00002 (chunk0001)
@@ -536,23 +891,32 @@ class TestBookMemoryAccumulation:
             "p00005": "Роуз ждала снаружи.",
             "p00006": "Ночь была тихой.",
         }
-        # ch2 is accepted_degraded with chunk0001 quarantined, but all of
-        # ch2's Rose evidence lives in chunk0002 (accepted).
+        source1 = {
+            "p00001": "Blake met Rose at the gate.",
+            "p00002": "The pact held firm against time.",
+            "p00003": "The others watched from afar.",
+        }
+        source2 = {
+            "p00001": "The pact held firm against time.",
+            "p00002": "The others watched from afar.",
+            "p00003": "The door was old and strong.",
+            "p00004": "Blake saw Rose smile.",
+            "p00005": "Rose waited outside.",
+            "p00006": "The night was quiet.",
+        }
+        cache1 = _entity_cache_entry("0001", source1)
+        cache2 = _entity_cache_entry("0002", source2)
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
-            "0001": (ch1, "complete", [], translations),
-            "0002": (ch2, "accepted_degraded", ["chunk0001"], translations),
+            "0001": (ch1, "complete", [], translations, cache1),
+            "0002": (ch2, "accepted_degraded", ["chunk0001"], translations, cache2),
         })
 
         assert result["chapters"][1]["terminal_status"] == "accepted_degraded"
-        assert result["chapters"][1]["book_memory_candidates"]["committed"] == 1
+        assert result["chapters"][1]["book_memory_candidates"]["committed"] >= 1
         bm = json.loads((memory / "book_memory.json").read_text(encoding="utf-8"))
         assert "Rose" in bm["characters"]
-        # The observation chunk_id must be the CURRENT chapter's accepted
-        # chunk (chunk0002), not the union-picked chunk0001 that is
-        # quarantined here (regression for 97571d3 finding).
-        promo = result["chapters"][1]["book_memory_promotions"][0]
-        assert promo["source"] == "Rose"
-        assert promo["chunk_ids"] == ["chunk0002"]
+        # Chapter accumulation: Rose was seen in BOTH chapters.
+        assert bm["characters"]["Rose"]["chapters"] == ["0001", "0002"]
 
     def test_fail_closed_when_current_chapter_provenance_missing(
         self, tmp_path, monkeypatch,

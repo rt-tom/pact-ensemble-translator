@@ -249,11 +249,11 @@ class TestBookRunCandidateIntegration:
         Both chapters are accepted, so the ledger accumulates pact across two
         chapters (6 occurrences) and Blake in chapter 0001. Blake meets the
         proper_name threshold in chapter 0001 (4 occurrences >= 2, single
-        target) and is proposed+committed there; pact meets the term
-        threshold (2 chapters AND 6 occurrences) only in chapter 0002 and is
-        proposed+committed there. ``glossary.json`` ends up with both flat
-        ``{source: target}`` entries; ``observations.json`` is cleared by
-        ``promote``.
+        target) and is proposed+committed there; pact is a generic TERM and
+        NEVER auto-promotes (owner decision 2026-08-14: frequency+stability
+        is not terminology) — it stays in the ledger only.
+        ``glossary.json`` ends up with only the Blake entry;
+        ``observations.json`` is cleared by ``promote``.
         """
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (_CH1_HTML, "complete", [], _CH1_TRANSLATIONS),
@@ -265,22 +265,23 @@ class TestBookRunCandidateIntegration:
             "complete", "complete",
         ]
 
-        # Per-chapter candidates blocks (V-final semantics):
-        #   ch1: Blake proposed+committed; pact is term with 1 chapter < 2.
-        #   ch2: pact proposed+committed; Blake already in glossary, so it is
-        #        excluded from generation (glossary exclusions).
+        # Per-chapter candidates blocks (P0 term-promotion-OFF semantics):
+        #   ch1: Blake proposed+committed; pact generated (term) but NEVER
+        #        proposed.
+        #   ch2: pact generated again; Blake already in glossary, so it is
+        #        excluded from generation (glossary exclusions). pact still
+        #        never proposes.
         ch1, ch2 = result["chapters"]
         assert ch1["candidates"] == {
             "generated": 2, "proposed": 1, "committed": 1, "conflicts": 0,
         }
         assert ch2["candidates"] == {
-            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 0,
         }
 
-        # V-final: the B9 loop promoted both candidates into glossary.json,
-        # stored flat {source: target} after _flatten_promoted_glossary.
+        # V-final: only the proper_name promoted into the flat glossary.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Blake": "Блэйк", "pact": "пакт"}
+        assert glossary == {"Blake": "Блэйк"}
 
         # observations.json is emptied by promote after each chapter.
         observations = json.loads(
@@ -289,7 +290,8 @@ class TestBookRunCandidateIntegration:
         assert observations.get("glossary", {}) == {}
 
         # Ledger accumulated: pact spans both chapters with 6 total
-        # occurrences; Blake only in 0001.
+        # occurrences; Blake only in 0001. The ledger is the observation
+        # store — pact lives there even though it never auto-promotes.
         ledger_path = out_base / "glossary_candidates.json"
         assert result["candidates_ledger"] == str(ledger_path)
         assert ledger_path.exists()
@@ -307,24 +309,25 @@ class TestBookRunCandidateIntegration:
         """B9-RV9 HIGH regression: a glossary-only promotion must NOT
         read-modify-write ``book_memory.json``.
 
-        BM (V4.1 §15) legitimately promotes recurring proper names (Blake)
-        into book_memory, so a Blake chapter is no longer "glossary-only".
-        This fixture uses a TERM-only chapter (``pact``, lowercase — never a
-        book_memory character candidate) promoted with ``term_min_chapters=1``
-        to keep the byte-preservation invariant testable: the glossary
-        category changes while book_memory has NO observations, so its bytes
-        (and the recorded per-chapter ``_book_memory_hash``) must stay
-        exactly the same.
+        The fixture uses a PROPER_NAME-only chapter (``Beasley``,
+        capitalized — a proper name never becomes a book_memory character
+        via the deterministic script, which is OFF; the entity extractor is
+        the only character source, and the mocked chapter has no
+        entity_context_cache.json) promoted with the 2-occurrence
+        proper_name threshold, to keep the byte-preservation invariant
+        testable: the glossary category changes while book_memory has NO
+        observations, so its bytes (and the recorded per-chapter
+        ``_book_memory_hash``) must stay exactly the same.
         """
         term_html = (
-            "<p>The pact was sealed with blood.</p>\n"
-            "<p>The pact bound them all.</p>\n"
-            "<p>The pact held for years.</p>"
+            "<p>He met Beasley at the office. Beasley knew the law.</p>\n"
+            "<p>Beasley signed the papers.</p>\n"
+            "<p>Beasley left at noon.</p>"
         )
         term_translations = {
-            "p00001": "Пакт был скреплён кровью.",
-            "p00002": "Пакт связывал их всех.",
-            "p00003": "Пакт держался годами.",
+            "p00001": "Он встретил Бизли в офисе. Бизли знал закон.",
+            "p00002": "Бизли подписал бумаги.",
+            "p00003": "Бизли ушёл в полдень.",
         }
         book_memory_bytes = b'{"pov":{"gender":"male"}}'
         memory, out_base, result = self._run(
@@ -332,13 +335,13 @@ class TestBookRunCandidateIntegration:
                 "0001": (term_html, "complete", [], term_translations),
             },
             book_memory_bytes=book_memory_bytes,
-            term_min_chapters=1,
         )
 
-        # Sanity: this IS a real glossary promotion (pact term, 3 occurrences,
-        # term_min_chapters=1) and BM generated NO character candidates.
+        # Sanity: this IS a real glossary promotion (Beasley proper_name, 3
+        # occurrences >= 2, single target) and book_memory got no entity
+        # observations (no entity_context_cache.json in the mocked chapter).
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"pact": "пакт"}
+        assert glossary == {"Beasley": "Бизли"}
         assert result["chapters"][0]["book_memory_candidates"] == {
             "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
@@ -361,19 +364,20 @@ class TestBookRunCandidateIntegration:
 
         An ``accepted_degraded`` chapter WITHOUT quarantined chunks (valid
         PID->chunk plan, no exclusion needed — the F5/F6 fail-closed branch
-        does not engage) promotes its glossary term candidate while leaving
-        ``book_memory.json`` bytes and ``_book_memory_hash`` untouched (same
-        term-only fixture as the complete case — see the sibling test).
+        does not engage) promotes its glossary proper_name candidate while
+        leaving ``book_memory.json`` bytes and ``_book_memory_hash``
+        untouched (same proper_name-only fixture as the complete case — see
+        the sibling test).
         """
         term_html = (
-            "<p>The pact was sealed with blood.</p>\n"
-            "<p>The pact bound them all.</p>\n"
-            "<p>The pact held for years.</p>"
+            "<p>He met Beasley at the office. Beasley knew the law.</p>\n"
+            "<p>Beasley signed the papers.</p>\n"
+            "<p>Beasley left at noon.</p>"
         )
         term_translations = {
-            "p00001": "Пакт был скреплён кровью.",
-            "p00002": "Пакт связывал их всех.",
-            "p00003": "Пакт держался годами.",
+            "p00001": "Он встретил Бизли в офисе. Бизли знал закон.",
+            "p00002": "Бизли подписал бумаги.",
+            "p00003": "Бизли ушёл в полдень.",
         }
         book_memory_bytes = b'{"pov":{"gender":"male"}}'
         memory, out_base, result = self._run(
@@ -381,12 +385,11 @@ class TestBookRunCandidateIntegration:
                 "0001": (term_html, "accepted_degraded", [], term_translations),
             },
             book_memory_bytes=book_memory_bytes,
-            term_min_chapters=1,
         )
 
         # Sanity: the accepted_degraded valid-plan chapter still promotes.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"pact": "пакт"}
+        assert glossary == {"Beasley": "Бизли"}
 
         # Exact bytes preserved — no read-modify-write reformatting.
         assert (memory / "book_memory.json").read_bytes() == book_memory_bytes
@@ -406,12 +409,12 @@ class TestBookRunCandidateIntegration:
 
         ch0001 aligns pact -> договор, ch0002 aligns pact -> пакт. The
         cumulative ledger then has ``targets_seen`` [договор, пакт] and a
-        merged ``target`` of None (irreversible), so pact's thresholds are
-        met (2 chapters, 6 occurrences) but the cross-chapter disagreement
-        must surface as a conflict: no proposal, no commit, glossary.json
-        unchanged. Before the fix ``_auto_promote_glossary`` decided
-        promotion from the current chapter's aligned record alone and ch0002
-        proposed+committed pact -> пакт, persisting an ambiguous mapping.
+        merged ``target`` of None (irreversible). P0 owner decision
+        2026-08-14 also turns generic-term auto-promotion OFF entirely, so
+        pact is NEVER proposed or committed in either chapter (it is not
+        even evaluated as a conflict — the term branch is skipped before
+        the conflict check); glossary.json stays unchanged and the ledger
+        retains the disagreement for human review.
         """
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (_CH1_DISAGREE_HTML, "complete", [],
@@ -421,23 +424,20 @@ class TestBookRunCandidateIntegration:
         })
 
         ch1, ch2 = result["chapters"]
-        # ch0001: pact is a single-chapter term (< 2 chapters) -> below the
-        # term threshold, neither proposed nor conflicting.
+        # pact is a generic term — auto-promotion is OFF, so it is never
+        # proposed nor reported as a conflict in either chapter.
         assert ch1["candidates"] == {
             "generated": 1, "proposed": 0, "committed": 0, "conflicts": 0,
         }
-        # ch0002: pact meets the thresholds, but the cumulative ledger
-        # records the cross-chapter target disagreement -> conflict, never
-        # proposed, never committed.
         assert ch2["candidates"] == {
-            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 1,
+            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 0,
         }
 
         # The ambiguous mapping never reached glossary.json.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
 
-        # The ledger retains the conflict for human review: no merged
+        # The ledger retains the disagreement for human review: no merged
         # target, both distinct chapter targets in conflicts.
         records = GlossaryCandidateLedger(
             str(out_base / "glossary_candidates.json")
@@ -606,10 +606,12 @@ class TestBookRunCandidateIntegration:
 
         # pact/bound/together (and the contrasting others/watched/afar) all
         # co-occur in the same pids and all dominate on a shared variant —
-        # the conservative guard strips the shared target from every
-        # competing candidate, so nothing can promote.
+        # they are generic TERMS, and P0 (2026-08-14) turns term
+        # auto-promotion OFF entirely: nothing can promote, and terms are
+        # not even evaluated as conflicts (the term branch is skipped before
+        # the conflict check).
         assert result["chapters"][0]["candidates"] == {
-            "generated": 6, "proposed": 0, "committed": 0, "conflicts": 6,
+            "generated": 6, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
@@ -1006,7 +1008,12 @@ class TestAutoPromoteGlossary:
         )
         assert "pact" not in observations.get("glossary", {})
 
-    def test_term_meets_two_chapters_is_observed(self, tmp_path):
+    def test_term_never_promoted_even_above_threshold(self, tmp_path):
+        # P0 owner decision 2026-08-14 (term auto-promotion OFF): a generic
+        # term that meets BOTH v3 thresholds (2 chapters, N occurrences) and
+        # has an unambiguous target is STILL never promoted — frequency +
+        # stability does not detect terminology (door → дверь is stable but
+        # not a term). It stays in the ledger only, never in the prompt.
         from pact_full_pipeline_runner_v1 import v4_book_run
 
         manager = self._manager(tmp_path)
@@ -1027,10 +1034,12 @@ class TestAutoPromoteGlossary:
             term_min_chapters=2, term_min_occurrences=3,
             proper_name_min_occurrences=2,
         )
-        assert len(promoted) == 1
-        assert self._observation(tmp_path, "pact") == {
-            "target": "пакт", "type": "term", "chunk_id": "chunk0002",
-        }
+        assert promoted == []
+        assert conflicts == []
+        observations = json.loads(
+            (tmp_path / "memory" / "observations.json").read_text(encoding="utf-8")
+        )
+        assert "pact" not in observations.get("glossary", {})
 
     def test_established_different_target_is_conflict(self, tmp_path):
         from pact_full_pipeline_runner_v1 import v4_book_run
@@ -1129,7 +1138,7 @@ class _RecordingManager:
 class TestAutoPromoteGlossaryCumulativeGuard:
     def _aligned_pact(self, target, conflicts=()):
         return [{
-            "source": "pact", "kind": "term", "occurrences": 3,
+            "source": "pact", "kind": "proper_name", "occurrences": 3,
             "chunk_ids": ["chunk0002"], "context": "The pact held.",
             "variants": {target: 3}, "target": target,
             "consensus_share": 1.0, "conflicts": list(conflicts),
@@ -1146,8 +1155,8 @@ class TestAutoPromoteGlossaryCumulativeGuard:
 
         manager = _RecordingManager()
         merged_ledger = {
-            v4_book_run.candidate_key("pact", "term"): {
-                "source": "pact", "kind": "term", "total_occurrences": 6,
+            v4_book_run.candidate_key("pact", "proper_name"): {
+                "source": "pact", "kind": "proper_name", "total_occurrences": 6,
                 "chapters": [
                     {"chapter_id": "0001", "chunk_ids": [], "count": 3},
                     {"chapter_id": "0002", "chunk_ids": [], "count": 3},
@@ -1179,8 +1188,8 @@ class TestAutoPromoteGlossaryCumulativeGuard:
 
         manager = _RecordingManager()
         merged_ledger = {
-            v4_book_run.candidate_key("pact", "term"): {
-                "source": "pact", "kind": "term", "total_occurrences": 6,
+            v4_book_run.candidate_key("pact", "proper_name"): {
+                "source": "pact", "kind": "proper_name", "total_occurrences": 6,
                 "chapters": [
                     {"chapter_id": "0001", "chunk_ids": [], "count": 3},
                     {"chapter_id": "0002", "chunk_ids": [], "count": 3},
@@ -1212,8 +1221,8 @@ class TestAutoPromoteGlossaryCumulativeGuard:
 
         manager = _RecordingManager()
         merged_ledger = {
-            v4_book_run.candidate_key("pact", "term"): {
-                "source": "pact", "kind": "term", "total_occurrences": 6,
+            v4_book_run.candidate_key("pact", "proper_name"): {
+                "source": "pact", "kind": "proper_name", "total_occurrences": 6,
                 "chapters": [
                     {"chapter_id": "0001", "chunk_ids": [], "count": 3},
                     {"chapter_id": "0002", "chunk_ids": [], "count": 3},
@@ -1234,7 +1243,7 @@ class TestAutoPromoteGlossaryCumulativeGuard:
         assert conflicts == []
         assert manager.calls == [
             ("glossary", "pact",
-             {"target": "пакт", "type": "term", "chunk_id": "chunk0002"}),
+             {"target": "пакт", "type": "proper_name", "chunk_id": "chunk0002"}),
         ]
 
 

@@ -189,6 +189,13 @@ def build_argparser() -> argparse.ArgumentParser:
                          "'R.D.T.' unblocks the tokens R/D/T; 'Blake' unblocks "
                          "'Blake'. The combined allowlist is "
                          "bible + glossary + source-derived + this manual set.")
+    p.add_argument("--arc-names", type=Path, default=None, metavar="FILE",
+                   help="P1 АРКИ: arc_names.json (English→Russian arc names, "
+                        "e.g. Bonds→Узы). Rendered as an 'АРКИ:' block in the "
+                        "whole-chapter generation prompt so chapter headings "
+                        "translate consistently. Default: "
+                        "<memory-dir>/../arc_names.json if it exists, else "
+                        "<cwd>/arc_names.json, else no block.")
     p.add_argument("--startup-timeout", type=float, default=240.0)
     p.add_argument("--unload-timeout", type=float, default=30.0)
     p.add_argument("--lazy-balanced", action=argparse.BooleanOptionalAction, default=None,
@@ -469,12 +476,50 @@ def _env_flag(name: str, *, default: bool) -> bool:
     )
 
 
+def _load_arc_names(args: argparse.Namespace) -> Tuple[Tuple[str, str], ...]:
+    """Load the deterministic АРКИ mapping (P1, owner decision 2026-08-14).
+
+    Resolution order: explicit ``--arc-names`` path, else
+    ``<memory-dir>/../arc_names.json``, else ``<cwd>/arc_names.json``.
+    Unreadable/missing/foreign payload => empty tuple (no АРКИ block) — the
+    arc block is an enhancement, never a run failure.
+    """
+    import json as _json
+
+    candidates: List[Path] = []
+    if args.arc_names is not None:
+        candidates.append(Path(args.arc_names))
+    memory_dir = getattr(args, "memory_dir", None)
+    if memory_dir is not None:
+        candidates.append(Path(memory_dir).parent / "arc_names.json")
+    candidates.append(Path.cwd() / "arc_names.json")
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            raw = _json.loads(candidate.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        pairs = []
+        for en, ru in raw.items():
+            if isinstance(en, str) and isinstance(ru, str) and en and ru:
+                pairs.append((en, ru))
+        if pairs:
+            return tuple(pairs)
+    return ()
+
+
 def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig:
     return StrictRunConfig(
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
         out_dir=args.out_dir, backend=backend,
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
+        # P1 АРКИ: deterministic arc-name mapping for the whole-chapter
+        # generation prompt (part of the config identity).
+        deterministic_arc_names=_load_arc_names(args),
         run_label=args.run_label,
         # V4.1: reasoning budget for Phase 2B generation and early exit after
         # Phase 1-2 generation. Both are part of the config identity
@@ -658,8 +703,11 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
     here and threading it into every adapter at construction time is the
     only point where the v4 model actually sees narrator
     gender/characters/facts — everywhere ``run_chapter_strict`` would not
-    re-render the bible. When no ``chapter_index.json`` exists the
-    renderer falls back to the legacy full-memory render.
+    re-render the bible. When ``chapter_index.json`` is missing or has no
+    entry for the chapter, the renderer fails SOFT to the minimum —
+    narrator + explicit ``seed: true`` global facts — NEVER the legacy
+    full-memory dump (owner decision 2026-08-14: no future-chapter
+    leakage).
     """
     from pact_v4.runtime.bible_renderer import render_bible_section
     from pact_v4.runtime.snapshot_factory import ChapterMemory
