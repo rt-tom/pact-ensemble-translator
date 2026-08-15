@@ -631,6 +631,16 @@ def _audit_cache_path(out_dir: Path) -> Path:
     return out_dir / "audit_cache_b3.json"
 
 
+def _r_editor_report_path(out_dir: Path) -> Path:
+    """Standalone R-report artifact (FAIL-PATH R-CACHE, 2026-08-15).
+
+    Written when an audit exception drops the normal cache-write path, so
+    a resume still sees the completed R stage (GOOD chunks reused instead
+    of re-running R from scratch). Same payload the cache would carry.
+    """
+    return out_dir / "r_editor_report.json"
+
+
 def _entity_cache_path(out_dir: Path) -> Path:
     return out_dir / "entity_context_cache.json"
 
@@ -1111,6 +1121,54 @@ def _validate_partial_payload(
     return None
 
 
+def _r_editor_resume_plan_from_report(
+    report: Any,
+) -> Dict[int, Dict[str, Any]]:
+    """Per-chunk R reuse plan from an R report payload (module-level).
+
+    Shared by ``B3AuditCache.r_editor_resume_plan`` (payload from the
+    audit cache) and the FAIL-PATH R-CACHE fallback (payload from the
+    standalone ``r_editor_report.json`` written when an audit exception
+    dropped the cache-write path, 2026-08-15). Same fail-closed guards:
+    only GOOD chunks with a list ``edits`` are replayable; a non-list
+    edits field is never coerced (chunk re-run).
+    """
+    if not isinstance(report, dict):
+        return {}
+    outcome = report.get("outcome")
+    if not isinstance(outcome, dict):
+        return {}
+    plan: Dict[int, Dict[str, Any]] = {}
+    for chunk_payload in outcome.get("chunks") or ():
+        if not isinstance(chunk_payload, dict):
+            continue
+        if chunk_payload.get("status") != "GOOD":
+            continue
+        chunk_index = chunk_payload.get("chunk")
+        if not isinstance(chunk_index, int):
+            continue
+        # PARTIAL-RESUME integrity (t_ec6bb8bc): never coerce a
+        # malformed edits field — a non-list is a payload violation and
+        # the chunk is re-run (fail-closed per chunk), not stringified
+        # into a replayable plan. The authoritative rejection happens in
+        # B3AuditCache.load (full miss); this guard only keeps the plan
+        # method safe when called on an unvalidated cache/report.
+        edits = chunk_payload.get("edits")
+        if not isinstance(edits, list):
+            LOG.warning(
+                "B3: partial r_editor chunk %d edits is not a list (%r) — "
+                "chunk re-run (fail-closed)",
+                chunk_index, type(edits).__name__,
+            )
+            continue
+        plan[chunk_index] = {
+            "status": "GOOD",
+            "first_pid": chunk_payload.get("first_pid"),
+            "edits": list(edits),
+        }
+    return plan
+
+
 class B3AuditCache:
     """Persistent audit cache with resume identity (card §10 B3 item 3).
 
@@ -1388,41 +1446,9 @@ class B3AuditCache:
         """
         if not self._payload:
             return {}
-        report = self._payload.get("r_editor")
-        if not isinstance(report, dict):
-            return {}
-        outcome = report.get("outcome")
-        if not isinstance(outcome, dict):
-            return {}
-        plan: Dict[int, Dict[str, Any]] = {}
-        for chunk_payload in outcome.get("chunks") or ():
-            if not isinstance(chunk_payload, dict):
-                continue
-            if chunk_payload.get("status") != "GOOD":
-                continue
-            chunk_index = chunk_payload.get("chunk")
-            if not isinstance(chunk_index, int):
-                continue
-            # PARTIAL-RESUME integrity (t_ec6bb8bc): never coerce a
-            # malformed edits field — a non-list is a payload violation and
-            # the chunk is re-run (fail-closed per chunk), not stringified
-            # into a replayable plan. The authoritative rejection happens in
-            # B3AuditCache.load (full miss); this guard only keeps the plan
-            # method safe when called on an unvalidated cache.
-            edits = chunk_payload.get("edits")
-            if not isinstance(edits, list):
-                LOG.warning(
-                    "B3: partial cache r_editor chunk %d edits is not a "
-                    "list (%r) — chunk re-run (fail-closed)",
-                    chunk_index, type(edits).__name__,
-                )
-                continue
-            plan[chunk_index] = {
-                "status": "GOOD",
-                "first_pid": chunk_payload.get("first_pid"),
-                "edits": list(edits),
-            }
-        return plan
+        return _r_editor_resume_plan_from_report(
+            self._payload.get("r_editor")
+        )
 
     def save(
         self,
@@ -1937,6 +1963,33 @@ class B3AuditRepair:
                 "chunk(s) + %d GOOD R chunk(s), re-running the failed ones",
                 chapter_id, len(audit_resume), len(r_editor_resume),
             )
+        elif not r_editor_resume:
+            # FAIL-PATH R-CACHE (2026-08-15): no partial audit cache (the
+            # previous run died inside the audit with an exception before
+            # the cache was written), but a standalone R report survived —
+            # reuse its GOOD chunks so R is not re-run from scratch.
+            fallback_path = _r_editor_report_path(out_dir)
+            if fallback_path.exists():
+                try:
+                    fallback_report = json.loads(
+                        fallback_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as exc:
+                    LOG.warning(
+                        "B3: standalone r_editor_report.json unreadable (%s); "
+                        "R re-run", exc,
+                    )
+                else:
+                    r_editor_resume = _r_editor_resume_plan_from_report(
+                        fallback_report
+                    )
+                    if r_editor_resume:
+                        LOG.info(
+                            "B3: reusing %d GOOD R chunk(s) from the "
+                            "standalone r_editor_report.json (audit cache "
+                            "absent) — R not re-run",
+                            len(r_editor_resume),
+                        )
         if cache is not None and cache.is_hit() and cache.audit_complete():
             repaired = cache.stored_translations_repaired()
             issues = cache.stored_issues()
@@ -2192,6 +2245,19 @@ class B3AuditRepair:
                 released_as_audited=False,
                 error=error,
             )
+            # FAIL-PATH R-CACHE (architect, run_0004-0005 2026-08-15): an
+            # audit exception (e.g. BudgetOverflowError) previously dropped
+            # the already-completed R report — save() only ran on the
+            # normal fail-closed path, so a resume re-ran R from scratch.
+            # Persist the R report to its own artifact here so the next
+            # resume reuses GOOD R chunks (r_editor_resume fallback in the
+            # resume section below) even though the audit cache was never
+            # written.
+            if r_editor_report is not None:
+                _atomic_write_json(
+                    _r_editor_report_path(out_dir),
+                    dict(r_editor_report),
+                )
             raise
         journal.emit(
             "audit_complete",
