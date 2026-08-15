@@ -24,6 +24,7 @@ from pact_v4.phase1.models import canonical_json_hash
 from pact_v4.pipeline.b3_audit_repair import (
     B3AuditRepair,
     B3AuditRepairConfig,
+    _r_editor_report_identity_mismatch,
     _r_editor_resume_plan_from_report,
 )
 from pact_v4.pipeline.v4_phase12_strict_runner import (
@@ -3750,3 +3751,251 @@ def test_r_editor_resume_plan_from_report_standalone_fallback() -> None:
     # malformed payloads are not coerced
     assert _r_editor_resume_plan_from_report(None) == {}
     assert _r_editor_resume_plan_from_report({"outcome": None}) == {}
+
+
+# ---------------------------------------------------------------------------
+# REVIEW b55e940 HIGH: the FAIL-PATH standalone r_editor_report.json is
+# replayable ONLY against the exact run that produced it. _build_r_editor_
+# report now persists the R fallback identity (raw translation hash, PID
+# order, harness/prompt versions, config identity, chunking parameters,
+# safe classes, enablement), and the resume fallback validates it fail-
+# closed BEFORE building the reuse plan: a stale report (old harness
+# version, changed chunk size/text) or a pre-identity report (missing
+# fields) is rejected and R re-runs from scratch. Never rely on the
+# first_pid check alone.
+# ---------------------------------------------------------------------------
+
+
+def _fallback_override() -> B3AuditRepairConfig:
+    """8 single-pid R chunks + 8 single-pair audit chunks (no transport
+    retries) — the same shapes the resume tests use."""
+    return B3AuditRepairConfig(
+        entity_context_enabled=False,
+        russian_editor_enabled=True,
+        russian_editor_chunk_size=1,
+        russian_editor_overlap_pairs=0,
+        russian_editor_retry_max_retries=0,
+        russian_editor_retry_base_delay_seconds=0,
+        max_input_tokens=1,
+        audit_transport_max_retries=0,
+        audit_transport_base_delay_seconds=0,
+    )
+
+
+def _write_standalone_report_from_cache(
+    cfg: Any,
+    *,
+    tamper: Optional[Dict[str, Any]] = None,
+    drop_identity: bool = False,
+) -> None:
+    """Simulate the FAIL-PATH state: delete the audit cache and leave only
+    the standalone r_editor_report.json (copied from the completed cache's
+    R payload, optionally tampered / stripped of identity fields)."""
+    cache = _read_json(cfg.out_dir / "audit_cache_b3.json")
+    report = dict(cache["r_editor"])
+    if tamper:
+        report.update(tamper)
+    if drop_identity:
+        for key in ("translation_hash", "pids", "config_identity"):
+            report.pop(key, None)
+    (cfg.out_dir / "r_editor_report.json").write_text(
+        json.dumps(report, ensure_ascii=False), encoding="utf-8"
+    )
+    (cfg.out_dir / "audit_cache_b3.json").unlink()
+
+
+def test_r_editor_report_identity_mismatch_gate() -> None:
+    """REVIEW b55e940 HIGH: the identity gate rejects a standalone report
+    whose persisted identity differs from the current run (stale harness,
+    changed chunk size/text, missing identity fields) and accepts an exact
+    match — fail-closed, never first_pid alone."""
+    from pact_v4.audit.russian_editor import SAFE_CLASSES
+
+    base = {
+        "enabled": True,
+        "version": "pact-v4.2-russian-editor/v3",
+        "harness_version": "4.3",
+        "chunk_size": 1,
+        "overlap_pairs": 0,
+        "safe_classes": sorted(SAFE_CLASSES),
+        "translation_hash": "raw-hash-abc",
+        "pids": ["p00001", "p00002", "p00003"],
+        "config_identity": "cid-1",
+    }
+    expected = dict(
+        translation_hash="raw-hash-abc",
+        pids=["p00001", "p00002", "p00003"],
+        harness_version="4.3",
+        config_identity="cid-1",
+        chunk_size=1,
+        overlap_pairs=0,
+        enabled=True,
+        version="pact-v4.2-russian-editor/v3",
+        safe_classes=sorted(SAFE_CLASSES),
+    )
+    # exact match -> reusable
+    assert _r_editor_report_identity_mismatch(dict(base), **expected) is None
+    # stale harness (old report surviving the 4.3 bump)
+    assert _r_editor_report_identity_mismatch(
+        {**base, "harness_version": "4.2"}, **expected,
+    ) is not None
+    # changed chunk size
+    assert _r_editor_report_identity_mismatch(
+        {**base, "chunk_size": 8}, **expected,
+    ) is not None
+    # changed text (raw translation hash)
+    assert _r_editor_report_identity_mismatch(
+        {**base, "translation_hash": "different-raw-hash"}, **expected,
+    ) is not None
+    # changed PID order / set
+    assert _r_editor_report_identity_mismatch(
+        {**base, "pids": ["p00001", "p00002"]}, **expected,
+    ) is not None
+    # pre-identity report (missing identity fields) -> rejected
+    assert _r_editor_report_identity_mismatch(
+        {k: v for k, v in base.items()
+         if k not in ("translation_hash", "pids", "config_identity")},
+        **expected,
+    ) is not None
+    # non-dict payload
+    assert _r_editor_report_identity_mismatch(None, **expected) is not None
+    assert _r_editor_report_identity_mismatch([], **expected) is not None
+
+
+def test_b3_fallback_report_matching_identity_reuses_good_chunks(
+    tmp_path: Path,
+) -> None:
+    """REVIEW b55e940 HIGH (positive): a standalone r_editor_report.json
+    whose persisted identity matches the current run exactly IS reused on
+    the fail-path — all 8 GOOD R chunks replay with 0 model calls."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = _fallback_override()
+    _run_with_b3(
+        cfg,
+        _B3MockBackend(
+            r_editor_edits=[("p00001", "typo", " — исправлено")],
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        ),
+        config_override=override,
+    )
+    _write_standalone_report_from_cache(cfg)
+
+    resume = _B3MockBackend(
+        r_editor_edits=[("p00001", "typo", " — исправлено")],
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    second = _run_with_b3(cfg, resume, config_override=override)
+    # The 8 GOOD R chunks replayed (0 model calls), the audit re-runs fresh
+    # (no audit cache) and completes.
+    assert resume.r_editor_calls() == 0
+    assert resume.audit_calls() == 8
+    assert second.step8["released_as_audited"] is True
+    edited = _read_json(cfg.out_dir / "translations_edited.json")
+    assert edited["translations"]["p00001"] == "Перевод номер1 номер1 — исправлено"
+
+
+def test_b3_fallback_report_stale_harness_not_reused(tmp_path: Path) -> None:
+    """REVIEW b55e940 HIGH: a standalone report persisted by an OLD harness
+    (harness_version 4.2) is rejected on the fail-path — R re-runs all 8
+    chunks from scratch instead of replaying GOOD chunks computed under a
+    different harness."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = _fallback_override()
+    _run_with_b3(
+        cfg,
+        _B3MockBackend(
+            r_editor_edits=[("p00001", "typo", " — исправлено")],
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        ),
+        config_override=override,
+    )
+    _write_standalone_report_from_cache(cfg, tamper={"harness_version": "4.2"})
+
+    resume = _B3MockBackend(
+        r_editor_edits=[("p00001", "typo", " — исправлено")],
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    second = _run_with_b3(cfg, resume, config_override=override)
+    assert resume.r_editor_calls() == 8  # stale report NOT reused
+    assert resume.audit_calls() == 8
+    assert second.step8["released_as_audited"] is True
+
+
+def test_b3_fallback_report_changed_chunk_size_not_reused(tmp_path: Path) -> None:
+    """REVIEW b55e940 HIGH: a standalone report whose persisted chunk_size
+    differs from the current run is rejected — the enlarged/shrunken chunk
+    boundary must never replay GOOD chunks computed for another chunking."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = _fallback_override()
+    _run_with_b3(
+        cfg,
+        _B3MockBackend(
+            r_editor_edits=[("p00001", "typo", " — исправлено")],
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        ),
+        config_override=override,
+    )
+    _write_standalone_report_from_cache(cfg, tamper={"chunk_size": 8})
+
+    resume = _B3MockBackend(
+        r_editor_edits=[("p00001", "typo", " — исправлено")],
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    second = _run_with_b3(cfg, resume, config_override=override)
+    assert resume.r_editor_calls() == 8  # changed chunking NOT reused
+    assert resume.audit_calls() == 8
+    assert second.step8["released_as_audited"] is True
+
+
+def test_b3_fallback_report_changed_text_not_reused(tmp_path: Path) -> None:
+    """REVIEW b55e940 HIGH: a standalone report whose raw translation hash
+    differs from the current run (text changed) is rejected — zero-edit
+    GOOD chunks must never replay against different text."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = _fallback_override()
+    _run_with_b3(
+        cfg,
+        _B3MockBackend(
+            r_editor_edits=[("p00001", "typo", " — исправлено")],
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        ),
+        config_override=override,
+    )
+    _write_standalone_report_from_cache(
+        cfg, tamper={"translation_hash": "different-raw-hash"},
+    )
+
+    resume = _B3MockBackend(
+        r_editor_edits=[("p00001", "typo", " — исправлено")],
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    second = _run_with_b3(cfg, resume, config_override=override)
+    assert resume.r_editor_calls() == 8  # changed text NOT reused
+    assert resume.audit_calls() == 8
+    assert second.step8["released_as_audited"] is True
+
+
+def test_b3_fallback_report_missing_identity_not_reused(tmp_path: Path) -> None:
+    """REVIEW b55e940 HIGH: a pre-identity report (no translation_hash /
+    pids / config_identity — the old schema) is rejected fail-closed; all
+    affected chunks re-run."""
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = _fallback_override()
+    _run_with_b3(
+        cfg,
+        _B3MockBackend(
+            r_editor_edits=[("p00001", "typo", " — исправлено")],
+            audit_issues=[], repair_results=[], reaudit_issues=[],
+        ),
+        config_override=override,
+    )
+    _write_standalone_report_from_cache(cfg, drop_identity=True)
+
+    resume = _B3MockBackend(
+        r_editor_edits=[("p00001", "typo", " — исправлено")],
+        audit_issues=[], repair_results=[], reaudit_issues=[],
+    )
+    second = _run_with_b3(cfg, resume, config_override=override)
+    assert resume.r_editor_calls() == 8  # old report NOT reused
+    assert resume.audit_calls() == 8
+    assert second.step8["released_as_audited"] is True
