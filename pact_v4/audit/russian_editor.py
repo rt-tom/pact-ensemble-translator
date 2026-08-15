@@ -48,10 +48,15 @@ harmful):
    continuity, or a foreign pid) is dropped per-edit with a WARNING — the
    chunk stays GOOD and the owned edits survive (run_remote_007 chunk5
    p00195), it is never applied and never forwarded to another chunk.
-   Structural validation runs before the scope check (RV t_f4111b48): a
-   MALFORMED out-of-scope edit (unknown class, missing/non-string fields,
-   non-substring original against a known pid text) still fails the WHOLE
-   chunk — the scope drop never masks malformed payloads.
+   R-SUBSTRING-DROP (owner 2026-08-15): an imprecise ``original`` quotation
+   (not a verbatim substring of a known pid text) is ALSO dropped per-edit
+   with a WARNING — every edit is validated individually, so one truncated
+   quotation (run_0005 p00128 — model cut the fragment before the closing
+   quote/») no longer discards the chunk's other valid edits. The later
+   apply pass re-checks the substring before the safe replace. Structural
+   validation runs before the scope check (RV t_f4111b48): a MALFORMED
+   out-of-scope edit (unknown class, missing/non-string fields) still fails
+   the WHOLE chunk — the per-edit drops never mask malformed payloads.
    Fail-closed is per-chunk: a failed chunk contributes NO edits to
    ``edits``/``applied``/``candidates``, so the caller applies exactly the
    successful chunks' work (RESILIENCE t_406fc48c, run_remote_001: 17 valid
@@ -458,9 +463,12 @@ def parse_editor_edits(
     from the current text as ``original`` (one sentence or a shorter span;
     it must be a substring of the current text — R-FIX2, run_012 p00010-class
     fragments), carry a non-empty ``rewritten`` and ``reason``, and tag a
-    KNOWN class. Any structural violation (original not a
-    substring, unknown class, missing/non-string fields) fails the WHOLE
-    chunk — a bad chunk is never silently read as ``edits=[]``.
+    KNOWN class. Any structural violation (unknown class, missing/non-string fields)
+ fails the WHOLE chunk — a bad chunk is never silently read as
+ ``edits=[]``. An imprecise ``original`` quotation (not a verbatim
+ substring of a known pid text) is dropped PER-EDIT with a WARNING
+ (R-SUBSTRING-DROP, owner 2026-08-15) — the chunk stays GOOD and its
+ other valid edits survive.
     Structural validation runs FIRST for every edit (RV t_f4111b48): the
     pid-scope drop below only applies to a WELL-FORMED out-of-scope edit.
     A malformed context/foreign edit (unknown class, missing/non-string
@@ -538,13 +546,24 @@ def parse_editor_edits(
         # original against — such a foreign edit is structurally
         # well-formed if the remaining fields pass (R-PID-SCOPE drops it
         # below with a WARNING, it is never applied).
+        # R-SUBSTRING-DROP (owner decision 2026-08-15): an imprecise
+        # quotation is now dropped PER-EDIT with a WARNING, not a chunk
+        # failure — every edit is validated individually, so one bad
+        # quotation must not discard the chunk's OTHER valid edits (the
+        # model regularly truncates a long PID at a closing quote/»).
+        # Fail-closed is preserved for everything that makes the whole
+        # response untrustworthy (invalid JSON, unknown class, missing
+        # fields); a bad fragment only forfeits ITS OWN edit. The later
+        # apply pass re-checks the substring before the safe replace
+        # (skips per-edit if an earlier same-pid edit moved the text).
         if original not in str(current_by_pid.get(pid, "")) and (
             pid in chunk_pid_set or pid in current_by_pid
         ):
-            errors.append(
+            warnings.append(
                 f"pid {pid}: original is not a substring of the current text "
                 f"(model must quote the exact fragment verbatim from the "
-                f"current Russian text)"
+                f"current Russian text) — edit dropped per-edit, chunk stays "
+                f"GOOD"
             )
             continue
         if not isinstance(rewritten, str) or not rewritten.strip():

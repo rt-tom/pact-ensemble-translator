@@ -277,25 +277,30 @@ def test_parse_out_of_scope_missing_or_non_string_original_fails_closed() -> Non
     assert warnings == ()
 
 
-def test_parse_out_of_scope_non_substring_original_fails_closed() -> None:
-    """RV t_f4111b48: an out-of-scope pid whose text IS known (a context
-    pid of the same chapter) is still held to the verbatim original-
-    substring rule — an invented original is a structural error, not a
-    WARNING drop."""
+def test_parse_out_of_scope_non_substring_original_dropped_per_edit() -> None:
+    """R-SUBSTRING-DROP (owner 2026-08-15): an imprecise original on a
+    KNOWN pid text is a per-edit WARNING drop — the chunk stays GOOD and
+    the OTHER valid edits of the chunk survive (previously: whole chunk
+    failed)."""
     current = {"p00001": "текст один", "p00002": "текст два"}
     edits, errors, warnings = parse_editor_edits(
-        _ok([_edit("p00002", "совсем другой текст", "фикс", "r", "typo")]),
-        ["p00001"], current,  # p00002 is context, its text IS known
+        _ok([
+            _edit("p00001", "текст один", "текст один испр", "r", "typo"),
+            _edit("p00002", "совсем другой текст", "фикс", "r", "typo"),
+        ]),
+        ["p00001", "p00002"], current,
     )
-    assert edits == ()
-    assert any("not a substring" in e for e in errors)
-    assert warnings == ()
+    assert errors == ()
+    assert len(edits) == 1  # the valid owned edit survives
+    assert edits[0].pid == "p00001"
+    assert any("not a substring" in w for w in warnings)
 
 
 def test_parse_mixed_owned_valid_foreign_malformed_fails_closed() -> None:
     """RV t_f4111b48: ONE malformed out-of-scope edit in a chunk that also
     carries a VALID owned edit fails the WHOLE chunk — the valid owned edit
-    is NOT retained (edits == (), errors present)."""
+    is NOT retained (edits == (), errors present). R-SUBSTRING-DROP does
+    NOT soften this: unknown class stays a whole-chunk failure."""
     current = {"p00001": "текст один", "p00002": "текст два"}
     edits, errors, warnings = parse_editor_edits(
         _ok([
@@ -309,39 +314,43 @@ def test_parse_mixed_owned_valid_foreign_malformed_fails_closed() -> None:
     assert warnings == ()
 
 
-def test_parse_rejects_original_mismatch() -> None:
+def test_parse_rejects_original_mismatch_dropped_per_edit() -> None:
     current = {"p00001": "текст А"}
-    edits, errors, _ = parse_editor_edits(
+    edits, errors, warnings = parse_editor_edits(
         _ok([_edit("p00001", "текст Б", "текст В", "r", "typo")]),
         ["p00001"], current,
     )
-    assert edits == ()
-    assert any("not a substring" in e for e in errors)
+    assert errors == ()
+    assert edits == ()  # the bad edit is dropped, not applied
+    assert any("not a substring" in w for w in warnings)
 
 
-def test_parse_rejects_original_leading_trailing_whitespace() -> None:
+def test_parse_rejects_original_leading_trailing_whitespace_dropped_per_edit() -> None:
     # RV fd7ee8e + R-FIX2: verbatim substring — ' текст А ' must NOT match
     # 'текст А' (leading/trailing whitespace is not a verbatim substring).
-    # The old strip()-based comparison silently accepted a whitespace-wrapped
-    # original; strict verbatim fails the WHOLE chunk.
+    # R-SUBSTRING-DROP (2026-08-15): a whitespace-wrapped original is now a
+    # per-edit WARNING drop, not a whole-chunk failure.
     current = {"p00001": "текст А"}
-    edits, errors, _ = parse_editor_edits(
+    edits, errors, warnings = parse_editor_edits(
         _ok([_edit("p00001", " текст А ", "текст Б", "r", "typo")]),
         ["p00001"], current,
     )
+    assert errors == ()
     assert edits == ()
-    assert any("not a substring" in e for e in errors)
+    assert any("not a substring" in w for w in warnings)
 
 
-def test_parse_rejects_original_trailing_whitespace() -> None:
-    # Even a single trailing space is not a verbatim substring.
+def test_parse_rejects_original_trailing_whitespace_dropped_per_edit() -> None:
+    # Even a single trailing space is not a verbatim substring — per-edit
+    # WARNING drop (R-SUBSTRING-DROP, 2026-08-15).
     current = {"p00001": "текст А"}
-    edits, errors, _ = parse_editor_edits(
+    edits, errors, warnings = parse_editor_edits(
         _ok([_edit("p00001", "текст А ", "текст Б", "r", "typo")]),
         ["p00001"], current,
     )
+    assert errors == ()
     assert edits == ()
-    assert any("not a substring" in e for e in errors)
+    assert any("not a substring" in w for w in warnings)
 
 
 def test_parse_accepts_original_fragment_substring() -> None:
@@ -368,19 +377,25 @@ def test_parse_accepts_original_fragment_substring() -> None:
     assert edits[0].original == fragment
 
 
-def test_parse_rejects_original_not_a_substring_invented() -> None:
-    # R-FIX2 fail-closed: a model-INVENTED original (not a substring of the
-    # PID) voids the whole chunk — 'not a substring', never applied.
+def test_parse_rejects_original_not_a_substring_invented_dropped_per_edit() -> None:
+    # R-FIX2 + R-SUBSTRING-DROP (2026-08-15): a model-INVENTED original
+    # (not a substring of the PID) is dropped per-edit with a WARNING —
+    # never applied, but the chunk's OTHER valid edits survive.
     current = {"p00010": "Три этажа, с однокомнатной башней."}
-    edits, errors, _ = parse_editor_edits(
+    edits, errors, warnings = parse_editor_edits(
         _ok([
             _edit("p00010", "Совершенно другой текст, которого нет в PID.",
                   "какой-то фикс", "выдумка", "typo"),
+            _edit("p00010", "Три этажа, с однокомнатной башней.",
+                  "Три этажа, с однокомнатной башней — исправлено.",
+                  "грамматика", "grammar"),
         ]),
         ["p00010"], current,
     )
-    assert edits == ()
-    assert any("not a substring" in e for e in errors)
+    assert errors == ()
+    assert len(edits) == 1  # the valid edit survives
+    assert edits[0].klass == "grammar"
+    assert any("not a substring" in w for w in warnings)
 
 
 def test_parse_preserves_exact_rewritten_no_strip() -> None:
@@ -928,22 +943,26 @@ def test_evaluator_fragment_originals_complete_and_preserve_pid() -> None:
     assert applied["p00011"].endswith("Она кивнула.")
 
 
-def test_evaluator_invented_original_chunk_fails_closed() -> None:
-    """R-FIX2 fail-closed: a chunk containing a model-INVENTED original (not
-    a substring of the PID) is FAILED — nothing from that chunk is applied."""
+def test_evaluator_invented_original_chunk_survives() -> None:
+    """R-SUBSTRING-DROP (2026-08-15): a chunk with a model-INVENTED
+    original is NOT failed anymore — the bad edit is dropped per-edit with
+    a WARNING, the chunk stays GOOD with its other valid edits applied."""
     translation = {"p00010": "Три этажа, с однокомнатной башней."}
     backend = _MockBackend(
         _ok([
             _edit("p00010", "Выдуманный текст без совпадения с PID.",
                   "фикс", "r", "typo"),
+            _edit("p00010", "Три этажа, с однокомнатной башней.",
+                  "Три этажа, с однокомнатной башней — исправлено.",
+                  "грамматика", "grammar"),
         ]),
     )
     evaluator = RussianEditorEvaluator(backend)
     outcome = evaluator(chapter_id="0001", translation=translation)
-    assert outcome.complete is False
-    assert outcome.failed_chunks == (1,)
-    assert outcome.applied == ()
-    assert outcome.candidates == ()
+    assert outcome.complete is True
+    assert outcome.failed_chunks == ()
+    assert len(outcome.applied) == 1  # the valid grammar edit is applied
+    assert outcome.applied[0][0] == "p00010"
 
 
 def test_evaluator_transport_failure_is_failed_chunk() -> None:
