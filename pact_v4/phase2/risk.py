@@ -153,7 +153,25 @@ def _snippets(pattern: re.Pattern[str], text: str, limit: int = 3) -> tuple[str,
 
 
 def _term_present(text: str, term: str) -> bool:
-    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE) is not None
+    # APOSTROPHE-NORM (architect, run_0004-0005 2026-08-15): the book's
+    # HTML source uses the typographic apostrophe (U+2019) — "Jacob’s
+    # Bell" — while the glossary stores the ASCII form ("Jacob's Bell").
+    # A plain escaped regex never matched, so budgeted entries with an
+    # apostrophe were silently dropped from the generation prompt (the
+    # model then invented "Колокол Якоба"). Match both forms exactly like
+    # _integrity_checks.source_term_present does (which already handled
+    # this); the two matchers must never disagree about presence.
+    folded = term.replace("\u2019", "'").replace("\u2018", "'")
+    if not folded:
+        return False
+    escaped = re.escape(folded)
+    escaped = escaped.replace(r"\ ", r"\s+")
+    escaped = escaped.replace("'", "['\u2019]")
+    flags = 0 if folded[:1].isupper() else re.IGNORECASE
+    return re.search(
+        rf"(?<!\w){escaped}(?!\w)", text.replace("\u2019", "'").replace("\u2018", "'"),
+        flags,
+    ) is not None
 
 
 def source_term_required_categories(source_term: str) -> frozenset[str]:
