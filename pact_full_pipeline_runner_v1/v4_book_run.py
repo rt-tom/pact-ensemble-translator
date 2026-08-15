@@ -1017,6 +1017,73 @@ def run_book(
         # promoted by the same promote() below (B7 quarantined filter
         # applies via chunk_id). The aligned target also fills canonical_ru
         # in the book_memory entity observations.
+        # GLOSSARY-FROM-ENTITY fail-closed quarantine provenance (RV
+        # finding t_72f549c8, B9-F5/F6): an accepted_degraded chapter WITH
+        # quarantined chunks may only generate/promote entity-derived
+        # glossary observations when the PID->chunk plan authoritatively
+        # maps each source/translation pid exactly once. A
+        # missing/corrupt/empty/ambiguous plan (``_pid_to_chunk`` -> None)
+        # or an incomplete plan (a source/translation pid the plan does
+        # not map) leaves pids of UNKNOWN provenance — they could belong
+        # to a quarantined chunk, and an observation carrying
+        # ``chunk_id=""`` would slip through the B7 filter and promote
+        # quarantine evidence. Such a chapter fails closed for the whole
+        # glossary block: no candidates generated/proposed/committed/
+        # conflicts, no glossary ledger line, no glossary observation, no
+        # glossary mutation (a warning is logged; the run never crashes).
+        # Complete chapters and accepted_degraded chapters WITHOUT
+        # quarantined chunks never consult the plan (there is no
+        # quarantine evidence to exclude) — behaviour unchanged, zero
+        # extra model calls.
+        glossary_provenance_ok = True
+        pid_to_chunk: Optional[Dict[str, str]] = None
+        if terminal_status == "accepted_degraded" and quarantined:
+            try:
+                pid_to_chunk = _pid_to_chunk(out_dir)
+                if pid_to_chunk is None:
+                    LOG.warning(
+                        "GLOSSARY-FROM-ENTITY F6: %s accepted_degraded "
+                        "with quarantined chunks %s but PID->chunk "
+                        "provenance missing/corrupt/empty/ambiguous "
+                        "(duplicate or malformed ownership); failing "
+                        "closed — no glossary candidates, ledger line, "
+                        "observation or mutation",
+                        out_dir.name, sorted(quarantined),
+                    )
+                    glossary_provenance_ok = False
+                else:
+                    present_pids = (
+                        {str(pid) for pid in _source_by_pid(chapter_html)}
+                        | {
+                            str(pid)
+                            for pid in _load_json(
+                                out_dir / "translations.json", {},
+                            )
+                        }
+                    )
+                    if not present_pids <= set(pid_to_chunk):
+                        LOG.warning(
+                            "GLOSSARY-FROM-ENTITY F5: %s accepted_degraded "
+                            "with quarantined chunks %s but PID->chunk "
+                            "provenance incomplete (plan pids=%d, unmapped "
+                            "source/translation pids=%s); failing closed — "
+                            "no glossary candidates, ledger line, "
+                            "observation or mutation",
+                            out_dir.name, sorted(quarantined),
+                            len(pid_to_chunk),
+                            sorted(present_pids - set(pid_to_chunk)),
+                        )
+                        glossary_provenance_ok = False
+            except Exception as exc:  # noqa: BLE001 — never break a run
+                LOG.warning(
+                    "GLOSSARY-FROM-ENTITY: provenance gate failed for %s "
+                    "(%s: %s); failing closed — no glossary candidates, "
+                    "ledger line, observation or mutation",
+                    chapter_id, type(exc).__name__, exc,
+                )
+                glossary_provenance_ok = False
+        else:
+            pid_to_chunk = _pid_to_chunk(out_dir)
         glossary_obs: Dict[str, Any] = {}
         canonical_ru_map: Dict[str, str] = {}
         glossary_proposed: List[Dict[str, Any]] = []
@@ -1087,22 +1154,31 @@ def run_book(
                             # GLOSSARY-FROM-ENTITY (variant B, 0 extra model
                             # calls): align the verified proper-noun entities
                             # against the finished chapter translation.
-                            g = glossary_observations_from_entity_context(
-                                context,
-                                chapter_id=chapter_id,
-                                source_by_pid=_source_by_pid(chapter_html),
-                                translations=_load_json(
-                                    out_dir / "translations.json", {}
-                                ),
-                                glossary=glossary_before,
-                                book_memory=book_memory_before,
-                                consensus_ratio=consensus_ratio,
-                                pid_to_chunk=_pid_to_chunk(out_dir),
-                            )
-                            glossary_obs.update(g["glossary"])
-                            canonical_ru_map.update(g["canonical_ru"])
-                            glossary_proposed.extend(g["proposed"])
-                            glossary_conflicts.extend(g["conflicts"])
+                            # Fail-closed provenance (RV finding
+                            # t_72f549c8, B9-F5/F6): when the chapter is
+                            # accepted_degraded WITH quarantined chunks, the
+                            # PID->chunk plan must be authoritative and
+                            # complete (checked above) — otherwise no
+                            # glossary observations are generated at all
+                            # (chunk_id="" would bypass the B7 filter and
+                            # could promote quarantine evidence).
+                            if glossary_provenance_ok:
+                                g = glossary_observations_from_entity_context(
+                                    context,
+                                    chapter_id=chapter_id,
+                                    source_by_pid=_source_by_pid(chapter_html),
+                                    translations=_load_json(
+                                        out_dir / "translations.json", {}
+                                    ),
+                                    glossary=glossary_before,
+                                    book_memory=book_memory_before,
+                                    consensus_ratio=consensus_ratio,
+                                    pid_to_chunk=pid_to_chunk,
+                                )
+                                glossary_obs.update(g["glossary"])
+                                canonical_ru_map.update(g["canonical_ru"])
+                                glossary_proposed.extend(g["proposed"])
+                                glossary_conflicts.extend(g["conflicts"])
                         except Exception as exc:  # noqa: BLE001 — never break a run
                             LOG.warning(
                                 "GLOSSARY-FROM-ENTITY: glossary alignment "

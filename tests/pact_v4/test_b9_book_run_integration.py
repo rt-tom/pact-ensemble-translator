@@ -134,14 +134,23 @@ def _make_chapter_artifacts(
     terminal_status: str,
     quarantined: list,
     translations: dict,
-    chunk_plan: dict,
+    chunk_plan: dict | None = None,
     entity_cache_payload: dict | None = None,
     record_source_hash: str = "test-hash",
     record_extractor_version: str = EXTRACTOR_VERSION,
 ) -> None:
-    """Pre-populate the per-chapter out_dir the way the strict driver would."""
+    """Pre-populate the per-chapter out_dir the way the strict driver would.
+
+    ``chunk_plan=None`` deliberately leaves ``chunk_plan.json`` ABSENT
+    (provenance-missing test); the selection record still declares which
+    chunks were quarantined, so the run sees a non-empty quarantined set
+    without an authoritative plan.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    chunk_ids = [c["chunk_id"] for c in chunk_plan["chunks"]]
+    if chunk_plan is not None:
+        chunk_ids = [c["chunk_id"] for c in chunk_plan["chunks"]]
+    else:
+        chunk_ids = list(quarantined)
     results = []
     for chunk_id in chunk_ids:
         is_q = chunk_id in quarantined
@@ -172,9 +181,10 @@ def _make_chapter_artifacts(
     out_dir.joinpath("translations.json").write_text(
         json.dumps(translations, ensure_ascii=False), encoding="utf-8",
     )
-    out_dir.joinpath("chunk_plan.json").write_text(
-        json.dumps(chunk_plan, ensure_ascii=False), encoding="utf-8",
-    )
+    if chunk_plan is not None:
+        out_dir.joinpath("chunk_plan.json").write_text(
+            json.dumps(chunk_plan, ensure_ascii=False), encoding="utf-8",
+        )
     if entity_cache_payload is not None:
         out_dir.joinpath("entity_context_cache.json").write_text(
             json.dumps(entity_cache_payload, ensure_ascii=False),
@@ -260,7 +270,7 @@ class TestBookRunGlossaryFromEntity:
                 terminal_status=spec["terminal"],
                 quarantined=spec.get("quarantined", []),
                 translations=spec["translations"],
-                chunk_plan=_PLAN,
+                chunk_plan=spec.get("chunk_plan", _PLAN),
                 entity_cache_payload=spec.get("entity_cache"),
                 record_source_hash=spec.get("source_hash", "test-hash"),
                 record_extractor_version=spec.get(
@@ -620,6 +630,215 @@ class TestBookRunGlossaryFromEntity:
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
+
+    def test_quarantined_anchor_chunk_missing_plan_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        """RV finding t_72f549c8 (HIGH): accepted_degraded WITH quarantined
+        chunks and NO chunk_plan.json — the entity-derived glossary block
+        fails closed (B9-F5/F6). The reproduced bug: missing plan made
+        ``_pid_to_chunk`` return None, the observation carried
+        ``chunk_id=\"\"``, and MemoryManager promoted the Rose entry
+        (quarantine evidence committed). Now the whole glossary block is
+        skipped: no candidates, no ledger line, no observation, no
+        glossary mutation — and the run does not crash."""
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": {
+                "html": _CH_HTML,
+                "terminal": "accepted_degraded",
+                "quarantined": ["chunk0001"],
+                "translations": _CH_TRANSLATIONS,
+                "chunk_plan": None,
+                "entity_cache": _entity_cache_entry(
+                    "0001", _CH_SOURCE_TEXT,
+                    entity="Rose", canonical_type="woman",
+                    anchor_pid="p00001",
+                    anchor_span="Rose met Blake at the gate.",
+                ),
+            },
+        })
+
+        rec = result["chapters"][0]
+        assert rec["terminal_status"] == "accepted_degraded"
+        # Fail-closed: candidates generated/proposed/committed/conflicts
+        # all zero for the glossary block.
+        assert rec["candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+        # No glossary ledger line (the ledger file is never created).
+        assert not (out_base / "glossary_candidates.json").exists()
+        # No glossary observation (observations.json holds nothing for
+        # glossary after promote).
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+        # No glossary mutation: the empty glossary.json is untouched.
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+        # The run continues: the SAFE-MEMORY entity path still promotes
+        # Rose to book_memory (chapter-level, no chunk provenance needed),
+        # but WITHOUT the glossary-derived canonical_ru (nothing aligned).
+        book_memory = json.loads(
+            (memory / "book_memory.json").read_text(encoding="utf-8")
+        )
+        assert "Rose" in book_memory.get("entities", {})
+        assert "canonical_ru" not in book_memory["entities"]["Rose"]
+
+    def test_quarantined_anchor_chunk_duplicate_plan_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        """A duplicate/ambiguous PID->chunk plan (the anchor pid listed in
+        TWO chunks) is non-authoritative: ``_pid_to_chunk`` returns None,
+        so the entity-derived glossary block fails closed (B9-F5/F6) — no
+        candidates, no ledger line, no observation, no glossary mutation."""
+        duplicate_plan = {
+            "artifact": "pact-v4-chunk-plan/v1",
+            "snapshot_hash": "test",
+            "plan_hash": "test",
+            "chunks": [
+                {"chunk_id": "chunk0001", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00002", "p00003"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+                {"chunk_id": "chunk0002", "snapshot_hash": "test",
+                 "pids": ["p00003", "p00004", "p00005", "p00006"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+            ],
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": {
+                "html": _CH_HTML,
+                "terminal": "accepted_degraded",
+                "quarantined": ["chunk0001"],
+                "translations": _CH_TRANSLATIONS,
+                "chunk_plan": duplicate_plan,
+                "entity_cache": _entity_cache_entry(
+                    "0001", _CH_SOURCE_TEXT,
+                    entity="Rose", canonical_type="woman",
+                    anchor_pid="p00001",
+                    anchor_span="Rose met Blake at the gate.",
+                ),
+            },
+        })
+
+        rec = result["chapters"][0]
+        assert rec["terminal_status"] == "accepted_degraded"
+        assert rec["candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+        assert not (out_base / "glossary_candidates.json").exists()
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+
+    def test_quarantined_anchor_chunk_incomplete_plan_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        """An incomplete PID->chunk plan (a source/translation pid the plan
+        does not map) is non-authoritative: the entity-derived glossary
+        block fails closed (B9-F5) — a pid of unknown provenance could
+        belong to a quarantined chunk."""
+        incomplete_plan = {
+            "artifact": "pact-v4-chunk-plan/v1",
+            "snapshot_hash": "test",
+            "plan_hash": "test",
+            "chunks": [
+                {"chunk_id": "chunk0001", "snapshot_hash": "test",
+                 "pids": ["p00001", "p00002", "p00003"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+                {"chunk_id": "chunk0002", "snapshot_hash": "test",
+                 "pids": ["p00004", "p00005"],
+                 "word_counts": [], "context": {"left_ru": "", "right_en": []},
+                 "undersized_exception": False},
+            ],
+        }
+        memory, out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": {
+                "html": _CH_HTML,
+                "terminal": "accepted_degraded",
+                "quarantined": ["chunk0001"],
+                "translations": _CH_TRANSLATIONS,
+                "chunk_plan": incomplete_plan,
+                "entity_cache": _entity_cache_entry(
+                    "0001", _CH_SOURCE_TEXT,
+                    entity="Rose", canonical_type="woman",
+                    anchor_pid="p00001",
+                    anchor_span="Rose met Blake at the gate.",
+                ),
+            },
+        })
+
+        rec = result["chapters"][0]
+        assert rec["terminal_status"] == "accepted_degraded"
+        assert rec["candidates"] == {
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
+        }
+        assert not (out_base / "glossary_candidates.json").exists()
+        observations = json.loads(
+            (memory / "observations.json").read_text(encoding="utf-8")
+        )
+        assert observations.get("glossary", {}) == {}
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {}
+
+    def test_accepted_anchor_chunk_promotes_accepted_degraded(
+        self, tmp_path, monkeypatch,
+    ):
+        """With a VALID authoritative plan, an entity anchored in an
+        ACCEPTED chunk may promote under accepted_degraded: the anchor
+        pid's chunk (chunk0002) is not quarantined, so the B7 filter keeps
+        the observation (quarantine never blocks clean evidence)."""
+        html = """<p>Rose met Blake at the gate.</p>
+<p>Blake waited outside for Mary.</p>
+<p>Rose knew the way home.</p>
+<p>Rose walked home alone.</p>
+<p>The pact held them all together.</p>
+<p>He walked home alone.</p>"""
+        translations = {
+            "p00001": "Роуз встретила Блэйка у ворот.",
+            "p00002": "Блэйк ждал снаружи Мэри.",
+            "p00003": "Роуз знала дорогу домой.",
+            "p00004": "Роуз пошла домой одна.",
+            "p00005": "Пакт держал их всех вместе.",
+            "p00006": "Он пошёл домой один.",
+        }
+        source_text = {
+            "p00001": "Rose met Blake at the gate.",
+            "p00002": "Blake waited outside for Mary.",
+            "p00003": "Rose knew the way home.",
+            "p00004": "Rose walked home alone.",
+            "p00005": "The pact held them all together.",
+            "p00006": "He walked home alone.",
+        }
+        memory, _out_base, result = self._run(tmp_path, monkeypatch, {
+            "0001": {
+                "html": html,
+                "terminal": "accepted_degraded",
+                "quarantined": ["chunk0001"],
+                "translations": translations,
+                "entity_cache": _entity_cache_entry(
+                    "0001", source_text,
+                    entity="Rose", canonical_type="woman",
+                    anchor_pid="p00004",
+                    anchor_span="Rose walked home alone.",
+                ),
+            },
+        })
+
+        rec = result["chapters"][0]
+        assert rec["terminal_status"] == "accepted_degraded"
+        # Anchor in chunk0002 (accepted): proposed and committed.
+        assert rec["candidates"] == {
+            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+        }
+        glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
+        assert glossary == {"Rose": "Роуз"}
 
     def test_failed_chapter_never_promotes(self, tmp_path, monkeypatch):
         """A failed chapter never promotes glossary entries — even with a
