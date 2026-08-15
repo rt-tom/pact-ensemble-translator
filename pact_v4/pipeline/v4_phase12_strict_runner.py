@@ -162,6 +162,7 @@ from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_OVERLAP_TOKENS,
     DEFAULT_REPAIR_CONTEXT_WINDOW,
     DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
+    DEFAULT_REPAIR_MAX_TOKENS,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
     REAUDIT_DELTA_FORMAT,
@@ -415,6 +416,13 @@ class StrictRunConfig:
     # Defaults mirror the selective-repair module (20000 tokens; JsonRetryPolicy
     # max_retries=2 -> 3 attempts, base_delay_seconds=1.0).
     audit_repair_reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
+    # REPAIR-MAX-TOKENS (owner decision 2026-08-15, "16к Делай"): the
+    # per-batch repair OUTPUT budget (distinct from the re-audit budget) —
+    # 4000 was exhausted by deepseek reasoning in run_0004-0005 (raw=0,
+    # reasoning 26-33k bytes) → 5/6 repair batches failed. Identity-bearing
+    # (F5): wired through _build_b3_audit_repair so a budget change
+    # invalidates a stale cached repaired map.
+    audit_repair_max_tokens: int = DEFAULT_REPAIR_MAX_TOKENS
     audit_repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
     audit_repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
     audit_prompt_version: str = PROMPT_VERSION
@@ -4853,6 +4861,7 @@ def _run_whole_chapter_strict_impl(
                     "delta_format": cfg.audit_repair_reaudit_delta_format,
                 },
                 "repair_reaudit_max_tokens": cfg.audit_repair_reaudit_max_tokens,
+                "repair_max_tokens": cfg.audit_repair_max_tokens,
                 "repair_reaudit_retry": {
                     "max_retries": cfg.audit_repair_reaudit_max_retries,
                     "base_delay_seconds": cfg.audit_repair_reaudit_base_delay_seconds,
