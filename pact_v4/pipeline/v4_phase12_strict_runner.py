@@ -566,6 +566,12 @@ class StrictRunConfig:
                     # 12000-token re-audit must never replay under the
                     # 20000-token policy (RV 71b7cbc finding).
                     "repair_reaudit_max_tokens": self.audit_repair_reaudit_max_tokens,
+                    # REPAIR-MAX-TOKENS (owner decision 2026-08-15): the
+                    # per-batch repair OUTPUT budget is identity-bearing —
+                    # a cache written under 4000 (empty deepseek repair
+                    # responses, run_0004-0005) must never replay under
+                    # 16000. F5: budget change invalidates cache/resume.
+                    "repair_max_tokens": self.audit_repair_max_tokens,
                     "repair_reaudit_retry": {
                         "max_retries": self.audit_repair_reaudit_max_retries,
                         "base_delay_seconds": self.audit_repair_reaudit_base_delay_seconds,
