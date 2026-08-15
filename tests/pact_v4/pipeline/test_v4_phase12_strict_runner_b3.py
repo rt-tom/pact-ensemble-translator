@@ -1703,6 +1703,76 @@ def test_b3_repair_failed_never_released(tmp_path: Path) -> None:
     assert repaired["translations"]["p00001"] == "Перевод номер1 номер1"
 
 
+def test_b3_tolerant_two_of_four_never_released(tmp_path: Path) -> None:
+    """REPAIR-ROBUST-PARTIAL (t_c0cb8e3c, review finding): a truncated
+    2-of-4 tolerant repair response (only indices 1,2 of 4 recovered) must
+    NOT release the chapter as audited. The recovered repairs are retained
+    (salvage policy preserved — committed/passed), but the batch is PARTIAL:
+    repair_complete=False and the B3 gate degrades the release to
+    accepted_degraded with released_as_audited=False; the missing findings
+    are explicit in the debt trace (never a silent complete/PASS)."""
+    cfg = _whole_chapter_cfg(tmp_path)
+
+    class _TruncatedRepairBackend(_B3MockBackend):
+        """Serves a TRUNCATED repair batch body (the model dropped the final
+        '}' after returning only indices 1,2 of 4) — the tolerant salvage
+        path, mirroring the run_0005 batch3/5/7/9 defect class."""
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.requests.append(request)
+            label = request.label or ""
+            if "selective_repair" in label:
+                # 2 of 4 answers, outer object truncated (no closing '}').
+                body = '{"results": [' + ",".join([
+                    json.dumps({"index": 1, "decision": "pass", "reason": "ok"},
+                               ensure_ascii=False),
+                    json.dumps({"index": 2, "decision": "pass", "reason": "ok"},
+                               ensure_ascii=False),
+                ]) + "]"  # truncated: no closing '}' after the ']'
+                return CompletionResponse(
+                    text=body, model="qwen-3.6-35b", finish_reason="stop",
+                )
+            return super().complete(request)
+
+    backend = _TruncatedRepairBackend(
+        audit_issues=[
+            {
+                "id": f"p{i:05d}", "category": "addition", "severity": "major",
+                "confidence": "high", "note": f"дублирование слова {i}",
+                "excerpt": f"номер{i} номер{i}",
+            }
+            for i in range(1, 5)
+        ],
+        repair_results=[],
+        reaudit_issues=[],
+    )
+    result = _run_with_b3(cfg, backend)
+
+    # Audit completed; repair did NOT complete (partial tolerant recovery).
+    assert result.step6["audit_complete"] is True
+    assert result.step7["repair_complete"] is False
+    assert result.step7["status"] == "incomplete"
+    # Terminal B3 gate: NOT released as audited (fail-closed).
+    assert result.step8["status"] == "accepted_degraded"
+    assert result.step8["released_as_audited"] is False
+    assert result.step8["repair_complete"] is False
+    assert result.step8["reason"] == "repair_incomplete"
+    # The missing findings (p00003, p00004) are explicit in the debt trace.
+    debt = " ".join(result.step8["debt_trace"])
+    assert "p00003" in debt and "p00004" in debt
+    # The recovered passes (p00001, p00002) are retained — salvage kept.
+    assert result.step7["passed_pids"] == ["p00001", "p00002"]
+
+    # Journal gate agrees: not released.
+    journal = [
+        json.loads(line)
+        for line in (cfg.out_dir / "audit_journal.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    gate = next(e for e in journal if e["event"] == "gate")
+    assert gate["released_as_audited"] is False
+    assert gate["repair_complete"] is False
+
+
 def test_b3_reaudit_failed_never_released(tmp_path: Path) -> None:
     # Repair commits, but the post-repair re-audit FAILS (transport) ->
     # repair_complete=False (selective_repair fail-closed). The chapter

@@ -688,6 +688,27 @@ def test_parse_repair_tolerant_coverage_below_threshold_fails() -> None:
     assert any("no answer recovered" in w for w in warnings)
 
 
+def test_parse_repair_tolerant_two_of_four_recovers_records() -> None:
+    """REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): a truncated 2-of-4 response
+    (only indices 1,2 present, no closing ``}``) still returns the recovered
+    records with NO errors — the 50% salvage policy is preserved at the
+    PARSER level. The PARTIAL state (missing indices surfaced, batch never
+    GOOD/complete) is decided by the caller (``_run_batch`` / evaluator),
+    not here: the parser keeps its ``(results, errors, warnings)`` contract
+    and the recovered records are retained for commit."""
+    findings = _four_findings()
+    text = '{"results": [' + ",".join([
+        json.dumps({"index": 1, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+        json.dumps({"index": 2, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+    ]) + "]"  # truncated: no closing '}' after the ']'
+    results, errors, warnings = parse_repair_batch(text, findings, {})
+    assert not errors
+    assert [r.index for r in results] == [1, 2]
+    assert any("no answer recovered" in w and "[3, 4]" in w for w in warnings)
+
+
 def test_parse_repair_empty_body_remains_failed() -> None:
     """REPAIR-ROBUST (run_0005 batch1: raw=0, finish=length): an EMPTY body
     has no content to salvage — the batch stays FAILED (the fix for batch1
@@ -1381,6 +1402,56 @@ def test_invalid_batch_response_debt():
     assert outcome.batches[0].status == "FAILED"
     assert outcome.repair_complete is False
     assert outcome.committed == ()
+
+
+def test_tolerant_two_of_four_partial_never_complete() -> None:
+    """REPAIR-ROBUST-PARTIAL (t_c0cb8e3c, review finding): a truncated
+    2-of-4 tolerant response (only indices 1,2 recovered for 4 findings)
+    must NOT be published as complete. The recovered records are retained
+    (salvage policy preserved) but the batch is PARTIAL: the missing
+    indices 3,4 are surfaced in ``missing_indices`` and routed to debt, and
+    ``repair_complete`` stays False — the 50% threshold is a recovery floor,
+    never a publication-complete threshold."""
+    issues = [
+        _issue(f"p{i:05d}", "invented_gender", note="n", confidence="high")
+        for i in range(1, 5)
+    ]
+    source = {f"p{i:05d}": f"source {i}" for i in range(1, 5)}
+    translation = {f"p{i:05d}": f"перевод {i}" for i in range(1, 5)}
+    filtered = _hard_filtered(issues, source, translation)
+    assert all(f.verdict == TIER_B for f in filtered)
+
+    # Truncated outer object: the model returned only indices 1,2 and
+    # dropped the closing '}' (the exact 2-of-4 reproducer).
+    text = '{"results": [' + ",".join([
+        json.dumps({"index": 1, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+        json.dumps({"index": 2, "decision": "pass", "reason": "ok"},
+                   ensure_ascii=False),
+    ]) + "]"  # no closing '}' — tolerant salvage path
+    backend = ScriptedRepairBackend([
+        CompletionResponse(text=text, model="gemma-4-26b", finish_reason="stop"),
+    ])
+    evaluator = SelectiveRepairEvaluator(backend)
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+
+    # Recovered records retained (salvage policy), but the batch is PARTIAL.
+    assert len(outcome.batches) == 1
+    assert outcome.batches[0].status == "PARTIAL"
+    assert outcome.batches[0].missing_indices == (3, 4)
+    assert [r.index for r in outcome.batches[0].results] == [1, 2]
+    # The recovered passes are retained as passed_pids (p00001, p00002).
+    assert outcome.passed_pids == ("p00001", "p00002")
+    # Missing findings are surfaced in debt, not silently accepted.
+    assert any("p00003" in d and "index 3" in d for d in outcome.debt_trace)
+    assert any("p00004" in d and "index 4" in d for d in outcome.debt_trace)
+    assert any("partial tolerant repair" in d for d in outcome.debt_trace)
+    # Never complete, never released.
+    assert outcome.repair_complete is False
+    assert outcome.skipped is False
 
 
 def test_mismatched_index_pid_debt_no_commit():

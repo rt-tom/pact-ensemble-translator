@@ -330,7 +330,7 @@ class RepairBatchOutcome:
     """Outcome of one repair batch (one model call)."""
 
     batch_index: int
-    status: str  # "GOOD" | "FAILED"
+    status: str  # "GOOD" | "PARTIAL" | "FAILED"
     findings: Tuple[EligibleFinding, ...] = ()
     results: Tuple[RepairResult, ...] = ()
     error: str = ""
@@ -338,6 +338,12 @@ class RepairBatchOutcome:
     # batch — e.g. no-op repairs converted to per-index pass (the batch stays
     # GOOD when they are the only issue). Never a batch-killing error.
     warnings: Tuple[str, ...] = ()
+    # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): finding indices the TOLERANT
+    # salvage did NOT recover (``seen != expected``, coverage >= 50%) — the
+    # batch is PARTIAL: the valid recovered repairs are retained, the missing
+    # findings are routed to debt by the evaluator, and ``repair_complete``
+    # can never become True (a partial response is never published complete).
+    missing_indices: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -451,6 +457,10 @@ class SelectiveRepairOutcome:
                     "error": b.error,
                     # REPAIR-2 (t_768537b9): per-index non-fatal notices.
                     "warnings": list(b.warnings),
+                    # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): indices the tolerant
+                    # salvage did not recover — surfaced in diagnostics so a
+                    # partial batch is never mistaken for complete.
+                    "missing_indices": list(b.missing_indices),
                 }
                 for b in self.batches
             ],
@@ -701,6 +711,15 @@ def parse_repair_batch(
     coverage gate (< ``REPAIR_PARSE_MIN_COVERAGE`` of findings recovered →
     the batch FAILS as before, never 1 record of 4).
 
+    REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): the 50% salvage threshold is a
+    RECOVERY threshold, never a publication-complete threshold. A tolerant
+    response that recovered SOME but not ALL findings (``seen != expected``,
+    coverage >= 50%) still returns its valid recovered records (they are
+    committed), but the caller marks the batch PARTIAL and routes every
+    missing index to debt — a partial response must never set
+    ``repair_complete=True`` or ``released_as_audited=True``. A warning alone
+    is not sufficient evidence for a fail-closed repair/release gate.
+
     Returns ``(results, errors, warnings)``:
     * ``errors`` — FATAL for the batch (debt, never a silent PASS): invalid
       JSON, unknown/duplicate/missing index, invalid decision, repair pid not
@@ -842,6 +861,16 @@ def _parse_repair_tolerant(
     batch when fewer than ``REPAIR_PARSE_MIN_COVERAGE`` of the findings were
     recovered (accepting 1 record of 4 is a sign of serious corruption, not
     salvage).
+
+    REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): when coverage >= 50% but ``seen !=
+    expected`` (the model answered only part of the batch), the recovered
+    records are still returned (``errors`` stays empty — the salvage policy
+    is preserved), but the caller (``SelectiveRepairEvaluator._run_batch``)
+    marks the batch PARTIAL and routes every missing finding index to debt.
+    The 50% threshold is a RECOVERY floor, NOT a publication-complete
+    threshold: a partial response must never set ``repair_complete=True`` or
+    ``released_as_audited=True`` (a warning is not sufficient evidence for a
+    fail-closed repair/release gate).
     """
     errors: list = []
     warnings: list = []
@@ -1379,6 +1408,21 @@ class SelectiveRepairEvaluator:
                     # The model answers PASS by index without echoing the PID;
                     # resolve it from the batch finding (the index contract).
                     passed_pids.append(finding_by_index[result.index].pid)
+            # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): a tolerant response that
+            # recovered SOME but not ALL of the batch's findings keeps its
+            # valid recovered repairs (committed above), but every missing
+            # finding is routed to debt — a partial response is NEVER
+            # published as complete (repair_complete stays False via the
+            # PARTIAL batch status).
+            if outcome.status == "PARTIAL":
+                for index in outcome.missing_indices:
+                    finding = finding_by_index.get(index)
+                    pid = finding.pid if finding is not None else f"index {index}"
+                    debt.append(
+                        f"pid {pid}: no repair answer recovered for finding "
+                        f"index {index} (partial tolerant repair — recovered "
+                        f"{len(outcome.results)}/{len(outcome.findings)})"
+                    )
 
         review_journal = _build_review_journal(batch_outcomes, review_candidates)
         # REPAIR-2 (t_768537b9): aggregate per-index non-fatal notices from
@@ -1554,6 +1598,25 @@ class SelectiveRepairEvaluator:
                 results=results,
                 error="; ".join(errors),
                 warnings=warnings,
+            )
+        # REPAIR-ROBUST-PARTIAL (t_c0cb8e3c): a response that did NOT answer
+        # every finding (the tolerant salvage recovered some but not all of
+        # the batch) is PARTIAL — the recovered repairs are retained, but the
+        # missing indices are surfaced in the outcome and routed to debt by
+        # the evaluator, so ``repair_complete`` can never become True for a
+        # partial response. A warning alone is not enough: the 50% salvage
+        # threshold must never act as a publication-complete threshold.
+        answered = {r.index for r in results}
+        expected = {f.index for f in findings}
+        missing = sorted(expected - answered)
+        if missing:
+            return RepairBatchOutcome(
+                batch_index=batch_index,
+                status="PARTIAL",
+                findings=tuple(findings),
+                results=results,
+                warnings=warnings,
+                missing_indices=tuple(missing),
             )
         return RepairBatchOutcome(
             batch_index=batch_index,
