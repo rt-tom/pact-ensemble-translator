@@ -695,13 +695,17 @@ def test_retry_shrink_still_failed_after_shrink_is_fail_closed() -> None:
 
 
 def test_entity_context_hard_cap_fails_closed() -> None:
+    # SAFE-MEMORY fix (2026-08-14): the entity block is a hint, so a hard
+    # overflow TRIMS to whole lines and proceeds — it must not fail the
+    # chapter. Renamed semantics kept in the test name for history: the
+    # audit completes, the model is called with the trimmed context.
     pairs = _pairs("p", 5)
     huge_entity = "e" * (800 * 4 + 100)  # > 800 est tokens
-    backend = ScriptedBackend([])
+    backend = ScriptedBackend([_ok_response([])])
     evaluator = ChunkedAuditEvaluator(backend)
-    with pytest.raises(BudgetOverflowError):
-        evaluator(chapter_id="0001", pairs=pairs, entity_context=huge_entity)
-    assert backend.requests == []  # no model call on hard budget failure
+    outcome = evaluator(chapter_id="0001", pairs=pairs, entity_context=huge_entity)
+    assert outcome.audit_complete
+    assert len(backend.requests) == 1  # trimmed context still reaches the model
 
 
 def test_input_budget_ok_within_limits() -> None:
