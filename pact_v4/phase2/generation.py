@@ -63,7 +63,7 @@ from pact_v4.phase1.models import (
     canonical_json_hash,
 )
 from pact_v4.phase2.prompts import (
-    BALANCED_LITERARY_V3,
+    BALANCED_LITERARY_V4,
     FIDELITY_FIRST_V1,
     PromptTemplate,
 )
@@ -354,7 +354,7 @@ def _roles_for_band(band: RiskBand, *, lazy_balanced: bool = True) -> Tuple[str,
 
 _TEMPLATES: Mapping[str, PromptTemplate] = MappingProxyType({
     "fidelity_first": FIDELITY_FIRST_V1,
-    "balanced_literary": BALANCED_LITERARY_V3,
+    "balanced_literary": BALANCED_LITERARY_V4,
 })
 
 

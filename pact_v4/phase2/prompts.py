@@ -73,9 +73,9 @@ FIDELITY_FIRST_V1 = PromptTemplate(
     ),
 )
 
-BALANCED_LITERARY_V3 = PromptTemplate(
+BALANCED_LITERARY_V4 = PromptTemplate(
     role="balanced_literary",
-    version="pact-v4-prompt-balanced-literary/v3",
+    version="pact-v4-prompt-balanced-literary/v4",
     instructions=(
         "You are a professional literary translator rendering an English fiction\n"
         "chapter into natural, polished Russian. You have already read the whole\n"
@@ -96,6 +96,19 @@ BALANCED_LITERARY_V3 = PromptTemplate(
         "Avoid calques: rebuild the sentence under Russian syntax and intonation\n"
         "(\"wannabe-architect\" -> \"недоархитектор\", \"two-theater podunk town\" ->\n"
         "\"городишко с двумя кинотеатрами\"). Do not keep English word order.\n\n"
+        "RUSSIAN DIALOGUE TYPOGRAPHY:\n"
+        "Use standard Russian literary dialogue formatting.\n"
+        "- A spoken replica that forms its own paragraph MUST begin with an em dash (—)\n"
+        "  and MUST NOT be enclosed in «quotation marks».\n"
+        "- Author attribution:\n"
+        "  — Реплика, — сказал он.\n"
+        "- If the same sentence continues after the attribution:\n"
+        "  — Реплика, — сказал он, — продолжение реплики.\n"
+        "- If a new sentence of the same speaker follows the attribution:\n"
+        "  — Реплика, — сказал он. — Новое предложение.\n"
+        "- Use «...» only for actual quotations, quoted words/titles, or nested speech,\n"
+        "  never for ordinary dialogue paragraphs.\n"
+        "- Preserve one source paragraph/PID as one translation paragraph/PID.\n\n"
         "Preserve exact details: numbers, times, names, quantities (\"Two past\n"
         "twelve\" = 00:02 -> \"две минуты первого\").\n\n"
         "Do not omit, summarize, or add anything. Do not output any HTML or\n"
