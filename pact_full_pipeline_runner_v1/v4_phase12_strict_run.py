@@ -625,6 +625,12 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             # through to the selective-repair evaluator by B3AuditRepair —
             # never silently left at module defaults.
             repair_reaudit_max_tokens=cfg.audit_repair_reaudit_max_tokens,
+            # REPAIR-MAX-TOKENS (owner decision 2026-08-15, "16к Делай"):
+            # the per-batch repair OUTPUT budget is wired from the run
+            # config (never silently left at module defaults) and is
+            # identity-bearing — a budget change invalidates the cached
+            # repaired map.
+            repair_max_tokens=cfg.audit_repair_max_tokens,
             repair_reaudit_max_retries=cfg.audit_repair_reaudit_max_retries,
             repair_reaudit_base_delay_seconds=cfg.audit_repair_reaudit_base_delay_seconds,
             prompt_version=cfg.audit_prompt_version,

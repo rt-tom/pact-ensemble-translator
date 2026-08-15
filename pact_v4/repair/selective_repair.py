@@ -168,7 +168,14 @@ REAUDIT_DELTA_FORMAT = "pact-v4-reaudit-delta/v1"
 # budget is kept (chunked JSON responses + reasoning headroom; the old
 # 12000-token budget was exhausted by reasoning on the full input in
 # run_010-style chapters — owner decision 2026-08-11).
-DEFAULT_REPAIR_MAX_TOKENS = 4000
+# REPAIR-MAX-TOKENS (owner decision 2026-08-15, "16к Делай"): 4000 → 16000.
+# run_0004-0005 remote (deepseek + reasoning high): repair batches burned
+# 8-33k BYTES of reasoning (b3_repair_batch1_raw.txt=0, reasoning=26445)
+# and exhausted the 4000-token budget BEFORE emitting JSON → empty/truncated
+# responses → 5/6 batches failed → chapter accepted_degraded (repair
+# incomplete). 16000 = reasoning headroom (deepseek regularly thinks 2-9k
+# tokens) + JSON content, mirroring the audit's own budget logic.
+DEFAULT_REPAIR_MAX_TOKENS = 16000
 DEFAULT_REAUDIT_MAX_TOKENS = 20000
 
 # The re-audit retry policy is identity-bearing (F5: a policy change must

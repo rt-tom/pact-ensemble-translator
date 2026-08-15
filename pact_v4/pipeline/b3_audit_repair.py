@@ -133,6 +133,7 @@ from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_OVERLAP_TOKENS,
     DEFAULT_REPAIR_CONTEXT_WINDOW,
     DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
+    DEFAULT_REPAIR_MAX_TOKENS,
     REAUDIT_DELTA_FORMAT,
     MICROBATCH_TARGET,
     MICROBATCH_TRIGGER,
@@ -470,6 +471,13 @@ class B3AuditRepairConfig:
     # without them the re-audit would silently fall back to module defaults
     # and a cache written under a different budget/policy could replay.
     repair_reaudit_max_tokens: int = DEFAULT_REAUDIT_MAX_TOKENS
+    # REPAIR-MAX-TOKENS (owner decision 2026-08-15): the per-batch repair
+    # OUTPUT budget (not the re-audit one) — 4000 exhausted by deepseek
+    # reasoning in run_0004-0005 → empty JSON → 5/6 batches failed.
+    # Identity-bearing (F5): a budget change must invalidate a stale
+    # cached repaired map, so it rides the run config identity and is
+    # wired into SelectiveRepairConfig below.
+    repair_max_tokens: int = DEFAULT_REPAIR_MAX_TOKENS
     repair_reaudit_max_retries: int = DEFAULT_REAUDIT_MAX_RETRIES
     repair_reaudit_base_delay_seconds: float = DEFAULT_REAUDIT_BASE_DELAY_SECONDS
     prompt_version: str = PROMPT_VERSION
@@ -536,6 +544,7 @@ class B3AuditRepairConfig:
                 "delta_format": self.repair_reaudit_delta_format,
             },
             "repair_reaudit_max_tokens": self.repair_reaudit_max_tokens,
+            "repair_max_tokens": self.repair_max_tokens,
             "repair_reaudit_retry": {
                 "max_retries": self.repair_reaudit_max_retries,
                 "base_delay_seconds": self.repair_reaudit_base_delay_seconds,
@@ -2384,6 +2393,10 @@ class B3AuditRepair:
                     findings_cap=cfg.repair_findings_cap,
                     microbatch_trigger=cfg.repair_microbatch_trigger,
                     microbatch_target=cfg.repair_microbatch_target,
+                    # REPAIR-MAX-TOKENS (owner decision 2026-08-15): wired
+                    # from the B3 config (identity carries it) — the repair
+                    # output budget is never a silent module default.
+                    max_tokens=cfg.repair_max_tokens,
                     # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
                     # REPAIR prompt/harness version is wired from the B3
                     # config (the run identity carries it) — the evaluator
