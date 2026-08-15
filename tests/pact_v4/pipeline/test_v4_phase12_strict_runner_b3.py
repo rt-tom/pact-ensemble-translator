@@ -1168,6 +1168,9 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         },
         "repair_reaudit_max_tokens": 20000,
         "repair_max_tokens": 16000,
+        # REPAIR-ROBUST (t_b6fd6cbd): the per-batch repair reasoning effort
+        # is identity-bearing (F5) — flipping it invalidates cache/resume.
+        "repair_reasoning": 1,
         "repair_reaudit_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
         "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
         "harness_version": "4.1",
@@ -1214,6 +1217,10 @@ def test_b3_repair_policy_knobs_part_of_config_identity(tmp_path: Path) -> None:
         "reaudit_max_tokens": dict(audit_repair_reaudit_max_tokens=25000),
         "reaudit_max_retries": dict(audit_repair_reaudit_max_retries=5),
         "reaudit_base_delay_seconds": dict(audit_repair_reaudit_base_delay_seconds=2.5),
+        # REPAIR-ROBUST (t_b6fd6cbd, F5): the per-batch repair reasoning
+        # effort is identity-bearing — flipping it (low → off/medium)
+        # invalidates a stale cached repaired map.
+        "repair_reasoning": dict(audit_repair_reasoning=0),
         # R-RETRY (t_8ab8ab35): the chunk-level TRANSPORT_ERROR retry policy
         # is identity-bearing — flipping it invalidates the cached audit.
         "audit_transport_max_retries": dict(audit_transport_max_retries=5),
@@ -1260,6 +1267,41 @@ def test_b3_reaudit_budget_and_retry_wired_from_run_config(
     assert bundle._config.repair_reaudit_max_tokens == 25000
     assert bundle._config.repair_reaudit_max_retries == 5
     assert bundle._config.repair_reaudit_base_delay_seconds == 2.5
+
+
+def test_b3_repair_reasoning_wired_from_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # REPAIR-ROBUST (t_b6fd6cbd, F5): the per-batch repair reasoning effort
+    # is carried from the run config through B3AuditRepairConfig into
+    # SelectiveRepairConfig — a cache produced under a different reasoning
+    # level must never replay (default 1 = low; run_0005 batch1: deepseek
+    # high burned 32k reasoning tokens before content).
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as strict_run_mod
+
+    cfg = _whole_chapter_cfg(tmp_path, audit_repair_reasoning=3)
+    backend = _B3MockBackend()
+    monkeypatch.setattr(strict_run_mod, "build_role_backend", lambda _b, _r: backend)
+    bundle = strict_run_mod._build_b3_audit_repair(cfg, None, None)
+    assert bundle is not None
+    assert bundle._config.repair_reasoning == 3
+
+    default_bundle = strict_run_mod._build_b3_audit_repair(
+        _whole_chapter_cfg(tmp_path), None, None,
+    )
+    assert default_bundle._config.repair_reasoning == 1  # low
+
+
+def test_b3_config_payload_carries_repair_reasoning() -> None:
+    # REPAIR-ROBUST (t_b6fd6cbd, F5): the repair reasoning effort is part of
+    # the B3 config payload/report (identity) — default 1 (low) and
+    # explicit overrides are preserved.
+    from pact_v4.repair.selective_repair import DEFAULT_REPAIR_REASONING
+    assert DEFAULT_REPAIR_REASONING == 1
+    payload = B3AuditRepairConfig().to_payload()
+    assert payload["repair_reasoning"] == 1
+    custom = B3AuditRepairConfig(repair_reasoning=2).to_payload()
+    assert custom["repair_reasoning"] == 2
 
 
 def test_b3_r_retry_and_cap_wired_from_run_config(
