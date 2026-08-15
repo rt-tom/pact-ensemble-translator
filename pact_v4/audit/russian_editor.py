@@ -22,7 +22,12 @@ harmful):
    tagged with exactly one class:
    * SAFE (auto-apply): ``typo | grammar | duplicate | preposition``
    * REVIEW (candidates only): ``calque | logic | ambiguity | unnatural |
-     register``
+     register | dialogue_format`` — ``dialogue_format`` is NEVER produced by
+     the model: it is the deterministic dialogue-typography detector's class
+     (t_41da17ec, 0 LLM — see ``detect_dialogue_format_candidates``), an
+     independent pass over the GOOD chunks' owned pids after the loop, so a
+     «...»-replica with attribution the editor missed still reaches the B2
+     repair-as-verifier.
 4. **Diff-gate** — a SAFE-classed edit is applied ONLY when
    ``rewritten != original`` (cuts the p00095-class false positive where
    Qwen proposes the same text). A no-op edit is dropped for BOTH classes
@@ -75,6 +80,7 @@ This module is pure and deterministic except for the injected model calls.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,14 +111,26 @@ LOG = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 RUSSIAN_EDITOR_SCHEMA = "pact-v4-russian-editor/v1"
-RUSSIAN_EDITOR_HARNESS_VERSION = "4.2"
+# DIALOGUE-TYPOGRAPHY (t_41da17ec, owner 2026-08-15): 4.3 — the R stage now
+# ALSO emits deterministic ``dialogue_format`` REVIEW candidates (0 LLM,
+# see ``detect_dialogue_format_candidates``). Identity-bearing: a cache
+# written before this pass must never replay an outcome without the new
+# candidates (F5 lesson — the harness version rides
+# ``config_identity`` via ``StrictRunConfig.russian_editor_harness_version``).
+RUSSIAN_EDITOR_HARNESS_VERSION = "4.3"
 RUSSIAN_EDITOR_PROMPT_VERSION = RUSSIAN_EDITOR_V4_2_R1.version
 
 # SAFE classes are auto-applied (with the diff-gate); REVIEW classes become
 # edit_candidates.json and are never auto-applied.
 SAFE_CLASSES = frozenset({"typo", "grammar", "duplicate", "preposition"})
+# DIALOGUE-TYPOGRAPHY (t_41da17ec): ``dialogue_format`` is a REVIEW class —
+# the deterministic detector flags «...»-replicas WITH attribution (a
+# Russian-typography defect: a spoken replica paragraph must open with an em
+# dash, not guillemets); it is NEVER SAFE (auto-apply forbidden — тире vs
+# кавычки depends on paragraph structure, the repair-as-verifier decides
+# contextually).
 REVIEW_CLASSES = frozenset(
-    {"calque", "logic", "ambiguity", "unnatural", "register"}
+    {"calque", "logic", "ambiguity", "unnatural", "register", "dialogue_format"}
 )
 ALL_CLASSES = SAFE_CLASSES | REVIEW_CLASSES
 
@@ -693,6 +711,85 @@ def route_edits(
 
 
 # ---------------------------------------------------------------------------
+# DIALOGUE-TYPOGRAPHY (t_41da17ec, owner 2026-08-15): deterministic Russian
+# dialogue-typography detector — 0 LLM, independent pass over the chunk text.
+# ---------------------------------------------------------------------------
+
+# Speech-attribution verbs (past-tense stems + common inflections). The PID
+# must CONTAIN one of these to be treated as a replica-with-attribution
+# (the «...»-quoted paragraph is then an English-typography rendering of a
+# spoken replica — Russian literary typography opens the replica paragraph
+# with an em dash, never with guillemets).
+_DIALOGUE_ATTRIBUTION_RE = re.compile(
+    r"\b(?:"
+    r"сказал[аи]?|спросил[аи]?|ответил[аи]?|отозвал(?:ся|ась|ись)|"
+    r"добавил[аи]?|произн[ёе]с(?:ла|ли)?|повторил[аи]?|крикнул[аи]?|"
+    r"прошептал[аи]?|воскликнул[аи]?|пробормотал[аи]?|начал[аи]?|"
+    r"продолжил[аи]?|заметил[аи]?|уточнил[аи]?|возразил[аи]?|"
+    r"перебил[аи]?|согласил(?:ся|ась|ись)|покачал[аи]?|кивнул[аи]?|"
+    r"улыбнул(?:ся|ась|ись)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_dialogue_format_candidates(
+    translation: Mapping[str, str],
+    pids: Sequence[str],
+) -> Tuple[ReviewCandidate, ...]:
+    """Deterministic Russian dialogue-typography detector (0 LLM).
+
+    Flags a PID-translation that STARTS with an opening guillemet ``«`` AND
+    contains a speech-attribution verb (сказал/спросил/...): in Russian
+    literary typography a spoken replica that forms its own paragraph MUST
+    begin with an em dash (—) and MUST NOT be enclosed in «quotation marks»
+    — the «...»-form is reserved for actual quotations, quoted words/titles
+    and nested speech. Produces ONE ``dialogue_format`` REVIEW candidate per
+    PID (never per occurrence — no spam). The class is NEVER SAFE (auto-apply
+    forbidden): тире vs кавычки depends on the paragraph structure, so the
+    B2 repair-as-verifier decides contextually.
+
+    NOT flagged (legitimate «...»): quotes in the middle of the text (not a
+    PID start), citations inside em-dash replicas (— Он сказал: «Не
+    выходи»), quoted names/words («Пробуждение»), nested speech.
+    """
+    out: List[ReviewCandidate] = []
+    for pid in pids:
+        text = translation.get(pid, "")
+        if not text.lstrip().startswith("«"):
+            continue
+        m = _DIALOGUE_ATTRIBUTION_RE.search(text)
+        if m is None:
+            continue
+        # Nested speech / reported speech: a speech verb that INTRODUCES a
+        # quoted clause with a colon (…сказал: „…") quotes a whole sentence
+        # — the «...» is a legitimate quotation, not a replica-with-
+        # attribution paragraph. The author-attribution defect always has
+        # the verb followed by the speaker (…сказал он / …ответила она).
+        if text[m.end():].lstrip().startswith(":"):
+            continue
+        # One candidate per PID. original/proposed carry the FULL paragraph
+        # (no deterministic rewrite — the verifier decides the em-dash form
+        # contextually); the reason states the defect and the decision rule.
+        out.append(
+            ReviewCandidate(
+                pid=pid,
+                original=text,
+                proposed=text,
+                klass="dialogue_format",
+                reason=(
+                    "реплика с атрибуцией оформлена кавычками «...», а не русским "
+                    "тире: по русской типографике реплика-абзац начинается с тире "
+                    "(— ...), кавычки допустимы только для цитат/названий/"
+                    "вложенной речи — переоформите на тире, если это обычная "
+                    "реплика, и оставьте кавычки, если это цитата/название"
+                ),
+            )
+        )
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------
 
@@ -796,6 +893,12 @@ class RussianEditorEvaluator:
         # PARTIAL-RESUME (t_a58dd881): per-chunk records (status + parsed
         # edits) so the audit cache can replay GOOD chunks with 0 model calls.
         chunk_records: List[Dict[str, Any]] = []
+        # DIALOGUE-TYPOGRAPHY (t_41da17ec): owned pid lists of GOOD chunks
+        # (fresh AND cached-replay paths) — the deterministic dialogue-format
+        # detector runs as an independent 0-LLM pass over exactly these pids
+        # after the loop (catches cases the model missed; fail-closed per
+        # chunk — a FAILED chunk's pids contribute no candidates).
+        good_chunk_pid_lists: List[List[str]] = []
 
         for chunk_index, chunk_pairs in enumerate(chunks, start=1):
             chunk_pids = [p.pid for p in chunk_pairs]
@@ -828,6 +931,7 @@ class RussianEditorEvaluator:
                         cached_edits.append(edit)
                     if cached_edits is not None:
                         all_edits.extend(cached_edits)
+                        good_chunk_pid_lists.append(list(chunk_pids))
                         chunk_records.append({
                             "chunk": chunk_index,
                             "first_pid": chunk_pids[0],
@@ -1003,6 +1107,7 @@ class RussianEditorEvaluator:
             if chunk_index in failed_chunks:
                 continue
             all_edits.extend(chunk_edits)
+            good_chunk_pid_lists.append(list(chunk_pids))
             chunk_warning_counts.append(len(chunk_warnings))
             chunk_records.append({
                 "chunk": chunk_index,
@@ -1022,6 +1127,24 @@ class RussianEditorEvaluator:
             current_by_pid=dict(translation),
             safe_classes=cfg.safe_classes,
         )
+        # DIALOGUE-TYPOGRAPHY (t_41da17ec, owner 2026-08-15): the
+        # deterministic dialogue-typography detector is an INDEPENDENT pass
+        # over the GOOD chunks' OWNED pids (0 LLM) — it does NOT wait for the
+        # model to propose the defect, so a «...»-replica with attribution the
+        # editor missed is still caught and forwarded to the B2 repair-as-
+        # verifier as a REVIEW candidate (class dialogue_format, never SAFE).
+        # Fail-closed per chunk is preserved: a FAILED chunk's pids contribute
+        # no candidates (same rule as model edits/candidates). One candidate
+        # per PID; a model-proposed dialogue_format candidate for the same pid
+        # wins (no duplicate).
+        dialogue_candidates = detect_dialogue_format_candidates(
+            dict(translation), [pid for plist in good_chunk_pid_lists for pid in plist]
+        )
+        model_dialogue_pids = {c.pid for c in candidates if c.klass == "dialogue_format"}
+        dialogue_candidates = tuple(
+            c for c in dialogue_candidates if c.pid not in model_dialogue_pids
+        )
+        all_candidates = tuple(candidates) + dialogue_candidates
         # Total per-edit warnings: parse-level (over MAX_EDITS_PER_PID
         # drops) + route-level (SAFE fragment no longer a substring after
         # earlier same-pid edits). None of them fail the chunk.
@@ -1040,7 +1163,7 @@ class RussianEditorEvaluator:
             complete=not failed_chunks,
             edits=tuple(all_edits),
             applied=tuple(applied),
-            candidates=tuple(candidates),
+            candidates=all_candidates,
             dropped=dropped,
             warning_count=parse_warning_count + len(route_warnings),
             chunks=tuple(chunk_records),
@@ -1069,5 +1192,6 @@ __all__ = [
     "get_editor_overlap",
     "parse_editor_edits",
     "route_edits",
+    "detect_dialogue_format_candidates",
     "RussianEditorEvaluator",
 ]

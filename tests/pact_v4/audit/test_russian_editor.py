@@ -27,6 +27,7 @@ from pact_v4.audit.russian_editor import (
     RussianEditorConfig,
     RussianEditorEvaluator,
     build_editor_chunks,
+    detect_dialogue_format_candidates,
     get_editor_overlap,
     parse_editor_edits,
     route_edits,
@@ -686,13 +687,100 @@ def test_route_same_pid_fragment_gone_warns_and_skips() -> None:
 
 
 def test_class_sets_cover_contract() -> None:
-    # The contract lists exactly 9 classes: 4 SAFE + 5 REVIEW.
+    # The contract lists exactly 10 classes: 4 SAFE + 6 REVIEW.
+    # DIALOGUE-TYPOGRAPHY (t_41da17ec): dialogue_format is a REVIEW class
+    # (the deterministic detector's class — never SAFE, never model-emitted).
     assert SAFE_CLASSES == frozenset({"typo", "grammar", "duplicate", "preposition"})
     assert REVIEW_CLASSES == frozenset(
-        {"calque", "logic", "ambiguity", "unnatural", "register"}
+        {
+            "calque",
+            "logic",
+            "ambiguity",
+            "unnatural",
+            "register",
+            "dialogue_format",
+        }
     )
     assert ALL_CLASSES == SAFE_CLASSES | REVIEW_CLASSES
-    assert len(ALL_CLASSES) == 9
+    assert len(ALL_CLASSES) == 10
+
+
+# ---------------------------------------------------------------------------
+# DIALOGUE-TYPOGRAPHY (t_41da17ec): deterministic dialogue-format detector
+# ---------------------------------------------------------------------------
+
+
+def test_dialogue_format_detector_flags_quoted_replica_with_attribution() -> None:
+    """«...»-replica with author attribution (English typography on Russian
+    dialogue) -> ONE dialogue_format REVIEW candidate."""
+    translation = {
+        "p00001": "«Я ухожу», — сказал он.",
+        "p00002": "— Я ухожу, — сказал он.",  # already correct Russian em dash
+        "p00003": "«Пробуждение» длилось недолго.",  # title in quotes, no replica
+    }
+    cands = detect_dialogue_format_candidates(translation, list(translation))
+    by_pid = {c.pid: c for c in cands}
+    assert set(by_pid) == {"p00001"}
+    c = by_pid["p00001"]
+    assert c.klass == "dialogue_format"
+    assert c.original == translation["p00001"]
+    assert c.proposed == translation["p00001"]
+    assert "кавычками" in c.reason
+
+
+def test_dialogue_format_detector_ignores_quotes_mid_text() -> None:
+    """«...» NOT at the PID start (narrated quote in the middle) is a
+    legitimate quotation, never a replica flag."""
+    translation = {
+        "p00001": "Он сказал: «Не выходи» — и закрыл дверь.",
+        "p00002": "Она прочитала «Пробуждение» за вечер.",
+    }
+    cands = detect_dialogue_format_candidates(translation, list(translation))
+    assert cands == ()
+
+
+def test_dialogue_format_detector_ignores_quote_inside_em_dash_replica() -> None:
+    """A quotation INSIDE a correct em-dash replica is not a format defect."""
+    translation = {
+        "p00001": "— Он сказал: «Не выходи», — и ушёл.",
+        "p00002": "— Я помню: «Никогда не сдавайся», — ответил он.",
+    }
+    cands = detect_dialogue_format_candidates(translation, list(translation))
+    assert cands == ()
+
+
+def test_dialogue_format_detector_ignores_quoted_words_and_nested_speech() -> None:
+    """Quoted names/words and nested speech inside the PID are not flagged."""
+    translation = {
+        "p00001": "«Пробуждение» — его любимая книга.",
+        # Nested speech: the attribution is INSIDE the outer «...», the
+        # replica is not an English-typography dialogue paragraph.
+        "p00002": "«Он сказал: \u201eНе выходи\u201f» — так она и поступила.",
+    }
+    cands = detect_dialogue_format_candidates(translation, list(translation))
+    assert cands == ()
+
+
+def test_dialogue_format_detector_one_candidate_per_pid() -> None:
+    """The threshold is ONE candidate per PID, never per occurrence."""
+    translation = {
+        "p00001": "«Иди сюда», — сказал он. «Иди», — повторил он.",
+        "p00002": "«Стой», — крикнул он. «Стой же!» — крикнул он снова.",
+    }
+    cands = detect_dialogue_format_candidates(translation, list(translation))
+    assert len(cands) == 2
+    assert {c.pid for c in cands} == {"p00001", "p00002"}
+
+
+def test_dialogue_format_detector_respects_pid_scope() -> None:
+    """Only the pids passed in are scanned (the evaluator passes GOOD-chunk
+    owned pids; CONTEXT_ONLY/foreign pids are never flagged)."""
+    translation = {
+        "p00001": "«Я ухожу», — сказал он.",
+        "p00002": "«Я остаюсь», — ответила она.",
+    }
+    cands = detect_dialogue_format_candidates(translation, ["p00001"])
+    assert [c.pid for c in cands] == ["p00001"]
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +881,39 @@ def test_run_010_25_edits_scenario_safe_applied_review_not() -> None:
     assert len(outcome.applied) == 5
     assert len(outcome.candidates) == 2
     assert outcome.dropped == 1
+
+
+def test_evaluator_dialogue_format_independent_pass_catches_missed_cases() -> None:
+    """DIALOGUE-TYPOGRAPHY (t_41da17ec): the deterministic detector is an
+    INDEPENDENT pass over the GOOD chunk's owned pids — a «...»-replica with
+    attribution the model did NOT edit still yields a dialogue_format REVIEW
+    candidate; legitimate «...» (titles, quotes mid-text, nested speech) do
+    not."""
+    translation = {
+        # Model edits NOTHING (empty edits response) — the detector still
+        # flags the English-typography replica with attribution.
+        "p00001": "«Я ухожу», — сказал он.",
+        # Legitimate: em-dash replica (already correct Russian).
+        "p00002": "— Я остаюсь, — ответила она.",
+        # Legitimate: title in quotes, no replica.
+        "p00003": "«Пробуждение» — его любимая книга.",
+        # Legitimate: nested speech quoted whole (attribution inside «...»).
+        "p00004": "«Он сказал: „Не выходи\"» — так она и поступила.",
+    }
+    backend = _MockBackend(_ok([]))  # model proposes nothing
+    evaluator = RussianEditorEvaluator(backend, config=RussianEditorConfig())
+    outcome = evaluator(chapter_id="0001", translation=translation)
+
+    assert outcome.complete is True
+    # 0 model edits, 0 applied, 0 SAFE drops — only the deterministic flag.
+    assert outcome.edits == ()
+    assert outcome.applied == ()
+    assert outcome.dropped == 0
+    by_pid = {c.pid: c for c in outcome.candidates}
+    assert set(by_pid) == {"p00001"}
+    assert by_pid["p00001"].klass == "dialogue_format"
+    # It is a REVIEW candidate — never auto-applied.
+    assert "dialogue_format" not in outcome.applied
 
 
 # ---------------------------------------------------------------------------
@@ -1238,7 +1359,11 @@ def test_module_constants() -> None:
     assert RUSSIAN_EDITOR_SCHEMA == "pact-v4-russian-editor/v1"
     # R-FIX2 (run_012): v3 = substring-original contract (fragment quotes).
     assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v3"
-    assert RUSSIAN_EDITOR_HARNESS_VERSION == "4.2"
+    # DIALOGUE-TYPOGRAPHY (t_41da17ec): 4.3 — the R stage now ALSO emits
+    # deterministic dialogue_format REVIEW candidates (0 LLM). Identity-
+    # bearing: a cache written before this pass must not replay an outcome
+    # without the new candidates (F5).
+    assert RUSSIAN_EDITOR_HARNESS_VERSION == "4.3"
 
 
 def test_prompt_few_shot_example_includes_class() -> None:

@@ -473,7 +473,7 @@ def run_generate(
             "risk_policy": "pact-v4-risk-source-en/v1",
             "risk_thresholds": {"medium": 3, "high": 7},
             "prompt_fidelity_first": "pact-v4-prompt-fidelity-first/v2",
-            "prompt_balanced_literary": "pact-v4-prompt-balanced-literary/v3",
+            "prompt_balanced_literary": "pact-v4-prompt-balanced-literary/v4",
         },
         "provisional_params": {
             "temperature": cfg.temperature,

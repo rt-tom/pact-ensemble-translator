@@ -41,7 +41,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from pact_v4.phase2.prompts import BALANCED_LITERARY_V3, FIDELITY_FIRST_V1, render_prompt
+from pact_v4.phase2.prompts import BALANCED_LITERARY_V4, FIDELITY_FIRST_V1, render_prompt
 from pact_v4.phase2.risk import REQUIRED_RISK_CATEGORIES, assess_source_risk
 from pact_v4.pipeline._shared_runner_helpers import (
     _glossary_entries,
@@ -59,7 +59,7 @@ CHARS_PER_TOKEN = 4.0
 
 _TEMPLATES = {
     "fidelity_first": FIDELITY_FIRST_V1,
-    "balanced_literary": BALANCED_LITERARY_V3,
+    "balanced_literary": BALANCED_LITERARY_V4,
 }
 
 

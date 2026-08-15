@@ -815,10 +815,10 @@ def test_cache_hit_revalidates_candidate_identity_defense_in_depth():
     # Recompute the exact bundle_hash our victim call will use, then poison
     # the shared cache at that key with the foreign candidate.
     from pact_v4.phase2.generation import PromptBundle
-    from pact_v4.phase2.prompts import BALANCED_LITERARY_V3
+    from pact_v4.phase2.prompts import BALANCED_LITERARY_V4
 
     victim_bundle = PromptBundle(
-        template=BALANCED_LITERARY_V3,
+        template=BALANCED_LITERARY_V4,
         role="balanced_literary",
         risk_band="low",
         risk_policy_version=make_risk(RiskBand.LOW).policy_version,
@@ -872,7 +872,7 @@ def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
     """The instructions must not tell the model to look for an 'OWNED_PIDS'
     section that render_prompt never emits (it emits 'OWNED_SOURCE')."""
     from pact_v4.phase2.prompts import (
-        BALANCED_LITERARY_V3,
+        BALANCED_LITERARY_V4,
         FIDELITY_FIRST_V1,
         render_prompt,
     )
@@ -886,12 +886,12 @@ def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
     )
     assert outcome.status == "complete"
 
-    for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V3):
+    for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V4):
         assert "OWNED_PIDS" not in template.instructions
     # v1/v2 templates name the block explicitly; the v3 literary template
     # refers to the same rendered section as "the SOURCE map".
     assert "OWNED_SOURCE" in FIDELITY_FIRST_V1.instructions
-    assert "SOURCE map" in BALANCED_LITERARY_V3.instructions
+    assert "SOURCE map" in BALANCED_LITERARY_V4.instructions
 
     for bundle in generator.calls:
         rendered = render_prompt(bundle)

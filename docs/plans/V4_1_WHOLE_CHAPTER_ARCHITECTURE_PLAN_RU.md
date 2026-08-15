@@ -359,7 +359,7 @@ no missing keys, no extra keys, no duplicate keys. Do not wrap the JSON
 in markdown fences or add commentary.
 ```
 
-Правила версии: новый `PromptTemplate` с version `pact-v4-prompt-balanced-literary/v3`; версия входит в bundle identity (смена = инвалидация кэша, осознанно).
+Правила версии: новый `PromptTemplate` с version `pact-v4-prompt-balanced-literary/v4`; версия входит в bundle identity (смена = инвалидация кэша, осознанно).
 
 ---
 

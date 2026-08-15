@@ -1178,6 +1178,58 @@ def _r_editor_resume_plan_from_report(
     return plan
 
 
+def _r_editor_report_identity_mismatch(
+    report: Any,
+    *,
+    translation_hash: str,
+    pids: Sequence[str],
+    harness_version: str,
+    config_identity: str,
+    chunk_size: int,
+    overlap_pairs: int,
+    enabled: bool,
+    version: str,
+    safe_classes: Sequence[str],
+) -> Optional[str]:
+    """Fail-closed identity gate for the FAIL-PATH R-CACHE fallback.
+
+    The standalone ``r_editor_report.json`` is read when the audit cache is
+    absent (a previous run died inside the audit with an exception). It is
+    replayable ONLY when it was produced by the exact same run: same raw
+    translation content (hash), same PID set/order, same R harness/prompt
+    versions, same safe-class policy, same run config identity, and same
+    chunking parameters. A stale report (old harness version, changed chunk
+    size, changed text) or a report missing the identity fields
+    (pre-identity schema) is rejected with a reason string — the caller then
+    re-runs R from scratch instead of replaying GOOD chunks that were
+    computed against different input.
+
+    Returns None when the report's persisted identity matches the expected
+    values exactly; otherwise a human-readable reason.
+    """
+    if not isinstance(report, dict):
+        return f"report is not an object ({type(report).__name__})"
+    expected = {
+        "enabled": enabled,
+        "version": version,
+        "harness_version": harness_version,
+        "chunk_size": chunk_size,
+        "overlap_pairs": overlap_pairs,
+        "safe_classes": sorted(safe_classes),
+        "translation_hash": translation_hash,
+        "pids": list(pids),
+        "config_identity": config_identity,
+    }
+    for key, wanted in expected.items():
+        got = report.get(key)
+        if got != wanted:
+            return (
+                f"identity {key} mismatch "
+                f"(report={got!r}, expected={wanted!r})"
+            )
+    return None
+
+
 class B3AuditCache:
     """Persistent audit cache with resume identity (card §10 B3 item 3).
 
@@ -1891,6 +1943,12 @@ class B3AuditRepair:
         # a cache miss — a full hit restores the stored R report and the
         # repaired map with 0 model calls (the resume contract).
         translation_hash = canonical_json_hash(dict(sorted(translation_map.items())))
+        # F4: exact PID set/order of the RAW map — captured here (before the
+        # R stage replaces ``translation_map`` with the edited map) because
+        # it is part of the R fallback identity (the standalone
+        # r_editor_report.json must be replayable only against the same
+        # raw PID coverage) and of the audit-cache repaired-map validation.
+        expected_pids = tuple(translation_map)
 
         # ------------------------------------------------------------------
         # 1. Entity context prepass (B1.2), when enabled.
@@ -1942,7 +2000,7 @@ class B3AuditRepair:
             r_editor_enabled=cfg.russian_editor_enabled,
             # F4: exact PID set/order validation — a cache whose
             # translations_repaired has missing/extra/reordered PIDs is a miss.
-            expected_pids=tuple(translation_map),
+            expected_pids=expected_pids,
             # PARTIAL-RESUME integrity (t_ec6bb8bc): the current (raw)
             # translation text lets the partial-payload validator enforce the
             # verbatim current-text substring constraint on every cached R
@@ -1989,16 +2047,44 @@ class B3AuditRepair:
                         "R re-run", exc,
                     )
                 else:
-                    r_editor_resume = _r_editor_resume_plan_from_report(
-                        fallback_report
+                    # REVIEW b55e940 HIGH: the standalone report is reused
+                    # ONLY when its persisted identity matches the current
+                    # run exactly (raw translation hash, PID set/order, R
+                    # harness/prompt versions, config identity, chunking
+                    # parameters). A stale report (old harness version,
+                    # changed chunk size/text) or a pre-identity report is
+                    # rejected fail-closed and R re-runs from scratch —
+                    # GOOD chunks computed against different input are never
+                    # replayed. Never rely on the first_pid check alone.
+                    identity_mismatch = _r_editor_report_identity_mismatch(
+                        fallback_report,
+                        translation_hash=translation_hash,
+                        pids=expected_pids,
+                        harness_version=cfg.russian_editor_harness_version,
+                        config_identity=config_identity,
+                        chunk_size=cfg.russian_editor_chunk_size,
+                        overlap_pairs=cfg.russian_editor_overlap_pairs,
+                        enabled=cfg.russian_editor_enabled,
+                        version=cfg.russian_editor_version,
+                        safe_classes=cfg.russian_editor_safe_classes,
                     )
-                    if r_editor_resume:
-                        LOG.info(
-                            "B3: reusing %d GOOD R chunk(s) from the "
-                            "standalone r_editor_report.json (audit cache "
-                            "absent) — R not re-run",
-                            len(r_editor_resume),
+                    if identity_mismatch is not None:
+                        LOG.warning(
+                            "B3: standalone r_editor_report.json NOT reused "
+                            "(%s); R re-run from scratch",
+                            identity_mismatch,
                         )
+                    else:
+                        r_editor_resume = _r_editor_resume_plan_from_report(
+                            fallback_report
+                        )
+                        if r_editor_resume:
+                            LOG.info(
+                                "B3: reusing %d GOOD R chunk(s) from the "
+                                "standalone r_editor_report.json (audit cache "
+                                "absent, identity verified) — R not re-run",
+                                len(r_editor_resume),
+                            )
         if cache is not None and cache.is_hit() and cache.audit_complete():
             repaired = cache.stored_translations_repaired()
             issues = cache.stored_issues()
@@ -2096,6 +2182,15 @@ class B3AuditRepair:
                 outcome=r_editor_outcome,
                 review_journal=(),
                 from_cache=False,
+                # R fallback identity (review b55e940 HIGH): the report is
+                # bound to the RAW map (translation_hash + expected_pids
+                # captured before the R stage replaced translation_map) and
+                # the run config identity — the standalone fail-path
+                # fallback rejects a report that does not match the current
+                # run exactly.
+                translation_hash=translation_hash,
+                pids=expected_pids,
+                config_identity=config_identity,
             )
             # PARTIAL-RESUME fail-closed guard: the cached audit chunks were
             # computed on the R-EDITED map of the ORIGINAL run (the partial
@@ -2644,6 +2739,15 @@ def _build_r_editor_report(
     outcome: Optional[RussianEditorOutcome],
     review_journal: Sequence[Mapping[str, Any]],
     from_cache: bool,
+    # R fallback identity (review b55e940 HIGH): the standalone
+    # r_editor_report.json must be replayable ONLY against the exact run
+    # that produced it — the RAW translation hash, the raw PID set/order,
+    # and the run config identity (which carries the R prompt/harness/
+    # chunking policy via StrictRunConfig, F5). Persisted so the fail-path
+    # fallback can reject stale reports fail-closed.
+    translation_hash: str,
+    pids: Sequence[str],
+    config_identity: str,
 ) -> Dict[str, Any]:
     """Build the Russian-editor report for the trial record / audit cache.
 
@@ -2679,6 +2783,15 @@ def _build_r_editor_report(
         "chunk_size": cfg.russian_editor_chunk_size,
         "overlap_pairs": cfg.russian_editor_overlap_pairs,
         "safe_classes": sorted(cfg.russian_editor_safe_classes),
+        # R fallback identity (review b55e940 HIGH): binds the report to the
+        # exact raw translation content, PID coverage, and run config that
+        # produced it. The standalone r_editor_report.json fail-path fallback
+        # validates these fail-closed before reusing any GOOD chunk — a
+        # stale report (old harness, changed chunk size/text) is rejected
+        # and R re-runs from scratch.
+        "translation_hash": translation_hash,
+        "pids": list(pids),
+        "config_identity": config_identity,
         "outcome": outcome_payload,
         "review_journal": [dict(entry) for entry in review_journal],
         "from_cache": from_cache,

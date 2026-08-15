@@ -1,4 +1,4 @@
-"""V4.1 A2 contract tests: prompt v3 render + JSON contract, Gemma server
+"""V4.1 A2 contract tests: prompt v4 render + JSON contract, Gemma server
 args per §3.4, whole-chapter glossary full-chapter filter, and the
 translations_repaired / translation_diffs snapshots (§7).
 """
@@ -7,22 +7,37 @@ from __future__ import annotations
 import json
 
 from pact_full_pipeline_runner_v1 import v4_phase12_strict_run as cli
-from pact_v4.phase2.prompts import BALANCED_LITERARY_V3, render_prompt
+from pact_v4.phase2.prompts import BALANCED_LITERARY_V4, render_prompt
 from pact_v4.phase2.risk import GlossaryEntry
 
 # ---------------------------------------------------------------------------
-# Prompt v3: full §4 text + JSON contract
+# Prompt v4: full §4 text + JSON contract
 # ---------------------------------------------------------------------------
 
 
-def test_balanced_literary_v3_version_and_contract():
-    assert BALANCED_LITERARY_V3.version == "pact-v4-prompt-balanced-literary/v3"
-    instructions = BALANCED_LITERARY_V3.instructions
+def test_balanced_literary_v4_version_and_contract():
+    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v4"
+    instructions = BALANCED_LITERARY_V4.instructions
     # §4 core instructions present.
     assert "Translate by EFFECT" in instructions
     assert "soften or intensify it" in instructions
     assert "Avoid calques" in instructions
     assert "Preserve exact details" in instructions
+    # DIALOGUE-TYPOGRAPHY (t_41da17ec): the Russian literary dialogue
+    # typography rule is part of the v4 instructions — a spoken replica
+    # paragraph must open with an em dash, never with guillemets; «...» is
+    # reserved for actual quotations/words/titles/nested speech.
+    assert "RUSSIAN DIALOGUE TYPOGRAPHY" in instructions
+    assert "MUST begin with an em dash (—)" in instructions
+    assert "MUST NOT be enclosed in «quotation marks»" in instructions
+    assert "never for ordinary dialogue paragraphs" in instructions
+    # The block sits between the calque paragraph and "Preserve exact details".
+    assert instructions.index("RUSSIAN DIALOGUE TYPOGRAPHY") > instructions.index(
+        "Avoid calques"
+    )
+    assert instructions.index("Preserve exact details") > instructions.index(
+        "RUSSIAN DIALOGUE TYPOGRAPHY"
+    )
     # Inline BOOK CONTEXT / LOCKED GLOSSARY tokens (render_prompt fills them).
     assert "{book_context}" in instructions
     assert "{glossary_entries}" in instructions
@@ -38,7 +53,7 @@ def _bundle(*, glossary=(), bible_text="bible", reasoning=0):
     from pact_v4.phase2.generation import GenerationParams, PromptBundle
 
     return PromptBundle(
-        template=BALANCED_LITERARY_V3,
+        template=BALANCED_LITERARY_V4,
         role="balanced_literary",
         risk_band="low",
         risk_policy_version="pact-v4-risk-source-en/v1",
@@ -60,7 +75,7 @@ def _bundle(*, glossary=(), bible_text="bible", reasoning=0):
     )
 
 
-def test_render_prompt_v3_substitutes_book_context_and_glossary():
+def test_render_prompt_v4_substitutes_book_context_and_glossary():
     glossary = (("Blake", ("Блэйк",)),)
     rendered = render_prompt(_bundle(glossary=glossary, bible_text="BIBLE:\n  - Narrator: male"))
     assert "BOOK CONTEXT (locked, authoritative — do not contradict):" in rendered
@@ -76,7 +91,7 @@ def test_render_prompt_v3_substitutes_book_context_and_glossary():
     assert "in markdown fences or add commentary" in rendered
 
 
-def test_render_prompt_v3_legacy_template_unaffected():
+def test_render_prompt_v4_legacy_template_unaffected():
     # A template without the inline tokens keeps the append-only layout.
     from dataclasses import replace
 
