@@ -360,6 +360,246 @@ def book_memory_observations_from_entity_context(
 
 
 # ---------------------------------------------------------------------------
+# GLOSSARY-FROM-ENTITY (owner decision 2026-08-15, variant B): verified
+# entities -> glossary candidates with targets aligned from the translation.
+# ---------------------------------------------------------------------------
+
+
+def _is_proper_noun_entity_name(name: str) -> bool:
+    """Glossary-worthiness filter: the entity name is a proper noun.
+
+    Only person/place/world-term entities belong in the glossary; everyday
+    objects (pocketwatch, upstairs bathroom mirror, Joel's car) do not. The
+    extractor names persons/places by their proper-noun display name (Rose,
+    Blake Thorburn, Hillsglade House) and objects by their common noun
+    (pocketwatch, mirror, car), so a deterministic title-case test on the
+    entity name separates the two without a prompt change or an LLM call:
+    every whitespace-separated word must start with an uppercase letter
+    (''Joel's car'' fails because ''car'' is lowercase). A single-word
+    lowercase name (''pocketwatch'') fails too.
+    """
+    words = [w for w in name.split() if w]
+    if not words:
+        return False
+    return all(w[0].isupper() for w in words)
+
+
+def _flat_glossary_target(value: Any) -> Optional[str]:
+    """Flat glossary target for an on-disk entry (str or ``{target: ...}``)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("target"), str):
+        return value["target"]
+    return None
+
+
+def _norm_source_key(value: str) -> str:
+    """Apostrophe-normalized, casefolded key for glossary/book_memory lookups.
+
+    APOSTROPHE-NORM (acceptance, Jacob's Bell): straight ``'`` and curly
+    ``’`` are the same source surface (the chapter source may use either);
+    an established glossary entry keyed ``Jacob's Bell`` must match an
+    extractor entity named ``Jacob’s Bell`` (and vice versa).
+    """
+    return value.replace("\u2019", "'").casefold()
+
+
+def _canonical_ru_from_book_memory(
+    book_memory: Mapping[str, Any], name: str,
+) -> Optional[str]:
+    """Established ``canonical_ru`` for an entity in book_memory (if any).
+
+    Variant B fallback: the memory fact wins over a fresh chapter alignment
+    (acceptance regression bike->НЕ велосипед). An entity whose name — or a
+    ``source_alias`` of it — matches an established ``canonical_ru`` in
+    ``book_memory.json`` (characters/entities sections) uses that
+    ``canonical_ru`` as the target instead of aligning (e.g. entity
+    ``bike``/``motorcycle`` resolves to the seeded vehicle's canonical_ru
+    ``мотоцикл``, never to the model's ``велосипед``). This is also the
+    multi-word fallback (card Q2): a multi-word entity name (Joel's car,
+    Hillsglade House) cannot be aligned word-by-word, so the target comes
+    from the established ``canonical_ru`` when present; otherwise the
+    candidate carries no target and is never promoted. Apostrophe-normalized
+    + casefolded (APOSTROPHE-NORM): ``Jacob’s Bell`` matches an established
+    ``Jacob's Bell`` entry; ``Blake's Vehicle`` matches ``Blake's vehicle``.
+    """
+    wanted = _norm_source_key(name)
+    for section in ("characters", "entities"):
+        for key, entry in (book_memory.get(section) or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if _norm_source_key(str(key)) == wanted:
+                if entry.get("canonical_ru"):
+                    return str(entry["canonical_ru"])
+            for alias in entry.get("source_aliases") or []:
+                if _norm_source_key(str(alias)) == wanted:
+                    if entry.get("canonical_ru"):
+                        return str(entry["canonical_ru"])
+    return None
+
+
+def _established_glossary_target(
+    glossary: Mapping[str, Any], name: str,
+) -> Optional[str]:
+    """Flat target of an established glossary entry for ``name``.
+
+    Apostrophe-normalized + casefolded key match (APOSTROPHE-NORM), so an
+    extractor entity named ``Jacob’s Bell`` (curly apostrophe) is recognized
+    as already established by the on-disk ``Jacob's Bell`` entry — the
+    conflict/no-op logic keys off the SOURCE SURFACE, not the exact
+    apostrophe variant.
+    """
+    wanted = _norm_source_key(name)
+    for key, value in glossary.items():
+        if _norm_source_key(str(key)) == wanted:
+            return _flat_glossary_target(value)
+    return None
+
+
+def glossary_observations_from_entity_context(
+    context: ChapterEntityContext,
+    *,
+    chapter_id: str,
+    source_by_pid: Mapping[str, str],
+    translations: Mapping[str, str],
+    glossary: Mapping[str, Any],
+    book_memory: Mapping[str, Any],
+    consensus_ratio: float = 0.8,
+    pid_to_chunk: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """GLOSSARY-FROM-ENTITY (variant B): verified entities -> glossary targets.
+
+    Owner decision 2026-08-15 (variant B): the source-only entity extractor
+    gives verified candidates ``{source, canonical_type, anchor}`` but does
+    NOT know the translation; the deterministic ``align_candidates`` script
+    (0 model calls) extracts the ACTUAL Russian target from the finished
+    chapter translation, so the glossary entry is exactly what the model
+    wrote (consistent with the text).
+
+    Rules (conservative, fail-closed):
+
+    * **Proper-noun filter** — only entities whose name is a proper noun
+      (title-case, ``_is_proper_noun_entity_name``) become glossary
+      candidates: persons and places. Objects (pocketwatch, upstairs
+      bathroom mirror, Joel's car, motorcycle, cat) are named by common
+      nouns and never reach the glossary.
+    * **Single-word names** — the entity name is aligned against the
+      chapter translation with the existing ``align_candidates``
+      (``consensus_ratio``); the dominant capitalized-Russian variant is
+      the target.
+    * **Multi-word names** (Joel's car, Hillsglade House) — word-level
+      alignment cannot join words (card Q2); the target falls back to the
+      entity's established ``canonical_ru`` in book_memory when present,
+      otherwise the candidate carries no target and is NOT promoted.
+    * **Established glossary conflict** — an existing glossary entry with a
+      DIFFERENT target is a conflict (never overwritten); the same target
+      is a no-op.
+    * **canonical_ru** — the same aligned target fills ``canonical_ru`` in
+      book_memory entities (the caller merges it into the entity
+      observations built by ``book_memory_observations_from_entity_context``).
+
+    ``source_by_pid`` is the chapter source ``{pid: text}`` (from
+    ``parse_source_html``), ``translations`` the finished
+    ``translations.json`` ``{pid: text}``, ``glossary`` the live
+    ``glossary.json`` and ``book_memory`` the live ``book_memory.json`` in
+    the memory dir. ``pid_to_chunk`` (optional, from ``chunk_plan.json``)
+    maps the anchor pid to a chunk so the observation carries a
+    ``chunk_id`` for the B7 quarantined-chunk filter.
+
+    Returns ``{"glossary": {source: {target, type, chunk_id}},
+    "canonical_ru": {entity: target}, "proposed": [...], "conflicts": [...]}``
+    — the glossary observations to feed into
+    ``MemoryManager.add_observation("glossary", ...)``, the canonical_ru
+    map to merge into book_memory entity observations, and the aligned
+    candidate records (proposed vs blocked) for the book-run
+    ``candidates`` block / ledger. Deterministic; zero model calls.
+    """
+    from pact_v4.phase1.glossary_candidates import align_candidates
+
+    observations: Dict[str, Any] = {}
+    canonical_ru: Dict[str, str] = {}
+    proposed: List[Dict[str, Any]] = []
+    conflicts: List[Dict[str, Any]] = []
+    for record in sorted(context.entities, key=lambda r: r.entity):
+        name = str(record.entity or "")
+        if not name or not _is_proper_noun_entity_name(name):
+            continue
+        chunk_ids: List[str] = []
+        if pid_to_chunk and record.anchor.pid in pid_to_chunk:
+            chunk_ids = [str(pid_to_chunk[record.anchor.pid])]
+        candidate: Dict[str, Any] = {
+            "source": name,
+            "kind": "proper_name",
+            "occurrences": 1,
+            "chunk_ids": chunk_ids,
+            "context": record.anchor.span,
+        }
+        if " " in name:
+            # Multi-word (card Q2): alignment by capitalized RU words cannot
+            # join the phrase — fall back to the established canonical_ru,
+            # then to the already-established glossary entry (apostrophe-
+            # normalized match => the source surface is already promoted, a
+            # no-op); else record the candidate WITHOUT a target (never
+            # promoted).
+            target = _canonical_ru_from_book_memory(book_memory, name)
+            if not target:
+                target = _established_glossary_target(glossary, name)
+            aligned: Dict[str, Any] = {
+                **candidate,
+                "variants": {target: 1} if target else {},
+                "target": target,
+                "consensus_share": 1.0 if target else 0.0,
+                "conflicts": [],
+            }
+        else:
+            # Single-word: the established canonical_ru fact (if any) wins
+            # over a fresh chapter alignment (bike->НЕ велосипед regression:
+            # the memory says the vehicle is мотоцикл, so "motorcycle" must
+            # never be promoted as the model's "велосипед"). Otherwise align
+            # the entity name against the finished translation.
+            established = _canonical_ru_from_book_memory(book_memory, name)
+            if established:
+                aligned = {
+                    **candidate,
+                    "variants": {established: 1},
+                    "target": established,
+                    "consensus_share": 1.0,
+                    "conflicts": [],
+                }
+            else:
+                aligned_list = align_candidates(
+                    [candidate], source_by_pid, translations,
+                    consensus_ratio=consensus_ratio, glossary=glossary,
+                )
+                aligned = aligned_list[0] if aligned_list else {**candidate}
+        target = aligned.get("target")
+        if not target:
+            conflicts.append(dict(aligned))
+            continue
+        existing_target = _established_glossary_target(glossary, name)
+        if existing_target is not None and existing_target != target:
+            # Established glossary entry with a different target: conflict,
+            # never overwrite (card Q5).
+            conflicts.append({**dict(aligned), "established_target": existing_target})
+            continue
+        if existing_target == target:
+            continue  # already established with the same target — no-op
+        observations[name] = {
+            "target": str(target),
+            "type": record.canonical_type or "proper_name",
+            "chunk_id": chunk_ids[0] if chunk_ids else "",
+        }
+        canonical_ru[name] = str(target)
+        proposed.append(dict(aligned))
+    return {
+        "glossary": observations,
+        "canonical_ru": canonical_ru,
+        "proposed": proposed,
+        "conflicts": conflicts,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Audit journal (append-only, one event per line, crash-safe)
 # ---------------------------------------------------------------------------
 

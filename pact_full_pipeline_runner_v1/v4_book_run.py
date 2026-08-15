@@ -5,34 +5,29 @@ after each chapter based on its terminal status. The wrapper calls
 ``v4_phase12_strict_run`` for each chapter and ``MemoryManager.promote``
 between chapters.
 
-B9 (owner decision 2026-08-04, V-final: deterministic source candidates
-+ strict source->target evidence,
-``docs/plans/V4_B9_GLOSSARY_OBSERVATIONS_TASK_RU.md``; see DECISIONS.md) adds
-the glossary-candidate loop between the chapter run and ``promote``: after
-each chapter the deterministic generator + consensus alignment
-(``pact_v4.phase1.glossary_candidates``) produces candidate records from the
-chapter source and ``out_dir/translations.json``, appends them to the
-append-only ledger (``glossary_candidates.json``), and auto-promotes the
-candidates that meet the v3 thresholds (proper_name >=
-``--proper-name-min-occurrences``; term >= ``--term-min-chapters`` chapters
-AND >= ``--term-min-occurrences`` total occurrences) with a single aligned
-target. Promotion goes through the existing ``MemoryManager.add_observation``
--> ``promote`` path (B7), so the quarantined-chunk filter keeps working;
-after ``promote`` the newly-promoted glossary entries are restored to the
-flat ``{source: target}`` on-disk contract (``_glossary_entries`` skips dict
-values). Only chapters that reached an accepted terminal result
-(``complete`` / ``accepted_degraded``) contribute to the ledger and to
+GLOSSARY-FROM-ENTITY (owner decision 2026-08-15, variant B) replaces the
+deterministic B9 glossary scan: after each accepted chapter
+(``complete`` / ``accepted_degraded``) the run reads the entity extractor's
+VALIDATED context (``entity_context_cache.json``, written by the strict run
+BEFORE generation — 0 extra model calls), promotes the VERIFIED claims into
+book_memory (SAFE-MEMORY), and derives glossary candidates from the verified
+proper-noun entities. The existing consensus alignment
+(``pact_v4.phase1.glossary_candidates.align_candidates``) extracts the
+ACTUAL Russian target from the chapter translation — the glossary entry is
+exactly what the model wrote (consistent with the text). The aligned target
+also fills ``canonical_ru`` in the book_memory entity observations. The
+deterministic B9 scan (``generate_candidates`` + v3-threshold
+auto-promotion) is removed from the run path (its helpers remain as dead
+code for reference, like the B7 book_memory_candidates script).
+
+Only chapters that reached an accepted terminal result contribute to
 promotion — failed/unknown/errored chapters are excluded (review F1), and
-candidate generation skips the B5 mixed-script allowlist (bible + glossary +
-manual + source-derived, review F3). For ``accepted_degraded`` the
-quarantined-chunk evidence is excluded BEFORE the ledger and auto-promotion
-(B9-RV3): a candidate whose occurrences come only from quarantined chunks is
-dropped entirely, and a mixed candidate keeps only its accepted-chunk
-occurrences. When the PID->chunk plan backing that exclusion is missing,
-corrupt, empty, ambiguous (duplicate PID/chunk ownership, malformed data) or
-incomplete, the chapter fails closed (B9-F5/F6): no candidate, ledger,
-observation or glossary contribution, with a logged warning (the run never
-crashes). Zero model calls; identity/cache/journal untouched.
+promotion goes through the existing ``MemoryManager.add_observation`` ->
+``promote`` path (B7), so the quarantined-chunk filter keeps working; after
+``promote`` the newly-promoted glossary entries are restored to the flat
+``{source: target}`` on-disk contract (``_glossary_entries`` skips dict
+values). Zero model calls in the promotion loop; identity/cache/journal
+untouched.
 
 CLI::
 
@@ -40,10 +35,7 @@ CLI::
         --memory-dir <dir> --chapters 0001 0002 0003 \\
         --chapter-html-pattern 'chapters/{chapter_id}.html' \\
         --out-base <dir> [--candidates-ledger <path>]
-        [--term-min-occurrences 3 --term-min-chapters 2]
-        [--proper-name-min-occurrences 2 --consensus-ratio 0.8]
-        [--bm-candidates-ledger <path>]
-        [--bm-min-name-occurrences 2 --bm-min-name-chapters 2]
+        [--consensus-ratio 0.8]
 
 Artefacts: ``book_run.json`` in ``--out-base`` records the per-chapter
 history (chapter_id, terminal status, promotion events, book_memory_hash
@@ -56,32 +48,23 @@ append-only glossary candidate ledger; ``book_memory_candidates.json``
 
 Per-chapter ``candidates`` field semantics (exact definitions):
 
-  * ``generated`` — number of aligned candidate records produced for this
-    chapter (generation + consensus alignment, exclusions applied). Always 0
-    for chapters that did not reach an accepted terminal result.
+  * ``generated`` — number of entity-derived glossary candidate records
+    produced for this chapter (proper-noun verified entities, proposed +
+    conflicts). Always 0 for chapters that did not reach an accepted
+    terminal result and for chapters without a validated entity context.
   * ``proposed`` — number of candidates from this chapter that were sent to
-    ``MemoryManager.add_observation``: the aligned records that met the v3
-    promotion thresholds (proper_name >= ``--proper-name-min-occurrences``
-    with a single aligned target; term >= ``--term-min-chapters`` chapters
-    AND >= ``--term-min-occurrences`` occurrences with a single aligned
-    target), whose cumulative ledger record retains exactly one unambiguous
-    target consistent with the chapter's aligned target, and that did not
-    collide with an established glossary entry.
+    ``MemoryManager.add_observation``: an aligned record with a single
+    target that did not collide with an established glossary entry.
   * ``committed`` — how many of the ``proposed`` candidates actually landed
     in ``glossary.json`` after ``MemoryManager.promote``. Counted as the
-    glossary key diff (before/after promote). For B9-generated observations
-    ``committed == proposed`` for BOTH ``complete`` and ``accepted_degraded``
-    (valid plan): quarantined pids are excluded BEFORE candidate generation
-    (B9-RV3, with B9-F5/F6 fail-closed on unavailable or ambiguous PID->chunk
-    provenance), so every proposed candidate carries an accepted ``chunk_id``
-    that the B7 quarantined-chunk filter keeps. The B7 filter remains
-    defense-in-depth: only independent (e.g. manual) observations carrying a
-    quarantined ``chunk_id`` can be dropped, giving ``committed < proposed``
-    for those; it never drops a B9-generated proposed candidate.
+    glossary key diff (before/after promote). For ``complete`` chapters
+    ``committed == proposed``. For ``accepted_degraded`` the B7
+    quarantined-chunk filter is defense-in-depth: an entity observation
+    whose anchor pid's chunk is quarantined is dropped (``committed <
+    proposed``) — quarantined evidence never locks a glossary entry.
   * ``conflicts`` — aligned records that were NOT proposed because of an
     alignment conflict (several notable variants, no single target), a
-    cumulative ledger target conflict (previous chapters resolved the source
-    to a different target, so the merged record has no single target), or a
+    multi-word entity name without an established ``canonical_ru``, or a
     conflict with an established glossary entry (different target).
 """
 from __future__ import annotations
@@ -981,23 +964,20 @@ def run_book(
 
         quarantined = _quarantined_chunks_from_record(out_dir)
 
-        # B9 (V-final, owner decision 2026-08-04): candidate generation +
-        # consensus alignment -> ledger, then v3-threshold auto-promotion via
-        # MemoryManager.add_observation, strictly after the chapter and
-        # BEFORE MemoryManager.promote (GATE). Only chapters that reached an
-        # accepted terminal result (complete / accepted_degraded) contribute
-        # to the ledger or to promotion — failed/unknown/errored chapters
-        # are excluded (review F1): their text was never accepted and must
-        # not satisfy later thresholds or appear as promotion evidence.
-        # Candidate generation skips the B5 mixed-script allowlist (bible +
-        # glossary + manual + source-derived, review F3). For
-        # accepted_degraded, quarantined-chunk evidence is excluded BEFORE
-        # ledger accumulation and auto-promotion (B9-RV3) inside
-        # _generate_and_align_chapter, with fail-closed on unavailable or
-        # ambiguous PID->chunk provenance (B9-F5/F6). The actual glossary
-        # write happens through the existing promote(status,
-        # quarantined_chunks) below, so the B7 quarantined-chunk filter
-        # applies to the proposed candidates.
+        # GLOSSARY-FROM-ENTITY (owner decision 2026-08-15, variant B): the
+        # deterministic B9 scan (generate_candidates + v3-threshold
+        # auto-promotion, 248 garbage candidates/chapter) is REMOVED from the
+        # book run. Glossary candidates now come from the source-only entity
+        # extractor's VERIFIED entities (entity_context_cache.json, written
+        # by the strict run BEFORE generation — 0 extra model calls), and the
+        # deterministic align_candidates script extracts the ACTUAL Russian
+        # target from the finished chapter translation. Promotion runs
+        # strictly after the chapter and BEFORE MemoryManager.promote (GATE),
+        # only for chapters with an accepted terminal result (complete /
+        # accepted_degraded), exactly like the SAFE-MEMORY entity promote
+        # below. The glossary write happens through the existing
+        # promote(status, quarantined_chunks), so the B7 quarantined-chunk
+        # filter applies to the proposed observations.
         glossary_before = _load_json(memory_dir / "glossary.json", {})
         candidates_block = {
             "generated": 0,
@@ -1006,34 +986,6 @@ def run_book(
             "conflicts": 0,
         }
         proposed_sources: set = set()
-        if terminal_status in _PROMOTING_STATUSES:
-            aligned = _generate_and_align_chapter(
-                chapter_html,
-                out_dir,
-                memory_dir,
-                proper_name_min_occurrences=proper_name_min_occurrences,
-                term_min_occurrences=term_min_occurrences,
-                consensus_ratio=consensus_ratio,
-                mixed_script_allow=mixed_script_allow,
-                excluded_chunk_ids=quarantined,
-            )
-            if aligned:
-                ledger.append_chapter(chapter_id, aligned)
-            candidates_block["generated"] = len(aligned)
-            proposed_recs, conflict_recs = _auto_promote_glossary(
-                manager,
-                aligned,
-                ledger.load(),
-                glossary_before,
-                term_min_chapters=term_min_chapters,
-                term_min_occurrences=term_min_occurrences,
-                proper_name_min_occurrences=proper_name_min_occurrences,
-            )
-            candidates_block["proposed"] = len(proposed_recs)
-            candidates_block["conflicts"] = len(conflict_recs)
-            proposed_sources = {
-                str(p.get("source")) for p in proposed_recs if p.get("source")
-            }
 
         # SAFE-MEMORY (P0 owner decision 2026-08-14, B7 → entity_extractor):
         # the deterministic book_memory_candidates script (B7) is OFF —
@@ -1057,6 +1009,85 @@ def run_book(
         }
         bm_promotions: List[Dict[str, Any]] = []
         entity_obs: Dict[str, Any] = {}
+        # GLOSSARY-FROM-ENTITY (owner decision 2026-08-15, variant B): the
+        # same validated entity context ALSO feeds the glossary — verified
+        # proper-noun entities become candidates, align_candidates (0 model
+        # calls) extracts the ACTUAL Russian target from the finished
+        # translation, the observation is added to shadow memory and
+        # promoted by the same promote() below (B7 quarantined filter
+        # applies via chunk_id). The aligned target also fills canonical_ru
+        # in the book_memory entity observations.
+        # GLOSSARY-FROM-ENTITY fail-closed quarantine provenance (RV
+        # finding t_72f549c8, B9-F5/F6): an accepted_degraded chapter WITH
+        # quarantined chunks may only generate/promote entity-derived
+        # glossary observations when the PID->chunk plan authoritatively
+        # maps each source/translation pid exactly once. A
+        # missing/corrupt/empty/ambiguous plan (``_pid_to_chunk`` -> None)
+        # or an incomplete plan (a source/translation pid the plan does
+        # not map) leaves pids of UNKNOWN provenance — they could belong
+        # to a quarantined chunk, and an observation carrying
+        # ``chunk_id=""`` would slip through the B7 filter and promote
+        # quarantine evidence. Such a chapter fails closed for the whole
+        # glossary block: no candidates generated/proposed/committed/
+        # conflicts, no glossary ledger line, no glossary observation, no
+        # glossary mutation (a warning is logged; the run never crashes).
+        # Complete chapters and accepted_degraded chapters WITHOUT
+        # quarantined chunks never consult the plan (there is no
+        # quarantine evidence to exclude) — behaviour unchanged, zero
+        # extra model calls.
+        glossary_provenance_ok = True
+        pid_to_chunk: Optional[Dict[str, str]] = None
+        if terminal_status == "accepted_degraded" and quarantined:
+            try:
+                pid_to_chunk = _pid_to_chunk(out_dir)
+                if pid_to_chunk is None:
+                    LOG.warning(
+                        "GLOSSARY-FROM-ENTITY F6: %s accepted_degraded "
+                        "with quarantined chunks %s but PID->chunk "
+                        "provenance missing/corrupt/empty/ambiguous "
+                        "(duplicate or malformed ownership); failing "
+                        "closed — no glossary candidates, ledger line, "
+                        "observation or mutation",
+                        out_dir.name, sorted(quarantined),
+                    )
+                    glossary_provenance_ok = False
+                else:
+                    present_pids = (
+                        {str(pid) for pid in _source_by_pid(chapter_html)}
+                        | {
+                            str(pid)
+                            for pid in _load_json(
+                                out_dir / "translations.json", {},
+                            )
+                        }
+                    )
+                    if not present_pids <= set(pid_to_chunk):
+                        LOG.warning(
+                            "GLOSSARY-FROM-ENTITY F5: %s accepted_degraded "
+                            "with quarantined chunks %s but PID->chunk "
+                            "provenance incomplete (plan pids=%d, unmapped "
+                            "source/translation pids=%s); failing closed — "
+                            "no glossary candidates, ledger line, "
+                            "observation or mutation",
+                            out_dir.name, sorted(quarantined),
+                            len(pid_to_chunk),
+                            sorted(present_pids - set(pid_to_chunk)),
+                        )
+                        glossary_provenance_ok = False
+            except Exception as exc:  # noqa: BLE001 — never break a run
+                LOG.warning(
+                    "GLOSSARY-FROM-ENTITY: provenance gate failed for %s "
+                    "(%s: %s); failing closed — no glossary candidates, "
+                    "ledger line, observation or mutation",
+                    chapter_id, type(exc).__name__, exc,
+                )
+                glossary_provenance_ok = False
+        else:
+            pid_to_chunk = _pid_to_chunk(out_dir)
+        glossary_obs: Dict[str, Any] = {}
+        canonical_ru_map: Dict[str, str] = {}
+        glossary_proposed: List[Dict[str, Any]] = []
+        glossary_conflicts: List[Dict[str, Any]] = []
         if terminal_status in _PROMOTING_STATUSES:
             entity_payload = _load_json(out_dir / "entity_context_cache.json", None)
             if isinstance(entity_payload, dict) and entity_payload.get("entries"):
@@ -1066,6 +1097,7 @@ def run_book(
                 )
                 from pact_v4.pipeline.b3_audit_repair import (
                     book_memory_observations_from_entity_context,
+                    glossary_observations_from_entity_context,
                 )
 
                 try:
@@ -1118,12 +1150,70 @@ def run_book(
                             context, chapter_id=chapter_id,
                         )
                         entity_obs.update(obs.get("book_memory", {}))
+                        try:
+                            # GLOSSARY-FROM-ENTITY (variant B, 0 extra model
+                            # calls): align the verified proper-noun entities
+                            # against the finished chapter translation.
+                            # Fail-closed provenance (RV finding
+                            # t_72f549c8, B9-F5/F6): when the chapter is
+                            # accepted_degraded WITH quarantined chunks, the
+                            # PID->chunk plan must be authoritative and
+                            # complete (checked above) — otherwise no
+                            # glossary observations are generated at all
+                            # (chunk_id="" would bypass the B7 filter and
+                            # could promote quarantine evidence).
+                            if glossary_provenance_ok:
+                                g = glossary_observations_from_entity_context(
+                                    context,
+                                    chapter_id=chapter_id,
+                                    source_by_pid=_source_by_pid(chapter_html),
+                                    translations=_load_json(
+                                        out_dir / "translations.json", {}
+                                    ),
+                                    glossary=glossary_before,
+                                    book_memory=book_memory_before,
+                                    consensus_ratio=consensus_ratio,
+                                    pid_to_chunk=pid_to_chunk,
+                                )
+                                glossary_obs.update(g["glossary"])
+                                canonical_ru_map.update(g["canonical_ru"])
+                                glossary_proposed.extend(g["proposed"])
+                                glossary_conflicts.extend(g["conflicts"])
+                        except Exception as exc:  # noqa: BLE001 — never break a run
+                            LOG.warning(
+                                "GLOSSARY-FROM-ENTITY: glossary alignment "
+                                "skipped for %s (%s: %s); no glossary "
+                                "promotion for this chapter",
+                                chapter_id, type(exc).__name__, exc,
+                            )
                 except Exception as exc:  # noqa: BLE001 — never break a run
                     LOG.warning(
                         "SAFE-MEMORY: entity_context_cache.json for %s "
                         "unreadable/foreign (%s: %s); no book_memory promote",
                         chapter_id, type(exc).__name__, exc,
                     )
+            # canonical_ru: the same alignment fills canonical_ru in the
+            # book_memory entity observations (owner decision 2026-08-15).
+            for ename, target in canonical_ru_map.items():
+                for section in ("entities", "characters"):
+                    key = f"{section}:{ename}"
+                    if key in entity_obs and isinstance(entity_obs[key], dict):
+                        entity_obs[key] = dict(entity_obs[key])
+                        entity_obs[key]["canonical_ru"] = target
+            # Glossary observations -> shadow memory (promoted below via the
+            # same promote(status, quarantined) call, B7 filter applies).
+            for source, value in glossary_obs.items():
+                manager.add_observation("glossary", source, value)
+                proposed_sources.add(source)
+            if glossary_proposed or glossary_conflicts:
+                ledger.append_chapter(
+                    chapter_id, glossary_proposed + glossary_conflicts,
+                )
+            candidates_block["generated"] = (
+                len(glossary_proposed) + len(glossary_conflicts)
+            )
+            candidates_block["proposed"] = len(glossary_proposed)
+            candidates_block["conflicts"] = len(glossary_conflicts)
             for key, value in entity_obs.items():
                 # Chapter accumulation: a character/entity seen in earlier
                 # chapters keeps its cumulative `chapters` list (the entity
