@@ -1166,6 +1166,7 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
             "delta_format": "pact-v4-reaudit-delta/v1",
         },
         "repair_reaudit_max_tokens": 20000,
+        "repair_max_tokens": 16000,
         "repair_reaudit_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
         "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
         "harness_version": "4.1",
