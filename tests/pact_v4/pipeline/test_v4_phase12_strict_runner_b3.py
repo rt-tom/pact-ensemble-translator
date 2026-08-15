@@ -24,6 +24,7 @@ from pact_v4.phase1.models import canonical_json_hash
 from pact_v4.pipeline.b3_audit_repair import (
     B3AuditRepair,
     B3AuditRepairConfig,
+    _r_editor_resume_plan_from_report,
 )
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictRunConfig,
@@ -3722,3 +3723,29 @@ def test_b3_partial_cache_rehashed_enabled_status_disabled_report_is_full_miss(
     cache2 = _read_json(cache_path)
     assert isinstance(cache2["r_editor"], dict)
     assert isinstance(cache2["r_editor"]["outcome"], dict)
+
+
+def test_r_editor_resume_plan_from_report_standalone_fallback() -> None:
+    """FAIL-PATH R-CACHE (2026-08-15): the standalone r_editor_report.json
+    payload (written when an audit exception drops the cache-write path)
+    feeds the SAME resume-plan builder as the audit cache, so GOOD R
+    chunks are reused instead of re-running R from scratch. Fail-closed
+    guards hold: non-GOOD chunks and non-list edits are never replayed."""
+    report = {
+        "outcome": {
+            "chunks": [
+                {"chunk": 1, "status": "GOOD", "first_pid": "p00001",
+                 "edits": [{"pid": "p00001", "original": "а", "rewritten": "б"}]},
+                {"chunk": 2, "status": "FAILED", "first_pid": "p00002",
+                 "edits": [{"pid": "p00002", "original": "в", "rewritten": "г"}]},
+                {"chunk": 3, "status": "GOOD", "first_pid": "p00003",
+                 "edits": "not-a-list"},  # malformed -> re-run, never replayed
+            ]
+        }
+    }
+    plan = _r_editor_resume_plan_from_report(report)
+    assert set(plan) == {1}
+    assert plan[1]["edits"][0]["pid"] == "p00001"
+    # malformed payloads are not coerced
+    assert _r_editor_resume_plan_from_report(None) == {}
+    assert _r_editor_resume_plan_from_report({"outcome": None}) == {}
