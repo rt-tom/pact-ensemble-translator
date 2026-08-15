@@ -101,8 +101,8 @@ DEFAULT_REASONING_BUDGET = 8192
 DEFAULT_TRANSPORT_MAX_RETRIES: int = JsonRetryPolicy().max_retries
 DEFAULT_TRANSPORT_BASE_DELAY_SECONDS: float = JsonRetryPolicy().base_delay_seconds
 
-ENTITY_SOFT_TOKENS = 500
-ENTITY_HARD_TOKENS = 800
+ENTITY_SOFT_TOKENS = 3000
+ENTITY_HARD_TOKENS = 4096
 
 _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 
@@ -534,9 +534,26 @@ def validate_input_budget(
     narrator_tokens = text_token_estimate(narrator_context)
     entity_tokens = text_token_estimate(entity_context)
     if entity_tokens > ENTITY_HARD_TOKENS:
-        raise BudgetOverflowError(
-            f"entity context ~{int(entity_tokens)} tokens exceeds hard cap "
-            f"{ENTITY_HARD_TOKENS}"
+        # The entity block is a hint (evidence level 3), never the
+        # audit's subject: a hard overflow must not fail the chapter.
+        # Trim to whole lines until it fits the budget (fail-soft) —
+        # BudgetOverflowError is reserved for the *required* prompt
+        # components (fixed/narrator/pairs) below.
+        lines = entity_context.splitlines()
+        kept: List[str] = []
+        kept_tokens = 0
+        for line in lines:
+            line_tokens = text_token_estimate(line)
+            if kept_tokens + line_tokens > ENTITY_HARD_TOKENS:
+                break
+            kept.append(line)
+            kept_tokens += line_tokens
+        entity_context = "\n".join(kept)
+        entity_tokens = kept_tokens
+        LOG.warning(
+            "entity context trimmed to ~%d tokens (hard cap %d) — "
+            "audit proceeds without the dropped entity lines",
+            entity_tokens, ENTITY_HARD_TOKENS,
         )
     if entity_tokens > ENTITY_SOFT_TOKENS:
         LOG.warning(
