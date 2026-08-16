@@ -1157,6 +1157,16 @@ def _validate_partial_payload(
             )
         if not isinstance(item.get("reasoning_file"), str):
             return f"chunk {chunk_index}: reasoning_file is not a string"
+        dropped_count = item.get("dropped_count")
+        if dropped_count is not None and (
+            not isinstance(dropped_count, int)
+            or isinstance(dropped_count, bool)
+            or dropped_count < 0
+        ):
+            return (
+                f"chunk {chunk_index}: dropped_count {dropped_count!r} "
+                f"is not a non-negative int"
+            )
         finish_reason = item.get("finish_reason")
         if finish_reason is not None and not isinstance(finish_reason, str):
             return f"chunk {chunk_index}: finish_reason is not a string or null"
@@ -1856,6 +1866,19 @@ def _validate_stage_progress(
             return f"stage_progress.audit chunk {chunk_index}: finish_reason is not a string or null"
         if not isinstance(item.get("issue_count"), int) or isinstance(item.get("issue_count"), bool) or item.get("issue_count") < 0:
             return f"stage_progress.audit chunk {chunk_index}: issue_count is not a non-negative int"
+        # CONTEXT-PID-DROP: the persisted dropped warning count is part of the
+        # incremental cache contract — a malformed/negative value is a full
+        # miss (never a trusted replay with a fabricated count).
+        dropped_count = item.get("dropped_count")
+        if dropped_count is not None and (
+            not isinstance(dropped_count, int)
+            or isinstance(dropped_count, bool)
+            or dropped_count < 0
+        ):
+            return (
+                f"stage_progress.audit chunk {chunk_index}: dropped_count "
+                f"{dropped_count!r} is not a non-negative int"
+            )
     for issue_index, issue in enumerate(a_issues):
         if not isinstance(issue, dict):
             return f"stage_progress.audit issue {issue_index}: not an object"
@@ -2390,6 +2413,26 @@ def _validate_stage_progress(
                         f"{first_pid!r}..{last_pid!r}"
                     )
             expected_aggregate.append(dict(issue))
+        # CONTEXT-PID-DROP: dropped context/foreign issue objects are part of
+        # the incremental reaudit contract — a malformed list/element is a
+        # full miss (never a trusted replay that loses the diagnostics).
+        dropped = record.get("dropped")
+        if dropped is not None:
+            if not isinstance(dropped, list):
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index}: "
+                    f"dropped is not a list"
+                )
+            for dropped_index, dropped_issue in enumerate(dropped):
+                if (
+                    not isinstance(dropped_issue, dict)
+                    or not isinstance(dropped_issue.get("id"), str)
+                    or not dropped_issue.get("id")
+                ):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: not a well-formed issue object"
+                    )
     if list(ra_issues) != expected_aggregate:
         return (
             "stage_progress.reaudit.issues does not match the order-sensitive "
@@ -2819,6 +2862,10 @@ class B3AuditCache:
                 "reasoning_chars": chunk_payload.get("reasoning_chars", 0),
                 "reasoning_file": chunk_payload.get("reasoning_file", ""),
                 "finish_reason": chunk_payload.get("finish_reason"),
+                # CONTEXT-PID-DROP: the persisted dropped warning count rides
+                # the resume plan so a replayed GOOD chunk re-emits the exact
+                # audit_chunk_done dropped_count (validated at load time).
+                "dropped_count": chunk_payload.get("dropped_count", 0),
                 "issues": issues_by_chunk.get(chunk_index, []),
             }
         return plan
@@ -2928,6 +2975,13 @@ class B3AuditCache:
                 "last_pid": record.get("last_pid"),
                 "issues": [
                     dict(issue) for issue in (record.get("issues") or ())
+                    if isinstance(issue, dict)
+                ],
+                # CONTEXT-PID-DROP: the dropped context/foreign issue objects
+                # ride the resume plan so a replayed re-audit chunk keeps its
+                # journaled diagnostics (validated at load time).
+                "dropped": [
+                    dict(issue) for issue in (record.get("dropped") or ())
                     if isinstance(issue, dict)
                 ],
             }

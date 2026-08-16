@@ -16,7 +16,7 @@ synthetic (hermetic; no chapter data in the repo, per data restrictions).
 from __future__ import annotations
 
 import json
-from typing import List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 import pytest
 
@@ -628,6 +628,53 @@ def test_audit_context_pid_issue_dropped_chunk_good() -> None:
     assert outcome.chunks[1]["status"] == "GOOD"
     assert outcome.chunks[1]["dropped_count"] == 1
     assert len(backend.requests) == 2  # no RetryShrink sub-chunks
+
+
+def test_audit_cached_replay_preserves_dropped_count() -> None:
+    """CONTEXT-PID-DROP (RV t_7e7cfe6f finding 1): a GOOD cached chunk
+    replayed from a partial-resume plan re-emits the exact persisted
+    ``dropped_count`` (3 here, zero included) in the chunk meta AND the
+    ``audit_chunk_done`` event — the replay previously read the missing key
+    as None -> emitted 0."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    # Resume plan built by B3AuditCache.audit_resume_plan(): the cached GOOD
+    # chunk 1 carries the persisted dropped_count of the original audit.
+    cached_chunks = {
+        1: {
+            "status": "GOOD",
+            "first_pid": "p00001",
+            "last_pid": "p00036",
+            "pair_count": 36,
+            "context_count": 0,
+            "reasoning_chars": 0,
+            "reasoning_file": "",
+            "finish_reason": "stop",
+            "dropped_count": 3,
+            "issues": [],
+        },
+    }
+    events: List[Mapping[str, Any]] = []
+
+    def _on_chunk_event(kind: str, fields: Mapping[str, Any]) -> None:
+        events.append(dict(fields))
+
+    backend = ScriptedBackend([
+        _ok_response([]),  # chunk 2 (only chunk 1 is cached)
+    ])
+    evaluator = ChunkedAuditEvaluator(
+        backend,
+        config=ChunkedAuditConfig(retry_shrink=False),
+        on_chunk_event=_on_chunk_event,
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs, cached_chunks=cached_chunks)
+    assert outcome.audit_complete
+    assert len(backend.requests) == 1  # chunk 1 replayed with 0 calls
+    assert outcome.chunks[0]["status"] == "GOOD"
+    # The replayed chunk keeps the persisted warning count, not 0.
+    assert outcome.chunks[0]["dropped_count"] == 3
+    done_events = [e for e in events if e.get("status") == "GOOD"]
+    assert done_events and done_events[0]["dropped_count"] == 3
+    assert done_events[0].get("reused") is True
 
 
 # ---------------------------------------------------------------------------

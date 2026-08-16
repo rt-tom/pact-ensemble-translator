@@ -219,6 +219,89 @@ def test_kill_safe_cache_audit_2of8_resume_plan(tmp_path: Path) -> None:
     assert cache.r_editor_resume_plan() == {}
 
 
+def test_kill_safe_cache_audit_resume_plan_preserves_dropped_count(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP: the audit resume plan carries the persisted
+    ``dropped_count`` (including zero) so a replayed GOOD chunk re-emits the
+    exact ``audit_chunk_done dropped_count`` instead of 0 (RV t_7e7cfe6f
+    finding 1: the plan used to omit the key -> replay read ``None -> 0``)."""
+    translations = _translation(8)
+    audit = {
+        "status": "partial",
+        "done_chunks": [1, 2], "failed_chunks": [],
+        "chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "pair_count": 1, "context_count": 0, "status": "GOOD",
+             "finish_reason": "stop", "reasoning_chars": 0,
+             "reasoning_file": "b3_audit_chunk1_raw.txt",
+             "dropped_count": 3},
+            {"chunk": 2, "first_pid": "p00002", "last_pid": "p00002",
+             "pair_count": 1, "context_count": 0, "status": "GOOD",
+             "finish_reason": "stop", "reasoning_chars": 0,
+             "reasoning_file": "b3_audit_chunk2_raw.txt",
+             "dropped_count": 0},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=audit,
+        repair=_repair_pending_stage(),
+        reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    cache = _load_stage_progress(path, translations=translations, r_editor_enabled=False)
+    assert cache is not None and cache.is_partial()
+    plan = cache.audit_resume_plan()
+    assert sorted(plan) == [1, 2]
+    # The exact persisted counts ride the plan (zero included) — the
+    # evaluator replay reconstructs ChunkMeta(dropped_count=...) from these.
+    assert plan[1]["dropped_count"] == 3
+    assert plan[2]["dropped_count"] == 0
+
+
+def test_kill_safe_cache_audit_malformed_dropped_count_full_miss(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP fail-closed: an audit chunk payload whose persisted
+    ``dropped_count`` is negative / non-int is a FULL miss — never a trusted
+    replay with a fabricated warning count (RV t_7e7cfe6f finding 1)."""
+    translations = _translation(3)
+    audit = {
+        "status": "partial",
+        "done_chunks": [1], "failed_chunks": [],
+        "chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "pair_count": 1, "context_count": 0, "status": "GOOD",
+             "finish_reason": "stop", "reasoning_chars": 0,
+             "reasoning_file": "b3_audit_chunk1_raw.txt",
+             "dropped_count": -1},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=audit,
+        repair=_repair_pending_stage(),
+        reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(path, translations=translations) is None
+
+    # Non-int dropped_count is equally malformed (fail-closed, never coerced).
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["stage_progress"]["audit"]["chunks"][0]["dropped_count"] = "3"
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "r_editor": payload["stage_progress"]["r_editor"],
+        "audit": payload["stage_progress"]["audit"],
+        "repair": payload["stage_progress"]["repair"],
+        "reaudit": payload["stage_progress"]["reaudit"],
+    })
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert _load_stage_progress(path, translations=translations) is None
+
+
 def test_kill_safe_cache_repair_2of4_resume_plan(tmp_path: Path) -> None:
     """kill-sim repair 2/4: stage_progress.repair with 2 GOOD batches of 4 ->
     resume plan reuses those 2 (committed not repeated), batches 3-4 redone."""
@@ -294,6 +377,77 @@ def test_kill_safe_cache_reaudit_1of3_resume_plan(tmp_path: Path) -> None:
     plan = cache.reaudit_resume_plan()
     assert sorted(plan) == [1]
     assert plan[1]["first_pid"] == "p00001"
+
+
+def test_kill_safe_cache_reaudit_resume_plan_preserves_dropped(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP: the reaudit resume plan carries the persisted
+    ``dropped`` issue objects so a replayed re-audit chunk keeps its
+    journaled context/foreign diagnostics (RV t_7e7cfe6f finding 2: the plan
+    used to strip the field)."""
+    translations = _translation(3)
+    dropped_issue = {
+        "id": "p00099", "category": "addition", "severity": "major",
+        "confidence": "high", "note": "foreign pid", "excerpt": "text",
+    }
+    reaudit = {
+        "status": "partial",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [], "dropped": [dict(dropped_issue)]},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    cache = _load_stage_progress(path, translations=translations, r_editor_enabled=False)
+    assert cache is not None and cache.is_partial()
+    plan = cache.reaudit_resume_plan()
+    assert sorted(plan) == [1]
+    assert plan[1]["dropped"] == [dropped_issue]
+
+
+def test_kill_safe_cache_reaudit_malformed_dropped_full_miss(tmp_path: Path) -> None:
+    """CONTEXT-PID-DROP fail-closed: a reaudit done_chunks record whose
+    ``dropped`` field is not a list / not well-formed issue objects is a FULL
+    miss — never a trusted replay that silently loses the diagnostics (RV
+    t_7e7cfe6f finding 2)."""
+    translations = _translation(3)
+    reaudit = {
+        "status": "partial",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [], "dropped": "oops-not-a-list"},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(path, translations=translations) is None
+
+    # A dropped element that is not a well-formed issue object is equally a
+    # full miss (never coerced/filtered into a lossy replay).
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["stage_progress"]["reaudit"]["done_chunks"][0]["dropped"] = ["junk"]
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "r_editor": payload["stage_progress"]["r_editor"],
+        "audit": payload["stage_progress"]["audit"],
+        "repair": payload["stage_progress"]["repair"],
+        "reaudit": payload["stage_progress"]["reaudit"],
+    })
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert _load_stage_progress(path, translations=translations) is None
 
 
 def test_kill_safe_cache_audit_complete_repair_pending_junction(

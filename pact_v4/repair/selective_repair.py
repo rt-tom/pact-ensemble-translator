@@ -1866,6 +1866,14 @@ class SelectiveRepairEvaluator:
                     "first_pid": chunk_pids[0],
                     "last_pid": chunk_pids[-1],
                     "issues": replayed_issues,
+                    # CONTEXT-PID-DROP: the dropped context/foreign issue
+                    # objects ride the cached replay too, so a killed/resumed
+                    # re-audit keeps the journaled diagnostics of the fresh
+                    # run (fail-closed validation happened at cache load).
+                    "dropped": [
+                        dict(item) for item in (cached.get("dropped") or ())
+                        if isinstance(item, dict)
+                    ],
                 })
                 self._emit_progress(
                     "reaudit_chunk_done",

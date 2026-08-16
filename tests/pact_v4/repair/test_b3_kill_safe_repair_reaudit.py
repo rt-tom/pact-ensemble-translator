@@ -10,6 +10,7 @@ Acceptance:
 from __future__ import annotations
 
 import json
+from typing import Any, Dict, List
 
 from pact_v4.repair.selective_repair import (
     SelectiveRepairConfig,
@@ -211,3 +212,83 @@ def test_kill_safe_reaudit_cached_1of3_zero_calls() -> None:
     assert len(reaudit_calls) == 2
     assert outcome.repair_complete is True
     assert outcome.reaudit is not None and outcome.reaudit.complete
+
+
+def test_kill_safe_reaudit_cached_chunk_preserves_dropped() -> None:
+    """CONTEXT-PID-DROP (RV t_7e7cfe6f finding 2): a cached reaudit chunk
+    whose fresh run journaled ``dropped`` context/foreign issue objects keeps
+    them in the replayed chunk record — a killed/resumed re-audit no longer
+    loses the diagnostics. The dropped issues stay OUT of the re-audit
+    findings (all_issues/outcome.reaudit.issues)."""
+    source = {f"p{i:05d}": f"source text {i}" for i in range(1, 4)}
+    translation = {f"p{i:05d}": f"перевод текста {i}" for i in range(1, 4)}
+    filtered = [_confirmed_finding(f"p{i:05d}") for i in range(1, 4)]
+
+    dropped_issue = {
+        "id": "p00099", "category": "addition", "severity": "major",
+        "confidence": "high", "note": "foreign pid", "excerpt": "text",
+    }
+    cached_reaudit_chunks = {
+        1: {
+            "first_pid": "p00001",
+            "last_pid": "p00001",
+            "issues": [],
+            # journaled by the fresh run — must survive the replay
+            "dropped": [dict(dropped_issue)],
+        },
+    }
+    progress_records: List[Dict[str, Any]] = []
+
+    def _on_progress(kind: str, fields: Dict[str, Any]) -> None:
+        if kind == "reaudit_chunk_done":
+            progress_records.append(dict(fields))
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00001",
+            "repaired_translation": "перевод текста 1 исправленный",
+            "reason": "fix",
+        }]),
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00002",
+            "repaired_translation": "перевод текста 2 исправленный",
+            "reason": "fix",
+        }]),
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00003",
+            "repaired_translation": "перевод текста 3 исправленный",
+            "reason": "fix",
+        }]),
+        _reaudit_response([]),  # chunk 2
+        _reaudit_response([]),  # chunk 3
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(
+            microbatch_trigger=1,
+            microbatch_target=1,
+            reaudit_max_input_tokens=1,  # 1 pid per reaudit chunk
+            reaudit_neighbour_window=0,
+        ),
+        on_progress=_on_progress,
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, cached_reaudit_chunks=cached_reaudit_chunks,
+    )
+    reaudit_calls = [
+        r for r in backend.requests if "reaudit" in (r.label or "")
+    ]
+    assert len(reaudit_calls) == 2  # chunk 1 replayed with 0 calls
+    assert outcome.repair_complete is True
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    # The replayed chunk record keeps the journaled dropped diagnostics.
+    replayed_records = [
+        r for r in progress_records
+        for c in r.get("done_chunks") or ()
+        if c.get("chunk") == 1 and c.get("dropped")
+    ]
+    assert replayed_records, "replayed chunk record lost the dropped field"
+    assert replayed_records[0]["done_chunks"][0]["dropped"] == [dropped_issue]
+    # Dropped issues are NOT re-audit findings.
+    assert outcome.reaudit.issues == ()
