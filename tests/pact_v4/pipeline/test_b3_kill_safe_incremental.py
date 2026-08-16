@@ -194,11 +194,13 @@ def test_kill_safe_cache_audit_2of8_resume_plan(tmp_path: Path) -> None:
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
              "pair_count": 1, "context_count": 0, "status": "GOOD",
              "finish_reason": "stop", "reasoning_chars": 0,
-             "reasoning_file": "b3_audit_chunk1_raw.txt"},
+             "reasoning_file": "b3_audit_chunk1_raw.txt",
+             "issue_count": 0},
             {"chunk": 2, "first_pid": "p00002", "last_pid": "p00002",
              "pair_count": 1, "context_count": 0, "status": "GOOD",
              "finish_reason": "stop", "reasoning_chars": 0,
-             "reasoning_file": "b3_audit_chunk2_raw.txt"},
+             "reasoning_file": "b3_audit_chunk2_raw.txt",
+             "issue_count": 0},
         ],
         "issues": [],
     }
@@ -221,25 +223,32 @@ def test_kill_safe_cache_repair_2of4_resume_plan(tmp_path: Path) -> None:
     """kill-sim repair 2/4: stage_progress.repair with 2 GOOD batches of 4 ->
     resume plan reuses those 2 (committed not repeated), batches 3-4 redone."""
     translations = _translation(4)
+    finding = lambda i: {  # noqa: E731 — _repair_batches_payload schema
+        "index": 1, "pid": f"p{i:05d}", "tier": "TIER_A",
+        "category": "addition", "severity": "major", "confidence": "high",
+        "source_stage": "fidelity_auditor", "sources": [],
+    }
     repair = {
         "status": "partial",
         "done_batches": [1, 2],
         "committed": {"p00001": "исправленный текст 1."},
-        "passed": [],
+        "passed": ["p00002"],
         "outcome": {
             "batch_count": 4,
             "batches": [
                 {"batch_index": 1, "status": "GOOD",
-                 "findings": [{"pid": "p00001"}],
+                 "findings": [finding(1)],
                  "results": [{"index": 1, "decision": "repair",
                               "pid": "p00001",
                               "repaired_translation": "исправленный текст 1.",
-                              "reason": "mock"}]},
+                              "reason": "mock"}],
+                 "error": "", "warnings": [], "missing_indices": []},
                 {"batch_index": 2, "status": "GOOD",
-                 "findings": [{"pid": "p00002"}],
+                 "findings": [finding(2)],
                  "results": [{"index": 1, "decision": "pass",
-                              "pid": "p00002", "repaired_translation": "",
-                              "reason": "verified"}]},
+                              "pid": "", "repaired_translation": "",
+                              "reason": "verified"}],
+                 "error": "", "warnings": [], "missing_indices": []},
             ],
         },
     }
@@ -298,7 +307,7 @@ def test_kill_safe_cache_audit_complete_repair_pending_junction(
         {"chunk": i, "first_pid": f"p{i:05d}", "last_pid": f"p{i:05d}",
          "pair_count": 1, "context_count": 0, "status": "GOOD",
          "finish_reason": "stop", "reasoning_chars": 0,
-         "reasoning_file": f"b3_audit_chunk{i}_raw.txt"}
+         "reasoning_file": f"b3_audit_chunk{i}_raw.txt", "issue_count": 0}
         for i in range(1, 9)
     ]
     audit = {
@@ -409,9 +418,298 @@ def test_kill_safe_cache_tamper_edit_class_full_miss(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Full-run kill-sims: a cache left by a killed process is loaded on resume,
-# GOOD chunks replayed with 0 model calls, the rest re-run, chapter released
+# FIX RV2 (t_d996bbf7): strict replay-payload validation — a recomputed hash
+# must NOT smuggle unauthorized repair/reaudit/R content into the evaluators
 # ---------------------------------------------------------------------------
+
+
+def _tamper_and_load(
+    path: Path,
+    translations: Mapping[str, str],
+    mutate,
+    r_editor_enabled: bool = False,
+):
+    """Tamper stage_progress, RECOMPUTE the partial_resume_hash (so only the
+    strict schema/boundary/text validation can catch the mutation), and load.
+    Returns the load result (None == full miss, the fail-closed contract)."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload["stage_progress"])
+    payload["partial_resume_hash"] = canonical_json_hash({
+        "r_editor": payload["stage_progress"]["r_editor"],
+        "audit": payload["stage_progress"]["audit"],
+        "repair": payload["stage_progress"]["repair"],
+        "reaudit": payload["stage_progress"]["reaudit"],
+    })
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return _load_stage_progress(
+        path, translations=translations, r_editor_enabled=r_editor_enabled
+    )
+
+
+def _repair_finding(pid: str) -> dict:
+    """A finding record in the exact _repair_batches_payload schema."""
+    return {
+        "index": 1, "pid": pid, "tier": "TIER_A", "category": "addition",
+        "severity": "major", "confidence": "high",
+        "source_stage": "fidelity_auditor", "sources": [],
+    }
+
+
+def _repair_stage_with_batch(
+    *,
+    finding_pid: str,
+    result: Mapping[str, Any],
+    committed: Mapping[str, str],
+    passed: Sequence[str] = (),
+) -> dict:
+    """A production-schema partial repair stage with ONE GOOD batch."""
+    return {
+        "status": "partial",
+        "done_batches": [1],
+        "committed": dict(committed),
+        "passed": list(passed),
+        "outcome": {
+            "batch_count": 1,
+            "batches": [{
+                "batch_index": 1, "status": "GOOD",
+                "findings": [_repair_finding(finding_pid)],
+                "results": [dict(result)],
+                "error": "", "warnings": [], "missing_indices": [],
+            }],
+        },
+    }
+
+
+def test_kill_safe_tamper_repair_result_text_full_miss(tmp_path: Path) -> None:
+    """RV2 HIGH probe: a cached GOOD batch whose repair result text was
+    replaced with UNAUTHORIZED is a FULL miss even with a recomputed hash —
+    the stored committed map no longer matches what replaying the batches
+    would commit, so the unauthorized text can never reach the evaluator."""
+    translations = _translation(3)
+    repair = _repair_stage_with_batch(
+        finding_pid="p00001",
+        result={"index": 1, "decision": "repair", "pid": "p00001",
+                "repaired_translation": "исправленный текст 1.",
+                "reason": "mock"},
+        committed={"p00001": "исправленный текст 1."},
+    )
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=repair, reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(
+        path, translations=translations, r_editor_enabled=False
+    ) is not None  # the untouched payload is valid
+
+    # The reviewer's deterministic probe: replace ONLY the result text —
+    # the evaluator would otherwise commit {'p00001': 'UNAUTHORIZED'} with
+    # 0 model calls. committed is untouched, so the recomputed-hash payload
+    # is caught by the committed<->results binding.
+    assert _tamper_and_load(path, translations, lambda sp: sp["repair"]
+        ["outcome"]["batches"][0]["results"][0]
+        .__setitem__("repaired_translation", "UNAUTHORIZED")) is None
+
+
+def test_kill_safe_tamper_repair_result_truncated_full_miss(tmp_path: Path) -> None:
+    """RV2: even when the tamperer ALSO rewrites committed to match (and
+    recomputes the hash), a repair text that preserves <40% of the current
+    text is rejected by the same truncation gate the fresh parse_repair_batch
+    applies — a cached batch can never contain a truncated repair."""
+    translations = _translation(3)
+    repair = _repair_stage_with_batch(
+        finding_pid="p00001",
+        result={"index": 1, "decision": "repair", "pid": "p00001",
+                "repaired_translation": "исправленный текст 1.",
+                "reason": "mock"},
+        committed={"p00001": "исправленный текст 1."},
+    )
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=repair, reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+
+    def mutate(sp):
+        sp["repair"]["outcome"]["batches"][0]["results"][0][
+            "repaired_translation"] = "X"
+        sp["repair"]["committed"]["p00001"] = "X"
+
+    assert _tamper_and_load(path, translations, mutate) is None
+
+
+def test_kill_safe_tamper_repair_result_pid_full_miss(tmp_path: Path) -> None:
+    """RV2: a repair result naming a pid other than its finding's pid breaks
+    the index/PID contract (same rule as the fresh path) — full miss."""
+    translations = _translation(3)
+    repair = _repair_stage_with_batch(
+        finding_pid="p00001",
+        result={"index": 1, "decision": "repair", "pid": "p00001",
+                "repaired_translation": "исправленный текст 1.",
+                "reason": "mock"},
+        committed={"p00001": "исправленный текст 1."},
+    )
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=repair, reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+
+    def mutate(sp):
+        sp["repair"]["outcome"]["batches"][0]["results"][0]["pid"] = "p00099"
+
+    assert _tamper_and_load(path, translations, mutate) is None
+
+
+def test_kill_safe_tamper_repair_result_decision_full_miss(tmp_path: Path) -> None:
+    """RV2: a cached result with a decision outside {pass, repair} is a full
+    miss — the replay path would otherwise commit it verbatim."""
+    translations = _translation(3)
+    repair = _repair_stage_with_batch(
+        finding_pid="p00001",
+        result={"index": 1, "decision": "repair", "pid": "p00001",
+                "repaired_translation": "исправленный текст 1.",
+                "reason": "mock"},
+        committed={"p00001": "исправленный текст 1."},
+    )
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=repair, reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+
+    def mutate(sp):
+        sp["repair"]["outcome"]["batches"][0]["results"][0][
+            "decision"] = "approve"
+
+    assert _tamper_and_load(path, translations, mutate) is None
+
+
+def test_kill_safe_tamper_reaudit_issue_schema_full_miss(tmp_path: Path) -> None:
+    """RV2 HIGH: a malformed cached reaudit issue (invalid category) is a
+    full miss — reaudit_resume_plan()/_run_reaudit() copy cached issues
+    verbatim with 0 model calls, so the same strict validator as a fresh
+    re-audit chunk applies at load time."""
+    translations = _translation(3)
+    issue = {"id": "p00001", "category": "addition",
+             "severity": "major", "confidence": "high"}
+    reaudit = {
+        "status": "partial",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [dict(issue)]},
+        ],
+        "issues": [dict(issue)],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(), reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(
+        path, translations=translations, r_editor_enabled=False
+    ) is not None
+
+    # Tamper the category in BOTH the per-chunk list and the aggregate (and
+    # recompute the hash) so only the issue-schema validation can catch it.
+    def mutate(sp):
+        for issues in (sp["reaudit"]["done_chunks"][0]["issues"],
+                       sp["reaudit"]["issues"]):
+            issues[0]["category"] = "bogus-category"
+
+    assert _tamper_and_load(path, translations, mutate) is None
+
+
+def test_kill_safe_tamper_reaudit_issue_out_of_span_full_miss(tmp_path: Path) -> None:
+    """RV2 HIGH: a cached reaudit issue whose id is NOT inside its chunk's pid
+    span is a full miss — the replayed chunk would otherwise publish
+    out-of-scope evidence with 0 model calls."""
+    translations = _translation(3)
+    issue = {"id": "p00001", "category": "addition",
+             "severity": "major", "confidence": "high"}
+    reaudit = {
+        "status": "partial",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [dict(issue)]},
+        ],
+        "issues": [dict(issue)],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(), reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+
+    # Move the issue onto p00002 in BOTH lists (aggregate stays consistent)
+    # — the per-chunk pid-span binding must reject it.
+    def mutate(sp):
+        for issues in (sp["reaudit"]["done_chunks"][0]["issues"],
+                       sp["reaudit"]["issues"]):
+            issues[0]["id"] = "p00002"
+
+    assert _tamper_and_load(path, translations, mutate) is None
+
+
+def test_kill_safe_tamper_r_edit_original_mismatch_full_miss(
+    tmp_path: Path,
+) -> None:
+    """RV2 MEDIUM: a cached R edit whose ``original`` is not a verbatim
+    substring of the CURRENT text of its pid is a full miss — without the
+    current-text binding a recomputed hash could replay an edit the model
+    never saw."""
+    translations = _translation(3)
+    r_editor = {
+        "status": "partial", "enabled": True,
+        "done_chunks": [1], "failed_chunks": [],
+        "outcome": {
+            "chunk_size": 1,
+            "chunks": [
+                {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+                 "status": "GOOD",
+                 "edits": [{"pid": "p00001", "original": "Текст абзаца 1.",
+                            "rewritten": "Текст абзаца 1!",
+                            "reason": "mock", "class": "typo"}]},
+            ],
+        },
+    }
+    stage = _stage_progress_with(
+        r_editor=r_editor, audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(), reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(
+        path, translations=translations, r_editor_enabled=True
+    ) is not None
+
+    def mutate(sp):
+        sp["r_editor"]["outcome"]["chunks"][0]["edits"][0][
+            "original"] = "Текст абзаца 999."
+
+    assert _tamper_and_load(path, translations, mutate) is None
+
+
+def test_kill_safe_tamper_unknown_schema_key_full_miss(tmp_path: Path) -> None:
+    """RV2 MEDIUM: an extra/unknown key in ANY stage record (here: a repair
+    batch) is a foreign-schema payload — full miss, never silently ignored."""
+    translations = _translation(3)
+    repair = _repair_stage_with_batch(
+        finding_pid="p00001",
+        result={"index": 1, "decision": "repair", "pid": "p00001",
+                "repaired_translation": "исправленный текст 1.",
+                "reason": "mock"},
+        committed={"p00001": "исправленный текст 1."},
+    )
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(), audit=_audit_pending_stage(),
+        repair=repair, reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+
+    def mutate(sp):
+        sp["repair"]["outcome"]["batches"][0]["evil_key"] = "smuggle"
+
+    assert _tamper_and_load(path, translations, mutate) is None
 
 
 def _craft_kill_state(
