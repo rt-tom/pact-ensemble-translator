@@ -2413,9 +2413,22 @@ def _validate_stage_progress(
                         f"{first_pid!r}..{last_pid!r}"
                     )
             expected_aggregate.append(dict(issue))
-        # CONTEXT-PID-DROP: dropped context/foreign issue objects are part of
-        # the incremental reaudit contract — a malformed list/element is a
-        # full miss (never a trusted replay that loses the diagnostics).
+        # CONTEXT-PID-DROP (RV2 t_61af1bb2): dropped context/foreign issue
+        # objects are persisted reaudit diagnostics and are validated with
+        # the SAME complete well-formed issue contract as cached audit
+        # issues — exact _ISSUE_KEYS, non-empty id/note/excerpt strings,
+        # valid category/severity/confidence vocab, and a harness _debug
+        # {chunk, reasoning_file} attributing the drop to the journaling
+        # chunk (the fresh _run_reaudit attaches it exactly like the audit's
+        # _with_debug). Any malformed/missing/extra/invalid field is a FULL
+        # miss BEFORE either resume plan is built — never a filtered/coerced
+        # replay. The PID boundary check is the safe equivalent for
+        # context/foreign dropped IDs: a dropped issue's id is by
+        # construction NOT in the chunk that journaled it (a context pid
+        # lies outside the chunk's span; a foreign/fabricated pid is not in
+        # the translation map at all), so the id must NOT lie inside the
+        # record's own first_pid..last_pid span — an in-span id would have
+        # been a valid issue, never a drop (tampered cache).
         dropped = record.get("dropped")
         if dropped is not None:
             if not isinstance(dropped, list):
@@ -2424,15 +2437,118 @@ def _validate_stage_progress(
                     f"dropped is not a list"
                 )
             for dropped_index, dropped_issue in enumerate(dropped):
+                if not isinstance(dropped_issue, dict):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: not an object"
+                    )
+                if set(dropped_issue) != _ISSUE_KEYS:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: key set mismatch "
+                        f"(expected {sorted(_ISSUE_KEYS)}, got "
+                        f"{sorted(dropped_issue)})"
+                    )
+                pid = dropped_issue.get("id")
+                if not isinstance(pid, str) or not pid:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: id is missing or not a string"
+                    )
+                if dropped_issue.get("category") not in AUDIT_V4_CATEGORIES:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: invalid category "
+                        f"{dropped_issue.get('category')!r}"
+                    )
+                if dropped_issue.get("severity") not in AUDIT_V4_SEVERITIES:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: invalid severity "
+                        f"{dropped_issue.get('severity')!r}"
+                    )
+                if dropped_issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: invalid confidence "
+                        f"{dropped_issue.get('confidence')!r}"
+                    )
+                note = dropped_issue.get("note")
+                if not isinstance(note, str) or not note.strip():
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: note is missing, not a string, or empty"
+                    )
+                excerpt = dropped_issue.get("excerpt")
+                if not isinstance(excerpt, str) or not excerpt.strip():
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: excerpt is missing, not a string, or "
+                        "empty"
+                    )
+                debug = dropped_issue.get("_debug")
+                if not isinstance(debug, dict):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug is missing or not an object"
+                    )
+                if set(debug) != {"chunk", "reasoning_file"}:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug key set mismatch "
+                        f"(expected ['chunk', 'reasoning_file'], got "
+                        f"{sorted(debug)})"
+                    )
+                debug_chunk = debug.get("chunk")
                 if (
-                    not isinstance(dropped_issue, dict)
-                    or not isinstance(dropped_issue.get("id"), str)
-                    or not dropped_issue.get("id")
+                    not isinstance(debug_chunk, int)
+                    or isinstance(debug_chunk, bool)
+                    or debug_chunk != chunk_index
                 ):
                     return (
                         f"stage_progress.reaudit chunk {chunk_index} dropped "
-                        f"issue {dropped_index}: not a well-formed issue object"
+                        f"issue {pid}: _debug.chunk {debug_chunk!r} does not "
+                        f"match the journaling chunk {chunk_index}"
                     )
+                if not isinstance(debug.get("reasoning_file"), str):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug.reasoning_file is not a string"
+                    )
+                # Safe PID equivalent for dropped IDs: the id must NOT lie
+                # inside the journaling record's own pid span. A dropped
+                # issue is by construction outside the chunk (context pid
+                # from the overlap, or a foreign/fabricated pid absent from
+                # the map), so an in-span id is an impossible drop (tamper).
+                if pid_positions is not None:
+                    first_pos = pid_positions.get(record.get("first_pid"))
+                    last_pos = pid_positions.get(record.get("last_pid"))
+                    pid_pos = pid_positions.get(pid)
+                    if (
+                        first_pos is not None
+                        and last_pos is not None
+                        and pid_pos is not None
+                        and first_pos <= pid_pos <= last_pos
+                    ):
+                        return (
+                            f"stage_progress.reaudit chunk {chunk_index} "
+                            f"dropped issue {pid}: id is inside the chunk's "
+                            f"own pid span "
+                            f"({record.get('first_pid')!r}.."
+                            f"{record.get('last_pid')!r}) — a dropped issue "
+                            f"is by definition outside the chunk (tampered)"
+                        )
+    ra_issues = reaudit.get("issues")
+    if not isinstance(ra_issues, list):
+        return "stage_progress.reaudit.issues is not a list"
+    for issue_index, issue in enumerate(ra_issues):
+        if not isinstance(issue, dict):
+            return f"stage_progress.reaudit issue {issue_index}: not an object"
+        pid = issue.get("id")
+        if not isinstance(pid, str) or not pid:
+            return f"stage_progress.reaudit issue {issue_index}: id is missing or not a string"
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"stage_progress.reaudit issue {issue_index}: id {pid!r} is not in the translation map"
     if list(ra_issues) != expected_aggregate:
         return (
             "stage_progress.reaudit.issues does not match the order-sensitive "

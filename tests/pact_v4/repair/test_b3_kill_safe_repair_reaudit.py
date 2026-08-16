@@ -20,6 +20,7 @@ from tests.pact_v4.repair.test_selective_repair import (
     CONFIRMED,
     FilteredIssue,
     ScriptedRepairBackend,
+    _hard_filtered,
     _issue,
     _reaudit_response,
     _repair_response,
@@ -227,6 +228,13 @@ def test_kill_safe_reaudit_cached_chunk_preserves_dropped() -> None:
     dropped_issue = {
         "id": "p00099", "category": "addition", "severity": "major",
         "confidence": "high", "note": "foreign pid", "excerpt": "text",
+        # harness _debug is attached at journal time (RV2 t_61af1bb2) —
+        # the persisted dropped object satisfies the exact _ISSUE_KEYS
+        # contract the incremental cache validator enforces on load.
+        "_debug": {
+            "chunk": 1,
+            "reasoning_file": "b3_repair_reaudit_chunk1_reasoning.txt",
+        },
     }
     cached_reaudit_chunks = {
         1: {
@@ -292,3 +300,67 @@ def test_kill_safe_reaudit_cached_chunk_preserves_dropped() -> None:
     assert replayed_records[0]["done_chunks"][0]["dropped"] == [dropped_issue]
     # Dropped issues are NOT re-audit findings.
     assert outcome.reaudit.issues == ()
+
+
+def test_reaudit_fresh_dropped_journaled_with_debug() -> None:
+    """CONTEXT-PID-DROP (RV2 t_61af1bb2): a FRESH re-audit journals its
+    dropped context/foreign issue objects as COMPLETE well-formed issue
+    objects — with the harness ``_debug`` {chunk, reasoning_file} attached
+    at journal time (same contract the incremental cache validator enforces
+    on load). The dropped issue stays OUT of the re-audit findings."""
+    issue = _issue("p00005", "invented_gender", note="n", confidence="high")
+    source = {f"p{i:05d}": f"Source paragraph {i}." for i in range(1, 11)}
+    translation = {f"p{i:05d}": f"Перевод абзаца {i}." for i in range(1, 11)}
+    filtered = _hard_filtered([issue], source, translation)
+
+    progress_records: List[Dict[str, Any]] = []
+
+    def _on_progress(kind: str, fields: Dict[str, Any]) -> None:
+        if kind == "reaudit_chunk_done":
+            progress_records.append(dict(fields))
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+        # re-audit response: one valid residual issue on an owned pid
+        # (p00005) + one issue on a CONTEXT pid (p00002) -> dropped.
+        _reaudit_response([
+            {"id": "p00005", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "residual", "excerpt": "text"},
+            {"id": "p00002", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "context-only", "excerpt": "text"},
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        on_progress=_on_progress,
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    # the context-pid issue is dropped — never a re-audit finding
+    assert [i["id"] for i in outcome.reaudit.issues] == ["p00005"]
+    # the fresh chunk record journals the dropped object COMPLETE with _debug
+    journaled = [
+        c for r in progress_records
+        for c in (r.get("done_chunks") or ())
+        if c.get("dropped")
+    ]
+    assert journaled, "fresh re-audit chunk record lost the dropped field"
+    dropped = journaled[0]["dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["id"] == "p00002"
+    assert dropped[0]["_debug"] == {
+        "chunk": 1,
+        "reasoning_file": "b3_repair_reaudit_chunk1_reasoning.txt",
+    }
+    assert set(dropped[0]) == {
+        "id", "category", "severity", "confidence", "note", "excerpt",
+        "_debug",
+    }

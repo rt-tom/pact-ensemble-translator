@@ -2013,12 +2013,31 @@ class SelectiveRepairEvaluator:
             # Dropped issues (context-only/foreign pids) are journaled but
             # NEVER extend the re-audit findings — they are not in scope.
             all_issues.extend(validation.issues)
+            # CONTEXT-PID-DROP (RV2 t_61af1bb2): dropped issues are journaled
+            # as COMPLETE well-formed issue objects — with the same harness
+            # ``_debug`` metadata the audit attaches to its cached issues
+            # ({chunk, reasoning_file}; the reasoning file name matches
+            # _write_reaudit_artifacts), so a persisted dropped record
+            # satisfies the exact _ISSUE_KEYS contract the incremental cache
+            # validator enforces on resume (malformed dropped objects are a
+            # full miss, never a trusted replay that loses diagnostics).
             chunk_records.append({
                 "chunk": chunk_index,
                 "first_pid": chunk_pids[0],
                 "last_pid": chunk_pids[-1],
                 "issues": [dict(i) for i in validation.issues],
-                "dropped": [dict(i) for i in validation.dropped],
+                "dropped": [
+                    {
+                        **dict(i),
+                        "_debug": {
+                            "chunk": chunk_index,
+                            "reasoning_file": (
+                                f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
+                            ),
+                        },
+                    }
+                    for i in validation.dropped
+                ],
             })
             self._emit_progress(
                 "reaudit_chunk_done",
