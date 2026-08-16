@@ -94,6 +94,7 @@ from pact_v4.audit.chunked_audit import (
     ChunkedAuditConfig,
     ChunkedAuditEvaluator,
     ChunkedAuditOutcome,
+    audit_model_ref,
     build_narrator_context,
     pairs_from_maps,
 )
@@ -1391,6 +1392,450 @@ def _validate_partial_payload(
     return None
 
 
+def _validate_stage_progress(
+    stage_progress: Any,
+    *,
+    expected_pids: Optional[Sequence[str]],
+    stored_hash: Any,
+    r_editor_enabled: bool = False,
+) -> Optional[str]:
+    """Validate the KILL-SAFE-INCREMENTAL ``stage_progress`` payload (t_2d16962c).
+
+    The incremental cache rewrites ``audit_cache_b3.json`` after EVERY chunk /
+    batch on all chunked stages (R, audit, repair, reaudit). The payload's
+    ``stage_progress`` records, per stage, which chunks/batches finished with
+    which status and the accumulated slices (chunk payloads / issues /
+    committed / passed / residual issues) needed to resume. Same fail-closed
+    policy as the top-level partial payload: any tamper, malformed value,
+    coverage gap, or foreign schema is a full cache miss (load returns None,
+    the stage re-runs from scratch) — never a partial replay of a payload the
+    validator cannot fully trust.
+
+    ``stored_hash`` is the top-level ``partial_resume_hash`` persisted at the
+    last save — recomputed over the four stage blocks at every incremental
+    rewrite, so any tamper (even with identity and translations_repaired_hash
+    preserved) is a full miss.
+
+    Returns None when valid, else a reason string naming the first violation.
+    """
+    if not isinstance(stage_progress, dict):
+        return "stage_progress is not an object"
+    expected_pid_set = frozenset(expected_pids) if expected_pids is not None else None
+
+    # ------------------------------------------------------------------
+    # r_editor
+    # ------------------------------------------------------------------
+    r_editor = stage_progress.get("r_editor")
+    if r_editor is None:
+        return "stage_progress.r_editor is missing"
+    if not isinstance(r_editor, dict):
+        return "stage_progress.r_editor is not an object"
+    r_status = r_editor.get("status")
+    if not isinstance(r_status, str) or r_status not in _R_EDITOR_REPORT_STATUSES:
+        return f"stage_progress.r_editor.status is missing or unknown {r_status!r}"
+    if not isinstance(r_editor.get("enabled"), bool):
+        return "stage_progress.r_editor.enabled is not a bool"
+    # FIX RV2-B (t_aa3ee032, mirrored from the top-level R report): the
+    # stored enabled flag must agree with the CURRENT run's R enablement
+    # (save() writes the config flag verbatim) — a stored disabled stage in
+    # an enabled-R incremental cache (or a ran stage in a disabled-R cache)
+    # is an impossible combination (tampered) and fails closed.
+    if r_editor.get("enabled") != r_editor_enabled:
+        return (
+            f"stage_progress.r_editor.enabled {r_editor.get('enabled')!r} "
+            f"contradicts the current run's R enablement {r_editor_enabled!r} "
+            "(tampered stage_progress)"
+        )
+    if r_editor.get("enabled") and r_status == "disabled":
+        return (
+            "stage_progress.r_editor.status 'disabled' contradicts "
+            "enabled=True — a disabled status is only written by a disabled "
+            "R config"
+        )
+    if not r_editor.get("enabled") and r_status != "disabled":
+        return (
+            f"stage_progress.r_editor.status {r_status!r} contradicts "
+            "enabled=False — a disabled R config never runs the stage"
+        )
+    done_chunks = r_editor.get("done_chunks")
+    if not isinstance(done_chunks, list) or any(
+        not isinstance(c, int) or isinstance(c, bool) for c in done_chunks
+    ):
+        return "stage_progress.r_editor.done_chunks is not a list of ints"
+    if done_chunks != sorted(set(done_chunks)):
+        return "stage_progress.r_editor.done_chunks contains duplicates"
+    if done_chunks != list(range(1, len(done_chunks) + 1)):
+        return (
+            "stage_progress.r_editor.done_chunks is not contiguous 1..N "
+            "(coverage gap — a kill between chunks must never look complete)"
+        )
+    failed_chunks = r_editor.get("failed_chunks")
+    if not isinstance(failed_chunks, list) or any(
+        not isinstance(c, int) or isinstance(c, bool) for c in failed_chunks
+    ):
+        return "stage_progress.r_editor.failed_chunks is not a list of ints"
+    if any(c not in done_chunks for c in failed_chunks):
+        return "stage_progress.r_editor.failed_chunks is not a subset of done_chunks"
+    r_outcome = r_editor.get("outcome")
+    if r_status in _R_EDITOR_RAN_STATUSES:
+        # R ran: outcome REQUIRED with a non-empty, prefix-coherent chunks list.
+        if not isinstance(r_outcome, dict):
+            return (
+                f"stage_progress.r_editor.outcome is required when status is "
+                f"{r_status!r} (got {type(r_outcome).__name__})"
+            )
+        r_chunks = r_outcome.get("chunks")
+        if not isinstance(r_chunks, list) or not r_chunks:
+            return "stage_progress.r_editor.outcome.chunks is missing, not a list, or empty"
+        chunk_size = r_outcome.get("chunk_size")
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
+            return f"stage_progress.r_editor.outcome.chunk_size {chunk_size!r} is not a positive int"
+        for position, item in enumerate(r_chunks, start=1):
+            if not isinstance(item, dict):
+                return f"stage_progress.r_editor chunk at position {position}: not an object"
+            if set(item) != _R_CHUNK_KEYS:
+                return (
+                    f"stage_progress.r_editor chunk at position {position}: "
+                    f"foreign key set {sorted(item)!r} (expected {sorted(_R_CHUNK_KEYS)})"
+                )
+            chunk_index = item.get("chunk")
+            if chunk_index != position:
+                return (
+                    f"stage_progress.r_editor chunk coverage/order mismatch: stored "
+                    f"index {chunk_index!r} at position {position} (expected 1..N)"
+                )
+            status = item.get("status")
+            if not isinstance(status, str) or status not in _R_EDITOR_CHUNK_STATUSES:
+                return f"stage_progress.r_editor chunk {chunk_index}: unknown status {status!r}"
+            first_pid = item.get("first_pid")
+            last_pid = item.get("last_pid")
+            if not isinstance(first_pid, str) or not first_pid:
+                return f"stage_progress.r_editor chunk {chunk_index}: first_pid is missing or not a string"
+            if not isinstance(last_pid, str) or not last_pid:
+                return f"stage_progress.r_editor chunk {chunk_index}: last_pid is missing or not a string"
+            if expected_pid_set is not None and (
+                first_pid not in expected_pid_set or last_pid not in expected_pid_set
+            ):
+                return (
+                    f"stage_progress.r_editor chunk {chunk_index}: boundary pids "
+                    f"{first_pid!r}/{last_pid!r} are not in the translation map"
+                )
+            if expected_pids is not None:
+                # Coherent prefix tiling: chunk k covers exactly the k-th
+                # chunk_size span of the ordered translation map.
+                start = (position - 1) * chunk_size
+                end = min(position * chunk_size, len(expected_pids))
+                if start >= len(expected_pids):
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index}: boundary span "
+                        f"starts beyond the translation map (position {position}, "
+                        f"chunk_size {chunk_size})"
+                    )
+                if (
+                    first_pid != expected_pids[start]
+                    or last_pid != expected_pids[end - 1]
+                ):
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index}: boundary span "
+                        f"{first_pid!r}/{last_pid!r} does not tile the translation "
+                        f"map prefix (expected {expected_pids[start]!r}/"
+                        f"{expected_pids[end - 1]!r} at positions {start}..{end - 1})"
+                    )
+            edits = item.get("edits")
+            if not isinstance(edits, list):
+                return f"stage_progress.r_editor chunk {chunk_index}: edits is not a list"
+            for edit_index, edit in enumerate(edits):
+                if not isinstance(edit, dict):
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index}: not an object"
+                    )
+                if set(edit) != _R_EDIT_KEYS:
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index}: foreign key set {sorted(edit)!r} "
+                        f"(expected {sorted(_R_EDIT_KEYS)})"
+                    )
+                edit_pid = edit.get("pid")
+                if not isinstance(edit_pid, str) or not edit_pid:
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index}: pid is missing or not a string"
+                    )
+                if expected_pid_set is not None and edit_pid not in expected_pid_set:
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index}: pid {edit_pid!r} is not in the translation map"
+                    )
+                if not isinstance(edit.get("original"), str) or not edit.get("original"):
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index} pid {edit_pid}: original is missing or not a string"
+                    )
+                if not isinstance(edit.get("rewritten"), str) or not edit.get("rewritten").strip():
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index} pid {edit_pid}: rewritten is missing or not a string"
+                    )
+                if not isinstance(edit.get("reason"), str) or not edit.get("reason").strip():
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index} pid {edit_pid}: reason is missing or not a string"
+                    )
+                klass = edit.get("class")
+                if not isinstance(klass, str) or klass not in ALL_CLASSES:
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index} pid {edit_pid}: unknown edit class {klass!r} "
+                        f"(allowed: {sorted(ALL_CLASSES)})"
+                    )
+    elif r_outcome is not None:
+        # pending/disabled/failed: a non-null outcome is a schema violation.
+        return (
+            f"stage_progress.r_editor: outcome must be null when status is "
+            f"{r_status!r} (got {type(r_outcome).__name__})"
+        )
+
+    # ------------------------------------------------------------------
+    # audit
+    # ------------------------------------------------------------------
+    audit = stage_progress.get("audit")
+    if audit is None:
+        return "stage_progress.audit is missing"
+    if not isinstance(audit, dict):
+        return "stage_progress.audit is not an object"
+    a_status = audit.get("status")
+    if not isinstance(a_status, str) or a_status not in ("pending", "partial", "complete"):
+        return f"stage_progress.audit.status is missing or unknown {a_status!r}"
+    a_chunks = audit.get("chunks")
+    if not isinstance(a_chunks, list):
+        return "stage_progress.audit.chunks is not a list"
+    a_issues = audit.get("issues")
+    if not isinstance(a_issues, list):
+        return "stage_progress.audit.issues is not a list"
+    if a_status == "pending" and a_chunks:
+        return "stage_progress.audit is pending but carries chunk payloads"
+    done = audit.get("done_chunks")
+    if not isinstance(done, list) or any(
+        not isinstance(c, int) or isinstance(c, bool) for c in done
+    ):
+        return "stage_progress.audit.done_chunks is not a list of ints"
+    if done != sorted(set(done)):
+        return "stage_progress.audit.done_chunks contains duplicates"
+    if done != list(range(1, len(done) + 1)):
+        return (
+            "stage_progress.audit.done_chunks is not contiguous 1..N "
+            "(coverage gap — a kill between chunks must never look complete)"
+        )
+    failed = audit.get("failed_chunks")
+    if not isinstance(failed, list) or any(
+        not isinstance(c, int) or isinstance(c, bool) for c in failed
+    ):
+        return "stage_progress.audit.failed_chunks is not a list of ints"
+    if any(c not in done for c in failed):
+        return "stage_progress.audit.failed_chunks is not a subset of done_chunks"
+    if done and [c.get("chunk") for c in a_chunks] != done:
+        return (
+            "stage_progress.audit.chunks indices do not match done_chunks "
+            "(coverage mismatch)"
+        )
+    pid_positions = (
+        {pid: position for position, pid in enumerate(expected_pids)}
+        if expected_pids is not None
+        else None
+    )
+    for position, item in enumerate(a_chunks, start=1):
+        if not isinstance(item, dict):
+            return f"stage_progress.audit chunk at position {position}: not an object"
+        chunk_index = item.get("chunk")
+        if chunk_index != position:
+            return (
+                f"stage_progress.audit chunk coverage/order mismatch: stored "
+                f"index {chunk_index!r} at position {position} (expected 1..N)"
+            )
+        status = item.get("status")
+        if not isinstance(status, str) or status not in _AUDIT_CHUNK_STATUSES:
+            return f"stage_progress.audit chunk {chunk_index}: unknown status {status!r}"
+        first_pid = item.get("first_pid")
+        last_pid = item.get("last_pid")
+        if not isinstance(first_pid, str) or not first_pid:
+            return f"stage_progress.audit chunk {chunk_index}: first_pid is missing or not a string"
+        if not isinstance(last_pid, str) or not last_pid:
+            return f"stage_progress.audit chunk {chunk_index}: last_pid is missing or not a string"
+        if expected_pid_set is not None and (
+            first_pid not in expected_pid_set or last_pid not in expected_pid_set
+        ):
+            return (
+                f"stage_progress.audit chunk {chunk_index}: boundary pids "
+                f"{first_pid!r}/{last_pid!r} are not in the translation map"
+            )
+        if not isinstance(item.get("pair_count"), int) or isinstance(item.get("pair_count"), bool) or item.get("pair_count") < 1:
+            return f"stage_progress.audit chunk {chunk_index}: pair_count is not a positive int"
+        if not isinstance(item.get("context_count"), int) or isinstance(item.get("context_count"), bool) or item.get("context_count") < 0:
+            return f"stage_progress.audit chunk {chunk_index}: context_count is not a non-negative int"
+        if not isinstance(item.get("reasoning_chars"), int) or isinstance(item.get("reasoning_chars"), bool) or item.get("reasoning_chars") < 0:
+            return f"stage_progress.audit chunk {chunk_index}: reasoning_chars is not a non-negative int"
+        if not isinstance(item.get("reasoning_file"), str):
+            return f"stage_progress.audit chunk {chunk_index}: reasoning_file is not a string"
+    for issue_index, issue in enumerate(a_issues):
+        if not isinstance(issue, dict):
+            return f"stage_progress.audit issue {issue_index}: not an object"
+        if set(issue) != _ISSUE_KEYS:
+            return (
+                f"stage_progress.audit issue {issue_index}: key set mismatch "
+                f"(expected {sorted(_ISSUE_KEYS)}, got {sorted(issue)})"
+            )
+        pid = issue.get("id")
+        if not isinstance(pid, str) or not pid:
+            return f"stage_progress.audit issue {issue_index}: id is missing or not a string"
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"stage_progress.audit issue {issue_index}: id {pid!r} is not in the translation map"
+        if issue.get("category") not in AUDIT_V4_CATEGORIES:
+            return f"stage_progress.audit issue {pid}: invalid category {issue.get('category')!r}"
+        if issue.get("severity") not in AUDIT_V4_SEVERITIES:
+            return f"stage_progress.audit issue {pid}: invalid severity {issue.get('severity')!r}"
+        if issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
+            return f"stage_progress.audit issue {pid}: invalid confidence {issue.get('confidence')!r}"
+        if not isinstance(issue.get("note"), str) or not issue.get("note").strip():
+            return f"stage_progress.audit issue {pid}: note is missing, not a string, or empty"
+        if not isinstance(issue.get("excerpt"), str) or not issue.get("excerpt").strip():
+            return f"stage_progress.audit issue {pid}: excerpt is missing, not a string, or empty"
+        debug = issue.get("_debug")
+        if not isinstance(debug, dict):
+            return f"stage_progress.audit issue {pid}: _debug is missing or not an object"
+        chunk = debug.get("chunk")
+        if not isinstance(chunk, int) or isinstance(chunk, bool) or not (1 <= chunk <= len(a_chunks)):
+            return (
+                f"stage_progress.audit issue {pid}: _debug.chunk {chunk!r} is not "
+                f"inside the covered chunk indices 1..{len(a_chunks)}"
+            )
+        if pid_positions is not None:
+            chunk_record = a_chunks[chunk - 1]
+            first_pos = pid_positions.get(chunk_record.get("first_pid"))
+            last_pos = pid_positions.get(chunk_record.get("last_pid"))
+            pid_pos = pid_positions.get(pid)
+            if (
+                first_pos is None or last_pos is None or pid_pos is None
+                or not (first_pos <= pid_pos <= last_pos)
+            ):
+                return (
+                    f"stage_progress.audit issue {pid}: id is not inside the actual "
+                    f"pid span of chunk {chunk} ({chunk_record.get('first_pid')!r}.."
+                    f"{chunk_record.get('last_pid')!r})"
+                )
+
+    # ------------------------------------------------------------------
+    # repair
+    # ------------------------------------------------------------------
+    repair = stage_progress.get("repair")
+    if repair is None:
+        return "stage_progress.repair is missing"
+    if not isinstance(repair, dict):
+        return "stage_progress.repair is not an object"
+    rp_status = repair.get("status")
+    if not isinstance(rp_status, str) or rp_status not in ("pending", "partial", "complete", "skipped", "failed"):
+        return f"stage_progress.repair.status is missing or unknown {rp_status!r}"
+    done_batches = repair.get("done_batches")
+    if not isinstance(done_batches, list) or any(
+        not isinstance(c, int) or isinstance(c, bool) for c in done_batches
+    ):
+        return "stage_progress.repair.done_batches is not a list of ints"
+    if done_batches != sorted(set(done_batches)):
+        return "stage_progress.repair.done_batches contains duplicates"
+    committed = repair.get("committed")
+    if committed is None:
+        return "stage_progress.repair.committed is missing"
+    if not isinstance(committed, dict):
+        return "stage_progress.repair.committed is not an object"
+    for pid, text in committed.items():
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"stage_progress.repair.committed pid {pid!r} is not in the translation map"
+        if not isinstance(text, str) or not text:
+            return f"stage_progress.repair.committed pid {pid!r}: text is missing or not a non-empty string"
+    passed = repair.get("passed")
+    if passed is None:
+        return "stage_progress.repair.passed is missing"
+    if not isinstance(passed, list):
+        return "stage_progress.repair.passed is not a list"
+    for pid in passed:
+        if not isinstance(pid, str) or not pid:
+            return f"stage_progress.repair.passed contains a non-string entry {pid!r}"
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"stage_progress.repair.passed pid {pid!r} is not in the translation map"
+    rp_outcome = repair.get("outcome")
+    if rp_status not in ("pending", "skipped", "failed") and not isinstance(rp_outcome, dict):
+        return (
+            f"stage_progress.repair.outcome is required when status is "
+            f"{rp_status!r} (got {type(rp_outcome).__name__})"
+        )
+
+    # ------------------------------------------------------------------
+    # reaudit
+    # ------------------------------------------------------------------
+    reaudit = stage_progress.get("reaudit")
+    if reaudit is None:
+        return "stage_progress.reaudit is missing"
+    if not isinstance(reaudit, dict):
+        return "stage_progress.reaudit is not an object"
+    ra_status = reaudit.get("status")
+    if not isinstance(ra_status, str) or ra_status not in ("pending", "partial", "complete", "failed"):
+        return f"stage_progress.reaudit.status is missing or unknown {ra_status!r}"
+    ra_done = reaudit.get("done_chunks")
+    if not isinstance(ra_done, list):
+        return "stage_progress.reaudit.done_chunks is not a list"
+    for position, record in enumerate(ra_done, start=1):
+        if not isinstance(record, dict):
+            return f"stage_progress.reaudit done_chunks record at position {position}: not an object"
+        chunk_index = record.get("chunk")
+        if chunk_index != position:
+            return (
+                f"stage_progress.reaudit done_chunks coverage/order mismatch: stored "
+                f"index {chunk_index!r} at position {position} (expected 1..N)"
+            )
+        first_pid = record.get("first_pid")
+        last_pid = record.get("last_pid")
+        if not isinstance(first_pid, str) or not first_pid:
+            return f"stage_progress.reaudit chunk {chunk_index}: first_pid is missing or not a string"
+        if not isinstance(last_pid, str) or not last_pid:
+            return f"stage_progress.reaudit chunk {chunk_index}: last_pid is missing or not a string"
+        if expected_pid_set is not None and (
+            first_pid not in expected_pid_set or last_pid not in expected_pid_set
+        ):
+            return (
+                f"stage_progress.reaudit chunk {chunk_index}: boundary pids "
+                f"{first_pid!r}/{last_pid!r} are not in the translation map"
+            )
+        if not isinstance(record.get("issues"), list):
+            return f"stage_progress.reaudit chunk {chunk_index}: issues is not a list"
+    ra_issues = reaudit.get("issues")
+    if not isinstance(ra_issues, list):
+        return "stage_progress.reaudit.issues is not a list"
+    for issue_index, issue in enumerate(ra_issues):
+        if not isinstance(issue, dict):
+            return f"stage_progress.reaudit issue {issue_index}: not an object"
+        pid = issue.get("id")
+        if not isinstance(pid, str) or not pid:
+            return f"stage_progress.reaudit issue {issue_index}: id is missing or not a string"
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"stage_progress.reaudit issue {issue_index}: id {pid!r} is not in the translation map"
+
+    # Canonical integrity binding: the whole stage_progress payload must
+    # match the hash persisted at save() time — any tamper (even with
+    # identity and translations_repaired_hash preserved) is a full miss.
+    computed_hash = canonical_json_hash({
+        "r_editor": r_editor,
+        "audit": audit,
+        "repair": repair,
+        "reaudit": reaudit,
+    })
+    if not isinstance(stored_hash, str) or stored_hash != computed_hash:
+        return (
+            "stage_progress partial_resume_hash mismatch (tampered or "
+            "malformed stage_progress; stored=%r computed=%r)"
+        ) % (stored_hash, computed_hash)
+    return None
+
+
 def _r_editor_resume_plan_from_report(
     report: Any,
 ) -> Dict[int, Dict[str, Any]]:
@@ -1625,12 +2070,26 @@ class B3AuditCache:
             # the R report itself is part of that required payload —
             # a missing/None stored r_editor is rejected here (full miss)
             # before either resume plan is built.
-            reason = _validate_partial_payload(
-                payload,
-                expected_pids=expected_pids,
-                current_text=current_text,
-                r_editor_enabled=r_editor_enabled,
-            )
+            # KILL-SAFE-INCREMENTAL (t_2d16962c): when the payload carries a
+            # ``stage_progress`` block (incremental rewrite after every
+            # chunk/batch), the VALIDATION TARGET switches to that block —
+            # the same fail-closed policy (any tamper/coverage gap/foreign
+            # schema = full miss, never a partial replay of a payload the
+            # validator cannot fully trust).
+            if payload.get("stage_progress") is not None:
+                reason = _validate_stage_progress(
+                    payload.get("stage_progress"),
+                    expected_pids=expected_pids,
+                    stored_hash=payload.get("partial_resume_hash"),
+                    r_editor_enabled=r_editor_enabled,
+                )
+            else:
+                reason = _validate_partial_payload(
+                    payload,
+                    expected_pids=expected_pids,
+                    current_text=current_text,
+                    r_editor_enabled=r_editor_enabled,
+                )
             if reason is not None:
                 LOG.warning(
                     "B3: audit cache partial payload rejected (%s); "
@@ -1715,19 +2174,42 @@ class B3AuditCache:
         context_count, reasoning_chars, reasoning_file, finish_reason,
         issues}}`` for every cached chunk whose status is GOOD/GOOD_RETRIED
         (valid JSON was confirmed at write time — never re-validated here).
-        ``issues`` are the top-level cached issues attributed to this chunk
-        via their ``_debug.chunk`` (the deduped top-level list is the
-        authoritative issue set; a GOOD_RETRIED chunk's sub-issues carry the
-        parent chunk index). Empty when the cache is not a partial hit or
-        has no reusable chunks.
+        ``issues`` are the cached issues attributed to this chunk via their
+        ``_debug.chunk`` (the deduped list is the authoritative issue set; a
+        GOOD_RETRIED chunk's sub-issues carry the parent chunk index). Empty
+        when the cache is not a partial hit or has no reusable chunks.
+
+        KILL-SAFE-INCREMENTAL (t_2d16962c): reads the accumulated audit
+        slices from ``stage_progress.audit`` (chunks + issues) when the
+        payload carries an incremental ``stage_progress`` block; legacy
+        caches read the top-level ``chunks``/``issues`` as before.
         """
         if not self._payload:
             return {}
+        stage_progress = self._payload.get("stage_progress")
+        if isinstance(stage_progress, dict):
+            audit_stage = stage_progress.get("audit")
+            if isinstance(audit_stage, dict):
+                chunk_payloads = audit_stage.get("chunks")
+                issues = audit_stage.get("issues")
+                if isinstance(chunk_payloads, list):
+                    return self._audit_resume_plan_from_slices(
+                        chunk_payloads, issues if isinstance(issues, list) else ()
+                    )
         chunk_payloads = self._payload.get("chunks")
         if not isinstance(chunk_payloads, list):
             return {}
+        return self._audit_resume_plan_from_slices(
+            chunk_payloads, self._payload.get("issues") or ()
+        )
+
+    @staticmethod
+    def _audit_resume_plan_from_slices(
+        chunk_payloads: Sequence[Mapping[str, Any]],
+        issues: Sequence[Mapping[str, Any]],
+    ) -> Dict[int, Dict[str, Any]]:
         issues_by_chunk: Dict[int, List[Dict[str, Any]]] = {}
-        for issue in self._payload.get("issues") or ():
+        for issue in issues:
             if not isinstance(issue, dict):
                 continue
             debug = issue.get("_debug")
@@ -1738,7 +2220,7 @@ class B3AuditCache:
         for chunk_payload in chunk_payloads:
             if not isinstance(chunk_payload, dict):
                 continue
-            if chunk_payload.get("status") not in self._GOOD_STATUSES:
+            if chunk_payload.get("status") not in B3AuditCache._GOOD_STATUSES:
                 continue
             chunk_index = chunk_payload.get("chunk")
             if not isinstance(chunk_index, int):
@@ -1765,12 +2247,106 @@ class B3AuditCache:
         with 0 model calls on resume; the caller re-runs only the failed
         chunks). Empty when R was disabled / the cache predates R / the R
         stage had no GOOD chunks.
+
+        KILL-SAFE-INCREMENTAL (t_2d16962c): reads the accumulated R outcome
+        from ``stage_progress.r_editor.outcome`` when the payload carries an
+        incremental ``stage_progress`` block; legacy caches read the
+        top-level ``r_editor`` report as before.
         """
         if not self._payload:
             return {}
+        stage_progress = self._payload.get("stage_progress")
+        if isinstance(stage_progress, dict):
+            r_editor_stage = stage_progress.get("r_editor")
+            if isinstance(r_editor_stage, dict):
+                return _r_editor_resume_plan_from_report({
+                    "outcome": r_editor_stage.get("outcome"),
+                })
         return _r_editor_resume_plan_from_report(
             self._payload.get("r_editor")
         )
+
+    # ------------------------------------------------------------------
+    # KILL-SAFE-INCREMENTAL (t_2d16962c): repair / reaudit resume plans
+    # ------------------------------------------------------------------
+
+    def repair_resume_plan(self) -> Optional[Dict[int, Dict[str, Any]]]:
+        """Per-batch repair reuse plan for an incremental partial cache.
+
+        Returns ``{batch_index: {status, findings_pids, results}}`` for
+        every cached GOOD repair batch (from ``stage_progress.repair``) —
+        the repair evaluator replays a batch with 0 model calls only when
+        its finding pids EXACTLY match the current batch (fail-closed on
+        mismatch). None when the payload has no incremental repair state
+        (legacy caches / repair not started).
+        """
+        if not self._payload:
+            return None
+        stage_progress = self._payload.get("stage_progress")
+        if not isinstance(stage_progress, dict):
+            return None
+        repair_stage = stage_progress.get("repair")
+        if not isinstance(repair_stage, dict):
+            return None
+        outcome = repair_stage.get("outcome")
+        if not isinstance(outcome, dict):
+            return None
+        plan: Dict[int, Dict[str, Any]] = {}
+        for batch in outcome.get("batches") or ():
+            if not isinstance(batch, dict):
+                continue
+            if batch.get("status") != "GOOD":
+                continue
+            batch_index = batch.get("batch_index")
+            if not isinstance(batch_index, int):
+                continue
+            plan[batch_index] = {
+                "status": "GOOD",
+                "findings_pids": [
+                    str(f.get("pid"))
+                    for f in (batch.get("findings") or ())
+                    if isinstance(f, dict)
+                ],
+                "results": [
+                    dict(r) for r in (batch.get("results") or ())
+                    if isinstance(r, dict)
+                ],
+            }
+        return plan or None
+
+    def reaudit_resume_plan(self) -> Dict[int, Dict[str, Any]]:
+        """Per-chunk reaudit reuse plan for an incremental partial cache.
+
+        Returns ``{chunk_index: {first_pid, last_pid, issues}}`` for every
+        cached reaudit chunk (from ``stage_progress.reaudit``) — the reaudit
+        loop replays a chunk with 0 model calls only when its boundaries
+        match the current chunk (fail-closed on mismatch). Empty when the
+        payload has no incremental reaudit state.
+        """
+        if not self._payload:
+            return {}
+        stage_progress = self._payload.get("stage_progress")
+        if not isinstance(stage_progress, dict):
+            return {}
+        reaudit_stage = stage_progress.get("reaudit")
+        if not isinstance(reaudit_stage, dict):
+            return {}
+        plan: Dict[int, Dict[str, Any]] = {}
+        for record in reaudit_stage.get("done_chunks") or ():
+            if not isinstance(record, dict):
+                continue
+            chunk_index = record.get("chunk")
+            if not isinstance(chunk_index, int):
+                continue
+            plan[chunk_index] = {
+                "first_pid": record.get("first_pid"),
+                "last_pid": record.get("last_pid"),
+                "issues": [
+                    dict(issue) for issue in (record.get("issues") or ())
+                    if isinstance(issue, dict)
+                ],
+            }
+        return plan
 
     def save(
         self,
@@ -1781,11 +2357,18 @@ class B3AuditCache:
         backend_identity_hash: str,
         entity_context_hash: Optional[str],
         entity_context_enabled: bool,
-        outcome: ChunkedAuditOutcome,
-        filtered: Sequence[FilteredIssue],
-        repair: Optional[SelectiveRepairOutcome],
+        outcome: Optional[ChunkedAuditOutcome] = None,
+        filtered: Sequence[FilteredIssue] = (),
+        repair: Optional[SelectiveRepairOutcome] = None,
         translations_repaired: Mapping[str, str],
         r_editor: Optional[Mapping[str, Any]] = None,
+        stage_progress: Optional[Mapping[str, Any]] = None,
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): explicit versions for the
+        # incremental branch, where ``outcome`` is None (R stage) — the
+        # identity check on load() compares these, so an incremental cache
+        # must carry the CURRENT run's prompt/harness versions.
+        prompt_version: Optional[str] = None,
+        harness_version: Optional[str] = None,
     ) -> None:
         # PARTIAL-RESUME integrity (t_ec6bb8bc): the replay payload slices
         # are computed ONCE and both written and bound to a canonical hash.
@@ -1793,6 +2376,47 @@ class B3AuditCache:
         # plan is built, so a tampered chunks/issues/r_editor payload — even
         # with identity and translations_repaired_hash preserved — is a full
         # cache miss, never a partial replay.
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): when ``stage_progress`` is
+        # provided the cache is rewritten INCREMENTALLY after every chunk /
+        # batch (R, audit, repair, reaudit). The payload carries the identity
+        # fields plus the accumulated ``stage_progress`` block; the final
+        # save at B3 completion keeps the legacy full payload (no
+        # stage_progress) so a completed chapter is a normal full-hit cache.
+        if stage_progress is not None:
+            payload = {
+                "schema": B3_AUDIT_CACHE_SCHEMA,
+                "snapshot_hash": snapshot_hash,
+                "translation_hash": translation_hash,
+                "config_identity": config_identity,
+                "backend_identity_hash": backend_identity_hash,
+                "prompt_version": (
+                    outcome.prompt_version if outcome is not None else (
+                        prompt_version if prompt_version is not None else ""
+                    )
+                ),
+                "harness_version": (
+                    outcome.harness_version if outcome is not None else (
+                        harness_version if harness_version is not None else ""
+                    )
+                ),
+                "entity_context_enabled": entity_context_enabled,
+                "entity_context_hash": entity_context_hash,
+                "audit_complete": False,
+                "translations_repaired": dict(translations_repaired),
+                "translations_repaired_hash": canonical_json_hash(
+                    dict(sorted(translations_repaired.items()))
+                ),
+                "stage_progress": dict(stage_progress),
+                "partial_resume_hash": canonical_json_hash({
+                    "r_editor": stage_progress.get("r_editor"),
+                    "audit": stage_progress.get("audit"),
+                    "repair": stage_progress.get("repair"),
+                    "reaudit": stage_progress.get("reaudit"),
+                }),
+            }
+            _atomic_write_json(self.path, payload)
+            self._payload = payload
+            return
         chunks_payload = outcome.to_payload()["chunks"]
         issues_payload = [dict(issue) for issue in outcome.issues]
         r_editor_payload = dict(r_editor) if r_editor is not None else None
@@ -2010,6 +2634,7 @@ class B3AuditRepair:
         journal: AuditJournal,
         out_dir: Optional[Path],
         cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, str], Tuple[ReviewCandidate, ...], Optional[RussianEditorOutcome]]:
         """V4.2 R stage: run the Russian-only editor over the raw map.
 
@@ -2094,6 +2719,7 @@ class B3AuditRepair:
                 retry_base_delay_seconds=cfg.russian_editor_retry_base_delay_seconds,
             ),
             on_chunk_event=_journal_r_editor_chunk_event,
+            on_progress=on_progress,
         )
         journal.emit(
             "r_editor_started",
@@ -2279,6 +2905,11 @@ class B3AuditRepair:
         )
         audit_resume: Dict[int, Dict[str, Any]] = {}
         r_editor_resume: Dict[int, Dict[str, Any]] = {}
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): per-batch repair and per-chunk
+        # reaudit resume plans from an incremental stage_progress cache —
+        # GOOD batches / reaudit chunks are replayed with 0 model calls.
+        repair_resume: Optional[Dict[int, Dict[str, Any]]] = None
+        reaudit_resume: Dict[int, Dict[str, Any]] = {}
         # PARTIAL-RESUME: PIDs whose edited text changed in the R re-run vs
         # the cached edited map — cached audit chunks over those PIDs are
         # re-audited (per-chunk fail-closed). None when no partial reuse.
@@ -2286,10 +2917,14 @@ class B3AuditRepair:
         if partial_cache is not None:
             audit_resume = partial_cache.audit_resume_plan()
             r_editor_resume = partial_cache.r_editor_resume_plan()
+            repair_resume = partial_cache.repair_resume_plan()
+            reaudit_resume = partial_cache.reaudit_resume_plan()
             LOG.info(
                 "B3: partial audit cache for %s — reusing %d GOOD audit "
-                "chunk(s) + %d GOOD R chunk(s), re-running the failed ones",
+                "chunk(s) + %d GOOD R chunk(s) + %d GOOD repair batch(es) + "
+                "%d reaudit chunk(s), re-running the failed ones",
                 chapter_id, len(audit_resume), len(r_editor_resume),
+                len(repair_resume or {}), len(reaudit_resume),
             )
         elif not r_editor_resume:
             # FAIL-PATH R-CACHE (2026-08-15): no partial audit cache (the
@@ -2426,6 +3061,80 @@ class B3AuditRepair:
         r_editor_outcome: Optional[RussianEditorOutcome] = None
         review_candidates: Tuple[ReviewCandidate, ...] = ()
         r_editor_report: Optional[Dict[str, Any]] = None
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): accumulated stage state. Every
+        # stage callback mutates it and rewrites audit_cache_b3.json via
+        # _save_stage_progress(), so a kill at ANY point preserves every
+        # completed chunk/batch (R GOOD chunks, audit GOOD chunks, repair
+        # committed/passed batches, reaudit residual issues).
+        stage_progress = {
+            "r_editor": {
+                "status": "disabled" if not cfg.russian_editor_enabled else "pending",
+                "enabled": cfg.russian_editor_enabled,
+                "done_chunks": [],
+                "failed_chunks": [],
+                "outcome": None,
+            },
+            "audit": {
+                "status": "pending", "done_chunks": [], "failed_chunks": [],
+                "chunks": [], "issues": [],
+            },
+            "repair": {
+                "status": "pending", "done_batches": [], "committed": {},
+                "passed": [], "outcome": None,
+            },
+            "reaudit": {
+                "status": "pending", "done_chunks": [], "issues": [],
+            },
+        }
+
+        def _save_stage_progress() -> None:
+            """Rewrite audit_cache_b3.json from the accumulated stage state.
+
+            The payload keeps the identity fields + translations_repaired so
+            load()'s identity / F4 checks pass on resume; the accumulated
+            per-stage slices live in ``stage_progress`` (validated by
+            _validate_stage_progress on load, fail-closed).
+            """
+            cache_writer = B3AuditCache(cache_path)
+            cache_writer.save(
+                snapshot_hash=snapshot_hash,
+                translation_hash=translation_hash,
+                config_identity=config_identity,
+                backend_identity_hash=backend_identity_hash,
+                entity_context_hash=entity_hash,
+                entity_context_enabled=cfg.entity_context_enabled,
+                outcome=None,
+                translations_repaired=dict(translation_map),
+                r_editor=None,
+                stage_progress=stage_progress,
+                prompt_version=cfg.prompt_version,
+                harness_version=cfg.harness_version,
+            )
+
+        def _on_r_editor_progress(kind: str, fields: Dict[str, Any]) -> None:
+            if kind != "chunk_done" or not cfg.russian_editor_enabled:
+                return
+            chunks = fields["chunks"]
+            failed = list(fields["failed_chunks"])
+            done = [c["chunk"] for c in chunks]
+            # Status mirrors _build_r_editor_report: all chunks done ->
+            # complete (no failed) / incomplete (some failed); else partial.
+            if len(done) == fields["chunk_count"]:
+                status = "complete" if not failed else "incomplete"
+            else:
+                status = "partial"
+            stage_progress["r_editor"] = {
+                "status": status,
+                "enabled": True,
+                "done_chunks": done,
+                "failed_chunks": failed,
+                "outcome": {
+                    "chunk_size": cfg.russian_editor_chunk_size,
+                    "chunks": [dict(c) for c in chunks],
+                },
+            }
+            _save_stage_progress()
+
         if cfg.russian_editor_enabled:
             edited_map, review_candidates, r_editor_outcome = (
                 self._run_russian_editor(
@@ -2434,10 +3143,24 @@ class B3AuditRepair:
                     journal=journal,
                     out_dir=out_dir,
                     cached_chunks=r_editor_resume or None,
+                    on_progress=_on_r_editor_progress,
                 )
             )
             # The audit/repair consume the R-EDITED map (raw + SAFE edits).
             translation_map = edited_map
+            # KILL-SAFE-INCREMENTAL (t_2d16962c): when the R stage FAILED
+            # (evaluator exception), the stage_progress must carry a failed
+            # status with NO outcome — an enabled stage that already ran can
+            # never be "pending", and a failed stage has nothing replayable
+            # (mirrors the top-level report: status "failed", outcome null).
+            if r_editor_outcome is None:
+                stage_progress["r_editor"] = {
+                    "status": "failed",
+                    "enabled": True,
+                    "done_chunks": [],
+                    "failed_chunks": [],
+                    "outcome": None,
+                }
             r_editor_report = _build_r_editor_report(
                 cfg=cfg,
                 outcome=r_editor_outcome,
@@ -2563,6 +3286,24 @@ class B3AuditRepair:
                         reused=fields.get("reused"),
                     )
 
+            def _on_audit_progress(kind: str, fields: Dict[str, Any]) -> None:
+                if kind != "chunk_done":
+                    return
+                chunks = fields["chunks"]
+                issues = fields["issues"]
+                done = [c["chunk"] for c in chunks]
+                failed = fields["failed_chunks"]
+                stage_progress["audit"] = {
+                    "status": (
+                        "complete" if len(done) == fields["chunk_count"] else "partial"
+                    ),
+                    "done_chunks": done,
+                    "failed_chunks": list(failed),
+                    "chunks": [dict(c) for c in chunks],
+                    "issues": [dict(i) for i in issues],
+                }
+                _save_stage_progress()
+
             evaluator = ChunkedAuditEvaluator(
                 self._audit_backend,
                 config=ChunkedAuditConfig(
@@ -2579,6 +3320,7 @@ class B3AuditRepair:
                     transport_base_delay_seconds=cfg.audit_transport_base_delay_seconds,
                 ),
                 on_chunk_event=_journal_chunk_event,
+                on_progress=_on_audit_progress,
             )
             outcome = evaluator(
                 chapter_id=chapter_id,
@@ -2742,6 +3484,44 @@ class B3AuditRepair:
         # ------------------------------------------------------------------
         repair_outcome: Optional[SelectiveRepairOutcome] = None
         try:
+            # KILL-SAFE-INCREMENTAL (t_2d16962c): per-batch repair progress —
+            # after every batch (and every reaudit chunk) the accumulated
+            # state is rewritten to the audit cache so a kill preserves every
+            # committed/passed batch and every reaudit chunk.
+            def _on_repair_progress(kind: str, fields: Dict[str, Any]) -> None:
+                if kind == "batch_done":
+                    batches = fields["batches"]
+                    done_batches = [
+                        b["batch_index"] for b in batches if b.get("status") == "GOOD"
+                    ]
+                    stage_progress["repair"] = {
+                        "status": "partial",
+                        "done_batches": done_batches,
+                        "committed": dict(fields.get("committed") or ()),
+                        "passed": list(fields.get("passed_pids") or ()),
+                        "outcome": {
+                            "batches": [dict(b) for b in batches],
+                            "batch_count": fields.get("batch_count", len(batches)),
+                        },
+                    }
+                    _save_stage_progress()
+                elif kind == "reaudit_chunk_done":
+                    done_chunks = fields["done_chunks"]
+                    stage_progress["reaudit"] = {
+                        "status": (
+                            "complete"
+                            if len(done_chunks) == fields.get("chunk_count")
+                            else "partial"
+                        ),
+                        "done_chunks": [dict(c) for c in done_chunks],
+                        "issues": [
+                            dict(i)
+                            for c in done_chunks
+                            for i in (c.get("issues") or ())
+                        ],
+                    }
+                    _save_stage_progress()
+
             repair_evaluator = SelectiveRepairEvaluator(
                 self._repair_backend,
                 reaudit_backend=self._audit_backend,
@@ -2803,6 +3583,7 @@ class B3AuditRepair:
                         base_delay_seconds=cfg.repair_reaudit_base_delay_seconds,
                     ),
                 ),
+                on_progress=_on_repair_progress,
             )
             repair_outcome = repair_evaluator(
                 chapter_id=chapter_id,
@@ -2820,6 +3601,11 @@ class B3AuditRepair:
                 # reasoning artifacts next to the audit cache.
                 out_dir=out_dir,
                 out_base="b3_repair",
+                # KILL-SAFE-INCREMENTAL (t_2d16962c): replay GOOD batches /
+                # reaudit chunks from an incremental partial cache (0 model
+                # calls); the missing ones are re-run.
+                cached_batches=repair_resume,
+                cached_reaudit_chunks=reaudit_resume or None,
             )
         except Exception as exc:  # noqa: BLE001 — a repair failure is debt, never a crash
             LOG.exception("B3: selective repair failed for %s", chapter_id)

@@ -1255,6 +1255,51 @@ def _build_review_journal(
 # ---------------------------------------------------------------------------
 
 
+def _repair_batches_payload(
+    batch_outcomes: Sequence[RepairBatchOutcome],
+) -> List[Dict[str, Any]]:
+    """Per-batch payload slices for the KILL-SAFE-INCREMENTAL progress hook.
+
+    Mirrors ``SelectiveRepairOutcome.to_payload()["batches"]`` exactly (same
+    per-batch key set), so the incremental cache validator checks the same
+    schema as the final repair payload. A cached GOOD batch is replayed on
+    resume only when its ``findings`` pids match the current batch.
+    """
+    return [
+        {
+            "batch_index": b.batch_index,
+            "status": b.status,
+            "findings": [
+                {
+                    "index": f.index,
+                    "pid": f.pid,
+                    "tier": f.tier,
+                    "category": f.category,
+                    "severity": f.severity,
+                    "confidence": f.confidence,
+                    "source_stage": f.source_stage,
+                    "sources": [dict(s) for s in f.sources],
+                }
+                for f in b.findings
+            ],
+            "results": [
+                {
+                    "index": r.index,
+                    "decision": r.decision,
+                    "pid": r.pid,
+                    "repaired_translation": r.repaired_translation,
+                    "reason": r.reason,
+                }
+                for r in b.results
+            ],
+            "error": b.error,
+            "warnings": list(b.warnings),
+            "missing_indices": list(b.missing_indices),
+        }
+        for b in batch_outcomes
+    ]
+
+
 class SelectiveRepairEvaluator:
     """B2 selective repair + repair-as-verifier over ``CompletionBackend``.
 
@@ -1283,10 +1328,25 @@ class SelectiveRepairEvaluator:
         *,
         reaudit_backend: Optional[CompletionBackend] = None,
         config: Optional[SelectiveRepairConfig] = None,
+        on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         self._repair_backend = repair_backend
         self._reaudit_backend = reaudit_backend or repair_backend
         self._config = config or SelectiveRepairConfig()
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): accumulated-state hook fired
+        # after EVERY batch and EVERY reaudit chunk with the partial repair /
+        # reaudit slices built so far. The B3 orchestrator uses it to rewrite
+        # audit_cache_b3.json incrementally (stage_progress.repair /
+        # .reaudit), so a kill preserves every completed batch / reaudit
+        # chunk.
+        self._on_progress = on_progress
+
+    def _emit_progress(self, kind: str, **fields: Any) -> None:
+        if self._on_progress is not None:
+            try:
+                self._on_progress(kind, fields)
+            except Exception:  # noqa: BLE001 — a progress hook never breaks repair
+                LOG.debug("selective_repair on_progress(%r) failed", kind, exc_info=True)
 
     @property
     def repair_backend(self) -> CompletionBackend:
@@ -1305,6 +1365,16 @@ class SelectiveRepairEvaluator:
         on_phase: Optional[Callable[[str], None]] = None,
         out_dir: Optional[Path] = None,
         out_base: str = "b3_repair",
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): per-batch repair resume plan
+        # ``{batch_index: {status, findings_pids, results}}`` — a cached GOOD
+        # batch whose finding pids match the CURRENT batch is replayed with 0
+        # model calls (committed/passed reused verbatim); a mismatch is a
+        # fail-closed re-run.
+        cached_batches: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        # Reaudit chunk resume plan ``{chunk_index: {first_pid, last_pid,
+        # issues}}`` — a cached chunk whose boundaries match the current
+        # chunk is replayed with 0 model calls.
+        cached_reaudit_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> SelectiveRepairOutcome:
         cfg = self._config
         model_ref = repair_model_ref(self._repair_backend)
@@ -1384,21 +1454,62 @@ class SelectiveRepairEvaluator:
         committed: dict = {}
         passed_pids: list = []
         for batch_index, batch in enumerate(batches, start=1):
-            outcome = self._run_batch(
-                chapter_id=chapter_id,
-                source=source,
-                translation=translation,
-                findings=batch,
-                batch_index=batch_index,
-                out_dir=out_dir,
-                out_base=out_base,
-            )
+            # KILL-SAFE-INCREMENTAL (t_2d16962c): a cached GOOD batch whose
+            # finding pids EXACTLY match the current batch is replayed with 0
+            # model calls — its stored results (committed/passed) are reused
+            # verbatim. Any mismatch (changed findings after a partial audit
+            # replay) is a fail-closed re-run, never a partial replay.
+            cached = (cached_batches or {}).get(batch_index)
+            if (
+                cached is not None
+                and cached.get("status") == "GOOD"
+                and list(cached.get("findings_pids") or ())
+                == [f.pid for f in batch]
+            ):
+                cached_results = [
+                    RepairResult(
+                        index=int(r.get("index", 0)),
+                        decision=str(r.get("decision", "")),
+                        pid=str(r.get("pid", "")),
+                        repaired_translation=str(r.get("repaired_translation", "")),
+                        reason=str(r.get("reason", "")),
+                    )
+                    for r in cached.get("results") or ()
+                ]
+                LOG.info(
+                    "B2: replaying cached GOOD repair batch %d (%d finding(s)) "
+                    "with 0 model calls (KILL-SAFE-INCREMENTAL)",
+                    batch_index, len(batch),
+                )
+                outcome = RepairBatchOutcome(
+                    batch_index=batch_index,
+                    status="GOOD",
+                    findings=tuple(batch),
+                    results=tuple(cached_results),
+                )
+            else:
+                outcome = self._run_batch(
+                    chapter_id=chapter_id,
+                    source=source,
+                    translation=translation,
+                    findings=batch,
+                    batch_index=batch_index,
+                    out_dir=out_dir,
+                    out_base=out_base,
+                )
             batch_outcomes.append(outcome)
             finding_by_index = {f.index: f for f in batch}
             if outcome.status == "FAILED":
                 debt.append(
                     f"failed repair batch {batch_index}: {outcome.error} "
                     f"(findings {[f.pid for f in outcome.findings]})"
+                )
+                self._emit_progress(
+                    "batch_done",
+                    batches=_repair_batches_payload(batch_outcomes),
+                    committed=sorted(committed.items()),
+                    passed_pids=list(passed_pids),
+                    batch_count=len(batches),
                 )
                 continue
             for result in outcome.results:
@@ -1423,6 +1534,13 @@ class SelectiveRepairEvaluator:
                         f"index {index} (partial tolerant repair — recovered "
                         f"{len(outcome.results)}/{len(outcome.findings)})"
                     )
+            self._emit_progress(
+                "batch_done",
+                batches=_repair_batches_payload(batch_outcomes),
+                committed=sorted(committed.items()),
+                passed_pids=list(passed_pids),
+                batch_count=len(batches),
+            )
 
         review_journal = _build_review_journal(batch_outcomes, review_candidates)
         # REPAIR-2 (t_768537b9): aggregate per-index non-fatal notices from
@@ -1445,6 +1563,10 @@ class SelectiveRepairEvaluator:
                 narrator_context=narrator_context,
                 out_dir=out_dir,
                 out_base=out_base,
+                # KILL-SAFE-INCREMENTAL (t_2d16962c): replay GOOD reaudit
+                # chunks from the partial cache (0 model calls); the rest are
+                # re-run. A boundary mismatch re-runs the chunk (fail-closed).
+                cached_chunks=cached_reaudit_chunks,
             )
             if reaudit.failed:
                 repair_complete = False
@@ -1666,6 +1788,11 @@ class SelectiveRepairEvaluator:
         narrator_context: str = "",
         out_dir: Optional[Path] = None,
         out_base: str = "b3_repair",
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): per-chunk reaudit resume plan
+        # ``{chunk_index: {first_pid, last_pid, issues}}`` — a cached chunk
+        # whose boundaries match the CURRENT chunk is replayed with 0 model
+        # calls; a boundary mismatch re-runs the chunk (fail-closed).
+        cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> ReauditOutcome:
         cfg = self._config
         try:
@@ -1711,8 +1838,41 @@ class SelectiveRepairEvaluator:
         model_ref = audit_model_ref(self._reaudit_backend)
         all_issues: List[Mapping[str, Any]] = []
         errors: List[str] = []
+        chunk_records: List[Dict[str, Any]] = []
         for chunk_index, chunk_pairs in enumerate(chunks, start=1):
             chunk_pids = [p.pid for p in chunk_pairs]
+            # KILL-SAFE-INCREMENTAL (t_2d16962c): a cached reaudit chunk whose
+            # boundaries match the CURRENT chunk is replayed with 0 model
+            # calls (its stored residual issues reused verbatim). A boundary
+            # mismatch (changed repair scope after a partial replay) is a
+            # fail-closed re-run, never a partial replay.
+            cached = (cached_chunks or {}).get(chunk_index)
+            if (
+                cached is not None
+                and str(cached.get("first_pid")) == chunk_pids[0]
+                and str(cached.get("last_pid")) == chunk_pids[-1]
+            ):
+                replayed_issues = [
+                    dict(item) for item in (cached.get("issues") or ())
+                ]
+                LOG.info(
+                    "B2: replaying cached GOOD reaudit chunk %d (%d issue(s)) "
+                    "with 0 model calls (KILL-SAFE-INCREMENTAL)",
+                    chunk_index, len(replayed_issues),
+                )
+                all_issues.extend(replayed_issues)
+                chunk_records.append({
+                    "chunk": chunk_index,
+                    "first_pid": chunk_pids[0],
+                    "last_pid": chunk_pids[-1],
+                    "issues": replayed_issues,
+                })
+                self._emit_progress(
+                    "reaudit_chunk_done",
+                    done_chunks=list(chunk_records),
+                    chunk_count=len(chunks),
+                )
+                continue
             context_pairs = get_overlap_context(
                 pairs,
                 chunk_pids[0],
@@ -1836,6 +1996,17 @@ class SelectiveRepairEvaluator:
                     f"chunk {chunk_index}: " + "; ".join(validation.errors)
                 )
             all_issues.extend(validation.issues)
+            chunk_records.append({
+                "chunk": chunk_index,
+                "first_pid": chunk_pids[0],
+                "last_pid": chunk_pids[-1],
+                "issues": [dict(i) for i in validation.issues],
+            })
+            self._emit_progress(
+                "reaudit_chunk_done",
+                done_chunks=list(chunk_records),
+                chunk_count=len(chunks),
+            )
         if errors:
             return ReauditOutcome(
                 complete=False,
