@@ -10,11 +10,20 @@ Acceptance:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 from pact_v4.repair.selective_repair import (
     SelectiveRepairConfig,
     SelectiveRepairEvaluator,
+)
+from tests.pact_v4.pipeline.test_b3_kill_safe_incremental import (
+    _audit_pending_stage,
+    _load_stage_progress,
+    _r_editor_pending_stage,
+    _repair_pending_stage,
+    _save_stage_progress,
+    _stage_progress_with,
 )
 from tests.pact_v4.repair.test_selective_repair import (
     CONFIRMED,
@@ -364,3 +373,152 @@ def test_reaudit_fresh_dropped_journaled_with_debug() -> None:
         "id", "category", "severity", "confidence", "note", "excerpt",
         "_debug",
     }
+
+
+def test_reaudit_fresh_dropped_extra_field_exact_schema_cache_survival(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP (RV3 t_c9eb65d4): a FRESH re-audit dropped
+    context/foreign issue whose model response carries an unknown EXTRA
+    field (validate_chunk_json accepts it — well-formed vocab/id) is
+    journaled with ONLY the canonical issue fields + the harness ``_debug``.
+    The emitted dropped object is exactly ``_ISSUE_KEYS`` (extra field
+    stripped), so the persisted stage-progress payload SURVIVES the
+    incremental cache (load -> ``reaudit_resume_plan`` -> cached replay /
+    chunk records) instead of tripping a full miss — and stays OUT of the
+    re-audit findings (all_issues) throughout."""
+    issue = _issue("p00005", "invented_gender", note="n", confidence="high")
+    source = {f"p{i:05d}": f"Source paragraph {i}." for i in range(1, 11)}
+    translation = {f"p{i:05d}": f"Перевод абзаца {i}." for i in range(1, 11)}
+    filtered = _hard_filtered([issue], source, translation)
+
+    progress_records: List[Dict[str, Any]] = []
+
+    def _on_progress(kind: str, fields: Dict[str, Any]) -> None:
+        if kind == "reaudit_chunk_done":
+            progress_records.append(dict(fields))
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+        # re-audit response: one valid residual issue on an owned pid
+        # (p00005) + one issue on a CONTEXT pid (p00002) carrying an
+        # unknown EXTRA model field -> dropped by validate_chunk_json.
+        _reaudit_response([
+            {"id": "p00005", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "residual", "excerpt": "text"},
+            {"id": "p00002", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "context-only", "excerpt": "text",
+             "extra": "model-extra-field"},
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        on_progress=_on_progress,
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    # the extra-field context issue is dropped — never a re-audit finding
+    assert [i["id"] for i in outcome.reaudit.issues] == ["p00005"]
+    # the fresh chunk record journals the dropped object EXACT-schema: the
+    # extra model field is stripped, only canonical fields + _debug remain.
+    journaled = [
+        c for r in progress_records
+        for c in (r.get("done_chunks") or ())
+        if c.get("dropped")
+    ]
+    assert journaled, "fresh re-audit chunk record lost the dropped field"
+    dropped = journaled[0]["dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["id"] == "p00002"
+    assert "extra" not in dropped[0]
+    assert set(dropped[0]) == {
+        "id", "category", "severity", "confidence", "note", "excerpt",
+        "_debug",
+    }
+    assert dropped[0]["_debug"] == {
+        "chunk": 1,
+        "reasoning_file": "b3_repair_reaudit_chunk1_reasoning.txt",
+    }
+
+    # ------------------------------------------------------------------
+    # Persist the emitted chunk record into an incremental stage_progress
+    # cache exactly as the pipeline's _on_repair_progress would — the
+    # exact-schema dropped object must SURVIVE cache -> resume plan.
+    # ------------------------------------------------------------------
+    done_chunks = [
+        dict(c) for r in progress_records
+        for c in (r.get("done_chunks") or ())
+    ]
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit={
+            "status": "complete",
+            "done_chunks": done_chunks,
+            "issues": [
+                dict(i) for c in done_chunks for i in (c.get("issues") or ())
+            ],
+        },
+    )
+    path = _save_stage_progress(
+        tmp_path, translations=translation, stage_progress=stage,
+    )
+    cache = _load_stage_progress(
+        path, translations=translation, r_editor_enabled=False,
+    )
+    assert cache is not None and cache.is_partial()
+    plan = cache.reaudit_resume_plan()
+    assert sorted(plan) == [1]
+    assert plan[1]["dropped"] == [dropped[0]]
+
+    # ------------------------------------------------------------------
+    # Cached replay: feed the resume plan back into a fresh evaluator run
+    # — chunk 1 replays with 0 model calls and the replayed chunk record
+    # keeps the exact-schema dropped diagnostic, still outside findings.
+    # ------------------------------------------------------------------
+    replay_records: List[Dict[str, Any]] = []
+
+    def _on_replay_progress(kind: str, fields: Dict[str, Any]) -> None:
+        if kind == "reaudit_chunk_done":
+            replay_records.append(dict(fields))
+
+    replay_backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+    ])
+    replay_evaluator = SelectiveRepairEvaluator(
+        replay_backend,
+        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        on_progress=_on_replay_progress,
+    )
+    replay_outcome = replay_evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, cached_reaudit_chunks=plan,
+    )
+    assert replay_outcome.reaudit is not None and replay_outcome.reaudit.complete
+    reaudit_calls = [
+        r for r in replay_backend.requests if "reaudit" in (r.label or "")
+    ]
+    # chunk 1 replayed with 0 reaudit calls (boundaries match the plan)
+    assert len(reaudit_calls) == 0
+    replayed = [
+        c for r in replay_records
+        for c in (r.get("done_chunks") or ())
+        if c.get("chunk") == 1 and c.get("dropped")
+    ]
+    assert replayed, "replayed chunk record lost the dropped field"
+    assert replayed[0]["dropped"] == [dropped[0]]
+    # the dropped diagnostic stays outside the re-audit findings on replay
+    assert [i["id"] for i in replay_outcome.reaudit.issues] == ["p00005"]

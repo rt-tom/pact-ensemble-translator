@@ -603,6 +603,22 @@ def test_kill_safe_cache_reaudit_dropped_in_chunk_span_full_miss(
     assert _load_reaudit_cache(path, translations) is None
 
 
+def test_kill_safe_cache_reaudit_dropped_extra_key_full_miss(
+    tmp_path: Path,
+) -> None:
+    """RV3 t_c9eb65d4 fail-closed counterpart: a persisted dropped issue
+    object carrying an unknown EXTRA top-level key (a model response field
+    that survived journaling) is a FULL miss — the exact-_ISSUE_KEYS
+    contract is never weakened, so the fix must happen at journaling time
+    (retain canonical fields), never by tolerating the foreign key on
+    reload."""
+    translations = _translation(3)
+    path = _reaudit_cache_with_dropped(
+        tmp_path, [_reaudit_dropped_with(extra="model-noise-field")],
+    )
+    assert _load_reaudit_cache(path, translations) is None
+
+
 def test_kill_safe_cache_reaudit_dropped_valid_replay(tmp_path: Path) -> None:
     """RV2 t_61af1bb2: a well-formed persisted dropped issue object (exact
     _ISSUE_KEYS, valid vocab, harness _debug matching the journaling chunk,

@@ -165,6 +165,18 @@ DEFAULT_REAUDIT_MAX_OVERLAP_PAIRS = MAX_OVERLAP_PAIRS        # 6
 # cache/resume, F5).
 REAUDIT_DELTA_FORMAT = "pact-v4-reaudit-delta/v1"
 
+# CONTEXT-PID-DROP (RV3 t_c9eb65d4): the canonical fields of a journaled
+# reaudit DROPPED issue object. ``validate_chunk_json`` accepts an
+# otherwise well-formed context/foreign issue carrying an unknown EXTRA
+# model field (it validates vocab/id, not the exact key set), so the fresh
+# journaling retains ONLY these fields before attaching the harness
+# ``_debug`` — the emitted/persisted dropped object then has exactly the
+# ``_ISSUE_KEYS`` contract (these 6 + ``_debug``) that
+# ``_validate_stage_progress`` enforces fail-closed on reload. A foreign
+# key would otherwise reject the whole stage-progress cache on resume,
+# losing the dropped diagnostic instead of preserving a valid object.
+_REAUDIT_DROPPED_FIELDS = ("id", "category", "severity", "confidence", "note", "excerpt")
+
 # Repair output budget (per batch call) and re-audit output budget. REPAIR-CTX
 # (t_97b31f81): the re-audit input is now the affected REGION (changed PIDs +
 # neighbours, chunked), not the full chapter — but the 20000-token output
@@ -2028,7 +2040,17 @@ class SelectiveRepairEvaluator:
                 "issues": [dict(i) for i in validation.issues],
                 "dropped": [
                     {
-                        **dict(i),
+                        # CONTEXT-PID-DROP (RV3 t_c9eb65d4): retain ONLY the
+                        # canonical issue fields before attaching the harness
+                        # _debug. validate_chunk_json accepts a well-formed
+                        # context/foreign issue carrying an unknown EXTRA
+                        # model field — journaling it verbatim would emit a
+                        # dropped object with keys outside the exact
+                        # _ISSUE_KEYS contract, which _validate_stage_progress
+                        # rejects fail-closed on reload (full miss = the
+                        # dropped diagnostic is lost). Canonical-only keeps
+                        # the persisted object exact-schema.
+                        **{k: i[k] for k in _REAUDIT_DROPPED_FIELDS if k in i},
                         "_debug": {
                             "chunk": chunk_index,
                             "reasoning_file": (
