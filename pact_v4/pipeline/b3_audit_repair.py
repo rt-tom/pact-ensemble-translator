@@ -1009,6 +1009,50 @@ _R_EDITOR_RAN_STATUSES = frozenset({"partial", "incomplete", "complete"})
 _R_CHUNK_KEYS = frozenset({"chunk", "first_pid", "last_pid", "status", "edits"})
 _R_EDIT_KEYS = frozenset({"pid", "original", "rewritten", "reason", "class"})
 
+# KILL-SAFE-INCREMENTAL (t_2d16962c, RV2 fix t_d996bbf7): EXACT key sets of
+# the incremental ``stage_progress`` payloads written by the per-stage
+# progress hooks in ``_run_impl``. The resume validator enforces these
+# verbatim — a record with a missing or extra key is a schema violation and
+# a FULL cache miss (the replay path copies these slices verbatim into the
+# evaluators, so a foreign-schema payload must never be replayed).
+_STAGE_PROGRESS_KEYS = frozenset({"r_editor", "audit", "repair", "reaudit"})
+_R_EDITOR_STAGE_KEYS = frozenset(
+    {"status", "enabled", "done_chunks", "failed_chunks", "outcome"}
+)
+_R_EDITOR_OUTCOME_KEYS = frozenset({"chunk_size", "chunks"})
+_AUDIT_STAGE_KEYS = frozenset(
+    {"status", "done_chunks", "failed_chunks", "chunks", "issues"}
+)
+# ChunkMeta.to_payload() (chunked_audit.py) — the audit slice payload.
+_AUDIT_CHUNK_KEYS = frozenset({
+    "chunk", "first_pid", "last_pid", "pair_count", "context_count",
+    "status", "finish_reason", "reasoning_chars", "reasoning_file",
+    "issue_count",
+})
+_REPAIR_STAGE_KEYS = frozenset(
+    {"status", "done_batches", "committed", "passed", "outcome"}
+)
+_REPAIR_OUTCOME_KEYS = frozenset({"batches", "batch_count"})
+# _repair_batches_payload() (selective_repair.py) — the per-batch slice.
+_REPAIR_BATCH_KEYS = frozenset({
+    "batch_index", "status", "findings", "results", "error", "warnings",
+    "missing_indices",
+})
+_REPAIR_FINDING_KEYS = frozenset({
+    "index", "pid", "tier", "category", "severity", "confidence",
+    "source_stage", "sources",
+})
+_REPAIR_RESULT_KEYS = frozenset({
+    "index", "decision", "pid", "repaired_translation", "reason",
+})
+_REAUDIT_STAGE_KEYS = frozenset({"status", "done_chunks", "issues"})
+_REAUDIT_CHUNK_KEYS = frozenset({"chunk", "first_pid", "last_pid", "issues"})
+
+# Repair decisions the fresh batch parser accepts (parse_repair_batch).
+_REPAIR_DECISIONS = frozenset({"pass", "repair"})
+# Repair batch statuses _repair_batches_payload can persist.
+_REPAIR_BATCH_STATUSES = frozenset({"GOOD", "PARTIAL", "FAILED"})
+
 def _validate_partial_payload(
     payload: Mapping[str, Any],
     *,
@@ -1398,6 +1442,16 @@ def _validate_stage_progress(
     expected_pids: Optional[Sequence[str]],
     stored_hash: Any,
     r_editor_enabled: bool = False,
+    # FIX RV2 (t_d996bbf7): the CURRENT raw translation text binds every
+    # cached R edit (``original`` must be a verbatim substring of the
+    # current text of the edit's pid) and the R-EDITED map (the payload's
+    # own ``translations_repaired`` at the last incremental save) binds the
+    # cached repair results (no-op / truncation gates mirror the fresh
+    # ``parse_repair_batch`` path). Either may be None only when the caller
+    # has no map — the text-dependent gates are then skipped (the exact
+    # schema / coverage / hash checks below still bind the whole payload).
+    current_text: Optional[Mapping[str, str]] = None,
+    edited_text: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
     """Validate the KILL-SAFE-INCREMENTAL ``stage_progress`` payload (t_2d16962c).
 
@@ -1416,10 +1470,43 @@ def _validate_stage_progress(
     rewrite, so any tamper (even with identity and translations_repaired_hash
     preserved) is a full miss.
 
+    FIX RV2 (t_d996bbf7) — the replay payloads are validated with the SAME
+    strictness as the fresh paths, so a recomputed hash cannot smuggle
+    unauthorized content into the evaluators:
+
+    * repair: EXACT stage/outcome/batch/finding/result key sets; contiguous
+      batch index coverage (1..k prefix of ``batch_count``); findings with
+      contiguous per-batch indices 1..M and PIDs inside the translation map;
+      every result bound to its finding (unknown/duplicate index = miss),
+      ``decision`` in {pass, repair}, a repair result naming the EXACT pid of
+      its finding (index/PID contract), non-empty ``repaired_translation``,
+      and the same no-op / <40%-preserved truncation gates the fresh
+      ``parse_repair_batch`` applies (against ``edited_text``); a GOOD batch
+      must answer EVERY finding (the fresh coverage gate); ``done_batches``
+      must equal the GOOD batch indices and ``committed``/``passed`` must
+      equal exactly what replaying the cached batches would produce;
+    * reaudit: EXACT stage/chunk key sets; contiguous chunk coverage 1..N;
+      every cached issue validated with the same strict validator as a fresh
+      re-audit (``validate_chunk_json`` semantics: object, non-empty string
+      id, category/severity/confidence vocab) AND bound to the pid span of
+      the chunk it lives in; the aggregate ``issues`` list must equal the
+      order-sensitive concatenation of the per-chunk issue lists;
+    * R: every cached edit bound to the CURRENT text (``original`` is a
+      verbatim substring of ``current_text[pid]``) and to the chunk's own
+      boundary span, like the legacy ``_validate_partial_payload``;
+    * every stage record and every nested record is checked against its
+      EXACT key set — an unknown key is a schema violation (fail-closed),
+      never silently ignored.
+
     Returns None when valid, else a reason string naming the first violation.
     """
     if not isinstance(stage_progress, dict):
         return "stage_progress is not an object"
+    if set(stage_progress) != _STAGE_PROGRESS_KEYS:
+        return (
+            f"stage_progress foreign key set {sorted(stage_progress)!r} "
+            f"(expected {sorted(_STAGE_PROGRESS_KEYS)})"
+        )
     expected_pid_set = frozenset(expected_pids) if expected_pids is not None else None
 
     # ------------------------------------------------------------------
@@ -1430,6 +1517,11 @@ def _validate_stage_progress(
         return "stage_progress.r_editor is missing"
     if not isinstance(r_editor, dict):
         return "stage_progress.r_editor is not an object"
+    if set(r_editor) != _R_EDITOR_STAGE_KEYS:
+        return (
+            f"stage_progress.r_editor foreign key set {sorted(r_editor)!r} "
+            f"(expected {sorted(_R_EDITOR_STAGE_KEYS)})"
+        )
     r_status = r_editor.get("status")
     if not isinstance(r_status, str) or r_status not in _R_EDITOR_REPORT_STATUSES:
         return f"stage_progress.r_editor.status is missing or unknown {r_status!r}"
@@ -1487,9 +1579,22 @@ def _validate_stage_progress(
         r_chunks = r_outcome.get("chunks")
         if not isinstance(r_chunks, list) or not r_chunks:
             return "stage_progress.r_editor.outcome.chunks is missing, not a list, or empty"
+        if set(r_outcome) != _R_EDITOR_OUTCOME_KEYS:
+            return (
+                f"stage_progress.r_editor.outcome foreign key set "
+                f"{sorted(r_outcome)!r} (expected {sorted(_R_EDITOR_OUTCOME_KEYS)})"
+            )
         chunk_size = r_outcome.get("chunk_size")
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
             return f"stage_progress.r_editor.outcome.chunk_size {chunk_size!r} is not a positive int"
+        # FIX RV2 (t_d996bbf7): the persisted chunk records are exactly the
+        # processed chunks the progress hook journaled — their indices must
+        # equal done_chunks (all processed chunks, GOOD and FAILED alike).
+        if [c.get("chunk") for c in r_chunks] != done_chunks:
+            return (
+                "stage_progress.r_editor.outcome.chunks indices do not match "
+                "done_chunks (coverage mismatch)"
+            )
         for position, item in enumerate(r_chunks, start=1):
             if not isinstance(item, dict):
                 return f"stage_progress.r_editor chunk at position {position}: not an object"
@@ -1541,6 +1646,13 @@ def _validate_stage_progress(
                         f"map prefix (expected {expected_pids[start]!r}/"
                         f"{expected_pids[end - 1]!r} at positions {start}..{end - 1})"
                     )
+            # FIX RV2 (t_d996bbf7): the pid span the chunk actually covers —
+            # every edit must name a pid INSIDE it (legacy validator parity).
+            chunk_pids = (
+                frozenset(expected_pids[start:end])
+                if expected_pids is not None
+                else None
+            )
             edits = item.get("edits")
             if not isinstance(edits, list):
                 return f"stage_progress.r_editor chunk {chunk_index}: edits is not a list"
@@ -1567,10 +1679,28 @@ def _validate_stage_progress(
                         f"stage_progress.r_editor chunk {chunk_index} edit "
                         f"{edit_index}: pid {edit_pid!r} is not in the translation map"
                     )
+                if chunk_pids is not None and edit_pid not in chunk_pids:
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index}: pid {edit_pid!r} is outside the chunk "
+                        f"boundary span {first_pid!r}..{last_pid!r}"
+                    )
                 if not isinstance(edit.get("original"), str) or not edit.get("original"):
                     return (
                         f"stage_progress.r_editor chunk {chunk_index} edit "
                         f"{edit_index} pid {edit_pid}: original is missing or not a string"
+                    )
+                # FIX RV2 (t_d996bbf7): the R editor rewrites the CURRENT raw
+                # text — ``original`` must be a verbatim substring of it.
+                # Without this binding a recomputed hash could replay an edit
+                # whose original never existed in the text the model saw.
+                if current_text is not None and edit.get("original") not in str(
+                    current_text.get(edit_pid, "")
+                ):
+                    return (
+                        f"stage_progress.r_editor chunk {chunk_index} edit "
+                        f"{edit_index} pid {edit_pid}: original is not a substring "
+                        f"of the current text (tampered cache edit)"
                     )
                 if not isinstance(edit.get("rewritten"), str) or not edit.get("rewritten").strip():
                     return (
@@ -1604,6 +1734,11 @@ def _validate_stage_progress(
         return "stage_progress.audit is missing"
     if not isinstance(audit, dict):
         return "stage_progress.audit is not an object"
+    if set(audit) != _AUDIT_STAGE_KEYS:
+        return (
+            f"stage_progress.audit foreign key set {sorted(audit)!r} "
+            f"(expected {sorted(_AUDIT_STAGE_KEYS)})"
+        )
     a_status = audit.get("status")
     if not isinstance(a_status, str) or a_status not in ("pending", "partial", "complete"):
         return f"stage_progress.audit.status is missing or unknown {a_status!r}"
@@ -1615,6 +1750,8 @@ def _validate_stage_progress(
         return "stage_progress.audit.issues is not a list"
     if a_status == "pending" and a_chunks:
         return "stage_progress.audit is pending but carries chunk payloads"
+    if a_status == "pending" and a_issues:
+        return "stage_progress.audit is pending but carries issues"
     done = audit.get("done_chunks")
     if not isinstance(done, list) or any(
         not isinstance(c, int) or isinstance(c, bool) for c in done
@@ -1647,6 +1784,11 @@ def _validate_stage_progress(
     for position, item in enumerate(a_chunks, start=1):
         if not isinstance(item, dict):
             return f"stage_progress.audit chunk at position {position}: not an object"
+        if set(item) != _AUDIT_CHUNK_KEYS:
+            return (
+                f"stage_progress.audit chunk at position {position}: foreign key "
+                f"set {sorted(item)!r} (expected {sorted(_AUDIT_CHUNK_KEYS)})"
+            )
         chunk_index = item.get("chunk")
         if chunk_index != position:
             return (
@@ -1677,6 +1819,13 @@ def _validate_stage_progress(
             return f"stage_progress.audit chunk {chunk_index}: reasoning_chars is not a non-negative int"
         if not isinstance(item.get("reasoning_file"), str):
             return f"stage_progress.audit chunk {chunk_index}: reasoning_file is not a string"
+        # FIX RV2 (t_d996bbf7): legacy validator parity — the remaining
+        # ChunkMeta.to_payload fields are type-bound too.
+        finish_reason = item.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            return f"stage_progress.audit chunk {chunk_index}: finish_reason is not a string or null"
+        if not isinstance(item.get("issue_count"), int) or isinstance(item.get("issue_count"), bool) or item.get("issue_count") < 0:
+            return f"stage_progress.audit chunk {chunk_index}: issue_count is not a non-negative int"
     for issue_index, issue in enumerate(a_issues):
         if not isinstance(issue, dict):
             return f"stage_progress.audit issue {issue_index}: not an object"
@@ -1732,6 +1881,11 @@ def _validate_stage_progress(
         return "stage_progress.repair is missing"
     if not isinstance(repair, dict):
         return "stage_progress.repair is not an object"
+    if set(repair) != _REPAIR_STAGE_KEYS:
+        return (
+            f"stage_progress.repair foreign key set {sorted(repair)!r} "
+            f"(expected {sorted(_REPAIR_STAGE_KEYS)})"
+        )
     rp_status = repair.get("status")
     if not isinstance(rp_status, str) or rp_status not in ("pending", "partial", "complete", "skipped", "failed"):
         return f"stage_progress.repair.status is missing or unknown {rp_status!r}"
@@ -1742,6 +1896,8 @@ def _validate_stage_progress(
         return "stage_progress.repair.done_batches is not a list of ints"
     if done_batches != sorted(set(done_batches)):
         return "stage_progress.repair.done_batches contains duplicates"
+    if any(c < 1 for c in done_batches):
+        return "stage_progress.repair.done_batches contains a non-positive index"
     committed = repair.get("committed")
     if committed is None:
         return "stage_progress.repair.committed is missing"
@@ -1763,11 +1919,327 @@ def _validate_stage_progress(
         if expected_pid_set is not None and pid not in expected_pid_set:
             return f"stage_progress.repair.passed pid {pid!r} is not in the translation map"
     rp_outcome = repair.get("outcome")
-    if rp_status not in ("pending", "skipped", "failed") and not isinstance(rp_outcome, dict):
-        return (
-            f"stage_progress.repair.outcome is required when status is "
-            f"{rp_status!r} (got {type(rp_outcome).__name__})"
-        )
+    if rp_status in ("pending", "skipped", "failed"):
+        # FIX RV2 (t_d996bbf7): a non-null outcome for a status that never
+        # ran is a schema violation (legacy validator parity) — and a
+        # pending/skipped/failed stage must carry no replayable slices.
+        if rp_outcome is not None:
+            return (
+                f"stage_progress.repair.outcome must be null when status is "
+                f"{rp_status!r} (got {type(rp_outcome).__name__})"
+            )
+        if done_batches or committed or passed:
+            return (
+                f"stage_progress.repair carries done_batches/committed/passed "
+                f"while status is {rp_status!r} (a stage that never ran has "
+                f"nothing replayable)"
+            )
+    else:
+        # partial / complete: outcome REQUIRED and validated in full — the
+        # repair_resume_plan() copies batches/results VERBATIM into the
+        # SelectiveRepairEvaluator, so every record is checked with the same
+        # strictness as the fresh parse_repair_batch path before replay.
+        if not isinstance(rp_outcome, dict):
+            return (
+                f"stage_progress.repair.outcome is required when status is "
+                f"{rp_status!r} (got {type(rp_outcome).__name__})"
+            )
+        if set(rp_outcome) != _REPAIR_OUTCOME_KEYS:
+            return (
+                f"stage_progress.repair.outcome foreign key set "
+                f"{sorted(rp_outcome)!r} (expected {sorted(_REPAIR_OUTCOME_KEYS)})"
+            )
+        batches = rp_outcome.get("batches")
+        if not isinstance(batches, list) or not batches:
+            return (
+                "stage_progress.repair.outcome.batches is missing, not a "
+                "list, or empty"
+            )
+        batch_count = rp_outcome.get("batch_count")
+        if (
+            not isinstance(batch_count, int)
+            or isinstance(batch_count, bool)
+            or batch_count < 1
+        ):
+            return (
+                f"stage_progress.repair.outcome.batch_count {batch_count!r} "
+                f"is not a positive int"
+            )
+        if len(batches) > batch_count:
+            return (
+                f"stage_progress.repair batch coverage mismatch: "
+                f"{len(batches)} batch(es) persisted for batch_count "
+                f"{batch_count} — a kill can only have processed a PREFIX of "
+                f"the planned batches"
+            )
+        if any(c > batch_count for c in done_batches):
+            return (
+                f"stage_progress.repair.done_batches index {c!r} is beyond "
+                f"batch_count {batch_count}"
+            )
+        # Recompute what replaying the cached batches would commit/pass —
+        # the stored committed/passed must equal it EXACTLY (a tampered
+        # result text/pid/decision is caught here even when the hash was
+        # recomputed).
+        expected_committed: Dict[str, str] = {}
+        expected_passed: List[str] = []
+        good_indices: List[int] = []
+        for position, batch in enumerate(batches, start=1):
+            if not isinstance(batch, dict):
+                return (
+                    f"stage_progress.repair batch at position {position}: "
+                    f"not an object"
+                )
+            if set(batch) != _REPAIR_BATCH_KEYS:
+                return (
+                    f"stage_progress.repair batch at position {position}: "
+                    f"foreign key set {sorted(batch)!r} "
+                    f"(expected {sorted(_REPAIR_BATCH_KEYS)})"
+                )
+            batch_index = batch.get("batch_index")
+            if batch_index != position:
+                return (
+                    f"stage_progress.repair batch coverage/order mismatch: "
+                    f"stored index {batch_index!r} at position {position} "
+                    f"(expected contiguous 1..k of the processed prefix)"
+                )
+            b_status = batch.get("status")
+            if not isinstance(b_status, str) or b_status not in _REPAIR_BATCH_STATUSES:
+                return (
+                    f"stage_progress.repair batch {batch_index}: unknown "
+                    f"status {b_status!r} (allowed: "
+                    f"{sorted(_REPAIR_BATCH_STATUSES)})"
+                )
+            findings = batch.get("findings")
+            if not isinstance(findings, list) or not findings:
+                return (
+                    f"stage_progress.repair batch {batch_index}: findings is "
+                    f"missing, not a list, or empty"
+                )
+            findings_by_index: Dict[int, Dict[str, Any]] = {}
+            for finding_position, finding in enumerate(findings, start=1):
+                if not isinstance(finding, dict):
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"{finding_position}: not an object"
+                    )
+                if set(finding) != _REPAIR_FINDING_KEYS:
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"{finding_position}: foreign key set {sorted(finding)!r} "
+                        f"(expected {sorted(_REPAIR_FINDING_KEYS)})"
+                    )
+                finding_index = finding.get("index")
+                if (
+                    not isinstance(finding_index, int)
+                    or isinstance(finding_index, bool)
+                    or finding_index < 1
+                ):
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"{finding_position}: index {finding_index!r} is not "
+                        f"a positive int"
+                    )
+                # make_microbatches re-numbers every batch 1..M contiguous.
+                if finding_index != finding_position:
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"index coverage/order mismatch: stored "
+                        f"{finding_index!r} at position {finding_position} "
+                        f"(expected contiguous 1..M within the batch)"
+                    )
+                finding_pid = finding.get("pid")
+                if not isinstance(finding_pid, str) or not finding_pid:
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"{finding_index}: pid is missing or not a string"
+                    )
+                if expected_pid_set is not None and finding_pid not in expected_pid_set:
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"{finding_index}: pid {finding_pid!r} is not in the "
+                        f"translation map"
+                    )
+                for field in ("tier", "category", "severity", "confidence", "source_stage"):
+                    if not isinstance(finding.get(field), str):
+                        return (
+                            f"stage_progress.repair batch {batch_index} finding "
+                            f"{finding_index}: {field} is not a string"
+                        )
+                sources = finding.get("sources")
+                if not isinstance(sources, list) or any(
+                    not isinstance(s, dict) for s in sources
+                ):
+                    return (
+                        f"stage_progress.repair batch {batch_index} finding "
+                        f"{finding_index}: sources is not a list of objects"
+                    )
+                findings_by_index[finding_index] = finding
+            results = batch.get("results")
+            if not isinstance(results, list):
+                return (
+                    f"stage_progress.repair batch {batch_index}: results is "
+                    f"not a list"
+                )
+            seen_indices: set = set()
+            for result_position, result in enumerate(results):
+                if not isinstance(result, dict):
+                    return (
+                        f"stage_progress.repair batch {batch_index} result "
+                        f"{result_position}: not an object"
+                    )
+                if set(result) != _REPAIR_RESULT_KEYS:
+                    return (
+                        f"stage_progress.repair batch {batch_index} result "
+                        f"{result_position}: foreign key set {sorted(result)!r} "
+                        f"(expected {sorted(_REPAIR_RESULT_KEYS)})"
+                    )
+                result_index = result.get("index")
+                if not isinstance(result_index, int) or isinstance(result_index, bool):
+                    return (
+                        f"stage_progress.repair batch {batch_index} result "
+                        f"{result_position}: index {result_index!r} is not an int"
+                    )
+                finding = findings_by_index.get(result_index)
+                if finding is None:
+                    return (
+                        f"stage_progress.repair batch {batch_index}: result "
+                        f"index {result_index} does not match any finding "
+                        f"(unknown index)"
+                    )
+                if result_index in seen_indices:
+                    return (
+                        f"stage_progress.repair batch {batch_index}: duplicate "
+                        f"result index {result_index}"
+                    )
+                seen_indices.add(result_index)
+                decision = result.get("decision")
+                if decision not in _REPAIR_DECISIONS:
+                    return (
+                        f"stage_progress.repair batch {batch_index} index "
+                        f"{result_index}: invalid decision {decision!r} "
+                        f"(allowed: {sorted(_REPAIR_DECISIONS)})"
+                    )
+                if not isinstance(result.get("reason"), str):
+                    return (
+                        f"stage_progress.repair batch {batch_index} index "
+                        f"{result_index}: reason is not a string"
+                    )
+                if decision == "repair":
+                    result_pid = result.get("pid")
+                    if (
+                        not isinstance(result_pid, str)
+                        or result_pid != finding.get("pid")
+                    ):
+                        return (
+                            f"stage_progress.repair batch {batch_index} index "
+                            f"{result_index}: repair pid {result_pid!r} does "
+                            f"not match finding pid {finding.get('pid')!r} "
+                            f"(index/PID contract)"
+                        )
+                    repaired = result.get("repaired_translation")
+                    if not isinstance(repaired, str) or not repaired.strip():
+                        return (
+                            f"stage_progress.repair batch {batch_index} index "
+                            f"{result_index}: repair has empty "
+                            f"repaired_translation"
+                        )
+                    # FIX RV2 (t_d996bbf7): the SAME text gates as the fresh
+                    # parse_repair_batch path — a cached GOOD batch can never
+                    # contain a no-op repair (converted to pass at fresh
+                    # time) or a truncated one (batch-killing error).
+                    if edited_text is not None:
+                        current_pid_text = str(edited_text.get(result_pid, ""))
+                        if repaired.strip() == current_pid_text.strip():
+                            return (
+                                f"stage_progress.repair batch {batch_index} "
+                                f"index {result_index}: no-op repair "
+                                f"(repaired_translation equals the current "
+                                f"text for pid {result_pid}) — impossible in "
+                                f"a cached batch"
+                            )
+                        if (
+                            current_pid_text.strip()
+                            and len(repaired.strip())
+                            < 0.4 * len(current_pid_text.strip())
+                        ):
+                            return (
+                                f"stage_progress.repair batch {batch_index} "
+                                f"index {result_index}: truncated repair — "
+                                f"repaired_translation is {len(repaired.strip())} "
+                                f"chars vs {len(current_pid_text.strip())} chars "
+                                f"current text (<40% preserved; the FULL "
+                                f"corrected PID text must be returned)"
+                            )
+                    expected_committed[result_pid] = repaired
+                else:  # pass — the model answers by index, the pid is either
+                    # empty or the finding pid (no-op conversion, fresh path).
+                    result_pid = result.get("pid")
+                    if result_pid not in ("", finding.get("pid")):
+                        return (
+                            f"stage_progress.repair batch {batch_index} index "
+                            f"{result_index}: pass result pid {result_pid!r} "
+                            f"does not match finding pid {finding.get('pid')!r}"
+                        )
+                    if result.get("repaired_translation") != "":
+                        return (
+                            f"stage_progress.repair batch {batch_index} index "
+                            f"{result_index}: pass result carries a "
+                            f"repaired_translation (must be empty)"
+                        )
+                    expected_passed.append(finding.get("pid"))
+            if b_status == "GOOD":
+                missing_answers = sorted(set(findings_by_index) - seen_indices)
+                if missing_answers:
+                    return (
+                        f"stage_progress.repair batch {batch_index}: missing "
+                        f"answer(s) for finding index(es) {missing_answers} — "
+                        f"a GOOD batch must answer every finding (coverage gate)"
+                    )
+                good_indices.append(batch_index)
+            # error/warnings/missing_indices are informational journal
+            # slices — only their container types are bound (exact key set
+            # above), never their content.
+            if not isinstance(batch.get("error"), str):
+                return (
+                    f"stage_progress.repair batch {batch_index}: error is not "
+                    f"a string"
+                )
+            if not isinstance(batch.get("warnings"), list) or any(
+                not isinstance(w, str) for w in batch.get("warnings")
+            ):
+                return (
+                    f"stage_progress.repair batch {batch_index}: warnings is "
+                    f"not a list of strings"
+                )
+            if not isinstance(batch.get("missing_indices"), list) or any(
+                not isinstance(m, int) or isinstance(m, bool)
+                for m in batch.get("missing_indices")
+            ):
+                return (
+                    f"stage_progress.repair batch {batch_index}: "
+                    f"missing_indices is not a list of ints"
+                )
+        # FIX RV2 (t_d996bbf7): done_batches must equal the GOOD batch
+        # indices exactly (the progress hook computes it that way) and the
+        # stored committed/passed must equal what replaying the cached
+        # batches would produce — any divergence is a tamper.
+        if list(done_batches) != good_indices:
+            return (
+                f"stage_progress.repair.done_batches {done_batches!r} does not "
+                f"match the GOOD batch indices {good_indices!r}"
+            )
+        if dict(committed) != expected_committed:
+            return (
+                "stage_progress.repair.committed does not match the cached "
+                f"batch results (stored={sorted(committed)!r} "
+                f"expected={sorted(expected_committed)!r})"
+            )
+        if list(passed) != expected_passed:
+            return (
+                "stage_progress.repair.passed does not match the cached batch "
+                f"results (stored={passed!r} expected={expected_passed!r})"
+            )
 
     # ------------------------------------------------------------------
     # reaudit
@@ -1777,15 +2249,45 @@ def _validate_stage_progress(
         return "stage_progress.reaudit is missing"
     if not isinstance(reaudit, dict):
         return "stage_progress.reaudit is not an object"
+    if set(reaudit) != _REAUDIT_STAGE_KEYS:
+        return (
+            f"stage_progress.reaudit foreign key set {sorted(reaudit)!r} "
+            f"(expected {sorted(_REAUDIT_STAGE_KEYS)})"
+        )
     ra_status = reaudit.get("status")
     if not isinstance(ra_status, str) or ra_status not in ("pending", "partial", "complete", "failed"):
         return f"stage_progress.reaudit.status is missing or unknown {ra_status!r}"
     ra_done = reaudit.get("done_chunks")
     if not isinstance(ra_done, list):
         return "stage_progress.reaudit.done_chunks is not a list"
+    ra_issues = reaudit.get("issues")
+    if not isinstance(ra_issues, list):
+        return "stage_progress.reaudit.issues is not a list"
+    if ra_status == "pending" and (ra_done or ra_issues):
+        return (
+            "stage_progress.reaudit is pending but carries done_chunks/issues"
+        )
+    # FIX RV2 (t_d996bbf7): reaudit_resume_plan()/_run_reaudit() copy the
+    # cached per-chunk issues VERBATIM (0 model calls) — every issue is
+    # validated with the same strictness as a fresh re-audit chunk
+    # (validate_chunk_json semantics) AND bound to the pid span of the chunk
+    # it lives in; the aggregate ``issues`` list must equal the order-
+    # sensitive concatenation of the per-chunk lists.
+    expected_aggregate: List[Dict[str, Any]] = []
+    pid_positions = (
+        {pid: position for position, pid in enumerate(expected_pids)}
+        if expected_pids is not None
+        else None
+    )
     for position, record in enumerate(ra_done, start=1):
         if not isinstance(record, dict):
             return f"stage_progress.reaudit done_chunks record at position {position}: not an object"
+        if set(record) != _REAUDIT_CHUNK_KEYS:
+            return (
+                f"stage_progress.reaudit done_chunks record at position "
+                f"{position}: foreign key set {sorted(record)!r} "
+                f"(expected {sorted(_REAUDIT_CHUNK_KEYS)})"
+            )
         chunk_index = record.get("chunk")
         if chunk_index != position:
             return (
@@ -1805,19 +2307,65 @@ def _validate_stage_progress(
                 f"stage_progress.reaudit chunk {chunk_index}: boundary pids "
                 f"{first_pid!r}/{last_pid!r} are not in the translation map"
             )
-        if not isinstance(record.get("issues"), list):
+        first_pos = pid_positions.get(first_pid) if pid_positions is not None else None
+        last_pos = pid_positions.get(last_pid) if pid_positions is not None else None
+        if pid_positions is not None and (
+            first_pos is None or last_pos is None or first_pos > last_pos
+        ):
+            return (
+                f"stage_progress.reaudit chunk {chunk_index}: invalid pid "
+                f"span {first_pid!r}..{last_pid!r}"
+            )
+        issues = record.get("issues")
+        if not isinstance(issues, list):
             return f"stage_progress.reaudit chunk {chunk_index}: issues is not a list"
-    ra_issues = reaudit.get("issues")
-    if not isinstance(ra_issues, list):
-        return "stage_progress.reaudit.issues is not a list"
-    for issue_index, issue in enumerate(ra_issues):
-        if not isinstance(issue, dict):
-            return f"stage_progress.reaudit issue {issue_index}: not an object"
-        pid = issue.get("id")
-        if not isinstance(pid, str) or not pid:
-            return f"stage_progress.reaudit issue {issue_index}: id is missing or not a string"
-        if expected_pid_set is not None and pid not in expected_pid_set:
-            return f"stage_progress.reaudit issue {issue_index}: id {pid!r} is not in the translation map"
+        for issue_index, issue in enumerate(issues):
+            if not isinstance(issue, dict):
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index} issue "
+                    f"{issue_index}: not an object"
+                )
+            pid = issue.get("id")
+            if not isinstance(pid, str) or not pid:
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index} issue "
+                    f"{issue_index}: id is missing or not a string"
+                )
+            if issue.get("category") not in AUDIT_V4_CATEGORIES:
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index} issue {pid}: "
+                    f"invalid category {issue.get('category')!r}"
+                )
+            if issue.get("severity") not in AUDIT_V4_SEVERITIES:
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index} issue {pid}: "
+                    f"invalid severity {issue.get('severity')!r}"
+                )
+            if issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index} issue {pid}: "
+                    f"invalid confidence {issue.get('confidence')!r}"
+                )
+            if expected_pid_set is not None and pid not in expected_pid_set:
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index} issue {pid}: "
+                    f"id is not in the translation map"
+                )
+            if pid_positions is not None:
+                pid_pos = pid_positions.get(pid)
+                if pid_pos is None or not (first_pos <= pid_pos <= last_pos):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} issue "
+                        f"{pid}: id is not inside the actual pid span "
+                        f"{first_pid!r}..{last_pid!r}"
+                    )
+            expected_aggregate.append(dict(issue))
+    if list(ra_issues) != expected_aggregate:
+        return (
+            "stage_progress.reaudit.issues does not match the order-sensitive "
+            "concatenation of the per-chunk issue lists (aggregate "
+            "inconsistency)"
+        )
 
     # Canonical integrity binding: the whole stage_progress payload must
     # match the hash persisted at save() time — any tamper (even with
@@ -2082,6 +2630,13 @@ class B3AuditCache:
                     expected_pids=expected_pids,
                     stored_hash=payload.get("partial_resume_hash"),
                     r_editor_enabled=r_editor_enabled,
+                    # FIX RV2 (t_d996bbf7): the current RAW text binds every
+                    # cached R edit (original-substring check) and the
+                    # payload's OWN translations_repaired (the R-edited map
+                    # at the last incremental save) binds the cached repair
+                    # results (no-op / truncation gates).
+                    current_text=current_text,
+                    edited_text=payload.get("translations_repaired"),
                 )
             else:
                 reason = _validate_partial_payload(
