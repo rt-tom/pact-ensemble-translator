@@ -388,15 +388,36 @@ class ValidationResult:
     valid: bool
     issues: Tuple[Dict[str, Any], ...] = ()
     errors: Tuple[str, ...] = ()
+    # CONTEXT-PID-DROP (owner 2026-08-15): well-formed issues whose id is
+    # NOT in the current chunk (context-only pid the model saw for
+    # continuity, or a completely foreign/fabricated pid) are dropped
+    # PER-ISSUE — they never make the chunk invalid and are never counted
+    # as findings. They are returned here so the caller can journal them
+    # for diagnostics (audit_chunk_done dropped_count / reaudit chunk
+    # record), mirroring R-PID-SCOPE's per-edit WARNING drop.
+    dropped: Tuple[Dict[str, Any], ...] = ()
 
 
-def validate_chunk_json(parsed: Any, chunk_pids: Sequence[str]) -> ValidationResult:
+def validate_chunk_json(
+    parsed: Any,
+    chunk_pids: Sequence[str],
+    context_pids: Sequence[str] = (),
+) -> ValidationResult:
     """Validate one chunk response against the v4.1 issue contract.
 
     Fail-closed: any invalid issue makes the whole chunk invalid (a failed
     chunk is NEVER read as ``issues=[]``). Valid issues are still returned
     (harness behaviour) so a partially-invalid chunk keeps its valid findings
     while the chunk itself is recorded as failed.
+
+    CONTEXT-PID-DROP (owner 2026-08-15): a WELL-FORMED issue whose ``id`` is
+    NOT in ``chunk_pids`` is dropped per-issue (returned in ``dropped``),
+    never a chunk failure — both for ``context_pids`` (the model saw that
+    pair only for continuity and must not audit it; run gl.6 chunk6 p00251
+    used to fail -> SPILL -> RetryShrink discarding 7 good issues) and for
+    completely foreign/fabricated pids (p99999) the model must never have
+    seen. Structural problems are checked FIRST (mirroring R-PID-SCOPE): a
+    malformed payload is never masked by the scope drop.
     """
     errors: List[str] = []
     if not isinstance(parsed, dict):
@@ -407,7 +428,9 @@ def validate_chunk_json(parsed: Any, chunk_pids: Sequence[str]) -> ValidationRes
     if not isinstance(issues, list):
         return ValidationResult(valid=False, errors=("'issues' is not an array",))
     valid_issues: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
     chunk_pid_set = frozenset(chunk_pids)
+    context_pid_set = frozenset(context_pids)
     for index, issue in enumerate(issues):
         if not isinstance(issue, dict):
             errors.append(f"issue {index}: not an object")
@@ -416,23 +439,39 @@ def validate_chunk_json(parsed: Any, chunk_pids: Sequence[str]) -> ValidationRes
         severity = issue.get("severity")
         confidence = issue.get("confidence")
         pid = issue.get("id")
-        problem = ""
+        # Structural validation runs FIRST for every issue (R-PID-SCOPE
+        # precedence): the scope drop below must NEVER mask malformed
+        # payload — invalid vocab or a missing/non-string id fail the
+        # WHOLE chunk exactly as they do for an owned pid.
         if category not in AUDIT_V4_CATEGORIES:
-            problem = f"invalid category '{category}'"
-        elif severity not in AUDIT_V4_SEVERITIES:
-            problem = f"invalid severity '{severity}'"
-        elif confidence not in AUDIT_V4_CONFIDENCES:
-            problem = f"invalid confidence '{confidence}'"
-        elif pid not in chunk_pid_set:
-            problem = f"id '{pid}' not in chunk"
-        if problem:
-            errors.append(f"issue {pid}: {problem}")
-        else:
-            valid_issues.append(dict(issue))
+            errors.append(f"issue {pid}: invalid category {category!r}")
+            continue
+        if severity not in AUDIT_V4_SEVERITIES:
+            errors.append(f"issue {pid}: invalid severity {severity!r}")
+            continue
+        if confidence not in AUDIT_V4_CONFIDENCES:
+            errors.append(f"issue {pid}: invalid confidence {confidence!r}")
+            continue
+        if not isinstance(pid, str) or not pid:
+            errors.append(f"issue {pid}: invalid id {pid!r}")
+            continue
+        # CONTEXT-PID-DROP: a WELL-FORMED issue on a pid the model must not
+        # have audited is dropped per-issue with a WARNING (journal), never
+        # a structural error — the chunk stays GOOD and the valid issues
+        # survive. Context pids and foreign pids are dropped alike (the
+        # issue is invalid for this chunk either way).
+        if pid in context_pid_set:
+            dropped.append(dict(issue))
+            continue
+        if pid not in chunk_pid_set:
+            dropped.append(dict(issue))
+            continue
+        valid_issues.append(dict(issue))
     return ValidationResult(
         valid=not errors,
         issues=tuple(valid_issues),
         errors=tuple(errors),
+        dropped=tuple(dropped),
     )
 
 
@@ -489,6 +528,10 @@ class ChunkMeta:
     validation_errors: Tuple[str, ...]
     reasoning_file: str
     issues: Tuple[Dict[str, Any], ...] = ()
+    # CONTEXT-PID-DROP (owner 2026-08-15): well-formed issues dropped for
+    # context-only/foreign pids — journaled as a warning count, never a
+    # chunk failure (mirrors R-PID-SCOPE's per-edit warning_count).
+    dropped_count: int = 0
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -502,6 +545,7 @@ class ChunkMeta:
             "reasoning_chars": self.reasoning_chars,
             "reasoning_file": self.reasoning_file,
             "issue_count": len(self.issues),
+            "dropped_count": self.dropped_count,
         }
 
 
@@ -830,6 +874,10 @@ class ChunkedAuditEvaluator:
                         validation_errors=(),
                         reasoning_file=str(cached.get("reasoning_file") or ""),
                         issues=cached_issues,
+                        # CONTEXT-PID-DROP: preserved across partial-resume
+                        # so the incremental cache keeps the warning count
+                        # of the original fresh audit.
+                        dropped_count=int(cached.get("dropped_count") or 0),
                     )
                     self._emit_chunk_event(
                         "done",
@@ -837,6 +885,7 @@ class ChunkedAuditEvaluator:
                         total=len(chunks),
                         status=meta.status,
                         issue_count=len(cached_issues),
+                        dropped_count=meta.dropped_count,
                         reused=True,
                     )
                     all_meta.append(meta)
@@ -1128,7 +1177,13 @@ class ChunkedAuditEvaluator:
         except Exception:
             parsed = None
             json_parse = "failed"
-        validation = validate_chunk_json(parsed, chunk_pids)
+        # CONTEXT-PID-DROP (owner 2026-08-15): the model is given
+        # context_pairs for continuity and must NOT audit them — issues on
+        # those pids are dropped per-issue with a warning, so a
+        # context-pid finding no longer fails the chunk into SPILL /
+        # RetryShrink (run gl.6 chunk6 p00251).
+        context_pids = [p.pid for p in context_pairs]
+        validation = validate_chunk_json(parsed, chunk_pids, context_pids=context_pids)
         status = classify_chunk(
             response.finish_reason, content, reasoning, validation.valid
         )
@@ -1147,6 +1202,7 @@ class ChunkedAuditEvaluator:
             validation_errors=validation.errors,
             reasoning_file=reason_file,
             issues=validation.issues,
+            dropped_count=len(validation.dropped),
         )
         self._emit_chunk_event(
             "done",
@@ -1154,6 +1210,7 @@ class ChunkedAuditEvaluator:
             total=chunk_total,
             status=meta.status,
             issue_count=len(validation.issues),
+            dropped_count=len(validation.dropped),
         )
         LOG.debug(
             "audit chunk %s: %s | finish=%s | issues=%d",
