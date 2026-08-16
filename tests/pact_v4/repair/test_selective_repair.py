@@ -1758,7 +1758,52 @@ def test_reaudit_request_carries_local_context_and_repaired_delta():
     assert 'id="p00003"' in reaudit_section
 
 
-def test_reaudit_token_budget_local_region():
+def test_reaudit_context_pid_issue_dropped_complete() -> None:
+    """CONTEXT-PID-DROP (owner 2026-08-15): the re-audit model is given
+    context_pairs (overlap) for continuity and must NOT re-audit them — an
+    issue on a context pid is dropped per-issue (journaled, never a
+    finding), the re-audit stays complete=True instead of failed debt (run
+    gl.6 p00251 case: the same validate_chunk_json error used to fail the
+    re-audit chunk -> failed=True -> debt)."""
+    issue = _issue("p00005", "invented_gender", note="n", confidence="high")
+    source = {f"p{i:05d}": f"Source paragraph {i}." for i in range(1, 11)}
+    translation = {f"p{i:05d}": f"Перевод абзаца {i}." for i in range(1, 11)}
+    filtered = _hard_filtered([issue], source, translation)
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+        # re-audit response: one valid residual issue on an owned pid
+        # (p00005) + one issue on a CONTEXT pid (p00002, overlap before the
+        # scope) -> the context issue is dropped per-issue. Both issues are
+        # complete canonical issue objects (non-empty note AND excerpt) —
+        # RV4 t_cfb1523d: a scope-dropped issue missing a canonical field
+        # is a structural failure, never a journaled dropped object.
+        _reaudit_response([
+            {"id": "p00005", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "residual", "excerpt": "text"},
+            {"id": "p00002", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "context-only", "excerpt": "text"},
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend, config=SelectiveRepairConfig(reaudit_neighbour_window=2)
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    assert outcome.committed != ()
+    assert outcome.reaudit is not None and outcome.reaudit.complete
+    # the context-pid issue is dropped — never a re-audit finding
+    assert [i["id"] for i in outcome.reaudit.issues] == ["p00005"]
+    assert len(backend.requests) == 2
+
+
+def test_reaudit_token_budget_local_region() -> None:
     """REPAIR-CTX acceptance: the re-audit input for a 400-PID chapter with a
     handful of changed PIDs must estimate well under ~5k tokens (run_012
     re-audit input was 41.5k tokens and truncated the 49k context)."""

@@ -1039,7 +1039,7 @@ _AUDIT_STAGE_KEYS = frozenset(
 _AUDIT_CHUNK_KEYS = frozenset({
     "chunk", "first_pid", "last_pid", "pair_count", "context_count",
     "status", "finish_reason", "reasoning_chars", "reasoning_file",
-    "issue_count",
+    "issue_count", "dropped_count",
 })
 _REPAIR_STAGE_KEYS = frozenset(
     {"status", "done_batches", "committed", "passed", "outcome"}
@@ -1058,7 +1058,9 @@ _REPAIR_RESULT_KEYS = frozenset({
     "index", "decision", "pid", "repaired_translation", "reason",
 })
 _REAUDIT_STAGE_KEYS = frozenset({"status", "done_chunks", "issues"})
-_REAUDIT_CHUNK_KEYS = frozenset({"chunk", "first_pid", "last_pid", "issues"})
+_REAUDIT_CHUNK_KEYS = frozenset({
+    "chunk", "first_pid", "last_pid", "issues", "failed", "dropped",
+})
 
 # Repair decisions the fresh batch parser accepts (parse_repair_batch).
 _REPAIR_DECISIONS = frozenset({"pass", "repair"})
@@ -1157,6 +1159,16 @@ def _validate_partial_payload(
             )
         if not isinstance(item.get("reasoning_file"), str):
             return f"chunk {chunk_index}: reasoning_file is not a string"
+        dropped_count = item.get("dropped_count")
+        if dropped_count is not None and (
+            not isinstance(dropped_count, int)
+            or isinstance(dropped_count, bool)
+            or dropped_count < 0
+        ):
+            return (
+                f"chunk {chunk_index}: dropped_count {dropped_count!r} "
+                f"is not a non-negative int"
+            )
         finish_reason = item.get("finish_reason")
         if finish_reason is not None and not isinstance(finish_reason, str):
             return f"chunk {chunk_index}: finish_reason is not a string or null"
@@ -1814,10 +1826,10 @@ def _validate_stage_progress(
     for position, item in enumerate(a_chunks, start=1):
         if not isinstance(item, dict):
             return f"stage_progress.audit chunk at position {position}: not an object"
-        if set(item) != _AUDIT_CHUNK_KEYS:
+        if not set(item) <= _AUDIT_CHUNK_KEYS:
             return (
                 f"stage_progress.audit chunk at position {position}: foreign key "
-                f"set {sorted(item)!r} (expected {sorted(_AUDIT_CHUNK_KEYS)})"
+                f"set {sorted(item)!r} (allowed {sorted(_AUDIT_CHUNK_KEYS)})"
             )
         chunk_index = item.get("chunk")
         if chunk_index != position:
@@ -1856,6 +1868,19 @@ def _validate_stage_progress(
             return f"stage_progress.audit chunk {chunk_index}: finish_reason is not a string or null"
         if not isinstance(item.get("issue_count"), int) or isinstance(item.get("issue_count"), bool) or item.get("issue_count") < 0:
             return f"stage_progress.audit chunk {chunk_index}: issue_count is not a non-negative int"
+        # CONTEXT-PID-DROP: the persisted dropped warning count is part of the
+        # incremental cache contract — a malformed/negative value is a full
+        # miss (never a trusted replay with a fabricated count).
+        dropped_count = item.get("dropped_count")
+        if dropped_count is not None and (
+            not isinstance(dropped_count, int)
+            or isinstance(dropped_count, bool)
+            or dropped_count < 0
+        ):
+            return (
+                f"stage_progress.audit chunk {chunk_index}: dropped_count "
+                f"{dropped_count!r} is not a non-negative int"
+            )
     for issue_index, issue in enumerate(a_issues):
         if not isinstance(issue, dict):
             return f"stage_progress.audit issue {issue_index}: not an object"
@@ -2312,17 +2337,29 @@ def _validate_stage_progress(
     for position, record in enumerate(ra_done, start=1):
         if not isinstance(record, dict):
             return f"stage_progress.reaudit done_chunks record at position {position}: not an object"
-        if set(record) != _REAUDIT_CHUNK_KEYS:
+        if not set(record) <= _REAUDIT_CHUNK_KEYS:
             return (
                 f"stage_progress.reaudit done_chunks record at position "
                 f"{position}: foreign key set {sorted(record)!r} "
-                f"(expected {sorted(_REAUDIT_CHUNK_KEYS)})"
+                f"(allowed {sorted(_REAUDIT_CHUNK_KEYS)})"
             )
         chunk_index = record.get("chunk")
         if chunk_index != position:
             return (
                 f"stage_progress.reaudit done_chunks coverage/order mismatch: stored "
                 f"index {chunk_index!r} at position {position} (expected 1..N)"
+            )
+        # CONTEXT-PID-DROP (RV5 t_f82ed9ad): the done record MUST carry an
+        # explicit ``failed`` bool — a missing/non-bool marker (a cache
+        # written before the failed marker existed, or a tampered one) is a
+        # full miss, NEVER a trusted replay: without the marker a chunk that
+        # failed fresh (malformed dropped diagnostics) could be replayed as
+        # complete with 0 model calls, silently losing the diagnostic/debt.
+        failed_marker = record.get("failed")
+        if not isinstance(failed_marker, bool):
+            return (
+                f"stage_progress.reaudit chunk {chunk_index}: failed is "
+                f"missing or not a bool"
             )
         first_pid = record.get("first_pid")
         last_pid = record.get("last_pid")
@@ -2390,6 +2427,142 @@ def _validate_stage_progress(
                         f"{first_pid!r}..{last_pid!r}"
                     )
             expected_aggregate.append(dict(issue))
+        # CONTEXT-PID-DROP (RV2 t_61af1bb2): dropped context/foreign issue
+        # objects are persisted reaudit diagnostics and are validated with
+        # the SAME complete well-formed issue contract as cached audit
+        # issues — exact _ISSUE_KEYS, non-empty id/note/excerpt strings,
+        # valid category/severity/confidence vocab, and a harness _debug
+        # {chunk, reasoning_file} attributing the drop to the journaling
+        # chunk (the fresh _run_reaudit attaches it exactly like the audit's
+        # _with_debug). Any malformed/missing/extra/invalid field is a FULL
+        # miss BEFORE either resume plan is built — never a filtered/coerced
+        # replay. The PID boundary check is the safe equivalent for
+        # context/foreign dropped IDs: a dropped issue's id is by
+        # construction NOT in the chunk that journaled it (a context pid
+        # lies outside the chunk's span; a foreign/fabricated pid is not in
+        # the translation map at all), so the id must NOT lie inside the
+        # record's own first_pid..last_pid span — an in-span id would have
+        # been a valid issue, never a drop (tampered cache).
+        dropped = record.get("dropped")
+        if dropped is not None:
+            if not isinstance(dropped, list):
+                return (
+                    f"stage_progress.reaudit chunk {chunk_index}: "
+                    f"dropped is not a list"
+                )
+            for dropped_index, dropped_issue in enumerate(dropped):
+                if not isinstance(dropped_issue, dict):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: not an object"
+                    )
+                if set(dropped_issue) != _ISSUE_KEYS:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: key set mismatch "
+                        f"(expected {sorted(_ISSUE_KEYS)}, got "
+                        f"{sorted(dropped_issue)})"
+                    )
+                pid = dropped_issue.get("id")
+                if not isinstance(pid, str) or not pid:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {dropped_index}: id is missing or not a string"
+                    )
+                if dropped_issue.get("category") not in AUDIT_V4_CATEGORIES:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: invalid category "
+                        f"{dropped_issue.get('category')!r}"
+                    )
+                if dropped_issue.get("severity") not in AUDIT_V4_SEVERITIES:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: invalid severity "
+                        f"{dropped_issue.get('severity')!r}"
+                    )
+                if dropped_issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: invalid confidence "
+                        f"{dropped_issue.get('confidence')!r}"
+                    )
+                note = dropped_issue.get("note")
+                if not isinstance(note, str) or not note.strip():
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: note is missing, not a string, or empty"
+                    )
+                excerpt = dropped_issue.get("excerpt")
+                if not isinstance(excerpt, str) or not excerpt.strip():
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: excerpt is missing, not a string, or "
+                        "empty"
+                    )
+                debug = dropped_issue.get("_debug")
+                if not isinstance(debug, dict):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug is missing or not an object"
+                    )
+                if set(debug) != {"chunk", "reasoning_file"}:
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug key set mismatch "
+                        f"(expected ['chunk', 'reasoning_file'], got "
+                        f"{sorted(debug)})"
+                    )
+                debug_chunk = debug.get("chunk")
+                if (
+                    not isinstance(debug_chunk, int)
+                    or isinstance(debug_chunk, bool)
+                    or debug_chunk != chunk_index
+                ):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug.chunk {debug_chunk!r} does not "
+                        f"match the journaling chunk {chunk_index}"
+                    )
+                if not isinstance(debug.get("reasoning_file"), str):
+                    return (
+                        f"stage_progress.reaudit chunk {chunk_index} dropped "
+                        f"issue {pid}: _debug.reasoning_file is not a string"
+                    )
+                # Safe PID equivalent for dropped IDs: the id must NOT lie
+                # inside the journaling record's own pid span. A dropped
+                # issue is by construction outside the chunk (context pid
+                # from the overlap, or a foreign/fabricated pid absent from
+                # the map), so an in-span id is an impossible drop (tamper).
+                if pid_positions is not None:
+                    first_pos = pid_positions.get(record.get("first_pid"))
+                    last_pos = pid_positions.get(record.get("last_pid"))
+                    pid_pos = pid_positions.get(pid)
+                    if (
+                        first_pos is not None
+                        and last_pos is not None
+                        and pid_pos is not None
+                        and first_pos <= pid_pos <= last_pos
+                    ):
+                        return (
+                            f"stage_progress.reaudit chunk {chunk_index} "
+                            f"dropped issue {pid}: id is inside the chunk's "
+                            f"own pid span "
+                            f"({record.get('first_pid')!r}.."
+                            f"{record.get('last_pid')!r}) — a dropped issue "
+                            f"is by definition outside the chunk (tampered)"
+                        )
+    ra_issues = reaudit.get("issues")
+    if not isinstance(ra_issues, list):
+        return "stage_progress.reaudit.issues is not a list"
+    for issue_index, issue in enumerate(ra_issues):
+        if not isinstance(issue, dict):
+            return f"stage_progress.reaudit issue {issue_index}: not an object"
+        pid = issue.get("id")
+        if not isinstance(pid, str) or not pid:
+            return f"stage_progress.reaudit issue {issue_index}: id is missing or not a string"
+        if expected_pid_set is not None and pid not in expected_pid_set:
+            return f"stage_progress.reaudit issue {issue_index}: id {pid!r} is not in the translation map"
     if list(ra_issues) != expected_aggregate:
         return (
             "stage_progress.reaudit.issues does not match the order-sensitive "
@@ -2819,6 +2992,10 @@ class B3AuditCache:
                 "reasoning_chars": chunk_payload.get("reasoning_chars", 0),
                 "reasoning_file": chunk_payload.get("reasoning_file", ""),
                 "finish_reason": chunk_payload.get("finish_reason"),
+                # CONTEXT-PID-DROP: the persisted dropped warning count rides
+                # the resume plan so a replayed GOOD chunk re-emits the exact
+                # audit_chunk_done dropped_count (validated at load time).
+                "dropped_count": chunk_payload.get("dropped_count", 0),
                 "issues": issues_by_chunk.get(chunk_index, []),
             }
         return plan
@@ -2905,7 +3082,12 @@ class B3AuditCache:
         Returns ``{chunk_index: {first_pid, last_pid, issues}}`` for every
         cached reaudit chunk (from ``stage_progress.reaudit``) — the reaudit
         loop replays a chunk with 0 model calls only when its boundaries
-        match the current chunk (fail-closed on mismatch). Empty when the
+        match the current chunk (fail-closed on mismatch). CONTEXT-PID-DROP
+        (RV5 t_f82ed9ad): a chunk whose done record is marked ``failed``
+        (invalid chunk JSON or malformed dropped diagnostics at journal
+        time) is NEVER included — the resume re-runs it fail-closed, so the
+        malformed input's diagnostic/debt is preserved instead of a 0-call
+        replay silently upgrading the chunk to complete. Empty when the
         payload has no incremental reaudit state.
         """
         if not self._payload:
@@ -2920,6 +3102,11 @@ class B3AuditCache:
         for record in reaudit_stage.get("done_chunks") or ():
             if not isinstance(record, dict):
                 continue
+            # CONTEXT-PID-DROP (RV5 t_f82ed9ad): a failed chunk is never
+            # replayable — exclude it from the plan so the next run re-runs
+            # it (fail-closed) instead of replaying it as complete.
+            if record.get("failed") is True:
+                continue
             chunk_index = record.get("chunk")
             if not isinstance(chunk_index, int):
                 continue
@@ -2928,6 +3115,13 @@ class B3AuditCache:
                 "last_pid": record.get("last_pid"),
                 "issues": [
                     dict(issue) for issue in (record.get("issues") or ())
+                    if isinstance(issue, dict)
+                ],
+                # CONTEXT-PID-DROP: the dropped context/foreign issue objects
+                # ride the resume plan so a replayed re-audit chunk keeps its
+                # journaled diagnostics (validated at load time).
+                "dropped": [
+                    dict(issue) for issue in (record.get("dropped") or ())
                     if isinstance(issue, dict)
                 ],
             }
@@ -3865,6 +4059,11 @@ class B3AuditRepair:
                         total=fields.get("total"),
                         status=fields.get("status"),
                         issue_count=fields.get("issue_count", 0),
+                        # CONTEXT-PID-DROP (owner 2026-08-15): issues dropped
+                        # for context-only/foreign pids are journaled as a
+                        # warning count for diagnostics — the chunk itself
+                        # stays GOOD (mirrors R-PID-SCOPE warning_count).
+                        dropped_count=fields.get("dropped_count", 0),
                         error=fields.get("error"),
                         # PARTIAL-RESUME: the chunk was replayed from the
                         # partial cache (0 model calls), not freshly audited.
@@ -4092,12 +4291,21 @@ class B3AuditRepair:
                     _save_stage_progress()
                 elif kind == "reaudit_chunk_done":
                     done_chunks = fields["done_chunks"]
-                    stage_progress["reaudit"] = {
-                        "status": (
+                    # CONTEXT-PID-DROP (RV5 t_f82ed9ad): a done record
+                    # marked failed means the stage is NOT complete — the
+                    # persisted status must say "failed" (a failed chunk can
+                    # never be represented as a successful complete stage).
+                    stage_status = (
+                        "failed"
+                        if any(c.get("failed") is True for c in done_chunks)
+                        else (
                             "complete"
                             if len(done_chunks) == fields.get("chunk_count")
                             else "partial"
-                        ),
+                        )
+                    )
+                    stage_progress["reaudit"] = {
+                        "status": stage_status,
                         "done_chunks": [dict(c) for c in done_chunks],
                         "issues": [
                             dict(i)

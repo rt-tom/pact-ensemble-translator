@@ -16,7 +16,7 @@ synthetic (hermetic; no chapter data in the repo, per data restrictions).
 from __future__ import annotations
 
 import json
-from typing import List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 import pytest
 
@@ -273,13 +273,69 @@ def test_validate_chunk_json_accepts_gold_issue_shape() -> None:
     {"id": "p00010", "category": "scene", "severity": "major", "confidence": "high"},
     {"id": "p00010", "category": "omission", "severity": "fatal", "confidence": "high"},
     {"id": "p00010", "category": "omission", "severity": "major", "confidence": "certain"},
-    {"id": "p99999", "category": "omission", "severity": "major", "confidence": "high"},
 ])
 def test_validate_chunk_json_rejects_invalid_issue(bad) -> None:
     result = validate_chunk_json({"issues": [bad]}, ["p00010"])
     assert not result.valid
     assert result.issues == ()
     assert result.errors
+    assert result.dropped == ()
+
+
+def test_validate_chunk_json_foreign_pid_dropped_not_invalid() -> None:
+    """CONTEXT-PID-DROP (owner 2026-08-15): a WELL-FORMED issue on a
+    foreign pid (p99999) is dropped per-issue — the chunk stays VALID, the
+    issue is journaled in ``dropped`` (never a finding). Previously this
+    failed the whole chunk (id not in chunk)."""
+    result = validate_chunk_json({"issues": [_issue("p99999")]}, ["p00010"])
+    assert result.valid
+    assert result.issues == ()
+    assert result.errors == ()
+    assert len(result.dropped) == 1
+    assert result.dropped[0]["id"] == "p99999"
+
+
+def test_validate_chunk_json_drops_context_and_foreign_pids() -> None:
+    """CONTEXT-PID-DROP (owner 2026-08-15): well-formed issues on a
+    context-only pid (model saw it for continuity, must not audit) or on a
+    completely foreign pid (p99999) are dropped per-issue — the chunk stays
+    GOOD, the dropped issues are journaled, valid findings survive."""
+    chunk_pids = ["p00001", "p00002"]
+    context_pids = ["p00099", "p00100"]
+    payload = {"issues": [
+        _issue("p00001"),                 # owned -> valid
+        _issue("p00099"),                 # context-only -> dropped
+        _issue("p00100"),                 # context-only -> dropped
+        _issue("p99999"),                 # foreign -> dropped
+        {"id": "p00002", "category": "omission", "severity": "major",
+         "confidence": "high", "note": "kept"},
+    ]}
+    result = validate_chunk_json(payload, chunk_pids, context_pids=context_pids)
+    assert result.valid
+    assert result.errors == ()
+    assert [i["id"] for i in result.issues] == ["p00001", "p00002"]
+    assert [i["id"] for i in result.dropped] == ["p00099", "p00100", "p99999"]
+
+
+def test_validate_chunk_json_malformed_never_masked_by_context_drop() -> None:
+    """CONTEXT-PID-DROP: the scope drop must NEVER mask malformed payload
+    (R-PID-SCOPE precedence) — an issue with a bad category on a context pid
+    still fails the whole chunk fail-closed."""
+    chunk_pids = ["p00001"]
+    context_pids = ["p00251"]
+    payload = {"issues": [
+        _issue("p00001", category="invented_gender"),  # valid owned
+        {"id": "p00251", "category": "bogus_category", "severity": "major",
+         "confidence": "high"},                        # context pid BUT malformed
+    ]}
+    result = validate_chunk_json(payload, chunk_pids, context_pids=context_pids)
+    assert not result.valid
+    # the valid owned issue is still returned (harness behavior — a failed
+    # chunk keeps its valid findings), the malformed one is neither a
+    # finding nor dropped, and the malformed payload still fails the chunk
+    assert [i["id"] for i in result.issues] == ["p00001"]
+    assert result.dropped == ()         # malformed never dropped either
+    assert any("invalid category" in e for e in result.errors)
 
 
 def test_validate_chunk_json_rejects_non_object_or_missing_issues() -> None:
@@ -366,13 +422,15 @@ def test_gold_suite_6_must_not_find_are_rejected() -> None:
     assert all(i["id"] not in GOLD_MUST_NOT_FIND for i in outcome.issues)
 
 
-def test_gold_must_not_find_issue_in_context_only_is_fail_closed() -> None:
-    # A would-be FP that references a CONTEXT_ONLY pair (in the overlap, not
-    # in the chunk's AUDIT_PAIRS) must be rejected by validation -> the chunk
-    # fails closed (audit_complete=false), never silently accepted.
+def test_gold_must_not_find_issue_in_context_only_is_dropped() -> None:
+    # CONTEXT-PID-DROP (owner 2026-08-15): a would-be FP that references a
+    # CONTEXT_ONLY pair (in the overlap, not in the chunk's AUDIT_PAIRS) is
+    # dropped PER-ISSUE with a WARNING — the chunk stays GOOD and the
+    # context-only issue never becomes a finding (previously this failed the
+    # chunk closed).
     # 40 big pairs (~4000 est tokens) -> 2 chunks (36 + 4); chunk 2's
     # CONTEXT_ONLY = preceding pairs (p00033..p00036, ~400 tokens); the model
-    # reports an issue for p00034 (context-only id) -> invalid for chunk 2.
+    # reports an issue for p00034 (context-only id) -> dropped for chunk 2.
     pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]
     backend = ScriptedBackend([
         _ok_response([]),                                        # chunk 1 GOOD
@@ -387,8 +445,11 @@ def test_gold_must_not_find_issue_in_context_only_is_fail_closed() -> None:
     second_prompt = backend.requests[1].messages[0].content
     assert "CONTEXT_ONLY (for resolving" in second_prompt
     assert "<PAIR id=\"p00034\"" in second_prompt  # p00034 is context-only for chunk 2
-    assert not outcome.audit_complete
-    assert outcome.failed_chunks == (2,)
+    # the chunk stays GOOD and the dropped context issue is journaled
+    assert outcome.audit_complete
+    assert outcome.failed_chunks == ()
+    assert outcome.chunks[1]["status"] == "GOOD"
+    assert outcome.chunks[1]["dropped_count"] == 1
     # the would-be FP never reaches the collected issues
     assert all(i["id"] != "p00034" for i in outcome.issues)
 
@@ -492,9 +553,11 @@ def test_fail_closed_on_invalid_json() -> None:
 
 def test_fail_closed_on_validation_error() -> None:
     pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
-    # chunk 1 returns an issue with a foreign id (not in chunk) -> invalid
+    # chunk 1 returns a STRUCTURALLY malformed issue (invalid category) ->
+    # invalid; CONTEXT-PID-DROP never masks malformed payload
     backend = ScriptedBackend([
-        _ok_response([_issue("p99999")]),
+        _ok_response([{"id": "p00001", "category": "bogus",
+                       "severity": "major", "confidence": "high"}]),
         _ok_response([]),
     ])
     evaluator = ChunkedAuditEvaluator(
@@ -503,6 +566,115 @@ def test_fail_closed_on_validation_error() -> None:
     outcome = evaluator(chapter_id="0001", pairs=pairs)
     assert not outcome.audit_complete
     assert outcome.failed_chunks == (1,)
+
+
+def test_audit_foreign_pid_issue_dropped_chunk_good() -> None:
+    """CONTEXT-PID-DROP (owner 2026-08-15): a WELL-FORMED issue on a
+    foreign pid (p99999) is dropped per-issue — the chunk stays GOOD and no
+    RetryShrink is triggered (previously: fail -> SPILL/INVALID_JSON ->
+    sub-chunk calls)."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    backend = ScriptedBackend([
+        _ok_response([_issue("p99999")]),  # chunk 1: foreign pid -> dropped
+        _ok_response([]),                  # chunk 2
+    ])
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(retry_shrink=False),
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert outcome.audit_complete
+    assert outcome.failed_chunks == ()
+    assert outcome.issue_count == 0
+    assert outcome.chunks[0]["status"] == "GOOD"
+    assert outcome.chunks[0]["dropped_count"] == 1
+    assert len(backend.requests) == 2  # no RetryShrink sub-chunks
+
+
+def test_audit_context_pid_issue_dropped_chunk_good() -> None:
+    """CONTEXT-PID-DROP (owner 2026-08-15, run gl.6 chunk6 p00251): the
+    model is given context_pairs for continuity and must NOT audit them — an
+    issue on a context-only pid is dropped per-issue, the chunk stays GOOD
+    with its valid issues, dropped_count is journaled, and NO RetryShrink is
+    triggered (previously: id not in chunk -> SPILL -> shrink discarding 7
+    good issues)."""
+    # 2 chunks (36+4); chunk 2's overlap context walks back from p00037 and
+    # covers p00033..p00036 (400 tokens / max 6 pairs) — a context pid.
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]
+    # chunk 1: 7 good issues on owned pids
+    chunk1_issues = [
+        _issue(f"p{i:05d}", category=cat)
+        for i, cat in enumerate(
+            ["omission", "addition", "changed_fact", "invented_gender",
+             "negation", "referent", "omission"],
+            start=1,
+        )
+    ]
+    # chunk 2 (p00037..p00040): one good issue on an OWNED pid + one issue
+    # on a context-only pid (p00035) -> dropped
+    backend = ScriptedBackend([
+        _ok_response(chunk1_issues),
+        _ok_response([
+            _issue("p00037", category="omission"),
+            _issue("p00035", category="addition"),  # context-only pid
+        ]),
+    ])
+    evaluator = ChunkedAuditEvaluator(
+        backend, config=ChunkedAuditConfig(retry_shrink=False),
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert outcome.audit_complete
+    assert outcome.failed_chunks == ()
+    assert outcome.issue_count == 8  # 7 chunk1 + 1 chunk2 (p00035 dropped)
+    assert outcome.chunks[1]["status"] == "GOOD"
+    assert outcome.chunks[1]["dropped_count"] == 1
+    assert len(backend.requests) == 2  # no RetryShrink sub-chunks
+
+
+def test_audit_cached_replay_preserves_dropped_count() -> None:
+    """CONTEXT-PID-DROP (RV t_7e7cfe6f finding 1): a GOOD cached chunk
+    replayed from a partial-resume plan re-emits the exact persisted
+    ``dropped_count`` (3 here, zero included) in the chunk meta AND the
+    ``audit_chunk_done`` event — the replay previously read the missing key
+    as None -> emitted 0."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    # Resume plan built by B3AuditCache.audit_resume_plan(): the cached GOOD
+    # chunk 1 carries the persisted dropped_count of the original audit.
+    cached_chunks = {
+        1: {
+            "status": "GOOD",
+            "first_pid": "p00001",
+            "last_pid": "p00036",
+            "pair_count": 36,
+            "context_count": 0,
+            "reasoning_chars": 0,
+            "reasoning_file": "",
+            "finish_reason": "stop",
+            "dropped_count": 3,
+            "issues": [],
+        },
+    }
+    events: List[Mapping[str, Any]] = []
+
+    def _on_chunk_event(kind: str, fields: Mapping[str, Any]) -> None:
+        events.append(dict(fields))
+
+    backend = ScriptedBackend([
+        _ok_response([]),  # chunk 2 (only chunk 1 is cached)
+    ])
+    evaluator = ChunkedAuditEvaluator(
+        backend,
+        config=ChunkedAuditConfig(retry_shrink=False),
+        on_chunk_event=_on_chunk_event,
+    )
+    outcome = evaluator(chapter_id="0001", pairs=pairs, cached_chunks=cached_chunks)
+    assert outcome.audit_complete
+    assert len(backend.requests) == 1  # chunk 1 replayed with 0 calls
+    assert outcome.chunks[0]["status"] == "GOOD"
+    # The replayed chunk keeps the persisted warning count, not 0.
+    assert outcome.chunks[0]["dropped_count"] == 3
+    done_events = [e for e in events if e.get("status") == "GOOD"]
+    assert done_events and done_events[0]["dropped_count"] == 3
+    assert done_events[0].get("reused") is True
 
 
 # ---------------------------------------------------------------------------
