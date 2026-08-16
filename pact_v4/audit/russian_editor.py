@@ -817,12 +817,20 @@ class RussianEditorEvaluator:
         *,
         config: Optional[RussianEditorConfig] = None,
         on_chunk_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         self._backend = backend
         self._config = config or RussianEditorConfig()
         # Optional per-chunk hook (started/done) so the caller's append-only
         # journal can record chunk causality like the B1 audit does.
         self._on_chunk_event = on_chunk_event
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): accumulated-state hook fired
+        # after EVERY chunk (cached replay and fresh alike) with the partial
+        # R outcome slices built so far — ``on_progress("chunk_done",
+        # {chunks: [...records...], failed_chunks, chunk_count})``. The B3
+        # orchestrator uses it to rewrite audit_cache_b3.json incrementally
+        # (stage_progress.r_editor), so a kill preserves every GOOD R chunk.
+        self._on_progress = on_progress
 
     @property
     def backend(self) -> CompletionBackend:
@@ -834,6 +842,32 @@ class RussianEditorEvaluator:
                 self._on_chunk_event(kind, fields)
             except Exception:  # noqa: BLE001 — a journal hook never breaks R
                 LOG.debug("russian_editor on_chunk_event(%r) failed", kind, exc_info=True)
+
+    def _emit_progress(self, kind: str, **fields: Any) -> None:
+        if self._on_progress is not None:
+            try:
+                self._on_progress(kind, fields)
+            except Exception:  # noqa: BLE001 — a progress hook never breaks R
+                LOG.debug("russian_editor on_progress(%r) failed", kind, exc_info=True)
+
+    def _emit_progress_r(
+        self,
+        chunk_records: Sequence[Mapping[str, Any]],
+        failed_chunks: Sequence[int],
+        chunk_count: int,
+    ) -> None:
+        """Emit the accumulated partial R state after one chunk.
+
+        KILL-SAFE-INCREMENTAL (t_2d16962c): the payload slices match the
+        final RussianEditorOutcome payload (per-chunk records with status +
+        edits), so the incremental cache is a strict prefix of the final one.
+        """
+        self._emit_progress(
+            "chunk_done",
+            chunks=[dict(record) for record in chunk_records],
+            failed_chunks=list(failed_chunks),
+            chunk_count=chunk_count,
+        )
 
     @staticmethod
     def _write_chunk_artifacts(
@@ -946,6 +980,9 @@ class RussianEditorEvaluator:
                             status="GOOD", edit_count=len(cached_edits),
                             reused=True,
                         )
+                        self._emit_progress_r(
+                            chunk_records, failed_chunks, len(chunks)
+                        )
                         continue
                     LOG.warning(
                         "russian_editor chunk %d: cached GOOD chunk edits "
@@ -1044,6 +1081,9 @@ class RussianEditorEvaluator:
                         "done", chunk=chunk_index, status="FAILED",
                         error=f"{type(exc).__name__}: {exc}",
                     )
+                    self._emit_progress_r(
+                        chunk_records, failed_chunks, len(chunks)
+                    )
                     break
                 content = response.text or ""
                 reasoning = str((response.raw_metadata or {}).get("reasoning") or "")
@@ -1098,6 +1138,9 @@ class RussianEditorEvaluator:
                         "done", chunk=chunk_index, status="FAILED",
                         error="; ".join(errors),
                     )
+                    self._emit_progress_r(
+                        chunk_records, failed_chunks, len(chunks)
+                    )
                     break
                 chunk_edits = edits
                 chunk_warnings = warnings
@@ -1121,6 +1164,7 @@ class RussianEditorEvaluator:
                 edit_count=len(chunk_edits),
                 warning_count=len(chunk_warnings),
             )
+            self._emit_progress_r(chunk_records, failed_chunks, len(chunks))
 
         applied, candidates, dropped, route_warnings = route_edits(
             all_edits,

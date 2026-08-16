@@ -677,6 +677,7 @@ class ChunkedAuditEvaluator:
         *,
         config: Optional[ChunkedAuditConfig] = None,
         on_chunk_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         self._backend = backend
         self._config = config or ChunkedAuditConfig()
@@ -688,6 +689,14 @@ class ChunkedAuditEvaluator:
         # ``on_chunk_event("started"|"done", {chunk, total, status,
         # issue_count, ...})``.
         self._on_chunk_event = on_chunk_event
+        # KILL-SAFE-INCREMENTAL (t_2d16962c): an optional accumulated-state
+        # hook fired after EVERY chunk (cached replay and fresh alike) with
+        # the partial audit slices built so far — ``on_progress("chunk_done",
+        # {chunks: [...payloads...], issues: [...attributed...], chunk_count,
+        # successful_chunks, failed_chunks})``. The B3 orchestrator uses it
+        # to rewrite audit_cache_b3.json incrementally (stage_progress), so a
+        # kill at any point preserves every completed chunk.
+        self._on_progress = on_progress
 
     @property
     def backend(self) -> CompletionBackend:
@@ -701,6 +710,45 @@ class ChunkedAuditEvaluator:
                 LOG.debug(
                     "chunked audit on_chunk_event(%r) failed", kind, exc_info=True
                 )
+
+    def _emit_progress(self, kind: str, **fields: Any) -> None:
+        if self._on_progress is not None:
+            try:
+                self._on_progress(kind, fields)
+            except Exception:  # noqa: BLE001 — a progress hook must never break the audit
+                LOG.debug(
+                    "chunked audit on_progress(%r) failed", kind, exc_info=True
+                )
+
+    def _emit_progress_audit(
+        self,
+        metas: Sequence[ChunkMeta],
+        raw_issues: Sequence[Mapping[str, Any]],
+        chunk_count: int,
+    ) -> None:
+        """Emit the accumulated partial audit state after one chunk.
+
+        KILL-SAFE-INCREMENTAL (t_2d16962c): the payload slices are built in
+        EXACTLY the shape the final cache save() writes (chunk payloads +
+        deduped/attributed issues), so the incremental cache is a strict
+        prefix of the final one and the resume validator checks the same
+        schema. Dedupe runs over the accumulated chunks only (the same
+        result the original run would have produced at this point); the
+        resumed run re-dedupes across replayed + fresh chunks at the end.
+        """
+        issues = self._attach_debug_and_dedupe(raw_issues, metas)
+        self._emit_progress(
+            "chunk_done",
+            chunks=[meta.to_payload() for meta in metas],
+            issues=[dict(issue) for issue in issues],
+            chunk_count=chunk_count,
+            successful_chunks=sum(
+                1 for m in metas if m.status in ("GOOD", "GOOD_RETRIED")
+            ),
+            failed_chunks=[
+                m.chunk for m in metas if m.status not in ("GOOD", "GOOD_RETRIED")
+            ],
+        )
 
 
     def __call__(
@@ -793,6 +841,7 @@ class ChunkedAuditEvaluator:
                     )
                     all_meta.append(meta)
                     all_issues.extend(cached_issues)
+                    self._emit_progress_audit(all_meta, all_issues, len(chunks))
                     continue
                 LOG.warning(
                     "audit chunk %s: cached GOOD chunk boundaries mismatch "
@@ -838,6 +887,7 @@ class ChunkedAuditEvaluator:
                 )
             all_meta.append(meta)
             all_issues.extend(meta.issues)
+            self._emit_progress_audit(all_meta, all_issues, len(chunks))
 
         final_issues = self._attach_debug_and_dedupe(all_issues, all_meta)
 
