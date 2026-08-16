@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -173,10 +174,21 @@ def _now_iso() -> str:
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
-    """Atomic write (write-then-rename) with a UTF-8 JSON payload."""
+    """Atomic write (write temp, fsync, replace) with a UTF-8 JSON payload.
+
+    KILL-SAFE-INCREMENTAL (t_2d16962c): the incremental audit-cache
+    rewrites must survive a kill at ANY point — the temp file is flushed
+    and fsynced to disk BEFORE the rename, so a torn/truncated
+    ``audit_cache_b3.json`` can never be left behind (a bare
+    write-then-rename can publish unflushed data after a crash).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.replace(path)
 
 
