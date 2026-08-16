@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
+import pytest
+
 from pact_v4.repair.selective_repair import (
     SelectiveRepairConfig,
     SelectiveRepairEvaluator,
@@ -522,3 +524,125 @@ def test_reaudit_fresh_dropped_extra_field_exact_schema_cache_survival(
     assert replayed[0]["dropped"] == [dropped[0]]
     # the dropped diagnostic stays outside the re-audit findings on replay
     assert [i["id"] for i in replay_outcome.reaudit.issues] == ["p00005"]
+
+
+def _dropped_issue(drop: str = "", **overrides: Any) -> Dict[str, Any]:
+    """A well-formed re-audit payload issue on a CONTEXT/foreign pid
+    (p00002) that the fresh journaling scope-drops — test variants mutate
+    the canonical fields (``drop`` removes a key, overrides replace it)."""
+    issue: Dict[str, Any] = {
+        "id": "p00002", "category": "changed_fact", "severity": "major",
+        "confidence": "high", "note": "context-only", "excerpt": "text",
+    }
+    if drop:
+        issue.pop(drop)
+    issue.update(overrides)
+    return issue
+
+
+@pytest.mark.parametrize("malformed", [
+    _dropped_issue(drop="note"),                     # note key ABSENT
+    _dropped_issue(note=None),                       # note present but null
+    _dropped_issue(note=123),                        # note non-string
+    _dropped_issue(note="   "),                      # note blank
+    _dropped_issue(drop="excerpt"),                  # excerpt key ABSENT
+    _dropped_issue(excerpt=9.5),                     # excerpt non-string
+], ids=[
+    "absent-note", "none-note", "int-note", "blank-note",
+    "absent-excerpt", "float-excerpt",
+])
+def test_reaudit_fresh_dropped_malformed_canonical_fails_closed(
+    tmp_path: Path, malformed: Dict[str, Any],
+) -> None:
+    """CONTEXT-PID-DROP (RV4 t_cfb1523d): a FRESH scope-dropped issue that
+    is missing/invalid on a canonical field (note/excerpt) can NEVER be
+    journaled as a malformed dropped object. ``validate_chunk_json`` checks
+    only id/category/severity/confidence before the scope drop, so such an
+    issue still reaches ``dropped`` — the re-audit now structurally
+    validates the canonical fields at journal time and FAILS CLOSED without
+    persisting the malformed object (the chunk is debt, the issue is named
+    in the outcome reason), instead of writing a key-set/value violation
+    into stage_progress that would full-miss the whole cache on resume.
+    The valid owned issue survives (harness behaviour) and a cache built
+    from the emitted records loads cleanly (no full miss)."""
+    issue = _issue("p00005", "invented_gender", note="n", confidence="high")
+    source = {f"p{i:05d}": f"Source paragraph {i}." for i in range(1, 11)}
+    translation = {f"p{i:05d}": f"Перевод абзаца {i}." for i in range(1, 11)}
+    filtered = _hard_filtered([issue], source, translation)
+
+    progress_records: List[Dict[str, Any]] = []
+
+    def _on_progress(kind: str, fields: Dict[str, Any]) -> None:
+        if kind == "reaudit_chunk_done":
+            progress_records.append(dict(fields))
+
+    backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+        # re-audit response: one valid owned issue (p00005) + one issue on a
+        # CONTEXT/foreign pid (p00002) that is MALFORMED on a canonical
+        # field -> scope-dropped by validate_chunk_json, but the dropped
+        # diagnostic must fail the chunk, never be persisted malformed.
+        _reaudit_response([
+            {"id": "p00005", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "residual", "excerpt": "text"},
+            malformed,
+        ]),
+    ])
+    evaluator = SelectiveRepairEvaluator(
+        backend,
+        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        on_progress=_on_progress,
+    )
+    outcome = evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered,
+    )
+    # fail closed: the chunk carrying the malformed dropped issue is debt
+    assert outcome.reaudit is not None and not outcome.reaudit.complete
+    assert outcome.reaudit.failed
+    # the diagnostic is kept in the outcome reason (never silently dropped)
+    assert "dropped issue 'p00002'" in (outcome.reaudit.reason or "")
+    # the valid owned issue still survives (harness behaviour)…
+    assert [i["id"] for i in outcome.reaudit.issues] == ["p00005"]
+    # …but the malformed dropped issue is NEVER journaled/persisted
+    journaled_dropped = [
+        d for r in progress_records
+        for c in (r.get("done_chunks") or ())
+        for d in (c.get("dropped") or ())
+    ]
+    assert journaled_dropped == []
+
+    # Persist the emitted chunk record (dropped=[]) exactly as the pipeline
+    # would: the cache MUST load (no full miss) and the resume plan must not
+    # carry any malformed dropped object — a fresh malformed dropped input
+    # never leaves a malformed dropped object on disk.
+    done_chunks = [
+        dict(c) for r in progress_records
+        for c in (r.get("done_chunks") or ())
+    ]
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit={
+            "status": "partial",
+            "done_chunks": done_chunks,
+            "issues": [
+                dict(i) for c in done_chunks for i in (c.get("issues") or ())
+            ],
+        },
+    )
+    path = _save_stage_progress(
+        tmp_path, translations=translation, stage_progress=stage,
+    )
+    cache = _load_stage_progress(
+        path, translations=translation, r_editor_enabled=False,
+    )
+    assert cache is not None and cache.is_partial()
+    plan = cache.reaudit_resume_plan()
+    assert sorted(plan) == [1]
+    assert plan[1]["dropped"] == []  # the malformed object never entered the cache

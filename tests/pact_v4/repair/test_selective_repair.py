@@ -1778,12 +1778,15 @@ def test_reaudit_context_pid_issue_dropped_complete() -> None:
         }]),
         # re-audit response: one valid residual issue on an owned pid
         # (p00005) + one issue on a CONTEXT pid (p00002, overlap before the
-        # scope) -> the context issue is dropped per-issue.
+        # scope) -> the context issue is dropped per-issue. Both issues are
+        # complete canonical issue objects (non-empty note AND excerpt) —
+        # RV4 t_cfb1523d: a scope-dropped issue missing a canonical field
+        # is a structural failure, never a journaled dropped object.
         _reaudit_response([
             {"id": "p00005", "category": "changed_fact", "severity": "major",
-             "confidence": "high", "note": "residual"},
+             "confidence": "high", "note": "residual", "excerpt": "text"},
             {"id": "p00002", "category": "changed_fact", "severity": "major",
-             "confidence": "high", "note": "context-only"},
+             "confidence": "high", "note": "context-only", "excerpt": "text"},
         ]),
     ])
     evaluator = SelectiveRepairEvaluator(

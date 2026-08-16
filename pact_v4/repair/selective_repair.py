@@ -73,6 +73,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
+    AUDIT_V4_CATEGORIES,
+    AUDIT_V4_CONFIDENCES,
+    AUDIT_V4_SEVERITIES,
     DEFAULT_MAX_INPUT_TOKENS,
     DEFAULT_OVERLAP_TOKENS,
     MAX_OVERLAP_PAIRS,
@@ -175,7 +178,50 @@ REAUDIT_DELTA_FORMAT = "pact-v4-reaudit-delta/v1"
 # ``_validate_stage_progress`` enforces fail-closed on reload. A foreign
 # key would otherwise reject the whole stage-progress cache on resume,
 # losing the dropped diagnostic instead of preserving a valid object.
+# CONTEXT-PID-DROP (RV4 t_cfb1523d): the SAME contract requires the
+# canonical fields themselves to be structurally well-formed (non-empty
+# string id/note/excerpt + valid vocab) — validate_chunk_json checks only
+# id/category/severity/confidence before the scope drop, so a dropped
+# issue missing/invalid note/excerpt is checked here at journal time
+# (``_reaudit_dropped_issue_error``) and fails the chunk closed instead of
+# being persisted malformed.
 _REAUDIT_DROPPED_FIELDS = ("id", "category", "severity", "confidence", "note", "excerpt")
+
+
+def _reaudit_dropped_issue_error(issue: Mapping[str, Any]) -> Optional[str]:
+    """CONTEXT-PID-DROP (RV4 t_cfb1523d): return a reason string when a
+    fresh scope-dropped issue is NOT a structurally well-formed canonical
+    issue object, else None.
+
+    ``validate_chunk_json`` scope-drops a context/foreign issue after
+    checking only id/category/severity/confidence, so a dropped issue can
+    still MISS note/excerpt or carry non-string canonical values. This
+    mirrors the exact persisted contract ``_validate_stage_progress``
+    enforces on reloaded dropped objects (non-empty string id/note/excerpt,
+    valid category/severity/confidence vocab), reporting such an issue at
+    journal time — the caller then fails closed WITHOUT persisting the
+    malformed dropped object, instead of writing a key-set/value violation
+    into stage_progress that full-misses the whole cache on the next
+    resume (the dropped diagnostic would be lost).
+    """
+    if not isinstance(issue, dict):
+        return "not an object"
+    pid = issue.get("id")
+    if not isinstance(pid, str) or not pid:
+        return "id is missing or not a non-empty string"
+    if issue.get("category") not in AUDIT_V4_CATEGORIES:
+        return f"invalid category {issue.get('category')!r}"
+    if issue.get("severity") not in AUDIT_V4_SEVERITIES:
+        return f"invalid severity {issue.get('severity')!r}"
+    if issue.get("confidence") not in AUDIT_V4_CONFIDENCES:
+        return f"invalid confidence {issue.get('confidence')!r}"
+    note = issue.get("note")
+    if not isinstance(note, str) or not note.strip():
+        return "note is missing, not a string, or empty"
+    excerpt = issue.get("excerpt")
+    if not isinstance(excerpt, str) or not excerpt.strip():
+        return "excerpt is missing, not a string, or empty"
+    return None
 
 # Repair output budget (per batch call) and re-audit output budget. REPAIR-CTX
 # (t_97b31f81): the re-audit input is now the affected REGION (changed PIDs +
@@ -2033,33 +2079,52 @@ class SelectiveRepairEvaluator:
             # satisfies the exact _ISSUE_KEYS contract the incremental cache
             # validator enforces on resume (malformed dropped objects are a
             # full miss, never a trusted replay that loses diagnostics).
+            # CONTEXT-PID-DROP (RV4 t_cfb1523d): a fresh scope-dropped issue
+            # must be a structurally well-formed canonical issue object
+            # BEFORE it is journaled — validate_chunk_json checked only
+            # id/category/severity/confidence pre-drop, so a dropped issue
+            # with a missing/non-string note/excerpt (or any other
+            # non-canonical value) would otherwise be persisted as a
+            # malformed dropped object and full-miss the WHOLE
+            # stage-progress cache on resume (reload fails closed, the
+            # dropped diagnostic lost). Malformed dropped inputs fail the
+            # chunk closed (debt, the issue named in the outcome reason)
+            # and are NEVER persisted; only contract-canonical dropped
+            # issues are journaled.
+            journaled_dropped: List[Dict[str, Any]] = []
+            for dropped_issue in validation.dropped:
+                dropped_error = _reaudit_dropped_issue_error(dropped_issue)
+                if dropped_error is not None:
+                    errors.append(
+                        f"chunk {chunk_index}: dropped issue "
+                        f"{dropped_issue.get('id')!r}: {dropped_error}"
+                    )
+                    continue
+                journaled_dropped.append({
+                    # CONTEXT-PID-DROP (RV3 t_c9eb65d4): retain ONLY the
+                    # canonical issue fields before attaching the harness
+                    # _debug. validate_chunk_json accepts a well-formed
+                    # context/foreign issue carrying an unknown EXTRA
+                    # model field — journaling it verbatim would emit a
+                    # dropped object with keys outside the exact
+                    # _ISSUE_KEYS contract, which _validate_stage_progress
+                    # rejects fail-closed on reload (full miss = the
+                    # dropped diagnostic is lost). Canonical-only keeps
+                    # the persisted object exact-schema.
+                    **{k: dropped_issue[k] for k in _REAUDIT_DROPPED_FIELDS if k in dropped_issue},
+                    "_debug": {
+                        "chunk": chunk_index,
+                        "reasoning_file": (
+                            f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
+                        ),
+                    },
+                })
             chunk_records.append({
                 "chunk": chunk_index,
                 "first_pid": chunk_pids[0],
                 "last_pid": chunk_pids[-1],
                 "issues": [dict(i) for i in validation.issues],
-                "dropped": [
-                    {
-                        # CONTEXT-PID-DROP (RV3 t_c9eb65d4): retain ONLY the
-                        # canonical issue fields before attaching the harness
-                        # _debug. validate_chunk_json accepts a well-formed
-                        # context/foreign issue carrying an unknown EXTRA
-                        # model field — journaling it verbatim would emit a
-                        # dropped object with keys outside the exact
-                        # _ISSUE_KEYS contract, which _validate_stage_progress
-                        # rejects fail-closed on reload (full miss = the
-                        # dropped diagnostic is lost). Canonical-only keeps
-                        # the persisted object exact-schema.
-                        **{k: i[k] for k in _REAUDIT_DROPPED_FIELDS if k in i},
-                        "_debug": {
-                            "chunk": chunk_index,
-                            "reasoning_file": (
-                                f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
-                            ),
-                        },
-                    }
-                    for i in validation.dropped
-                ],
+                "dropped": journaled_dropped,
             })
             self._emit_progress(
                 "reaudit_chunk_done",
