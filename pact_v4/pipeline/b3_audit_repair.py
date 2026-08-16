@@ -1039,7 +1039,7 @@ _AUDIT_STAGE_KEYS = frozenset(
 _AUDIT_CHUNK_KEYS = frozenset({
     "chunk", "first_pid", "last_pid", "pair_count", "context_count",
     "status", "finish_reason", "reasoning_chars", "reasoning_file",
-    "issue_count",
+    "issue_count", "dropped_count",
 })
 _REPAIR_STAGE_KEYS = frozenset(
     {"status", "done_batches", "committed", "passed", "outcome"}
@@ -1058,7 +1058,9 @@ _REPAIR_RESULT_KEYS = frozenset({
     "index", "decision", "pid", "repaired_translation", "reason",
 })
 _REAUDIT_STAGE_KEYS = frozenset({"status", "done_chunks", "issues"})
-_REAUDIT_CHUNK_KEYS = frozenset({"chunk", "first_pid", "last_pid", "issues"})
+_REAUDIT_CHUNK_KEYS = frozenset({
+    "chunk", "first_pid", "last_pid", "issues", "failed", "dropped",
+})
 
 # Repair decisions the fresh batch parser accepts (parse_repair_batch).
 _REPAIR_DECISIONS = frozenset({"pass", "repair"})
@@ -1824,10 +1826,10 @@ def _validate_stage_progress(
     for position, item in enumerate(a_chunks, start=1):
         if not isinstance(item, dict):
             return f"stage_progress.audit chunk at position {position}: not an object"
-        if set(item) != _AUDIT_CHUNK_KEYS:
+        if not set(item) <= _AUDIT_CHUNK_KEYS:
             return (
                 f"stage_progress.audit chunk at position {position}: foreign key "
-                f"set {sorted(item)!r} (expected {sorted(_AUDIT_CHUNK_KEYS)})"
+                f"set {sorted(item)!r} (allowed {sorted(_AUDIT_CHUNK_KEYS)})"
             )
         chunk_index = item.get("chunk")
         if chunk_index != position:
@@ -2335,11 +2337,11 @@ def _validate_stage_progress(
     for position, record in enumerate(ra_done, start=1):
         if not isinstance(record, dict):
             return f"stage_progress.reaudit done_chunks record at position {position}: not an object"
-        if set(record) != _REAUDIT_CHUNK_KEYS:
+        if not set(record) <= _REAUDIT_CHUNK_KEYS:
             return (
                 f"stage_progress.reaudit done_chunks record at position "
                 f"{position}: foreign key set {sorted(record)!r} "
-                f"(expected {sorted(_REAUDIT_CHUNK_KEYS)})"
+                f"(allowed {sorted(_REAUDIT_CHUNK_KEYS)})"
             )
         chunk_index = record.get("chunk")
         if chunk_index != position:

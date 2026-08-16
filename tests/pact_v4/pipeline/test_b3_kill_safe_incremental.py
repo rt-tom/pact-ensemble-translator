@@ -235,11 +235,13 @@ def test_kill_safe_cache_audit_resume_plan_preserves_dropped_count(
              "pair_count": 1, "context_count": 0, "status": "GOOD",
              "finish_reason": "stop", "reasoning_chars": 0,
              "reasoning_file": "b3_audit_chunk1_raw.txt",
+             "issue_count": 0,
              "dropped_count": 3},
             {"chunk": 2, "first_pid": "p00002", "last_pid": "p00002",
              "pair_count": 1, "context_count": 0, "status": "GOOD",
              "finish_reason": "stop", "reasoning_chars": 0,
              "reasoning_file": "b3_audit_chunk2_raw.txt",
+             "issue_count": 0,
              "dropped_count": 0},
         ],
         "issues": [],
@@ -1024,7 +1026,7 @@ def test_kill_safe_tamper_reaudit_issue_schema_full_miss(tmp_path: Path) -> None
         "status": "partial",
         "done_chunks": [
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
-             "issues": [dict(issue)]},
+             "failed": False, "issues": [dict(issue)]},
         ],
         "issues": [dict(issue)],
     }
@@ -1058,7 +1060,7 @@ def test_kill_safe_tamper_reaudit_issue_out_of_span_full_miss(tmp_path: Path) ->
         "status": "partial",
         "done_chunks": [
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
-             "issues": [dict(issue)]},
+             "failed": False, "issues": [dict(issue)]},
         ],
         "issues": [dict(issue)],
     }
