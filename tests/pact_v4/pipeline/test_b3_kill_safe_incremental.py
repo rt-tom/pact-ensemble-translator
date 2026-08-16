@@ -992,3 +992,85 @@ def test_b3_kill_safe_incremental_tamper_full_miss(tmp_path: Path) -> None:
     assert second.step6["partial_resume"] is False
     assert resume.audit_calls() == 8
     assert second.step8["released_as_audited"] is True
+
+
+# ---------------------------------------------------------------------------
+# FIX RV2-findings (t_006f3a79): unconditional audit coverage + malformed
+# chunk-record fail-closed (a miss, never an AttributeError escaping load())
+# ---------------------------------------------------------------------------
+
+
+def test_kill_safe_audit_unmarked_chunk_coverage_full_miss(tmp_path: Path) -> None:
+    """Finding A (t_006f3a79): audit.done_chunks=[] with a GOOD record still
+    carried in audit.chunks is an UNMARKED chunk — the chunk-index coverage
+    check runs UNCONDITIONALLY (not only under ``if done``), so load() is a
+    full miss even when partial_resume_hash is recomputed over the payload:
+    no unmarked chunk may ever enter a resume plan."""
+    translations = _translation(2)
+    audit = {
+        "status": "partial", "done_chunks": [1, 2], "failed_chunks": [],
+        "chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "pair_count": 1, "context_count": 0, "status": "GOOD",
+             "finish_reason": "stop", "reasoning_chars": 0,
+             "reasoning_file": "b3_audit_chunk1_raw.txt", "issue_count": 0},
+            {"chunk": 2, "first_pid": "p00002", "last_pid": "p00002",
+             "pair_count": 1, "context_count": 0, "status": "GOOD",
+             "finish_reason": "stop", "reasoning_chars": 0,
+             "reasoning_file": "b3_audit_chunk2_raw.txt", "issue_count": 0},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=audit,
+        repair=_repair_pending_stage(),
+        reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+
+    # Tamper: drop the done marks while the GOOD chunk records remain, then
+    # RECOMPUTE the hash — only the unconditional coverage check can reject.
+    assert _tamper_and_load(
+        path, translations,
+        lambda sp: sp["audit"].update(done_chunks=[], failed_chunks=[]),
+    ) is None
+
+
+def test_kill_safe_r_editor_malformed_chunk_record_full_miss(tmp_path: Path) -> None:
+    """Finding B (t_006f3a79): r_editor.outcome.chunks=[ [ ] ] is a malformed
+    chunk record — the item type is validated BEFORE field access, so load()
+    returns a clean miss (None) instead of raising AttributeError."""
+    translations = _translation(2)
+    r_editor = {
+        "status": "partial", "enabled": True,
+        "done_chunks": [1], "failed_chunks": [],
+        "outcome": {"chunk_size": 1, "chunks": [[]]},
+    }
+    stage = _stage_progress_with(
+        r_editor=r_editor,
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(path, translations=translations, r_editor_enabled=True) is None
+
+
+def test_kill_safe_audit_malformed_chunk_record_full_miss(tmp_path: Path) -> None:
+    """Finding B (t_006f3a79): audit.chunks=[ [ ] ] with done_chunks=[1] is a
+    malformed chunk record — the item type is validated BEFORE field access,
+    so load() returns a clean miss (None) instead of raising AttributeError."""
+    translations = _translation(2)
+    audit = {
+        "status": "partial", "done_chunks": [1], "failed_chunks": [],
+        "chunks": [[]], "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=audit,
+        repair=_repair_pending_stage(),
+        reaudit=_reaudit_pending_stage(),
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(path, translations=translations, r_editor_enabled=False) is None

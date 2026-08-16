@@ -1590,6 +1590,15 @@ def _validate_stage_progress(
         # FIX RV2 (t_d996bbf7): the persisted chunk records are exactly the
         # processed chunks the progress hook journaled — their indices must
         # equal done_chunks (all processed chunks, GOOD and FAILED alike).
+        # FIX RV2-findings (t_006f3a79): the records are type-validated
+        # BEFORE field access — a malformed chunk record (e.g. `[ [ ] ]`)
+        # must fail closed as a clean miss (None), never an AttributeError
+        # escaping the validator.
+        if any(not isinstance(c, dict) for c in r_chunks):
+            return (
+                "stage_progress.r_editor.outcome.chunks contains a "
+                "non-object record"
+            )
         if [c.get("chunk") for c in r_chunks] != done_chunks:
             return (
                 "stage_progress.r_editor.outcome.chunks indices do not match "
@@ -1771,7 +1780,16 @@ def _validate_stage_progress(
         return "stage_progress.audit.failed_chunks is not a list of ints"
     if any(c not in done for c in failed):
         return "stage_progress.audit.failed_chunks is not a subset of done_chunks"
-    if done and [c.get("chunk") for c in a_chunks] != done:
+    # FIX RV2-findings (t_006f3a79): the persisted chunk records are
+    # type-validated BEFORE field access — a malformed chunk record (e.g.
+    # `[ [ ] ]`) must fail closed as a clean miss (None), never an
+    # AttributeError escaping the validator. The chunk-index coverage
+    # comparison against done_chunks is enforced UNCONDITIONALLY (not only
+    # under ``if done``): ``done_chunks=[]`` with a carried GOOD chunk
+    # record is an unmarked chunk that must never enter a resume plan.
+    if any(not isinstance(c, dict) for c in a_chunks):
+        return "stage_progress.audit.chunks contains a non-object record"
+    if [c.get("chunk") for c in a_chunks] != done:
         return (
             "stage_progress.audit.chunks indices do not match done_chunks "
             "(coverage mismatch)"
