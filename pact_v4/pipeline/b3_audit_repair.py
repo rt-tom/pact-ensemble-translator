@@ -2347,6 +2347,18 @@ def _validate_stage_progress(
                 f"stage_progress.reaudit done_chunks coverage/order mismatch: stored "
                 f"index {chunk_index!r} at position {position} (expected 1..N)"
             )
+        # CONTEXT-PID-DROP (RV5 t_f82ed9ad): the done record MUST carry an
+        # explicit ``failed`` bool — a missing/non-bool marker (a cache
+        # written before the failed marker existed, or a tampered one) is a
+        # full miss, NEVER a trusted replay: without the marker a chunk that
+        # failed fresh (malformed dropped diagnostics) could be replayed as
+        # complete with 0 model calls, silently losing the diagnostic/debt.
+        failed_marker = record.get("failed")
+        if not isinstance(failed_marker, bool):
+            return (
+                f"stage_progress.reaudit chunk {chunk_index}: failed is "
+                f"missing or not a bool"
+            )
         first_pid = record.get("first_pid")
         last_pid = record.get("last_pid")
         if not isinstance(first_pid, str) or not first_pid:
@@ -3068,7 +3080,12 @@ class B3AuditCache:
         Returns ``{chunk_index: {first_pid, last_pid, issues}}`` for every
         cached reaudit chunk (from ``stage_progress.reaudit``) — the reaudit
         loop replays a chunk with 0 model calls only when its boundaries
-        match the current chunk (fail-closed on mismatch). Empty when the
+        match the current chunk (fail-closed on mismatch). CONTEXT-PID-DROP
+        (RV5 t_f82ed9ad): a chunk whose done record is marked ``failed``
+        (invalid chunk JSON or malformed dropped diagnostics at journal
+        time) is NEVER included — the resume re-runs it fail-closed, so the
+        malformed input's diagnostic/debt is preserved instead of a 0-call
+        replay silently upgrading the chunk to complete. Empty when the
         payload has no incremental reaudit state.
         """
         if not self._payload:
@@ -3082,6 +3099,11 @@ class B3AuditCache:
         plan: Dict[int, Dict[str, Any]] = {}
         for record in reaudit_stage.get("done_chunks") or ():
             if not isinstance(record, dict):
+                continue
+            # CONTEXT-PID-DROP (RV5 t_f82ed9ad): a failed chunk is never
+            # replayable — exclude it from the plan so the next run re-runs
+            # it (fail-closed) instead of replaying it as complete.
+            if record.get("failed") is True:
                 continue
             chunk_index = record.get("chunk")
             if not isinstance(chunk_index, int):
@@ -4267,12 +4289,21 @@ class B3AuditRepair:
                     _save_stage_progress()
                 elif kind == "reaudit_chunk_done":
                     done_chunks = fields["done_chunks"]
-                    stage_progress["reaudit"] = {
-                        "status": (
+                    # CONTEXT-PID-DROP (RV5 t_f82ed9ad): a done record
+                    # marked failed means the stage is NOT complete — the
+                    # persisted status must say "failed" (a failed chunk can
+                    # never be represented as a successful complete stage).
+                    stage_status = (
+                        "failed"
+                        if any(c.get("failed") is True for c in done_chunks)
+                        else (
                             "complete"
                             if len(done_chunks) == fields.get("chunk_count")
                             else "partial"
-                        ),
+                        )
+                    )
+                    stage_progress["reaudit"] = {
+                        "status": stage_status,
                         "done_chunks": [dict(c) for c in done_chunks],
                         "issues": [
                             dict(i)

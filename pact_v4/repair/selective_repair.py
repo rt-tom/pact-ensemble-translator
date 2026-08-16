@@ -1909,6 +1909,12 @@ class SelectiveRepairEvaluator:
                 cached is not None
                 and str(cached.get("first_pid")) == chunk_pids[0]
                 and str(cached.get("last_pid")) == chunk_pids[-1]
+                # CONTEXT-PID-DROP (RV5 t_f82ed9ad): a cached chunk that
+                # FAILED fresh (malformed dropped diagnostics etc.) is NEVER
+                # replayed — even if its boundaries match — so the malformed
+                # input's diagnostic/debt is preserved instead of a 0-call
+                # replay silently upgrading the chunk to complete.
+                and cached.get("failed") is not True
             ):
                 replayed_issues = [
                     dict(item) for item in (cached.get("issues") or ())
@@ -1932,6 +1938,12 @@ class SelectiveRepairEvaluator:
                         dict(item) for item in (cached.get("dropped") or ())
                         if isinstance(item, dict)
                     ],
+                    # CONTEXT-PID-DROP (RV5 t_f82ed9ad): a replayed cached
+                    # chunk is by construction NOT failed (the replay guard
+                    # above refuses failed records, and reaudit_resume_plan
+                    # excludes them) — the marker rides the done record so
+                    # the persisted stage_progress round-trips cleanly.
+                    "failed": False,
                 })
                 self._emit_progress(
                     "reaudit_chunk_done",
@@ -2064,10 +2076,16 @@ class SelectiveRepairEvaluator:
             # p00251 case).
             context_pids = [p.pid for p in context_pairs]
             validation = validate_chunk_json(parsed, chunk_pids, context_pids=context_pids)
+            # CONTEXT-PID-DROP (RV5 t_f82ed9ad): per-chunk failure tracking
+            # for the done record's ``failed`` marker — a chunk that surfaces
+            # ANY error (invalid chunk JSON or a malformed dropped issue)
+            # is marked failed and is NEVER replayable on resume.
+            chunk_failed = False
             if not validation.valid:
                 errors.append(
                     f"chunk {chunk_index}: " + "; ".join(validation.errors)
                 )
+                chunk_failed = True
             # Dropped issues (context-only/foreign pids) are journaled but
             # NEVER extend the re-audit findings — they are not in scope.
             all_issues.extend(validation.issues)
@@ -2099,6 +2117,7 @@ class SelectiveRepairEvaluator:
                         f"chunk {chunk_index}: dropped issue "
                         f"{dropped_issue.get('id')!r}: {dropped_error}"
                     )
+                    chunk_failed = True
                     continue
                 journaled_dropped.append({
                     # CONTEXT-PID-DROP (RV3 t_c9eb65d4): retain ONLY the
@@ -2125,6 +2144,15 @@ class SelectiveRepairEvaluator:
                 "last_pid": chunk_pids[-1],
                 "issues": [dict(i) for i in validation.issues],
                 "dropped": journaled_dropped,
+                # CONTEXT-PID-DROP (RV5 t_f82ed9ad): the failed marker makes
+                # this done record explicit — a chunk with errors (invalid
+                # chunk JSON or malformed dropped diagnostics) is NEVER a
+                # replayable-complete record. reaudit_resume_plan excludes
+                # failed records, so the next resume re-runs the chunk
+                # (fail-closed debt/diagnostic preserved) instead of
+                # replaying it with 0 model calls and silently upgrading it
+                # to complete.
+                "failed": chunk_failed,
             })
             self._emit_progress(
                 "reaudit_chunk_done",

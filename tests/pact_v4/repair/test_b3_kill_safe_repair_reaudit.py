@@ -616,10 +616,23 @@ def test_reaudit_fresh_dropped_malformed_canonical_fails_closed(
     ]
     assert journaled_dropped == []
 
-    # Persist the emitted chunk record (dropped=[]) exactly as the pipeline
-    # would: the cache MUST load (no full miss) and the resume plan must not
-    # carry any malformed dropped object — a fresh malformed dropped input
-    # never leaves a malformed dropped object on disk.
+    # CONTEXT-PID-DROP (RV5 t_f82ed9ad): the emitted done record is marked
+    # failed (the chunk surfaced a malformed dropped diagnostic) — a failed
+    # record can NEVER be replayed as complete on resume.
+    done_records = [
+        dict(c) for r in progress_records
+        for c in (r.get("done_chunks") or ())
+    ]
+    assert done_records, "no reaudit done record was emitted"
+    assert done_records[0]["failed"] is True
+    assert done_records[0]["dropped"] == []
+
+    # Persist the emitted chunk record (failed=True, dropped=[]) exactly as
+    # the pipeline would: the cache MUST load (no full miss) and the resume
+    # plan must NOT carry the failed chunk — the malformed dropped input
+    # never leaves a malformed dropped object on disk AND never becomes a
+    # replayable-complete chunk (the next resume re-runs it fail-closed,
+    # preserving the debt/diagnostic).
     done_chunks = [
         dict(c) for r in progress_records
         for c in (r.get("done_chunks") or ())
@@ -629,7 +642,7 @@ def test_reaudit_fresh_dropped_malformed_canonical_fails_closed(
         audit=_audit_pending_stage(),
         repair=_repair_pending_stage(),
         reaudit={
-            "status": "partial",
+            "status": "failed",
             "done_chunks": done_chunks,
             "issues": [
                 dict(i) for c in done_chunks for i in (c.get("issues") or ())
@@ -644,5 +657,48 @@ def test_reaudit_fresh_dropped_malformed_canonical_fails_closed(
     )
     assert cache is not None and cache.is_partial()
     plan = cache.reaudit_resume_plan()
-    assert sorted(plan) == [1]
-    assert plan[1]["dropped"] == []  # the malformed object never entered the cache
+    # RV5: the failed chunk is excluded from the resume plan — the malformed
+    # input's diagnostic/debt is preserved (fail-closed re-run), never
+    # silently upgraded to complete via a 0-call replay.
+    assert sorted(plan) == []
+    assert 1 not in plan
+    # The malformed object never entered the cache.
+    assert all(
+        c.get("dropped") == [] for c in done_chunks
+    )
+
+    # ------------------------------------------------------------------
+    # Actual resume path: feed the (empty) plan back into a fresh evaluator
+    # run — the failed chunk is NOT replayed with 0 model calls; it re-runs
+    # (a reaudit call happens) and fails closed again, naming the malformed
+    # dropped issue in the reason. The debt is preserved across resume.
+    # ------------------------------------------------------------------
+    replay_backend = ScriptedRepairBackend([
+        _repair_response([{
+            "index": 1, "decision": "repair", "pid": "p00005",
+            "repaired_translation": "Исправленный перевод абзаца 5.",
+            "reason": "confirmed",
+        }]),
+        # the model AGAIN returns the same malformed dropped issue
+        _reaudit_response([
+            {"id": "p00005", "category": "changed_fact", "severity": "major",
+             "confidence": "high", "note": "residual", "excerpt": "text"},
+            malformed,
+        ]),
+    ])
+    replay_evaluator = SelectiveRepairEvaluator(
+        replay_backend,
+        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+    )
+    replay_outcome = replay_evaluator(
+        chapter_id="0001", source=source, translation=translation,
+        filtered=filtered, cached_reaudit_chunks=plan,
+    )
+    reaudit_calls = [
+        r for r in replay_backend.requests if "reaudit" in (r.label or "")
+    ]
+    # 0-call replay upgrade is impossible: the failed chunk re-ran.
+    assert len(reaudit_calls) == 1
+    assert replay_outcome.reaudit is not None and not replay_outcome.reaudit.complete
+    assert replay_outcome.reaudit.failed
+    assert "dropped issue 'p00002'" in (replay_outcome.reaudit.reason or "")

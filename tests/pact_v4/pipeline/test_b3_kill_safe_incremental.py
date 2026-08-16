@@ -361,7 +361,7 @@ def test_kill_safe_cache_reaudit_1of3_resume_plan(tmp_path: Path) -> None:
         "status": "partial",
         "done_chunks": [
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
-             "issues": []},
+             "issues": [], "failed": False},
         ],
         "issues": [],
     }
@@ -402,7 +402,8 @@ def test_kill_safe_cache_reaudit_resume_plan_preserves_dropped(
         "status": "partial",
         "done_chunks": [
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
-             "issues": [], "dropped": [dict(dropped_issue)]},
+             "issues": [], "dropped": [dict(dropped_issue)],
+             "failed": False},
         ],
         "issues": [],
     }
@@ -430,7 +431,7 @@ def test_kill_safe_cache_reaudit_malformed_dropped_full_miss(tmp_path: Path) -> 
         "status": "partial",
         "done_chunks": [
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
-             "issues": [], "dropped": "oops-not-a-list"},
+             "issues": [], "dropped": "oops-not-a-list", "failed": False},
         ],
         "issues": [],
     }
@@ -463,7 +464,7 @@ def _reaudit_stage_with_dropped(dropped: Any) -> dict:
         "status": "partial",
         "done_chunks": [
             {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
-             "issues": [], "dropped": dropped},
+             "issues": [], "dropped": dropped, "failed": False},
         ],
         "issues": [],
     }
@@ -632,6 +633,94 @@ def test_kill_safe_cache_reaudit_dropped_valid_replay(tmp_path: Path) -> None:
     plan = cache.reaudit_resume_plan()
     assert sorted(plan) == [1]
     assert plan[1]["dropped"] == [dropped_issue]
+
+
+def test_kill_safe_cache_reaudit_failed_marker_excluded_from_plan(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP (RV5 t_f82ed9ad): a done reaudit chunk record
+    marked ``failed: True`` loads (the marker is a valid bool) but is NEVER
+    replayable — reaudit_resume_plan excludes it, so the next run re-runs
+    the chunk fail-closed (debt/diagnostic preserved) instead of replaying
+    it as complete with 0 model calls."""
+    translations = _translation(3)
+    reaudit = {
+        "status": "failed",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [], "dropped": [], "failed": True},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    cache = _load_stage_progress(path, translations=translations, r_editor_enabled=False)
+    assert cache is not None and cache.is_partial()
+    plan = cache.reaudit_resume_plan()
+    assert plan == {}
+    assert 1 not in plan
+
+
+def test_kill_safe_cache_reaudit_failed_marker_missing_full_miss(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP (RV5 t_f82ed9ad): a done reaudit chunk record
+    WITHOUT the ``failed`` bool marker (a cache written before the marker
+    existed, or a tampered one) is a FULL miss — never a trusted replay
+    that could silently upgrade a failed chunk to complete with 0 model
+    calls."""
+    translations = _translation(3)
+    reaudit = {
+        "status": "partial",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [], "dropped": []},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(
+        path, translations=translations, r_editor_enabled=False,
+    ) is None
+
+
+def test_kill_safe_cache_reaudit_failed_marker_nonbool_full_miss(
+    tmp_path: Path,
+) -> None:
+    """CONTEXT-PID-DROP (RV5 t_f82ed9ad): a done reaudit chunk record
+    whose ``failed`` marker is NOT a bool (e.g. a string) is a FULL miss —
+    the marker is part of the fail-closed contract and any foreign value is
+    rejected."""
+    translations = _translation(3)
+    reaudit = {
+        "status": "partial",
+        "done_chunks": [
+            {"chunk": 1, "first_pid": "p00001", "last_pid": "p00001",
+             "issues": [], "dropped": [], "failed": "yes"},
+        ],
+        "issues": [],
+    }
+    stage = _stage_progress_with(
+        r_editor=_r_editor_pending_stage(),
+        audit=_audit_pending_stage(),
+        repair=_repair_pending_stage(),
+        reaudit=reaudit,
+    )
+    path = _save_stage_progress(tmp_path, translations=translations, stage_progress=stage)
+    assert _load_stage_progress(
+        path, translations=translations, r_editor_enabled=False,
+    ) is None
 
 
 def test_kill_safe_cache_audit_complete_repair_pending_junction(
