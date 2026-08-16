@@ -1990,17 +1990,27 @@ class SelectiveRepairEvaluator:
                     scope=scope_pids,
                     reason=f"re-audit chunk {chunk_index} response is not valid JSON: {exc}",
                 )
-            validation = validate_chunk_json(parsed, chunk_pids)
+            # CONTEXT-PID-DROP (owner 2026-08-15): the re-audit model is
+            # given context_pairs for continuity and must NOT re-audit them —
+            # an issue on a context pid is dropped per-issue (journaled in
+            # the chunk record for diagnostics), never a chunk failure, so
+            # re-audit no longer falls into failed=True debt (run gl.6
+            # p00251 case).
+            context_pids = [p.pid for p in context_pairs]
+            validation = validate_chunk_json(parsed, chunk_pids, context_pids=context_pids)
             if not validation.valid:
                 errors.append(
                     f"chunk {chunk_index}: " + "; ".join(validation.errors)
                 )
+            # Dropped issues (context-only/foreign pids) are journaled but
+            # NEVER extend the re-audit findings — they are not in scope.
             all_issues.extend(validation.issues)
             chunk_records.append({
                 "chunk": chunk_index,
                 "first_pid": chunk_pids[0],
                 "last_pid": chunk_pids[-1],
                 "issues": [dict(i) for i in validation.issues],
+                "dropped": [dict(i) for i in validation.dropped],
             })
             self._emit_progress(
                 "reaudit_chunk_done",

@@ -3865,6 +3865,11 @@ class B3AuditRepair:
                         total=fields.get("total"),
                         status=fields.get("status"),
                         issue_count=fields.get("issue_count", 0),
+                        # CONTEXT-PID-DROP (owner 2026-08-15): issues dropped
+                        # for context-only/foreign pids are journaled as a
+                        # warning count for diagnostics — the chunk itself
+                        # stays GOOD (mirrors R-PID-SCOPE warning_count).
+                        dropped_count=fields.get("dropped_count", 0),
                         error=fields.get("error"),
                         # PARTIAL-RESUME: the chunk was replayed from the
                         # partial cache (0 model calls), not freshly audited.
