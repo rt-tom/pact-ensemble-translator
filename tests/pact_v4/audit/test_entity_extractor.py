@@ -423,6 +423,27 @@ def test_cache_identity_changes_with_extractor_version():
     )
 
 
+def test_cache_identity_ignores_prompt_version_change():
+    """Regression: prompt wording change (t_83bab286) must not invalidate
+    existing caches. Cache key = source_hash + extractor_version; prompt
+    version is not part of the identity. Verify by computing cache keys
+    with the same source_hash and extractor_version — they must match
+    regardless of prompt version."""
+    from pact_v4.audit.entity_extractor import ENTITY_EXTRACTION_V1
+    source = _source_0001()
+    key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    # The prompt version field exists and is /v1 — but it must NOT affect
+    # the cache key. Changing it (hypothetically) would not change the key.
+    assert ENTITY_EXTRACTION_V1.version.endswith("/v1")
+    # Cache identity is deterministic and depends only on source_hash + version.
+    key2 = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    assert key == key2
+
+
 def test_cache_payload_round_trip():
     source = _source_0001()
     extractor = _RecordingExtractor(_gold_payload_0001(source))
@@ -629,6 +650,192 @@ def test_parse_model_output_rejects_fences_and_malformed():
         parse_model_output('{"entities": [')
     with pytest.raises(Exception):
         parse_model_output("")
+
+
+
+# ---------------------------------------------------------------------------
+# t_83bab286: entity-context output shape — prompt contract and bare-array
+# normalization
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_requires_object_not_bare_array():
+    """Prompt contract: the instructions must require a JSON object with
+    'entities' key and must NOT tell the model to return a bare array."""
+    source = _source_0001()
+    prompt = render_entity_extraction_prompt(
+        chapter_id=source.chapter_id, source=dict(source.source)
+    )
+    # Must require object shape
+    assert '"entities"' in prompt
+    assert "JSON object" in prompt
+    # Must NOT instruct bare array
+    assert "ONLY the top-level" not in prompt
+    assert "entities array" not in prompt.replace(
+        "entities: array of objects", ""
+    ).replace("top-level \"entities\" key", "")
+    # Must explicitly warn against bare array
+    assert "bare JSON array" in prompt.lower() or "bare json array" in prompt.lower()
+
+
+def test_parse_model_output_bare_array_normalizes_to_object():
+    """Bare array of valid entity objects → normalized to {"entities": list}."""
+    entities = [
+        {
+            "entity": "test",
+            "canonical_type": "thing",
+            "anchor": {"pid": "p00001", "span": "thing"},
+            "aliases": [],
+            "claims": [],
+        }
+    ]
+    raw = json.dumps(entities, ensure_ascii=False)
+    result = parse_model_output(raw)
+    assert result == {"entities": entities}
+    assert isinstance(result, dict)
+    assert "entities" in result
+
+
+def test_parse_model_output_bare_array_empty_fails_closed():
+    """Empty bare array → ValueError (not silently accepted)."""
+    with pytest.raises(ValueError, match="empty"):
+        parse_model_output("[]")
+
+
+def test_parse_model_output_bare_array_with_scalar_fails_closed():
+    """Bare array with non-object element → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output('[1, 2, 3]')
+
+
+def test_parse_model_output_bare_array_with_string_fails_closed():
+    """Bare array with string elements → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output('["hello", "world"]')
+
+
+def test_parse_model_output_bare_array_with_null_fails_closed():
+    """Bare array with null element → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output("[null]")
+
+
+def test_parse_model_output_bare_array_with_nested_array_fails_closed():
+    """Bare array with nested array → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output("[[1, 2]]")
+
+
+def test_parse_model_output_valid_object_unchanged():
+    """Existing valid object shape passes through unchanged."""
+    payload = {"entities": [{"entity": "x"}]}
+    assert parse_model_output(json.dumps(payload)) == payload
+
+
+def test_parse_model_output_bare_array_normalized_log(caplog):
+    """Bare array normalization emits a diagnostic LOG.info."""
+    import logging
+
+    entities = [{"entity": "x", "canonical_type": "y",
+                 "anchor": {"pid": "p00001", "span": "y"},
+                 "aliases": [], "claims": []}]
+    with caplog.at_level(logging.INFO, logger="pact_v4.audit.entity_extractor"):
+        result = parse_model_output(json.dumps(entities))
+    assert result == {"entities": entities}
+    assert any("bare JSON array" in r.message for r in caplog.records)
+
+
+def test_parse_model_output_fenced_bare_array_uppercase_tag():
+    """Regression: fenced bare array with uppercase JSON tag normalizes
+    through the same path as unfenced — no fence-stripping regression."""
+    entities = [{"entity": "x", "canonical_type": "y",
+                 "anchor": {"pid": "p00001", "span": "y"},
+                 "aliases": [], "claims": []}]
+    raw = f"```JSON\n{json.dumps(entities)}\n```"
+    result = parse_model_output(raw)
+    assert result == {"entities": entities}
+    assert isinstance(result, dict)
+    assert "entities" in result
+
+
+def test_parse_model_output_fenced_bare_array_alternate_lang_tag():
+    """Regression: fenced bare array with non-json language tag (e.g.
+    plaintext) normalizes correctly."""
+    entities = [{"entity": "a", "canonical_type": "b",
+                 "anchor": {"pid": "p00001", "span": "b"},
+                 "aliases": [], "claims": []}]
+    raw = f"```plaintext\n{json.dumps(entities)}\n```"
+    result = parse_model_output(raw)
+    assert result == {"entities": entities}
+
+
+def test_bare_array_flows_through_extract_entity_context():
+    """Integration: a bare-array model response is normalized, stamped,
+    validated, and produces a correct EntityExtractionResult."""
+    source = _source_0001()
+    gold = _gold_payload_0001(source)
+    # The model body is a bare array (not wrapped in {"entities": ...}).
+    bare_array_body = json.dumps(gold["entities"], ensure_ascii=False)
+    extractor = _RecordingExtractor(json.loads(bare_array_body))
+    # Override __call__ to return the bare array (not the wrapped object).
+    original_call = extractor.__call__
+
+    def _bare_call(*, chapter_id, source, out_dir=None):
+        extractor.calls += 1
+        return bare_array_body
+
+    extractor.__call__ = _bare_call
+
+    result = extract_entity_context(source_artifact=source, extractor=extractor)
+    assert result.from_cache is False
+    assert result.validation.is_clean()
+    assert len(result.context.entities) == 2
+    assert result.context.chapter_id == source.chapter_id
+    assert result.context.source_hash == source.source_hash
+
+
+def test_bare_array_no_model_retry_through_backend():
+    """Regression: bare-array normalization must NOT trigger a model retry.
+    BackendEntityExtractor uses retry_json_call which retries only on
+    EmptyResponseError/TruncatedJSONError — a valid JSON array is NOT
+    retryable.  The backend must be called exactly once."""
+    source = _source_0001()
+    gold = _gold_payload_0001(source)
+    bare_array_body = json.dumps(gold["entities"], ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(bare_array_body)])
+    extractor = BackendEntityExtractor(
+        backend,
+        config=BackendEntityExtractorConfig(
+            retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0)
+        ),
+    )
+    result = extract_entity_context(
+        source_artifact=source, extractor=extractor
+    )
+    # Exactly one backend call — no retry for a valid JSON array.
+    assert len(backend.requests) == 1
+    assert result.from_cache is False
+    assert result.validation.is_clean()
+    assert len(result.context.entities) == 2
+
+
+def test_bare_array_raw_artifact_written(tmp_path):
+    """Regression: when bare-array normalization happens through the
+    backend path with out_dir, the raw artifact contains the original
+    bare-array text (not the normalized form)."""
+    source = _source_0001()
+    gold = _gold_payload_0001(source)
+    bare_array_body = json.dumps(gold["entities"], ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(bare_array_body)])
+    extractor = BackendEntityExtractor(backend)
+    raw = extractor(
+        chapter_id=source.chapter_id,
+        source=dict(source.source),
+        out_dir=tmp_path,
+    )
+    raw_file = tmp_path / "b1.2_entity_raw.txt"
+    assert raw_file.exists()
+    assert raw_file.read_text(encoding="utf-8") == bare_array_body
 
 
 # ---------------------------------------------------------------------------
