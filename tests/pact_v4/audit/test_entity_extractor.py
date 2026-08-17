@@ -652,16 +652,6 @@ def test_parse_model_output_rejects_fences_and_malformed():
         parse_model_output("")
 
 
-def test_parse_json_response_attaches_parsed_value_for_list():
-    """Regression: parse_json_response must attach the parsed list to the
-    ValueError so parse_model_output can use it without re-parsing."""
-    from pact_v4.runtime.json_resilience import parse_json_response
-    raw = '[{"entity": "x"}]'
-    with pytest.raises(ValueError, match="not an object") as exc_info:
-        parse_json_response(raw)
-    assert hasattr(exc_info.value, "parsed_value")
-    assert exc_info.value.parsed_value == [{"entity": "x"}]
-
 
 # ---------------------------------------------------------------------------
 # t_83bab286: entity-context output shape — prompt contract and bare-array

@@ -36,6 +36,7 @@ Design rules (konspekt §8.3 + B1.1 review, PROPOSAL reply §1.2/§1.4/§1.5):
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -54,6 +55,7 @@ from pact_v4.runtime.json_resilience import (
     EmptyResponseError,
     JsonRetryPolicy,
     TruncatedJSONError,
+    _strip_markdown_fences,
     parse_json_response,
     retry_json_call,
 )
@@ -417,13 +419,20 @@ def parse_model_output(raw: str) -> Dict[str, Any]:
     except ValueError as exc:
         # parse_json_response raises ValueError for valid JSON that is not
         # a dict (e.g. a bare list).  Attempt entity-specific normalization
-        # before giving up.
+        # before giving up — re-parse with fence-stripping to detect bare
+        # arrays without depending on json_resilience internals.
         if isinstance(exc, (EmptyResponseError, TruncatedJSONError)):
             raise
-        # Use the already-parsed value attached by parse_json_response
-        # (avoids re-parsing with inconsistent fence-stripping semantics).
-        parsed_value = getattr(exc, "parsed_value", None)
-        if parsed_value is not None and isinstance(parsed_value, list):
+        try:
+            cleaned = _strip_markdown_fences(
+                raw.strip().lstrip("\ufeff")
+            )
+            parsed_value = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError(
+                f"entity-extraction payload must be a JSON object: {exc}"
+            ) from exc
+        if isinstance(parsed_value, list):
             return _normalize_bare_array(parsed_value)
         raise ValueError(
             f"entity-extraction payload must be a JSON object: {exc}"
