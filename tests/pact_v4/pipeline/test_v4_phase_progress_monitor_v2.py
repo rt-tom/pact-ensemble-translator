@@ -809,6 +809,100 @@ def test_phase_block_tolerates_malformed_schema(tmp_path: Path):
     assert "Translation:" in text and "5 слов" in text
 
 
+# ---------------------------------------------------------------------------
+# RV t_52f8e9f7 MEDIUM: scalar-context / scalar-r_editor / scalar-repair
+# fields must not raise AttributeError / TypeError — the monitor stays
+# read-only and never aborts for malformed-but-valid JSON/schema.
+# ---------------------------------------------------------------------------
+
+
+def test_phase_block_scalar_context_no_crash(tmp_path: Path):
+    """entity_context_cache.json with context as a string (not a dict)
+    must not raise AttributeError -- Extraction line degrades gracefully."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json",
+           {"entries": [{"context": "bad"}]})
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Extraction with scalar context yields no entities -> line absent.
+    assert "Extraction:" not in text
+    assert "-- Phase --" in text
+
+
+def test_phase_block_scalar_r_editor_applied_candidates(tmp_path: Path):
+    """r_editor.outcome.applied/candidates as scalar ints must not raise
+    TypeError at len() -- the monitor renders scalar as a count."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {
+            "chunk_count": 2, "successful_chunks": 2,
+            "applied": 4, "candidates": 1,
+        }},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "R_editor: chunks done=2/2" in text
+    assert "safe (применено)=4" in text
+    assert "review (предложено)=1" in text
+
+
+def test_phase_block_scalar_repair_findings_results_committed(tmp_path: Path):
+    """repair.batches[].findings as scalar int, results as scalar int,
+    and repair.committed as scalar int must not raise TypeError at
+    len() or iteration -- the monitor renders scalar as a count."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 4,
+            "batches": [
+                {"findings": 4, "results": []},
+                {"findings": [1, 2, 3], "results": 4},
+            ],
+            "committed": 4,
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "Repair: batches done=2/2" in text
+    # Scalar findings=4 renders as count; results=[] yields repaired=0.
+    assert "0/4" in text
+    # Scalar results=4 yields repaired=0 (not iterable).
+    assert "0/3" in text
+    assert "total 4" in text
+
+
+def test_phase_block_scalar_repair_in_incremental_cache(tmp_path: Path):
+    """Incremental stage_progress.repair with scalar findings/results/
+    committed must not raise TypeError -- same guard as final cache."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "repair": {
+                "status": "partial",
+                "done_batches": [1, 2],
+                "committed": 4,
+                "outcome": {
+                    "batch_count": 3,
+                    "batches": [
+                        {"findings": 2, "results": []},
+                        {"findings": [1], "results": 3},
+                    ],
+                },
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "Repair: batches done=2/3" in text
+    assert "0/2" in text
+    assert "0/1" in text
+    assert "total 4" in text
+
+
 def test_usage_block_tolerates_corrupt_ndjson(tmp_path: Path):
     """Invalid UTF-8 / malformed rows in usage.ndjson render an invalid
     diagnostic instead of raising UnicodeDecodeError / AttributeError."""

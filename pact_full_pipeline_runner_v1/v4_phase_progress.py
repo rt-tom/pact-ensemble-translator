@@ -1126,7 +1126,10 @@ def _phase_extraction(out_dir: Path) -> Optional[str]:
         ent
         for entry in entries
         if isinstance(entry, dict)
-        for ent in ((entry.get("context") or {}).get("entities") or [])
+        for ent in (
+            (lambda c: c.get("entities") or []
+             if isinstance(c, dict) else [])(entry.get("context"))
+        )
     ]
     if not entities:
         return None
@@ -1215,8 +1218,16 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                             and (c.get("status") or "").upper()
                             in ("GOOD", "GOOD_RETRIED")
                         )
-                applied = len(outcome.get("applied") or [])
-                candidates = len(outcome.get("candidates") or [])
+                # MEDIUM (RV t_52f8e9f7): applied/candidates may be a
+                # scalar int instead of a list — treat scalar as a count.
+                _applied_raw = outcome.get("applied")
+                applied = (len(_applied_raw)
+                           if isinstance(_applied_raw, list)
+                           else _as_int(_applied_raw))
+                _candidates_raw = outcome.get("candidates")
+                candidates = (len(_candidates_raw)
+                              if isinstance(_candidates_raw, list)
+                              else _as_int(_candidates_raw))
                 return (f"R_editor: chunks done={done}/{chunk_count} "
                         f"| safe (применено)={applied} | review (предложено)={candidates}")
     # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
@@ -1311,14 +1322,26 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
             for batch in batches:
                 if not isinstance(batch, dict):
                     continue
-                findings = len(batch.get("findings") or [])
+                # MEDIUM (RV t_52f8e9f7): findings/results may be scalar
+                # ints instead of lists — treat scalar findings as a count
+                # and skip iteration on scalar results.
+                _findings_raw = batch.get("findings")
+                findings = (len(_findings_raw)
+                            if isinstance(_findings_raw, list)
+                            else _as_int(_findings_raw))
+                _results_raw = batch.get("results")
+                _results_iter = _results_raw if isinstance(_results_raw, list) else ()
                 repaired = sum(
-                    1 for r in (batch.get("results") or [])
+                    1 for r in _results_iter
                     if isinstance(r, dict)
                     and (r.get("decision") or "").lower() == "repair"
                 )
                 per_batch.append(f"{repaired}/{findings}")
-            committed = len(repair.get("committed") or [])
+            # MEDIUM (RV t_52f8e9f7): committed may be a scalar int.
+            _committed_raw = repair.get("committed")
+            committed = (len(_committed_raw)
+                         if isinstance(_committed_raw, (list, dict))
+                         else _as_int(_committed_raw))
             eligible = _as_int(repair.get("eligible_count"))
             return (f"Repair: batches done={len(batches)}/{len(batches)} "
                     f"| repaired per batch: [{', '.join(per_batch)}] "
@@ -1342,9 +1365,15 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
     for batch in batches:
         if not isinstance(batch, dict):
             continue
-        findings = len(batch.get("findings") or [])
+        # MEDIUM (RV t_52f8e9f7): scalar findings/results guard.
+        _findings_raw = batch.get("findings")
+        findings = (len(_findings_raw)
+                    if isinstance(_findings_raw, list)
+                    else _as_int(_findings_raw))
+        _results_raw = batch.get("results")
+        _results_iter = _results_raw if isinstance(_results_raw, list) else ()
         repaired = sum(
-            1 for r in (batch.get("results") or [])
+            1 for r in _results_iter
             if isinstance(r, dict)
             and (r.get("decision") or "").lower() == "repair"
         )
@@ -1355,7 +1384,7 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
     elif isinstance(committed, list):
         committed_count = len(committed)
     else:
-        committed_count = 0
+        committed_count = _as_int(committed)
     done_txt = f"{done}/{batch_count}" if batch_count else f"{done}"
     return (f"Repair: batches done={done_txt} "
             f"| repaired per batch: [{', '.join(per_batch)}] "
