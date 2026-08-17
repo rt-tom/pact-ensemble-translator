@@ -1127,7 +1127,8 @@ def _phase_extraction(out_dir: Path) -> Optional[str]:
         for entry in entries
         if isinstance(entry, dict)
         for ent in (
-            (lambda c: c.get("entities") or []
+            (lambda c: (c.get("entities")
+                        if isinstance(c.get("entities"), list) else [])
              if isinstance(c, dict) else [])(entry.get("context"))
         )
     ]
@@ -1215,7 +1216,8 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                         done = sum(
                             1 for c in chunks
                             if isinstance(c, dict)
-                            and (c.get("status") or "").upper()
+                            and isinstance(c.get("status"), str)
+                            and c.get("status").upper()
                             in ("GOOD", "GOOD_RETRIED")
                         )
                 # MEDIUM (RV t_52f8e9f7): applied/candidates may be a
@@ -1260,9 +1262,12 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                 for edit in edits:
                     if not isinstance(edit, dict):
                         continue
-                    if edit.get("class") in SAFE_CLASSES:
+                    edit_cls = edit.get("class")
+                    if not isinstance(edit_cls, str):
+                        continue
+                    if edit_cls in SAFE_CLASSES:
                         applied += 1
-                    elif edit.get("class") in REVIEW_CLASSES:
+                    elif edit_cls in REVIEW_CLASSES:
                         candidates += 1
     return (f"R_editor: chunks done={done} "
             f"| safe (применено)={applied} | review (предложено)={candidates}")
@@ -1334,7 +1339,8 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
                 repaired = sum(
                     1 for r in _results_iter
                     if isinstance(r, dict)
-                    and (r.get("decision") or "").lower() == "repair"
+                    and isinstance(r.get("decision"), str)
+                    and r.get("decision").lower() == "repair"
                 )
                 per_batch.append(f"{repaired}/{findings}")
             # MEDIUM (RV t_52f8e9f7): committed may be a scalar int.
@@ -1375,7 +1381,8 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
         repaired = sum(
             1 for r in _results_iter
             if isinstance(r, dict)
-            and (r.get("decision") or "").lower() == "repair"
+            and isinstance(r.get("decision"), str)
+            and r.get("decision").lower() == "repair"
         )
         per_batch.append(f"{repaired}/{findings}")
     committed = stage.get("committed")
