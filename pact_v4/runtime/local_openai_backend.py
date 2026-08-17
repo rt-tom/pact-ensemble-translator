@@ -110,6 +110,11 @@ class LocalOpenAIBackend:
         )
         self._records: list[BackendCallRecord] = []
         self._closed = False
+        # MONITOR-V2 (2.1): optional per-call usage sink
+        # (``UsageRecordWriter.write_call``), attached by the coordinator's
+        # ``set_usage_writer`` so LOCAL llama-server calls also land in
+        # ``usage.ndjson``. Mirror of ``OpenCodeServerBackend``.
+        self._usage_sink: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # CompletionBackend protocol
@@ -189,13 +194,23 @@ class LocalOpenAIBackend:
         attempts = getattr(record, "attempt_count", None) if record else None
         retry_count = max(0, int(attempts) - 1) if attempts else 0
         streamed = bool(getattr(record, "streamed", False)) if record else False
+        usage = dict(record.usage) if record else {}
+        # MONITOR-V2 (2.1): llama-server reports OpenAI-style
+        # prompt_tokens/completion_tokens; normalize to the usage-record
+        # vocabulary (input_tokens/output_tokens) so local rows carry token
+        # counts in usage.ndjson exactly like remote rows. Only values the
+        # server actually reported are mapped (never invented).
+        if "input_tokens" not in usage and "prompt_tokens" in usage:
+            usage["input_tokens"] = usage["prompt_tokens"]
+        if "output_tokens" not in usage and "completion_tokens" in usage:
+            usage["output_tokens"] = usage["completion_tokens"]
         response = CompletionResponse(
             text=text,
             structured=None,
             provider="local_llama",
             model=actual_model,
             finish_reason=record.finish_reason if record else None,
-            usage=dict(record.usage) if record else {},
+            usage=usage,
             wall_seconds=round(wall, 3),
             request_id=None,
             session_id=None,
@@ -227,7 +242,34 @@ class LocalOpenAIBackend:
                 raw_metadata=response.raw_metadata,
             )
         )
+        # MONITOR-V2 (2.1): per-call usage write at completion (crash-safe:
+        # the call is in usage.ndjson the moment it finishes, not at a phase
+        # boundary). Mirror of ``OpenCodeServerBackend`` — the local backend
+        # has no failure record (transport errors raise before a record is
+        # created), so the success path is the only emit point.
+        self._emit_usage(self._records[-1])
         return response
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """Attach a per-call usage sink (``UsageRecordWriter.write_call``).
+
+        Called by the coordinator's ``set_usage_writer`` for local
+        sub-backends so every completed local llama-server call is appended
+        to ``usage.ndjson`` at the moment it finishes (mirror of
+        ``OpenCodeServerBackend.set_usage_sink``).
+        """
+        self._usage_sink = sink
+
+    def _emit_usage(self, record: BackendCallRecord) -> None:
+        if self._usage_sink is not None:
+            try:
+                self._usage_sink(record)
+            except Exception:  # noqa: BLE001 -- usage is diagnostics, never a gate
+                LOG.warning(
+                    "LocalOpenAIBackend: usage sink failed; disabling",
+                    exc_info=True,
+                )
+                self._usage_sink = None
 
     def close(self) -> None:
         # Idempotent: closes the HTTP session this backend owns, but never

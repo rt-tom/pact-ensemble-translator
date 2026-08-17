@@ -407,6 +407,21 @@ class LocalRoutingBackend:
             name: key for key, name in config.model_names.items()
         }
         self._backends: Dict[str, LocalOpenAIBackend] = {}
+        # MONITOR-V2 (2.1): per-call usage sink forwarded to every
+        # LocalOpenAIBackend this routing backend creates (existing and
+        # future), so local llama-server calls land in usage.ndjson.
+        self._usage_sink: Optional[Any] = None
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """Forward a per-call usage sink to every owned local backend.
+
+        Called by the coordinator's ``set_usage_writer`` (MONITOR-V2 2.3):
+        existing ``LocalOpenAIBackend`` instances get the sink immediately,
+        and any backend created later by ``complete()`` receives it too.
+        """
+        self._usage_sink = sink
+        for backend in self._backends.values():
+            backend.set_usage_sink(sink)
 
     @property
     def descriptor(self) -> BackendDescriptor:
@@ -430,6 +445,8 @@ class LocalRoutingBackend:
                 temperature=request.temperature,
             )
             backend = LocalOpenAIBackend(api=ApiClient(api_config, name=request.label))
+            if self._usage_sink is not None:
+                backend.set_usage_sink(self._usage_sink)
             self._backends[request.model_ref] = backend
         return backend.complete(request)
 
@@ -691,7 +708,12 @@ class CompositeBackendConfig:
             if isinstance(runtime, LocalLifecycleCoordinator):
                 if local_coord is None:
                     local_coord = runtime
-                sub_backends[name] = LocalRoutingBackend(runtime.router, cfg)
+                sub_backend = LocalRoutingBackend(runtime.router, cfg)
+                # MONITOR-V2 (2.3): register the local routing backend on
+                # the sub-coordinator so the composite coordinator's
+                # set_usage_writer forwards local usage to its per-call sink.
+                runtime.set_usage_backend(sub_backend)
+                sub_backends[name] = sub_backend
             elif isinstance(runtime, RemoteRuntimeCoordinator):
                 if remote_coord is None:
                     remote_coord = runtime
@@ -893,7 +915,14 @@ def build_role_backend(
     built runtime.
     """
     if isinstance(cfg, LocalLlamaBackendConfig):
-        return LocalRoutingBackend(runtime.router, cfg)
+        backend = LocalRoutingBackend(runtime.router, cfg)
+        # MONITOR-V2 (2.3): register the local routing backend on the
+        # coordinator so the strict runner's runtime.set_usage_writer()
+        # reaches the per-call sink of the LocalOpenAIBackend instances.
+        attach = getattr(runtime, "set_usage_backend", None)
+        if attach is not None:
+            attach(backend)
+        return backend
     if isinstance(cfg, OpenCodeBackendConfig):
         return runtime.backend
     if isinstance(cfg, CompositeBackendConfig):

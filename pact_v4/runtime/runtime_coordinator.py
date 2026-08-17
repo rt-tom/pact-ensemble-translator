@@ -287,10 +287,32 @@ class LocalLifecycleCoordinator:
         self._descriptor = descriptor
         self._events: List[BackendEvent] = []
         self._closed = False
+        # MONITOR-V2 (2.3): the local routing backend this coordinator owns
+        # (registered by build_role_backend / composite build_runtime), so
+        # set_usage_writer can reach the per-call sink of every
+        # LocalOpenAIBackend that serves local calls.
+        self._usage_backend: Optional[Any] = None
 
     @property
     def router(self) -> ModelRouter:
         return self._router
+
+    def set_usage_backend(self, backend: Any) -> None:
+        """Register the local routing backend that serves this coordinator's calls."""
+        self._usage_backend = backend
+
+    def set_usage_writer(self, writer: Any) -> None:
+        """Forward a usage writer to the local backend's per-call sink.
+
+        Since MONITOR-V2 (2.3) local llama-server calls are journaled like
+        remote ones: the writer's ``write_call`` becomes the
+        ``LocalRoutingBackend``'s usage sink, so every completed local call
+        lands in ``usage.ndjson`` at the moment it finishes.
+        """
+        if self._usage_backend is not None:
+            sink = getattr(self._usage_backend, "set_usage_sink", None)
+            if sink is not None:
+                sink(writer.write_call)
 
     def _sync(self) -> None:
         switches = self._router.switches
@@ -489,14 +511,18 @@ class CompositeRuntimeCoordinator:
         return self._backend
 
     def set_usage_writer(self, writer: Any) -> None:
-        """Forward the usage writer to the remote sub-coordinator.
+        """Forward the usage writer to the remote AND local sub-coordinators.
 
-        Local switch events are never written (the writer only accepts
-        remote-call events), so a composite run's local calls stay in
-        ``local_lifecycle`` exactly like a local-only run.
+        Since MONITOR-V2 (2.3), local llama-server calls are also journaled:
+        the writer is forwarded to the local sub-coordinator's per-call sink
+        (see ``LocalLifecycleCoordinator.set_usage_writer``) so a composite
+        run writes local usage rows exactly like a local-only run. Local
+        *switch* events stay filtered out by the writer itself.
         """
         if self._remote is not None:
             self._remote.set_usage_writer(writer)
+        if self._local is not None:
+            self._local.set_usage_writer(writer)
 
     @property
     def backend_descriptor(self) -> BackendDescriptor:

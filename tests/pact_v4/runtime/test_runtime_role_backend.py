@@ -10,6 +10,7 @@ remote backends are constructed but never called.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -58,6 +59,7 @@ from pact_v4.runtime.runtime_coordinator import (
 class _FakeLifecycleAdapter:
     def __init__(self) -> None:
         self.calls: list = []
+        self.base_url = "http://127.0.0.1:8093"
 
     def start(self, model_key, profile, extra_args, retries=1):
         self.calls.append(("start", model_key))
@@ -641,3 +643,146 @@ def _make_descriptor(kind: str) -> BackendDescriptor:
         model_bindings={"generator": "gemma"},
         effective_options={},
     )
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 (2.1/2.3): local usage writing — writer -> coordinator ->
+# LocalRoutingBackend -> LocalOpenAIBackend -> usage.ndjson
+# ---------------------------------------------------------------------------
+
+
+class _FakeLocalResponse:
+    def __init__(self, *, status_code: int, text: str, payload=None):
+        self.status_code = status_code
+        self.text = text
+        self.reason = "OK" if 200 <= status_code < 300 else "Error"
+        self._payload = payload
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no JSON payload")
+        return self._payload
+
+    def close(self):
+        pass
+
+
+class _FakeLocalSession:
+    def __init__(self, script):
+        self._script = list(script)
+
+    def post(self, url, *, json, timeout, stream=False):
+        item = self._script.pop(0) if self._script else (200, "x",
+            {"choices": [{"message": {"role": "assistant", "content": "ok"},
+                          "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 10, "completion_tokens": 20}})
+        if isinstance(item, BaseException):
+            raise item
+        status, text, payload = item
+        return _FakeLocalResponse(status_code=status, text=text, payload=payload)
+
+
+def _local_backend_with_session(router, cfg, session) -> LocalRoutingBackend:
+    """LocalRoutingBackend over ``router`` whose per-model LocalOpenAIBackend
+    uses ``session`` (fake HTTP) so complete() runs fully offline."""
+    from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
+
+    def _complete(self, request):
+        key = self._ref_to_key.get(request.model_ref)
+        if key is None:
+            raise CompletionError(f"no local model {request.model_ref!r}")
+        self._router.ensure_resident(key)
+        backend = self._backends.get(request.model_ref)
+        if backend is None:
+            from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
+            api_config = ApiClientConfig(
+                chat_url=f"{self._router.base_url}/v1/chat/completions",
+                model=request.model_ref, timeout_seconds=1800.0,
+                context_size=32768, temperature=request.temperature,
+            )
+            backend = LocalOpenAIBackend(
+                api=ApiClient(api_config, name=request.label, session=session)
+            )
+            if self._usage_sink is not None:
+                backend.set_usage_sink(self._usage_sink)
+            self._backends[request.model_ref] = backend
+        return backend.complete(request)
+
+    class _Patched(LocalRoutingBackend):
+        complete = _complete
+
+    return _Patched(router, cfg)
+
+
+def test_local_usage_writer_writes_rows_per_call(tmp_path: Path):
+    """MONITOR-V2 2.1/2.3: a local llama-server call with a usage sink
+    attached lands in usage.ndjson (KIND_LOCAL_LLAMA per-call path), even
+    for a local-only run whose coordinator has no remote sub-backend."""
+    from pact_v4.pipeline.usage_record import UsageRecordWriter, USAGE_FILENAME
+
+    cfg = _local_cfg()
+    router = _make_router()  # fake lifecycle adapter, no real server
+    # Wire the local backend the way build_role_backend does (2.3).
+    backend = _local_backend_with_session(router, cfg, _FakeLocalSession([]))
+    runtime = LocalLifecycleCoordinator(router, descriptor=cfg.build_descriptor())
+    runtime.set_usage_backend(backend)
+    runtime.set_usage_writer(UsageRecordWriter(tmp_path))
+
+    request = CompletionRequest(
+        model_ref="gemma-fake",
+        messages=(Message(role="user", content="ping"),),
+        max_output_tokens=16, temperature=0.0,
+        response_schema=None, label="phase3/qwen_chapter_audit_v4",
+        request_options={},
+    )
+    backend.complete(request)
+    backend.complete(request)
+
+    path = tmp_path / USAGE_FILENAME
+    assert path.exists()
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Two calls -> two rows (identity-less local calls are always written).
+    assert len(rows) == 2
+    assert rows[0]["label"] == "phase3/qwen_chapter_audit_v4"
+    assert rows[0]["model_ref"] == "gemma-fake"
+    assert rows[0]["input_tokens"] == 10
+    assert rows[0]["output_tokens"] == 20
+    runtime.close()
+
+
+def test_composite_coordinator_forwards_writer_to_local(tmp_path: Path):
+    """MONITOR-V2 2.3: CompositeRuntimeCoordinator.set_usage_writer must
+    forward to BOTH sub-coordinators; the local sub-coordinator reaches its
+    LocalRoutingBackend's per-call sink."""
+    from pact_v4.pipeline.usage_record import UsageRecordWriter, USAGE_FILENAME
+
+    cfg = _local_cfg()
+    router = _make_router()  # fake lifecycle adapter, no real server
+    local = LocalLifecycleCoordinator(router, descriptor=cfg.build_descriptor())
+    local_backend = _local_backend_with_session(router, cfg, _FakeLocalSession([]))
+    local.set_usage_backend(local_backend)
+    remote = RemoteRuntimeCoordinator(_FakeCompletionBackend("remote", {}))
+    composite = CompositeRuntimeCoordinator(
+        local, remote, _make_descriptor("composite"),
+        backend=CompositeCompletionBackend(
+            {"local": local_backend, "remote": _FakeCompletionBackend("remote", {})},
+            _make_descriptor("composite"),
+        ),
+    )
+    composite.set_usage_writer(UsageRecordWriter(tmp_path))
+
+    request = CompletionRequest(
+        model_ref="gemma-fake",
+        messages=(Message(role="user", content="ping"),),
+        max_output_tokens=16, temperature=0.0,
+        response_schema=None, label="phase2b/balanced_literary/whole_chapter",
+        request_options={},
+    )
+    local_backend.complete(request)
+
+    path = tmp_path / USAGE_FILENAME
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["label"] == "phase2b/balanced_literary/whole_chapter"
+    local.close()
+    remote.close()

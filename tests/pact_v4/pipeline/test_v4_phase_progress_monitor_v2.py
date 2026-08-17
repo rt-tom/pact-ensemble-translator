@@ -110,28 +110,29 @@ def test_usage_grouping_reuses_phase_for_label(tmp_path: Path):
     groups = tracker._usage_group_rows(tracker._read_usage_rows(out))
     by_group = {(g["label_group"], g["model"]): g for g in groups}
 
-    # phase2b collapses per-chunk labels into one "generation" group.
-    assert by_group[("phase2b generation", "deepseek-v4-flash")]["calls"] == 2
-    assert by_group[("phase2b generation", "deepseek-v4-flash")]["step"] == "Steps1-5"
-    # phase2c/phase4 keep their label sub-role.
-    assert by_group[("phase2c qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("phase4 region_repair", "deepseek-v4-flash")]["step"] == "Step7"
-    assert by_group[("phase4 region_fidelity_gate", "qwen3.7-plus")]["step"] == "Step7"
-    assert by_group[("phase3 audit", "qwen3.7-plus")]["step"] == "Step6"
-    assert by_group[("phase5 formatting", "deepseek-v4-flash")]["step"] == "Step8"
+    # MONITOR-V2 (1.3): the column is renamed to "фазы" and shows human
+    # phase names (Extraction / Translation / R_editor / Audit / Repair /
+    # Re-audit) instead of the old "phase2b generation" label-groups.
+    assert by_group[("Translation", "deepseek-v4-flash")]["calls"] == 2
+    assert by_group[("Translation", "deepseek-v4-flash")]["step"] == "Steps1-5"
+    # phase2c/phase4 keep their phase identity through phase_for_label.
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
+    assert by_group[("Repair", "deepseek-v4-flash")]["step"] == "Step7"
+    assert by_group[("Repair", "qwen3.7-plus")]["step"] == "Step7"
+    assert by_group[("Audit", "qwen3.7-plus")]["step"] == "Step6"
+    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Step8"
 
     # The step mapping goes through phase_for_label — prove the reuse by
     # checking the label->phase leg is literally v4_usage's function.
     assert tracker.phase_for_label is v4_usage.phase_for_label
-    assert by_group[("phase2b generation", "deepseek-v4-flash")]["reported_cost"] == 0.03
-    assert by_group[("phase3 audit", "qwen3.7-plus")]["reported_cost"] == 0.04
+    assert by_group[("Translation", "deepseek-v4-flash")]["reported_cost"] == 0.03
+    assert by_group[("Audit", "qwen3.7-plus")]["reported_cost"] == 0.04
 
 
 def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
-    # Non-blocking review observation: legacy adapter labels
-    # ("phase2c-qwen-fidelity") carry the phase namespace inside the token;
-    # the label-group must render the canonical "phase2c qwen_fidelity",
-    # not the raw "phase2c-qwen-fidelity qwen_fidelity".
+    # Legacy adapter labels ("phase2c-qwen-fidelity") carry the phase
+    # namespace inside the token; the "фазы" column must render the human
+    # phase name, not the raw "phase2c-qwen-fidelity" token.
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     _write_ndjson(out / USAGE_FILENAME, [
         _usage_row("phase2c-qwen-fidelity", model="qwen3.7-plus", cost=0.01),
@@ -141,9 +142,9 @@ def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
     groups = tracker._usage_group_rows(tracker._read_usage_rows(out))
     by_group = {(g["label_group"], g["model"]): g for g in groups}
 
-    assert by_group[("phase2c qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("phase2c gemma_preference", "deepseek-v4-flash")]["step"] == "Step2c"
-    assert not any(g.startswith("phase2c-qwen-fidelity") for g, _ in by_group)
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
+    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "Step2c"
+    assert not any(g.startswith("phase2c") for g, _ in by_group)
 
 
 def test_usage_block_hides_cost_column_when_all_zero(tmp_path: Path):
@@ -387,6 +388,212 @@ def test_render_book_report_is_read_only(tmp_path: Path):
     tracker.render_book_report(base)
     after = _snapshot(base)
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2: Phase block (1.1), local speed block (1.2), фазы column (1.3),
+# book-table tokens (1.4), last-call block (1.5)
+# ---------------------------------------------------------------------------
+
+
+def _phase_mock_artifacts(out: Path) -> None:
+    """B3-era artifacts matching the real chapter-0006 shapes."""
+    _write(out / "entity_context_cache.json", {"schema": "x", "entries": [{
+        "context": {"entities": [
+            {"entity": "Blake", "anchor": {"status": "verified"},
+             "aliases": [{"status": "verified"}], "claims": []},
+            {"entity": "Rose", "anchor": {"status": "candidate"},
+             "aliases": [{"status": "candidate"}], "claims": []},
+        ]},
+    }]})
+    _write(out / "translations_raw.json", {
+        "p1": "Узы 1.6", "p2": "Она была мокрой. Он молчал.",
+    })
+    _write(out / "chunk_plan.json", {"chunks": [
+        {"chunk_id": "c1", "word_counts": [2, 22, 38]},
+        {"chunk_id": "c2", "word_counts": [87, 137]},
+    ]})
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {
+            "chunk_count": 2, "successful_chunks": 2,
+            "applied": [["p1", "текст"]], "candidates": [{"pid": "p2"}],
+        }},
+        "chunks": [
+            {"chunk": 1, "status": "GOOD", "issue_count": 3},
+            {"chunk": 2, "status": "GOOD_RETRIED", "issue_count": 0},
+        ],
+        "issue_count": 3,
+        "repair": {
+            "eligible_count": 4,
+            "batches": [
+                {"batch_index": 1, "findings": [{"index": 1}],
+                 "results": [{"index": 1, "decision": "repair"}]},
+                {"batch_index": 2, "findings": [{"index": 2}, {"index": 3}],
+                 "results": [{"index": 2, "decision": "repair"},
+                             {"index": 3, "decision": "skip"}]},
+            ],
+            "committed": ["p1", "p2"],
+            "reaudit": {"complete": True, "failed": False, "issues": [{"id": "p9"}]},
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    _write(out / "b3_repair_reaudit_chunk2_raw.txt", "{}")
+
+
+def test_phase_block_renders_six_phases(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _phase_mock_artifacts(out)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    assert lines[0] == "-- Phase --"
+    text = "\n".join(lines)
+    assert "Extraction: сущностей: 2 | claims: verified 2 / candidate 2" in text
+    assert "Translation: attempt 1/3 | source 286 слов → перевод 7 слов" in text
+    assert "R_editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
+    assert "Audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
+    assert "Repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | total 2/4" in text
+    assert "Re-audit: chunks done=2/2 | residual: 1 | debt: 0" in text
+
+
+def test_phase_block_skips_absent_artifacts(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    assert lines == ["-- Phase --", "  (нет Phase-артефактов: entity_context_cache.json / "
+                                    "translations_raw.json / audit_cache_b3.json)"]
+
+
+def test_phase_block_translation_attempt_from_wc_events(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "translations_raw.json", {"p1": "текст"})
+    _write(out / "chunk_plan.json", {"chunks": [{"chunk_id": "c1", "word_counts": [5]}]})
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_retry_attempt", "ts": _iso(30), "attempt": 2},
+    ])
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    assert "Translation: attempt 2/3 | source 5 слов → перевод 1 слов" in "\n".join(lines)
+
+
+def _local_server_log(out: Path, name: str = "Gemma_20260816_120000_stderr.log") -> Path:
+    out.mkdir(parents=True, exist_ok=True)
+    logs = out / "server_logs"
+    logs.mkdir(exist_ok=True)
+    path = logs / name
+    # Real llama-server slot print_timing lines (shape from chapter 6).
+    path.write_text(
+        "0.32.156.164 I slot print_timing: id  0 | task 0 | n_decoded =    100, "
+        "tg =  26.08 t/s, tg_3s =  26.08 t/s\n"
+        "14.51.578.226 I slot print_timing: id  0 | task 20347 | prompt eval time ="
+        "    7287.64 ms /  2747 tokens (    2.65 ms per token,   376.94 tokens per second)\n"
+        "14.51.578.231 I slot print_timing: id  0 | task 20347 |        eval time ="
+        "   79759.70 ms /  2373 tokens (   33.61 ms per token,    29.75 tokens per second)\n"
+        "14.52.001.005 I slot print_timing: id  0 | task 20347 | n_decoded =    500, "
+        "tg =  30.11 t/s, tg_3s =  29.63 t/s\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_server_speed_block_local(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _local_server_log(out)
+    lines = tracker._server_speed_lines(out)
+    assert lines[0] == "-- скорость генерации (локальная, из server_logs) --"
+    assert "gemma: eval 29.75 t/s | prompt 376.9 t/s | live tg_3s 29.63 t/s" in lines[1]
+    assert "n_decoded=2373, eval 79.8s (запрос от 14:51:57)" in lines[2]
+
+
+def test_server_speed_block_absent_for_remote(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    logs = out / "server_logs"
+    logs.mkdir()
+    (logs / "opencode_serve_20260815_100151_stderr.log").write_text("x", encoding="utf-8")
+    assert tracker._server_speed_lines(out) == []
+
+
+def test_server_speed_block_picks_newest_log(tmp_path: Path):
+    import os
+    from datetime import datetime, timezone
+
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    gemma = _local_server_log(out, "Gemma_20260816_100000_stderr.log")
+    qwen = _local_server_log(out, "Qwen_20260816_120000_stderr.log")
+    # Qwen log has a different eval speed.
+    qwen.write_text(
+        "4.30.558.340 I slot print_timing: id  0 | task 0 |        eval time ="
+        "   5000.00 ms /  1000 tokens (    5.00 ms per token,   200.00 tokens per second)\n",
+        encoding="utf-8",
+    )
+    # The card: "последний по времени лог = текущая фаза" — the newest log
+    # by mtime wins, regardless of filename.
+    os.utime(gemma, (0, 0))
+    os.utime(qwen, (2_000_000_000, 2_000_000_000))
+    lines = tracker._server_speed_lines(out)
+    assert "qwen: eval 200.00 t/s" in lines[1]
+
+
+def test_llama_ts_to_hms():
+    assert tracker._llama_ts_to_hms("14.51.578.231") == "14:51:57"
+    assert tracker._llama_ts_to_hms("4.30.558.334") == "4:30:55"
+
+
+def test_last_call_block_from_usage(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / USAGE_FILENAME, [
+        _usage_row("phase2b/balanced_literary/chunk0001", input_tokens=100, output_tokens=50),
+        _usage_row("phase3/reaudit_scope_v4", model="qwen3.7-plus",
+                   input_tokens=45620, output_tokens=210, reasoning_tokens=5800,
+                   seconds_ago=5),
+    ])
+    lines = tracker._last_call_block_lines(out)
+    assert lines[0] == "-- последний вызов (из usage.ndjson) --"
+    assert lines[1] == "  Re-audit | qwen3.7-plus | in=45620 out=210 reas=5800 | wall=?s"
+
+
+def test_last_call_block_absent_without_usage(tmp_path: Path):
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    assert tracker._last_call_block_lines(out) == []
+
+
+def test_book_table_shows_token_columns(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    ch1 = _chapter_dir(base, "chapter_0001", _iso(3600))
+    _write_ndjson(ch1 / USAGE_FILENAME, [
+        _usage_row("phase2b/balanced_literary/chunk0001", input_tokens=1000,
+                   output_tokens=500, reasoning_tokens=0),
+    ])
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "input" in table and "output" in table
+    assert "reasoning" not in table  # zero everywhere -> hidden
+    assert "1.0k" in table
+
+
+def test_book_table_hides_token_columns_without_usage(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _chapter_dir(base, "chapter_0001", _iso(3600))
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "input" not in table and "output" not in table
+
+
+def test_phase_for_label_b3_subphases():
+    assert v4_usage.phase_for_label("b1.2/entity_extractor") == "extraction"
+    assert v4_usage.phase_for_label("phase3/russian_editor_v4") == "r_editor"
+    assert v4_usage.phase_for_label("phase3/reaudit_scope_v4") == "reaudit"
+    assert v4_usage.phase_for_label("phase3/selective_repair_v4") == "repair"
+    assert v4_usage.phase_for_label("phase3/qwen_chapter_audit_v4") == "audit"
+    # The legacy phase3 umbrella still maps to audit.
+    assert v4_usage.phase_for_label("phase3/other_thing") == "audit"
 
 
 def test_cli_requires_exactly_one_target(tmp_path: Path):
