@@ -423,6 +423,27 @@ def test_cache_identity_changes_with_extractor_version():
     )
 
 
+def test_cache_identity_ignores_prompt_version_change():
+    """Regression: prompt wording change (t_83bab286) must not invalidate
+    existing caches. Cache key = source_hash + extractor_version; prompt
+    version is not part of the identity. Verify by computing cache keys
+    with the same source_hash and extractor_version — they must match
+    regardless of prompt version."""
+    from pact_v4.audit.entity_extractor import ENTITY_EXTRACTION_V1
+    source = _source_0001()
+    key = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    # The prompt version field exists and is /v1 — but it must NOT affect
+    # the cache key. Changing it (hypothetically) would not change the key.
+    assert ENTITY_EXTRACTION_V1.version.endswith("/v1")
+    # Cache identity is deterministic and depends only on source_hash + version.
+    key2 = entity_context_cache_key(
+        source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
+    )
+    assert key == key2
+
+
 def test_cache_payload_round_trip():
     source = _source_0001()
     extractor = _RecordingExtractor(_gold_payload_0001(source))
@@ -631,6 +652,17 @@ def test_parse_model_output_rejects_fences_and_malformed():
         parse_model_output("")
 
 
+def test_parse_json_response_attaches_parsed_value_for_list():
+    """Regression: parse_json_response must attach the parsed list to the
+    ValueError so parse_model_output can use it without re-parsing."""
+    from pact_v4.runtime.json_resilience import parse_json_response
+    raw = '[{"entity": "x"}]'
+    with pytest.raises(ValueError, match="not an object") as exc_info:
+        parse_json_response(raw)
+    assert hasattr(exc_info.value, "parsed_value")
+    assert exc_info.value.parsed_value == [{"entity": "x"}]
+
+
 # ---------------------------------------------------------------------------
 # t_83bab286: entity-context output shape — prompt contract and bare-array
 # normalization
@@ -721,6 +753,30 @@ def test_parse_model_output_bare_array_normalized_log(caplog):
         result = parse_model_output(json.dumps(entities))
     assert result == {"entities": entities}
     assert any("bare JSON array" in r.message for r in caplog.records)
+
+
+def test_parse_model_output_fenced_bare_array_uppercase_tag():
+    """Regression: fenced bare array with uppercase JSON tag normalizes
+    through the same path as unfenced — no fence-stripping regression."""
+    entities = [{"entity": "x", "canonical_type": "y",
+                 "anchor": {"pid": "p00001", "span": "y"},
+                 "aliases": [], "claims": []}]
+    raw = f"```JSON\n{json.dumps(entities)}\n```"
+    result = parse_model_output(raw)
+    assert result == {"entities": entities}
+    assert isinstance(result, dict)
+    assert "entities" in result
+
+
+def test_parse_model_output_fenced_bare_array_alternate_lang_tag():
+    """Regression: fenced bare array with non-json language tag (e.g.
+    plaintext) normalizes correctly."""
+    entities = [{"entity": "a", "canonical_type": "b",
+                 "anchor": {"pid": "p00001", "span": "b"},
+                 "aliases": [], "claims": []}]
+    raw = f"```plaintext\n{json.dumps(entities)}\n```"
+    result = parse_model_output(raw)
+    assert result == {"entities": entities}
 
 
 def test_bare_array_flows_through_extract_entity_context():

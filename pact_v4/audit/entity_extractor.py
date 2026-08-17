@@ -420,22 +420,11 @@ def parse_model_output(raw: str) -> Dict[str, Any]:
         # before giving up.
         if isinstance(exc, (EmptyResponseError, TruncatedJSONError)):
             raise
-        if "not an object" in str(exc):
-            # parse_json_response parsed successfully but got a non-dict;
-            # re-parse to get the actual parsed value for normalization.
-            import json as _json
-            cleaned = raw.strip().lstrip("\ufeff")
-            # Strip markdown fences if present
-            cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-            try:
-                parsed_value = _json.loads(cleaned)
-            except _json.JSONDecodeError:
-                raise ValueError(
-                    f"entity-extraction payload must be a JSON object: {exc}"
-                ) from exc
-            if isinstance(parsed_value, list):
-                return _normalize_bare_array(parsed_value)
+        # Use the already-parsed value attached by parse_json_response
+        # (avoids re-parsing with inconsistent fence-stripping semantics).
+        parsed_value = getattr(exc, "parsed_value", None)
+        if parsed_value is not None and isinstance(parsed_value, list):
+            return _normalize_bare_array(parsed_value)
         raise ValueError(
             f"entity-extraction payload must be a JSON object: {exc}"
         ) from exc

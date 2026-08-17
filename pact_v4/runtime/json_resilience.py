@@ -519,10 +519,12 @@ def parse_json_response(text: str) -> dict:
                     f"response is not complete JSON: {exc}"
                 ) from exc
     if not isinstance(parsed, dict):
-        raise ValueError(
+        exc = ValueError(
             f"response is valid JSON but not an object: "
             f"{type(parsed).__name__}"
         )
+        exc.parsed_value = parsed  # type: ignore[attr-defined]
+        raise exc
     return parsed
 
 
