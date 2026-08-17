@@ -794,6 +794,50 @@ def test_bare_array_flows_through_extract_entity_context():
     assert result.context.source_hash == source.source_hash
 
 
+def test_bare_array_no_model_retry_through_backend():
+    """Regression: bare-array normalization must NOT trigger a model retry.
+    BackendEntityExtractor uses retry_json_call which retries only on
+    EmptyResponseError/TruncatedJSONError — a valid JSON array is NOT
+    retryable.  The backend must be called exactly once."""
+    source = _source_0001()
+    gold = _gold_payload_0001(source)
+    bare_array_body = json.dumps(gold["entities"], ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(bare_array_body)])
+    extractor = BackendEntityExtractor(
+        backend,
+        config=BackendEntityExtractorConfig(
+            retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0)
+        ),
+    )
+    result = extract_entity_context(
+        source_artifact=source, extractor=extractor
+    )
+    # Exactly one backend call — no retry for a valid JSON array.
+    assert len(backend.requests) == 1
+    assert result.from_cache is False
+    assert result.validation.is_clean()
+    assert len(result.context.entities) == 2
+
+
+def test_bare_array_raw_artifact_written(tmp_path):
+    """Regression: when bare-array normalization happens through the
+    backend path with out_dir, the raw artifact contains the original
+    bare-array text (not the normalized form)."""
+    source = _source_0001()
+    gold = _gold_payload_0001(source)
+    bare_array_body = json.dumps(gold["entities"], ensure_ascii=False)
+    backend = ScriptedBackend([_text_response(bare_array_body)])
+    extractor = BackendEntityExtractor(backend)
+    raw = extractor(
+        chapter_id=source.chapter_id,
+        source=dict(source.source),
+        out_dir=tmp_path,
+    )
+    raw_file = tmp_path / "b1.2_entity_raw.txt"
+    assert raw_file.exists()
+    assert raw_file.read_text(encoding="utf-8") == bare_array_body
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle wiring: Qwen resident before every extraction call (existing
 # LifecycleAdapter/ModelRouter path — no new spawn code).
