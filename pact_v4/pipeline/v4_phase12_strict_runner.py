@@ -2568,12 +2568,26 @@ def run_chapter_strict(
     wall_t0 = time.monotonic()
     progress_writer = progress or PhaseProgressWriter(cfg.out_dir, now=now_fn)
     usage_writer = usage_writer or UsageRecordWriter(cfg.out_dir, now=now_fn)
-    # D1: per-call usage writing. Remote/composite coordinators forward the
-    # writer to their backend's per-call completion sink, so every completed
-    # remote call (success and failure) is appended to usage.ndjson at the
-    # moment it finishes — crash-safe inside a phase, not at phase
-    # boundaries. LocalLifecycleCoordinator has no sink: local calls stay in
-    # local_lifecycle and local runs write no usage.ndjson.
+    # D1/MONITOR-V2: per-call usage writing. Remote/composite coordinators
+    # forward the writer to their backend's per-call completion sink, so
+    # every completed remote call (success and failure) is appended to
+    # usage.ndjson at the moment it finishes — crash-safe inside a phase,
+    # not at phase boundaries. Since MONITOR-V2 (2.3) the local
+    # sub-coordinator forwards the writer too (LocalLifecycleCoordinator
+    # gained set_usage_writer), so local llama-server calls are journaled
+    # exactly like remote ones.
+    # MONITOR-V2 (2.4, RV t_c9f9ea90 HIGH #2): the injected lifecycle
+    # adapters (legacy/default local path — build_strict_lifecycle over the
+    # router) each own their OWN LocalOpenAIBackend that is NOT the
+    # coordinator's registered LocalRoutingBackend, so register them on the
+    # local coordinator before attaching the writer; every completed local
+    # call then lands in usage.ndjson no matter which path built the backend.
+    register = getattr(runtime, "register_usage_backend", None)
+    if register is not None:
+        for adapter in (model_caller, qwen_evaluator, gemma_selector,
+                        qwen_audit_evaluator, gemma_audit_evaluator):
+            if adapter is not None and hasattr(adapter, "set_usage_sink"):
+                register(adapter)
     attach = getattr(runtime, "set_usage_writer", None)
     if attach is not None:
         attach(usage_writer)

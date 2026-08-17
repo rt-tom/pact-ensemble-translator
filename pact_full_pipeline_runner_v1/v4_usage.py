@@ -66,6 +66,16 @@ _PHASE_RULES: Tuple[Tuple[str, str], ...] = (
     ("phase2c-qwen-fidelity", "qwen_fidelity"),
     ("phase2c-gemma-russian-preference", "gemma_preference"),
     ("phase2c", "(other)"),
+    # MONITOR-V2 (1.3): B3-era sub-phases. The B3 stage runs four distinct
+    # roles under the phase3 namespace (R_editor, audit, selective repair,
+    # re-audit); the monitor's usage column shows them as the same human
+    # phases as the Phase block, so these specific prefixes must win over
+    # the generic phase3 rule below.
+    ("b1.2/entity_extractor", "extraction"),
+    ("phase3/russian_editor", "r_editor"),
+    ("phase3/reaudit_scope", "reaudit"),
+    ("phase3/selective_repair", "repair"),
+    ("phase3/qwen_chapter_audit", "audit"),
     ("phase3", "audit"),
     ("phase4", "repair"),
     ("phase5", "formatting"),
@@ -348,8 +358,9 @@ def render_usage_report(out_dir: Path) -> str:
         lines.extend(_fmt_bucket_rows(agg["by_role"]) or ["  (none)"])
 
         lines.append("")
-        lines.append("-- by phase (A1.3: gen / qwen_fidelity / "
-                     "gemma_preference / audit / repair / formatting) --")
+        lines.append("-- by phase (A1.3 + MONITOR-V2 1.3: extraction / gen / "
+                     "qwen_fidelity / gemma_preference / r_editor / audit / "
+                     "repair / reaudit / formatting) --")
         lines.extend(_fmt_bucket_rows(agg["by_phase"]) or ["  (none)"])
 
         lines.append("")

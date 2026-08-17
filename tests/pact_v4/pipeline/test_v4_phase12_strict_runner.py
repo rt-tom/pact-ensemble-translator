@@ -1757,3 +1757,50 @@ def test_a2_dry_run_report_v2_consistency():
     assert totals["lazy"]["gen"] == sum(r["lazy_calls"]["gen"] for r in rows)
     assert totals["lazy"]["gemma_preference"] == 0
     assert totals["gen_delta"] == totals["lazy"]["gen"] - totals["legacy"]["gen"]
+
+
+# ---------------------------------------------------------------------------
+# RV t_c9f9ea90 HIGH #2: run_chapter_strict registers injected lifecycle
+# adapters on the local coordinator so the default/legacy local path writes
+# usage.ndjson (not just LocalRoutingBackend).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLifecycleCaller:
+    """Stand-in for a Lifecycle* adapter (e.g. LifecycleModelCaller): it owns
+    a backend exposing set_usage_sink and records whether the runner wired
+    the usage writer to it."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.sink = None
+
+    def __call__(self, bundle):
+        return self._inner(bundle)
+
+    @property
+    def last_reasoning(self):
+        return getattr(self._inner, "last_reasoning", "")
+
+    def set_usage_sink(self, sink):
+        self.sink = sink
+
+
+def test_run_chapter_strict_forwards_usage_writer_to_lifecycle_adapters(tmp_path: Path):
+    cfg = _make_cfg(tmp_path, n_paragraphs=8)
+    router = _make_router()
+    # Legacy/default local path: the injected adapters are Lifecycle* wrappers
+    # exposing set_usage_sink (they own their OWN LocalOpenAIBackend).
+    recorded = _RecordingLifecycleCaller(StubModelCaller())
+    result = run_chapter_strict(
+        cfg, router=router, model_caller=recorded,
+        qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    # The runner must have attached a callable (usage_writer.write_call) to
+    # the injected lifecycle adapter's sink — otherwise the default local
+    # path would silently produce no usage rows (the HIGH finding).
+    assert recorded.sink is not None and callable(recorded.sink)
+    assert result.record is not None

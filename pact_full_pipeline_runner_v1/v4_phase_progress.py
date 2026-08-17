@@ -25,9 +25,31 @@ falls back to a coarse inference from the artifacts that do exist
 ``--out-base`` is the multi-chapter (book-run) mode: the monitor discovers
 ``chapter_*/`` subdirectories that carry ``phase_progress.ndjson`` (chapters
 appear dynamically as the book run reaches them), renders a chapters header
-table (chunk/journal counts, phase step, terminal status, calls and provider
-cost from each chapter's ``usage.ndjson``) and then the full detail report of
-the currently active chapter. ``--out-dir`` keeps the single-chapter mode.
+table (chunk/journal counts, phase step, terminal status, calls, per-chapter
+input/output/reasoning token sums and provider cost from each chapter's
+``usage.ndjson``) and then the full detail report of the currently active
+chapter. ``--out-dir`` keeps the single-chapter mode.
+
+MONITOR-V2 additions (backing cards ``V4_BOOK_RUN_MONITOR_TASK_RU.md`` and
+the monitor-v2 spec):
+
+* ``-- Phase --`` block between the alive header and the usage block:
+  per-pipeline-phase progress (Extraction / Translation / R_editor / Audit /
+  Repair / Re-audit) read-only from the B3 artifacts
+  (``entity_context_cache.json``, ``translations_raw.json``,
+  ``audit_cache_b3.json``);
+* ``-- скорость генерации (локальная, из server_logs) --`` block after the
+  Phase block, LOCAL runs only: llama-server ``slot print_timing`` eval /
+  prompt / live ``tg_3s`` tokens-per-second from the newest local
+  ``Gemma_*``/``Qwen_*`` stderr log, plus ``live думание`` growth of the
+  freshest ``*_reasoning.txt`` trace (B/s). Remote runs never render a
+  speed block;
+* the usage-by-step-x-model "label-group" column is renamed to ``фазы`` and
+  shows the same human phase names as the Phase block (the label -> phase
+  leg still reuses ``phase_for_label()`` — never duplicated);
+* ``-- последний вызов (из usage.ndjson) --`` block after the usage block:
+  the human phase, model, in/out/reasoning tokens and wall seconds of the
+  most recent completed call.
 
 The usage-by-step-x-model counters block reuses ``phase_for_label()`` from
 ``pact_full_pipeline_runner_v1.v4_usage.py`` (V4 Efficiency A1.3, already on
@@ -40,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,42 +87,37 @@ B3_AUDIT_JOURNAL_FILENAME = "audit_journal.ndjson"
 # "Дизайн обновлённого монитора"): usage-label group -> step-group mapping.
 # The label -> phase leg is delegated to phase_for_label() from v4_usage.py
 # (A1.3) — never duplicated here; this table only maps the *phase* it
-# returns to the step-group the monitor displays.
+# returns to the step-group the monitor displays. B3-era phases
+# (extraction / r_editor / reaudit) were added in MONITOR-V2 (1.3) so the
+# Phase block and the usage column share the same phase vocabulary.
 PHASE_TO_STEP_GROUP = {
     "gen": "Steps1-5",
+    "extraction": "Step6",
     "qwen_fidelity": "Step2c",
     "gemma_preference": "Step2c",
+    "r_editor": "Step6",
     "audit": "Step6",
     "repair": "Step7",
+    "reaudit": "Step7",
     "formatting": "Step8",
 }
 
-# Friendly role name shown in the usage-by-step-x-model "label-group" column
-# for labels whose phase has no sub-role of its own (phase2b per-chunk
-# labels, phase3 audit detectors, phase5 formatting).
-PHASE_FRIENDLY_ROLE = {
-    "gen": "generation",
-    "audit": "audit",
-    "formatting": "formatting",
-}
-
-# Step-groups that carry a sub-role in the label (phase2c/phase4) keep that
-# sub-role in the label-group column (e.g. "phase2c qwen_fidelity",
-# "phase4 region_repair"); everything else falls back to PHASE_FRIENDLY_ROLE.
-LABEL_GROUP_SUBROLE_PREFIXES = ("phase2c", "phase4")
-
-# Display-only canonical prefix per phase (same design as
-# PHASE_TO_STEP_GROUP). Lets legacy hyphen labels ("phase2c-qwen-fidelity")
-# render the canonical "phase2c qwen_fidelity" label-group instead of the
-# raw "phase2c-qwen-fidelity qwen_fidelity"; the label -> phase leg stays
-# fully delegated to phase_for_label() from v4_usage.py, never duplicated.
-PHASE_TO_LABEL_PREFIX = {
-    "gen": "phase2b",
-    "qwen_fidelity": "phase2c",
-    "gemma_preference": "phase2c",
-    "audit": "phase3",
-    "repair": "phase4",
-    "formatting": "phase5",
+# MONITOR-V2 (1.3): the usage-by-step-x-model "label-group" column is
+# renamed to "фазы" and shows the human phase names of the Phase block
+# (Extraction / Translation / R_editor / Audit / Repair / Re-audit). The
+# label -> phase leg stays fully delegated to phase_for_label(); this table
+# only maps the *phase* to its human display name (never duplicated rules).
+PHASE_HUMAN_NAME = {
+    "extraction": "Extraction",
+    "gen": "Translation",
+    "r_editor": "R_editor",
+    "audit": "Audit",
+    "repair": "Repair",
+    "reaudit": "Re-audit",
+    "formatting": "Formatting",
+    "qwen_fidelity": "qwen_fidelity",
+    "gemma_preference": "gemma_preference",
+    "(other)": "(other)",
 }
 
 TRIAL_STATES = (
@@ -130,16 +148,25 @@ def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     rows: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
         except json.JSONDecodeError:
             # Crash-safe: a partial trailing line (crash mid-write) must not
             # break the read -- skip it.
             continue
+        # MEDIUM (RV t_c9f9ea90): a structurally valid JSON line that is not
+        # an object (e.g. ``[1]``) must not reach a caller that does
+        # ``row.get(...)`` — skip it, the artifact stays diagnostic.
+        if isinstance(row, dict):
+            rows.append(row)
     return rows
 
 
@@ -147,8 +174,15 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        # MEDIUM (RV t_c9f9ea90): invalid UTF-8 (errors="replace" above
+        # already degrades the bytes) and malformed JSON render an
+        # unavailable artifact, never an abort.
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -885,26 +919,17 @@ def _read_usage_rows(out_dir: Path) -> List[Dict[str, Any]]:
 
 
 def _label_group(label: Optional[str]) -> str:
-    """Human label-group for the usage-by-step-x-model column.
+    """Human phase name for the usage-by-step-x-model "фазы" column.
 
-    ``phase2b/...`` -> ``phase2b generation``, ``phase3/...`` -> ``phase3
-    audit``, ``phase5/...`` -> ``phase5 formatting`` (friendly phase role);
-    ``phase2c/<sub>`` and ``phase4/<sub>`` keep their label sub-role
-    (``phase2c qwen_fidelity``, ``phase4 region_repair``,
-    ``phase4 region_fidelity_gate``). Uses ``phase_for_label()`` for the
-    phase leg — the same label->phase rules as v4_usage, never duplicated.
+    MONITOR-V2 (1.3): the column is renamed from ``label-group`` to
+    ``фазы`` and shows the same human phase names as the Phase block
+    (Extraction / Translation / R_editor / Audit / Repair / Re-audit).
+    Uses ``phase_for_label()`` for the label -> phase leg — the same
+    rules as v4_usage, never duplicated; ``PHASE_HUMAN_NAME`` only maps
+    the returned phase to its human display name.
     """
-    parts = (label or "").split("/")
     phase = phase_for_label(label)
-    # Canonical prefix from the phase (handles legacy hyphen labels such as
-    # "phase2c-qwen-fidelity" -> "phase2c"); fall back to the raw token for
-    # labels phase_for_label does not recognize.
-    prefix = PHASE_TO_LABEL_PREFIX.get(phase, parts[0] if parts and parts[0] else "(unknown)")
-    if prefix in LABEL_GROUP_SUBROLE_PREFIXES and len(parts) > 1 and parts[1]:
-        role = parts[1]
-    else:
-        role = PHASE_FRIENDLY_ROLE.get(phase, phase)
-    return f"{prefix} {role}"
+    return PHASE_HUMAN_NAME.get(phase, phase)
 
 
 def _usage_group_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -941,10 +966,13 @@ def _usage_group_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                           "cached_input_tokens", "cached_write_tokens"):
             value = row.get(token_key)
             if value is not None:
-                bucket[token_key] += int(value)
+                # MEDIUM (RV t_c9f9ea90): a non-numeric token value in a
+                # structurally-valid row (e.g. ``"input_tokens": "abc"``)
+                # counts as 0 — the aggregate stays readable, never aborts.
+                bucket[token_key] += _as_int(value)
         cost = row.get("reported_cost")
         if cost is not None:
-            bucket["reported_cost"] += float(cost)
+            bucket["reported_cost"] += _as_float(cost)
             bucket["has_cost"] = True
     return list(buckets.values())
 
@@ -988,6 +1016,12 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
     """``-- usage by step x model --`` block (from usage.ndjson)."""
     rows = _read_usage_rows(out_dir)
     if not rows:
+        # MEDIUM (RV t_c9f9ea90): distinguish "never written" from
+        # "exists but corrupt/unreadable" — both render a diagnostic, never
+        # an abort.
+        if (out_dir / USAGE_FILENAME).exists():
+            return ["-- usage by step x model (из usage.ndjson) --",
+                    "  (usage.ndjson exists but no readable rows — corrupt/invalid)"]
         return ["-- usage by step x model --", "  (no usage.ndjson yet)"]
     groups = _usage_group_rows(rows)
     totals = _usage_totals(groups)
@@ -998,7 +1032,7 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
     )
 
     lines = ["-- usage by step x model (из usage.ndjson) --"]
-    header = (f"{'step':<9} {'label-group':<25} {'model':<18}"
+    header = (f"{'step':<9} {'фазы':<25} {'model':<18}"
               f"{'calls':>6}{'input':>9}{'output':>9}")
     if show_reasoning:
         header += f"{'reasoning':>10}"
@@ -1034,6 +1068,568 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
         total_row += f"{_fmt_cost(totals['reported_cost']):>11}"
     lines.append(total_row)
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Phase block (MONITOR-V2 1.1) — per-pipeline-phase progress from artifacts
+# ---------------------------------------------------------------------------
+
+
+def _stage_progress_slice(cache: Dict[str, Any], stage: str) -> Optional[Dict[str, Any]]:
+    """The KILL-SAFE-INCREMENTAL ``stage_progress`` slice for one B3 stage.
+
+    ``audit_cache_b3.json`` has two shapes:
+    * final cache: per-stage results at TOP level (``r_editor`` /
+      ``chunks`` / ``repair`` / ``repair.reaudit``) — the historical shape;
+    * incremental (KILL-SAFE-INCREMENTAL, t_2d16962c): live per-stage
+      payloads under ``stage_progress.<stage>`` (r_editor / audit / repair /
+      reaudit), rewritten after every chunk/batch.
+
+    Returns the incremental slice (validated as an object) or ``None`` when
+    the cache is a final cache (or the stage never ran). The Phase builders
+    prefer the final top-level fields and fall back to this slice so an
+    active incremental run shows live Audit/Repair/Re-audit progress
+    (RV t_c9f9ea90 HIGH #1).
+    """
+    stage_progress = cache.get("stage_progress")
+    if not isinstance(stage_progress, dict):
+        return None
+    slice_ = stage_progress.get(stage)
+    return slice_ if isinstance(slice_, dict) else None
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Tolerant int for monitor counters: ``None``/non-numeric render 0."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Tolerant float for monitor counters (wall seconds, costs)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _phase_extraction(out_dir: Path) -> Optional[str]:
+    """Extraction line from ``entity_context_cache.json`` (read-only)."""
+    payload = _read_json(out_dir / "entity_context_cache.json")
+    if not payload:
+        return None
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return None
+    entities = [
+        ent
+        for entry in entries
+        if isinstance(entry, dict)
+        for ent in (
+            (lambda c: (c.get("entities")
+                        if isinstance(c.get("entities"), list) else [])
+             if isinstance(c, dict) else [])(entry.get("context"))
+        )
+    ]
+    if not entities:
+        return None
+    verified = 0
+    candidate = 0
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        anchor = ent.get("anchor") or {}
+        if not isinstance(anchor, dict):
+            anchor = {}
+        if anchor.get("status") == "verified":
+            verified += 1
+        elif anchor.get("status") == "candidate":
+            candidate += 1
+        aliases = ent.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if isinstance(alias, dict):
+                    if alias.get("status") == "verified":
+                        verified += 1
+                    elif alias.get("status") == "candidate":
+                        candidate += 1
+        claims = ent.get("claims")
+        if isinstance(claims, list):
+            for claim in claims:
+                if isinstance(claim, dict):
+                    if claim.get("status") == "verified":
+                        verified += 1
+                    elif claim.get("status") == "candidate":
+                        candidate += 1
+    return (f"Extraction: сущностей: {len(entities)} "
+            f"| claims: verified {verified} / candidate {candidate}")
+
+
+def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[str]:
+    """Translation line from ``translations_raw.json`` + wc events."""
+    raw = _read_json(out_dir / "translations_raw.json")
+    if raw is None:
+        return None
+    plan = _read_json(out_dir / "chunk_plan.json")
+    source_words = 0
+    if plan:
+        chunks = plan.get("chunks")
+        if isinstance(chunks, list):
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                word_counts = chunk.get("word_counts")
+                if isinstance(word_counts, list):
+                    for w in word_counts:
+                        source_words += _as_int(w)
+    translation_words = sum(
+        len(str(value).split()) for value in raw.values()
+    )
+    gen = _wc_gen_status(events)
+    attempt = f"attempt {gen['attempt']}/{gen['max_attempts']} | " if gen else ""
+    return (f"Translation: {attempt}source {source_words} слов → "
+            f"перевод {translation_words} слов")
+
+
+def _phase_r_editor(out_dir: Path) -> Optional[str]:
+    """R_editor line from ``audit_cache_b3.json``.
+
+    Final cache: top-level ``r_editor.outcome`` (chunk_count /
+    successful_chunks / applied / candidates). Incremental cache:
+    ``stage_progress.r_editor`` (status / done_chunks / outcome.chunks with
+    per-chunk edits) — the live fallback (RV t_c9f9ea90 HIGH #1).
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    r_editor = cache.get("r_editor")
+    if isinstance(r_editor, dict):
+        outcome = r_editor.get("outcome")
+        if isinstance(outcome, dict):
+            chunk_count = outcome.get("chunk_count")
+            if chunk_count:
+                done = outcome.get("successful_chunks")
+                if done is None:
+                    chunks = outcome.get("chunks")
+                    if isinstance(chunks, list):
+                        done = sum(
+                            1 for c in chunks
+                            if isinstance(c, dict)
+                            and isinstance(c.get("status"), str)
+                            and c.get("status").upper()
+                            in ("GOOD", "GOOD_RETRIED")
+                        )
+                # MEDIUM (RV t_52f8e9f7): applied/candidates may be a
+                # scalar int instead of a list — treat scalar as a count.
+                _applied_raw = outcome.get("applied")
+                applied = (len(_applied_raw)
+                           if isinstance(_applied_raw, list)
+                           else _as_int(_applied_raw))
+                _candidates_raw = outcome.get("candidates")
+                candidates = (len(_candidates_raw)
+                              if isinstance(_candidates_raw, list)
+                              else _as_int(_candidates_raw))
+                return (f"R_editor: chunks done={done}/{chunk_count} "
+                        f"| safe (применено)={applied} | review (предложено)={candidates}")
+    # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
+    stage = _stage_progress_slice(cache, "r_editor")
+    if stage is None:
+        return None
+    done_chunks = stage.get("done_chunks")
+    if not isinstance(done_chunks, list) or not done_chunks:
+        return None
+    done = len(done_chunks)
+    # The incremental payload does not persist the planned chunk_count (only
+    # chunk_size + the done chunk records), so the live line renders the
+    # exact done count without a fabricated denominator.
+    applied = 0
+    candidates = 0
+    outcome = stage.get("outcome")
+    if isinstance(outcome, dict):
+        chunks = outcome.get("chunks")
+        if isinstance(chunks, list):
+            # Lazy import: the class sets live in the audit module (single
+            # source of truth — never duplicated here); pulled only when the
+            # incremental R fallback actually needs them.
+            from pact_v4.audit.russian_editor import REVIEW_CLASSES, SAFE_CLASSES
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                edits = chunk.get("edits")
+                if not isinstance(edits, list):
+                    continue
+                for edit in edits:
+                    if not isinstance(edit, dict):
+                        continue
+                    edit_cls = edit.get("class")
+                    if not isinstance(edit_cls, str):
+                        continue
+                    if edit_cls in SAFE_CLASSES:
+                        applied += 1
+                    elif edit_cls in REVIEW_CLASSES:
+                        candidates += 1
+    return (f"R_editor: chunks done={done} "
+            f"| safe (применено)={applied} | review (предложено)={candidates}")
+
+
+def _phase_audit(out_dir: Path) -> Optional[str]:
+    """Audit line from ``audit_cache_b3.json``.
+
+    Final cache: top-level ``chunks`` + ``issue_count``. Incremental cache:
+    ``stage_progress.audit`` (done_chunks / chunks / issues) — live fallback.
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    chunks = cache.get("chunks")
+    if isinstance(chunks, list) and chunks:
+        total = _as_int(cache.get("issue_count"))
+        findings: List[int] = []
+        for c in chunks:
+            if isinstance(c, dict):
+                findings.append(_as_int(c.get("issue_count")))
+        return (f"Audit: chunks done={len(chunks)}/{len(chunks)} "
+                f"| findings per chunk: {findings} | всего {total}")
+    stage = _stage_progress_slice(cache, "audit")
+    if stage is None:
+        return None
+    done_chunks = stage.get("done_chunks")
+    if not isinstance(done_chunks, list) or not done_chunks:
+        return None
+    stage_chunks = stage.get("chunks")
+    findings = []
+    if isinstance(stage_chunks, list):
+        for c in stage_chunks:
+            if isinstance(c, dict):
+                findings.append(_as_int(c.get("issue_count")))
+    issues = stage.get("issues")
+    total = len(issues) if isinstance(issues, list) else sum(findings)
+    return (f"Audit: chunks done={len(done_chunks)} "
+            f"| findings per chunk: {findings} | всего {total}")
+
+
+def _phase_repair(out_dir: Path) -> Optional[str]:
+    """Repair line from ``audit_cache_b3.json``.
+
+    Final cache: top-level ``repair.batches`` (+ committed / eligible_count).
+    Incremental cache: ``stage_progress.repair`` (done_batches / committed /
+    outcome.batches / outcome.batch_count) — live fallback.
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    repair = cache.get("repair")
+    if isinstance(repair, dict):
+        batches = repair.get("batches")
+        if isinstance(batches, list) and batches:
+            per_batch = []
+            for batch in batches:
+                if not isinstance(batch, dict):
+                    continue
+                # MEDIUM (RV t_52f8e9f7): findings/results may be scalar
+                # ints instead of lists — treat scalar findings as a count
+                # and skip iteration on scalar results.
+                _findings_raw = batch.get("findings")
+                findings = (len(_findings_raw)
+                            if isinstance(_findings_raw, list)
+                            else _as_int(_findings_raw))
+                _results_raw = batch.get("results")
+                _results_iter = _results_raw if isinstance(_results_raw, list) else ()
+                repaired = sum(
+                    1 for r in _results_iter
+                    if isinstance(r, dict)
+                    and isinstance(r.get("decision"), str)
+                    and r.get("decision").lower() == "repair"
+                )
+                per_batch.append(f"{repaired}/{findings}")
+            # MEDIUM (RV t_52f8e9f7): committed may be a scalar int.
+            _committed_raw = repair.get("committed")
+            committed = (len(_committed_raw)
+                         if isinstance(_committed_raw, (list, dict))
+                         else _as_int(_committed_raw))
+            eligible = _as_int(repair.get("eligible_count"))
+            return (f"Repair: batches done={len(batches)}/{len(batches)} "
+                    f"| repaired per batch: [{', '.join(per_batch)}] "
+                    f"| total {committed}/{eligible}")
+    stage = _stage_progress_slice(cache, "repair")
+    if stage is None:
+        return None
+    done_batches = stage.get("done_batches")
+    if not isinstance(done_batches, list) or not done_batches:
+        return None
+    done = len(done_batches)
+    outcome = stage.get("outcome")
+    batch_count: Optional[int] = None
+    batches: List[Any] = []
+    if isinstance(outcome, dict):
+        if isinstance(outcome.get("batch_count"), int):
+            batch_count = outcome["batch_count"]
+        if isinstance(outcome.get("batches"), list):
+            batches = outcome["batches"]
+    per_batch = []
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        # MEDIUM (RV t_52f8e9f7): scalar findings/results guard.
+        _findings_raw = batch.get("findings")
+        findings = (len(_findings_raw)
+                    if isinstance(_findings_raw, list)
+                    else _as_int(_findings_raw))
+        _results_raw = batch.get("results")
+        _results_iter = _results_raw if isinstance(_results_raw, list) else ()
+        repaired = sum(
+            1 for r in _results_iter
+            if isinstance(r, dict)
+            and isinstance(r.get("decision"), str)
+            and r.get("decision").lower() == "repair"
+        )
+        per_batch.append(f"{repaired}/{findings}")
+    committed = stage.get("committed")
+    if isinstance(committed, dict):
+        committed_count = len(committed)
+    elif isinstance(committed, list):
+        committed_count = len(committed)
+    else:
+        committed_count = _as_int(committed)
+    done_txt = f"{done}/{batch_count}" if batch_count else f"{done}"
+    return (f"Repair: batches done={done_txt} "
+            f"| repaired per batch: [{', '.join(per_batch)}] "
+            f"| total {committed_count}")
+
+
+def _phase_reaudit(out_dir: Path) -> Optional[str]:
+    """Re-audit line from ``audit_cache_b3.json``.
+
+    Final cache: ``repair.reaudit`` (complete/failed/issues); done = persisted
+    reaudit chunk raw artifacts, residual = remaining issues, debt = 1 when
+    the pass failed. Incremental cache: ``stage_progress.reaudit``
+    (status / done_chunks / issues) — live fallback.
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    repair = cache.get("repair")
+    if isinstance(repair, dict):
+        reaudit = repair.get("reaudit")
+        if isinstance(reaudit, dict):
+            chunk_files = sorted(out_dir.glob("b3_repair_reaudit_chunk*_raw.txt"))
+            total = len(chunk_files)
+            done = total if reaudit.get("complete") else 0
+            issues = reaudit.get("issues")
+            residual = len(issues) if isinstance(issues, list) else 0
+            debt = 1 if reaudit.get("failed") else 0
+            return (f"Re-audit: chunks done={done}/{total} "
+                    f"| residual: {residual} | debt: {debt}")
+    stage = _stage_progress_slice(cache, "reaudit")
+    if stage is None:
+        return None
+    done_chunks = stage.get("done_chunks")
+    if not isinstance(done_chunks, list) or not done_chunks:
+        return None
+    issues = stage.get("issues")
+    residual = len(issues) if isinstance(issues, list) else 0
+    # KILL-SAFE-INCREMENTAL (RV5 t_f82ed9ad): a done record marked failed
+    # (or a stage status "failed") means the pass did NOT complete — debt 1.
+    failed = stage.get("status") == "failed" or any(
+        isinstance(c, dict) and c.get("failed") is True for c in done_chunks
+    )
+    debt = 1 if failed else 0
+    return (f"Re-audit: chunks done={len(done_chunks)} "
+            f"| residual: {residual} | debt: {debt}")
+
+
+def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]]) -> List[str]:
+    """``-- Phase --`` block: per-pipeline-phase progress (MONITOR-V2 1.1).
+
+    One line per phase whose artifact exists (Extraction / Translation /
+    R_editor / Audit / Repair / Re-audit). Absent artifacts are skipped so
+    generation-only or pre-B3 runs do not render dead phase lines.
+    """
+    lines = ["-- Phase --"]
+    line_builders = [
+        _phase_extraction,
+        lambda d: _phase_translation(d, events),
+        _phase_r_editor,
+        _phase_audit,
+        _phase_repair,
+        _phase_reaudit,
+    ]
+    rendered = [line for b in line_builders if (line := b(out_dir)) is not None]
+    if not rendered:
+        lines.append("  (нет Phase-артефактов: entity_context_cache.json / "
+                     "translations_raw.json / audit_cache_b3.json)")
+    else:
+        lines.extend(f"  {line}" for line in rendered)
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Local generation speed (MONITOR-V2 1.2) — from server_logs, local only
+# ---------------------------------------------------------------------------
+
+
+def _llama_ts_to_hms(prefix: str) -> str:
+    """llama.cpp log timestamp ``14.51.578.231`` -> ``14:51:57``.
+
+    The token after the seconds in llama.cpp's ``HH.MM.SS.mmm``-style log is
+    the millisecond fraction; the seconds themselves are the first two
+    digits of the third dot-group.
+    """
+    parts = prefix.split(".")
+    if len(parts) >= 3:
+        return f"{parts[0]}:{parts[1]}:{parts[2][:2]}"
+    return prefix
+
+
+def _server_speed_lines(out_dir: Path) -> List[str]:
+    """``-- скорость генерации (локальная) --`` block from server_logs.
+
+    MONITOR-V2 (1.2): local-only. Reads the newest ``Gemma_*`` / ``Qwen_*``
+    ``_stderr.log`` and parses llama-server ``slot print_timing`` lines
+    (eval / prompt tokens-per-second, live ``tg_3s``). Remote runs have no
+    local llama-server logs, so the block is not rendered at all.
+    """
+    logs_dir = out_dir / "server_logs"
+    if not logs_dir.is_dir():
+        return []
+    candidates = [
+        p for p in logs_dir.glob("*_stderr.log")
+        if p.name.split("_", 1)[0] in ("Gemma", "Qwen")
+    ]
+    if not candidates:
+        return []
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    model = newest.name.split("_", 1)[0].lower()  # gemma / qwen
+
+    eval_tps: Optional[float] = None
+    eval_n_decoded: Optional[int] = None
+    eval_ms: Optional[float] = None
+    eval_ts = ""
+    prompt_tps: Optional[float] = None
+    live_tg3s: Optional[float] = None
+    try:
+        for line in newest.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "slot print_timing" not in line:
+                continue
+            ts_match = line.split(" I ", 1)[0] if " I " in line else ""
+            m = re.search(r"n_decoded =\s*(\d+), tg =\s*([\d.]+) t/s, tg_3s =\s*([\d.]+) t/s", line)
+            if m:
+                live_tg3s = float(m.group(3))
+                continue
+            m = re.search(r"prompt eval time =\s*([\d.]+) ms / \s*(\d+) tokens \(\s*[\d.]+\s*ms per token,\s*([\d.]+) tokens per second\)", line)
+            if m:
+                prompt_tps = float(m.group(3))
+                continue
+            m = re.search(r"eval time =\s*([\d.]+) ms / \s*(\d+) tokens \(\s*[\d.]+\s*ms per token,\s*([\d.]+) tokens per second\)", line)
+            if m:
+                eval_ms = float(m.group(1))
+                eval_n_decoded = int(m.group(2))
+                eval_tps = float(m.group(3))
+                eval_ts = ts_match
+    except OSError:
+        return []
+
+    lines = ["-- скорость генерации (локальная, из server_logs) --"]
+    if eval_tps is None:
+        lines.append(f"  {model}: (нет завершённых eval в server_logs)")
+        return lines
+    prompt_txt = f"{prompt_tps:.1f}" if prompt_tps is not None else "n/a"
+    live_txt = f"{live_tg3s:.2f}" if live_tg3s is not None else "n/a"
+    lines.append(
+        f"  {model}: eval {eval_tps:.2f} t/s | prompt {prompt_txt} t/s "
+        f"| live tg_3s {live_txt} t/s"
+    )
+    eval_seconds = eval_ms / 1000.0
+    request_ts = _llama_ts_to_hms(eval_ts) if eval_ts else "?"
+    lines.append(
+        f"    n_decoded={eval_n_decoded}, eval {eval_seconds:.1f}s "
+        f"(запрос от {request_ts})"
+    )
+    return lines
+
+
+def _reasoning_growth(out_dir: Path, window: float = 1.0) -> Optional[Tuple[float, str]]:
+    """Live growth of the freshest ``*_reasoning.txt`` file (B/s) + label.
+
+    Read-only: samples the file size twice ``window`` seconds apart. Only
+    files modified within FRESHNESS_WINDOW_SECONDS count (live думание);
+    returns ``None`` when no reasoning file is being written.
+    """
+    now = time.time()
+    fresh = []
+    for p in out_dir.glob("*_reasoning.txt"):
+        try:
+            age = now - p.stat().st_mtime
+        except OSError:
+            continue
+        if age <= FRESHNESS_WINDOW_SECONDS:
+            fresh.append(p)
+    if not fresh:
+        return None
+    newest = max(fresh, key=lambda p: p.stat().st_mtime)
+    try:
+        size0 = newest.stat().st_size
+        time.sleep(window)
+        size1 = newest.stat().st_size
+    except OSError:
+        return None
+    rate = (size1 - size0) / window if window > 0 else 0.0
+    if rate <= 0:
+        return None
+    name = newest.name
+    label = name
+    for marker, human in (
+        ("b3_audit_chunk", "audit chunk "),
+        ("r_editor_chunk", "R_editor chunk "),
+        ("b3_repair_batch", "repair batch "),
+        ("b3_repair_reaudit_chunk", "re-audit chunk "),
+        ("whole_chapter", "whole chapter"),
+        ("b1.2_entity", "entity extraction"),
+    ):
+        if marker in name:
+            tail = name.split(marker, 1)[1].replace("_reasoning.txt", "")
+            label = human + tail.lstrip("_")
+            break
+    return rate, label
+
+
+def _local_thinking_lines(out_dir: Path) -> List[str]:
+    """``live думание`` line: growth of the reasoning trace (local only)."""
+    growth = _reasoning_growth(out_dir)
+    if growth is None:
+        return []
+    rate, label = growth
+    return [f"  live думание: reasoning.txt растёт {rate:.0f} B/s ({label})"]
+
+
+# ---------------------------------------------------------------------------
+# Last call (MONITOR-V2 1.5) — from usage.ndjson
+# ---------------------------------------------------------------------------
+
+
+def _last_call_block_lines(out_dir: Path) -> List[str]:
+    """``-- последний вызов (из usage.ndjson) --`` block (MONITOR-V2 1.5).
+
+    One line with the human phase, model, in/out/reasoning tokens and wall
+    seconds of the most recent usage row. Absent usage.ndjson -> no block.
+    """
+    rows = _read_usage_rows(out_dir)
+    if not rows:
+        return []
+    row = rows[-1]
+    label = row.get("label")
+    group = _label_group(label)
+    model = row.get("model") or row.get("model_ref") or "?"
+    inp = _as_int(row.get("input_tokens"))
+    out = _as_int(row.get("output_tokens"))
+    reas = _as_int(row.get("reasoning_tokens"))
+    wall = row.get("wall_seconds")
+    wall_txt = f"{_as_float(wall):.0f}" if wall is not None else "?"
+    return [
+        "-- последний вызов (из usage.ndjson) --",
+        f"  {group} | {model} | in={inp} out={out} reas={reas} | wall={wall_txt}s",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1137,6 +1733,17 @@ def render_report(out_dir: Path) -> str:
     lines.append(f"status: {_status_line(out_dir, events, phase)}")
     lines.append(f"phase: {phase} -- {phase_basis}")
 
+    # MONITOR-V2 (1.1/1.2): Phase block (per-pipeline-phase progress) right
+    # after the alive header, then the local generation-speed block (local
+    # runs only — remote runs never render a speed block).
+    lines.append("")
+    lines.extend(_phase_block_lines(out_dir, events))
+    speed_lines = _server_speed_lines(out_dir)
+    if speed_lines:
+        lines.append("")
+        lines.extend(speed_lines)
+        # MONITOR-V2 (1.2): live reasoning-trace growth, local only.
+        lines.extend(_local_thinking_lines(out_dir))
     lines.append("")
     lines.append("-- chunks (trial -> audit -> repair) --")
     if rows:
@@ -1210,6 +1817,11 @@ def render_report(out_dir: Path) -> str:
     lines.append("")
     lines.extend(_usage_block_lines(out_dir))
 
+    # MONITOR-V2 (1.5): last completed call block (only when usage.ndjson
+    # exists), placed right after the usage block.
+    lines.append("")
+    lines.extend(_last_call_block_lines(out_dir))
+
     lines.append("")
     lines.append("-- model activity --")
     # V4 monitor v2: primary liveness is the last usage.ndjson record
@@ -1257,7 +1869,7 @@ def _discover_chapters(out_base: Path) -> List[Path]:
 
 
 def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
-    """One row of the chapters table: id, chunks, step, status, calls, cost."""
+    """One row of the chapters table: id, chunks, step, status, calls, tokens, cost."""
     events = _load_events(chapter_dir)
     phase, _ = _detect_phase(chapter_dir, events)
 
@@ -1267,9 +1879,15 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
 
     usage = _read_usage_rows(chapter_dir)
     calls = len(usage)
-    costs = [float(row["reported_cost"]) for row in usage
+    costs = [_as_float(row.get("reported_cost")) for row in usage
              if row.get("reported_cost") is not None]
     cost = sum(costs)
+    # MONITOR-V2 (1.4): per-chapter token sums from usage.ndjson.
+    # MEDIUM (RV t_c9f9ea90): non-numeric token values count as 0 — a
+    # malformed-but-valid usage row never aborts the book table.
+    input_tokens = sum(_as_int(row.get("input_tokens")) for row in usage)
+    output_tokens = sum(_as_int(row.get("output_tokens")) for row in usage)
+    reasoning_tokens = sum(_as_int(row.get("reasoning_tokens")) for row in usage)
 
     if phase == "done":
         step = "8"
@@ -1307,6 +1925,9 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
         # non-zero provider cost: all 0/None -> hide the column gracefully
         # (spec), not "$0.00" noise.
         "cost_present": any(c != 0 for c in costs),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
         "events": events,
     }
 
@@ -1315,13 +1936,27 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     rows = [_chapter_summary_row(ch) for ch in chapters]
     total_calls = sum(r["calls"] for r in rows)
     total_cost = sum(r["cost"] for r in rows)
+    total_input = sum(r["input_tokens"] for r in rows)
+    total_output = sum(r["output_tokens"] for r in rows)
+    total_reasoning = sum(r["reasoning_tokens"] for r in rows)
     # Cost column only when at least one chapter actually reported a cost
     # (all 0/None -> hide gracefully, no "$0.00" noise).
     show_cost = any(r["cost_present"] for r in rows)
+    # MONITOR-V2 (1.4): token columns follow the same graceful rule — shown
+    # only when at least one chapter reported usage tokens.
+    show_input = any(r["input_tokens"] for r in rows)
+    show_output = any(r["output_tokens"] for r in rows)
+    show_reasoning = any(r["reasoning_tokens"] for r in rows)
 
     lines = [f"-- chapters ({len(chapters)}) {'-' * 56}"]
     header = (f"{'chapter_id':<24} {'chunks':>7} {'step':>5} {'status':<15}"
               f"{'calls':>7}")
+    if show_input:
+        header += f"{'input':>9}"
+    if show_output:
+        header += f"{'output':>9}"
+    if show_reasoning:
+        header += f"{'reasoning':>10}"
     if show_cost:
         header += f" {'cost(prov.)':>10}"
     lines.append(header)
@@ -1329,10 +1964,22 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
         status = _SHORT_STATUS.get(row["status"], row["status"])[:15]
         line = (f"{row['chapter_id']:<24} {row['chunks']:>7} {row['step']:>5}"
                 f" {status:<15}{row['calls']:>7}")
+        if show_input:
+            line += f"{_fmt_tokens(row['input_tokens']):>9}"
+        if show_output:
+            line += f"{_fmt_tokens(row['output_tokens']):>9}"
+        if show_reasoning:
+            line += f"{_fmt_tokens(row['reasoning_tokens']):>10}"
         if show_cost:
             line += f" {_fmt_cost_short(row['cost']):>10}"
         lines.append(line)
     total_line = (f"{'TOTAL':<24} {'':>7} {'':>5} {'':<15}{total_calls:>7}")
+    if show_input:
+        total_line += f"{_fmt_tokens(total_input):>9}"
+    if show_output:
+        total_line += f"{_fmt_tokens(total_output):>9}"
+    if show_reasoning:
+        total_line += f"{_fmt_tokens(total_reasoning):>10}"
     if show_cost:
         total_line += f" {_fmt_cost_short(total_cost):>10}"
     lines.append(total_line)

@@ -287,10 +287,48 @@ class LocalLifecycleCoordinator:
         self._descriptor = descriptor
         self._events: List[BackendEvent] = []
         self._closed = False
+        # MONITOR-V2 (2.3/2.4): EVERY local backend that serves this
+        # coordinator's calls — the LocalRoutingBackend registered by
+        # build_role_backend / composite build_runtime, plus (RV t_c9f9ea90
+        # HIGH #2) the Lifecycle* adapters of the legacy/default local path
+        # (build_strict_lifecycle) that own their OWN LocalOpenAIBackend
+        # instances. set_usage_writer forwards the per-call sink to all of
+        # them, so every completed local llama-server call lands in
+        # usage.ndjson regardless of which path created it.
+        self._usage_backends: List[Any] = []
 
     @property
     def router(self) -> ModelRouter:
         return self._router
+
+    def set_usage_backend(self, backend: Any) -> None:
+        """Register a local usage backend (idempotent)."""
+        if backend is not None and backend not in self._usage_backends:
+            self._usage_backends.append(backend)
+
+    def register_usage_backend(self, backend: Any) -> None:
+        """Register an additional local usage backend (legacy lifecycle
+        adapters that own their own ``LocalOpenAIBackend``).
+
+        Idempotent: the same adapter may be registered more than once (e.g.
+        a default local run wiring both build_role_backend and the injected
+        Lifecycle* adapters) — the sink is attached exactly once.
+        """
+        self.set_usage_backend(backend)
+
+    def set_usage_writer(self, writer: Any) -> None:
+        """Forward a usage writer to every registered local backend's sink.
+
+        Since MONITOR-V2 (2.3/2.4) local llama-server calls are journaled
+        like remote ones: the writer's ``write_call`` becomes the per-call
+        usage sink of every LocalRoutingBackend / Lifecycle* adapter
+        registered on this coordinator, so every completed local call lands
+        in ``usage.ndjson`` at the moment it finishes.
+        """
+        for backend in self._usage_backends:
+            sink = getattr(backend, "set_usage_sink", None)
+            if sink is not None:
+                sink(writer.write_call)
 
     def _sync(self) -> None:
         switches = self._router.switches
@@ -489,14 +527,18 @@ class CompositeRuntimeCoordinator:
         return self._backend
 
     def set_usage_writer(self, writer: Any) -> None:
-        """Forward the usage writer to the remote sub-coordinator.
+        """Forward the usage writer to the remote AND local sub-coordinators.
 
-        Local switch events are never written (the writer only accepts
-        remote-call events), so a composite run's local calls stay in
-        ``local_lifecycle`` exactly like a local-only run.
+        Since MONITOR-V2 (2.3), local llama-server calls are also journaled:
+        the writer is forwarded to the local sub-coordinator's per-call sink
+        (see ``LocalLifecycleCoordinator.set_usage_writer``) so a composite
+        run writes local usage rows exactly like a local-only run. Local
+        *switch* events stay filtered out by the writer itself.
         """
         if self._remote is not None:
             self._remote.set_usage_writer(writer)
+        if self._local is not None:
+            self._local.set_usage_writer(writer)
 
     @property
     def backend_descriptor(self) -> BackendDescriptor:

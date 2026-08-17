@@ -36,9 +36,12 @@ Line vocabulary (each line carries ``schema``, ``ts`` and per-call fields):
 * ``wall_seconds``, ``request_id``, ``session_id``, ``finish_reason``,
   ``retry_count``, ``error_class`` (failed calls only).
 
-Local llama-server calls are never written here: the runner only feeds
-``EVENT_KIND_REMOTE_CALL`` events, so local runs produce no ``usage.ndjson``
-(their lifecycle stays in ``local_lifecycle``).
+Local llama-server calls ARE written here since MONITOR-V2 (2.2): the
+coordinator's ``set_usage_writer`` now also feeds the local sub-backend's
+per-call sink (``KIND_LOCAL_LLAMA`` records), so local runs produce the
+same ``usage.ndjson`` as remote ones. Local *switch* events
+(``EVENT_KIND_LOCAL_SWITCH``) remain filtered out — only completed calls
+are journaled.
 """
 from __future__ import annotations
 
@@ -48,6 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from pact_v4.runtime.backend_protocol import KIND_LOCAL_LLAMA
 from pact_v4.runtime.runtime_coordinator import EVENT_KIND_REMOTE_CALL
 
 LOG = logging.getLogger(__name__)
@@ -204,12 +208,13 @@ class UsageRecordWriter:
         self._journaled = journaled
 
     def write_call(self, record: Any) -> None:
-        """Append one line for a completed remote call.
+        """Append one line for a completed backend call.
 
         ``record`` is a ``BackendCallRecord`` (from the backend's per-call
         usage sink) or a ``BackendEvent`` with ``kind ==
-        EVENT_KIND_REMOTE_CALL`` (coordinator path). Local switch events /
-        local lifecycle records are ignored so local runs never write usage.
+        EVENT_KIND_REMOTE_CALL`` (coordinator path) / ``KIND_LOCAL_LLAMA``
+        (local per-call sink). Local *switch* events and unknown kinds are
+        ignored so lifecycle transitions never create usage rows.
 
         Durable dedup: a call whose ``session_id`` + ``request_id`` identity
         is already journaled is skipped (no duplicate row). Identity-less
@@ -222,7 +227,7 @@ class UsageRecordWriter:
             # is a defensive guard for plain-dict callers.
             fields = record
             kind = fields.get("kind")
-            if kind is not None and kind != EVENT_KIND_REMOTE_CALL:
+            if kind is not None and kind not in (EVENT_KIND_REMOTE_CALL, KIND_LOCAL_LLAMA):
                 return
             label = fields.get("label")
             model_ref = fields.get("model_ref") or ""
@@ -231,7 +236,7 @@ class UsageRecordWriter:
             identity = self._row_identity(fields)
         else:
             kind = getattr(record, "kind", None)
-            if kind is not None and kind != EVENT_KIND_REMOTE_CALL:
+            if kind is not None and kind not in (EVENT_KIND_REMOTE_CALL, KIND_LOCAL_LLAMA):
                 return
             label = getattr(record, "label", None)
             model_ref = getattr(record, "model_ref", None) or ""
