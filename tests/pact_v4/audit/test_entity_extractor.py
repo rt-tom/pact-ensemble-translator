@@ -632,6 +632,123 @@ def test_parse_model_output_rejects_fences_and_malformed():
 
 
 # ---------------------------------------------------------------------------
+# t_83bab286: entity-context output shape — prompt contract and bare-array
+# normalization
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_requires_object_not_bare_array():
+    """Prompt contract: the instructions must require a JSON object with
+    'entities' key and must NOT tell the model to return a bare array."""
+    source = _source_0001()
+    prompt = render_entity_extraction_prompt(
+        chapter_id=source.chapter_id, source=dict(source.source)
+    )
+    # Must require object shape
+    assert '"entities"' in prompt
+    assert "JSON object" in prompt
+    # Must NOT instruct bare array
+    assert "ONLY the top-level" not in prompt
+    assert "entities array" not in prompt.replace(
+        "entities: array of objects", ""
+    ).replace("top-level \"entities\" key", "")
+    # Must explicitly warn against bare array
+    assert "bare JSON array" in prompt.lower() or "bare json array" in prompt.lower()
+
+
+def test_parse_model_output_bare_array_normalizes_to_object():
+    """Bare array of valid entity objects → normalized to {"entities": list}."""
+    entities = [
+        {
+            "entity": "test",
+            "canonical_type": "thing",
+            "anchor": {"pid": "p00001", "span": "thing"},
+            "aliases": [],
+            "claims": [],
+        }
+    ]
+    raw = json.dumps(entities, ensure_ascii=False)
+    result = parse_model_output(raw)
+    assert result == {"entities": entities}
+    assert isinstance(result, dict)
+    assert "entities" in result
+
+
+def test_parse_model_output_bare_array_empty_fails_closed():
+    """Empty bare array → ValueError (not silently accepted)."""
+    with pytest.raises(ValueError, match="empty"):
+        parse_model_output("[]")
+
+
+def test_parse_model_output_bare_array_with_scalar_fails_closed():
+    """Bare array with non-object element → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output('[1, 2, 3]')
+
+
+def test_parse_model_output_bare_array_with_string_fails_closed():
+    """Bare array with string elements → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output('["hello", "world"]')
+
+
+def test_parse_model_output_bare_array_with_null_fails_closed():
+    """Bare array with null element → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output("[null]")
+
+
+def test_parse_model_output_bare_array_with_nested_array_fails_closed():
+    """Bare array with nested array → ValueError."""
+    with pytest.raises(ValueError, match="not an object"):
+        parse_model_output("[[1, 2]]")
+
+
+def test_parse_model_output_valid_object_unchanged():
+    """Existing valid object shape passes through unchanged."""
+    payload = {"entities": [{"entity": "x"}]}
+    assert parse_model_output(json.dumps(payload)) == payload
+
+
+def test_parse_model_output_bare_array_normalized_log(caplog):
+    """Bare array normalization emits a diagnostic LOG.info."""
+    import logging
+
+    entities = [{"entity": "x", "canonical_type": "y",
+                 "anchor": {"pid": "p00001", "span": "y"},
+                 "aliases": [], "claims": []}]
+    with caplog.at_level(logging.INFO, logger="pact_v4.audit.entity_extractor"):
+        result = parse_model_output(json.dumps(entities))
+    assert result == {"entities": entities}
+    assert any("bare JSON array" in r.message for r in caplog.records)
+
+
+def test_bare_array_flows_through_extract_entity_context():
+    """Integration: a bare-array model response is normalized, stamped,
+    validated, and produces a correct EntityExtractionResult."""
+    source = _source_0001()
+    gold = _gold_payload_0001(source)
+    # The model body is a bare array (not wrapped in {"entities": ...}).
+    bare_array_body = json.dumps(gold["entities"], ensure_ascii=False)
+    extractor = _RecordingExtractor(json.loads(bare_array_body))
+    # Override __call__ to return the bare array (not the wrapped object).
+    original_call = extractor.__call__
+
+    def _bare_call(*, chapter_id, source, out_dir=None):
+        extractor.calls += 1
+        return bare_array_body
+
+    extractor.__call__ = _bare_call
+
+    result = extract_entity_context(source_artifact=source, extractor=extractor)
+    assert result.from_cache is False
+    assert result.validation.is_clean()
+    assert len(result.context.entities) == 2
+    assert result.context.chapter_id == source.chapter_id
+    assert result.context.source_hash == source.source_hash
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle wiring: Qwen resident before every extraction call (existing
 # LifecycleAdapter/ModelRouter path — no new spawn code).
 # ---------------------------------------------------------------------------
