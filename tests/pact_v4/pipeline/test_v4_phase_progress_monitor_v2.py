@@ -611,3 +611,232 @@ def test_cli_requires_exactly_one_target(tmp_path: Path):
     assert rc == 0
     after = {p.name: (p.stat().st_mtime_ns, p.stat().st_size) for p in out.iterdir()}
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# RV t_c9f9ea90 HIGH #1: incremental B3 stage_progress fallback in the Phase
+# block (KILL-SAFE-INCREMENTAL cache shape, t_2d16962c)
+# ---------------------------------------------------------------------------
+
+
+def _stage_progress_cache() -> dict:
+    """A realistic KILL-SAFE-INCREMENTAL ``audit_cache_b3.json`` payload.
+
+    Live slices live under ``stage_progress`` (r_editor / audit / repair /
+    reaudit); the final top-level keys (r_editor / chunks / repair) are
+    ABSENT, so the Phase builders must fall back to the live slices.
+    """
+    return {
+        "schema": "pact-v4-b3-audit-cache/v1",
+        "snapshot_hash": "s", "translation_hash": "t",
+        "config_identity": "c", "backend_identity_hash": "b",
+        "entity_context_enabled": True,
+        "audit_complete": False,
+        "translations_repaired": {},
+        "translations_repaired_hash": "h",
+        # R in progress: 3 of 5 chunks done, 2 of those GOOD with edits.
+        "stage_progress": {
+            "r_editor": {
+                "status": "partial", "enabled": True,
+                "done_chunks": [1, 2, 3], "failed_chunks": [],
+                "outcome": {
+                    "chunk_size": 50,
+                    "chunks": [
+                        {"chunk": 1, "first_pid": "p00001", "last_pid": "p00050",
+                         "status": "GOOD",
+                         "edits": [
+                             {"pid": "p00003", "original": "x", "rewritten": "y",
+                              "reason": "r", "class": "typo"},
+                             {"pid": "p00003", "original": "x", "rewritten": "y",
+                              "reason": "r", "class": "grammar"},
+                         ]},
+                        {"chunk": 2, "first_pid": "p00051", "last_pid": "p00100",
+                         "status": "GOOD",
+                         "edits": [
+                             {"pid": "p00060", "original": "x", "rewritten": "y",
+                              "reason": "r", "class": "calque"},
+                         ]},
+                        {"chunk": 3, "first_pid": "p00101", "last_pid": "p00150",
+                         "status": "GOOD", "edits": []},
+                    ],
+                },
+            },
+            "audit": {
+                "status": "partial",
+                "done_chunks": [1, 2], "failed_chunks": [],
+                "chunks": [
+                    {"chunk": 1, "first_pid": "p00001", "last_pid": "p00100",
+                     "pair_count": 100, "context_count": 0, "status": "GOOD",
+                     "finish_reason": "stop", "reasoning_chars": 0,
+                     "reasoning_file": "b3_audit_chunk1_raw.txt", "issue_count": 3},
+                    {"chunk": 2, "first_pid": "p00101", "last_pid": "p00200",
+                     "pair_count": 100, "context_count": 0, "status": "GOOD",
+                     "finish_reason": "stop", "reasoning_chars": 0,
+                     "reasoning_file": "b3_audit_chunk2_raw.txt", "issue_count": 1},
+                ],
+                "issues": [
+                    {"id": "i1", "category": "addition", "severity": "major",
+                     "confidence": "high"},
+                    {"id": "i2", "category": "omission", "severity": "minor",
+                     "confidence": "medium"},
+                ],
+            },
+            "repair": {
+                "status": "partial",
+                "done_batches": [1, 2],
+                "committed": {"p00001": "исправлено 1.", "p00002": "исправлено 2."},
+                "passed": ["p00003"],
+                "outcome": {
+                    "batch_count": 4,
+                    "batches": [
+                        {"batch_index": 1, "status": "GOOD",
+                         "findings": [{"index": 1, "pid": "p00001"}],
+                         "results": [{"index": 1, "decision": "repair",
+                                      "pid": "p00001", "repaired_translation": "1",
+                                      "reason": ""}],
+                         "error": "", "warnings": [], "missing_indices": []},
+                        {"batch_index": 2, "status": "GOOD",
+                         "findings": [{"index": 1, "pid": "p00002"}],
+                         "results": [{"index": 1, "decision": "repair",
+                                      "pid": "p00002", "repaired_translation": "2",
+                                      "reason": ""}],
+                         "error": "", "warnings": [], "missing_indices": []},
+                    ],
+                },
+            },
+            "reaudit": {
+                "status": "partial",
+                "done_chunks": [
+                    {"chunk": 1, "first_pid": "p00001", "last_pid": "p00100",
+                     "issues": [], "failed": False},
+                ],
+                "issues": [{"id": "r1"}],
+            },
+        },
+    }
+
+
+def test_phase_block_renders_incremental_stage_progress(tmp_path: Path):
+    """RV HIGH #1: an active KILL-SAFE-INCREMENTAL run renders live R_editor /
+    Audit / Repair / Re-audit progress from ``stage_progress`` — not the
+    ``(нет Phase-артефактов...)`` placeholder that ignored the nested slices.
+    Exact K/N and counters come from the partial lists.
+    """
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", _stage_progress_cache())
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+
+    assert lines[0] == "-- Phase --"
+    # R_editor: 3 done chunks; 2 SAFE edits (typo, grammar) + 1 REVIEW (calque).
+    assert "R_editor: chunks done=3 | safe (применено)=2 | review (предложено)=1" in text
+    # Audit: 2 done chunks, findings [3, 1], всего = 2 issues so far.
+    assert "Audit: chunks done=2 | findings per chunk: [3, 1] | всего 2" in text
+    # Repair: 2 done batches of batch_count 4, committed 2.
+    assert ("Repair: batches done=2/4 | repaired per batch: [1/1, 1/1] "
+            "| total 2") in text
+    # Re-audit: 1 done chunk, residual 1 issue, no failed marker -> debt 0.
+    assert "Re-audit: chunks done=1 | residual: 1 | debt: 0" in text
+    assert "(нет Phase-артефактов" not in text
+
+
+def test_phase_block_final_cache_output_preserved(tmp_path: Path):
+    """RV HIGH #1: the historical FINAL-cache shape (top-level r_editor /
+    chunks / repair) still renders exactly as before — the stage_progress
+    fallback must not change final-cache output."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _phase_mock_artifacts(out)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "R_editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
+    assert "Audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
+    assert "Repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | total 2/4" in text
+    assert "Re-audit: chunks done=2/2 | residual: 1 | debt: 0" in text
+
+
+# ---------------------------------------------------------------------------
+# RV t_c9f9ea90 MEDIUM #3: graceful degradation — corrupt/empty/ambiguous
+# inputs render an unavailable/invalid diagnostic, never an abort.
+# ---------------------------------------------------------------------------
+
+
+def test_phase_block_tolerates_invalid_utf8_json(tmp_path: Path):
+    """Invalid UTF-8 bytes in a Phase artifact must not raise
+    UnicodeDecodeError; the line degrades to unavailable."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "entity_context_cache.json").write_bytes(b"\xff\xfe{\"entries\": []}")
+    (out / "translations_raw.json").write_bytes(b"\xff{\"p1\": \"text\"}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Neither artifact is readable — block renders, proving no abort.
+    assert "-- Phase --" in text
+
+
+def test_phase_block_tolerates_malformed_schema(tmp_path: Path):
+    """Structurally-valid JSON with a malformed schema (entries:[1],
+    chunks:[1], non-numeric word_counts) must not raise AttributeError /
+    ValueError — the affected lines degrade gracefully."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json", {"entries": [1]})
+    _write(out / "translations_raw.json", {"p1": "текст абзаца"})
+    _write(out / "chunk_plan.json", {"chunks": [
+        {"chunk_id": "c1", "word_counts": ["abc", 5]},
+        7,  # a non-object chunk -> skipped
+    ]})
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {"chunk_count": 2, "chunks": [1]}},
+        "chunks": [1, {"chunk": 2, "issue_count": 3}],
+        "issue_count": 3,
+        "repair": {"batches": [1, {"batch_index": 2, "findings": [],
+                                   "results": []}],
+                   "eligible_count": 1},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Malformed pieces are skipped; readable data still renders — no abort.
+    assert "-- Phase --" in text
+    # Extraction with entries=[1] yields no entities -> line absent.
+    assert "Extraction:" not in text
+    # word_counts with a non-numeric value counts it as 0, the numeric one as 5.
+    assert "Translation:" in text and "5 слов" in text
+
+
+def test_usage_block_tolerates_corrupt_ndjson(tmp_path: Path):
+    """Invalid UTF-8 / malformed rows in usage.ndjson render an invalid
+    diagnostic instead of raising UnicodeDecodeError / AttributeError."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / USAGE_FILENAME).write_bytes(
+        b'{"schema":"x","label":"phase2b/a","input_tokens":1}\n'
+        b"\xff\xfe{\"garbage\"}\n"
+        b"[1, 2, 3]\n"
+        b'{"schema":"x","label":"phase2b/b","input_tokens":"abc"}\n'
+    )
+    lines = tracker._usage_block_lines(out)
+    text = "\n".join(lines)
+    # Two valid rows survive (the non-object row and garbage are skipped);
+    # the non-numeric token counts as 0.
+    assert "Translation" in text
+    assert "calls" in text
+    assert "2" in text
+
+    # Last-call block also degrades on the malformed-but-valid row.
+    last = tracker._last_call_block_lines(out)
+    assert isinstance(last, list)
+
+
+def test_usage_block_distinguishes_corrupt_vs_absent(tmp_path: Path):
+    """MEDIUM #3: a corrupt usage.ndjson that yields no readable rows is
+    reported as corrupt, while an absent file keeps the 'no usage yet'
+    wording."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / USAGE_FILENAME).write_bytes(b"\xff\xfe not json \x00")
+    lines = tracker._usage_block_lines(out)
+    assert any("corrupt" in l or "no readable rows" in l for l in lines)

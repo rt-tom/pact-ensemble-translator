@@ -130,6 +130,21 @@ class LifecycleModelCaller:
         if setter is not None:
             setter(sink)
 
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to the wrapped
+        ``HttpModelCaller``'s LocalOpenAIBackend (the V4 provider boundary).
+
+        RV t_c9f9ea90 HIGH #2: the legacy/default local path
+        (``build_strict_lifecycle``) builds these Lifecycle adapters with
+        their OWN LocalOpenAIBackend instances — the coordinator must reach
+        them through ``set_usage_sink`` so every completed generation call
+        lands in ``usage.ndjson``.
+        """
+        backend = getattr(self._caller, "backend", None)
+        setter = getattr(backend, "set_usage_sink", None)
+        if setter is not None:
+            setter(sink)
+
 
 class LifecycleQwenEvaluator:
     """``QwenEvaluator`` that ensures Qwen is resident before every call."""
@@ -156,6 +171,16 @@ class LifecycleQwenEvaluator:
     def __call__(self, source: Mapping[str, str], translation: Mapping[str, str]) -> GateResult:
         self._router.ensure_resident(QWEN_MODEL_KEY)
         return self._evaluator(source, translation)
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to the wrapped
+        ``HttpQwenEvaluator``'s LocalOpenAIBackend (legacy/default local path
+        wiring, RV t_c9f9ea90 HIGH #2 — see ``LifecycleModelCaller``)."""
+        impl = getattr(self._evaluator, "impl", None)
+        backend = getattr(impl, "backend", None)
+        setter = getattr(backend, "set_usage_sink", None)
+        if setter is not None:
+            setter(sink)
 
 
 class LifecycleGemmaSelector:
@@ -184,6 +209,16 @@ class LifecycleGemmaSelector:
     ) -> GateResult:
         self._router.ensure_resident(GEMMA_MODEL_KEY)
         return self._selector(candidates)
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to the wrapped
+        ``HttpGemmaSelector``'s LocalOpenAIBackend (legacy/default local path
+        wiring, RV t_c9f9ea90 HIGH #2 — see ``LifecycleModelCaller``)."""
+        impl = getattr(self._selector, "impl", None)
+        backend = getattr(impl, "backend", None)
+        setter = getattr(backend, "set_usage_sink", None)
+        if setter is not None:
+            setter(sink)
 
 
 class LifecycleQwenAuditEvaluator:
@@ -277,6 +312,14 @@ class LifecycleQwenAuditEvaluator:
             )
         return self._evaluator(chunk_id=chunk_id, source=source, translation=translation)
 
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to this
+        adapter's OWN LocalOpenAIBackend (legacy/default local path wiring,
+        RV t_c9f9ea90 HIGH #2 — see ``LifecycleModelCaller``)."""
+        setter = getattr(self._backend, "set_usage_sink", None)
+        if setter is not None:
+            setter(sink)
+
 
 class LifecycleGemmaAuditEvaluator:
     """``GemmaAuditEvaluator`` (Phase 3B Step 6) over the router's Gemma.
@@ -296,9 +339,11 @@ class LifecycleGemmaAuditEvaluator:
             context_size=32768,
             temperature=0.0,
         )
-        backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
+        # MONITOR-V2 (2.4): keep the owned LocalOpenAIBackend so
+        # set_usage_sink can reach it (legacy/default local path wiring).
+        self._backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
         self._evaluator = BackendGemmaAuditEvaluator(
-            backend,
+            self._backend,
             config=BackendGemmaAuditEvaluatorConfig(
                 max_tokens=cfg.max_tokens, template=cfg.template, label=cfg.label,
                 bible_text=cfg.bible_text,
@@ -308,6 +353,14 @@ class LifecycleGemmaAuditEvaluator:
     def __call__(self, *, chunk_id: str, translation: Mapping[str, str]) -> str:
         self._router.ensure_resident(GEMMA_MODEL_KEY)
         return self._evaluator(chunk_id=chunk_id, translation=translation)
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to this
+        adapter's OWN LocalOpenAIBackend (legacy/default local path wiring,
+        RV t_c9f9ea90 HIGH #2 — see ``LifecycleModelCaller``)."""
+        setter = getattr(self._backend, "set_usage_sink", None)
+        if setter is not None:
+            setter(sink)
 
 
 class LifecycleQwenEntityExtractor:
@@ -338,6 +391,9 @@ class LifecycleQwenEntityExtractor:
             temperature=0.0,
         )
         backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
+        # MONITOR-V2 (2.4): keep the owned LocalOpenAIBackend so
+        # set_usage_sink can reach it (legacy/default local path wiring).
+        self._backend = backend
         self._extractor = BackendEntityExtractor(
             backend,
             config=BackendEntityExtractorConfig(
@@ -356,6 +412,14 @@ class LifecycleQwenEntityExtractor:
         return self._extractor(
             chapter_id=chapter_id, source=source, out_dir=out_dir
         )
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to this
+        adapter's OWN LocalOpenAIBackend (legacy/default local path wiring,
+        RV t_c9f9ea90 HIGH #2 — see ``LifecycleModelCaller``)."""
+        setter = getattr(self._backend, "set_usage_sink", None)
+        if setter is not None:
+            setter(sink)
 
 
 class LifecycleSelectiveRepairEvaluator:
@@ -419,6 +483,10 @@ class LifecycleSelectiveRepairEvaluator:
         reaudit_backend = LocalOpenAIBackend(
             api=ApiClient(reaudit_api, name="b2_reaudit_scope")
         )
+        # MONITOR-V2 (2.4): keep the owned LocalOpenAIBackend instances so
+        # set_usage_sink can reach BOTH (legacy/default local path wiring).
+        self._repair_backend = repair_backend
+        self._reaudit_backend = reaudit_backend
         self._evaluator = SelectiveRepairEvaluator(
             repair_backend,
             reaudit_backend=reaudit_backend,
@@ -451,3 +519,15 @@ class LifecycleSelectiveRepairEvaluator:
             self._router.ensure_resident(QWEN_MODEL_KEY)
         else:
             self._router.ensure_resident(GEMMA_MODEL_KEY)
+
+    def set_usage_sink(self, sink: Any) -> None:
+        """MONITOR-V2 (2.4): forward the per-call usage sink to BOTH owned
+        LocalOpenAIBackend instances (repair generator + reaudit auditor).
+
+        Legacy/default local path wiring (RV t_c9f9ea90 HIGH #2 — see
+        ``LifecycleModelCaller``).
+        """
+        for backend in (self._repair_backend, self._reaudit_backend):
+            setter = getattr(backend, "set_usage_sink", None)
+            if setter is not None:
+                setter(sink)

@@ -2576,6 +2576,18 @@ def run_chapter_strict(
     # sub-coordinator forwards the writer too (LocalLifecycleCoordinator
     # gained set_usage_writer), so local llama-server calls are journaled
     # exactly like remote ones.
+    # MONITOR-V2 (2.4, RV t_c9f9ea90 HIGH #2): the injected lifecycle
+    # adapters (legacy/default local path — build_strict_lifecycle over the
+    # router) each own their OWN LocalOpenAIBackend that is NOT the
+    # coordinator's registered LocalRoutingBackend, so register them on the
+    # local coordinator before attaching the writer; every completed local
+    # call then lands in usage.ndjson no matter which path built the backend.
+    register = getattr(runtime, "register_usage_backend", None)
+    if register is not None:
+        for adapter in (model_caller, qwen_evaluator, gemma_selector,
+                        qwen_audit_evaluator, gemma_audit_evaluator):
+            if adapter is not None and hasattr(adapter, "set_usage_sink"):
+                register(adapter)
     attach = getattr(runtime, "set_usage_writer", None)
     if attach is not None:
         attach(usage_writer)

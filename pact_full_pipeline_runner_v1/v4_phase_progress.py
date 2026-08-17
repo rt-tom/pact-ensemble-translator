@@ -148,16 +148,25 @@ def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     rows: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
         except json.JSONDecodeError:
             # Crash-safe: a partial trailing line (crash mid-write) must not
             # break the read -- skip it.
             continue
+        # MEDIUM (RV t_c9f9ea90): a structurally valid JSON line that is not
+        # an object (e.g. ``[1]``) must not reach a caller that does
+        # ``row.get(...)`` — skip it, the artifact stays diagnostic.
+        if isinstance(row, dict):
+            rows.append(row)
     return rows
 
 
@@ -165,8 +174,15 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        # MEDIUM (RV t_c9f9ea90): invalid UTF-8 (errors="replace" above
+        # already degrades the bytes) and malformed JSON render an
+        # unavailable artifact, never an abort.
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -950,10 +966,13 @@ def _usage_group_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                           "cached_input_tokens", "cached_write_tokens"):
             value = row.get(token_key)
             if value is not None:
-                bucket[token_key] += int(value)
+                # MEDIUM (RV t_c9f9ea90): a non-numeric token value in a
+                # structurally-valid row (e.g. ``"input_tokens": "abc"``)
+                # counts as 0 — the aggregate stays readable, never aborts.
+                bucket[token_key] += _as_int(value)
         cost = row.get("reported_cost")
         if cost is not None:
-            bucket["reported_cost"] += float(cost)
+            bucket["reported_cost"] += _as_float(cost)
             bucket["has_cost"] = True
     return list(buckets.values())
 
@@ -997,6 +1016,12 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
     """``-- usage by step x model --`` block (from usage.ndjson)."""
     rows = _read_usage_rows(out_dir)
     if not rows:
+        # MEDIUM (RV t_c9f9ea90): distinguish "never written" from
+        # "exists but corrupt/unreadable" — both render a diagnostic, never
+        # an abort.
+        if (out_dir / USAGE_FILENAME).exists():
+            return ["-- usage by step x model (из usage.ndjson) --",
+                    "  (usage.ndjson exists but no readable rows — corrupt/invalid)"]
         return ["-- usage by step x model --", "  (no usage.ndjson yet)"]
     groups = _usage_group_rows(rows)
     totals = _usage_totals(groups)
@@ -1050,15 +1075,57 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _stage_progress_slice(cache: Dict[str, Any], stage: str) -> Optional[Dict[str, Any]]:
+    """The KILL-SAFE-INCREMENTAL ``stage_progress`` slice for one B3 stage.
+
+    ``audit_cache_b3.json`` has two shapes:
+    * final cache: per-stage results at TOP level (``r_editor`` /
+      ``chunks`` / ``repair`` / ``repair.reaudit``) — the historical shape;
+    * incremental (KILL-SAFE-INCREMENTAL, t_2d16962c): live per-stage
+      payloads under ``stage_progress.<stage>`` (r_editor / audit / repair /
+      reaudit), rewritten after every chunk/batch.
+
+    Returns the incremental slice (validated as an object) or ``None`` when
+    the cache is a final cache (or the stage never ran). The Phase builders
+    prefer the final top-level fields and fall back to this slice so an
+    active incremental run shows live Audit/Repair/Re-audit progress
+    (RV t_c9f9ea90 HIGH #1).
+    """
+    stage_progress = cache.get("stage_progress")
+    if not isinstance(stage_progress, dict):
+        return None
+    slice_ = stage_progress.get(stage)
+    return slice_ if isinstance(slice_, dict) else None
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Tolerant int for monitor counters: ``None``/non-numeric render 0."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Tolerant float for monitor counters (wall seconds, costs)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _phase_extraction(out_dir: Path) -> Optional[str]:
     """Extraction line from ``entity_context_cache.json`` (read-only)."""
     payload = _read_json(out_dir / "entity_context_cache.json")
     if not payload:
         return None
-    entries = payload.get("entries") or []
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return None
     entities = [
         ent
         for entry in entries
+        if isinstance(entry, dict)
         for ent in ((entry.get("context") or {}).get("entities") or [])
     ]
     if not entities:
@@ -1066,21 +1133,31 @@ def _phase_extraction(out_dir: Path) -> Optional[str]:
     verified = 0
     candidate = 0
     for ent in entities:
+        if not isinstance(ent, dict):
+            continue
         anchor = ent.get("anchor") or {}
+        if not isinstance(anchor, dict):
+            anchor = {}
         if anchor.get("status") == "verified":
             verified += 1
         elif anchor.get("status") == "candidate":
             candidate += 1
-        for alias in ent.get("aliases") or []:
-            if alias.get("status") == "verified":
-                verified += 1
-            elif alias.get("status") == "candidate":
-                candidate += 1
-        for claim in ent.get("claims") or []:
-            if claim.get("status") == "verified":
-                verified += 1
-            elif claim.get("status") == "candidate":
-                candidate += 1
+        aliases = ent.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if isinstance(alias, dict):
+                    if alias.get("status") == "verified":
+                        verified += 1
+                    elif alias.get("status") == "candidate":
+                        candidate += 1
+        claims = ent.get("claims")
+        if isinstance(claims, list):
+            for claim in claims:
+                if isinstance(claim, dict):
+                    if claim.get("status") == "verified":
+                        verified += 1
+                    elif claim.get("status") == "candidate":
+                        candidate += 1
     return (f"Extraction: сущностей: {len(entities)} "
             f"| claims: verified {verified} / candidate {candidate}")
 
@@ -1093,8 +1170,15 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[
     plan = _read_json(out_dir / "chunk_plan.json")
     source_words = 0
     if plan:
-        for chunk in plan.get("chunks") or []:
-            source_words += sum(int(w) for w in (chunk.get("word_counts") or []))
+        chunks = plan.get("chunks")
+        if isinstance(chunks, list):
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                word_counts = chunk.get("word_counts")
+                if isinstance(word_counts, list):
+                    for w in word_counts:
+                        source_words += _as_int(w)
     translation_words = sum(
         len(str(value).split()) for value in raw.values()
     )
@@ -1105,85 +1189,217 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[
 
 
 def _phase_r_editor(out_dir: Path) -> Optional[str]:
-    """R_editor line from ``audit_cache_b3.json`` r_editor.outcome."""
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
-        return None
-    r_editor = cache.get("r_editor") or {}
-    outcome = r_editor.get("outcome")
-    if not isinstance(outcome, dict):
-        return None
-    chunk_count = outcome.get("chunk_count")
-    if not chunk_count:
-        return None
-    done = outcome.get("successful_chunks")
-    if done is None:
-        chunks = outcome.get("chunks") or []
-        done = sum(1 for c in chunks if (c.get("status") or "").upper() in ("GOOD", "GOOD_RETRIED"))
-    applied = len(outcome.get("applied") or [])
-    candidates = len(outcome.get("candidates") or [])
-    return (f"R_editor: chunks done={done}/{chunk_count} "
-            f"| safe (применено)={applied} | review (предложено)={candidates}")
+    """R_editor line from ``audit_cache_b3.json``.
 
-
-def _phase_audit(out_dir: Path) -> Optional[str]:
-    """Audit line from ``audit_cache_b3.json`` chunks issue_count."""
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
-        return None
-    chunks = cache.get("chunks") or []
-    if not chunks:
-        return None
-    total = cache.get("issue_count") or 0
-    findings = [int(c.get("issue_count") or 0) for c in chunks]
-    return (f"Audit: chunks done={len(chunks)}/{len(chunks)} "
-            f"| findings per chunk: {findings} | всего {total}")
-
-
-def _phase_repair(out_dir: Path) -> Optional[str]:
-    """Repair line from ``audit_cache_b3.json`` repair.batches."""
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
-        return None
-    repair = cache.get("repair") or {}
-    batches = repair.get("batches") or []
-    if not batches:
-        return None
-    per_batch = []
-    for batch in batches:
-        findings = len(batch.get("findings") or [])
-        repaired = sum(
-            1 for r in (batch.get("results") or [])
-            if (r.get("decision") or "").lower() == "repair"
-        )
-        per_batch.append(f"{repaired}/{findings}")
-    committed = len(repair.get("committed") or [])
-    eligible = repair.get("eligible_count") or 0
-    return (f"Repair: batches done={len(batches)}/{len(batches)} "
-            f"| repaired per batch: [{', '.join(per_batch)}] "
-            f"| total {committed}/{eligible}")
-
-
-def _phase_reaudit(out_dir: Path) -> Optional[str]:
-    """Re-audit line from ``audit_cache_b3.json`` repair.reaudit.
-
-    Re-audit is chunked (REPAIR-CTX): done = persisted reaudit chunk raw
-    artifacts (``b3_repair_reaudit_chunk*_raw.txt``), residual = remaining
-    issues, debt = 1 when the re-audit pass failed (unfinished debt).
+    Final cache: top-level ``r_editor.outcome`` (chunk_count /
+    successful_chunks / applied / candidates). Incremental cache:
+    ``stage_progress.r_editor`` (status / done_chunks / outcome.chunks with
+    per-chunk edits) — the live fallback (RV t_c9f9ea90 HIGH #1).
     """
     cache = _read_json(out_dir / "audit_cache_b3.json")
     if not cache:
         return None
-    repair = cache.get("repair") or {}
-    reaudit = repair.get("reaudit")
-    if not isinstance(reaudit, dict):
+    r_editor = cache.get("r_editor")
+    if isinstance(r_editor, dict):
+        outcome = r_editor.get("outcome")
+        if isinstance(outcome, dict):
+            chunk_count = outcome.get("chunk_count")
+            if chunk_count:
+                done = outcome.get("successful_chunks")
+                if done is None:
+                    chunks = outcome.get("chunks")
+                    if isinstance(chunks, list):
+                        done = sum(
+                            1 for c in chunks
+                            if isinstance(c, dict)
+                            and (c.get("status") or "").upper()
+                            in ("GOOD", "GOOD_RETRIED")
+                        )
+                applied = len(outcome.get("applied") or [])
+                candidates = len(outcome.get("candidates") or [])
+                return (f"R_editor: chunks done={done}/{chunk_count} "
+                        f"| safe (применено)={applied} | review (предложено)={candidates}")
+    # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
+    stage = _stage_progress_slice(cache, "r_editor")
+    if stage is None:
         return None
-    chunk_files = sorted(out_dir.glob("b3_repair_reaudit_chunk*_raw.txt"))
-    total = len(chunk_files)
-    done = total if reaudit.get("complete") else 0
-    residual = len(reaudit.get("issues") or [])
-    debt = 1 if reaudit.get("failed") else 0
-    return (f"Re-audit: chunks done={done}/{total} "
+    done_chunks = stage.get("done_chunks")
+    if not isinstance(done_chunks, list) or not done_chunks:
+        return None
+    done = len(done_chunks)
+    # The incremental payload does not persist the planned chunk_count (only
+    # chunk_size + the done chunk records), so the live line renders the
+    # exact done count without a fabricated denominator.
+    applied = 0
+    candidates = 0
+    outcome = stage.get("outcome")
+    if isinstance(outcome, dict):
+        chunks = outcome.get("chunks")
+        if isinstance(chunks, list):
+            # Lazy import: the class sets live in the audit module (single
+            # source of truth — never duplicated here); pulled only when the
+            # incremental R fallback actually needs them.
+            from pact_v4.audit.russian_editor import REVIEW_CLASSES, SAFE_CLASSES
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                edits = chunk.get("edits")
+                if not isinstance(edits, list):
+                    continue
+                for edit in edits:
+                    if not isinstance(edit, dict):
+                        continue
+                    if edit.get("class") in SAFE_CLASSES:
+                        applied += 1
+                    elif edit.get("class") in REVIEW_CLASSES:
+                        candidates += 1
+    return (f"R_editor: chunks done={done} "
+            f"| safe (применено)={applied} | review (предложено)={candidates}")
+
+
+def _phase_audit(out_dir: Path) -> Optional[str]:
+    """Audit line from ``audit_cache_b3.json``.
+
+    Final cache: top-level ``chunks`` + ``issue_count``. Incremental cache:
+    ``stage_progress.audit`` (done_chunks / chunks / issues) — live fallback.
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    chunks = cache.get("chunks")
+    if isinstance(chunks, list) and chunks:
+        total = _as_int(cache.get("issue_count"))
+        findings: List[int] = []
+        for c in chunks:
+            if isinstance(c, dict):
+                findings.append(_as_int(c.get("issue_count")))
+        return (f"Audit: chunks done={len(chunks)}/{len(chunks)} "
+                f"| findings per chunk: {findings} | всего {total}")
+    stage = _stage_progress_slice(cache, "audit")
+    if stage is None:
+        return None
+    done_chunks = stage.get("done_chunks")
+    if not isinstance(done_chunks, list) or not done_chunks:
+        return None
+    stage_chunks = stage.get("chunks")
+    findings = []
+    if isinstance(stage_chunks, list):
+        for c in stage_chunks:
+            if isinstance(c, dict):
+                findings.append(_as_int(c.get("issue_count")))
+    issues = stage.get("issues")
+    total = len(issues) if isinstance(issues, list) else sum(findings)
+    return (f"Audit: chunks done={len(done_chunks)} "
+            f"| findings per chunk: {findings} | всего {total}")
+
+
+def _phase_repair(out_dir: Path) -> Optional[str]:
+    """Repair line from ``audit_cache_b3.json``.
+
+    Final cache: top-level ``repair.batches`` (+ committed / eligible_count).
+    Incremental cache: ``stage_progress.repair`` (done_batches / committed /
+    outcome.batches / outcome.batch_count) — live fallback.
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    repair = cache.get("repair")
+    if isinstance(repair, dict):
+        batches = repair.get("batches")
+        if isinstance(batches, list) and batches:
+            per_batch = []
+            for batch in batches:
+                if not isinstance(batch, dict):
+                    continue
+                findings = len(batch.get("findings") or [])
+                repaired = sum(
+                    1 for r in (batch.get("results") or [])
+                    if isinstance(r, dict)
+                    and (r.get("decision") or "").lower() == "repair"
+                )
+                per_batch.append(f"{repaired}/{findings}")
+            committed = len(repair.get("committed") or [])
+            eligible = _as_int(repair.get("eligible_count"))
+            return (f"Repair: batches done={len(batches)}/{len(batches)} "
+                    f"| repaired per batch: [{', '.join(per_batch)}] "
+                    f"| total {committed}/{eligible}")
+    stage = _stage_progress_slice(cache, "repair")
+    if stage is None:
+        return None
+    done_batches = stage.get("done_batches")
+    if not isinstance(done_batches, list) or not done_batches:
+        return None
+    done = len(done_batches)
+    outcome = stage.get("outcome")
+    batch_count: Optional[int] = None
+    batches: List[Any] = []
+    if isinstance(outcome, dict):
+        if isinstance(outcome.get("batch_count"), int):
+            batch_count = outcome["batch_count"]
+        if isinstance(outcome.get("batches"), list):
+            batches = outcome["batches"]
+    per_batch = []
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        findings = len(batch.get("findings") or [])
+        repaired = sum(
+            1 for r in (batch.get("results") or [])
+            if isinstance(r, dict)
+            and (r.get("decision") or "").lower() == "repair"
+        )
+        per_batch.append(f"{repaired}/{findings}")
+    committed = stage.get("committed")
+    if isinstance(committed, dict):
+        committed_count = len(committed)
+    elif isinstance(committed, list):
+        committed_count = len(committed)
+    else:
+        committed_count = 0
+    done_txt = f"{done}/{batch_count}" if batch_count else f"{done}"
+    return (f"Repair: batches done={done_txt} "
+            f"| repaired per batch: [{', '.join(per_batch)}] "
+            f"| total {committed_count}")
+
+
+def _phase_reaudit(out_dir: Path) -> Optional[str]:
+    """Re-audit line from ``audit_cache_b3.json``.
+
+    Final cache: ``repair.reaudit`` (complete/failed/issues); done = persisted
+    reaudit chunk raw artifacts, residual = remaining issues, debt = 1 when
+    the pass failed. Incremental cache: ``stage_progress.reaudit``
+    (status / done_chunks / issues) — live fallback.
+    """
+    cache = _read_json(out_dir / "audit_cache_b3.json")
+    if not cache:
+        return None
+    repair = cache.get("repair")
+    if isinstance(repair, dict):
+        reaudit = repair.get("reaudit")
+        if isinstance(reaudit, dict):
+            chunk_files = sorted(out_dir.glob("b3_repair_reaudit_chunk*_raw.txt"))
+            total = len(chunk_files)
+            done = total if reaudit.get("complete") else 0
+            issues = reaudit.get("issues")
+            residual = len(issues) if isinstance(issues, list) else 0
+            debt = 1 if reaudit.get("failed") else 0
+            return (f"Re-audit: chunks done={done}/{total} "
+                    f"| residual: {residual} | debt: {debt}")
+    stage = _stage_progress_slice(cache, "reaudit")
+    if stage is None:
+        return None
+    done_chunks = stage.get("done_chunks")
+    if not isinstance(done_chunks, list) or not done_chunks:
+        return None
+    issues = stage.get("issues")
+    residual = len(issues) if isinstance(issues, list) else 0
+    # KILL-SAFE-INCREMENTAL (RV5 t_f82ed9ad): a done record marked failed
+    # (or a stage status "failed") means the pass did NOT complete — debt 1.
+    failed = stage.get("status") == "failed" or any(
+        isinstance(c, dict) and c.get("failed") is True for c in done_chunks
+    )
+    debt = 1 if failed else 0
+    return (f"Re-audit: chunks done={len(done_chunks)} "
             f"| residual: {residual} | debt: {debt}")
 
 
@@ -1369,11 +1585,11 @@ def _last_call_block_lines(out_dir: Path) -> List[str]:
     label = row.get("label")
     group = _label_group(label)
     model = row.get("model") or row.get("model_ref") or "?"
-    inp = row.get("input_tokens") or 0
-    out = row.get("output_tokens") or 0
-    reas = row.get("reasoning_tokens") or 0
+    inp = _as_int(row.get("input_tokens"))
+    out = _as_int(row.get("output_tokens"))
+    reas = _as_int(row.get("reasoning_tokens"))
     wall = row.get("wall_seconds")
-    wall_txt = f"{float(wall):.0f}" if wall is not None else "?"
+    wall_txt = f"{_as_float(wall):.0f}" if wall is not None else "?"
     return [
         "-- последний вызов (из usage.ndjson) --",
         f"  {group} | {model} | in={inp} out={out} reas={reas} | wall={wall_txt}s",
@@ -1627,13 +1843,15 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
 
     usage = _read_usage_rows(chapter_dir)
     calls = len(usage)
-    costs = [float(row["reported_cost"]) for row in usage
+    costs = [_as_float(row.get("reported_cost")) for row in usage
              if row.get("reported_cost") is not None]
     cost = sum(costs)
     # MONITOR-V2 (1.4): per-chapter token sums from usage.ndjson.
-    input_tokens = sum(int(row.get("input_tokens") or 0) for row in usage)
-    output_tokens = sum(int(row.get("output_tokens") or 0) for row in usage)
-    reasoning_tokens = sum(int(row.get("reasoning_tokens") or 0) for row in usage)
+    # MEDIUM (RV t_c9f9ea90): non-numeric token values count as 0 — a
+    # malformed-but-valid usage row never aborts the book table.
+    input_tokens = sum(_as_int(row.get("input_tokens")) for row in usage)
+    output_tokens = sum(_as_int(row.get("output_tokens")) for row in usage)
+    reasoning_tokens = sum(_as_int(row.get("reasoning_tokens")) for row in usage)
 
     if phase == "done":
         step = "8"
