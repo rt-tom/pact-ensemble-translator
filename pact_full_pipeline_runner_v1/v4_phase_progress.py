@@ -186,6 +186,40 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
+# Sentinel for a present-but-malformed audit_cache_b3.json.  The audit
+# cache is cache-authoritative: a present file that is empty, non-JSON,
+# non-object, or otherwise unreadable must fail closed (render an explicit
+# error) rather than silently falling through to journal/missing-artifact
+# fallback.
+_MALFORMED_SENTINEL: Dict[str, Any] = {"__malformed": True}
+
+
+def _read_audit_cache(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """Read ``audit_cache_b3.json`` with cache-authoritative semantics.
+
+    Returns:
+    * ``None`` when the file does not exist (no B3 artifact).
+    * ``_MALFORMED_SENTINEL`` (a dict with ``__malformed=True``) when the
+      file exists but is empty, non-JSON, non-object, or otherwise
+      unreadable — callers MUST render an explicit error message.
+    * The parsed dict payload when the file is valid.
+    """
+    path = out_dir / "audit_cache_b3.json"
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return dict(_MALFORMED_SENTINEL)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return dict(_MALFORMED_SENTINEL)
+    if not isinstance(payload, dict):
+        return dict(_MALFORMED_SENTINEL)
+    return payload
+
+
 def _server_log_freshness(out_dir: Path) -> Tuple[int, Optional[float]]:
     """Return ``(log_file_count, age_seconds_of_newest)`` for ``server_logs``."""
     logs = out_dir / "server_logs"
@@ -1233,18 +1267,38 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     successful_chunks / applied / candidates). Incremental cache:
     ``stage_progress.r_editor`` (status / done_chunks / outcome.chunks with
     per-chunk edits) — the live fallback (RV t_c9f9ea90 HIGH #1).
+
+    FINDING 1: cache-authoritative — a present but malformed cache renders
+    an explicit error, never falls through silently.
+    FINDING 2: journal completion validates ``successful_chunks`` and
+    ``chunk_count`` as coherent non-negative integers.
+    FINDING 3: ``applied_count`` / ``candidate_count`` from the production
+    cache are preserved when available (not recomputed from lists).
     """
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
+    cache = _read_audit_cache(out_dir)
+    if cache is None:
         return None
+    if cache.get("__malformed"):
+        return ("R-editor: audit_cache_b3.json present but malformed "
+                "(fail-closed)")
     r_editor = cache.get("r_editor")
     if isinstance(r_editor, dict):
         outcome = r_editor.get("outcome")
         if isinstance(outcome, dict):
-            chunk_count = outcome.get("chunk_count")
-            if chunk_count:
-                done = outcome.get("successful_chunks")
+            raw_cc = outcome.get("chunk_count")
+            raw_sc = outcome.get("successful_chunks")
+            # FINDING 2: validate chunk_count and successful_chunks as
+            # coherent non-negative ints.  bool/float/string/negative/
+            # mismatch -> fall through to incremental path (no crash).
+            chunk_count: Optional[int] = None
+            if isinstance(raw_cc, int) and not isinstance(raw_cc, bool) and raw_cc >= 0:
+                chunk_count = raw_cc
+            done: Optional[int] = None
+            if isinstance(raw_sc, int) and not isinstance(raw_sc, bool) and raw_sc >= 0:
+                done = raw_sc
+            if chunk_count is not None:
                 if done is None:
+                    # Fallback: count GOOD/GOOD_RETRIED chunks.
                     chunks = outcome.get("chunks")
                     if isinstance(chunks, list):
                         done = sum(
@@ -1253,10 +1307,24 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                             and (c.get("status") or "").upper()
                             in ("GOOD", "GOOD_RETRIED")
                         )
-                applied = len(outcome.get("applied") or [])
-                candidates = len(outcome.get("candidates") or [])
-                return (f"R-editor: chunks done={done}/{chunk_count} "
-                        f"| safe (применено)={applied} | review (предложено)={candidates}")
+                    else:
+                        done = 0
+                # Coherence: successful_chunks must equal chunk_count.
+                if done != chunk_count:
+                    # Conflicting evidence — fall through to incremental
+                    # path rather than rendering wrong numbers.
+                    pass
+                else:
+                    # FINDING 3: prefer production applied_count /
+                    # candidate_count when present; else compute from lists.
+                    applied = outcome.get("applied_count")
+                    if not isinstance(applied, int) or isinstance(applied, bool):
+                        applied = len(outcome.get("applied") or [])
+                    candidates = outcome.get("candidate_count")
+                    if not isinstance(candidates, int) or isinstance(candidates, bool):
+                        candidates = len(outcome.get("candidates") or [])
+                    return (f"R-editor: chunks done={done}/{chunk_count} "
+                            f"| safe (применено)={applied} | review (предложено)={candidates}")
     # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
     stage = _stage_progress_slice(cache, "r_editor")
     if stage is None:
@@ -1300,10 +1368,16 @@ def _phase_audit(out_dir: Path) -> Optional[str]:
 
     Final cache: top-level ``chunks`` + ``issue_count``. Incremental cache:
     ``stage_progress.audit`` (done_chunks / chunks / issues) — live fallback.
+
+    FINDING 1: cache-authoritative — a present but malformed cache renders
+    an explicit error.
     """
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
+    cache = _read_audit_cache(out_dir)
+    if cache is None:
         return None
+    if cache.get("__malformed"):
+        return ("Chapter audit: audit_cache_b3.json present but malformed "
+                "(fail-closed)")
     chunks = cache.get("chunks")
     if isinstance(chunks, list) and chunks:
         total = _as_int(cache.get("issue_count"))
@@ -1340,10 +1414,18 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
 
     MONITOR-V2 whole-chapter (task req. 2): show "findings eligible: N"
     and "PID edits committed: M" as separate units (not a ratio).
+
+    FINDING 1: cache-authoritative — a present but malformed cache renders
+    an explicit error.
+    FINDING 3: preserve production ``applied_count`` / ``candidate_count``
+    when available (not recomputed from lists).
     """
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
+    cache = _read_audit_cache(out_dir)
+    if cache is None:
         return None
+    if cache.get("__malformed"):
+        return ("Selective repair: audit_cache_b3.json present but malformed "
+                "(fail-closed)")
     repair = cache.get("repair")
     if isinstance(repair, dict):
         batches = repair.get("batches")
@@ -1415,10 +1497,16 @@ def _phase_reaudit(out_dir: Path) -> Optional[str]:
     reaudit chunk raw artifacts, residual = remaining issues, debt = 1 when
     the pass failed. Incremental cache: ``stage_progress.reaudit``
     (status / done_chunks / issues) — live fallback.
+
+    FINDING 1: cache-authoritative — a present but malformed cache renders
+    an explicit error.
     """
-    cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
+    cache = _read_audit_cache(out_dir)
+    if cache is None:
         return None
+    if cache.get("__malformed"):
+        return ("Re-audit scope: audit_cache_b3.json present but malformed "
+                "(fail-closed)")
     repair = cache.get("repair")
     if isinstance(repair, dict):
         reaudit = repair.get("reaudit")
@@ -1463,15 +1551,50 @@ def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]]) -> List[str]
     One line per phase whose artifact exists (Extraction / Translation /
     R_editor / Audit / Repair / Re-audit). Absent artifacts are skipped so
     generation-only or pre-B3 runs do not render dead phase lines.
+
+    FINDING 1: the audit cache is read once and the malformed sentinel is
+    rendered as a single error line (not duplicated per phase).
     """
     lines = ["-- Phase --"]
+
+    # Pre-read the audit cache once so the malformed-sentinel error is
+    # rendered exactly once, not once per cache-reading phase function.
+    audit_cache = _read_audit_cache(out_dir)
+    _cache_malformed = (
+        isinstance(audit_cache, dict) and audit_cache.get("__malformed")
+    )
+
+    def _r_editor(d: Path) -> Optional[str]:
+        if _cache_malformed:
+            return ("R-editor: audit_cache_b3.json present but malformed "
+                    "(fail-closed)")
+        return _phase_r_editor(d)
+
+    def _audit(d: Path) -> Optional[str]:
+        if _cache_malformed:
+            return ("Chapter audit: audit_cache_b3.json present but malformed "
+                    "(fail-closed)")
+        return _phase_audit(d)
+
+    def _repair(d: Path) -> Optional[str]:
+        if _cache_malformed:
+            return ("Selective repair: audit_cache_b3.json present but "
+                    "malformed (fail-closed)")
+        return _phase_repair(d)
+
+    def _reaudit(d: Path) -> Optional[str]:
+        if _cache_malformed:
+            return ("Re-audit scope: audit_cache_b3.json present but "
+                    "malformed (fail-closed)")
+        return _phase_reaudit(d)
+
     line_builders = [
         _phase_extraction,
         lambda d: _phase_translation(d, events),
-        _phase_r_editor,
-        _phase_audit,
-        _phase_repair,
-        _phase_reaudit,
+        _r_editor,
+        _audit,
+        _repair,
+        _reaudit,
     ]
     rendered = [line for b in line_builders if (line := b(out_dir)) is not None]
     if not rendered:

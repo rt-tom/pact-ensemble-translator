@@ -1207,3 +1207,247 @@ def test_chapter_table_step_uses_canonical(tmp_path: Path):
     assert table_line
     # Should contain canonical names, not internal codes.
     assert "1-5" not in table_line[0]
+
+
+# ---------------------------------------------------------------------------
+# FINDING 1: cache-authoritative malformed audit_cache_b3.json
+# ---------------------------------------------------------------------------
+
+def test_malformed_empty_cache_renders_fail_closed(tmp_path: Path):
+    """An empty audit_cache_b3.json is cache-authoritative and must render
+    explicit fail-closed errors, not silently fall through."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("", encoding="utf-8")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # All four cache-dependent phases render fail-closed errors.
+    assert "fail-closed" in text
+    assert "R-editor:" in text
+    assert "Chapter audit:" in text
+    assert "Selective repair:" in text
+    assert "Re-audit scope:" in text
+    # Must NOT show "нет Phase-артефактов" — the file exists, just malformed.
+    assert "нет Phase-артефактов" not in text
+
+
+def test_malformed_non_json_cache_renders_fail_closed(tmp_path: Path):
+    """Non-JSON content in audit_cache_b3.json renders fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("not json {{{", encoding="utf-8")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "fail-closed" in text
+    assert "R-editor:" in text
+
+
+def test_malformed_non_object_cache_renders_fail_closed(tmp_path: Path):
+    """A JSON array (non-object) in audit_cache_b3.json renders fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("[1, 2, 3]", encoding="utf-8")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "fail-closed" in text
+
+
+def test_malformed_cache_no_journal_fallback(tmp_path: Path):
+    """A malformed audit_cache_b3.json does NOT fall through to journal
+    or missing-artifact fallback — it fails closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("garbage", encoding="utf-8")
+    events = tracker._load_events(out)
+    # Individual phase functions also fail closed.
+    assert "fail-closed" in (tracker._phase_r_editor(out) or "")
+    assert "fail-closed" in (tracker._phase_audit(out) or "")
+    assert "fail-closed" in (tracker._phase_repair(out) or "")
+    assert "fail-closed" in (tracker._phase_reaudit(out) or "")
+
+
+def test_absent_cache_still_returns_none(tmp_path: Path):
+    """An absent audit_cache_b3.json returns None (no error) — only
+    present-but-malformed triggers fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    events = tracker._load_events(out)
+    # No audit_cache_b3.json -> individual functions return None.
+    assert tracker._phase_r_editor(out) is None
+    assert tracker._phase_audit(out) is None
+    assert tracker._phase_repair(out) is None
+    assert tracker._phase_reaudit(out) is None
+
+
+def test_malformed_nested_fields_do_not_crash(tmp_path: Path):
+    """Malformed nested fields in audit_cache_b3.json (e.g. chunks: [1],
+    repair.batches: [1]) must not crash — they render gracefully."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {"chunk_count": "abc", "successful_chunks": True}},
+        "chunks": [1, "garbage"],
+        "issue_count": "not_a_number",
+        "repair": {"batches": [1], "eligible_count": "x", "committed": "y"},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Must render without crashing; malformed data degrades gracefully.
+    assert "-- Phase --" in text
+
+
+# ---------------------------------------------------------------------------
+# FINDING 2: R-editor successful_chunks / chunk_count validation
+# ---------------------------------------------------------------------------
+
+def test_r_editor_chunk_count_must_be_non_negative_int(tmp_path: Path):
+    """chunk_count that is a bool, float, string, or negative must NOT
+    produce a done=X/Y line — fall through to incremental path."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    for bad_cc in [True, 3.5, "two", -1]:
+        _write(out / "audit_cache_b3.json", {
+            "r_editor": {
+                "outcome": {
+                    "chunk_count": bad_cc,
+                    "successful_chunks": 2,
+                    "applied": [],
+                    "candidates": [],
+                },
+            },
+        })
+        result = tracker._phase_r_editor(out)
+        # Should NOT render "chunks done=X/Y" for bad chunk_count.
+        if result is not None:
+            assert "chunks done=" not in result or "/" not in result, (
+                f"bad chunk_count {bad_cc!r} should not produce done/X/Y"
+            )
+
+
+def test_r_editor_successful_chunks_must_be_non_negative_int(tmp_path: Path):
+    """successful_chunks that is bool/string/negative must NOT produce
+    done=X/Y — fall through to incremental path."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    for bad_sc in [True, "one", -1]:
+        _write(out / "audit_cache_b3.json", {
+            "r_editor": {
+                "outcome": {
+                    "chunk_count": 2,
+                    "successful_chunks": bad_sc,
+                    "applied": [],
+                    "candidates": [],
+                },
+            },
+        })
+        result = tracker._phase_r_editor(out)
+        if result is not None:
+            assert "chunks done=" not in result or "/" not in result, (
+                f"bad successful_chunks {bad_sc!r} should not produce done/X/Y"
+            )
+
+
+def test_r_editor_mismatch_falls_through(tmp_path: Path):
+    """successful_chunks != chunk_count (conflicting evidence) must fall
+    through to incremental path, not render wrong numbers."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 3,
+                "successful_chunks": 1,  # mismatch
+                "applied": [],
+                "candidates": [],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    # Should NOT render "done=1/3" — the mismatch falls through.
+    if result is not None:
+        assert "done=1/3" not in result
+
+
+def test_r_editor_coherent_integers_render(tmp_path: Path):
+    """Coherent non-negative integer chunk_count == successful_chunks
+    renders the done=X/Y line correctly."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 2,
+                "successful_chunks": 2,
+                "applied": [{"pid": "p1", "text": "x"}],
+                "candidates": [{"pid": "p2", "text": "y"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "done=2/2" in result
+    assert "safe (применено)=1" in result
+    assert "review (предложено)=1" in result
+
+
+# ---------------------------------------------------------------------------
+# FINDING 3: applied_count / candidate_count from production cache
+# ---------------------------------------------------------------------------
+
+def test_r_editor_preserves_applied_candidate_count(tmp_path: Path):
+    """When the production cache carries applied_count/candidate_count,
+    the monitor uses those values instead of recomputing from lists."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": 1,
+                # Production fields — the monitor must preserve these.
+                "applied_count": 5,
+                "candidate_count": 3,
+                # List representations may differ (e.g. after partial apply).
+                "applied": [{"pid": "p1"}],
+                "candidates": [],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    # Must show production counts, not list-length counts.
+    assert "safe (применено)=5" in result
+    assert "review (предложено)=3" in result
+
+
+def test_r_editor_falls_back_to_list_length(tmp_path: Path):
+    """When applied_count/candidate_count are absent, the monitor computes
+    from the applied/candidates lists."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": 1,
+                "applied": [{"pid": "p1"}, {"pid": "p2"}],
+                "candidates": [{"pid": "p3"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "safe (применено)=2" in result
+    assert "review (предложено)=1" in result
+
+
+def test_repair_preserves_eligible_count(tmp_path: Path):
+    """The monitor preserves the production eligible_count field."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 15,
+            "committed": ["p1", "p2"],
+            "batches": [
+                {"batch_index": 1, "findings": [{"index": 1}],
+                 "results": [{"index": 1, "decision": "repair"}]},
+            ],
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "findings eligible: 15" in text
+    assert "PID edits committed: 2" in text
