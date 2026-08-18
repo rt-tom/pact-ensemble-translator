@@ -914,17 +914,17 @@ def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
     audit_done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "audit_unit_done"}
     for event in events:
         if event.get("event") == "audit_unit_started" and (event.get("chunk_id"), event.get("detector")) not in audit_done:
-            in_flight.append(f"audit {event.get('chunk_id')}:{event.get('detector')}")
+            in_flight.append(f"{PHASE_HUMAN_NAME.get('audit', 'Audit')} {event.get('chunk_id')}:{event.get('detector')}")
 
     region_done = {e.get("repair_id") for e in events if e.get("event") == "region_done"}
     for event in events:
         if event.get("event") == "region_started" and event.get("repair_id") not in region_done:
-            in_flight.append(f"region {event.get('repair_id')} ({event.get('chunk_id')})")
+            in_flight.append(f"{PHASE_HUMAN_NAME.get('repair', 'Repair')} {event.get('repair_id')} ({event.get('chunk_id')})")
 
     reaudit_done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "reaudit_unit_done"}
     for event in events:
         if event.get("event") == "reaudit_unit_started" and (event.get("chunk_id"), event.get("detector")) not in reaudit_done:
-            in_flight.append(f"reaudit {event.get('chunk_id')}:{event.get('detector')}")
+            in_flight.append(f"{PHASE_HUMAN_NAME.get('reaudit', 'Re-audit')} {event.get('chunk_id')}:{event.get('detector')}")
 
     return in_flight
 
@@ -1227,7 +1227,7 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     falls through to journal (RV t_dd4cf283 HIGH #2).
     """
     cache = _read_json(out_dir / "audit_cache_b3.json")
-    if cache:
+    if cache is not None:
         r_editor = cache.get("r_editor")
         if isinstance(r_editor, dict):
             # Check for explicit status field in the cache (failed/partial/incomplete).
@@ -1310,12 +1310,20 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                                     applied += 1
                                 elif edit.get("class") in REVIEW_CLASSES:
                                     candidates += 1
-                # Only render complete when stage_status is not failed/partial/incomplete.
-                if stage_status not in ("failed", "partial", "incomplete"):
+                # Only render complete when stage_status is explicitly present and not failed/partial/incomplete.
+                # Empty status with done_chunks means in-progress, never completion-like.
+                if stage_status and stage_status not in ("failed", "partial", "incomplete"):
                     return (f"R_editor: chunks done={done}/{chunk_count} "
                             f"| safe (применено)={applied} | review (предложено)={candidates}")
-                return (f"R_editor: chunks done={done}/{chunk_count} ({stage_status}) "
+                if stage_status in ("failed", "partial", "incomplete"):
+                    return (f"R_editor: chunks done={done}/{chunk_count} ({stage_status}) "
+                            f"| safe (применено)={applied} | review (предложено)={candidates}")
+                # Empty status: render as in_progress to avoid false completion.
+                return (f"R_editor: chunks done={done}/{chunk_count} (in_progress) "
                         f"| safe (применено)={applied} | review (предложено)={candidates}")
+
+        # Cache present but no r_editor data or stage_progress — never consult journal.
+        return "R_editor: cache present but no r_editor data"
 
     # JOURNAL-ONLY fallback: no cache, resolve lifecycle from audit_journal.ndjson.
     b3_events = _load_b3_events(out_dir)
@@ -1325,26 +1333,26 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     last = r_editor_events[-1]
     status = (last.get("status") or "").lower()
     chunk_count = last.get("chunk_count")
-    done_chunks = last.get("done_chunks")
-    applied = last.get("applied")
-    candidates = last.get("candidates")
+    successful_chunks = last.get("successful_chunks")
+    applied_count = last.get("applied_count")
+    candidate_count = last.get("candidate_count")
     if status == "complete" and chunk_count is not None:
         # Validate successful_chunks against chunk_count: only render complete
         # when done_val == chunk_count.
-        done_val = done_chunks if done_chunks is not None else chunk_count
+        done_val = successful_chunks if successful_chunks is not None else chunk_count
         if done_val == chunk_count:
-            applied_val = applied if applied is not None else 0
-            candidates_val = candidates if candidates is not None else 0
+            applied_count_val = applied_count if applied_count is not None else 0
+            candidate_count_val = candidate_count if candidate_count is not None else 0
             return (f"R_editor: chunks done={done_val}/{chunk_count} "
-                    f"| safe (применено)={applied_val} | review (предложено)={candidates_val}")
+                    f"| safe (применено)={applied_count_val} | review (предложено)={candidate_count_val}")
         # Incomplete: done_val != chunk_count despite status=complete.
         return (f"R_editor: chunks done={done_val}/{chunk_count} (incomplete) "
-                f"| safe (применено)={applied or 0} | review (предложено)={candidates or 0}")
+                f"| safe (применено)={applied_count or 0} | review (предложено)={candidate_count or 0}")
     if status == "failed":
         return "R_editor: failed (журнал)"
-    if status == "partial" and done_chunks is not None and chunk_count is not None:
-        return (f"R_editor: chunks done={done_chunks}/{chunk_count} (partial) "
-                f"| safe (применено)={applied or 0} | review (предложено)={candidates or 0}")
+    if status == "partial" and successful_chunks is not None and chunk_count is not None:
+        return (f"R_editor: chunks done={successful_chunks}/{chunk_count} (partial) "
+                f"| safe (применено)={applied_count or 0} | review (предложено)={candidate_count or 0}")
     # Ambiguous / unknown status — render a minimal diagnostic, never claim complete.
     return f"R_editor: status={status or 'unknown'} (из журнала)"
 
@@ -1801,9 +1809,12 @@ def render_report(out_dir: Path) -> str:
         # MONITOR-V2 (1.2): live reasoning-trace growth, local only.
         lines.extend(_local_thinking_lines(out_dir))
     lines.append("")
-    lines.append("-- chunks (trial -> audit -> repair) --")
+    _gen_name = PHASE_HUMAN_NAME.get("gen", "Translation")
+    _audit_name = PHASE_HUMAN_NAME.get("audit", "Audit")
+    _repair_name = PHASE_HUMAN_NAME.get("repair", "Repair")
+    lines.append(f"-- chunks ({_gen_name} -> {_audit_name} -> {_repair_name}) --")
     if rows:
-        lines.append(f"{'chunk_id':<18} {'trial':<22} {'audit':<18} {'repair':<12}")
+        lines.append(f"'{'chunk_id':<18} {_gen_name:<22} {_audit_name:<18} {_repair_name:<12}")
         for row in rows:
             lines.append(
                 f"{row['chunk_id']:<18} {row['trial']:<22} {row['audit']:<18} {row['repair']:<12}"
@@ -1886,8 +1897,9 @@ def render_report(out_dir: Path) -> str:
     last_usage = identity["last_usage"]
     if last_usage is not None:
         age_text = f" ({identity['last_usage_age']:.0f}s ago)" if identity["last_usage_age"] is not None else ""
+        _usage_phase = PHASE_HUMAN_NAME.get(phase_for_label(last_usage.get("label")), last_usage.get("label"))
         lines.append(
-            f"last usage.ndjson: {last_usage.get('ts')} label={last_usage.get('label')} "
+            f"last usage.ndjson: {last_usage.get('ts')} phase={_usage_phase} "
             f"model={last_usage.get('model_ref')}{age_text}"
         )
     if in_flight:

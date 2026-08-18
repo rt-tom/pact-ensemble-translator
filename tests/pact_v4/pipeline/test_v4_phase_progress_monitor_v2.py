@@ -393,7 +393,7 @@ def test_model_activity_shows_last_usage_record(tmp_path: Path):
     ])
     report = tracker.render_report(out)
     assert "last usage.ndjson:" in report
-    assert "label=phase3/qwen_chapter_audit" in report
+    assert "phase=Audit" in report
     assert "model=opencode-go/qwen3.7-plus" in report
     assert "age since server start" in report
 
@@ -874,7 +874,7 @@ def test_usage_block_distinguishes_corrupt_vs_absent(tmp_path: Path):
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     (out / USAGE_FILENAME).write_bytes(b"\xff\xfe not json \x00")
     lines = tracker._usage_block_lines(out)
-    assert any("corrupt" in l or "no readable rows" for l in lines)
+    assert any("corrupt" in l or "no readable rows" in l for l in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1013,8 +1013,8 @@ def test_r_editor_journal_complete(tmp_path: Path):
     line with chunk counts."""
     out = _r_editor_journal_dir(tmp_path, [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "complete", "chunk_count": 4, "done_chunks": 4,
-         "applied": 3, "candidates": 1},
+         "status": "complete", "chunk_count": 4, "successful_chunks": 4,
+         "applied_count": 3, "candidate_count": 1},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1041,8 +1041,8 @@ def test_r_editor_journal_partial(tmp_path: Path):
     line with chunk counts."""
     out = _r_editor_journal_dir(tmp_path, [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "partial", "chunk_count": 6, "done_chunks": 3,
-         "applied": 2, "candidates": 1},
+         "status": "partial", "chunk_count": 6, "successful_chunks": 3,
+         "applied_count": 2, "candidate_count": 1},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1101,8 +1101,8 @@ def test_r_editor_cache_takes_precedence_over_journal(tmp_path: Path):
     # Also write journal events (should be ignored when cache exists)
     _write_ndjson(out / "audit_journal.ndjson", [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "complete", "chunk_count": 5, "done_chunks": 3,
-         "applied": 1, "candidates": 0},
+         "status": "complete", "chunk_count": 5, "successful_chunks": 3,
+         "applied_count": 1, "candidate_count": 0},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1230,7 +1230,7 @@ def test_r_editor_cache_failed_with_no_outcome(tmp_path: Path):
     # Journal says complete — should be ignored (cache authoritative)
     _write_ndjson(out / "audit_journal.ndjson", [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "complete", "chunk_count": 4, "done_chunks": 4},
+         "status": "complete", "chunk_count": 4, "successful_chunks": 4},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1334,8 +1334,8 @@ def test_r_editor_journal_complete_validates_done_chunks(tmp_path: Path):
     must render incomplete."""
     out = _r_editor_journal_dir(tmp_path, [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "complete", "chunk_count": 4, "done_chunks": 2,
-         "applied": 1, "candidates": 0},
+         "status": "complete", "chunk_count": 4, "successful_chunks": 2,
+         "applied_count": 1, "candidate_count": 0},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1357,8 +1357,8 @@ def test_r_editor_journal_partial_renders_partial(tmp_path: Path):
     """Direct probe: journal status=partial renders a partial diagnostic."""
     out = _r_editor_journal_dir(tmp_path, [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "partial", "chunk_count": 4, "done_chunks": 2,
-         "applied": 1, "candidates": 0},
+         "status": "partial", "chunk_count": 4, "successful_chunks": 2,
+         "applied_count": 1, "candidate_count": 0},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1376,8 +1376,8 @@ def test_r_editor_cache_authoritative_over_journal(tmp_path: Path):
     # Journal says complete with different numbers
     _write_ndjson(out / "audit_journal.ndjson", [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "complete", "chunk_count": 10, "done_chunks": 10,
-         "applied": 5, "candidates": 3},
+         "status": "complete", "chunk_count": 10, "successful_chunks": 10,
+         "applied_count": 5, "candidate_count": 3},
     ])
     line = tracker._phase_r_editor(out)
     assert line is not None
@@ -1396,7 +1396,7 @@ def test_r_editor_malformed_cache_does_not_fall_through(tmp_path: Path):
     # Journal says complete
     _write_ndjson(out / "audit_journal.ndjson", [
         {"event": "r_editor_done", "ts": _iso(10),
-         "status": "complete", "chunk_count": 2, "done_chunks": 2},
+         "status": "complete", "chunk_count": 2, "successful_chunks": 2},
     ])
     line = tracker._phase_r_editor(out)
     # Should either return None (no valid cache/journal) or render journal
@@ -1463,3 +1463,156 @@ def test_phase_display_order_matches_human_name_values():
             f"PHASE_DISPLAY_ORDER has {display_name!r} "
             f"not in PHASE_HUMAN_NAME values"
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: _phase_r_editor cache lifecycle (RV t_2be84da1)
+# ---------------------------------------------------------------------------
+
+
+def test_r_editor_empty_cache_does_not_fall_through_to_journal(tmp_path: Path):
+    """Regression: empty cache {} must not be treated as absent (was `if cache:`
+    which treats {} as falsy). Cache presence is authoritative."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {})
+    # Also write journal events (should be ignored when cache exists)
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 5, "successful_chunks": 5,
+         "applied_count": 2, "candidate_count": 1},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Cache is present but empty — should NOT consult journal
+    assert "cache present but no r_editor data" in line
+    assert "журнал" not in line
+
+
+def test_r_editor_malformed_cache_falls_through_to_journal(tmp_path: Path):
+    """Regression: malformed JSON cache (read error) should consult journal."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_bytes(b"\xff\xfe not json \x00")
+    # Write journal events
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "successful_chunks": 4,
+         "applied_count": 1, "candidate_count": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Malformed cache = cache is None → journal fallback
+    assert "chunks done=4/4" in line
+    assert "safe (применено)=1" in line
+
+
+def test_r_editor_unknown_cache_shape_no_r_editor(tmp_path: Path):
+    """Regression: cache with no r_editor key should not fall through
+    to journal — cache presence is authoritative."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {"some_other_key": "value"})
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Cache present but no r_editor data
+    assert "cache present but no r_editor data" in line
+
+
+def test_r_editor_journal_uses_production_field_names(tmp_path: Path):
+    """Regression: journal fallback must read successful_chunks/applied_count/
+    candidate_count (production field names), not done_chunks/applied/candidates."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Write journal with production field names
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 6,
+         "successful_chunks": 4,  # != chunk_count → incomplete
+         "applied_count": 3, "candidate_count": 2},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # successful_chunks=4 != chunk_count=6 → incomplete
+    assert "chunks done=4/6 (incomplete)" in line
+    assert "safe (применено)=3" in line
+    assert "review (предложено)=2" in line
+
+
+def test_r_editor_journal_partial_uses_production_field_names(tmp_path: Path):
+    """Regression: journal partial status must read production field names."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "partial", "chunk_count": 8,
+         "successful_chunks": 5,
+         "applied_count": 2, "candidate_count": 1},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=5/8 (partial)" in line
+    assert "safe (применено)=2" in line
+    assert "review (предложено)=1" in line
+
+
+def test_r_editor_incremental_empty_status_renders_in_progress(tmp_path: Path):
+    """Regression: incremental stage_progress with done_chunks but no explicit
+    status should render (in_progress), not completion-like."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    cache = {
+        "stage_progress": {
+            "r_editor": {
+                "status": "",  # empty status
+                "done_chunks": [1, 2, 3],
+                "chunk_count": 4,
+            }
+        }
+    }
+    _write(out / "audit_cache_b3.json", cache)
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=3/4 (in_progress)" in line
+    # Must NOT look complete (no done=3/4 without status label)
+    assert "(in_progress)" in line
+
+
+# ---------------------------------------------------------------------------
+# Regression: canonical output assertions (RV t_2be84da1)
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_section_uses_canonical_phase_names(tmp_path: Path):
+    """Regression: chunk section heading and column headers must use
+    PHASE_HUMAN_NAME, not raw trial/audit/repair labels."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    # Must NOT contain raw chunk section labels
+    assert "trial -> audit -> repair" not in report
+    # Must contain canonical names in chunk section
+    assert "Translation -> Audit -> Repair" in report
+
+
+def test_last_usage_line_uses_canonical_phase(tmp_path: Path):
+    """Regression: last usage.ndjson line must show phase= canonical name,
+    not raw label= usage label."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / USAGE_FILENAME, [
+        _usage_row("phase2b/balanced_literary/chunk0001", cost=0.01),
+    ])
+    report = tracker.render_report(out)
+    # Must NOT contain raw label= in model activity
+    assert "label=phase2b" not in report
+    # Must contain phase= with canonical name
+    assert "phase=Translation" in report
+
+
+def test_in_flight_labels_use_canonical_names(tmp_path: Path):
+    """Regression: in-flight model activity labels must use
+    PHASE_HUMAN_NAME, not raw audit/region/reaudit."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "pact-v4-phase-progress/ndjson/v1",
+         "event": "audit_unit_started", "ts": _iso(5),
+         "chunk_id": "c1", "detector": "unit_test"},
+    ])
+    report = tracker.render_report(out)
+    # Must NOT contain raw "audit" prefix
+    assert "in flight: audit c1:unit_test" not in report
+    # Must contain canonical "Audit" prefix
+    assert "in flight: Audit c1:unit_test" in report
