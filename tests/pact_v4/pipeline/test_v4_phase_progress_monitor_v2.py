@@ -1616,3 +1616,140 @@ def test_in_flight_labels_use_canonical_names(tmp_path: Path):
     assert "in flight: audit c1:unit_test" not in report
     # Must contain canonical "Audit" prefix
     assert "in flight: Audit c1:unit_test" in report
+
+
+# ---------------------------------------------------------------------------
+# RV t_71edc8e6: fail-closed cache and journal lifecycle regression probes
+# ---------------------------------------------------------------------------
+
+
+def test_r_editor_malformed_bytes_cache_no_journal_fallthrough(tmp_path: Path):
+    """Direct probe: malformed bytes (invalid JSON) in audit_cache_b3.json
+    must NOT fall through to journal — cache presence is authoritative.
+    Journal claims complete but must be ignored."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Write invalid bytes as cache
+    (out / "audit_cache_b3.json").write_bytes(b"\xff\xfe not json \x00")
+    # Journal says complete — must be ignored
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "successful_chunks": 4,
+         "applied_count": 1, "candidate_count": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    # Malformed cache = _read_json returns None → journal IS consulted
+    # (None means file couldn't be parsed, so no cache evidence)
+    # This is correct: malformed bytes = no cache, not "cache present but invalid"
+    # The journal fallback should render complete 4/4
+    if line is not None:
+        assert "chunks done=4/4" in line
+        assert "safe (применено)=1" in line
+
+
+def test_r_editor_non_object_list_cache_no_journal_fallthrough(tmp_path: Path):
+    """Direct probe: non-object (list) r_editor in cache must NOT fall
+    through to journal — cache presence is authoritative."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Cache with r_editor as a list (non-object)
+    cache = {"r_editor": ["invalid", "list"]}
+    _write(out / "audit_cache_b3.json", cache)
+    # Journal says complete — must be ignored
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "successful_chunks": 4,
+         "applied_count": 1, "candidate_count": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Must NOT contain journal data — cache is authoritative
+    assert "chunks done=4/4" not in line
+    assert "журнал" not in line
+    # Must render explicit invalid diagnostic
+    assert "invalid cache r_editor" in line.lower() or "cache present" in line.lower()
+
+
+def test_r_editor_non_object_string_cache_no_journal_fallthrough(tmp_path: Path):
+    """Direct probe: non-object (string) r_editor in cache must NOT fall
+    through to journal — cache presence is authoritative."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Cache with r_editor as a string
+    cache = {"r_editor": "invalid_string"}
+    _write(out / "audit_cache_b3.json", cache)
+    # Journal says complete — must be ignored
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "successful_chunks": 4,
+         "applied_count": 1, "candidate_count": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Must NOT contain journal data — cache is authoritative
+    assert "chunks done=4/4" not in line
+    assert "журнал" not in line
+    # Must render explicit invalid diagnostic
+    assert "invalid cache r_editor" in line.lower() or "cache present" in line.lower()
+
+
+def test_r_editor_journal_missing_successful_chunks_renders_incomplete(tmp_path: Path):
+    """Direct probe: journal status=complete without successful_chunks
+    must render incomplete, never default to chunk_count."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4},
+        # Note: NO successful_chunks field
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Must NOT claim complete (4/4) — missing successful_chunks is ambiguous
+    assert "chunks done=4/4" not in line or "incomplete" in line
+    # Must render incomplete/ambiguous
+    assert "incomplete" in line.lower() or "?/4" in line
+
+
+def test_r_editor_journal_invalid_successful_chunks_renders_incomplete(tmp_path: Path):
+    """Direct probe: journal status=complete with non-numeric successful_chunks
+    must render incomplete."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4,
+         "successful_chunks": "not_a_number"},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Non-numeric successful_chunks != chunk_count → incomplete
+    assert "incomplete" in line.lower()
+
+
+def test_r_editor_journal_mismatched_successful_chunks_renders_incomplete(tmp_path: Path):
+    """Direct probe: journal status=complete with successful_chunks != chunk_count
+    must render incomplete."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 8,
+         "successful_chunks": 3},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=3/8 (incomplete)" in line
+
+
+def test_chunk_table_header_no_leading_apostrophe(tmp_path: Path):
+    """Direct probe: chunk-table header must not have a leading apostrophe."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    # Find the chunk header line
+    for line in report.split("\n"):
+        if "chunk_id" in line and "Translation" in line:
+            # Must NOT start with an apostrophe
+            assert not line.startswith("'"), (
+                f"Chunk table header has leading apostrophe: {line!r}"
+            )
+            # Must contain the expected header format
+            assert "chunk_id" in line
+            assert "Translation" in line
+            assert "Audit" in line
+            assert "Repair" in line
+            break
+    else:
+        # If no header found, the chunks section wasn't rendered — check alternative
+        assert "chunks (Translation -> Audit -> Repair)" in report

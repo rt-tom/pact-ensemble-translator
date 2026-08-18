@@ -919,7 +919,7 @@ def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
     region_done = {e.get("repair_id") for e in events if e.get("event") == "region_done"}
     for event in events:
         if event.get("event") == "region_started" and event.get("repair_id") not in region_done:
-            in_flight.append(f"{PHASE_HUMAN_NAME.get('repair', 'Repair')} {event.get('repair_id')} ({event.get('chunk_id')})")
+            in_flight.append(f"{PHASE_HUMAN_NAME.get('repair', 'Repair')} region {event.get('repair_id')} ({event.get('chunk_id')})")
 
     reaudit_done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "reaudit_unit_done"}
     for event in events:
@@ -1282,7 +1282,14 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
             if cache_status in ("partial", "incomplete"):
                 return f"R_editor: {cache_status} (cache)"
 
-        # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
+        elif r_editor is not None:
+            # Cache present but r_editor is NOT a dict and NOT None
+            # (malformed/non-object: string, list, int, etc.).
+            # Cache presence is AUTHORITATIVE — never fall through to journal.
+            return f"R_editor: invalid cache r_editor (cache present but r_editor is {type(r_editor).__name__})"
+
+        # r_editor is None (no r_editor key in cache) — fall through to
+        # KILL-SAFE-INCREMENTAL fallback or "no r_editor data" message.
         stage = _stage_progress_slice(cache, "r_editor")
         if stage is not None:
             done_chunks = stage.get("done_chunks")
@@ -1338,15 +1345,19 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     candidate_count = last.get("candidate_count")
     if status == "complete" and chunk_count is not None:
         # Validate successful_chunks against chunk_count: only render complete
-        # when done_val == chunk_count.
-        done_val = successful_chunks if successful_chunks is not None else chunk_count
-        if done_val == chunk_count:
+        # when done_val == chunk_count. Missing successful_chunks with
+        # status=complete is ambiguous — never default to chunk_count.
+        if successful_chunks is None:
+            # Missing successful_chunks: ambiguous, never claim complete.
+            return (f"R_editor: chunks done=?/{chunk_count} (incomplete) "
+                    f"| safe (применено)={applied_count or 0} | review (предложено)={candidate_count or 0}")
+        if successful_chunks == chunk_count:
             applied_count_val = applied_count if applied_count is not None else 0
             candidate_count_val = candidate_count if candidate_count is not None else 0
-            return (f"R_editor: chunks done={done_val}/{chunk_count} "
+            return (f"R_editor: chunks done={successful_chunks}/{chunk_count} "
                     f"| safe (применено)={applied_count_val} | review (предложено)={candidate_count_val}")
-        # Incomplete: done_val != chunk_count despite status=complete.
-        return (f"R_editor: chunks done={done_val}/{chunk_count} (incomplete) "
+        # Incomplete: successful_chunks != chunk_count despite status=complete.
+        return (f"R_editor: chunks done={successful_chunks}/{chunk_count} (incomplete) "
                 f"| safe (применено)={applied_count or 0} | review (предложено)={candidate_count or 0}")
     if status == "failed":
         return "R_editor: failed (журнал)"
@@ -1814,7 +1825,7 @@ def render_report(out_dir: Path) -> str:
     _repair_name = PHASE_HUMAN_NAME.get("repair", "Repair")
     lines.append(f"-- chunks ({_gen_name} -> {_audit_name} -> {_repair_name}) --")
     if rows:
-        lines.append(f"'{'chunk_id':<18} {_gen_name:<22} {_audit_name:<18} {_repair_name:<12}")
+        lines.append(f"{'chunk_id':<18} {_gen_name:<22} {_audit_name:<18} {_repair_name:<12}")
         for row in rows:
             lines.append(
                 f"{row['chunk_id']:<18} {row['trial']:<22} {row['audit']:<18} {row['repair']:<12}"
