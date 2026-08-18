@@ -34,6 +34,8 @@ from pact_full_pipeline_runner_v1 import v4_usage
 from pact_v4.pipeline.phase_progress import PHASE_PROGRESS_FILENAME
 from pact_v4.pipeline.usage_record import USAGE_FILENAME
 
+PHASE_PROGRESS_SCHEMA = "pact-v4-phase-progress/ndjson/v1"
+
 
 def _write(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +91,38 @@ def _chapter_dir(tmp_path: Path, name: str, started_at: str) -> Path:
     return out
 
 
+def _wc_event(event: str, seconds_ago: float, **fields) -> dict:
+    return {
+        "schema": PHASE_PROGRESS_SCHEMA,
+        "event": event,
+        "ts": _iso(seconds_ago),
+        **fields,
+    }
+
+
+def _b3_event(event: str, seconds_ago: float, **fields) -> dict:
+    return {
+        "schema": "pact-v4-b3-audit-journal/v1",
+        "event": event,
+        "ts": _iso(seconds_ago),
+        **fields,
+    }
+
+
+def _wc_run_dir(tmp_path: Path, *, with_b3: bool = True) -> Path:
+    """Whole-chapter run dir: run_started + wc generation events."""
+    out = tmp_path / "chapter_0001"
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("run_started", 600, chapter_id="0001", out_dir=str(out),
+                  started_at=_iso(600), backend_identity_hash="h", resumed_from_index=0),
+        _wc_event("wc_generation_started", 550, pid_count=120,
+                  reasoning_budget=3, model="gemma-4-26b", max_attempts=3),
+    ])
+    if with_b3:
+        _write_ndjson(out / "audit_journal.ndjson", [])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Usage by step x model (reuses phase_for_label)
 # ---------------------------------------------------------------------------
@@ -114,13 +148,13 @@ def test_usage_grouping_reuses_phase_for_label(tmp_path: Path):
     # phase names (Extraction / Translation / R_editor / Audit / Repair /
     # Re-audit) instead of the old "phase2b generation" label-groups.
     assert by_group[("Translation", "deepseek-v4-flash")]["calls"] == 2
-    assert by_group[("Translation", "deepseek-v4-flash")]["step"] == "Steps1-5"
+    assert by_group[("Translation", "deepseek-v4-flash")]["step"] == "Translation"
     # phase2c/phase4 keep their phase identity through phase_for_label.
-    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("Repair", "deepseek-v4-flash")]["step"] == "Step7"
-    assert by_group[("Repair", "qwen3.7-plus")]["step"] == "Step7"
-    assert by_group[("Audit", "qwen3.7-plus")]["step"] == "Step6"
-    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Step8"
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "qwen_fidelity"
+    assert by_group[("Repair", "deepseek-v4-flash")]["step"] == "Repair"
+    assert by_group[("Repair", "qwen3.7-plus")]["step"] == "Repair"
+    assert by_group[("Audit", "qwen3.7-plus")]["step"] == "Audit"
+    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Formatting"
 
     # The step mapping goes through phase_for_label — prove the reuse by
     # checking the label->phase leg is literally v4_usage's function.
@@ -142,8 +176,8 @@ def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
     groups = tracker._usage_group_rows(tracker._read_usage_rows(out))
     by_group = {(g["label_group"], g["model"]): g for g in groups}
 
-    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "Step2c"
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "qwen_fidelity"
+    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "gemma_preference"
     assert not any(g.startswith("phase2c") for g, _ in by_group)
 
 
@@ -288,7 +322,7 @@ def test_step8_not_started_wording(tmp_path: Path):
          "ts": _iso(20), "round_number": 1},
     ])
     report = tracker.render_report(out)
-    assert "Step 8: not started (ожидание formatting/terminal)" in report
+    assert "Formatting: not started (ожидание formatting/terminal)" in report
     assert "formatting incidents=None" not in report
 
 
@@ -839,4 +873,239 @@ def test_usage_block_distinguishes_corrupt_vs_absent(tmp_path: Path):
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     (out / USAGE_FILENAME).write_bytes(b"\xff\xfe not json \x00")
     lines = tracker._usage_block_lines(out)
-    assert any("corrupt" in l or "no readable rows" in l for l in lines)
+    assert any("corrupt" in l or "no readable rows" for l in lines)
+
+
+# ---------------------------------------------------------------------------
+# Structural regression: PHASE_HUMAN_NAME is the single display mapping
+# ---------------------------------------------------------------------------
+
+
+def test_phase_human_name_is_single_display_mapping():
+    """Structural regression: PHASE_HUMAN_NAME is the single canonical
+    display mapping. PHASE_TO_STEP_GROUP is NOT used for user-facing
+    display; only PHASE_HUMAN_NAME feeds render_report, _status_line,
+    _usage_block_lines, and _chapter_summary_row."""
+    # PHASE_HUMAN_NAME must cover every phase that PHASE_TO_STEP_GROUP
+    # maps, preventing drift.
+    for phase in tracker.PHASE_TO_STEP_GROUP:
+        assert phase in tracker.PHASE_HUMAN_NAME, (
+            f"phase {phase!r} in PHASE_TO_STEP_GROUP but not in PHASE_HUMAN_NAME"
+        )
+    # Internal phase names (step6/step7/step8/steps1-5) must also be
+    # covered so _detect_phase output resolves to canonical names.
+    for internal in ("step6", "step7", "step8", "steps1-5"):
+        assert internal in tracker.PHASE_HUMAN_NAME, (
+            f"internal phase {internal!r} not in PHASE_HUMAN_NAME"
+        )
+    # Core pipeline phases must have unique display names (internal names
+    # may alias to the same canonical value, which is intentional).
+    core_phases = [k for k in tracker.PHASE_HUMAN_NAME
+                   if k not in ("(other)", "step6", "step7", "step8", "steps1-5")]
+    core_values = [tracker.PHASE_HUMAN_NAME[k] for k in core_phases]
+    assert len(core_values) == len(set(core_values)), (
+        f"Duplicate values in core PHASE_HUMAN_NAME: {core_values}"
+    )
+
+
+def test_usage_block_rows_use_canonical_names(tmp_path: Path):
+    """Usage rows must show canonical PHASE_HUMAN_NAME values in the step
+    column, never legacy Steps1-5/Step6/Step7/Step8."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / USAGE_FILENAME, [
+        _usage_row("phase2b/balanced_literary/chunk0001", cost=0.01),
+        _usage_row("phase3/qwen_chapter_audit", model="qwen3.7-plus", cost=0.02),
+        _usage_row("phase4/region_repair", cost=0.03),
+        _usage_row("phase5/formatting_align", cost=0.04),
+    ])
+    report = tracker.render_report(out)
+    # Must contain canonical names
+    assert "Translation" in report
+    assert "Audit" in report
+    assert "Repair" in report
+    assert "Formatting" in report
+    # Must NOT contain legacy step-group labels
+    assert "Steps1-5" not in report
+    assert "Step6" not in report
+    assert "Step7" not in report
+    assert "Step8" not in report
+
+
+def test_status_line_uses_canonical_names(tmp_path: Path):
+    """Status line must use canonical PHASE_HUMAN_NAME values, never raw
+    phase labels (GEN, AUDIT, REPAIR) or internal step names."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "run_started",
+         "ts": _iso(3600), "started_at": _iso(3600)},
+    ])
+    events = tracker._load_events(out)
+    line = tracker._status_line(out, events, "gen")
+    # Must not contain raw internal labels
+    assert "GEN " not in line
+    assert "AUDIT " not in line
+    assert "REPAIR " not in line
+    # Must contain canonical names
+    assert "Translation" in line
+
+
+def test_chapter_summary_uses_canonical_names(tmp_path: Path):
+    """Book-run chapter summary row must use canonical phase names for
+    step and status columns."""
+    base = tmp_path / "book"
+    base.mkdir()
+    out = _wc_run_dir(base)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_retry_attempt", 500, attempt=2, reason="malformed"),
+    ])
+    report = tracker.render_book_report(base)
+    # Must not contain raw phase names
+    assert "step6" not in report
+    assert "step7" not in report
+    assert "step8" not in report
+    assert "steps1-5" not in report
+    # Must contain canonical names
+    assert "Translation" in report
+
+
+def test_render_report_shows_canonical_phase(tmp_path: Path):
+    """render_report must show the canonical phase name, not raw internal
+    phase values like step6/step7."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "b2_handoff.json", {"chunks": [
+        {"chunk_id": "c1", "audit_status": "clean"},
+        {"chunk_id": "c2", "audit_status": "clean"},
+    ]})
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "run_started",
+         "ts": _iso(60), "started_at": _iso(60)},
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "repair_round_started",
+         "ts": _iso(50), "round_number": 1},
+    ])
+    report = tracker.render_report(out)
+    # phase line must show canonical name
+    assert "phase: Repair --" in report
+    # Must not contain "phase: step7 --"
+    assert "phase: step7" not in report
+    assert "phase: step6" not in report
+
+
+# ---------------------------------------------------------------------------
+# Journal-only R-editor lifecycle (RV t_7cf9ae65 HIGH #3)
+# ---------------------------------------------------------------------------
+
+
+def _r_editor_journal_dir(tmp_path: Path, events: list) -> Path:
+    """Create a run dir with only a B3 journal (no audit_cache_b3.json)."""
+    out = tmp_path / "run_r_editor_journal"
+    _write(out / "chunk_plan.json", {"chunks": [{"chunk_id": "c1"}]})
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "run_started",
+         "ts": _iso(60), "started_at": _iso(60)},
+    ])
+    _write_ndjson(out / "audit_journal.ndjson", events)
+    return out
+
+
+def test_r_editor_journal_complete(tmp_path: Path):
+    """Journal-only r_editor_done with status=complete renders a lifecycle
+    line with chunk counts."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "done_chunks": 4,
+         "applied": 3, "candidates": 1},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "R_editor: chunks done=4/4" in line
+    assert "safe (применено)=3" in line
+    assert "review (предложено)=1" in line
+
+
+def test_r_editor_journal_failed(tmp_path: Path):
+    """Journal-only r_editor_done with status=failed renders a failed line,
+    never claims completion."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "failed"},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "failed" in line.lower()
+    assert "done=" not in line
+
+
+def test_r_editor_journal_partial(tmp_path: Path):
+    """Journal-only r_editor_done with status=partial renders a partial
+    line with chunk counts."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "partial", "chunk_count": 6, "done_chunks": 3,
+         "applied": 2, "candidates": 1},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "partial" in line
+    assert "chunks done=3/6" in line
+
+
+def test_r_editor_journal_unknown_status(tmp_path: Path):
+    """Journal-only r_editor_done with an unknown status renders a
+    diagnostic, never claims completion."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "weird_status"},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "weird_status" in line
+    assert "done=" not in line
+
+
+def test_r_editor_journal_malformed_missing_fields(tmp_path: Path):
+    """Journal-only r_editor_done with missing fields (no chunk_count,
+    no status) renders a diagnostic."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10)},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "unknown" in line.lower()
+
+
+def test_r_editor_no_events_returns_none(tmp_path: Path):
+    """When there is no cache and no journal events, _phase_r_editor
+    returns None (no R_editor line rendered)."""
+    out = _r_editor_journal_dir(tmp_path, [])
+    line = tracker._phase_r_editor(out)
+    assert line is None
+
+
+def test_r_editor_cache_takes_precedence_over_journal(tmp_path: Path):
+    """When both cache and journal exist, cache wins (authoritative
+    precedence)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Write a final cache with R_editor outcome
+    cache = {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 2,
+                "successful_chunks": 2,
+                "applied": ["p1"],
+                "candidates": ["p2"],
+            }
+        }
+    }
+    _write(out / "audit_cache_b3.json", cache)
+    # Also write journal events (should be ignored when cache exists)
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 5, "done_chunks": 3,
+         "applied": 1, "candidates": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Cache values should be used, not journal
+    assert "chunks done=2/2" in line
+    assert "safe (применено)=1" in line
+    assert "review (предложено)=1" in line

@@ -118,6 +118,11 @@ PHASE_HUMAN_NAME = {
     "qwen_fidelity": "qwen_fidelity",
     "gemma_preference": "gemma_preference",
     "(other)": "(other)",
+    # Internal phase names (from _detect_phase) mapped to canonical display.
+    "step6": "Audit",
+    "step7": "Repair",
+    "step8": "Formatting",
+    "steps1-5": "Translation",
 }
 
 TRIAL_STATES = (
@@ -935,8 +940,8 @@ def _label_group(label: Optional[str]) -> str:
 def _usage_group_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Aggregate usage rows into per-(label-group, model) buckets.
 
-    Each bucket carries the step-group (from ``PHASE_TO_STEP_GROUP`` via
-    ``phase_for_label``), the label-group, the model, calls, summed
+    Each bucket carries the canonical phase name (from ``PHASE_HUMAN_NAME``
+    via ``phase_for_label``), the label-group, the model, calls, summed
     input/output/reasoning/cached tokens and summed ``reported_cost``.
     """
     buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -949,7 +954,7 @@ def _usage_group_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         model = row.get("model") or row.get("model_ref") or "(unknown)"
         key = (group, str(model))
         bucket = buckets.setdefault(key, {
-            "step": PHASE_TO_STEP_GROUP.get(phase, phase),
+            "step": PHASE_HUMAN_NAME.get(phase, phase),
             "label_group": group,
             "model": model,
             "calls": 0,
@@ -1042,7 +1047,9 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
         header += f"{'cost':>11}"
     lines.append(header)
 
-    step_order = {"Steps1-5": 0, "Step2c": 1, "Step6": 2, "Step7": 3, "Step8": 4}
+    step_order = {"Translation": 0, "qwen_fidelity": 1, "gemma_preference": 1,
+                  "Extraction": 2, "R_editor": 3, "Audit": 4,
+                  "Repair": 5, "Re-audit": 6, "Formatting": 7}
     for g in sorted(
         groups,
         key=lambda g: (step_order.get(g["step"], 99), g["label_group"], g["model"]),
@@ -1189,72 +1196,92 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[
 
 
 def _phase_r_editor(out_dir: Path) -> Optional[str]:
-    """R_editor line from ``audit_cache_b3.json``.
+    """R_editor line from ``audit_cache_b3.json`` or ``audit_journal.ndjson``.
 
     Final cache: top-level ``r_editor.outcome`` (chunk_count /
     successful_chunks / applied / candidates). Incremental cache:
     ``stage_progress.r_editor`` (status / done_chunks / outcome.chunks with
     per-chunk edits) — the live fallback (RV t_c9f9ea90 HIGH #1).
+
+    Journal-only fallback: when no cache exists, read ``audit_journal.ndjson``
+    for ``r_editor_done`` events and render a lifecycle line from the journal
+    alone (RV t_7cf9ae65 HIGH #3).
     """
     cache = _read_json(out_dir / "audit_cache_b3.json")
-    if not cache:
-        return None
-    r_editor = cache.get("r_editor")
-    if isinstance(r_editor, dict):
-        outcome = r_editor.get("outcome")
-        if isinstance(outcome, dict):
-            chunk_count = outcome.get("chunk_count")
-            if chunk_count:
-                done = outcome.get("successful_chunks")
-                if done is None:
+    if cache:
+        r_editor = cache.get("r_editor")
+        if isinstance(r_editor, dict):
+            outcome = r_editor.get("outcome")
+            if isinstance(outcome, dict):
+                chunk_count = outcome.get("chunk_count")
+                if chunk_count:
+                    done = outcome.get("successful_chunks")
+                    if done is None:
+                        chunks = outcome.get("chunks")
+                        if isinstance(chunks, list):
+                            done = sum(
+                                1 for c in chunks
+                                if isinstance(c, dict)
+                                and (c.get("status") or "").upper()
+                                in ("GOOD", "GOOD_RETRIED")
+                            )
+                    applied = len(outcome.get("applied") or [])
+                    candidates = len(outcome.get("candidates") or [])
+                    return (f"R_editor: chunks done={done}/{chunk_count} "
+                            f"| safe (применено)={applied} | review (предложено)={candidates}")
+        # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
+        stage = _stage_progress_slice(cache, "r_editor")
+        if stage is not None:
+            done_chunks = stage.get("done_chunks")
+            if isinstance(done_chunks, list) and done_chunks:
+                done = len(done_chunks)
+                applied = 0
+                candidates = 0
+                outcome = stage.get("outcome")
+                if isinstance(outcome, dict):
                     chunks = outcome.get("chunks")
                     if isinstance(chunks, list):
-                        done = sum(
-                            1 for c in chunks
-                            if isinstance(c, dict)
-                            and (c.get("status") or "").upper()
-                            in ("GOOD", "GOOD_RETRIED")
-                        )
-                applied = len(outcome.get("applied") or [])
-                candidates = len(outcome.get("candidates") or [])
-                return (f"R_editor: chunks done={done}/{chunk_count} "
+                        from pact_v4.audit.russian_editor import REVIEW_CLASSES, SAFE_CLASSES
+                        for chunk in chunks:
+                            if not isinstance(chunk, dict):
+                                continue
+                            edits = chunk.get("edits")
+                            if not isinstance(edits, list):
+                                continue
+                            for edit in edits:
+                                if not isinstance(edit, dict):
+                                    continue
+                                if edit.get("class") in SAFE_CLASSES:
+                                    applied += 1
+                                elif edit.get("class") in REVIEW_CLASSES:
+                                    candidates += 1
+                return (f"R_editor: chunks done={done} "
                         f"| safe (применено)={applied} | review (предложено)={candidates}")
-    # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
-    stage = _stage_progress_slice(cache, "r_editor")
-    if stage is None:
+
+    # JOURNAL-ONLY fallback: no cache, resolve lifecycle from audit_journal.ndjson.
+    b3_events = _load_b3_events(out_dir)
+    r_editor_events = [e for e in b3_events if e.get("event") == "r_editor_done"]
+    if not r_editor_events:
         return None
-    done_chunks = stage.get("done_chunks")
-    if not isinstance(done_chunks, list) or not done_chunks:
-        return None
-    done = len(done_chunks)
-    # The incremental payload does not persist the planned chunk_count (only
-    # chunk_size + the done chunk records), so the live line renders the
-    # exact done count without a fabricated denominator.
-    applied = 0
-    candidates = 0
-    outcome = stage.get("outcome")
-    if isinstance(outcome, dict):
-        chunks = outcome.get("chunks")
-        if isinstance(chunks, list):
-            # Lazy import: the class sets live in the audit module (single
-            # source of truth — never duplicated here); pulled only when the
-            # incremental R fallback actually needs them.
-            from pact_v4.audit.russian_editor import REVIEW_CLASSES, SAFE_CLASSES
-            for chunk in chunks:
-                if not isinstance(chunk, dict):
-                    continue
-                edits = chunk.get("edits")
-                if not isinstance(edits, list):
-                    continue
-                for edit in edits:
-                    if not isinstance(edit, dict):
-                        continue
-                    if edit.get("class") in SAFE_CLASSES:
-                        applied += 1
-                    elif edit.get("class") in REVIEW_CLASSES:
-                        candidates += 1
-    return (f"R_editor: chunks done={done} "
-            f"| safe (применено)={applied} | review (предложено)={candidates}")
+    last = r_editor_events[-1]
+    status = (last.get("status") or "").lower()
+    chunk_count = last.get("chunk_count")
+    done_chunks = last.get("done_chunks")
+    applied = last.get("applied")
+    candidates = last.get("candidates")
+    if status == "complete" and chunk_count is not None:
+        done_val = done_chunks if done_chunks is not None else chunk_count
+        applied_val = applied if applied is not None else 0
+        candidates_val = candidates if candidates is not None else 0
+        return (f"R_editor: chunks done={done_val}/{chunk_count} "
+                f"| safe (применено)={applied_val} | review (предложено)={candidates_val}")
+    if status == "failed":
+        return "R_editor: failed (журнал)"
+    if status == "partial" and done_chunks is not None and chunk_count is not None:
+        return (f"R_editor: chunks done={done_chunks}/{chunk_count} (partial) "
+                f"| safe (применено)={applied or 0} | review (предложено)={candidates or 0}")
+    # Ambiguous / unknown status — render a minimal diagnostic, never claim complete.
+    return f"R_editor: status={status or 'unknown'} (из журнала)"
 
 
 def _phase_audit(out_dir: Path) -> Optional[str]:
@@ -1614,11 +1641,11 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
     """
     started = _run_started_event(events)
     chapter = (started or {}).get("chapter_id") or out_dir.name
-    segments = [f"[{chapter}] {phase}"]
+    segments = [f"[{chapter}] {PHASE_HUMAN_NAME.get(phase, phase)}"]
 
     gen = _wc_gen_status(events)
     if gen is not None:
-        segments.append(f"GEN {gen['status']}")
+        segments.append(f"Translation {gen['status']}")
     elif phase not in ("gen", "steps1-5", "unknown"):
         # Chunked runs: show the chunked generation progress (journal) as the
         # GEN segment so the status line stays meaningful outside whole-chapter.
@@ -1626,29 +1653,29 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
         chunk_plan = _read_json(out_dir / "chunk_plan.json")
         total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
         if total:
-            segments.append(f"GEN chunks {len(journal)}/{total}")
+            segments.append(f"Translation chunks {len(journal)}/{total}")
 
     b3 = _load_b3_events(out_dir)
     audit_chunks = [e for e in b3 if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
     if audit_chunks:
         last = audit_chunks[-1]
         total = last.get("total")
-        # The card's "AUDIT chunk N/8" is the CURRENT chunk number, i.e. the
+        # The card's "Audit chunk N/8" is the CURRENT chunk number, i.e. the
         # newest event's chunk (the one being processed / just finished), not
         # a count of events.
         current = last.get("chunk") or sum(
             1 for e in audit_chunks if e.get("event") == "audit_chunk_started"
         )
-        segments.append(f"AUDIT chunk {current}/{total or '?'}")
+        segments.append(f"Audit chunk {current}/{total or '?'}")
 
     region_counts = _region_counts(events)
     repair_hint = _b3_repair_hint(b3)
     if repair_hint or region_counts["done"]:
         if repair_hint:
-            segments.append(f"REPAIR {repair_hint.lstrip('; ')}")
+            segments.append(f"Repair {repair_hint.lstrip('; ')}")
         else:
             segments.append(
-                f"REPAIR regions done={region_counts['done']} "
+                f"Repair regions done={region_counts['done']} "
                 f"committed={region_counts['committed']} "
                 f"debt={region_counts['debt']}"
             )
@@ -1695,7 +1722,7 @@ def render_report(out_dir: Path) -> str:
     if identity["resumed_from_index"] is not None:
         lines.append(f"resumed_from_index: {identity['resumed_from_index']}")
     lines.append(f"status: {_status_line(out_dir, events, phase)}")
-    lines.append(f"phase: {phase} -- {phase_basis}")
+    lines.append(f"phase: {PHASE_HUMAN_NAME.get(phase, phase)} -- {phase_basis}")
 
     # MONITOR-V2 (1.1/1.2): Phase block (per-pipeline-phase progress) right
     # after the alive header, then the local generation-speed block (local
@@ -1737,7 +1764,7 @@ def render_report(out_dir: Path) -> str:
         else:
             lines.append("PID validation: pending (wc_validated not written yet)")
     else:
-        lines.append(f"Steps 1-5: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
+        lines.append(f"Translation: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
                      f" (selected={trial_counts['selected']}, quarantined={trial_counts['quarantined']}, "
                      f"needs_synthesis={trial_counts['needs_synthesis']}, "
                      f"incomplete_generation={trial_counts['incomplete_generation']})")
@@ -1748,35 +1775,35 @@ def render_report(out_dir: Path) -> str:
             total = b3_audit_chunks[-1].get("total")
             started_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_started")
             done_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_done")
-            lines.append(f"Step 6 (B3): audit chunks started={started_n}/{total or '?'} "
+            lines.append(f"Audit (B3): chunks started={started_n}/{total or '?'} "
                          f"done={done_n} (audit_journal.ndjson)")
         else:
-            lines.append("Step 6 (B3): no audit chunk events yet")
+            lines.append("Audit (B3): no audit chunk events yet")
         repair_hint = _b3_repair_hint(b3_events)
         if repair_hint:
-            lines.append(f"Step 7 (B3): {repair_hint.lstrip('; ')}")
+            lines.append(f"Repair (B3): {repair_hint.lstrip('; ')}")
         else:
-            lines.append("Step 7 (B3): repair not started")
+            lines.append("Repair (B3): repair not started")
     elif fine:
         lines.append(
-            f"Step 6: audit units done={audit_counts['done']}/{audit_counts['expected']} "
+            f"Audit: units done={audit_counts['done']}/{audit_counts['expected']} "
             f"(started={audit_counts['started']})"
         )
         lines.append(
-            f"Step 7: regions planned={region_counts['planned']} done={region_counts['done']} "
+            f"Repair: regions planned={region_counts['planned']} done={region_counts['done']} "
             f"committed={region_counts['committed']} debt={region_counts['debt']} "
             f"in_progress={region_counts['in_progress']}; "
-            f"re-audit units done={reaudit_counts['done']}/{reaudit_counts['started']}"
+            f"Re-audit: units done={reaudit_counts['done']}/{reaudit_counts['started']}"
         )
     else:
-        lines.append("Step 6/7 detail: not available (coarse mode, no phase_progress.ndjson)")
-    # V4 monitor v2 (owner observation eff-a1a2): before Step 8 starts the
+        lines.append("Audit/Repair detail: not available (coarse mode, no phase_progress.ndjson)")
+    # V4 monitor v2 (owner observation eff-a1a2): before Formatting starts the
     # old text read as "formatting incidents=None ... terminal=None" — a
-    # broken-looking Step 8 block. Show an explicit "not started" instead.
+    # broken-looking Formatting block. Show an explicit "not started" instead.
     if phase in ("steps1-5", "step6", "step7", "unknown", "gen"):
-        lines.append("Step 8: not started (ожидание formatting/terminal)")
+        lines.append("Formatting: not started (ожидание formatting/terminal)")
     else:
-        lines.append(f"Step 8: formatting incidents={formatting['incidents']} blocking={formatting['blocking']}"
+        lines.append(f"Formatting: incidents={formatting['incidents']} blocking={formatting['blocking']}"
                      f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
     lines.append("")
     lines.extend(_usage_block_lines(out_dir))
@@ -1854,34 +1881,34 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
     reasoning_tokens = sum(_as_int(row.get("reasoning_tokens")) for row in usage)
 
     if phase == "done":
-        step = "8"
+        step = "Formatting"
         terminal = _terminal_counts(chapter_dir, events)
         status = terminal["status"] or "done"
     elif phase == "step8":
-        step = "8"
-        status = "step8"
+        step = "Formatting"
+        status = "Formatting"
     elif phase == "step7":
-        step = "7"
+        step = "Repair"
         round_number = _current_round(events)
-        status = f"repair r{round_number}" if round_number else "step7"
+        status = f"Repair r{round_number}" if round_number else "Repair"
     elif phase == "step6":
-        step = "6"
-        status = "step6"
+        step = "Audit"
+        status = "Audit"
     elif phase == "gen":
-        step = "1-5"
+        step = "Translation"
         gen = _wc_gen_status(events)
-        status = f"gen {gen['attempt']}/{gen['max_attempts']}" if gen else "gen"
+        status = f"Translation {gen['attempt']}/{gen['max_attempts']}" if gen else "Translation"
     elif phase == "steps1-5":
-        step = "1-5"
-        status = "steps1-5"
+        step = "Translation"
+        status = "Translation"
     else:
-        step = "?"
-        status = phase
+        step = PHASE_HUMAN_NAME.get(phase, phase)
+        status = PHASE_HUMAN_NAME.get(phase, phase)
 
     return {
         "chapter_id": chapter_dir.name,
         "chunks": f"{len(journal)}/{total}",
-        "step": step,
+        "phase": step,
         "status": status,
         "calls": calls,
         "cost": cost,
@@ -1913,7 +1940,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     show_reasoning = any(r["reasoning_tokens"] for r in rows)
 
     lines = [f"-- chapters ({len(chapters)}) {'-' * 56}"]
-    header = (f"{'chapter_id':<24} {'chunks':>7} {'step':>5} {'status':<15}"
+    header = (f"{'chapter_id':<24} {'chunks':>7} {'phase':<15} {'status':<15}"
               f"{'calls':>7}")
     if show_input:
         header += f"{'input':>9}"
@@ -1926,7 +1953,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     lines.append(header)
     for row in rows:
         status = _SHORT_STATUS.get(row["status"], row["status"])[:15]
-        line = (f"{row['chapter_id']:<24} {row['chunks']:>7} {row['step']:>5}"
+        line = (f"{row['chapter_id']:<24} {row['chunks']:>7} {row['phase']:<15}"
                 f" {status:<15}{row['calls']:>7}")
         if show_input:
             line += f"{_fmt_tokens(row['input_tokens']):>9}"
@@ -1937,7 +1964,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
         if show_cost:
             line += f" {_fmt_cost_short(row['cost']):>10}"
         lines.append(line)
-    total_line = (f"{'TOTAL':<24} {'':>7} {'':>5} {'':<15}{total_calls:>7}")
+    total_line = (f"{'TOTAL':<24} {'':>7} {'':<15} {'':<15}{total_calls:>7}")
     if show_input:
         total_line += f"{_fmt_tokens(total_input):>9}"
     if show_output:
