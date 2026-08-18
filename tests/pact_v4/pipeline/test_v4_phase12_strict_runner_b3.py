@@ -1178,7 +1178,7 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
         # version participates in the identity — a cache written under a
         # different repair prompt must never replay the repaired map.
-        "repair_prompt_version": "pact-v4-repair-as-verifier/v4",
+        "repair_prompt_version": "pact-v4-repair-as-verifier/v5",
         "repair_harness_version": "1.0",
     }
     on = _whole_chapter_cfg(tmp_path)
@@ -1364,7 +1364,7 @@ def test_b3_repair_prompt_version_wired_from_run_config(
     default_bundle = strict_run_mod._build_b3_audit_repair(
         _whole_chapter_cfg(tmp_path), None, None,
     )
-    assert default_bundle._config.repair_prompt_version == "pact-v4-repair-as-verifier/v4"
+    assert default_bundle._config.repair_prompt_version == "pact-v4-repair-as-verifier/v5"
     assert default_bundle._config.repair_harness_version == "1.0"
 
 
@@ -1531,9 +1531,9 @@ def test_b3_config_payload_carries_repair_prompt_version() -> None:
         REPAIR_HARNESS_VERSION,
         REPAIR_PROMPT_VERSION,
     )
-    assert REPAIR_PROMPT_VERSION == "pact-v4-repair-as-verifier/v4"
+    assert REPAIR_PROMPT_VERSION == "pact-v4-repair-as-verifier/v5"
     payload = B3AuditRepairConfig().to_payload()
-    assert payload["repair_prompt_version"] == "pact-v4-repair-as-verifier/v4"
+    assert payload["repair_prompt_version"] == "pact-v4-repair-as-verifier/v5"
     assert payload["repair_harness_version"] == REPAIR_HARNESS_VERSION
     custom = B3AuditRepairConfig(
         repair_prompt_version="pact-v4-repair-as-verifier/v9.9",
@@ -4111,3 +4111,44 @@ def test_b3_fallback_report_missing_identity_not_reused(tmp_path: Path) -> None:
     assert resume.r_editor_calls() == 8  # old report NOT reused
     assert resume.audit_calls() == 8
     assert second.step8["released_as_audited"] is True
+
+
+def test_b3_repair_cache_rejects_old_prompt_version(tmp_path: Path) -> None:
+    """t_448b7be2 HIGH: when REPAIR_PROMPT_VERSION is bumped (instructions
+    changed), an existing B3 audit cache written under the old prompt version
+    must be rejected on load — the old repaired map must never replay under
+    the new prompt."""
+    from pact_v4.pipeline.b3_audit_repair import B3AuditCache
+
+    cfg = _whole_chapter_cfg(tmp_path)
+    override = B3AuditRepairConfig(
+        entity_context_enabled=False,
+        russian_editor_enabled=False,
+        max_input_tokens=1,
+        audit_transport_max_retries=0,
+        audit_transport_base_delay_seconds=0,
+    )
+    _run_with_b3(
+        cfg,
+        _B3MockBackend(audit_issues=[], repair_results=[], reaudit_issues=[]),
+        config_override=override,
+    )
+    cache_path = cfg.out_dir / "audit_cache_b3.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["audit_complete"] is True  # full cache exists
+
+    # Simulate a prompt version bump: load with a DIFFERENT prompt_version
+    # (as if REPAIR_PROMPT_VERSION changed from v4 to v5).
+    miss = B3AuditCache.load(
+        cache_path,
+        snapshot_hash=payload["snapshot_hash"],
+        translation_hash=payload["translation_hash"],
+        config_identity=payload["config_identity"],
+        backend_identity_hash=payload["backend_identity_hash"],
+        prompt_version="pact-v4-repair-as-verifier/v5",  # bumped
+        harness_version=payload["harness_version"],
+        entity_context_hash=payload["entity_context_hash"],
+        entity_context_enabled=payload["entity_context_enabled"],
+        r_editor_enabled=False,
+    )
+    assert miss is None  # old cache must NOT be reused after prompt bump

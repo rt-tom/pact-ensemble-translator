@@ -132,9 +132,12 @@ REPAIR_HARNESS_VERSION = "1.0"
 # CANDIDATE-MERGE (t_0ffe56e1): v4 — REPAIR_AS_VERIFIER_V1 now tells the
 # verifier the SOURCE of each finding (fidelity_auditor vs russian_editor)
 # and that one PID may carry BOTH remarks to be resolved in ONE decision.
+# v5 — DIALOGUE MARKER RULE added to the repair prompt instructions
+# (t_448b7be2): the prompt semantics changed, so a stale cached repaired
+# map written under v4 must never replay under v5.
 # Identity-bearing: the prompt version rides the run config identity, so a
 # stale cached repaired map written under v3 can never replay under v4.
-REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v4"
+REPAIR_PROMPT_VERSION = "pact-v4-repair-as-verifier/v5"
 
 # Cap on eligible findings repaired per chapter (owner decision 2026-08-11:
 # run_010 showed the 10-finding cap cut 73% of real findings — cap on

@@ -602,7 +602,7 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 # back losing the meaning).
 REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
     role="selective_repair",
-    version="pact-v4-repair-as-verifier/v4",
+    version="pact-v4-repair-as-verifier/v5",
     instructions=(
         "You are a Russian-language repair editor for an English-to-Russian "
         "literary translation. You are given the SOURCE (PID -> English text) "

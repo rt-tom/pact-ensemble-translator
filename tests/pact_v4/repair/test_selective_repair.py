@@ -746,7 +746,7 @@ def test_repair_prompt_requires_full_pid_text_not_fragment():
     assert "FULL corrected text" in instructions
     assert "every sentence of the paragraph" in instructions
     assert "Never return a fragment" in instructions
-    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v4"
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v5"
 
 
 def test_repair_prompt_guardrails_self_verification_present():
@@ -2775,7 +2775,7 @@ def test_repair_instructions_mention_source_difference():
     assert "source=russian_editor" in instructions
     assert "source=fidelity_auditor+russian_editor" in instructions
     assert "Never apply two sequential rewrites to the same pid" in instructions
-    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v4"
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v5"
 
 
 def test_merged_editor_auditor_single_repair_call():

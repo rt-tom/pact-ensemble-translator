@@ -236,7 +236,11 @@ GLOSSARY_BUDGET_SCHEMA = "pact-v4-glossary-budget/v1"
 # glossary_conflict-carrying entries, and entries tied to the chunk's
 # required risk categories number_word/tone_profanity are never cut). The
 # bible is NOT filtered (owner decision, plan rev.2 §0.1).
-GLOSSARY_BUDGET_POLICY_VERSION = "pact-v4-glossary-budget/v1"
+# v2 — _all_targets_lowercase changed generation glossary presence semantics
+# (t_448b7be2): lowercase-target case-insensitive matching now applies to
+# Vestige/Vestiges, so a stale journal/resume written under v1 must be
+# rejected to avoid mixing pre-change and post-change glossary regimes.
+GLOSSARY_BUDGET_POLICY_VERSION = "pact-v4-glossary-budget/v2"
 # B12-F4 (RV4 HIGH): the repair-cache envelope is versioned with the repair
 # policy. ``_repair_unit_hash`` embeds ``REPAIR_POLICY_VERSION`` (now v2
 # after the F3 fail-closed Qwen verdict fix), so a cache file written under
