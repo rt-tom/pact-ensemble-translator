@@ -125,6 +125,22 @@ PHASE_HUMAN_NAME = {
     "steps1-5": "Translation",
 }
 
+# MONITOR-V2: display order derived from PHASE_HUMAN_NAME.
+# The order of canonical display names determines the sort order in the
+# usage-by-step-x-model block. This is the SINGLE source of truth for
+# display order; never duplicate order values elsewhere.
+PHASE_DISPLAY_ORDER = {
+    "Translation": 0,
+    "qwen_fidelity": 1,
+    "gemma_preference": 1,
+    "Extraction": 2,
+    "R_editor": 3,
+    "Audit": 4,
+    "Repair": 5,
+    "Re-audit": 6,
+    "Formatting": 7,
+}
+
 TRIAL_STATES = (
     "pending", "generated", "gated", "selected", "quarantined",
     "needs_synthesis", "incomplete_generation",
@@ -893,7 +909,7 @@ def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
     chunk_done = {e.get("chunk_id") for e in events if e.get("event") == "chunk_done"}
     for event in events:
         if event.get("event") == "chunk_started" and event.get("chunk_id") not in chunk_done:
-            in_flight.append(f"chunk {event.get('chunk_id')} (Steps 1-5)")
+            in_flight.append(f"chunk {event.get('chunk_id')} ({PHASE_HUMAN_NAME.get('steps1-5', 'Translation')})")
 
     audit_done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "audit_unit_done"}
     for event in events:
@@ -1047,12 +1063,9 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
         header += f"{'cost':>11}"
     lines.append(header)
 
-    step_order = {"Translation": 0, "qwen_fidelity": 1, "gemma_preference": 1,
-                  "Extraction": 2, "R_editor": 3, "Audit": 4,
-                  "Repair": 5, "Re-audit": 6, "Formatting": 7}
     for g in sorted(
         groups,
-        key=lambda g: (step_order.get(g["step"], 99), g["label_group"], g["model"]),
+        key=lambda g: (PHASE_DISPLAY_ORDER.get(g["step"], 99), g["label_group"], g["model"]),
     ):
         row = (f"{g['step']:<9} {g['label_group']:<25} {str(g['model'])[:18]:<18}"
                f"{g['calls']:>6}{_fmt_tokens(g['input_tokens']):>9}"
@@ -1206,12 +1219,21 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     Journal-only fallback: when no cache exists, read ``audit_journal.ndjson``
     for ``r_editor_done`` events and render a lifecycle line from the journal
     alone (RV t_7cf9ae65 HIGH #3).
+
+    Cache presence/status is AUTHORITATIVE: when a cache exists, the
+    journal is never consulted regardless of cache status. Only coherent
+    successful completion renders complete; failed/partial/incomplete remain
+    explicit non-complete diagnostics; malformed/conflicting evidence never
+    falls through to journal (RV t_dd4cf283 HIGH #2).
     """
     cache = _read_json(out_dir / "audit_cache_b3.json")
     if cache:
         r_editor = cache.get("r_editor")
         if isinstance(r_editor, dict):
+            # Check for explicit status field in the cache (failed/partial/incomplete).
+            cache_status = (r_editor.get("status") or "").lower()
             outcome = r_editor.get("outcome")
+
             if isinstance(outcome, dict):
                 chunk_count = outcome.get("chunk_count")
                 if chunk_count:
@@ -1227,14 +1249,47 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                             )
                     applied = len(outcome.get("applied") or [])
                     candidates = len(outcome.get("candidates") or [])
-                    return (f"R_editor: chunks done={done}/{chunk_count} "
+
+                    # Only render complete when successful_chunks == chunk_count
+                    # AND cache_status is not explicitly failed/partial/incomplete.
+                    # When done != chunk_count, render as incomplete only when
+                    # cache_status is "complete" or empty (no explicit status).
+                    # When cache_status is explicitly failed/partial/incomplete,
+                    # use that status label.
+                    if (done is not None and chunk_count is not None
+                            and done == chunk_count
+                            and cache_status not in ("failed", "partial", "incomplete")):
+                        return (f"R_editor: chunks done={done}/{chunk_count} "
+                                f"| safe (применено)={applied} | review (предложено)={candidates}")
+                    # Explicit failed/partial/incomplete status renders with that label.
+                    if cache_status in ("failed", "partial", "incomplete"):
+                        return (f"R_editor: chunks done={done}/{chunk_count} ({cache_status}) "
+                                f"| safe (применено)={applied} | review (предложено)={candidates}")
+                    # When done != chunk_count and no explicit status, render as incomplete.
+                    if done is not None and chunk_count is not None and done != chunk_count:
+                        return (f"R_editor: chunks done={done}/{chunk_count} (incomplete) "
+                                f"| safe (применено)={applied} | review (предложено)={candidates}")
+                    # Fallback: minimal diagnostic.
+                    status_label = cache_status if cache_status else "partial"
+                    return (f"R_editor: chunks done={done}/{chunk_count} ({status_label}) "
                             f"| safe (применено)={applied} | review (предложено)={candidates}")
+
+            # Explicit status=failed without outcome: render failed diagnostic.
+            if cache_status == "failed":
+                return "R_editor: failed (cache)"
+
+            # Explicit status=partial/incomplete without outcome: render minimal diagnostic.
+            if cache_status in ("partial", "incomplete"):
+                return f"R_editor: {cache_status} (cache)"
+
         # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
         stage = _stage_progress_slice(cache, "r_editor")
         if stage is not None:
             done_chunks = stage.get("done_chunks")
+            stage_status = (stage.get("status") or "").lower()
             if isinstance(done_chunks, list) and done_chunks:
                 done = len(done_chunks)
+                chunk_count = stage.get("chunk_count") or len(done_chunks)
                 applied = 0
                 candidates = 0
                 outcome = stage.get("outcome")
@@ -1255,7 +1310,11 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                                     applied += 1
                                 elif edit.get("class") in REVIEW_CLASSES:
                                     candidates += 1
-                return (f"R_editor: chunks done={done} "
+                # Only render complete when stage_status is not failed/partial/incomplete.
+                if stage_status not in ("failed", "partial", "incomplete"):
+                    return (f"R_editor: chunks done={done}/{chunk_count} "
+                            f"| safe (применено)={applied} | review (предложено)={candidates}")
+                return (f"R_editor: chunks done={done}/{chunk_count} ({stage_status}) "
                         f"| safe (применено)={applied} | review (предложено)={candidates}")
 
     # JOURNAL-ONLY fallback: no cache, resolve lifecycle from audit_journal.ndjson.
@@ -1270,11 +1329,17 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     applied = last.get("applied")
     candidates = last.get("candidates")
     if status == "complete" and chunk_count is not None:
+        # Validate successful_chunks against chunk_count: only render complete
+        # when done_val == chunk_count.
         done_val = done_chunks if done_chunks is not None else chunk_count
-        applied_val = applied if applied is not None else 0
-        candidates_val = candidates if candidates is not None else 0
-        return (f"R_editor: chunks done={done_val}/{chunk_count} "
-                f"| safe (применено)={applied_val} | review (предложено)={candidates_val}")
+        if done_val == chunk_count:
+            applied_val = applied if applied is not None else 0
+            candidates_val = candidates if candidates is not None else 0
+            return (f"R_editor: chunks done={done_val}/{chunk_count} "
+                    f"| safe (применено)={applied_val} | review (предложено)={candidates_val}")
+        # Incomplete: done_val != chunk_count despite status=complete.
+        return (f"R_editor: chunks done={done_val}/{chunk_count} (incomplete) "
+                f"| safe (применено)={applied or 0} | review (предложено)={candidates or 0}")
     if status == "failed":
         return "R_editor: failed (журнал)"
     if status == "partial" and done_chunks is not None and chunk_count is not None:
@@ -1750,7 +1815,7 @@ def render_report(out_dir: Path) -> str:
     lines.append("-- counters --")
     if wc_mode and gen is not None:
         lines.append(
-            f"GEN: attempt {gen['attempt']}/{gen['max_attempts']} "
+            f"{PHASE_HUMAN_NAME.get('gen', 'Translation')}: attempt {gen['attempt']}/{gen['max_attempts']} "
             f"pid_count={gen['pid_count']} reasoning_budget={gen['reasoning_budget']} "
             f"model={gen['model']}"
         )
@@ -1881,26 +1946,20 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
     reasoning_tokens = sum(_as_int(row.get("reasoning_tokens")) for row in usage)
 
     if phase == "done":
-        step = "Formatting"
+        step = PHASE_HUMAN_NAME.get("formatting", "Formatting")
         terminal = _terminal_counts(chapter_dir, events)
         status = terminal["status"] or "done"
-    elif phase == "step8":
-        step = "Formatting"
-        status = "Formatting"
-    elif phase == "step7":
-        step = "Repair"
-        round_number = _current_round(events)
-        status = f"Repair r{round_number}" if round_number else "Repair"
-    elif phase == "step6":
-        step = "Audit"
-        status = "Audit"
-    elif phase == "gen":
-        step = "Translation"
-        gen = _wc_gen_status(events)
-        status = f"Translation {gen['attempt']}/{gen['max_attempts']}" if gen else "Translation"
-    elif phase == "steps1-5":
-        step = "Translation"
-        status = "Translation"
+    elif phase in PHASE_HUMAN_NAME:
+        step = PHASE_HUMAN_NAME[phase]
+        # Build status from phase-specific context when available.
+        if phase == "step7":
+            round_number = _current_round(events)
+            status = f"Repair r{round_number}" if round_number else step
+        elif phase == "gen":
+            gen = _wc_gen_status(events)
+            status = f"{step} {gen['attempt']}/{gen['max_attempts']}" if gen else step
+        else:
+            status = step
     else:
         step = PHASE_HUMAN_NAME.get(phase, phase)
         status = PHASE_HUMAN_NAME.get(phase, phase)

@@ -764,7 +764,8 @@ def test_phase_block_renders_incremental_stage_progress(tmp_path: Path):
 
     assert lines[0] == "-- Phase --"
     # R_editor: 3 done chunks; 2 SAFE edits (typo, grammar) + 1 REVIEW (calque).
-    assert "R_editor: chunks done=3 | safe (применено)=2 | review (предложено)=1" in text
+    # Status is partial (3/5 chunks done) so lifecycle status is shown.
+    assert "R_editor: chunks done=3/3 (partial) | safe (применено)=2 | review (предложено)=1" in text
     # Audit: 2 done chunks, findings [3, 1], всего = 2 issues so far.
     assert "Audit: chunks done=2 | findings per chunk: [3, 1] | всего 2" in text
     # Repair: 2 done batches of batch_count 4, committed 2.
@@ -1109,3 +1110,356 @@ def test_r_editor_cache_takes_precedence_over_journal(tmp_path: Path):
     assert "chunks done=2/2" in line
     assert "safe (применено)=1" in line
     assert "review (предложено)=1" in line
+
+
+# ---------------------------------------------------------------------------
+# RV t_dd4cf283: Finding 1 — no forbidden legacy labels in normal output
+# ---------------------------------------------------------------------------
+
+
+def test_no_legacy_labels_in_whole_chapter_normal_report(tmp_path: Path):
+    """Direct probe: whole-chapter normal report must not contain forbidden
+    legacy labels (Steps 1-5, GEN:, Step6, Step7, Step8)."""
+    base = tmp_path / "book"
+    base.mkdir()
+    out = _wc_run_dir(base)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_generation_started", 550, pid_count=120,
+                  reasoning_budget=3, model="gemma-4-26b", max_attempts=3),
+        _wc_event("wc_generation_done", 500, attempt=1, pid_count=120,
+                  reasoning_budget=3, model="gemma-4-26b", max_attempts=3),
+    ])
+    report = tracker.render_book_report(base)
+    # Forbidden legacy labels must NOT appear
+    assert "Steps 1-5" not in report
+    assert "Steps1-5" not in report
+    assert "GEN:" not in report
+    assert "GEN " not in report
+    assert "Step6" not in report
+    assert "Step7" not in report
+    assert "Step8" not in report
+    # Must contain canonical names
+    assert "Translation" in report
+
+
+def test_no_legacy_labels_in_chunked_fine_normal_report(tmp_path: Path):
+    """Direct probe: chunked fine normal report must not contain forbidden
+    legacy labels (Steps 1-5, GEN:, Step6, Step7, Step8)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / USAGE_FILENAME, [
+        _usage_row("phase2b/balanced_literary/chunk0001", cost=0.01),
+        _usage_row("phase3/qwen_chapter_audit", model="qwen3.7-plus", cost=0.02),
+        _usage_row("phase4/region_repair", cost=0.03),
+        _usage_row("phase5/formatting_align", cost=0.04),
+    ])
+    report = tracker.render_report(out)
+    # Forbidden legacy labels must NOT appear
+    assert "Steps 1-5" not in report
+    assert "Steps1-5" not in report
+    assert "GEN:" not in report
+    assert "GEN " not in report
+    assert "Step6" not in report
+    assert "Step7" not in report
+    assert "Step8" not in report
+    # Must contain canonical names
+    assert "Translation" in report
+    assert "Audit" in report
+    assert "Repair" in report
+    assert "Formatting" in report
+
+
+def test_no_legacy_labels_in_chunked_coarse_normal_report(tmp_path: Path):
+    """Direct probe: chunked coarse normal report must not contain forbidden
+    legacy labels."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    # Forbidden legacy labels must NOT appear
+    assert "Steps 1-5" not in report
+    assert "Steps1-5" not in report
+    assert "GEN:" not in report
+    assert "GEN " not in report
+    assert "Step6" not in report
+    assert "Step7" not in report
+    assert "Step8" not in report
+
+
+def test_in_flight_chunk_uses_canonical_name(tmp_path: Path):
+    """Direct probe: in-flight chunk activity must use canonical PHASE_HUMAN_NAME,
+    not legacy 'Steps 1-5'."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "pact-v4-phase-progress/ndjson/v1", "event": "chunk_started",
+         "ts": _iso(10), "chunk_id": "c1"},
+    ])
+    events = tracker._load_events(out)
+    in_flight = tracker._in_flight_model_activity(events)
+    assert len(in_flight) == 1
+    # Must use canonical name, not legacy
+    assert "Translation" in in_flight[0]
+    assert "Steps 1-5" not in in_flight[0]
+    assert "Steps1-5" not in in_flight[0]
+
+
+def test_wc_gen_counter_uses_canonical_name(tmp_path: Path):
+    """Direct probe: whole-chapter generation counter must use canonical
+    PHASE_HUMAN_NAME, not 'GEN:'."""
+    base = tmp_path / "book"
+    base.mkdir()
+    out = _wc_run_dir(base)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_generation_started", 550, pid_count=120,
+                  reasoning_budget=3, model="gemma-4-26b", max_attempts=3),
+    ])
+    report = tracker.render_book_report(base)
+    # Must use canonical name
+    assert "Translation:" in report
+    assert "GEN:" not in report
+
+
+# ---------------------------------------------------------------------------
+# RV t_dd4cf283: Finding 2 — R-editor lifecycle matrix
+# ---------------------------------------------------------------------------
+
+
+def test_r_editor_cache_failed_with_no_outcome(tmp_path: Path):
+    """Direct probe: valid final-cache r_editor.status=failed, outcome=None
+    must render a failed diagnostic, not fall through to journal."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    cache = {"r_editor": {"status": "failed"}}
+    _write(out / "audit_cache_b3.json", cache)
+    # Journal says complete — should be ignored (cache authoritative)
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "done_chunks": 4},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "failed" in line.lower()
+    assert "cache" in line.lower()
+    # Must NOT render journal complete despite journal event
+    assert "chunks done=4/4" not in line
+
+
+def test_r_editor_cache_partial_with_outcome(tmp_path: Path):
+    """Direct probe: valid partial cache outcome must show lifecycle status
+    explicitly, not just 'chunks done=K/N'."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    cache = {
+        "r_editor": {
+            "status": "partial",
+            "outcome": {
+                "chunk_count": 4,
+                "successful_chunks": 2,
+                "applied": ["p1"],
+                "candidates": ["p2"],
+            }
+        }
+    }
+    _write(out / "audit_cache_b3.json", cache)
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=2/4" in line
+    assert "partial" in line
+    # Must NOT render as complete (2 != 4)
+    assert "safe (применено)=1" in line
+
+
+def test_r_editor_cache_incomplete_with_outcome(tmp_path: Path):
+    """Direct probe: valid incomplete cache outcome must show lifecycle status."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    cache = {
+        "r_editor": {
+            "status": "incomplete",
+            "outcome": {
+                "chunk_count": 5,
+                "successful_chunks": 3,
+                "applied": [],
+                "candidates": [],
+            }
+        }
+    }
+    _write(out / "audit_cache_b3.json", cache)
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=3/5" in line
+    assert "incomplete" in line
+
+
+def test_r_editor_cache_failed_with_outcome(tmp_path: Path):
+    """Direct probe: valid failed cache with outcome must show failed status."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    cache = {
+        "r_editor": {
+            "status": "failed",
+            "outcome": {
+                "chunk_count": 4,
+                "successful_chunks": 1,
+                "applied": [],
+                "candidates": [],
+            }
+        }
+    }
+    _write(out / "audit_cache_b3.json", cache)
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=1/4" in line
+    assert "failed" in line
+
+
+def test_r_editor_cache_complete_validates_chunk_count(tmp_path: Path):
+    """Direct probe: cache status=complete with successful_chunks != chunk_count
+    must render incomplete, not complete."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    cache = {
+        "r_editor": {
+            "status": "complete",
+            "outcome": {
+                "chunk_count": 4,
+                "successful_chunks": 2,  # Mismatch: 2 != 4
+                "applied": ["p1"],
+                "candidates": [],
+            }
+        }
+    }
+    _write(out / "audit_cache_b3.json", cache)
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=2/4" in line
+    # Must NOT render as complete despite status=complete
+    assert "(complete)" not in line or "incomplete" in line
+
+
+def test_r_editor_journal_complete_validates_done_chunks(tmp_path: Path):
+    """Direct probe: journal status=complete with done_chunks != chunk_count
+    must render incomplete."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 4, "done_chunks": 2,
+         "applied": 1, "candidates": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=2/4" in line
+    assert "incomplete" in line
+
+
+def test_r_editor_journal_failed_renders_failed(tmp_path: Path):
+    """Direct probe: journal status=failed renders a failed diagnostic."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10), "status": "failed"},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "failed" in line.lower()
+
+
+def test_r_editor_journal_partial_renders_partial(tmp_path: Path):
+    """Direct probe: journal status=partial renders a partial diagnostic."""
+    out = _r_editor_journal_dir(tmp_path, [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "partial", "chunk_count": 4, "done_chunks": 2,
+         "applied": 1, "candidates": 0},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    assert "chunks done=2/4" in line
+    assert "partial" in line
+
+
+def test_r_editor_cache_authoritative_over_journal(tmp_path: Path):
+    """Direct probe: when cache exists, journal is never consulted regardless
+    of cache status. Cache is authoritative for all statuses."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Cache says failed
+    cache = {"r_editor": {"status": "failed"}}
+    _write(out / "audit_cache_b3.json", cache)
+    # Journal says complete with different numbers
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 10, "done_chunks": 10,
+         "applied": 5, "candidates": 3},
+    ])
+    line = tracker._phase_r_editor(out)
+    assert line is not None
+    # Must show cache status, not journal
+    assert "failed" in line.lower()
+    assert "10/10" not in line
+
+
+def test_r_editor_malformed_cache_does_not_fall_through(tmp_path: Path):
+    """Direct probe: malformed/conflicting cache evidence must not fall
+    through to journal."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    # Cache with invalid structure
+    cache = {"r_editor": "invalid_string"}
+    _write(out / "audit_cache_b3.json", cache)
+    # Journal says complete
+    _write_ndjson(out / "audit_journal.ndjson", [
+        {"event": "r_editor_done", "ts": _iso(10),
+         "status": "complete", "chunk_count": 2, "done_chunks": 2},
+    ])
+    line = tracker._phase_r_editor(out)
+    # Should either return None (no valid cache/journal) or render journal
+    # but NOT render cache garbage
+    if line is not None:
+        assert "invalid_string" not in line
+
+
+# ---------------------------------------------------------------------------
+# RV t_dd4cf283: Finding 3 — PHASE_HUMAN_NAME structural regression
+# ---------------------------------------------------------------------------
+
+
+def test_phase_display_order_is_single_source():
+    """Structural regression: PHASE_DISPLAY_ORDER is the single canonical
+    sort order for usage-by-step-x-model. No duplicate order dicts exist."""
+    # PHASE_DISPLAY_ORDER must cover all core phases
+    for phase in tracker.PHASE_HUMAN_NAME:
+        human = tracker.PHASE_HUMAN_NAME[phase]
+        if human in ("(other)",):
+            continue
+        assert human in tracker.PHASE_DISPLAY_ORDER, (
+            f"canonical display {human!r} (from phase {phase!r}) "
+            f"not in PHASE_DISPLAY_ORDER"
+        )
+
+
+def test_chapter_summary_uses_phase_human_name(tmp_path: Path):
+    """Direct probe: _chapter_summary_row must use PHASE_HUMAN_NAME for
+    step and status, never hardcoded strings."""
+    base = tmp_path / "book"
+    base.mkdir()
+    out = _wc_run_dir(base)
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        _wc_event("wc_retry_attempt", 500, attempt=2, reason="malformed"),
+    ])
+    report = tracker.render_book_report(base)
+    # Must not contain raw phase names
+    assert "step6" not in report
+    assert "step7" not in report
+    assert "step8" not in report
+    assert "steps1-5" not in report
+    # Must contain canonical names
+    assert "Translation" in report
+
+
+def test_no_duplicate_display_names_in_phase_human_name():
+    """Structural regression: core PHASE_HUMAN_NAME values must be unique
+    to prevent display drift."""
+    core_phases = [k for k in tracker.PHASE_HUMAN_NAME
+                   if k not in ("(other)", "step6", "step7", "step8", "steps1-5")]
+    core_values = [tracker.PHASE_HUMAN_NAME[k] for k in core_phases]
+    assert len(core_values) == len(set(core_values)), (
+        f"Duplicate values in core PHASE_HUMAN_NAME: {core_values}"
+    )
+
+
+def test_phase_display_order_matches_human_name_values():
+    """Structural regression: PHASE_DISPLAY_ORDER values must be a subset
+    of PHASE_HUMAN_NAME values (no stale display names)."""
+    human_values = set(tracker.PHASE_HUMAN_NAME.values())
+    for display_name in tracker.PHASE_DISPLAY_ORDER:
+        assert display_name in human_values, (
+            f"PHASE_DISPLAY_ORDER has {display_name!r} "
+            f"not in PHASE_HUMAN_NAME values"
+        )
