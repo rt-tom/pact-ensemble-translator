@@ -441,7 +441,7 @@ def test_status_line_whole_chapter_live_generation(tmp_path: Path):
     ])
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "gen")
-    assert line.startswith("[0001] gen")
+    assert line.startswith("[0001] Whole-chapter translation")
     assert "Whole-chapter translation attempt 1/3 (reason: truncated)" in line
 
 
@@ -461,7 +461,7 @@ def test_status_line_whole_chapter_audit_and_repair(tmp_path: Path):
     ])
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "step7")
-    assert "[0001] step7" in line
+    assert "[0001] Selective repair" in line
     assert "Chapter audit chunk 5/8" in line
     assert "committed=1" in line and "debt=1" in line
 
@@ -523,7 +523,7 @@ def test_render_report_whole_chapter_shows_generation_and_validation(tmp_path: P
         _b3_event("audit_chunk_done", 440, chunk=5, total=8, status="ok"),
     ])
     report = tracker.render_report(out)
-    assert "status: [0001] step6" in report
+    assert "status: [0001] Chapter audit" in report
     assert "Whole-chapter translation attempt 1/3 done finish_reason=complete" in report
     assert "Chapter audit chunk 5/8" in report
     assert "PID validation: json_ok=True pids_ok=True order_ok=True" in report

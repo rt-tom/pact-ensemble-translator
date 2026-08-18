@@ -507,7 +507,8 @@ def test_server_speed_block_local(tmp_path: Path):
     lines = tracker._server_speed_lines(out)
     assert lines[0] == "-- скорость генерации (локальная, из server_logs) --"
     assert "gemma: eval 29.75 t/s | prompt 376.9 t/s | live tg_3s 29.63 t/s" in lines[1]
-    assert "n_decoded=2373, eval 79.8s (запрос от 14:51:57)" in lines[2]
+    # MONITOR-V2 finding 2: raw prefix, not wall-clock HMS.
+    assert "n_decoded=500, eval 79.8s (raw: 14.51.578.231)" in lines[2]
 
 
 def test_server_speed_block_absent_for_remote(tmp_path: Path):
@@ -539,9 +540,23 @@ def test_server_speed_block_picks_newest_log(tmp_path: Path):
     assert "qwen: eval 200.00 t/s" in lines[1]
 
 
-def test_llama_ts_to_hms():
-    assert tracker._llama_ts_to_hms("14.51.578.231") == "14:51:57"
-    assert tracker._llama_ts_to_hms("4.30.558.334") == "4:30:55"
+def test_llama_ts_raw():
+    # MONITOR-V2 finding 2: _llama_ts_raw returns the prefix as-is —
+    # no wall-clock interpretation, no impossible timestamps.
+    assert tracker._llama_ts_raw("14.51.578.231") == "14.51.578.231"
+    assert tracker._llama_ts_raw("4.30.558.334") == "4.30.558.334"
+    assert tracker._llama_ts_raw("bad") == "bad"
+
+
+def test_llama_ts_raw_no_impossible_wall_clock():
+    """_llama_ts_raw never produces impossible timestamps like
+    35:59:86 — it returns the raw prefix verbatim (task req. 7)."""
+    # Impossible prefix: 35.59.86.231 would be 35:59:86 with the old
+    # wall-clock conversion — now it stays as-is.
+    assert tracker._llama_ts_raw("35.59.86.231") == "35.59.86.231"
+    # Normal prefixes are also returned as-is.
+    assert tracker._llama_ts_raw("14.51.578.231") == "14.51.578.231"
+    assert tracker._llama_ts_raw("23.59.59.999") == "23.59.59.999"
 
 
 def test_last_call_block_from_usage(tmp_path: Path):
@@ -736,8 +751,8 @@ def test_phase_block_renders_incremental_stage_progress(tmp_path: Path):
     # Repair: 2 done batches of batch_count 4, committed 2.
     assert ("Selective repair: batches done=2/4 | repaired per batch: [1/1, 1/1] "
             "| findings eligible: 2 | PID edits committed: 2") in text
-    # Re-audit: 1 done chunk, residual 1 issue, no failed marker -> debt 0.
-    assert "Re-audit scope: chunks done=1 | residual: 1 | debt: 0" in text
+    # Re-audit: 1 done chunk, residual 1 issue, incomplete stage -> debt 1.
+    assert "Re-audit scope: chunks done=1 | residual: 1 | debt: 1" in text
     assert "(нет Phase-артефактов" not in text
 
 
@@ -857,15 +872,21 @@ def test_canonical_phase_names_consistent(tmp_path: Path):
     assert tracker.PHASE_HUMAN_NAME["repair"] == "Selective repair"
     assert tracker.PHASE_HUMAN_NAME["reaudit"] == "Re-audit scope"
     assert tracker.PHASE_HUMAN_NAME["formatting"] == "Formatting"
-    # PHASE_TO_STEP_GROUP uses the same canonical names.
+    # MONITOR-V2 finding 6: PHASE_TO_STEP_GROUP is derived from PHASE_HUMAN_NAME.
     for phase in ("extraction", "gen", "r_editor", "audit", "repair",
                   "reaudit", "formatting"):
         assert tracker.PHASE_TO_STEP_GROUP[phase] == tracker.PHASE_HUMAN_NAME[phase]
+    # Structural invariant: every key in PHASE_TO_STEP_GROUP (except extras)
+    # must exist in PHASE_HUMAN_NAME.
+    for key in tracker.PHASE_TO_STEP_GROUP:
+        assert key in tracker.PHASE_HUMAN_NAME, (
+            f"PHASE_TO_STEP_GROUP key {key!r} not in PHASE_HUMAN_NAME"
+        )
 
 
 def test_speed_block_live_tg3s_without_final_eval(tmp_path: Path):
     """Active local generation with tg_3s but no final eval renders live
-    t/s and 'eval in progress' (task req. 5)."""
+    t/s, n_decoded, and 'eval in progress' (task req. 5, finding 1)."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     logs = out / "server_logs"
     logs.mkdir(exist_ok=True)
@@ -879,6 +900,8 @@ def test_speed_block_live_tg3s_without_final_eval(tmp_path: Path):
     assert len(lines) == 2
     assert "live tg_3s 26.08 t/s" in lines[1]
     assert "eval in progress" in lines[1]
+    # MONITOR-V2 finding 1: n_decoded must be rendered even without final eval.
+    assert "n_decoded=100" in lines[1]
     # Must NOT show "нет завершённых eval" during active generation.
     assert "нет завершённых eval" not in lines[1]
 
@@ -1010,14 +1033,177 @@ def test_counters_whole_chapter_canonical_lifecycle(tmp_path: Path):
     assert "Steps 1-5" not in report
 
 
-def test_llama_ts_no_impossible_wall_clock():
-    """_llama_ts_to_hms does not produce impossible timestamps like
-    35:59:86 (task req. 7)."""
-    # Normal case.
-    assert tracker._llama_ts_to_hms("14.51.578.231") == "14:51:57"
-    # Single-digit hour.
-    assert tracker._llama_ts_to_hms("4.30.558.334") == "4:30:55"
-    # Edge: seconds=59, milliseconds=999.
-    assert tracker._llama_ts_to_hms("23.59.59.999") == "23:59:59"
-    # Invalid prefix falls through.
-    assert tracker._llama_ts_to_hms("bad") == "bad"
+# ---------------------------------------------------------------------------
+# MONITOR-V2 finding 3: R-editor lifecycle from B3 events only
+# ---------------------------------------------------------------------------
+
+def test_r_editor_not_started_without_b3(tmp_path: Path):
+    """Generation done without B3 events must NOT claim R-editor complete
+    (finding 3 regression)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_generation_done", "ts": _iso(50),
+         "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
+    ])
+    report = tracker.render_report(out)
+    # R-editor must be "not started" — no B3 r_editor events exist.
+    assert "R-editor: not started" in report
+    assert "R-editor: complete" not in report
+
+
+def test_r_editor_in_progress_from_b3_started(tmp_path: Path):
+    """R-editor in progress when B3 has r_editor_started but no r_editor_done."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_generation_done", "ts": _iso(50),
+         "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
+    ])
+    _write(out / "audit_journal.ndjson", "")
+    import json as _json
+    with open(out / "audit_journal.ndjson", "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"schema": "pact-v4-b3-audit-journal/v1",
+                               "event": "r_editor_started",
+                               "ts": _iso(40)}) + "\n")
+    report = tracker.render_report(out)
+    assert "R-editor: in progress" in report
+    assert "R-editor: complete" not in report
+    assert "R-editor: not started" not in report
+
+
+def test_r_editor_complete_from_b3_done(tmp_path: Path):
+    """R-editor complete when B3 has r_editor_done events."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_generation_done", "ts": _iso(50),
+         "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
+    ])
+    _write(out / "audit_journal.ndjson", "")
+    import json as _json
+    with open(out / "audit_journal.ndjson", "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"schema": "pact-v4-b3-audit-journal/v1",
+                               "event": "r_editor_started",
+                               "ts": _iso(40)}) + "\n")
+        fh.write(_json.dumps({"schema": "pact-v4-b3-audit-journal/v1",
+                               "event": "r_editor_done",
+                               "ts": _iso(30), "chunk": 1, "total": 1}) + "\n")
+    report = tracker.render_report(out)
+    assert "R-editor: complete" in report
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 finding 4: re-audit incomplete execution debt
+# ---------------------------------------------------------------------------
+
+def test_reaudit_incomplete_execution_debt_final(tmp_path: Path):
+    """Final cache: incomplete re-audit (complete=False, failed=False)
+    must render debt=1, not debt=0 (finding 4 regression)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "reaudit": {
+                "complete": False,
+                "issues": [{"id": "p1"}],
+            },
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "residual: 1" in text
+    # debt=1 because incomplete, NOT because failed.
+    assert "debt: 1" in text
+    assert "debt: 0" not in text
+
+
+def test_reaudit_incomplete_execution_debt_incremental(tmp_path: Path):
+    """Incremental path: incomplete stage (no terminal status) must render
+    debt=1 (finding 4 regression)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "reaudit": {
+                "status": "in_progress",
+                "done_chunks": [{"chunk": 1, "issues": []}],
+                "issues": [],
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Incomplete stage → debt=1.
+    assert "debt: 1" in text
+    assert "debt: 0" not in text
+
+
+def test_reaudit_complete_no_debt(tmp_path: Path):
+    """Complete re-audit (complete=True) with no failed chunks → debt=0."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "reaudit": {
+                "complete": True,
+                "issues": [],
+            },
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "debt: 0" in text
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 finding 5: canonical phase names in status and chapter table
+# ---------------------------------------------------------------------------
+
+def test_status_line_uses_canonical_phase_names(tmp_path: Path):
+    """Status line uses canonical phase names, not raw internal codes."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    events = tracker._load_events(out)
+    line = tracker._status_line(out, events, "gen")
+    # Canonical name, not raw "gen".
+    assert "[chapter_0001] Whole-chapter translation" in line
+    assert "[chapter_0001] gen" not in line
+
+
+def test_render_report_phase_line_canonical(tmp_path: Path):
+    """render_report phase: line uses canonical name."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_report(out)
+    # phase: line uses canonical name, not raw "gen".
+    assert "phase: Whole-chapter translation --" in report
+    assert "phase: gen --" not in report
+
+
+def test_chapter_table_step_uses_canonical(tmp_path: Path):
+    """Chapter table step column uses canonical names, not raw step numbers."""
+    base = tmp_path / "book"
+    base.mkdir()
+    out = _chapter_dir(base, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_book_report(base)
+    # Step column must not show raw "1-5", "6", "7", "8".
+    table_line = [l for l in report.split("\n") if "chapter_0001" in l]
+    assert table_line
+    # Should contain canonical names, not internal codes.
+    assert "1-5" not in table_line[0]
