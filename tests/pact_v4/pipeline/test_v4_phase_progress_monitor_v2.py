@@ -113,20 +113,20 @@ def test_usage_grouping_reuses_phase_for_label(tmp_path: Path):
     # MONITOR-V2 (1.3): the column is renamed to "фазы" and shows human
     # phase names (Extraction / Translation / R_editor / Audit / Repair /
     # Re-audit) instead of the old "phase2b generation" label-groups.
-    assert by_group[("Translation", "deepseek-v4-flash")]["calls"] == 2
-    assert by_group[("Translation", "deepseek-v4-flash")]["step"] == "Steps1-5"
+    assert by_group[("Whole-chapter translation", "deepseek-v4-flash")]["calls"] == 2
+    assert by_group[("Whole-chapter translation", "deepseek-v4-flash")]["step"] == "Whole-chapter translation"
     # phase2c/phase4 keep their phase identity through phase_for_label.
-    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("Repair", "deepseek-v4-flash")]["step"] == "Step7"
-    assert by_group[("Repair", "qwen3.7-plus")]["step"] == "Step7"
-    assert by_group[("Audit", "qwen3.7-plus")]["step"] == "Step6"
-    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Step8"
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "qwen_fidelity"
+    assert by_group[("Selective repair", "deepseek-v4-flash")]["step"] == "Selective repair"
+    assert by_group[("Selective repair", "qwen3.7-plus")]["step"] == "Selective repair"
+    assert by_group[("Chapter audit", "qwen3.7-plus")]["step"] == "Chapter audit"
+    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Formatting"
 
     # The step mapping goes through phase_for_label — prove the reuse by
     # checking the label->phase leg is literally v4_usage's function.
     assert tracker.phase_for_label is v4_usage.phase_for_label
-    assert by_group[("Translation", "deepseek-v4-flash")]["reported_cost"] == 0.03
-    assert by_group[("Audit", "qwen3.7-plus")]["reported_cost"] == 0.04
+    assert by_group[("Whole-chapter translation", "deepseek-v4-flash")]["reported_cost"] == 0.03
+    assert by_group[("Chapter audit", "qwen3.7-plus")]["reported_cost"] == 0.04
 
 
 def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
@@ -142,8 +142,8 @@ def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
     groups = tracker._usage_group_rows(tracker._read_usage_rows(out))
     by_group = {(g["label_group"], g["model"]): g for g in groups}
 
-    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "Step2c"
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "qwen_fidelity"
+    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "gemma_preference"
     assert not any(g.startswith("phase2c") for g, _ in by_group)
 
 
@@ -288,8 +288,8 @@ def test_step8_not_started_wording(tmp_path: Path):
          "ts": _iso(20), "round_number": 1},
     ])
     report = tracker.render_report(out)
-    assert "Step 8: not started (ожидание formatting/terminal)" in report
-    assert "formatting incidents=None" not in report
+    assert "Formatting: not started (ожидание formatting/terminal)" in report
+    assert "incidents=None" not in report
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +451,12 @@ def test_phase_block_renders_six_phases(tmp_path: Path):
     lines = tracker._phase_block_lines(out, events)
     assert lines[0] == "-- Phase --"
     text = "\n".join(lines)
-    assert "Extraction: сущностей: 2 | claims: verified 2 / candidate 2" in text
-    assert "Translation: attempt 1/3 | source 286 слов → перевод 7 слов" in text
-    assert "R_editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
-    assert "Audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
-    assert "Repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | total 2/4" in text
-    assert "Re-audit: chunks done=2/2 | residual: 1 | debt: 0" in text
+    assert "Entity extraction: сущностей: 2 | claims: verified 2 / candidate 2" in text
+    assert "Whole-chapter translation: attempt 1/3 | source 286 слов → перевод 7 слов" in text
+    assert "R-editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
+    assert "Chapter audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
+    assert "Selective repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | findings eligible: 4 | PID edits committed: 2" in text
+    assert "Re-audit scope: chunks done=2/2 | residual: 1 | debt: 0" in text
 
 
 def test_phase_block_skips_absent_artifacts(tmp_path: Path):
@@ -478,7 +478,7 @@ def test_phase_block_translation_attempt_from_wc_events(tmp_path: Path):
     ])
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
-    assert "Translation: attempt 2/3 | source 5 слов → перевод 1 слов" in "\n".join(lines)
+    assert "Whole-chapter translation: attempt 2/3 | source 5 слов → перевод 1 слов" in "\n".join(lines)
 
 
 def _local_server_log(out: Path, name: str = "Gemma_20260816_120000_stderr.log") -> Path:
@@ -554,7 +554,7 @@ def test_last_call_block_from_usage(tmp_path: Path):
     ])
     lines = tracker._last_call_block_lines(out)
     assert lines[0] == "-- последний вызов (из usage.ndjson) --"
-    assert lines[1] == "  Re-audit | qwen3.7-plus | in=45620 out=210 reas=5800 | wall=?s"
+    assert lines[1] == "  Re-audit scope | qwen3.7-plus | in=45620 out=210 reas=5800 | wall=?s"
 
 
 def test_last_call_block_absent_without_usage(tmp_path: Path):
@@ -730,14 +730,14 @@ def test_phase_block_renders_incremental_stage_progress(tmp_path: Path):
 
     assert lines[0] == "-- Phase --"
     # R_editor: 3 done chunks; 2 SAFE edits (typo, grammar) + 1 REVIEW (calque).
-    assert "R_editor: chunks done=3 | safe (применено)=2 | review (предложено)=1" in text
+    assert "R-editor: chunks done=3 | safe (применено)=2 | review (предложено)=1" in text
     # Audit: 2 done chunks, findings [3, 1], всего = 2 issues so far.
-    assert "Audit: chunks done=2 | findings per chunk: [3, 1] | всего 2" in text
+    assert "Chapter audit: chunks done=2 | findings per chunk: [3, 1] | всего 2" in text
     # Repair: 2 done batches of batch_count 4, committed 2.
-    assert ("Repair: batches done=2/4 | repaired per batch: [1/1, 1/1] "
-            "| total 2") in text
+    assert ("Selective repair: batches done=2/4 | repaired per batch: [1/1, 1/1] "
+            "| findings eligible: 2 | PID edits committed: 2") in text
     # Re-audit: 1 done chunk, residual 1 issue, no failed marker -> debt 0.
-    assert "Re-audit: chunks done=1 | residual: 1 | debt: 0" in text
+    assert "Re-audit scope: chunks done=1 | residual: 1 | debt: 0" in text
     assert "(нет Phase-артефактов" not in text
 
 
@@ -754,10 +754,10 @@ def test_phase_block_final_cache_output_preserved(tmp_path: Path):
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
     text = "\n".join(lines)
-    assert "R_editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
-    assert "Audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
-    assert "Repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | total 2/4" in text
-    assert "Re-audit: chunks done=2/2 | residual: 1 | debt: 0" in text
+    assert "R-editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
+    assert "Chapter audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
+    assert "Selective repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | findings eligible: 4 | PID edits committed: 2" in text
+    assert "Re-audit scope: chunks done=2/2 | residual: 1 | debt: 0" in text
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +806,7 @@ def test_phase_block_tolerates_malformed_schema(tmp_path: Path):
     # Extraction with entries=[1] yields no entities -> line absent.
     assert "Extraction:" not in text
     # word_counts with a non-numeric value counts it as 0, the numeric one as 5.
-    assert "Translation:" in text and "5 слов" in text
+    assert "Whole-chapter translation:" in text and "5 слов" in text
 
 
 def test_usage_block_tolerates_corrupt_ndjson(tmp_path: Path):
@@ -823,7 +823,7 @@ def test_usage_block_tolerates_corrupt_ndjson(tmp_path: Path):
     text = "\n".join(lines)
     # Two valid rows survive (the non-object row and garbage are skipped);
     # the non-numeric token counts as 0.
-    assert "Translation" in text
+    assert "Whole-chapter translation" in text
     assert "calls" in text
     assert "2" in text
 
@@ -840,3 +840,184 @@ def test_usage_block_distinguishes_corrupt_vs_absent(tmp_path: Path):
     (out / USAGE_FILENAME).write_bytes(b"\xff\xfe not json \x00")
     lines = tracker._usage_block_lines(out)
     assert any("corrupt" in l or "no readable rows" in l for l in lines)
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 whole-chapter vocabulary: canonical names, live speed, liveness,
+# repair/re-audit separation, book table mode/unit, timestamp (task req.)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_phase_names_consistent(tmp_path: Path):
+    """All seven canonical phase names are the single source of truth."""
+    assert tracker.PHASE_HUMAN_NAME["extraction"] == "Entity extraction"
+    assert tracker.PHASE_HUMAN_NAME["gen"] == "Whole-chapter translation"
+    assert tracker.PHASE_HUMAN_NAME["r_editor"] == "R-editor"
+    assert tracker.PHASE_HUMAN_NAME["audit"] == "Chapter audit"
+    assert tracker.PHASE_HUMAN_NAME["repair"] == "Selective repair"
+    assert tracker.PHASE_HUMAN_NAME["reaudit"] == "Re-audit scope"
+    assert tracker.PHASE_HUMAN_NAME["formatting"] == "Formatting"
+    # PHASE_TO_STEP_GROUP uses the same canonical names.
+    for phase in ("extraction", "gen", "r_editor", "audit", "repair",
+                  "reaudit", "formatting"):
+        assert tracker.PHASE_TO_STEP_GROUP[phase] == tracker.PHASE_HUMAN_NAME[phase]
+
+
+def test_speed_block_live_tg3s_without_final_eval(tmp_path: Path):
+    """Active local generation with tg_3s but no final eval renders live
+    t/s and 'eval in progress' (task req. 5)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    logs = out / "server_logs"
+    logs.mkdir(exist_ok=True)
+    # Write a log with tg_3s but NO final eval line.
+    (logs / "Gemma_20260816_120000_stderr.log").write_text(
+        "0.32.156.164 I slot print_timing: id  0 | task 0 | n_decoded =    100, "
+        "tg =  26.08 t/s, tg_3s =  26.08 t/s\n",
+        encoding="utf-8",
+    )
+    lines = tracker._server_speed_lines(out)
+    assert len(lines) == 2
+    assert "live tg_3s 26.08 t/s" in lines[1]
+    assert "eval in progress" in lines[1]
+    # Must NOT show "нет завершённых eval" during active generation.
+    assert "нет завершённых eval" not in lines[1]
+
+
+def test_local_liveness_from_fresh_gemma_log(tmp_path: Path):
+    """Fresh local Gemma/Qwen log is an additional liveness signal
+    (task req. 6). Remote logs cannot produce alive=yes."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    logs = out / "server_logs"
+    logs.mkdir(exist_ok=True)
+    # Fresh local log -> alive.
+    (logs / "Gemma_20260816_120000_stderr.log").write_text("x", encoding="utf-8")
+    events = tracker._load_events(out)
+    identity = tracker._identity(out, events)
+    assert identity["alive"] is True
+    assert "local llama timing" in identity["alive_basis"]
+
+    # Remote log only -> NOT alive via local liveness.
+    out2 = _chapter_dir(tmp_path, "chapter_0002", _iso(7200))
+    logs2 = out2 / "server_logs"
+    logs2.mkdir(exist_ok=True)
+    (logs2 / "opencode_serve_20260815_100151_stderr.log").write_text("x", encoding="utf-8")
+    events2 = tracker._load_events(out2)
+    identity2 = tracker._identity(out2, events2)
+    # Stale run, no usage/events -> not alive; remote logs don't help.
+    assert identity2["alive"] is False
+
+
+def test_repair_metrics_separated(tmp_path: Path):
+    """Repair output shows findings eligible and PID edits committed as
+    separate units, not a ratio (task req. 2)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 10,
+            "committed": ["p1", "p2", "p3"],
+            "batches": [
+                {"batch_index": 1, "findings": [{"index": 1}],
+                 "results": [{"index": 1, "decision": "repair"}]},
+                {"batch_index": 2, "findings": [{"index": 2}, {"index": 3}],
+                 "results": [{"index": 2, "decision": "repair"},
+                             {"index": 3, "decision": "skip"}]},
+            ],
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "findings eligible: 10" in text
+    assert "PID edits committed: 3" in text
+    # Old ratio format must not appear.
+    assert "total 3/10" not in text
+
+
+def test_reaudit_quality_and_execution_debt_separated(tmp_path: Path):
+    """Re-audit residual and debt are independent (task req. 3)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "reaudit": {
+                "complete": False,
+                "failed": True,
+                "issues": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}],
+            },
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Residual=3, debt=1 (failed re-audit).
+    assert "residual: 3" in text
+    assert "debt: 1" in text
+    # residual>0 does NOT force debt=0.
+    assert "residual: 3 | debt: 0" not in text
+
+
+def test_book_table_mode_unit_whole_chapter(tmp_path: Path):
+    """Whole-chapter book rows show '1/1' (task req. 4)."""
+    base = tmp_path / "book"
+    base.mkdir()
+    ch = _chapter_dir(base, "chapter_0001", _iso(3600))
+    _write_ndjson(ch / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "mode/unit" in table
+    assert "1/1" in table
+
+
+def test_book_table_mode_unit_chunked(tmp_path: Path):
+    """Chunked book rows show 'N/M' (task req. 4)."""
+    base = tmp_path / "book"
+    base.mkdir()
+    _chapter_dir(base, "chapter_0001", _iso(3600))
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "mode/unit" in table
+    # Fixture has 2 chunks planned, 2 journaled -> "2/2".
+    assert "2/2" in table
+    # Old "chunks" column name must not appear.
+    assert "chunks" not in table.split("\n")[0]
+
+
+def test_counters_whole_chapter_canonical_lifecycle(tmp_path: Path):
+    """Counters block uses canonical phase names, not legacy Step N
+    (task req. 1)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_report(out)
+    # Canonical name for generation.
+    assert "Whole-chapter translation: attempt 1/3" in report
+    # Canonical names for subsequent stages.
+    assert "R-editor: not started" in report
+    assert "Chapter audit: not started" in report
+    assert "Selective repair: not started" in report
+    assert "Re-audit scope: not started" in report
+    assert "Formatting: not applicable (whole-chapter)" in report
+    # Legacy names must not appear in user-facing output.
+    assert "GEN:" not in report
+    assert "Step 6" not in report
+    assert "Step 7" not in report
+    assert "Step 8" not in report
+    assert "Steps 1-5" not in report
+
+
+def test_llama_ts_no_impossible_wall_clock():
+    """_llama_ts_to_hms does not produce impossible timestamps like
+    35:59:86 (task req. 7)."""
+    # Normal case.
+    assert tracker._llama_ts_to_hms("14.51.578.231") == "14:51:57"
+    # Single-digit hour.
+    assert tracker._llama_ts_to_hms("4.30.558.334") == "4:30:55"
+    # Edge: seconds=59, milliseconds=999.
+    assert tracker._llama_ts_to_hms("23.59.59.999") == "23:59:59"
+    # Invalid prefix falls through.
+    assert tracker._llama_ts_to_hms("bad") == "bad"

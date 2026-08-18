@@ -83,37 +83,34 @@ FRESHNESS_WINDOW_SECONDS = 300.0
 # emitted there — this card only surfaces them).
 B3_AUDIT_JOURNAL_FILENAME = "audit_journal.ndjson"
 
-# V4 monitor v2 (owner-approved spec, docs/plans/V4_PHASE12_..._RU.md,
-# "Дизайн обновлённого монитора"): usage-label group -> step-group mapping.
-# The label -> phase leg is delegated to phase_for_label() from v4_usage.py
-# (A1.3) — never duplicated here; this table only maps the *phase* it
-# returns to the step-group the monitor displays. B3-era phases
-# (extraction / r_editor / reaudit) were added in MONITOR-V2 (1.3) so the
-# Phase block and the usage column share the same phase vocabulary.
+# V4 monitor v2: usage-label group -> step-group mapping.
+# MONITOR-V2 whole-chapter vocabulary: step groups now use canonical names
+# (Entity extraction, Whole-chapter translation, etc.) — the same names as
+# PHASE_HUMAN_NAME. The label -> phase leg is delegated to
+# phase_for_label() from v4_usage.py (A1.3) — never duplicated here.
 PHASE_TO_STEP_GROUP = {
-    "gen": "Steps1-5",
-    "extraction": "Step6",
-    "qwen_fidelity": "Step2c",
-    "gemma_preference": "Step2c",
-    "r_editor": "Step6",
-    "audit": "Step6",
-    "repair": "Step7",
-    "reaudit": "Step7",
-    "formatting": "Step8",
+    "gen": "Whole-chapter translation",
+    "extraction": "Entity extraction",
+    "qwen_fidelity": "qwen_fidelity",
+    "gemma_preference": "gemma_preference",
+    "r_editor": "R-editor",
+    "audit": "Chapter audit",
+    "repair": "Selective repair",
+    "reaudit": "Re-audit scope",
+    "formatting": "Formatting",
 }
 
 # MONITOR-V2 (1.3): the usage-by-step-x-model "label-group" column is
-# renamed to "фазы" and shows the human phase names of the Phase block
-# (Extraction / Translation / R_editor / Audit / Repair / Re-audit). The
-# label -> phase leg stays fully delegated to phase_for_label(); this table
-# only maps the *phase* to its human display name (never duplicated rules).
+# renamed to "фазы" and shows the same human phase names as the Phase block.
+# MONITOR-V2 whole-chapter vocabulary: all seven user-facing phase names are
+# the canonical single source of truth (no second mapping table).
 PHASE_HUMAN_NAME = {
-    "extraction": "Extraction",
-    "gen": "Translation",
-    "r_editor": "R_editor",
-    "audit": "Audit",
-    "repair": "Repair",
-    "reaudit": "Re-audit",
+    "extraction": "Entity extraction",
+    "gen": "Whole-chapter translation",
+    "r_editor": "R-editor",
+    "audit": "Chapter audit",
+    "repair": "Selective repair",
+    "reaudit": "Re-audit scope",
     "formatting": "Formatting",
     "qwen_fidelity": "qwen_fidelity",
     "gemma_preference": "gemma_preference",
@@ -301,6 +298,14 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
     b3_age = _recent_event_age(b3_events)
     recent_b3 = b3_age <= FRESHNESS_WINDOW_SECONDS
 
+    # MONITOR-V2 whole-chapter (task req. 6): fresh local llama timing
+    # activity (Gemma_/Qwen_ tg_3s) is an additional liveness signal for
+    # local runs during long whole-chapter calls. Remote server logs (static
+    # opencode_serve_*.log) NEVER produce alive=yes. Basis is explicit.
+    local_log_age = _local_log_freshness(out_dir)
+    recent_local_log = (local_log_age is not None
+                        and local_log_age <= FRESHNESS_WINDOW_SECONDS)
+
     alive_basis: List[str] = []
     if record is not None:
         alive = False
@@ -309,13 +314,15 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         alive = False
         alive_basis.append("terminal event written (run finished)")
     else:
-        alive = bool(recent_usage or recent_event or recent_b3)
+        alive = bool(recent_usage or recent_event or recent_b3 or recent_local_log)
         if recent_usage:
             alive_basis.append(f"last usage.ndjson {usage_age:.0f}s ago")
         if recent_event:
             alive_basis.append(f"last progress event {_recent_event_age(events):.0f}s ago")
         if recent_b3:
             alive_basis.append(f"last audit_journal event {b3_age:.0f}s ago")
+        if recent_local_log:
+            alive_basis.append(f"fresh local llama timing log ({local_log_age:.0f}s ago)")
         if not alive_basis:
             alive_basis.append("no recent usage.ndjson / progress / audit_journal events (stalled or unknown)")
 
@@ -360,6 +367,31 @@ def _recent_event_age(events: List[Dict[str, Any]]) -> float:
     if not latest_ts:
         return float("inf")
     return _ts_age(latest_ts)
+
+
+def _local_log_freshness(out_dir: Path) -> Optional[float]:
+    """Age of the newest local Gemma/Qwen stderr log (seconds, inf if absent).
+
+    MONITOR-V2 whole-chapter (task req. 6): fresh local llama timing
+    activity (Gemma_/Qwen_ tg_3s) is an additional liveness signal.
+    Remote server logs (opencode_serve_*.log) are NOT checked — they are
+    static after server start and never produce alive=yes.
+    """
+    logs_dir = out_dir / "server_logs"
+    if not logs_dir.is_dir():
+        return float("inf")
+    candidates = [
+        p for p in logs_dir.glob("*_stderr.log")
+        if p.name.split("_", 1)[0] in ("Gemma", "Qwen")
+    ]
+    if not candidates:
+        return float("inf")
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    try:
+        age = (_now() - datetime.fromtimestamp(newest.stat().st_mtime, timezone.utc)).total_seconds()
+    except OSError:
+        return float("inf")
+    return age
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +920,7 @@ def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
     chunk_done = {e.get("chunk_id") for e in events if e.get("event") == "chunk_done"}
     for event in events:
         if event.get("event") == "chunk_started" and event.get("chunk_id") not in chunk_done:
-            in_flight.append(f"chunk {event.get('chunk_id')} (Steps 1-5)")
+            in_flight.append(f"chunk {event.get('chunk_id')} (Entity extraction)")
 
     audit_done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "audit_unit_done"}
     for event in events:
@@ -1042,7 +1074,11 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
         header += f"{'cost':>11}"
     lines.append(header)
 
-    step_order = {"Steps1-5": 0, "Step2c": 1, "Step6": 2, "Step7": 3, "Step8": 4}
+    step_order = {"Entity extraction": 0, "qwen_fidelity": 1,
+                  "gemma_preference": 1, "Whole-chapter translation": 2,
+                  "R-editor": 3, "Chapter audit": 4,
+                  "Selective repair": 5, "Re-audit scope": 6,
+                  "Formatting": 7}
     for g in sorted(
         groups,
         key=lambda g: (step_order.get(g["step"], 99), g["label_group"], g["model"]),
@@ -1158,7 +1194,7 @@ def _phase_extraction(out_dir: Path) -> Optional[str]:
                         verified += 1
                     elif claim.get("status") == "candidate":
                         candidate += 1
-    return (f"Extraction: сущностей: {len(entities)} "
+    return (f"Entity extraction: сущностей: {len(entities)} "
             f"| claims: verified {verified} / candidate {candidate}")
 
 
@@ -1184,7 +1220,7 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[
     )
     gen = _wc_gen_status(events)
     attempt = f"attempt {gen['attempt']}/{gen['max_attempts']} | " if gen else ""
-    return (f"Translation: {attempt}source {source_words} слов → "
+    return (f"Whole-chapter translation: {attempt}source {source_words} слов → "
             f"перевод {translation_words} слов")
 
 
@@ -1217,7 +1253,7 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                         )
                 applied = len(outcome.get("applied") or [])
                 candidates = len(outcome.get("candidates") or [])
-                return (f"R_editor: chunks done={done}/{chunk_count} "
+                return (f"R-editor: chunks done={done}/{chunk_count} "
                         f"| safe (применено)={applied} | review (предложено)={candidates}")
     # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
     stage = _stage_progress_slice(cache, "r_editor")
@@ -1253,7 +1289,7 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                         applied += 1
                     elif edit.get("class") in REVIEW_CLASSES:
                         candidates += 1
-    return (f"R_editor: chunks done={done} "
+    return (f"R-editor: chunks done={done} "
             f"| safe (применено)={applied} | review (предложено)={candidates}")
 
 
@@ -1273,7 +1309,7 @@ def _phase_audit(out_dir: Path) -> Optional[str]:
         for c in chunks:
             if isinstance(c, dict):
                 findings.append(_as_int(c.get("issue_count")))
-        return (f"Audit: chunks done={len(chunks)}/{len(chunks)} "
+        return (f"Chapter audit: chunks done={len(chunks)}/{len(chunks)} "
                 f"| findings per chunk: {findings} | всего {total}")
     stage = _stage_progress_slice(cache, "audit")
     if stage is None:
@@ -1289,7 +1325,7 @@ def _phase_audit(out_dir: Path) -> Optional[str]:
                 findings.append(_as_int(c.get("issue_count")))
     issues = stage.get("issues")
     total = len(issues) if isinstance(issues, list) else sum(findings)
-    return (f"Audit: chunks done={len(done_chunks)} "
+    return (f"Chapter audit: chunks done={len(done_chunks)} "
             f"| findings per chunk: {findings} | всего {total}")
 
 
@@ -1299,6 +1335,9 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
     Final cache: top-level ``repair.batches`` (+ committed / eligible_count).
     Incremental cache: ``stage_progress.repair`` (done_batches / committed /
     outcome.batches / outcome.batch_count) — live fallback.
+
+    MONITOR-V2 whole-chapter (task req. 2): show "findings eligible: N"
+    and "PID edits committed: M" as separate units (not a ratio).
     """
     cache = _read_json(out_dir / "audit_cache_b3.json")
     if not cache:
@@ -1320,9 +1359,9 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
                 per_batch.append(f"{repaired}/{findings}")
             committed = len(repair.get("committed") or [])
             eligible = _as_int(repair.get("eligible_count"))
-            return (f"Repair: batches done={len(batches)}/{len(batches)} "
+            return (f"Selective repair: batches done={len(batches)}/{len(batches)} "
                     f"| repaired per batch: [{', '.join(per_batch)}] "
-                    f"| total {committed}/{eligible}")
+                    f"| findings eligible: {eligible} | PID edits committed: {committed}")
     stage = _stage_progress_slice(cache, "repair")
     if stage is None:
         return None
@@ -1356,10 +1395,15 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
         committed_count = len(committed)
     else:
         committed_count = 0
+    # Count eligible findings from batch outcome.
+    eligible_count = 0
+    for batch in batches:
+        if isinstance(batch, dict):
+            eligible_count += len(batch.get("findings") or [])
     done_txt = f"{done}/{batch_count}" if batch_count else f"{done}"
-    return (f"Repair: batches done={done_txt} "
+    return (f"Selective repair: batches done={done_txt} "
             f"| repaired per batch: [{', '.join(per_batch)}] "
-            f"| total {committed_count}")
+            f"| findings eligible: {eligible_count} | PID edits committed: {committed_count}")
 
 
 def _phase_reaudit(out_dir: Path) -> Optional[str]:
@@ -1383,7 +1427,7 @@ def _phase_reaudit(out_dir: Path) -> Optional[str]:
             issues = reaudit.get("issues")
             residual = len(issues) if isinstance(issues, list) else 0
             debt = 1 if reaudit.get("failed") else 0
-            return (f"Re-audit: chunks done={done}/{total} "
+            return (f"Re-audit scope: chunks done={done}/{total} "
                     f"| residual: {residual} | debt: {debt}")
     stage = _stage_progress_slice(cache, "reaudit")
     if stage is None:
@@ -1399,7 +1443,7 @@ def _phase_reaudit(out_dir: Path) -> Optional[str]:
         isinstance(c, dict) and c.get("failed") is True for c in done_chunks
     )
     debt = 1 if failed else 0
-    return (f"Re-audit: chunks done={len(done_chunks)} "
+    return (f"Re-audit scope: chunks done={len(done_chunks)} "
             f"| residual: {residual} | debt: {debt}")
 
 
@@ -1495,6 +1539,15 @@ def _server_speed_lines(out_dir: Path) -> List[str]:
         return []
 
     lines = ["-- скорость генерации (локальная, из server_logs) --"]
+    if eval_tps is None and live_tg3s is not None:
+        # Live tg_3s available from slot print_timing even though no final
+        # eval line has been written yet — show it immediately (task req. 5).
+        prompt_txt = f"{prompt_tps:.1f}" if prompt_tps is not None else "n/a"
+        lines.append(
+            f"  {model}: live tg_3s {live_tg3s:.2f} t/s | prompt {prompt_txt} t/s"
+            f" | eval in progress"
+        )
+        return lines
     if eval_tps is None:
         lines.append(f"  {model}: (нет завершённых eval в server_logs)")
         return lines
@@ -1604,8 +1657,8 @@ def _last_call_block_lines(out_dir: Path) -> List[str]:
 def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str:
     """Compact one-line status (V4.1 M card)::
 
-        [0001] gen | GEN attempt 2/3 (reason: malformed) | AUDIT chunk 3/8 |
-        REPAIR regions done=2 committed=1 debt=1 | DONE
+        [0001] Whole-chapter translation | attempt 2/3 (reason: malformed) | Chapter audit chunk 3/8 |
+        Selective repair committed=2 debt=1 | DONE
 
     Segments appear only when the corresponding events exist; ``DONE`` only
     at a terminal state. Works for both whole-chapter (wc_* + B3 journal)
@@ -1618,7 +1671,8 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
 
     gen = _wc_gen_status(events)
     if gen is not None:
-        segments.append(f"GEN {gen['status']}")
+        # MONITOR-V2 whole-chapter canonical: "GEN" -> "Whole-chapter translation"
+        segments.append(f"Whole-chapter translation {gen['status']}")
     elif phase not in ("gen", "steps1-5", "unknown"):
         # Chunked runs: show the chunked generation progress (journal) as the
         # GEN segment so the status line stays meaningful outside whole-chapter.
@@ -1626,29 +1680,31 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
         chunk_plan = _read_json(out_dir / "chunk_plan.json")
         total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
         if total:
-            segments.append(f"GEN chunks {len(journal)}/{total}")
+            segments.append(f"Entity extraction chunks {len(journal)}/{total}")
 
     b3 = _load_b3_events(out_dir)
     audit_chunks = [e for e in b3 if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
     if audit_chunks:
         last = audit_chunks[-1]
         total = last.get("total")
-        # The card's "AUDIT chunk N/8" is the CURRENT chunk number, i.e. the
+        # The card's audit chunk N/8 is the CURRENT chunk number, i.e. the
         # newest event's chunk (the one being processed / just finished), not
         # a count of events.
         current = last.get("chunk") or sum(
             1 for e in audit_chunks if e.get("event") == "audit_chunk_started"
         )
-        segments.append(f"AUDIT chunk {current}/{total or '?'}")
+        # MONITOR-V2 whole-chapter canonical: "AUDIT" -> "Chapter audit"
+        segments.append(f"Chapter audit chunk {current}/{total or '?'}")
 
     region_counts = _region_counts(events)
     repair_hint = _b3_repair_hint(b3)
     if repair_hint or region_counts["done"]:
+        # MONITOR-V2 whole-chapter canonical: "REPAIR" -> "Selective repair"
         if repair_hint:
-            segments.append(f"REPAIR {repair_hint.lstrip('; ')}")
+            segments.append(f"Selective repair {repair_hint.lstrip('; ')}")
         else:
             segments.append(
-                f"REPAIR regions done={region_counts['done']} "
+                f"Selective repair regions done={region_counts['done']} "
                 f"committed={region_counts['committed']} "
                 f"debt={region_counts['debt']}"
             )
@@ -1722,8 +1778,11 @@ def render_report(out_dir: Path) -> str:
     lines.append("")
     lines.append("-- counters --")
     if wc_mode and gen is not None:
+        # MONITOR-V2 whole-chapter canonical lifecycle: show the current
+        # phase with attempt/max, PID count, reasoning budget/model and
+        # pending validation; subsequent stages as not started/complete.
         lines.append(
-            f"GEN: attempt {gen['attempt']}/{gen['max_attempts']} "
+            f"Whole-chapter translation: attempt {gen['attempt']}/{gen['max_attempts']} "
             f"pid_count={gen['pid_count']} reasoning_budget={gen['reasoning_budget']} "
             f"model={gen['model']}"
         )
@@ -1737,26 +1796,43 @@ def render_report(out_dir: Path) -> str:
         else:
             lines.append("PID validation: pending (wc_validated not written yet)")
     else:
-        lines.append(f"Steps 1-5: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
+        lines.append(f"Entity extraction: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
                      f" (selected={trial_counts['selected']}, quarantined={trial_counts['quarantined']}, "
                      f"needs_synthesis={trial_counts['needs_synthesis']}, "
                      f"incomplete_generation={trial_counts['incomplete_generation']})")
     if wc_mode:
+        # MONITOR-V2 whole-chapter canonical lifecycle: subsequent stages
+        # show lifecycle status, not legacy Step N names.
+        gen_done = any(e.get("event") == "wc_generation_done" for e in events)
+        lines.append("R-editor: not started" if not gen_done else "R-editor: complete")
         b3_audit_chunks = [e for e in b3_events
                            if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
         if b3_audit_chunks:
             total = b3_audit_chunks[-1].get("total")
             started_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_started")
             done_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_done")
-            lines.append(f"Step 6 (B3): audit chunks started={started_n}/{total or '?'} "
+            lines.append(f"Chapter audit: in progress, chunks started={started_n}/{total or '?'} "
                          f"done={done_n} (audit_journal.ndjson)")
+        elif gen_done:
+            lines.append("Chapter audit: not started")
         else:
-            lines.append("Step 6 (B3): no audit chunk events yet")
+            lines.append("Chapter audit: not started (awaiting generation)")
         repair_hint = _b3_repair_hint(b3_events)
         if repair_hint:
-            lines.append(f"Step 7 (B3): {repair_hint.lstrip('; ')}")
+            lines.append(f"Selective repair: {repair_hint.lstrip('; ')}")
+        elif gen_done:
+            lines.append("Selective repair: not started")
         else:
-            lines.append("Step 7 (B3): repair not started")
+            lines.append("Selective repair: not started (awaiting generation)")
+        # Re-audit and Formatting: lifecycle status for whole-chapter.
+        reaudit_events = [e for e in b3_events if e.get("event") == "reaudit_scope"]
+        if reaudit_events:
+            lines.append("Re-audit scope: in progress")
+        elif gen_done:
+            lines.append("Re-audit scope: not started")
+        else:
+            lines.append("Re-audit scope: not started (awaiting generation)")
+        lines.append("Formatting: not applicable (whole-chapter)")
     elif fine:
         lines.append(
             f"Step 6: audit units done={audit_counts['done']}/{audit_counts['expected']} "
@@ -1773,11 +1849,14 @@ def render_report(out_dir: Path) -> str:
     # V4 monitor v2 (owner observation eff-a1a2): before Step 8 starts the
     # old text read as "formatting incidents=None ... terminal=None" — a
     # broken-looking Step 8 block. Show an explicit "not started" instead.
-    if phase in ("steps1-5", "step6", "step7", "unknown", "gen"):
-        lines.append("Step 8: not started (ожидание formatting/terminal)")
-    else:
-        lines.append(f"Step 8: formatting incidents={formatting['incidents']} blocking={formatting['blocking']}"
-                     f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
+    # MONITOR-V2 whole-chapter: Formatting is already shown as "not
+    # applicable" in the counters block — skip the redundant Step 8 line.
+    if not wc_mode:
+        if phase in ("steps1-5", "step6", "step7", "unknown", "gen"):
+            lines.append("Formatting: not started (ожидание formatting/terminal)")
+        else:
+            lines.append(f"Formatting: incidents={formatting['incidents']} blocking={formatting['blocking']}"
+                         f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
     lines.append("")
     lines.extend(_usage_block_lines(out_dir))
 
@@ -1833,7 +1912,7 @@ def _discover_chapters(out_base: Path) -> List[Path]:
 
 
 def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
-    """One row of the chapters table: id, chunks, step, status, calls, tokens, cost."""
+    """One row of the chapters table: id, mode/unit, step, status, calls, tokens, cost."""
     events = _load_events(chapter_dir)
     phase, _ = _detect_phase(chapter_dir, events)
 
@@ -1852,6 +1931,15 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
     input_tokens = sum(_as_int(row.get("input_tokens")) for row in usage)
     output_tokens = sum(_as_int(row.get("output_tokens")) for row in usage)
     reasoning_tokens = sum(_as_int(row.get("reasoning_tokens")) for row in usage)
+
+    # MONITOR-V2 whole-chapter book table (task req. 4): whole-chapter runs
+    # show "1/1" (one generation unit), chunked runs show "N/M" (journal
+    # chunks / planned chunks). Never mix generation and audit progress.
+    wc_mode = _whole_chapter_mode(events)
+    if wc_mode:
+        mode_unit = "1/1"
+    else:
+        mode_unit = f"{len(journal)}/{total}"
 
     if phase == "done":
         step = "8"
@@ -1880,7 +1968,7 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
 
     return {
         "chapter_id": chapter_dir.name,
-        "chunks": f"{len(journal)}/{total}",
+        "mode_unit": mode_unit,
         "step": step,
         "status": status,
         "calls": calls,
@@ -1913,7 +2001,10 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     show_reasoning = any(r["reasoning_tokens"] for r in rows)
 
     lines = [f"-- chapters ({len(chapters)}) {'-' * 56}"]
-    header = (f"{'chapter_id':<24} {'chunks':>7} {'step':>5} {'status':<15}"
+    # MONITOR-V2 whole-chapter book table (task req. 4): column renamed
+    # from "chunks" to "mode/unit" — whole-chapter runs show "1/1",
+    # chunked runs show "N/M" (journal/planned).
+    header = (f"{'chapter_id':<24} {'mode/unit':>9} {'step':>5} {'status':<15}"
               f"{'calls':>7}")
     if show_input:
         header += f"{'input':>9}"
@@ -1926,7 +2017,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     lines.append(header)
     for row in rows:
         status = _SHORT_STATUS.get(row["status"], row["status"])[:15]
-        line = (f"{row['chapter_id']:<24} {row['chunks']:>7} {row['step']:>5}"
+        line = (f"{row['chapter_id']:<24} {row['mode_unit']:>9} {row['step']:>5}"
                 f" {status:<15}{row['calls']:>7}")
         if show_input:
             line += f"{_fmt_tokens(row['input_tokens']):>9}"
@@ -1937,7 +2028,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
         if show_cost:
             line += f" {_fmt_cost_short(row['cost']):>10}"
         lines.append(line)
-    total_line = (f"{'TOTAL':<24} {'':>7} {'':>5} {'':<15}{total_calls:>7}")
+    total_line = (f"{'TOTAL':<24} {'':>9} {'':>5} {'':<15}{total_calls:>7}")
     if show_input:
         total_line += f"{_fmt_tokens(total_input):>9}"
     if show_output:
