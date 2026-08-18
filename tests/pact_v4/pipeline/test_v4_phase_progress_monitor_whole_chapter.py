@@ -8,11 +8,11 @@ Covers ``docs/plans/V4_1_AUDIT_B1_RU.md`` §13 (card M — whole-chapter events
   wc_validated) and writes them with the expected fields;
 * ``generate_whole_chapter`` fires the diagnostics ``on_retry`` hook with
   the reason vocabulary (malformed/missing_pid/truncated/abort) — the
-  monitor's "GEN attempt N/M (reason)" source;
+  monitor's "Translation attempt N/M (reason)" source;
 * the monitor (``v4_phase_progress``) detects the whole-chapter path from
   ``wc_*`` events (phase ``gen`` while the 10-minute generation runs, then
   ``step6``/``step7``/``step8`` from the B3 audit journal, then ``done``);
-* the one-line status renders ``GEN attempt N/M (reason)`` live, ``AUDIT
+* the one-line status renders ``Translation attempt N/M (reason)`` live, ``Audit
   chunk N/8`` and ``REPAIR regions done/committed/debt`` from the B3 journal
   events, and ``DONE`` with the wc_validated PID flags after the run;
 * RV fix (t_7b554c07): B3 liveness — a fresh audit_journal event keeps the
@@ -442,7 +442,7 @@ def test_status_line_whole_chapter_live_generation(tmp_path: Path):
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "gen")
     assert line.startswith("[0001] gen")
-    assert "GEN attempt 1/3 (reason: truncated)" in line
+    assert "Translation attempt 1/3 (reason: truncated)" in line
 
 
 def test_status_line_whole_chapter_audit_and_repair(tmp_path: Path):
@@ -477,11 +477,11 @@ def test_status_line_whole_chapter_done_with_validation(tmp_path: Path):
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "done")
     assert line.endswith("DONE (complete)")
-    assert "GEN attempt 1/3 done finish_reason=complete" in line
+    assert "Translation attempt 1/3 done finish_reason=complete" in line
 
 
 def test_status_line_chunked_mode_backward_compat(tmp_path: Path):
-    # A chunked run (no wc_* events) still renders: GEN chunks + REPAIR
+    # A chunked run (no wc_* events) still renders: Translation chunks + REPAIR
     # regions from the old region events.
     out = tmp_path / "run_chunked"
     _write(out / "chunk_plan.json", {"chunks": [{"chunk_id": "c1"}, {"chunk_id": "c2"}]})
@@ -524,10 +524,10 @@ def test_render_report_whole_chapter_shows_generation_and_validation(tmp_path: P
     ])
     report = tracker.render_report(out)
     assert "status: [0001] step6" in report
-    assert "GEN attempt 1/3 done finish_reason=complete" in report
+    assert "Translation attempt 1/3 done finish_reason=complete" in report
     assert "AUDIT chunk 5/8" in report
     assert "PID validation: json_ok=True pids_ok=True order_ok=True" in report
-    assert "Step 8: not started" in report
+    assert "Formatting: not started" in report
 
 
 def test_render_report_whole_chapter_final_done(tmp_path: Path):
@@ -565,7 +565,7 @@ def test_render_report_whole_chapter_incomplete_validation_flags(tmp_path: Path)
     report = tracker.render_report(out)
     assert "PID validation: json_ok=True pids_ok=False order_ok=False" in report
     assert "incomplete_generation" in report
-    assert "GEN attempt 3/3 done finish_reason=incomplete" in report
+    assert "Translation attempt 3/3 done finish_reason=incomplete" in report
 
 
 def test_render_report_whole_chapter_is_read_only(tmp_path: Path):
@@ -629,7 +629,7 @@ def test_render_report_b3_journal_without_audit_chunk_events(tmp_path: Path):
     assert row["repair"] == "not_started"
 
     report = tracker.render_report(out)
-    assert "GEN attempt 1/3 done finish_reason=complete" in report
+    assert "Translation attempt 1/3 done finish_reason=complete" in report
     assert "B3 audit started" in report
     assert "not_started" in report
 
@@ -676,4 +676,4 @@ def test_chapters_table_whole_chapter_gen_status(tmp_path: Path):
     ])
     report = tracker.render_book_report(base)
     assert "-- chapters (1)" in report
-    assert "gen 3/3" in report or "gen 2/3" in report
+    assert "Translation 3/3" in report or "Translation 2/3" in report

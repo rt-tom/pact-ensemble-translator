@@ -888,7 +888,7 @@ def _in_flight_model_activity(events: List[Dict[str, Any]]) -> List[str]:
     chunk_done = {e.get("chunk_id") for e in events if e.get("event") == "chunk_done"}
     for event in events:
         if event.get("event") == "chunk_started" and event.get("chunk_id") not in chunk_done:
-            in_flight.append(f"chunk {event.get('chunk_id')} (Steps 1-5)")
+            in_flight.append(f"chunk {event.get('chunk_id')} (Translation)")
 
     audit_done = {(e.get("chunk_id"), e.get("detector")) for e in events if e.get("event") == "audit_unit_done"}
     for event in events:
@@ -1042,7 +1042,14 @@ def _usage_block_lines(out_dir: Path) -> List[str]:
         header += f"{'cost':>11}"
     lines.append(header)
 
-    step_order = {"Steps1-5": 0, "Step2c": 1, "Step6": 2, "Step7": 3, "Step8": 4}
+    # MONITOR-V2 (1.3): the usage-by-step-x-model "label-group" column is
+    # renamed to "фазы" and shows the human phase names as the Phase block
+    # (Extraction / Translation / R_editor / Audit / Repair / Re-audit).
+    # step_order is mechanically derived from PHASE_TO_STEP_GROUP — never
+    # duplicated (structural regression test prevents drift).
+    step_order = {sg: i for i, sg in enumerate(
+        dict.fromkeys(PHASE_TO_STEP_GROUP.values())
+    )}
     for g in sorted(
         groups,
         key=lambda g: (step_order.get(g["step"], 99), g["label_group"], g["model"]),
@@ -1192,6 +1199,38 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[
             f"перевод {translation_words} слов")
 
 
+def _r_editor_lifecycle_status(cache: Dict[str, Any]) -> Optional[str]:
+    """Derive the R-editor lifecycle status from the authoritative B3 cache.
+
+    Only a ``"complete"`` status may say complete; ``"failed"``,
+    ``"partial"``, and ``"incomplete"`` must not.  ``"disabled"`` and
+    ``"pending"`` mean not started.  Reads both the final top-level
+    ``r_editor.status`` and the incremental ``stage_progress.r_editor.status``
+    so cache-only final/incremental shapes report matching status.
+    """
+    r_editor = cache.get("r_editor")
+    if isinstance(r_editor, dict):
+        status = r_editor.get("status")
+        if isinstance(status, str) and status:
+            return status
+    stage = _stage_progress_slice(cache, "r_editor")
+    if isinstance(stage, dict):
+        status = stage.get("status")
+        if isinstance(status, str) and status:
+            return status
+    return None
+
+
+_R_EDITOR_LIFECYCLE_LABEL = {
+    "complete": "complete",
+    "failed": "failed",
+    "partial": "partial",
+    "incomplete": "incomplete",
+    "disabled": "not started (disabled)",
+    "pending": "not started",
+}
+
+
 def _phase_r_editor(out_dir: Path) -> Optional[str]:
     """R_editor line from ``audit_cache_b3.json``.
 
@@ -1199,10 +1238,17 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     successful_chunks / applied / candidates). Incremental cache:
     ``stage_progress.r_editor`` (status / done_chunks / outcome.chunks with
     per-chunk edits) — the live fallback (RV t_c9f9ea90 HIGH #1).
+
+    Lifecycle: only a ``"complete"`` status may say complete; ``"failed"``,
+    ``"partial"``, and ``"incomplete"`` must not.  Cache-only
+    final/incremental shapes report matching status via
+    ``_r_editor_lifecycle_status``.
     """
     cache = _read_json(out_dir / "audit_cache_b3.json")
     if not cache:
         return None
+    lifecycle = _r_editor_lifecycle_status(cache)
+    lifecycle_label = _R_EDITOR_LIFECYCLE_LABEL.get(lifecycle, lifecycle or "unknown")
     r_editor = cache.get("r_editor")
     if isinstance(r_editor, dict):
         outcome = r_editor.get("outcome")
@@ -1230,8 +1276,11 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                 candidates = (len(_candidates_raw)
                               if isinstance(_candidates_raw, list)
                               else _as_int(_candidates_raw))
-                return (f"R_editor: chunks done={done}/{chunk_count} "
+                return (f"R_editor [{lifecycle_label}]: chunks done={done}/{chunk_count} "
                         f"| safe (применено)={applied} | review (предложено)={candidates}")
+        # Failed/disabled with no outcome: still render lifecycle status.
+        if lifecycle in ("failed", "disabled"):
+            return f"R_editor [{lifecycle_label}]"
     # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
     stage = _stage_progress_slice(cache, "r_editor")
     if stage is None:
@@ -1269,7 +1318,7 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                         applied += 1
                     elif edit_cls in REVIEW_CLASSES:
                         candidates += 1
-    return (f"R_editor: chunks done={done} "
+    return (f"R_editor [{lifecycle_label}]: chunks done={done} "
             f"| safe (применено)={applied} | review (предложено)={candidates}")
 
 
@@ -1640,8 +1689,8 @@ def _last_call_block_lines(out_dir: Path) -> List[str]:
 def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str:
     """Compact one-line status (V4.1 M card)::
 
-        [0001] gen | GEN attempt 2/3 (reason: malformed) | AUDIT chunk 3/8 |
-        REPAIR regions done=2 committed=1 debt=1 | DONE
+        [0001] gen | Translation attempt 2/3 (reason: malformed) | Audit chunk 3/8 |
+        Repair regions done=2 committed=1 debt=1 | DONE
 
     Segments appear only when the corresponding events exist; ``DONE`` only
     at a terminal state. Works for both whole-chapter (wc_* + B3 journal)
@@ -1654,15 +1703,16 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
 
     gen = _wc_gen_status(events)
     if gen is not None:
-        segments.append(f"GEN {gen['status']}")
+        segments.append(f"Translation {gen['status']}")
     elif phase not in ("gen", "steps1-5", "unknown"):
         # Chunked runs: show the chunked generation progress (journal) as the
-        # GEN segment so the status line stays meaningful outside whole-chapter.
+        # Translation segment so the status line stays meaningful outside
+        # whole-chapter.
         journal = _read_ndjson(out_dir / "journal.ndjson")
         chunk_plan = _read_json(out_dir / "chunk_plan.json")
         total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
         if total:
-            segments.append(f"GEN chunks {len(journal)}/{total}")
+            segments.append(f"Translation chunks {len(journal)}/{total}")
 
     b3 = _load_b3_events(out_dir)
     audit_chunks = [e for e in b3 if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
@@ -1745,9 +1795,9 @@ def render_report(out_dir: Path) -> str:
         # MONITOR-V2 (1.2): live reasoning-trace growth, local only.
         lines.extend(_local_thinking_lines(out_dir))
     lines.append("")
-    lines.append("-- chunks (trial -> audit -> repair) --")
+    lines.append("-- chunks (translation -> audit -> repair) --")
     if rows:
-        lines.append(f"{'chunk_id':<18} {'trial':<22} {'audit':<18} {'repair':<12}")
+        lines.append(f"{'chunk_id':<18} {'translation':<22} {'audit':<18} {'repair':<12}")
         for row in rows:
             lines.append(
                 f"{row['chunk_id']:<18} {row['trial']:<22} {row['audit']:<18} {row['repair']:<12}"
@@ -1759,7 +1809,7 @@ def render_report(out_dir: Path) -> str:
     lines.append("-- counters --")
     if wc_mode and gen is not None:
         lines.append(
-            f"GEN: attempt {gen['attempt']}/{gen['max_attempts']} "
+            f"Translation: attempt {gen['attempt']}/{gen['max_attempts']} "
             f"pid_count={gen['pid_count']} reasoning_budget={gen['reasoning_budget']} "
             f"model={gen['model']}"
         )
@@ -1773,7 +1823,7 @@ def render_report(out_dir: Path) -> str:
         else:
             lines.append("PID validation: pending (wc_validated not written yet)")
     else:
-        lines.append(f"Steps 1-5: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
+        lines.append(f"Translation: journaled {len(journal_by_chunk)}/{total_chunks or 0}"
                      f" (selected={trial_counts['selected']}, quarantined={trial_counts['quarantined']}, "
                      f"needs_synthesis={trial_counts['needs_synthesis']}, "
                      f"incomplete_generation={trial_counts['incomplete_generation']})")
@@ -1784,35 +1834,35 @@ def render_report(out_dir: Path) -> str:
             total = b3_audit_chunks[-1].get("total")
             started_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_started")
             done_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_done")
-            lines.append(f"Step 6 (B3): audit chunks started={started_n}/{total or '?'} "
+            lines.append(f"Audit (B3): chunks started={started_n}/{total or '?'} "
                          f"done={done_n} (audit_journal.ndjson)")
         else:
-            lines.append("Step 6 (B3): no audit chunk events yet")
+            lines.append("Audit (B3): no audit chunk events yet")
         repair_hint = _b3_repair_hint(b3_events)
         if repair_hint:
-            lines.append(f"Step 7 (B3): {repair_hint.lstrip('; ')}")
+            lines.append(f"Repair (B3): {repair_hint.lstrip('; ')}")
         else:
-            lines.append("Step 7 (B3): repair not started")
+            lines.append("Repair (B3): repair not started")
     elif fine:
         lines.append(
-            f"Step 6: audit units done={audit_counts['done']}/{audit_counts['expected']} "
+            f"Audit: units done={audit_counts['done']}/{audit_counts['expected']} "
             f"(started={audit_counts['started']})"
         )
         lines.append(
-            f"Step 7: regions planned={region_counts['planned']} done={region_counts['done']} "
+            f"Repair: regions planned={region_counts['planned']} done={region_counts['done']} "
             f"committed={region_counts['committed']} debt={region_counts['debt']} "
             f"in_progress={region_counts['in_progress']}; "
-            f"re-audit units done={reaudit_counts['done']}/{reaudit_counts['started']}"
+            f"Re-audit: units done={reaudit_counts['done']}/{reaudit_counts['started']}"
         )
     else:
-        lines.append("Step 6/7 detail: not available (coarse mode, no phase_progress.ndjson)")
-    # V4 monitor v2 (owner observation eff-a1a2): before Step 8 starts the
+        lines.append("Audit/Repair detail: not available (coarse mode, no phase_progress.ndjson)")
+    # V4 monitor v2 (owner observation eff-a1a2): before Formatting starts the
     # old text read as "formatting incidents=None ... terminal=None" — a
-    # broken-looking Step 8 block. Show an explicit "not started" instead.
+    # broken-looking Formatting block. Show an explicit "not started" instead.
     if phase in ("steps1-5", "step6", "step7", "unknown", "gen"):
-        lines.append("Step 8: not started (ожидание formatting/terminal)")
+        lines.append("Formatting: not started (ожидание formatting/terminal)")
     else:
-        lines.append(f"Step 8: formatting incidents={formatting['incidents']} blocking={formatting['blocking']}"
+        lines.append(f"Formatting: incidents={formatting['incidents']} blocking={formatting['blocking']}"
                      f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
     lines.append("")
     lines.extend(_usage_block_lines(out_dir))
@@ -1890,34 +1940,26 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
     reasoning_tokens = sum(_as_int(row.get("reasoning_tokens")) for row in usage)
 
     if phase == "done":
-        step = "8"
         terminal = _terminal_counts(chapter_dir, events)
         status = terminal["status"] or "done"
     elif phase == "step8":
-        step = "8"
-        status = "step8"
+        status = "Formatting"
     elif phase == "step7":
-        step = "7"
         round_number = _current_round(events)
-        status = f"repair r{round_number}" if round_number else "step7"
+        status = f"Repair r{round_number}" if round_number else "Repair"
     elif phase == "step6":
-        step = "6"
-        status = "step6"
+        status = "Audit"
     elif phase == "gen":
-        step = "1-5"
         gen = _wc_gen_status(events)
-        status = f"gen {gen['attempt']}/{gen['max_attempts']}" if gen else "gen"
+        status = f"Translation {gen['attempt']}/{gen['max_attempts']}" if gen else "Translation"
     elif phase == "steps1-5":
-        step = "1-5"
-        status = "steps1-5"
+        status = "Translation"
     else:
-        step = "?"
         status = phase
 
     return {
         "chapter_id": chapter_dir.name,
         "chunks": f"{len(journal)}/{total}",
-        "step": step,
         "status": status,
         "calls": calls,
         "cost": cost,
@@ -1949,7 +1991,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     show_reasoning = any(r["reasoning_tokens"] for r in rows)
 
     lines = [f"-- chapters ({len(chapters)}) {'-' * 56}"]
-    header = (f"{'chapter_id':<24} {'chunks':>7} {'step':>5} {'status':<15}"
+    header = (f"{'chapter_id':<24} {'chunks':>7} {'status':<20}"
               f"{'calls':>7}")
     if show_input:
         header += f"{'input':>9}"
@@ -1961,9 +2003,9 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
         header += f" {'cost(prov.)':>10}"
     lines.append(header)
     for row in rows:
-        status = _SHORT_STATUS.get(row["status"], row["status"])[:15]
-        line = (f"{row['chapter_id']:<24} {row['chunks']:>7} {row['step']:>5}"
-                f" {status:<15}{row['calls']:>7}")
+        status = _SHORT_STATUS.get(row["status"], row["status"])[:20]
+        line = (f"{row['chapter_id']:<24} {row['chunks']:>7}"
+                f" {status:<20}{row['calls']:>7}")
         if show_input:
             line += f"{_fmt_tokens(row['input_tokens']):>9}"
         if show_output:
