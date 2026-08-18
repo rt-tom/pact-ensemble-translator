@@ -1296,19 +1296,19 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
             done: Optional[int] = None
             if isinstance(raw_sc, int) and not isinstance(raw_sc, bool) and raw_sc >= 0:
                 done = raw_sc
-            if chunk_count is not None:
-                if done is None:
-                    # Fallback: count GOOD/GOOD_RETRIED chunks.
-                    chunks = outcome.get("chunks")
-                    if isinstance(chunks, list):
-                        done = sum(
-                            1 for c in chunks
-                            if isinstance(c, dict)
-                            and (c.get("status") or "").upper()
-                            in ("GOOD", "GOOD_RETRIED")
-                        )
-                    else:
-                        done = 0
+            # FIX 2 (RV HIGH #1): once cache is present, all invalid
+            # nested R-editor shapes must render explicit fail-closed
+            # diagnostic.  No GOOD-chunk inference — require explicit
+            # valid integer successful_chunks.
+            if chunk_count is None and done is not None:
+                return ("R-editor: audit_cache_b3.json present but "
+                        "r_editor.outcome has invalid chunk_count "
+                        "(fail-closed)")
+            if done is None and chunk_count is not None:
+                # Absent/invalid successful_chunks with valid chunk_count
+                # — fall through to incremental path (no GOOD inference).
+                pass
+            elif chunk_count is not None and done is not None:
                 # Coherence: successful_chunks must equal chunk_count.
                 if done != chunk_count:
                     # Conflicting evidence — fall through to incremental
@@ -1325,6 +1325,23 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
                         candidates = len(outcome.get("candidates") or [])
                     return (f"R-editor: chunks done={done}/{chunk_count} "
                             f"| safe (применено)={applied} | review (предложено)={candidates}")
+            else:
+                # Cache present, r_editor is a dict, outcome is a dict,
+                # but both chunk_count and successful_chunks are
+                # absent/invalid — fail-closed (no GOOD inference).
+                return ("R-editor: audit_cache_b3.json present but "
+                        "r_editor.outcome has no valid completion data "
+                        "(fail-closed)")
+        else:
+            # Cache present, r_editor is a dict but outcome is not a dict
+            # — malformed nested shape, fail-closed.
+            return ("R-editor: audit_cache_b3.json present but "
+                    "r_editor.outcome is not a valid object "
+                    "(fail-closed)")
+    elif "r_editor" in cache and cache["r_editor"] is not None:
+        # r_editor is present but not a dict — malformed.
+        return ("R-editor: audit_cache_b3.json present but "
+                "r_editor is not a valid object (fail-closed)")
     # KILL-SAFE-INCREMENTAL fallback: live done_chunks + per-chunk edits.
     stage = _stage_progress_slice(cache, "r_editor")
     if stage is None:
@@ -1900,12 +1917,12 @@ def render_report(out_dir: Path) -> str:
         # MONITOR-V2 (1.2): live reasoning-trace growth, local only.
         lines.extend(_local_thinking_lines(out_dir))
     lines.append("")
-    lines.append("-- chunks (trial -> audit -> repair) --")
+    lines.append("-- chunks (Entity extraction -> Chapter audit -> Selective repair) --")
     if rows:
-        lines.append(f"{'chunk_id':<18} {'trial':<22} {'audit':<18} {'repair':<12}")
+        lines.append(f"{'chunk_id':<18} {'Entity extraction':<22} {'Chapter audit':<18} {'Selective repair':<13}")
         for row in rows:
             lines.append(
-                f"{row['chunk_id']:<18} {row['trial']:<22} {row['audit']:<18} {row['repair']:<12}"
+                f"{row['chunk_id']:<18} {row['trial']:<22} {row['audit']:<18} {row['repair']:<13}"
             )
     else:
         lines.append("(no chunk_plan.json / no chunks)")
@@ -1984,17 +2001,17 @@ def render_report(out_dir: Path) -> str:
         lines.append("Formatting: not applicable (whole-chapter)")
     elif fine:
         lines.append(
-            f"Step 6: audit units done={audit_counts['done']}/{audit_counts['expected']} "
+            f"Chapter audit: audit units done={audit_counts['done']}/{audit_counts['expected']} "
             f"(started={audit_counts['started']})"
         )
         lines.append(
-            f"Step 7: regions planned={region_counts['planned']} done={region_counts['done']} "
+            f"Selective repair: regions planned={region_counts['planned']} done={region_counts['done']} "
             f"committed={region_counts['committed']} debt={region_counts['debt']} "
             f"in_progress={region_counts['in_progress']}; "
-            f"re-audit units done={reaudit_counts['done']}/{reaudit_counts['started']}"
+            f"Re-audit scope: units done={reaudit_counts['done']}/{reaudit_counts['started']}"
         )
     else:
-        lines.append("Step 6/7 detail: not available (coarse mode, no phase_progress.ndjson)")
+        lines.append("Chapter audit / Selective repair: not available (coarse mode, no phase_progress.ndjson)")
     # V4 monitor v2 (owner observation eff-a1a2): before Step 8 starts the
     # old text read as "formatting incidents=None ... terminal=None" — a
     # broken-looking Step 8 block. Show an explicit "not started" instead.
@@ -2105,11 +2122,11 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
         step = "Chapter audit"
         status = "Chapter audit"
     elif phase == "gen":
-        step = "Whole-chapter"
+        step = "Whole-chapter translation"
         gen = _wc_gen_status(events)
-        status = f"gen {gen['attempt']}/{gen['max_attempts']}" if gen else "Whole-chapter translation"
+        status = f"Whole-chapter translation {gen['attempt']}/{gen['max_attempts']}" if gen else "Whole-chapter translation"
     elif phase == "steps1-5":
-        step = "Entity ext."
+        step = "Entity extraction"
         status = "Entity extraction"
     else:
         step = "?"
@@ -2153,7 +2170,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     # MONITOR-V2 whole-chapter book table (task req. 4): column renamed
     # from "chunks" to "mode/unit" — whole-chapter runs show "1/1",
     # chunked runs show "N/M" (journal/planned).
-    header = (f"{'chapter_id':<24} {'mode/unit':>9} {'step':>15} {'status':<15}"
+    header = (f"{'chapter_id':<24} {'mode/unit':>9} {'step':>25} {'status':<30}"
               f"{'calls':>7}")
     if show_input:
         header += f"{'input':>9}"
@@ -2165,9 +2182,9 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
         header += f" {'cost(prov.)':>10}"
     lines.append(header)
     for row in rows:
-        status = _SHORT_STATUS.get(row["status"], row["status"])[:15]
-        line = (f"{row['chapter_id']:<24} {row['mode_unit']:>9} {row['step']:>15}"
-                f" {status:<15}{row['calls']:>7}")
+        status = _SHORT_STATUS.get(row["status"], row["status"])[:30]
+        line = (f"{row['chapter_id']:<24} {row['mode_unit']:>9} {row['step']:>25}"
+                f" {status:<30}{row['calls']:>7}")
         if show_input:
             line += f"{_fmt_tokens(row['input_tokens']):>9}"
         if show_output:
@@ -2177,7 +2194,7 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
         if show_cost:
             line += f" {_fmt_cost_short(row['cost']):>10}"
         lines.append(line)
-    total_line = (f"{'TOTAL':<24} {'':>9} {'':>15} {'':<15}{total_calls:>7}")
+    total_line = (f"{'TOTAL':<24} {'':>9} {'':>25} {'':<30}{total_calls:>7}")
     if show_input:
         total_line += f"{_fmt_tokens(total_input):>9}"
     if show_output:

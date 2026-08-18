@@ -676,4 +676,4 @@ def test_chapters_table_whole_chapter_gen_status(tmp_path: Path):
     ])
     report = tracker.render_book_report(base)
     assert "-- chapters (1)" in report
-    assert "gen 3/3" in report or "gen 2/3" in report
+    assert "Whole-chapter translation 3/3" in report or "Whole-chapter translation 2/3" in report

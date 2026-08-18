@@ -1451,3 +1451,236 @@ def test_repair_preserves_eligible_count(tmp_path: Path):
     text = "\n".join(lines)
     assert "findings eligible: 15" in text
     assert "PID edits committed: 2" in text
+
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2: Defect 1 -- malformed nested R-editor shape fail-closed
+# ---------------------------------------------------------------------------
+
+def test_r_editor_malformed_outcome_not_dict(tmp_path: Path):
+    """Cache present, r_editor is a dict, but outcome is a list (not dict).
+    Must render explicit fail-closed diagnostic, not hide as absent."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": ["unexpected", "list"]},
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+    assert "outcome is not a valid object" in result
+
+
+def test_r_editor_malformed_outcome_none(tmp_path: Path):
+    """Cache present, r_editor is a dict, outcome is None.
+    Must render explicit fail-closed diagnostic."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": None},
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+
+
+def test_r_editor_malformed_r_editor_not_dict(tmp_path: Path):
+    """Cache present, r_editor is a string (not dict).
+    Must render explicit fail-closed diagnostic."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": "not_a_dict",
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+    assert "r_editor is not a valid object" in result
+
+
+def test_r_editor_malformed_invalid_chunk_count(tmp_path: Path):
+    """Cache present, r_editor.outcome has chunk_count=abc (string) and
+    successful_chunks=True (bool). Both invalid -> fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": "abc",
+                "successful_chunks": True,
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+    # Both invalid -> "no valid completion data" (not "invalid chunk_count")
+    assert "no valid completion data" in result
+
+
+def test_r_editor_malformed_invalid_successful_chunks(tmp_path: Path):
+    """Cache present, r_editor.outcome has valid chunk_count but
+    invalid successful_chunks (float). Must fall through to
+    incremental (no GOOD inference)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 3,
+                "successful_chunks": 1.5,  # float, invalid
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=2/2" not in result
+        assert "done=3/3" not in result
+
+
+def test_r_editor_malformed_full_render_report(tmp_path: Path):
+    """Full render_report with malformed nested r_editor shape
+    must show the fail-closed diagnostic in the Phase block."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {"chunk_count": "abc"}},
+    })
+    report = tracker.render_report(out)
+    assert "R-editor: audit_cache_b3.json present but" in report
+    assert "fail-closed" in report
+    # Must NOT show "нет Phase-артефактов" when cache is present.
+    assert "\u043d\u0435\u0442 Phase-\u0430\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u043e\u0432" not in report
+
+
+def test_r_editor_conflicting_cache_journal_full_report(tmp_path: Path):
+    """Valid cache with mismatched chunk_count/successful_chunks
+    falls through to incremental; full report does not claim R-editor
+    complete from journal when cache evidence conflicts."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 3,
+                "successful_chunks": 1,  # mismatch
+            },
+        },
+    })
+    report = tracker.render_report(out)
+    assert "done=3/3" not in report
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2: Defect 2 -- no GOOD chunk inference for absent successful_chunks
+# ---------------------------------------------------------------------------
+
+def test_r_editor_no_good_chunk_fallback(tmp_path: Path):
+    """When chunk_count is valid but successful_chunks is absent,
+    the monitor must NOT count GOOD chunks as done."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 2,
+                "chunks": [
+                    {"status": "GOOD"},
+                    {"status": "GOOD_RETRIED"},
+                ],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=2/2" not in result
+
+
+def test_r_editor_bool_successful_chunks_no_inference(tmp_path: Path):
+    """When successful_chunks is a bool (True), must NOT count GOOD chunks."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": True,
+                "chunks": [{"status": "GOOD"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=1/1" not in result
+
+
+def test_r_editor_negative_successful_chunks_no_inference(tmp_path: Path):
+    """When successful_chunks is negative, must NOT count GOOD chunks."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": -1,
+                "chunks": [{"status": "GOOD"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=1/1" not in result
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2: Defect 3 -- legacy labels removed from normal output
+# ---------------------------------------------------------------------------
+
+def test_no_legacy_labels_in_chunk_block(tmp_path: Path):
+    """The chunks block header and columns must use canonical names."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    assert "Entity extraction" in report
+    assert "Chapter audit" in report
+    assert "Selective repair" in report
+    lines = report.split("\n")
+    for line in lines:
+        if "chunks (" in line:
+            assert "trial" not in line.lower() or "Entity extraction" in line
+
+
+def test_no_legacy_labels_in_counters_block(tmp_path: Path):
+    """The counters block must use canonical names, not Step 6/7."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    assert "Step 6" not in report
+    assert "Step 7" not in report
+    assert "Step 6/7" not in report
+    assert "Chapter audit:" in report
+    assert "Selective repair:" in report
+
+
+def test_no_legacy_labels_in_book_table(tmp_path: Path):
+    """The book table step column must use canonical names."""
+    out_base = tmp_path / "book_run"
+    out_base.mkdir()
+    ch = out_base / "chapter_0001"
+    ch.mkdir()
+    _write(ch / "chunk_plan.json", {"chunks": [{"chunk_id": "c1"}]})
+    _write_ndjson(ch / "journal.ndjson", [{"chunk_id": "c1", "outcome": "selected"}])
+    _write_ndjson(ch / PHASE_PROGRESS_FILENAME, [{
+        "schema": "pact-v4-phase-progress/ndjson/v1",
+        "event": "run_started",
+        "ts": _iso(3600),
+        "started_at": _iso(3600),
+        "resumed_from_index": 0,
+    }])
+    text = tracker.render_book_report(out_base)
+    assert "Entity ext." not in text
+    assert "Whole-chapter" in text or "Entity extraction" in text or "Chapter audit" in text
+
+
+def test_canonical_names_consistent_all_blocks(tmp_path: Path):
+    """All user-facing blocks use the same canonical names."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json", {
+        "entries": [{"context": {"entities": [
+            {"anchor": {"status": "verified"}, "aliases": [], "claims": []}
+        ]}}]
+    })
+    report = tracker.render_report(out)
+    assert "Entity extraction:" in report
+    assert "Step 6" not in report
+    assert "Step 7" not in report
+    assert "Entity ext." not in report
