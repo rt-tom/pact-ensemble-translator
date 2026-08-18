@@ -4681,6 +4681,7 @@ def _run_whole_chapter_strict_impl(
                 snapshot_hash=snapshot.snapshot_hash,
                 translation=raw_final_text_by_pid,
                 book_memory=memory.book_memory,
+                glossary=glossary,
                 out_dir=cfg.out_dir,
                 config_identity=config.config_identity,
                 backend_identity_hash=cfg.backend.identity_hash,

@@ -152,7 +152,33 @@ def _snippets(pattern: re.Pattern[str], text: str, limit: int = 3) -> tuple[str,
     return tuple(match.group(0) for match in list(pattern.finditer(text))[:limit])
 
 
-def _term_present(text: str, term: str) -> bool:
+def _all_targets_lowercase(target_terms: tuple[str, ...] | tuple[str, ...]) -> bool:
+    """True when every non-empty canonical target term starts with a lowercase letter.
+
+    Leading whitespace, quotes, and punctuation are skipped when finding
+    the first alphabetic character.  Empty / non-alphabetic / mixed-case
+    target forms cause a conservative ``False`` (legacy case-sensitive
+    behaviour preserved).  Used by the glossary budgeter to decide whether
+    source-term presence search should be case-insensitive.
+    """
+    for target in target_terms:
+        t = target.strip()
+        if not t:
+            return False
+        for ch in t:
+            if ch.isalpha():
+                if ch.isupper():
+                    return False
+                break
+        else:
+            # no alphabetic character found — conservative
+            return False
+    return True
+
+
+def _term_present(
+    text: str, term: str, *, force_case_insensitive: bool = False,
+) -> bool:
     # APOSTROPHE-NORM (architect, run_0004-0005 2026-08-15): the book's
     # HTML source uses the typographic apostrophe (U+2019) — "Jacob’s
     # Bell" — while the glossary stores the ASCII form ("Jacob's Bell").
@@ -167,7 +193,10 @@ def _term_present(text: str, term: str) -> bool:
     escaped = re.escape(folded)
     escaped = escaped.replace(r"\ ", r"\s+")
     escaped = escaped.replace("'", "['\u2019]")
-    flags = 0 if folded[:1].isupper() else re.IGNORECASE
+    if force_case_insensitive:
+        flags = re.IGNORECASE
+    else:
+        flags = 0 if folded[:1].isupper() else re.IGNORECASE
     return re.search(
         rf"(?<!\w){escaped}(?!\w)", text.replace("\u2019", "'").replace("\u2018", "'"),
         flags,

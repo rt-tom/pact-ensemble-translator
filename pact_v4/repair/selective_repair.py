@@ -1420,6 +1420,7 @@ class SelectiveRepairEvaluator:
         entity_context: str = "",
         narrator_context: str = "",
         review_candidates: Sequence[ReviewCandidate] = (),
+        glossary: Sequence[Any] = (),
         on_phase: Optional[Callable[[str], None]] = None,
         out_dir: Optional[Path] = None,
         out_base: str = "b3_repair",
@@ -1554,6 +1555,7 @@ class SelectiveRepairEvaluator:
                     batch_index=batch_index,
                     out_dir=out_dir,
                     out_base=out_base,
+                    glossary=glossary,
                 )
             batch_outcomes.append(outcome)
             finding_by_index = {f.index: f for f in batch}
@@ -1695,6 +1697,7 @@ class SelectiveRepairEvaluator:
         batch_index: int,
         out_dir: Optional[Path] = None,
         out_base: str = "b3_repair",
+        glossary: Sequence[Any] = (),
     ) -> RepairBatchOutcome:
         cfg = self._config
         prompt = render_selective_repair_prompt(
@@ -1705,6 +1708,7 @@ class SelectiveRepairEvaluator:
             template=cfg.template,
             repair_context_window=cfg.repair_context_window,
             repair_context_window_by_category=cfg.repair_context_window_by_category,
+            glossary=glossary,
         )
         model_ref = repair_model_ref(self._repair_backend)
         # REASONING-STREAM: the reasoning file is created BEFORE the call and
