@@ -44,6 +44,14 @@ providers:
         ref: opencode-go/qwen3.7-plus
         reasoning_contract:
           variants: [high, max]
+      # Muse Spark 1.2 (added 2026-08-18). Catalog id opencode-go/muse-spark-1.2,
+      # display "Muse Spark 1.2", family muse, context up to ~1M tokens.
+      # reasoningEffort variants verified 2026-08-18 via `opencode models
+      # opencode-go --verbose`.
+      muse:
+        ref: opencode-go/muse-spark-1.2
+        reasoning_contract:
+          variants: [minimal, low, medium, high, xhigh]
   openai:
     kind: opencode_server
     models:

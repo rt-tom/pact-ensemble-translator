@@ -1089,7 +1089,7 @@ class ProviderModel:
 # catalog). Used to map --reasoning 1/2/3 to the nearest DECLARED variant
 # when the model's contract does not list the canonical value itself
 # (e.g. deepseek-v4-flash declares {low, high, max}: 2 -> high).
-REASONING_EFFORT_LADDER = ("none", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORT_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 # Canonical --reasoning level -> reasoningEffort value (the B1/opencode
 # transport default when the model declares no contract).
