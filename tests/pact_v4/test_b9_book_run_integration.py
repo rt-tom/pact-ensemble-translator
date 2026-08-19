@@ -1283,3 +1283,108 @@ class TestBookRunCliArgs:
         assert args.proper_name_min_occurrences == 2
         assert args.consensus_ratio == 0.8
         assert args.mixed_script_allow is None
+
+
+    # ------------------------------------------------------------------
+    # B1 promote-only (owner 2026-08-19): reuse a completed strict chapter
+    # out_dir instead of re-running the strict pipeline (--promote-existing).
+    # ------------------------------------------------------------------
+
+    def test_promote_existing_complete_promotes_without_strict(
+        self, tmp_path, monkeypatch,
+    ):
+        """--promote-existing consumes an already-completed strict chapter
+        out_dir and runs the acceptance/promotion stage without ever invoking
+        the strict pipeline (the translator model may be unavailable)."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        src_dir = tmp_path / "src"
+        out_base = tmp_path / "out"
+        existing = out_base / "chapter_0001"
+
+        # Build the completed-strict chapter artifacts (as if a prior strict
+        # run had succeeded) directly in --promote-existing dir.
+        _write_chapter_html(src_dir, "0001", _CH_HTML)
+        _make_chapter_artifacts(
+            existing, "0001",
+            terminal_status="complete",
+            quarantined=[],
+            translations=_CH_TRANSLATIONS,
+            chunk_plan=_PLAN,
+            entity_cache_payload=_entity_cache_entry(
+                "0001", _CH_SOURCE_TEXT,
+                entity="Rose", canonical_type="woman",
+                anchor_pid="p00001",
+                anchor_span="Rose met Blake at the gate.",
+            ),
+            record_source_hash="test-hash",
+            record_extractor_version=EXTRACTOR_VERSION,
+        )
+
+        # The strict pipeline must NOT be invoked in promote-only mode.
+        called = {"n": 0}
+
+        def fake_run_one(*args, **kwargs):
+            called["n"] += 1
+            raise AssertionError("strict must not run under promote-existing")
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+            promote_existing_dir=existing,
+        )
+        assert called["n"] == 0, "promote-only must not call the strict run"
+        rec = result["chapters"][0]
+        assert rec["terminal_status"] == "complete"
+        assert rec["promoted"] is True
+        # The verified proper-noun entity promoted into the flat glossary.
+        _glossary_path = memory / "glossary.json"
+        mem_keys = set(
+            json.loads(_glossary_path.read_text(encoding="utf-8"))
+            if _glossary_path.exists() else {}
+        )
+        assert "Rose" in mem_keys  # the verified entity landed in the glossary
+
+    def test_promote_existing_missing_record_errors(self, tmp_path, monkeypatch):
+        """--promote-existing pointing at a dir without a strict record
+        fails closed with a clear error, not a silent no-op."""
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        memory = _setup_memory(tmp_path)
+        out_base = tmp_path / "out"
+        empty_dir = out_base / "chapter_0001"
+        empty_dir.mkdir(parents=True, exist_ok=True)
+
+        def fake_run_one(*args, **kwargs):
+            raise AssertionError("strict must not run when record is absent")
+
+        monkeypatch.setattr(v4_book_run, "_run_one_chapter", fake_run_one)
+
+        src_dir = tmp_path / "src"
+        _write_chapter_html(src_dir, "0001", _CH_HTML)
+        result = v4_book_run.run_book(
+            memory_dir=memory,
+            chapter_ids=["0001"],
+            chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
+            out_base=out_base,
+            promote_existing_dir=empty_dir,
+        )
+        rec = result["chapters"][0]
+        assert rec["terminal_status"] == "error"
+        assert "no strict_chapter_trial_record.json" in rec.get("error", "")
+
+    def test_promote_existing_argparse(self):
+        from pact_full_pipeline_runner_v1 import v4_book_run
+
+        args, _extra = v4_book_run.build_argparser().parse_known_args([
+            "--memory-dir", "mem", "--chapters", "0001",
+            "--chapter-html-pattern", "ch/{chapter_id}.html",
+            "--out-base", "out",
+            "--promote-existing", "D:/some/completed/chapter_0001",
+        ])
+        assert args.promote_existing == Path("D:/some/completed/chapter_0001")
