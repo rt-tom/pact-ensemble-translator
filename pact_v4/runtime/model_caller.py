@@ -25,12 +25,14 @@ from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 
 
 # Phase 2B generation calls produce JSON-object output. The output budget is
-# 32768 tokens (V4.1 A1, owner decision 2026-08-08): whole-chapter generation
-# emits the full chapter in one call (chapter 0001 ~12-19k tokens, the longest
-# chapter 0077 ~21k). For chunked calls the bound is still generous; the
-# OpenCode transport does not send max_output_tokens in the POST body (Gate 0
-# §2.4), so this value lives in the request/identity, not the transport wire.
-DEFAULT_MAX_TOKENS = 32768
+# 70000 tokens (V4.1 A1, owner decision 2026-08-08; raised 2026-08-19 from
+# 32768 to 70000 so high-reasoning remotes like Muse keep room for content
+# after reasoning tokens): whole-chapter generation emits the full chapter in
+# one call (chapter 0001 ~12-19k tokens, the longest chapter 0077 ~21k). For
+# chunked calls the bound is still generous; the OpenCode transport does not
+# send max_output_tokens in the POST body (Gate 0 §2.4), so this value lives
+# in the request/identity, not the transport wire.
+DEFAULT_MAX_TOKENS = 70000
 
 
 @dataclass(frozen=True)

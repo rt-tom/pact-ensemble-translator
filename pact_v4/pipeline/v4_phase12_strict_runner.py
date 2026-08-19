@@ -279,14 +279,16 @@ class StrictRunConfig:
     temperature: float = 0.2
     seed: int = 7
     # V4.1 A1 (owner decision 2026-08-08): the generator's output budget is
-    # 32768 tokens (whole-chapter output of chapter 0001 is ~12-19k tokens,
-    # the longest chapter 0077 ~21k; Gate 0 §8.5). The value is part of the
+    # 70000 tokens (raised 2026-08-19 from 32768 so high-reasoning remotes
+    # like Muse keep room for content after reasoning tokens; whole-chapter
+    # output of chapter 0001 is ~12-19k tokens, the longest chapter 0077
+    # ~21k; Gate 0 §8.5). The value is part of the
     # config identity (generation.max_tokens below), so changing it
     # invalidates cache/resume exactly like any other generation setting.
     # The OpenCode transport does not send it in the POST body (Gate 0 §2.4),
     # so this is an identity/record value, not a transport constraint; the
     # Qwen-role ceiling MAX_TOKENS_CEILING=24576 is untouched.
-    max_tokens: int = 32768
+    max_tokens: int = 70000
     deterministic_glossary_terms: Tuple[Tuple[str, str], ...] = ()
     deterministic_names: Tuple[Tuple[str, str], ...] = ()
     deterministic_mixed_script_allow: Tuple[str, ...] = ()

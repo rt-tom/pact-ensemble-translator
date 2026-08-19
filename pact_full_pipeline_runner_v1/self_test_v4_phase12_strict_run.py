@@ -269,12 +269,12 @@ class WholeChapterCliTest(unittest.TestCase):
         artifact = cfg.to_config_artifact(model_profile="test")
         self.assertEqual(artifact.values["stop_after"], "")
 
-    def test_generation_max_tokens_default_is_32768(self):
+    def test_generation_max_tokens_default_is_70000(self):
         args = m.build_argparser().parse_args(BASE_ARGS)
         cfg = m._build_run_config(args, backend=None)
-        self.assertEqual(cfg.max_tokens, 32768)
+        self.assertEqual(cfg.max_tokens, 70000)
         artifact = cfg.to_config_artifact(model_profile="test")
-        self.assertEqual(artifact.values["generation"]["max_tokens"], 32768)
+        self.assertEqual(artifact.values["generation"]["max_tokens"], 70000)
 
 
 if __name__ == "__main__":
