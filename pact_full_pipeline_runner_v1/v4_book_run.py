@@ -926,6 +926,7 @@ def run_book(
     bm_candidates_ledger: Optional[Path] = None,
     bm_min_name_occurrences: int = DEFAULT_MIN_NAME_OCCURRENCES,
     bm_min_name_chapters: int = DEFAULT_MIN_NAME_CHAPTERS,
+    promote_existing_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
@@ -940,16 +941,41 @@ def run_book(
     records: List[BookRunRecord] = []
     for chapter_id in chapter_ids:
         chapter_html = Path(chapter_html_pattern.format(chapter_id=chapter_id))
-        out_dir = out_base / f"chapter_{chapter_id}"
+        # B1 (promote-only, owner 2026-08-19): when --promote-existing is set,
+        # the chapter's strict trial is REUSED from an already-completed
+        # out_dir instead of re-running the strict pipeline (the translator
+        # model, e.g. Muse, may no longer be available). Only the acceptance +
+        # promotion stage runs (entity/glossary/book_memory/index) — never the
+        # strict generation/audit/repair. Everything consumed below (terminal
+        # status, quarantined set, entity_context_cache, translations.json) is
+        # read from the SAME --promote-existing dir, so promotion is
+        # byte-identical to what book_run would have done had the strict run
+        # succeeded.
+        if promote_existing_dir is not None:
+            out_dir = promote_existing_dir
+            run_record_pre = _load_run_record(out_dir)
+            if not run_record_pre:
+                result = {
+                    "status": "error",
+                    "error": (
+                        f"--promote-existing: no strict_chapter_trial_record.json "
+                        f"in {out_dir}"
+                    ),
+                }
+            else:
+                # Mark "ok" so the shared acceptance/promotion block below
+                # runs with the TUNED terminal status from the existing record.
+                result = {"status": "ok"}
+        else:
+            out_dir = out_base / f"chapter_{chapter_id}"
+            result = _run_one_chapter(
+                chapter_id,
+                memory_dir=memory_dir,
+                chapter_html_path=chapter_html,
+                out_dir=out_dir,
+                extra_args=extra_args,
+            )
         hash_before = _book_memory_hash(memory_dir)
-
-        result = _run_one_chapter(
-            chapter_id,
-            memory_dir=memory_dir,
-            chapter_html_path=chapter_html,
-            out_dir=out_dir,
-            extra_args=extra_args,
-        )
 
         terminal_status = "error"
         error_msg: Optional[str] = None
@@ -1477,6 +1503,16 @@ def build_argparser() -> argparse.ArgumentParser:
                         default=DEFAULT_MIN_NAME_CHAPTERS,
                         help="BM character: min distinct chapters before "
                              "promotion (v3-style, spec §15)")
+    parser.add_argument(
+        "--promote-existing", type=Path, default=None, metavar="CHAPTER_DIR",
+        help="B1 promote-only: REUSE an already-completed strict chapter "
+             "out_dir (strict_chapter_trial_record.json + translations.json "
+             "+ entity_context_cache.json) instead of running the strict "
+             "pipeline, then run the standard acceptance/promotion stage "
+             "(entity/glossary/book_memory/chapter_index). Use this when the "
+             "translator model (e.g. Muse) is no longer available. Only one "
+             "chapter is supported in this mode; --chapters width is ignored.",
+    )
     return parser
 
 
@@ -1503,6 +1539,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bm_candidates_ledger=args.bm_candidates_ledger,
         bm_min_name_occurrences=args.bm_min_name_occurrences,
         bm_min_name_chapters=args.bm_min_name_chapters,
+        promote_existing_dir=args.promote_existing,
     )
     failed = 0
     for rec in result["chapters"]:
