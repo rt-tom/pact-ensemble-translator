@@ -26,6 +26,7 @@ from pact_v4.phase2.generation import GenerationOutcome
 from pact_v4.phase2.risk import (
     GlossaryEntry,
     RiskAssessment,
+    _all_targets_lowercase,
     _term_present,
     assess_source_risk,
     source_term_required_categories,
@@ -225,7 +226,16 @@ def _glossary_entries_for_chunk(
         source_term = entry.source_term.strip()
         if not source_term:
             continue
-        present = _term_present(chunk_text, source_term)
+        # GLOSSARY-CASE (t_2ef6563e): when every non-empty canonical
+        # target term starts with a lowercase letter, the source-term
+        # presence search is case-insensitive — e.g. "Vestige" matches
+        # "vestige" in source text.  Otherwise legacy case-sensitive
+        # behaviour is preserved (e.g. "Rose" does NOT match lowercase
+        # "rose").  Empty / non-alphabetic / mixed-case target forms
+        # cause conservative case-sensitive matching.
+        force_ci = _all_targets_lowercase(entry.target_terms)
+        present = _term_present(chunk_text, source_term,
+                                force_case_insensitive=force_ci)
         categories = source_term_required_categories(source_term)
         always = bool(
             (required_codes & categories)

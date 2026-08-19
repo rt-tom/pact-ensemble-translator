@@ -746,7 +746,7 @@ def test_repair_prompt_requires_full_pid_text_not_fragment():
     assert "FULL corrected text" in instructions
     assert "every sentence of the paragraph" in instructions
     assert "Never return a fragment" in instructions
-    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v4"
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v5"
 
 
 def test_repair_prompt_guardrails_self_verification_present():
@@ -2775,7 +2775,7 @@ def test_repair_instructions_mention_source_difference():
     assert "source=russian_editor" in instructions
     assert "source=fidelity_auditor+russian_editor" in instructions
     assert "Never apply two sequential rewrites to the same pid" in instructions
-    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v4"
+    assert REPAIR_AS_VERIFIER_V1.version == "pact-v4-repair-as-verifier/v5"
 
 
 def test_merged_editor_auditor_single_repair_call():
@@ -3189,3 +3189,105 @@ def test_lifecycle_selective_repair_bindings_match_residency():
     assert inner._reaudit_backend.api.config.chat_url == (
         f"{router.base_url}/v1/chat/completions"
     )
+
+
+# ---------------------------------------------------------------------------
+# GLOSSARY-REPAIR (t_2ef6563e): relevant glossary context in repair prompt
+# ---------------------------------------------------------------------------
+
+
+def test_repair_prompt_includes_relevant_glossary_block():
+    """When glossary entries are provided, the repair prompt includes a
+    RELEVANT GLOSSARY block with only the pairs whose source term appears
+    in the local source text."""
+    from pact_v4.phase2.risk import GlossaryEntry
+    findings = [
+        EligibleFinding(index=1, pid="p00001", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    glossary = [
+        GlossaryEntry(source_term="vestige", target_terms=("отпечаток",)),
+        GlossaryEntry(source_term="Rose", target_terms=("Роза",)),
+    ]
+    # source text contains "vestige" (case-insensitive match) but not "Rose"
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001",
+        source={"p00001": "She felt a vestige of warmth."},
+        translation={"p00001": "Она чувствовала отпечаток тепла."},
+        findings=findings,
+        glossary=glossary,
+    )
+    assert "RELEVANT GLOSSARY" in prompt
+    assert "vestige -> отпечаток" in prompt
+    # Rose is NOT in the local source text, so it should not appear
+    assert "Rose -> Роза" not in prompt
+
+
+def test_repair_prompt_no_glossary_block_when_no_match():
+    """When no glossary entries match the local source, no glossary block
+    is rendered."""
+    from pact_v4.phase2.risk import GlossaryEntry
+    findings = [
+        EligibleFinding(index=1, pid="p00001", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    glossary = [
+        GlossaryEntry(source_term="vestige", target_terms=("отпечаток",)),
+    ]
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001",
+        source={"p00001": "The door was closed."},
+        translation={"p00001": "Дверь была закрыта."},
+        findings=findings,
+        glossary=glossary,
+    )
+    assert "RELEVANT GLOSSARY" not in prompt
+
+
+def test_repair_prompt_no_glossary_block_when_no_glossary_provided():
+    """When glossary is not provided (default empty), no glossary block."""
+    findings = [
+        EligibleFinding(index=1, pid="p00001", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001",
+        source={"p00001": "She felt a vestige."},
+        translation={"p00001": "Она чувствовала отпечаток."},
+        findings=findings,
+    )
+    assert "RELEVANT GLOSSARY" not in prompt
+
+
+def test_repair_prompt_glossary_uses_case_insensitive_matching():
+    """GLOSSARY-CASE: a glossary entry with all-lowercase targets should
+    match the source term case-insensitively in the local source text."""
+    from pact_v4.phase2.risk import GlossaryEntry
+    findings = [
+        EligibleFinding(index=1, pid="p00001", tier="B", category="changed_fact",
+                        severity="major", confidence="high", note="n",
+                        excerpt="e", issue={}),
+    ]
+    glossary = [
+        GlossaryEntry(source_term="Vestige", target_terms=("отпечаток",)),
+    ]
+    # Source has lowercase "vestige" — should match because target is lowercase
+    prompt = render_selective_repair_prompt(
+        chapter_id="0001",
+        source={"p00001": "She felt a vestige of warmth."},
+        translation={"p00001": "Она чувствовала отпечаток тепла."},
+        findings=findings,
+        glossary=glossary,
+    )
+    assert "RELEVANT GLOSSARY" in prompt
+    assert "Vestige -> отпечаток" in prompt
+
+
+def test_repair_prompt_dialogue_marker_rule_present():
+    """The repair prompt includes the DIALOGUE MARKER RULE instruction."""
+    instructions = REPAIR_AS_VERIFIER_V1.instructions
+    assert "DIALOGUE MARKER RULE" in instructions
+    assert "em-dash dialogue marker" in instructions

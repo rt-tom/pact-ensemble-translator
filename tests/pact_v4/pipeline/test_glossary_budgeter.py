@@ -58,11 +58,24 @@ def test_absent_term_is_dropped_and_reported() -> None:
     assert dropped == ["steward"]
 
 
-def test_match_is_case_insensitive() -> None:
+def test_match_is_case_insensitive_when_all_targets_lowercase() -> None:
+    # GLOSSARY-CASE (t_2ef6563e): source-term search is case-insensitive
+    # when ALL target terms start with a lowercase letter.  "Blake" has
+    # target "Блэйк" (uppercase Б) → legacy case-sensitive → no match
+    # for lowercase source "blake".  Use a lowercase-target entry instead.
     kept, _ = _run_filter(
+        [ENTRY("vestige", ("отпечаток",))], chunk_text="She felt a Vestige."
+    )
+    assert kept == ["vestige"]
+
+
+def test_uppercase_target_preserves_case_sensitive() -> None:
+    # "Blake" → "Блэйк" (uppercase target) → legacy case-sensitive.
+    kept, dropped = _run_filter(
         [ENTRY("Blake", ("Блэйк",))], chunk_text="blake walked in."
     )
-    assert kept == ["Blake"]
+    assert kept == []
+    assert dropped == ["Blake"]
 
 
 def test_match_respects_word_boundaries() -> None:
@@ -260,3 +273,101 @@ def test_narrator_terms_dedupes_tokens() -> None:
     assert _narrator_glossary_terms(
         {"pov": {"source_name": "Blake Blake"}}
     ) == ("Blake",)
+
+
+# ---------------------------------------------------------------------------
+# GLOSSARY-CASE (t_2ef6563e): case-insensitive when all targets lowercase
+# ---------------------------------------------------------------------------
+
+
+def test_vestige_matches_lowercase_in_source() -> None:
+    # "Vestige" (capital V) should match "vestige" in source because the
+    # Russian target "отпечаток" starts with a lowercase letter.
+    kept, dropped = _run_filter(
+        [ENTRY("Vestige", ("отпечаток",))],
+        chunk_text="She felt a vestige of warmth.",
+    )
+    assert kept == ["Vestige"]
+    assert dropped == []
+
+
+def test_vestiges_matches_lowercase_in_source() -> None:
+    kept, dropped = _run_filter(
+        [ENTRY("Vestiges", ("отпечатки",))],
+        chunk_text="Only vestiges remain.",
+    )
+    assert kept == ["Vestiges"]
+    assert dropped == []
+
+
+def test_rose_does_not_match_lowercase_english_rose() -> None:
+    # "Rose" (capital R) should NOT match lowercase "rose" in source
+    # because the Russian target "Роза" starts with an uppercase letter.
+    kept, dropped = _run_filter(
+        [ENTRY("Rose", ("Роза",))],
+        chunk_text="She smelled the rose.",
+    )
+    assert kept == []
+    assert dropped == ["Rose"]
+
+
+def test_rose_matches_capital_rose_in_source() -> None:
+    # "Rose" DOES match "Rose" (same case) — the existing sensitive
+    # behaviour is preserved.
+    kept, _ = _run_filter(
+        [ENTRY("Rose", ("Роза",))],
+        chunk_text="She met Rose at dawn.",
+    )
+    assert kept == ["Rose"]
+
+
+def test_non_alpha_target_conservative_case_sensitive() -> None:
+    # Target with no alphabetic characters → conservative case-sensitive
+    # (legacy behaviour preserved).
+    kept, dropped = _run_filter(
+        [ENTRY("Test", ("123",))],
+        chunk_text="A Test.",
+    )
+    # "123" has no alphabetic char → conservative → case-sensitive
+    # → "Test" matches "Test" (exact case).
+    assert kept == ["Test"]
+    assert dropped == []
+
+
+def test_mixed_case_target_conservative_case_sensitive() -> None:
+    # Target starting with uppercase → legacy case-sensitive.
+    kept, dropped = _run_filter(
+        [ENTRY("Blake", ("Блэйк",))],
+        chunk_text="blake walked in.",
+    )
+    # Blake has uppercase B → case-sensitive → "blake" should NOT match
+    # (existing test_match_is_case_insensitive covers this too).
+    # But wait — Blake target "Блэйк" starts with uppercase Б →
+    # NOT all lowercase → legacy case-sensitive → "blake" should NOT match.
+    # However, the existing test_match_is_case_insensitive says it DOES match.
+    # This is because the old behaviour (before GLOSSARY-CASE) always used
+    # the SOURCE term's case, not the target's. The new behaviour changes
+    # this: if ALL targets are lowercase, use case-insensitive; else legacy.
+    # "Блэйк" starts with uppercase → legacy → case-sensitive → no match.
+    # This is a BEHAVIOUR CHANGE for entries like Blake → Блэйк.
+    # But the task says: "Vestige matches lowercase vestige; Rose does NOT
+    # match lowercase rose". Blake → Блэйк should follow the same rule:
+    # Блэйк starts with uppercase → legacy case-sensitive → no match for
+    # lowercase source. This is correct.
+    assert kept == []
+    assert dropped == ["Blake"]
+
+
+def test_all_targets_lowercase_multi_entry() -> None:
+    # Multiple entries: one with all-lowercase targets (case-insensitive),
+    # one with uppercase target (case-sensitive).
+    kept, dropped = _run_filter(
+        [
+            ENTRY("Vestige", ("отпечаток",)),
+            ENTRY("Rose", ("Роза",)),
+        ],
+        chunk_text="She felt a vestige of the rose.",
+    )
+    assert "Vestige" in kept  # case-insensitive match
+    assert "Rose" not in kept  # case-sensitive, "rose" != "Rose"
+    assert "Rose" in dropped

@@ -1660,6 +1660,60 @@ def test_resume_rejects_pre_policy_glossary_budget_journal(tmp_path: Path):
         raise AssertionError("expected a Foreign identity ValueError for a pre-policy journal")
 
 
+def test_resume_rejects_old_policy_version_glossary_budget_journal(tmp_path: Path):
+    """t_448b7be2 HIGH: when GLOSSARY_BUDGET_POLICY_VERSION is bumped (v1 -> v2),
+    a journal written under the old policy version must be rejected on resume
+    — the old prompt/output decisions must not mix with the new case-policy
+    regime."""
+    from pact_v4.pipeline.v4_phase12_strict_runner import (
+        GLOSSARY_BUDGET_POLICY_VERSION,
+    )
+
+    cfg = _make_cfg(tmp_path, n_paragraphs=24, max_consecutive=1)
+    first_result, _router1 = _run(cfg, qwen=StubQwen(passed=False, reason="meaning drift"))
+    assert first_result.processed_count == 1  # journal has one entry
+
+    # Current identity uses the new policy version (v2).
+    artifact = cfg.to_config_artifact(model_profile=cfg.backend.config_profile_name())
+    current_identity = artifact.config_identity
+
+    # Simulate a v1 -> v2 bump: rewrite the journal entries with the OLD
+    # policy version embedded in the config identity (replace v2 with v1 in
+    # the JSON-serialized artifact values, then re-hash).
+    old_values = {
+        key: _plain_json(value) for key, value in artifact.values.items()
+    }
+    old_values["glossary_budget_policy_version"] = "pact-v4-glossary-budget/v1"
+    old_identity = build_config_artifact(
+        version=cfg.config_version, values=old_values
+    ).config_identity
+    assert old_identity != current_identity  # versions produce different identities
+
+    # Rewrite the journal as if it had been written under v1.
+    journal_path = cfg.out_dir / "journal.ndjson"
+    lines = journal_path.read_text(encoding="utf-8").splitlines()
+    rewritten = []
+    for line in lines:
+        entry = json.loads(line)
+        entry["config_identity"] = old_identity
+        rewritten.append(json.dumps(entry, ensure_ascii=False))
+    journal_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
+    resumed_cfg = StrictRunConfig(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        max_consecutive_terminal_nonselections=3,
+    )
+    try:
+        _run(resumed_cfg)
+    except ValueError as exc:
+        assert "Foreign identity" in str(exc)
+    else:
+        raise AssertionError(
+            "expected a Foreign identity ValueError for a v1-policy journal"
+        )
+
+
 def test_glossary_budget_report_rows_survive_partial_resume(tmp_path: Path):
     """A1.1 review fix (MEDIUM): a partial resume replays already-journaled
     chunks without re-budgeting them, so the report must MERGE the prior
