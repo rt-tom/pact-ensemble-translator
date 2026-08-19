@@ -113,20 +113,20 @@ def test_usage_grouping_reuses_phase_for_label(tmp_path: Path):
     # MONITOR-V2 (1.3): the column is renamed to "фазы" and shows human
     # phase names (Extraction / Translation / R_editor / Audit / Repair /
     # Re-audit) instead of the old "phase2b generation" label-groups.
-    assert by_group[("Translation", "deepseek-v4-flash")]["calls"] == 2
-    assert by_group[("Translation", "deepseek-v4-flash")]["step"] == "Steps1-5"
+    assert by_group[("Whole-chapter translation", "deepseek-v4-flash")]["calls"] == 2
+    assert by_group[("Whole-chapter translation", "deepseek-v4-flash")]["step"] == "Whole-chapter translation"
     # phase2c/phase4 keep their phase identity through phase_for_label.
-    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("Repair", "deepseek-v4-flash")]["step"] == "Step7"
-    assert by_group[("Repair", "qwen3.7-plus")]["step"] == "Step7"
-    assert by_group[("Audit", "qwen3.7-plus")]["step"] == "Step6"
-    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Step8"
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "qwen_fidelity"
+    assert by_group[("Selective repair", "deepseek-v4-flash")]["step"] == "Selective repair"
+    assert by_group[("Selective repair", "qwen3.7-plus")]["step"] == "Selective repair"
+    assert by_group[("Chapter audit", "qwen3.7-plus")]["step"] == "Chapter audit"
+    assert by_group[("Formatting", "deepseek-v4-flash")]["step"] == "Formatting"
 
     # The step mapping goes through phase_for_label — prove the reuse by
     # checking the label->phase leg is literally v4_usage's function.
     assert tracker.phase_for_label is v4_usage.phase_for_label
-    assert by_group[("Translation", "deepseek-v4-flash")]["reported_cost"] == 0.03
-    assert by_group[("Audit", "qwen3.7-plus")]["reported_cost"] == 0.04
+    assert by_group[("Whole-chapter translation", "deepseek-v4-flash")]["reported_cost"] == 0.03
+    assert by_group[("Chapter audit", "qwen3.7-plus")]["reported_cost"] == 0.04
 
 
 def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
@@ -142,8 +142,8 @@ def test_usage_grouping_canonicalizes_legacy_hyphen_labels(tmp_path: Path):
     groups = tracker._usage_group_rows(tracker._read_usage_rows(out))
     by_group = {(g["label_group"], g["model"]): g for g in groups}
 
-    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "Step2c"
-    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "Step2c"
+    assert by_group[("qwen_fidelity", "qwen3.7-plus")]["step"] == "qwen_fidelity"
+    assert by_group[("gemma_preference", "deepseek-v4-flash")]["step"] == "gemma_preference"
     assert not any(g.startswith("phase2c") for g, _ in by_group)
 
 
@@ -288,8 +288,8 @@ def test_step8_not_started_wording(tmp_path: Path):
          "ts": _iso(20), "round_number": 1},
     ])
     report = tracker.render_report(out)
-    assert "Step 8: not started (ожидание formatting/terminal)" in report
-    assert "formatting incidents=None" not in report
+    assert "Formatting: not started (ожидание formatting/terminal)" in report
+    assert "incidents=None" not in report
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +451,12 @@ def test_phase_block_renders_six_phases(tmp_path: Path):
     lines = tracker._phase_block_lines(out, events)
     assert lines[0] == "-- Phase --"
     text = "\n".join(lines)
-    assert "Extraction: сущностей: 2 | claims: verified 2 / candidate 2" in text
-    assert "Translation: attempt 1/3 | source 286 слов → перевод 7 слов" in text
-    assert "R_editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
-    assert "Audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
-    assert "Repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | total 2/4" in text
-    assert "Re-audit: chunks done=2/2 | residual: 1 | debt: 0" in text
+    assert "Entity extraction: сущностей: 2 | claims: verified 2 / candidate 2" in text
+    assert "Whole-chapter translation: attempt 1/3 | source 286 слов → перевод 7 слов" in text
+    assert "R-editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
+    assert "Chapter audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
+    assert "Selective repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | findings eligible: 4 | PID edits committed: 2" in text
+    assert "Re-audit scope: chunks done=2/2 | residual: 1 | debt: 0" in text
 
 
 def test_phase_block_skips_absent_artifacts(tmp_path: Path):
@@ -478,7 +478,7 @@ def test_phase_block_translation_attempt_from_wc_events(tmp_path: Path):
     ])
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
-    assert "Translation: attempt 2/3 | source 5 слов → перевод 1 слов" in "\n".join(lines)
+    assert "Whole-chapter translation: attempt 2/3 | source 5 слов → перевод 1 слов" in "\n".join(lines)
 
 
 def _local_server_log(out: Path, name: str = "Gemma_20260816_120000_stderr.log") -> Path:
@@ -507,7 +507,8 @@ def test_server_speed_block_local(tmp_path: Path):
     lines = tracker._server_speed_lines(out)
     assert lines[0] == "-- скорость генерации (локальная, из server_logs) --"
     assert "gemma: eval 29.75 t/s | prompt 376.9 t/s | live tg_3s 29.63 t/s" in lines[1]
-    assert "n_decoded=2373, eval 79.8s (запрос от 14:51:57)" in lines[2]
+    # MONITOR-V2 finding 2: raw prefix, not wall-clock HMS.
+    assert "n_decoded=500, eval 79.8s (raw: 14.51.578.231)" in lines[2]
 
 
 def test_server_speed_block_absent_for_remote(tmp_path: Path):
@@ -539,9 +540,23 @@ def test_server_speed_block_picks_newest_log(tmp_path: Path):
     assert "qwen: eval 200.00 t/s" in lines[1]
 
 
-def test_llama_ts_to_hms():
-    assert tracker._llama_ts_to_hms("14.51.578.231") == "14:51:57"
-    assert tracker._llama_ts_to_hms("4.30.558.334") == "4:30:55"
+def test_llama_ts_raw():
+    # MONITOR-V2 finding 2: _llama_ts_raw returns the prefix as-is —
+    # no wall-clock interpretation, no impossible timestamps.
+    assert tracker._llama_ts_raw("14.51.578.231") == "14.51.578.231"
+    assert tracker._llama_ts_raw("4.30.558.334") == "4.30.558.334"
+    assert tracker._llama_ts_raw("bad") == "bad"
+
+
+def test_llama_ts_raw_no_impossible_wall_clock():
+    """_llama_ts_raw never produces impossible timestamps like
+    35:59:86 — it returns the raw prefix verbatim (task req. 7)."""
+    # Impossible prefix: 35.59.86.231 would be 35:59:86 with the old
+    # wall-clock conversion — now it stays as-is.
+    assert tracker._llama_ts_raw("35.59.86.231") == "35.59.86.231"
+    # Normal prefixes are also returned as-is.
+    assert tracker._llama_ts_raw("14.51.578.231") == "14.51.578.231"
+    assert tracker._llama_ts_raw("23.59.59.999") == "23.59.59.999"
 
 
 def test_last_call_block_from_usage(tmp_path: Path):
@@ -554,7 +569,7 @@ def test_last_call_block_from_usage(tmp_path: Path):
     ])
     lines = tracker._last_call_block_lines(out)
     assert lines[0] == "-- последний вызов (из usage.ndjson) --"
-    assert lines[1] == "  Re-audit | qwen3.7-plus | in=45620 out=210 reas=5800 | wall=?s"
+    assert lines[1] == "  Re-audit scope | qwen3.7-plus | in=45620 out=210 reas=5800 | wall=?s"
 
 
 def test_last_call_block_absent_without_usage(tmp_path: Path):
@@ -730,14 +745,14 @@ def test_phase_block_renders_incremental_stage_progress(tmp_path: Path):
 
     assert lines[0] == "-- Phase --"
     # R_editor: 3 done chunks; 2 SAFE edits (typo, grammar) + 1 REVIEW (calque).
-    assert "R_editor: chunks done=3 | safe (применено)=2 | review (предложено)=1" in text
+    assert "R-editor: chunks done=3 | safe (применено)=2 | review (предложено)=1" in text
     # Audit: 2 done chunks, findings [3, 1], всего = 2 issues so far.
-    assert "Audit: chunks done=2 | findings per chunk: [3, 1] | всего 2" in text
+    assert "Chapter audit: chunks done=2 | findings per chunk: [3, 1] | всего 2" in text
     # Repair: 2 done batches of batch_count 4, committed 2.
-    assert ("Repair: batches done=2/4 | repaired per batch: [1/1, 1/1] "
-            "| total 2") in text
-    # Re-audit: 1 done chunk, residual 1 issue, no failed marker -> debt 0.
-    assert "Re-audit: chunks done=1 | residual: 1 | debt: 0" in text
+    assert ("Selective repair: batches done=2/4 | repaired per batch: [1/1, 1/1] "
+            "| findings eligible: 2 | PID edits committed: 2") in text
+    # Re-audit: 1 done chunk, residual 1 issue, incomplete stage -> debt 1.
+    assert "Re-audit scope: chunks done=1 | residual: 1 | debt: 1" in text
     assert "(нет Phase-артефактов" not in text
 
 
@@ -754,10 +769,10 @@ def test_phase_block_final_cache_output_preserved(tmp_path: Path):
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
     text = "\n".join(lines)
-    assert "R_editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
-    assert "Audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
-    assert "Repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | total 2/4" in text
-    assert "Re-audit: chunks done=2/2 | residual: 1 | debt: 0" in text
+    assert "R-editor: chunks done=2/2 | safe (применено)=1 | review (предложено)=1" in text
+    assert "Chapter audit: chunks done=2/2 | findings per chunk: [3, 0] | всего 3" in text
+    assert "Selective repair: batches done=2/2 | repaired per batch: [1/1, 1/2] | findings eligible: 4 | PID edits committed: 2" in text
+    assert "Re-audit scope: chunks done=2/2 | residual: 1 | debt: 0" in text
 
 
 # ---------------------------------------------------------------------------
@@ -806,15 +821,898 @@ def test_phase_block_tolerates_malformed_schema(tmp_path: Path):
     # Extraction with entries=[1] yields no entities -> line absent.
     assert "Extraction:" not in text
     # word_counts with a non-numeric value counts it as 0, the numeric one as 5.
-    assert "Translation:" in text and "5 слов" in text
+    assert "Whole-chapter translation:" in text and "5 слов" in text
+
+
+def test_usage_block_tolerates_corrupt_ndjson(tmp_path: Path):
+    """Invalid UTF-8 / malformed rows in usage.ndjson render an invalid
+    diagnostic instead of raising UnicodeDecodeError / AttributeError."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / USAGE_FILENAME).write_bytes(
+        b'{"schema":"x","label":"phase2b/a","input_tokens":1}\n'
+        b"\xff\xfe{\"garbage\"}\n"
+        b"[1, 2, 3]\n"
+        b'{"schema":"x","label":"phase2b/b","input_tokens":"abc"}\n'
+    )
+    lines = tracker._usage_block_lines(out)
+    text = "\n".join(lines)
+    # Two valid rows survive (the non-object row and garbage are skipped);
+    # the non-numeric token counts as 0.
+    assert "Whole-chapter translation" in text
+    assert "calls" in text
+    assert "2" in text
+
+    # Last-call block also degrades on the malformed-but-valid row.
+    last = tracker._last_call_block_lines(out)
+    assert isinstance(last, list)
+
+
+def test_usage_block_distinguishes_corrupt_vs_absent(tmp_path: Path):
+    """MEDIUM #3: a corrupt usage.ndjson that yields no readable rows is
+    reported as corrupt, while an absent file keeps the 'no usage yet'
+    wording."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / USAGE_FILENAME).write_bytes(b"\xff\xfe not json \x00")
+    lines = tracker._usage_block_lines(out)
+    assert any("corrupt" in l or "no readable rows" in l for l in lines)
 
 
 # ---------------------------------------------------------------------------
-# RV t_52f8e9f7 MEDIUM: scalar-context / scalar-r_editor / scalar-repair
-# fields must not raise AttributeError / TypeError — the monitor stays
-# read-only and never aborts for malformed-but-valid JSON/schema.
+# MONITOR-V2 whole-chapter vocabulary: canonical names, live speed, liveness,
+# repair/re-audit separation, book table mode/unit, timestamp (task req.)
 # ---------------------------------------------------------------------------
 
+
+def test_canonical_phase_names_consistent(tmp_path: Path):
+    """All seven canonical phase names are the single source of truth."""
+    assert tracker.PHASE_HUMAN_NAME["extraction"] == "Entity extraction"
+    assert tracker.PHASE_HUMAN_NAME["gen"] == "Whole-chapter translation"
+    assert tracker.PHASE_HUMAN_NAME["r_editor"] == "R-editor"
+    assert tracker.PHASE_HUMAN_NAME["audit"] == "Chapter audit"
+    assert tracker.PHASE_HUMAN_NAME["repair"] == "Selective repair"
+    assert tracker.PHASE_HUMAN_NAME["reaudit"] == "Re-audit scope"
+    assert tracker.PHASE_HUMAN_NAME["formatting"] == "Formatting"
+    # MONITOR-V2 finding 6: PHASE_TO_STEP_GROUP is derived from PHASE_HUMAN_NAME.
+    for phase in ("extraction", "gen", "r_editor", "audit", "repair",
+                  "reaudit", "formatting"):
+        assert tracker.PHASE_TO_STEP_GROUP[phase] == tracker.PHASE_HUMAN_NAME[phase]
+    # Structural invariant: every key in PHASE_TO_STEP_GROUP (except extras)
+    # must exist in PHASE_HUMAN_NAME.
+    for key in tracker.PHASE_TO_STEP_GROUP:
+        assert key in tracker.PHASE_HUMAN_NAME, (
+            f"PHASE_TO_STEP_GROUP key {key!r} not in PHASE_HUMAN_NAME"
+        )
+
+
+def test_speed_block_live_tg3s_without_final_eval(tmp_path: Path):
+    """Active local generation with tg_3s but no final eval renders live
+    t/s, n_decoded, and 'eval in progress' (task req. 5, finding 1)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    logs = out / "server_logs"
+    logs.mkdir(exist_ok=True)
+    # Write a log with tg_3s but NO final eval line.
+    (logs / "Gemma_20260816_120000_stderr.log").write_text(
+        "0.32.156.164 I slot print_timing: id  0 | task 0 | n_decoded =    100, "
+        "tg =  26.08 t/s, tg_3s =  26.08 t/s\n",
+        encoding="utf-8",
+    )
+    lines = tracker._server_speed_lines(out)
+    assert len(lines) == 2
+    assert "live tg_3s 26.08 t/s" in lines[1]
+    assert "eval in progress" in lines[1]
+    # MONITOR-V2 finding 1: n_decoded must be rendered even without final eval.
+    assert "n_decoded=100" in lines[1]
+    # Must NOT show "нет завершённых eval" during active generation.
+    assert "нет завершённых eval" not in lines[1]
+
+
+def test_local_liveness_from_fresh_gemma_log(tmp_path: Path):
+    """Fresh local Gemma/Qwen log is an additional liveness signal
+    (task req. 6). Remote logs cannot produce alive=yes."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    logs = out / "server_logs"
+    logs.mkdir(exist_ok=True)
+    # Fresh local log -> alive.
+    (logs / "Gemma_20260816_120000_stderr.log").write_text("x", encoding="utf-8")
+    events = tracker._load_events(out)
+    identity = tracker._identity(out, events)
+    assert identity["alive"] is True
+    assert "local llama timing" in identity["alive_basis"]
+
+    # Remote log only -> NOT alive via local liveness.
+    out2 = _chapter_dir(tmp_path, "chapter_0002", _iso(7200))
+    logs2 = out2 / "server_logs"
+    logs2.mkdir(exist_ok=True)
+    (logs2 / "opencode_serve_20260815_100151_stderr.log").write_text("x", encoding="utf-8")
+    events2 = tracker._load_events(out2)
+    identity2 = tracker._identity(out2, events2)
+    # Stale run, no usage/events -> not alive; remote logs don't help.
+    assert identity2["alive"] is False
+
+
+def test_repair_metrics_separated(tmp_path: Path):
+    """Repair output shows findings eligible and PID edits committed as
+    separate units, not a ratio (task req. 2)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 10,
+            "committed": ["p1", "p2", "p3"],
+            "batches": [
+                {"batch_index": 1, "findings": [{"index": 1}],
+                 "results": [{"index": 1, "decision": "repair"}]},
+                {"batch_index": 2, "findings": [{"index": 2}, {"index": 3}],
+                 "results": [{"index": 2, "decision": "repair"},
+                             {"index": 3, "decision": "skip"}]},
+            ],
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "findings eligible: 10" in text
+    assert "PID edits committed: 3" in text
+    # Old ratio format must not appear.
+    assert "total 3/10" not in text
+
+
+def test_reaudit_quality_and_execution_debt_separated(tmp_path: Path):
+    """Re-audit residual and debt are independent (task req. 3)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "reaudit": {
+                "complete": False,
+                "failed": True,
+                "issues": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}],
+            },
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Residual=3, debt=1 (failed re-audit).
+    assert "residual: 3" in text
+    assert "debt: 1" in text
+    # residual>0 does NOT force debt=0.
+    assert "residual: 3 | debt: 0" not in text
+
+
+def test_book_table_mode_unit_whole_chapter(tmp_path: Path):
+    """Whole-chapter book rows show '1/1' (task req. 4)."""
+    base = tmp_path / "book"
+    base.mkdir()
+    ch = _chapter_dir(base, "chapter_0001", _iso(3600))
+    _write_ndjson(ch / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "mode/unit" in table
+    assert "1/1" in table
+
+
+def test_book_table_mode_unit_chunked(tmp_path: Path):
+    """Chunked book rows show 'N/M' (task req. 4)."""
+    base = tmp_path / "book"
+    base.mkdir()
+    _chapter_dir(base, "chapter_0001", _iso(3600))
+    report = tracker.render_book_report(base)
+    table = report.split("-- active chapter", 1)[0]
+    assert "mode/unit" in table
+    # Fixture has 2 chunks planned, 2 journaled -> "2/2".
+    assert "2/2" in table
+    # Old "chunks" column name must not appear.
+    assert "chunks" not in table.split("\n")[0]
+
+
+def test_counters_whole_chapter_canonical_lifecycle(tmp_path: Path):
+    """Counters block uses canonical phase names, not legacy Step N
+    (task req. 1)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_report(out)
+    # Canonical name for generation.
+    assert "Whole-chapter translation: attempt 1/3" in report
+    # Canonical names for subsequent stages.
+    assert "R-editor: not started" in report
+    assert "Chapter audit: not started" in report
+    assert "Selective repair: not started" in report
+    assert "Re-audit scope: not started" in report
+    assert "Formatting: not applicable (whole-chapter)" in report
+    # Legacy names must not appear in user-facing output.
+    assert "GEN:" not in report
+    assert "Step 6" not in report
+    assert "Step 7" not in report
+    assert "Step 8" not in report
+    assert "Steps 1-5" not in report
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 finding 3: R-editor lifecycle from B3 events only
+# ---------------------------------------------------------------------------
+
+def test_r_editor_not_started_without_b3(tmp_path: Path):
+    """Generation done without B3 events must NOT claim R-editor complete
+    (finding 3 regression)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_generation_done", "ts": _iso(50),
+         "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
+    ])
+    report = tracker.render_report(out)
+    # R-editor must be "not started" — no B3 r_editor events exist.
+    assert "R-editor: not started" in report
+    assert "R-editor: complete" not in report
+
+
+def test_r_editor_in_progress_from_b3_started(tmp_path: Path):
+    """R-editor in progress when B3 has r_editor_started but no r_editor_done."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_generation_done", "ts": _iso(50),
+         "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
+    ])
+    _write(out / "audit_journal.ndjson", "")
+    import json as _json
+    with open(out / "audit_journal.ndjson", "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"schema": "pact-v4-b3-audit-journal/v1",
+                               "event": "r_editor_started",
+                               "ts": _iso(40)}) + "\n")
+    report = tracker.render_report(out)
+    assert "R-editor: in progress" in report
+    assert "R-editor: complete" not in report
+    assert "R-editor: not started" not in report
+
+
+def test_r_editor_complete_from_b3_done(tmp_path: Path):
+    """R-editor complete when B3 has r_editor_done events."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+        {"schema": "x", "event": "wc_generation_done", "ts": _iso(50),
+         "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
+    ])
+    _write(out / "audit_journal.ndjson", "")
+    import json as _json
+    with open(out / "audit_journal.ndjson", "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"schema": "pact-v4-b3-audit-journal/v1",
+                               "event": "r_editor_started",
+                               "ts": _iso(40)}) + "\n")
+        fh.write(_json.dumps({"schema": "pact-v4-b3-audit-journal/v1",
+                               "event": "r_editor_done",
+                               "ts": _iso(30), "chunk": 1, "total": 1}) + "\n")
+    report = tracker.render_report(out)
+    assert "R-editor: complete" in report
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 finding 4: re-audit incomplete execution debt
+# ---------------------------------------------------------------------------
+
+def test_reaudit_incomplete_execution_debt_final(tmp_path: Path):
+    """Final cache: incomplete re-audit (complete=False, failed=False)
+    must render debt=1, not debt=0 (finding 4 regression)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "reaudit": {
+                "complete": False,
+                "issues": [{"id": "p1"}],
+            },
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "residual: 1" in text
+    # debt=1 because incomplete, NOT because failed.
+    assert "debt: 1" in text
+    assert "debt: 0" not in text
+
+
+def test_reaudit_incomplete_execution_debt_incremental(tmp_path: Path):
+    """Incremental path: incomplete stage (no terminal status) must render
+    debt=1 (finding 4 regression)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "reaudit": {
+                "status": "in_progress",
+                "done_chunks": [{"chunk": 1, "issues": []}],
+                "issues": [],
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Incomplete stage → debt=1.
+    assert "debt: 1" in text
+    assert "debt: 0" not in text
+
+
+def test_reaudit_complete_no_debt(tmp_path: Path):
+    """Complete re-audit (complete=True) with no failed chunks → debt=0."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "reaudit": {
+                "complete": True,
+                "issues": [],
+            },
+        },
+    })
+    _write(out / "b3_repair_reaudit_chunk1_raw.txt", "{}")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "debt: 0" in text
+
+
+# ---------------------------------------------------------------------------
+# MONITOR-V2 finding 5: canonical phase names in status and chapter table
+# ---------------------------------------------------------------------------
+
+def test_status_line_uses_canonical_phase_names(tmp_path: Path):
+    """Status line uses canonical phase names, not raw internal codes."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    events = tracker._load_events(out)
+    line = tracker._status_line(out, events, "gen")
+    # Canonical name, not raw "gen".
+    assert "[chapter_0001] Whole-chapter translation" in line
+    assert "[chapter_0001] gen" not in line
+
+
+def test_render_report_phase_line_canonical(tmp_path: Path):
+    """render_report phase: line uses canonical name."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_report(out)
+    # phase: line uses canonical name, not raw "gen".
+    assert "phase: Whole-chapter translation --" in report
+    assert "phase: gen --" not in report
+
+
+def test_chapter_table_step_uses_canonical(tmp_path: Path):
+    """Chapter table step column uses canonical names, not raw step numbers."""
+    base = tmp_path / "book"
+    base.mkdir()
+    out = _chapter_dir(base, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
+    report = tracker.render_book_report(base)
+    # Step column must not show raw "1-5", "6", "7", "8".
+    table_line = [l for l in report.split("\n") if "chapter_0001" in l]
+    assert table_line
+    # Should contain canonical names, not internal codes.
+    assert "1-5" not in table_line[0]
+
+
+# ---------------------------------------------------------------------------
+# FINDING 1: cache-authoritative malformed audit_cache_b3.json
+# ---------------------------------------------------------------------------
+
+def test_malformed_empty_cache_renders_fail_closed(tmp_path: Path):
+    """An empty audit_cache_b3.json is cache-authoritative and must render
+    explicit fail-closed errors, not silently fall through."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("", encoding="utf-8")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # All four cache-dependent phases render fail-closed errors.
+    assert "fail-closed" in text
+    assert "R-editor:" in text
+    assert "Chapter audit:" in text
+    assert "Selective repair:" in text
+    assert "Re-audit scope:" in text
+    # Must NOT show "нет Phase-артефактов" — the file exists, just malformed.
+    assert "нет Phase-артефактов" not in text
+
+
+def test_malformed_non_json_cache_renders_fail_closed(tmp_path: Path):
+    """Non-JSON content in audit_cache_b3.json renders fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("not json {{{", encoding="utf-8")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "fail-closed" in text
+    assert "R-editor:" in text
+
+
+def test_malformed_non_object_cache_renders_fail_closed(tmp_path: Path):
+    """A JSON array (non-object) in audit_cache_b3.json renders fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("[1, 2, 3]", encoding="utf-8")
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "fail-closed" in text
+
+
+def test_malformed_cache_no_journal_fallback(tmp_path: Path):
+    """A malformed audit_cache_b3.json does NOT fall through to journal
+    or missing-artifact fallback — it fails closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    (out / "audit_cache_b3.json").write_text("garbage", encoding="utf-8")
+    events = tracker._load_events(out)
+    # Individual phase functions also fail closed.
+    assert "fail-closed" in (tracker._phase_r_editor(out) or "")
+    assert "fail-closed" in (tracker._phase_audit(out) or "")
+    assert "fail-closed" in (tracker._phase_repair(out) or "")
+    assert "fail-closed" in (tracker._phase_reaudit(out) or "")
+
+
+def test_absent_cache_still_returns_none(tmp_path: Path):
+    """An absent audit_cache_b3.json returns None (no error) — only
+    present-but-malformed triggers fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    events = tracker._load_events(out)
+    # No audit_cache_b3.json -> individual functions return None.
+    assert tracker._phase_r_editor(out) is None
+    assert tracker._phase_audit(out) is None
+    assert tracker._phase_repair(out) is None
+    assert tracker._phase_reaudit(out) is None
+
+
+def test_malformed_nested_fields_do_not_crash(tmp_path: Path):
+    """Malformed nested fields in audit_cache_b3.json (e.g. chunks: [1],
+    repair.batches: [1]) must not crash — they render gracefully."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {"chunk_count": "abc", "successful_chunks": True}},
+        "chunks": [1, "garbage"],
+        "issue_count": "not_a_number",
+        "repair": {"batches": [1], "eligible_count": "x", "committed": "y"},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Must render without crashing; malformed data degrades gracefully.
+    assert "-- Phase --" in text
+
+
+# ---------------------------------------------------------------------------
+# FINDING 2: R-editor successful_chunks / chunk_count validation
+# ---------------------------------------------------------------------------
+
+def test_r_editor_chunk_count_must_be_non_negative_int(tmp_path: Path):
+    """chunk_count that is a bool, float, string, or negative must NOT
+    produce a done=X/Y line — fall through to incremental path."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    for bad_cc in [True, 3.5, "two", -1]:
+        _write(out / "audit_cache_b3.json", {
+            "r_editor": {
+                "outcome": {
+                    "chunk_count": bad_cc,
+                    "successful_chunks": 2,
+                    "applied": [],
+                    "candidates": [],
+                },
+            },
+        })
+        result = tracker._phase_r_editor(out)
+        # Should NOT render "chunks done=X/Y" for bad chunk_count.
+        if result is not None:
+            assert "chunks done=" not in result or "/" not in result, (
+                f"bad chunk_count {bad_cc!r} should not produce done/X/Y"
+            )
+
+
+def test_r_editor_successful_chunks_must_be_non_negative_int(tmp_path: Path):
+    """successful_chunks that is bool/string/negative must NOT produce
+    done=X/Y — fall through to incremental path."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    for bad_sc in [True, "one", -1]:
+        _write(out / "audit_cache_b3.json", {
+            "r_editor": {
+                "outcome": {
+                    "chunk_count": 2,
+                    "successful_chunks": bad_sc,
+                    "applied": [],
+                    "candidates": [],
+                },
+            },
+        })
+        result = tracker._phase_r_editor(out)
+        if result is not None:
+            assert "chunks done=" not in result or "/" not in result, (
+                f"bad successful_chunks {bad_sc!r} should not produce done/X/Y"
+            )
+
+
+def test_r_editor_mismatch_falls_through(tmp_path: Path):
+    """successful_chunks != chunk_count (conflicting evidence) must fall
+    through to incremental path, not render wrong numbers."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 3,
+                "successful_chunks": 1,  # mismatch
+                "applied": [],
+                "candidates": [],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    # Should NOT render "done=1/3" — the mismatch falls through.
+    if result is not None:
+        assert "done=1/3" not in result
+
+
+def test_r_editor_coherent_integers_render(tmp_path: Path):
+    """Coherent non-negative integer chunk_count == successful_chunks
+    renders the done=X/Y line correctly."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 2,
+                "successful_chunks": 2,
+                "applied": [{"pid": "p1", "text": "x"}],
+                "candidates": [{"pid": "p2", "text": "y"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "done=2/2" in result
+    assert "safe (применено)=1" in result
+    assert "review (предложено)=1" in result
+
+
+# ---------------------------------------------------------------------------
+# FINDING 3: applied_count / candidate_count from production cache
+# ---------------------------------------------------------------------------
+
+def test_r_editor_preserves_applied_candidate_count(tmp_path: Path):
+    """When the production cache carries applied_count/candidate_count,
+    the monitor uses those values instead of recomputing from lists."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": 1,
+                # Production fields — the monitor must preserve these.
+                "applied_count": 5,
+                "candidate_count": 3,
+                # List representations may differ (e.g. after partial apply).
+                "applied": [{"pid": "p1"}],
+                "candidates": [],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    # Must show production counts, not list-length counts.
+    assert "safe (применено)=5" in result
+    assert "review (предложено)=3" in result
+
+
+def test_r_editor_falls_back_to_list_length(tmp_path: Path):
+    """When applied_count/candidate_count are absent, the monitor computes
+    from the applied/candidates lists."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": 1,
+                "applied": [{"pid": "p1"}, {"pid": "p2"}],
+                "candidates": [{"pid": "p3"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "safe (применено)=2" in result
+    assert "review (предложено)=1" in result
+
+
+def test_repair_preserves_eligible_count(tmp_path: Path):
+    """The monitor preserves the production eligible_count field."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 15,
+            "committed": ["p1", "p2"],
+            "batches": [
+                {"batch_index": 1, "findings": [{"index": 1}],
+                 "results": [{"index": 1, "decision": "repair"}]},
+            ],
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "findings eligible: 15" in text
+    assert "PID edits committed: 2" in text
+
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2: Defect 1 -- malformed nested R-editor shape fail-closed
+# ---------------------------------------------------------------------------
+
+def test_r_editor_malformed_outcome_not_dict(tmp_path: Path):
+    """Cache present, r_editor is a dict, but outcome is a list (not dict).
+    Must render explicit fail-closed diagnostic, not hide as absent."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": ["unexpected", "list"]},
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+    assert "outcome is not a valid object" in result
+
+
+def test_r_editor_malformed_outcome_none(tmp_path: Path):
+    """Cache present, r_editor is a dict, outcome is None.
+    Must render explicit fail-closed diagnostic."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": None},
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+
+
+def test_r_editor_malformed_r_editor_not_dict(tmp_path: Path):
+    """Cache present, r_editor is a string (not dict).
+    Must render explicit fail-closed diagnostic."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": "not_a_dict",
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+    assert "r_editor is not a valid object" in result
+
+
+def test_r_editor_malformed_invalid_chunk_count(tmp_path: Path):
+    """Cache present, r_editor.outcome has chunk_count=abc (string) and
+    successful_chunks=True (bool). Both invalid -> fail-closed."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": "abc",
+                "successful_chunks": True,
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    assert result is not None
+    assert "fail-closed" in result
+    # Both invalid -> "no valid completion data" (not "invalid chunk_count")
+    assert "no valid completion data" in result
+
+
+def test_r_editor_malformed_invalid_successful_chunks(tmp_path: Path):
+    """Cache present, r_editor.outcome has valid chunk_count but
+    invalid successful_chunks (float). Must fall through to
+    incremental (no GOOD inference)."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 3,
+                "successful_chunks": 1.5,  # float, invalid
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=2/2" not in result
+        assert "done=3/3" not in result
+
+
+def test_r_editor_malformed_full_render_report(tmp_path: Path):
+    """Full render_report with malformed nested r_editor shape
+    must show the fail-closed diagnostic in the Phase block."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {"chunk_count": "abc"}},
+    })
+    report = tracker.render_report(out)
+    assert "R-editor: audit_cache_b3.json present but" in report
+    assert "fail-closed" in report
+    # Must NOT show "нет Phase-артефактов" when cache is present.
+    assert "\u043d\u0435\u0442 Phase-\u0430\u0440\u0442\u0435\u0444\u0430\u043a\u0442\u043e\u0432" not in report
+
+
+def test_r_editor_conflicting_cache_journal_full_report(tmp_path: Path):
+    """Valid cache with mismatched chunk_count/successful_chunks
+    falls through to incremental; full report does not claim R-editor
+    complete from journal when cache evidence conflicts."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 3,
+                "successful_chunks": 1,  # mismatch
+            },
+        },
+    })
+    report = tracker.render_report(out)
+    assert "done=3/3" not in report
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2: Defect 2 -- no GOOD chunk inference for absent successful_chunks
+# ---------------------------------------------------------------------------
+
+def test_r_editor_no_good_chunk_fallback(tmp_path: Path):
+    """When chunk_count is valid but successful_chunks is absent,
+    the monitor must NOT count GOOD chunks as done."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 2,
+                "chunks": [
+                    {"status": "GOOD"},
+                    {"status": "GOOD_RETRIED"},
+                ],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=2/2" not in result
+
+
+def test_r_editor_bool_successful_chunks_no_inference(tmp_path: Path):
+    """When successful_chunks is a bool (True), must NOT count GOOD chunks."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": True,
+                "chunks": [{"status": "GOOD"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=1/1" not in result
+
+
+def test_r_editor_negative_successful_chunks_no_inference(tmp_path: Path):
+    """When successful_chunks is negative, must NOT count GOOD chunks."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {
+            "outcome": {
+                "chunk_count": 1,
+                "successful_chunks": -1,
+                "chunks": [{"status": "GOOD"}],
+            },
+        },
+    })
+    result = tracker._phase_r_editor(out)
+    if result is not None:
+        assert "done=1/1" not in result
+
+
+# ---------------------------------------------------------------------------
+# FIX ROUND 2: Defect 3 -- legacy labels removed from normal output
+# ---------------------------------------------------------------------------
+
+def test_no_legacy_labels_in_chunk_block(tmp_path: Path):
+    """The chunks block header and columns must use canonical names."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    assert "Entity extraction" in report
+    assert "Chapter audit" in report
+    assert "Selective repair" in report
+    lines = report.split("\n")
+    for line in lines:
+        if "chunks (" in line:
+            assert "trial" not in line.lower() or "Entity extraction" in line
+
+
+def test_no_legacy_labels_in_counters_block(tmp_path: Path):
+    """The counters block must use canonical names, not Step 6/7."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    report = tracker.render_report(out)
+    assert "Step 6" not in report
+    assert "Step 7" not in report
+    assert "Step 6/7" not in report
+    assert "Chapter audit:" in report
+    assert "Selective repair:" in report
+
+
+def test_no_legacy_labels_in_book_table(tmp_path: Path):
+    """The book table step column must use canonical names."""
+    out_base = tmp_path / "book_run"
+    out_base.mkdir()
+    ch = out_base / "chapter_0001"
+    ch.mkdir()
+    _write(ch / "chunk_plan.json", {"chunks": [{"chunk_id": "c1"}]})
+    _write_ndjson(ch / "journal.ndjson", [{"chunk_id": "c1", "outcome": "selected"}])
+    _write_ndjson(ch / PHASE_PROGRESS_FILENAME, [{
+        "schema": "pact-v4-phase-progress/ndjson/v1",
+        "event": "run_started",
+        "ts": _iso(3600),
+        "started_at": _iso(3600),
+        "resumed_from_index": 0,
+    }])
+    text = tracker.render_book_report(out_base)
+    assert "Entity ext." not in text
+    assert "Whole-chapter" in text or "Entity extraction" in text or "Chapter audit" in text
+
+
+def test_canonical_names_consistent_all_blocks(tmp_path: Path):
+    """All user-facing blocks use the same canonical names."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json", {
+        "entries": [{"context": {"entities": [
+            {"anchor": {"status": "verified"}, "aliases": [], "claims": []}
+        ]}}]
+    })
+    report = tracker.render_report(out)
+    assert "Entity extraction:" in report
+    assert "Step 6" not in report
+    assert "Step 7" not in report
+    assert "Entity ext." not in report
+
+
+# ----------------------------------------------------------------
+# Repair scalar-schema regression coverage (merged from fix/repair-prompt-...)
+# ----------------------------------------------------------------
+
+def test_phase_block_scalar_chunk_status_no_crash(tmp_path: Path):
+    """r_editor.outcome.chunks with scalar status (e.g. status=42)
+    must not raise AttributeError at .upper() -- the monitor safely
+    skips chunks with non-string status."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {
+            "chunk_count": 2, "successful_chunks": None,
+            "chunks": [
+                {"status": "GOOD"},
+                {"status": 42},
+                {"status": []},
+            ],
+        }},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Scalar/non-string statuses must not crash; the monitor does NOT
+    # fabricate a done count from chunk statuses (no GOOD-chunk inference,
+    # MONITOR-V2 strict successful_chunks contract).
+    assert "chunks done=" not in text
+    assert "R-editor:" not in text
 
 def test_phase_block_scalar_context_no_crash(tmp_path: Path):
     """entity_context_cache.json with context as a string (not a dict)
@@ -829,6 +1727,74 @@ def test_phase_block_scalar_context_no_crash(tmp_path: Path):
     assert "Extraction:" not in text
     assert "-- Phase --" in text
 
+def test_phase_block_scalar_decision_final_repair_no_crash(tmp_path: Path):
+    """Final repair batches with scalar result.decision (e.g. 42)
+    must not raise AttributeError at .lower() -- the monitor safely
+    skips results with non-string decision."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 3,
+            "batches": [
+                {"findings": 3, "results": [
+                    {"decision": "repair"},
+                    {"decision": 42},
+                    {"decision": []},
+                ]},
+            ],
+            "committed": 1,
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Only the string "repair" decision counts; scalar/non-string skipped.
+    assert "Selective repair: batches done=1/1" in text
+    assert "1/3" in text
+
+def test_phase_block_scalar_decision_incremental_repair_no_crash(tmp_path: Path):
+    """Incremental stage_progress.repair with scalar result.decision
+    must not raise AttributeError at .lower() -- same guard as final."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "repair": {
+                "status": "partial",
+                "done_batches": [1],
+                "committed": 1,
+                "outcome": {
+                    "batch_count": 2,
+                    "batches": [
+                        {"findings": 2, "results": [
+                            {"decision": "repair"},
+                            {"decision": 99},
+                        ]},
+                    ],
+                },
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Only string "repair" decision counts; scalar skipped.
+    assert "Selective repair: batches done=1/2" in text
+    assert "1/2" in text
+
+def test_phase_block_scalar_entities_no_crash(tmp_path: Path):
+    """entity_context_cache.json with context.entities as a scalar
+    (e.g. {"entities": 1}) must not raise TypeError on iteration --
+    the monitor degrades gracefully and skips malformed entities."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json",
+           {"entries": [{"context": {"entities": 1}}]})
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Scalar entities yields no iterable -> Extraction line absent.
+    assert "Extraction:" not in text
+    assert "Extraction:" not in text
+    assert "Phase" in text
 
 def test_phase_block_scalar_r_editor_applied_candidates(tmp_path: Path):
     """r_editor.outcome.applied/candidates as scalar ints must not raise
@@ -843,10 +1809,9 @@ def test_phase_block_scalar_r_editor_applied_candidates(tmp_path: Path):
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
     text = "\n".join(lines)
-    assert "R_editor: chunks done=2/2" in text
+    assert "R-editor: chunks done=2/2" in text
     assert "safe (применено)=4" in text
     assert "review (предложено)=1" in text
-
 
 def test_phase_block_scalar_repair_findings_results_committed(tmp_path: Path):
     """repair.batches[].findings as scalar int, results as scalar int,
@@ -866,13 +1831,12 @@ def test_phase_block_scalar_repair_findings_results_committed(tmp_path: Path):
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
     text = "\n".join(lines)
-    assert "Repair: batches done=2/2" in text
+    assert "Selective repair: batches done=2/2" in text
     # Scalar findings=4 renders as count; results=[] yields repaired=0.
     assert "0/4" in text
     # Scalar results=4 yields repaired=0 (not iterable).
     assert "0/3" in text
-    assert "total 4" in text
-
+    assert "PID edits committed: 4" in text
 
 def test_phase_block_scalar_repair_in_incremental_cache(tmp_path: Path):
     """Incremental stage_progress.repair with scalar findings/results/
@@ -897,86 +1861,10 @@ def test_phase_block_scalar_repair_in_incremental_cache(tmp_path: Path):
     events = tracker._load_events(out)
     lines = tracker._phase_block_lines(out, events)
     text = "\n".join(lines)
-    assert "Repair: batches done=2/3" in text
+    assert "Selective repair: batches done=2/3" in text
     assert "0/2" in text
     assert "0/1" in text
-    assert "total 4" in text
-
-
-def test_usage_block_tolerates_corrupt_ndjson(tmp_path: Path):
-    """Invalid UTF-8 / malformed rows in usage.ndjson render an invalid
-    diagnostic instead of raising UnicodeDecodeError / AttributeError."""
-    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
-    (out / USAGE_FILENAME).write_bytes(
-        b'{"schema":"x","label":"phase2b/a","input_tokens":1}\n'
-        b"\xff\xfe{\"garbage\"}\n"
-        b"[1, 2, 3]\n"
-        b'{"schema":"x","label":"phase2b/b","input_tokens":"abc"}\n'
-    )
-    lines = tracker._usage_block_lines(out)
-    text = "\n".join(lines)
-    # Two valid rows survive (the non-object row and garbage are skipped);
-    # the non-numeric token counts as 0.
-    assert "Translation" in text
-    assert "calls" in text
-    assert "2" in text
-
-    # Last-call block also degrades on the malformed-but-valid row.
-    last = tracker._last_call_block_lines(out)
-    assert isinstance(last, list)
-
-
-def test_usage_block_distinguishes_corrupt_vs_absent(tmp_path: Path):
-    """MEDIUM #3: a corrupt usage.ndjson that yields no readable rows is
-    reported as corrupt, while an absent file keeps the 'no usage yet'
-    wording."""
-    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
-    (out / USAGE_FILENAME).write_bytes(b"\xff\xfe not json \x00")
-    lines = tracker._usage_block_lines(out)
-    assert any("corrupt" in l or "no readable rows" in l for l in lines)
-
-
-# ---------------------------------------------------------------------------
-# Regression: malformed scalar schema in Phase readers (HIGH findings)
-# ---------------------------------------------------------------------------
-
-def test_phase_block_scalar_entities_no_crash(tmp_path: Path):
-    """entity_context_cache.json with context.entities as a scalar
-    (e.g. {"entities": 1}) must not raise TypeError on iteration --
-    the monitor degrades gracefully and skips malformed entities."""
-    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
-    _write(out / "entity_context_cache.json",
-           {"entries": [{"context": {"entities": 1}}]})
-    events = tracker._load_events(out)
-    lines = tracker._phase_block_lines(out, events)
-    text = "\n".join(lines)
-    # Scalar entities yields no iterable -> Extraction line absent.
-    assert "Extraction:" not in text
-    assert "Extraction:" not in text
-    assert "Phase" in text
-
-
-def test_phase_block_scalar_chunk_status_no_crash(tmp_path: Path):
-    """r_editor.outcome.chunks with scalar status (e.g. status=42)
-    must not raise AttributeError at .upper() -- the monitor safely
-    skips chunks with non-string status."""
-    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
-    _write(out / "audit_cache_b3.json", {
-        "r_editor": {"outcome": {
-            "chunk_count": 2, "successful_chunks": None,
-            "chunks": [
-                {"status": "GOOD"},
-                {"status": 42},
-                {"status": []},
-            ],
-        }},
-    })
-    events = tracker._load_events(out)
-    lines = tracker._phase_block_lines(out, events)
-    text = "\n".join(lines)
-    # Only the GOOD chunk counts; scalar/non-string statuses are skipped.
-    assert "R_editor: chunks done=1/2" in text
-
+    assert "PID edits committed: 4" in text
 
 def test_phase_block_unhashable_edit_class_no_crash(tmp_path: Path):
     """Incremental r_editor with edit.class as unhashable type (e.g. [])
@@ -1007,60 +1895,3 @@ def test_phase_block_unhashable_edit_class_no_crash(tmp_path: Path):
     # typo=safe, ambiguity=review; unhashable/numeric are skipped.
     assert "safe (\u043f\u0440\u0438\u043c\u0435\u043d\u0435\u043d\u043e)=1" in text
     assert "review (\u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u043e)=1" in text
-
-
-def test_phase_block_scalar_decision_final_repair_no_crash(tmp_path: Path):
-    """Final repair batches with scalar result.decision (e.g. 42)
-    must not raise AttributeError at .lower() -- the monitor safely
-    skips results with non-string decision."""
-    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
-    _write(out / "audit_cache_b3.json", {
-        "repair": {
-            "eligible_count": 3,
-            "batches": [
-                {"findings": 3, "results": [
-                    {"decision": "repair"},
-                    {"decision": 42},
-                    {"decision": []},
-                ]},
-            ],
-            "committed": 1,
-        },
-    })
-    events = tracker._load_events(out)
-    lines = tracker._phase_block_lines(out, events)
-    text = "\n".join(lines)
-    # Only the string "repair" decision counts; scalar/non-string skipped.
-    assert "Repair: batches done=1/1" in text
-    assert "1/3" in text
-
-
-def test_phase_block_scalar_decision_incremental_repair_no_crash(tmp_path: Path):
-    """Incremental stage_progress.repair with scalar result.decision
-    must not raise AttributeError at .lower() -- same guard as final."""
-    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
-    _write(out / "audit_cache_b3.json", {
-        "stage_progress": {
-            "repair": {
-                "status": "partial",
-                "done_batches": [1],
-                "committed": 1,
-                "outcome": {
-                    "batch_count": 2,
-                    "batches": [
-                        {"findings": 2, "results": [
-                            {"decision": "repair"},
-                            {"decision": 99},
-                        ]},
-                    ],
-                },
-            },
-        },
-    })
-    events = tracker._load_events(out)
-    lines = tracker._phase_block_lines(out, events)
-    text = "\n".join(lines)
-    # Only string "repair" decision counts; scalar skipped.
-    assert "Repair: batches done=1/2" in text
-    assert "1/2" in text
-

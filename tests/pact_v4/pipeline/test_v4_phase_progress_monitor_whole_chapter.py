@@ -441,8 +441,8 @@ def test_status_line_whole_chapter_live_generation(tmp_path: Path):
     ])
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "gen")
-    assert line.startswith("[0001] gen")
-    assert "GEN attempt 1/3 (reason: truncated)" in line
+    assert line.startswith("[0001] Whole-chapter translation")
+    assert "Whole-chapter translation attempt 1/3 (reason: truncated)" in line
 
 
 def test_status_line_whole_chapter_audit_and_repair(tmp_path: Path):
@@ -461,8 +461,8 @@ def test_status_line_whole_chapter_audit_and_repair(tmp_path: Path):
     ])
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "step7")
-    assert "[0001] step7" in line
-    assert "AUDIT chunk 5/8" in line
+    assert "[0001] Selective repair" in line
+    assert "Chapter audit chunk 5/8" in line
     assert "committed=1" in line and "debt=1" in line
 
 
@@ -477,7 +477,7 @@ def test_status_line_whole_chapter_done_with_validation(tmp_path: Path):
     events = tracker._load_events(out)
     line = tracker._status_line(out, events, "done")
     assert line.endswith("DONE (complete)")
-    assert "GEN attempt 1/3 done finish_reason=complete" in line
+    assert "Whole-chapter translation attempt 1/3 done finish_reason=complete" in line
 
 
 def test_status_line_chunked_mode_backward_compat(tmp_path: Path):
@@ -502,7 +502,7 @@ def test_status_line_chunked_mode_backward_compat(tmp_path: Path):
     phase, _ = tracker._detect_phase(out, events)
     assert phase == "step7"
     line = tracker._status_line(out, events, phase)
-    assert "REPAIR regions done=1 committed=1 debt=0" in line
+    assert "Selective repair regions done=1 committed=1 debt=0" in line
 
 
 # ---------------------------------------------------------------------------
@@ -523,11 +523,11 @@ def test_render_report_whole_chapter_shows_generation_and_validation(tmp_path: P
         _b3_event("audit_chunk_done", 440, chunk=5, total=8, status="ok"),
     ])
     report = tracker.render_report(out)
-    assert "status: [0001] step6" in report
-    assert "GEN attempt 1/3 done finish_reason=complete" in report
-    assert "AUDIT chunk 5/8" in report
+    assert "status: [0001] Chapter audit" in report
+    assert "Whole-chapter translation attempt 1/3 done finish_reason=complete" in report
+    assert "Chapter audit chunk 5/8" in report
     assert "PID validation: json_ok=True pids_ok=True order_ok=True" in report
-    assert "Step 8: not started" in report
+    assert "Formatting: not applicable (whole-chapter)" in report
 
 
 def test_render_report_whole_chapter_final_done(tmp_path: Path):
@@ -565,7 +565,7 @@ def test_render_report_whole_chapter_incomplete_validation_flags(tmp_path: Path)
     report = tracker.render_report(out)
     assert "PID validation: json_ok=True pids_ok=False order_ok=False" in report
     assert "incomplete_generation" in report
-    assert "GEN attempt 3/3 done finish_reason=incomplete" in report
+    assert "Whole-chapter translation attempt 3/3 done finish_reason=incomplete" in report
 
 
 def test_render_report_whole_chapter_is_read_only(tmp_path: Path):
@@ -629,7 +629,7 @@ def test_render_report_b3_journal_without_audit_chunk_events(tmp_path: Path):
     assert row["repair"] == "not_started"
 
     report = tracker.render_report(out)
-    assert "GEN attempt 1/3 done finish_reason=complete" in report
+    assert "Whole-chapter translation attempt 1/3 done finish_reason=complete" in report
     assert "B3 audit started" in report
     assert "not_started" in report
 
@@ -659,7 +659,7 @@ def test_monitor_audit_chunk_done_without_started_no_crash(tmp_path: Path):
     assert "done=1/8" in row["audit_basis"]
 
     report = tracker.render_report(out)
-    assert "AUDIT chunk 1/8" in report
+    assert "Chapter audit chunk 1/8" in report
 
 
 # ---------------------------------------------------------------------------
@@ -676,4 +676,4 @@ def test_chapters_table_whole_chapter_gen_status(tmp_path: Path):
     ])
     report = tracker.render_book_report(base)
     assert "-- chapters (1)" in report
-    assert "gen 3/3" in report or "gen 2/3" in report
+    assert "Whole-chapter translation 3/3" in report or "Whole-chapter translation 2/3" in report
