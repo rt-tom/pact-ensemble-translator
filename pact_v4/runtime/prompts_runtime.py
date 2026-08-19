@@ -602,7 +602,7 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 # back losing the meaning).
 REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
     role="selective_repair",
-    version="pact-v4-repair-as-verifier/v4",
+    version="pact-v4-repair-as-verifier/v5",
     instructions=(
         "You are a Russian-language repair editor for an English-to-Russian "
         "literary translation. You are given the SOURCE (PID -> English text) "
@@ -667,6 +667,13 @@ REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
         "the grammatical attachment of all surrounding clauses. Do not "
         "reassign a modifier or action to another entity unless SOURCE "
         "explicitly supports it.\n"
+        "\n"
+        "DIALOGUE MARKER RULE: if the original Russian TRANSLATION PID starts "
+        "with «—» (em-dash dialogue marker), the repaired_translation MUST "
+        "preserve the initial «—» and the dialogue-paragraph structure "
+        "(dash + text, not quoted speech). This rule applies unless the finding "
+        "explicitly requires a structural rewrite of the dialogue format. Do NOT "
+        "convert dash-led dialogue into quoted speech or strip the leading «—».\n"
         "\n"
         "CRITICAL: repaired_translation MUST be the FULL corrected text of "
         "the entire PID — every sentence of the paragraph, with ONLY the "
@@ -1159,6 +1166,7 @@ def render_selective_repair_prompt(
     template: ReviewerPrompt = REPAIR_AS_VERIFIER_V1,
     repair_context_window: int = DEFAULT_REPAIR_CONTEXT_WINDOW,
     repair_context_window_by_category: Optional[Mapping[str, int]] = None,
+    glossary: Sequence[Any] = (),
 ) -> str:
     """Render a B2 selective-repair batch request as one user message.
 
@@ -1230,6 +1238,30 @@ def render_selective_repair_prompt(
             f"{', '.join(context_pids)} — for resolving speakers, referents, "
             "ellipsis, continuity).\nNEVER propose an edit for a CONTEXT_ONLY pid."
         )
+    # GLOSSARY-REPAIR (t_2ef6563e): compact relevant glossary context for
+    # the repair model. Only pairs whose source term appears in the local
+    # source text (findings + neighbours) are included — the model sees
+    # only the terminology that matters for the repair scope.
+    glossary_block = ""
+    if glossary:
+        local_src = "\n".join(source.get(pid, "") for pid in local_pids)
+        from pact_v4.phase2.risk import _all_targets_lowercase, _term_present
+        relevant_pairs: list[str] = []
+        for entry in glossary:
+            src = getattr(entry, "source_term", "")
+            targets = getattr(entry, "target_terms", ())
+            if not src or not targets:
+                continue
+            force_ci = _all_targets_lowercase(targets)
+            if _term_present(local_src, src.strip(), force_case_insensitive=force_ci):
+                target_str = ", ".join(t.strip() for t in targets)
+                relevant_pairs.append(f"  {src.strip()} -> {target_str}")
+        if relevant_pairs:
+            glossary_block = (
+                "\n\nRELEVANT GLOSSARY / LOCKED TERMINOLOGY:\n"
+                + "\n".join(relevant_pairs) + "\n"
+                "\nUse these canonical term pairs when repairing.\n"
+            )
     # The instructions label findings [CONFIRMED] (Tier A) / [CANDIDATE]
     # (Tier B); the FINDINGS block uses the same labels so the model can
     # apply the right per-finding contract. CANDIDATE-MERGE (t_0ffe56e1):
@@ -1245,7 +1277,7 @@ def render_selective_repair_prompt(
         f"CHUNK: {chapter_id}\n\n"
         f"SOURCE (PID -> English text):\n{src_lines}\n\n"
         f"TRANSLATION (PID -> Russian text, same PIDs in the same order):\n{tr_lines}\n"
-        f"{ctx_block}\n\n"
+        f"{ctx_block}{glossary_block}\n\n"
         f"FINDINGS (verify, then repair only confirmed issues):\n{finding_lines}\n"
     )
 

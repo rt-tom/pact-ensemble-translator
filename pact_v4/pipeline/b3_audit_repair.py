@@ -3318,6 +3318,7 @@ class B3AuditRepair:
         snapshot_hash: str,
         translation: Mapping[str, str],
         book_memory: Mapping[str, Any],
+        glossary: Sequence[Any] = (),
         out_dir: Path,
         config_identity: str,
         backend_identity_hash: str,
@@ -3332,6 +3333,7 @@ class B3AuditRepair:
                 snapshot_hash=snapshot_hash,
                 translation=translation,
                 book_memory=book_memory,
+                glossary=glossary,
                 out_dir=out_dir,
                 config_identity=config_identity,
                 backend_identity_hash=backend_identity_hash,
@@ -3589,6 +3591,7 @@ class B3AuditRepair:
         snapshot_hash: str,
         translation: Mapping[str, str],
         book_memory: Mapping[str, Any],
+        glossary: Sequence[Any] = (),
         out_dir: Path,
         config_identity: str,
         backend_identity_hash: str,
@@ -4385,6 +4388,7 @@ class B3AuditRepair:
                 filtered=filtered,
                 entity_context=entity_context,
                 narrator_context=narrator_context,
+                glossary=glossary,
                 # V4.2 R: REVIEW-classed Russian-editor candidates are
                 # additional verify-before-repair input — the verifier
                 # accepts/rejects each against the ORIGINAL; accepted ones

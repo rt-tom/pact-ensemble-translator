@@ -36,6 +36,7 @@ Design rules (konspekt §8.3 + B1.1 review, PROPOSAL reply §1.2/§1.4/§1.5):
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -54,6 +55,7 @@ from pact_v4.runtime.json_resilience import (
     EmptyResponseError,
     JsonRetryPolicy,
     TruncatedJSONError,
+    _strip_markdown_fences,
     parse_json_response,
     retry_json_call,
 )
@@ -101,9 +103,11 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "PID map (PID -> English text). Extract persistent long-range "
         "entities and per-claim facts about them that the source itself "
         "establishes. Return STRICT JSON, no markdown fences, no commentary, "
-        "with exactly this schema. The response body is ONLY the top-level "
-        "entities array — do not add schema, extractor_version, chapter_id, "
-        "or source_hash; the harness stamps these from the actual chapter. "
+        "with exactly this schema. The response MUST be a single JSON object "
+        "with a top-level \"entities\" key — do NOT return a bare JSON array "
+        "(e.g. [{...}] is wrong; {\"entities\": [...]} is correct). Do not "
+        "add schema, extractor_version, chapter_id, or source_hash; the "
+        "harness stamps these from the actual chapter. "
         "Schema:\n"
         "  entities: array of objects, each with:\n"
         "    entity: short canonical display name for the entity\n"
@@ -358,6 +362,37 @@ def render_entity_extraction_prompt(
 # Model-output parsing
 # ---------------------------------------------------------------------------
 
+def _normalize_bare_array(raw_list: list) -> Dict[str, Any]:
+    """Entity-specific boundary: recover a bare JSON array → ``{"entities": list}``.
+
+    The prompt requires a JSON object with a top-level ``entities`` key, but
+    models occasionally return a bare array instead.  This helper is the ONLY
+    place such recovery is attempted — it is strictly gated:
+
+    * The list must be non-empty.
+    * Every element must be a JSON object (dict).
+    * No element may be a scalar, null, or non-object container.
+
+    On success the list is wrapped as ``{"entities": list}`` and a diagnostic
+    is logged.  On failure a ``ValueError`` is raised — the caller must NOT
+    silently accept malformed payloads.
+    """
+    if not raw_list:
+        raise ValueError(
+            "bare JSON array is empty — cannot normalize to entity object"
+        )
+    for idx, item in enumerate(raw_list):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"bare JSON array element {idx} is not an object: "
+                f"{type(item).__name__} — not a recoverable entity payload"
+            )
+    LOG.info(
+        "entity_extractor: bare JSON array (%d items) normalized to "
+        "{\"entities\": ...} object", len(raw_list),
+    )
+    return {"entities": raw_list}
+
 
 def parse_model_output(raw: str) -> Dict[str, Any]:
     """Parse the Qwen extraction response into a payload dict.
@@ -368,6 +403,12 @@ def parse_model_output(raw: str) -> Dict[str, Any]:
     raises ``ValueError`` — never a silent accept. RESILIENCE
     (t_406fc48c): fences / BOM / prose are stripped by the shared
     ``parse_json_response`` utility.
+
+    ENTITY-SPECIFIC NORMALIZATION (t_83bab286): when the model returns a
+    bare JSON array of objects, this is a recoverable variant — the list
+    is wrapped as ``{"entities": list}`` with a diagnostic log.  Non-object
+    elements, empty lists, scalars, and malformed payloads are NOT
+    recovered and raise ``ValueError``.
     """
     if not raw.strip():
         raise EmptyResponseError(
@@ -376,11 +417,23 @@ def parse_model_output(raw: str) -> Dict[str, Any]:
     try:
         payload = parse_json_response(raw)
     except ValueError as exc:
-        # parse_json_response already raises the retryable classes for
-        # empty/truncated bodies; only re-wrap the wrong-shape case with
-        # extraction-specific wording.
+        # parse_json_response raises ValueError for valid JSON that is not
+        # a dict (e.g. a bare list).  Attempt entity-specific normalization
+        # before giving up — re-parse with fence-stripping to detect bare
+        # arrays without depending on json_resilience internals.
         if isinstance(exc, (EmptyResponseError, TruncatedJSONError)):
             raise
+        try:
+            cleaned = _strip_markdown_fences(
+                raw.strip().lstrip("\ufeff")
+            )
+            parsed_value = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError(
+                f"entity-extraction payload must be a JSON object: {exc}"
+            ) from exc
+        if isinstance(parsed_value, list):
+            return _normalize_bare_array(parsed_value)
         raise ValueError(
             f"entity-extraction payload must be a JSON object: {exc}"
         ) from exc

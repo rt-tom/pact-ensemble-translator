@@ -1684,3 +1684,214 @@ def test_canonical_names_consistent_all_blocks(tmp_path: Path):
     assert "Step 6" not in report
     assert "Step 7" not in report
     assert "Entity ext." not in report
+
+
+# ----------------------------------------------------------------
+# Repair scalar-schema regression coverage (merged from fix/repair-prompt-...)
+# ----------------------------------------------------------------
+
+def test_phase_block_scalar_chunk_status_no_crash(tmp_path: Path):
+    """r_editor.outcome.chunks with scalar status (e.g. status=42)
+    must not raise AttributeError at .upper() -- the monitor safely
+    skips chunks with non-string status."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {
+            "chunk_count": 2, "successful_chunks": None,
+            "chunks": [
+                {"status": "GOOD"},
+                {"status": 42},
+                {"status": []},
+            ],
+        }},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Scalar/non-string statuses must not crash; the monitor does NOT
+    # fabricate a done count from chunk statuses (no GOOD-chunk inference,
+    # MONITOR-V2 strict successful_chunks contract).
+    assert "chunks done=" not in text
+    assert "R-editor:" not in text
+
+def test_phase_block_scalar_context_no_crash(tmp_path: Path):
+    """entity_context_cache.json with context as a string (not a dict)
+    must not raise AttributeError -- Extraction line degrades gracefully."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json",
+           {"entries": [{"context": "bad"}]})
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Extraction with scalar context yields no entities -> line absent.
+    assert "Extraction:" not in text
+    assert "-- Phase --" in text
+
+def test_phase_block_scalar_decision_final_repair_no_crash(tmp_path: Path):
+    """Final repair batches with scalar result.decision (e.g. 42)
+    must not raise AttributeError at .lower() -- the monitor safely
+    skips results with non-string decision."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 3,
+            "batches": [
+                {"findings": 3, "results": [
+                    {"decision": "repair"},
+                    {"decision": 42},
+                    {"decision": []},
+                ]},
+            ],
+            "committed": 1,
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Only the string "repair" decision counts; scalar/non-string skipped.
+    assert "Selective repair: batches done=1/1" in text
+    assert "1/3" in text
+
+def test_phase_block_scalar_decision_incremental_repair_no_crash(tmp_path: Path):
+    """Incremental stage_progress.repair with scalar result.decision
+    must not raise AttributeError at .lower() -- same guard as final."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "repair": {
+                "status": "partial",
+                "done_batches": [1],
+                "committed": 1,
+                "outcome": {
+                    "batch_count": 2,
+                    "batches": [
+                        {"findings": 2, "results": [
+                            {"decision": "repair"},
+                            {"decision": 99},
+                        ]},
+                    ],
+                },
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Only string "repair" decision counts; scalar skipped.
+    assert "Selective repair: batches done=1/2" in text
+    assert "1/2" in text
+
+def test_phase_block_scalar_entities_no_crash(tmp_path: Path):
+    """entity_context_cache.json with context.entities as a scalar
+    (e.g. {"entities": 1}) must not raise TypeError on iteration --
+    the monitor degrades gracefully and skips malformed entities."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "entity_context_cache.json",
+           {"entries": [{"context": {"entities": 1}}]})
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # Scalar entities yields no iterable -> Extraction line absent.
+    assert "Extraction:" not in text
+    assert "Extraction:" not in text
+    assert "Phase" in text
+
+def test_phase_block_scalar_r_editor_applied_candidates(tmp_path: Path):
+    """r_editor.outcome.applied/candidates as scalar ints must not raise
+    TypeError at len() -- the monitor renders scalar as a count."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "r_editor": {"outcome": {
+            "chunk_count": 2, "successful_chunks": 2,
+            "applied": 4, "candidates": 1,
+        }},
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "R-editor: chunks done=2/2" in text
+    assert "safe (применено)=4" in text
+    assert "review (предложено)=1" in text
+
+def test_phase_block_scalar_repair_findings_results_committed(tmp_path: Path):
+    """repair.batches[].findings as scalar int, results as scalar int,
+    and repair.committed as scalar int must not raise TypeError at
+    len() or iteration -- the monitor renders scalar as a count."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "repair": {
+            "eligible_count": 4,
+            "batches": [
+                {"findings": 4, "results": []},
+                {"findings": [1, 2, 3], "results": 4},
+            ],
+            "committed": 4,
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "Selective repair: batches done=2/2" in text
+    # Scalar findings=4 renders as count; results=[] yields repaired=0.
+    assert "0/4" in text
+    # Scalar results=4 yields repaired=0 (not iterable).
+    assert "0/3" in text
+    assert "PID edits committed: 4" in text
+
+def test_phase_block_scalar_repair_in_incremental_cache(tmp_path: Path):
+    """Incremental stage_progress.repair with scalar findings/results/
+    committed must not raise TypeError -- same guard as final cache."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "repair": {
+                "status": "partial",
+                "done_batches": [1, 2],
+                "committed": 4,
+                "outcome": {
+                    "batch_count": 3,
+                    "batches": [
+                        {"findings": 2, "results": []},
+                        {"findings": [1], "results": 3},
+                    ],
+                },
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    assert "Selective repair: batches done=2/3" in text
+    assert "0/2" in text
+    assert "0/1" in text
+    assert "PID edits committed: 4" in text
+
+def test_phase_block_unhashable_edit_class_no_crash(tmp_path: Path):
+    """Incremental r_editor with edit.class as unhashable type (e.g. [])
+    must not raise TypeError during set membership -- the monitor
+    safely skips edits with non-string class."""
+    out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write(out / "audit_cache_b3.json", {
+        "stage_progress": {
+            "r_editor": {
+                "status": "partial",
+                "done_chunks": [1],
+                "outcome": {
+                    "chunks": [
+                        {"edits": [
+                            {"class": "typo"},
+                            {"class": []},
+                            {"class": 42},
+                            {"class": "ambiguity"},
+                        ]},
+                    ],
+                },
+            },
+        },
+    })
+    events = tracker._load_events(out)
+    lines = tracker._phase_block_lines(out, events)
+    text = "\n".join(lines)
+    # typo=safe, ambiguity=review; unhashable/numeric are skipped.
+    assert "safe (\u043f\u0440\u0438\u043c\u0435\u043d\u0435\u043d\u043e)=1" in text
+    assert "review (\u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u043e)=1" in text
