@@ -49,7 +49,7 @@ providers:
       # reasoningEffort variants verified 2026-08-18 via `opencode models
       # opencode-go --verbose`.
       muse:
-        ref: opencode-go/muse-spark-1.2
+        ref: opencode-go/muse-spark-1.2-contributor
         reasoning_contract:
           variants: [minimal, low, medium, high, xhigh]
   openai:
