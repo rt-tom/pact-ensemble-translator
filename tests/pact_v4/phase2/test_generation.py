@@ -888,10 +888,11 @@ def test_prompt_instructions_reference_the_section_that_is_actually_rendered():
 
     for template in (FIDELITY_FIRST_V1, BALANCED_LITERARY_V4):
         assert "OWNED_PIDS" not in template.instructions
-    # v1/v2 templates name the block explicitly; the v3 literary template
-    # refers to the same rendered section as "the SOURCE map".
+    # Both templates must name the block the renderer actually emits.
+    # After the JSON-contract clarification (v3/v5) the literary template
+    # also names OWNED_SOURCE explicitly.
     assert "OWNED_SOURCE" in FIDELITY_FIRST_V1.instructions
-    assert "SOURCE map" in BALANCED_LITERARY_V4.instructions
+    assert "OWNED_SOURCE" in BALANCED_LITERARY_V4.instructions
 
     for bundle in generator.calls:
         rendered = render_prompt(bundle)
