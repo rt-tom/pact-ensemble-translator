@@ -52,6 +52,14 @@ providers:
         ref: opencode-go/muse-spark-1.2-contributor
         reasoning_contract:
           variants: [minimal, low, medium, high, xhigh]
+      # Muse Spark 1.2 Contributor Free (added 2026-08-20, owner). CLI alias
+      # musefree. Same muse family/reasoning variants as muse. Provider is
+      # "opencode" (NOT opencode-go) per owner-specified exact ref
+      # opencode/muse-spark-1.2-contributor-free.
+      musefree:
+        ref: opencode/muse-spark-1.2-contributor-free
+        reasoning_contract:
+          variants: [minimal, low, medium, high, xhigh]
   openai:
     kind: opencode_server
     models:
