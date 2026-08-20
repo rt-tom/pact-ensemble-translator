@@ -53,16 +53,29 @@ _OWNERSHIP_GUARD = (
     "translate, return, echo, or paraphrase any PID that appears only in "
     "left_context or right_context — those are read-only context and are not "
     "part of your output. "
-    "Return STRICT JSON: an object mapping each PID from OWNED_SOURCE to its "
-    "Russian translation, with keys in exactly the same order as "
-    "OWNED_SOURCE, no missing keys, no extra keys, no duplicate keys, and no "
-    "keys outside OWNED_SOURCE. Do not wrap the JSON in markdown fences or "
-    "add commentary."
+    "OWNED_SOURCE is an input list/map shown as lines \"PID: English text\" "
+    "in source order; it is not an output format — do not reproduce its lines "
+    "or its \"PID: text\" layout in your output. "
+    "Return exactly one top-level JSON object and nothing else. The object maps "
+    "each PID from OWNED_SOURCE to its Russian translation as a string value. "
+    "Do not return an array, do not wrap the object in any outer key such as "
+    "\"translations\", \"items\", \"paragraphs\" or \"data\", do not use pid/text "
+    "records like {\"pid\": \"...\", \"text\": \"...\"} or "
+    "{\"id\": \"...\", \"translation\": \"...\"}, and do not nest the translations "
+    "inside another object or array. Every top-level value must be a Russian "
+    "string. Keys must be exactly the PIDs that appear in OWNED_SOURCE — no "
+    "missing keys, no extra keys, no duplicate keys, no keys outside "
+    "OWNED_SOURCE — in exactly the same order as OWNED_SOURCE. Do not wrap the "
+    "JSON in markdown fences (```) and do not add commentary, explanation, or "
+    "extra text before or after the JSON. Shape example (illustrative only — do "
+    "not output these placeholder PIDs or texts; use only the actual "
+    "OWNED_SOURCE PIDs and your translations): "
+    "{\"p00001\": \"Русский перевод...\", \"p00002\": \"Русский перевод...\"}"
 )
 
 FIDELITY_FIRST_V1 = PromptTemplate(
     role="fidelity_first",
-    version="pact-v4-prompt-fidelity-first/v2",
+    version="pact-v4-prompt-fidelity-first/v3",
     instructions=(
         "You are translating English fiction into Russian with maximum "
         "fidelity to the source: preserve meaning, register, negation scope, "
@@ -75,7 +88,7 @@ FIDELITY_FIRST_V1 = PromptTemplate(
 
 BALANCED_LITERARY_V4 = PromptTemplate(
     role="balanced_literary",
-    version="pact-v4-prompt-balanced-literary/v4",
+    version="pact-v4-prompt-balanced-literary/v5",
     instructions=(
         "You are a professional literary translator rendering an English fiction\n"
         "chapter into natural, polished Russian. You have already read the whole\n"
@@ -113,10 +126,24 @@ BALANCED_LITERARY_V4 = PromptTemplate(
         "twelve\" = 00:02 -> \"две минуты первого\").\n\n"
         "Do not omit, summarize, or add anything. Do not output any HTML or\n"
         "markup — plain Russian text only.\n\n"
-        "Return STRICT JSON: an object mapping every PID from the SOURCE map to\n"
-        "its Russian translation, keys in exactly the same order as the source,\n"
-        "no missing keys, no extra keys, no duplicate keys. Do not wrap the JSON\n"
-        "in markdown fences or add commentary."
+        "Output contract (authoritative — this restates and tightens the JSON "
+        "rule above, it does not replace it): return exactly one top-level JSON "
+        "object and nothing else. The object maps each PID from OWNED_SOURCE to "
+        "its Russian translation as a string value. Do not return an array, do "
+        "not wrap the object in any outer key such as \"translations\", \"items\", "
+        "\"paragraphs\" or \"data\", do not use pid/text records like "
+        "{\"pid\": \"...\", \"text\": \"...\"} or "
+        "{\"id\": \"...\", \"translation\": \"...\"}, and do not nest the translations "
+        "inside another object or array. Every top-level value must be a Russian "
+        "string. Keys must be exactly the PIDs from OWNED_SOURCE — no missing "
+        "keys, no extra keys, no duplicate keys, no keys outside OWNED_SOURCE — "
+        "in exactly the same order as OWNED_SOURCE. OWNED_SOURCE is an input "
+        "list/map shown as lines \"PID: English text\"; it is not an output format. "
+        "Do not wrap the JSON in markdown fences (```) and do not add commentary, "
+        "explanation, or extra text before or after the JSON. Shape example "
+        "(illustrative only — do not output these placeholder PIDs or texts; use "
+        "only the actual OWNED_SOURCE PIDs and your translations): "
+        "{\"p00001\": \"Русский перевод...\", \"p00002\": \"Русский перевод...\"}"
     ),
 )
 
