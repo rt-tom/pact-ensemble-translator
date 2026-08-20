@@ -317,6 +317,10 @@ def test_omit_system_tools_drops_system_and_tools_from_body():
     assert "system" not in body
     assert "tools" not in body
     assert body["model"] == {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"}
+    # Output-budget fix (2026-08-20): explicit budget is forwarded so the
+    # relay does not apply its ~32k default to long whole-chapter runs.
+    assert body["max_completion_tokens"] == 8192
+    assert body["max_tokens"] == 8192
     assert body["parts"] == [{"type": "text", "text": "Translate: Hello."}]
 
 
