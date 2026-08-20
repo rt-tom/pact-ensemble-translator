@@ -868,6 +868,18 @@ class OpenCodeServerBackend:
             body["agent"] = self._cfg.agent
         if self._cfg.tools_disabled and not request.omit_system_tools:
             body["tools"] = {tool_id: False for tool_id in self._tool_ids}
+        # Output-budget fix (2026-08-20): pass the request's explicit token
+        # budget to the relay so it does not apply its upstream default
+        # (~32k), which truncated long whole-chapter generations at exactly
+        # 32000 (finish=length) while the model itself (e.g. Muse) can emit
+        # 49k+ tokens. Direct probe (owner 2026-08-20) confirmed Muse returns
+        # 49k / finish=stop with no program limit, and ~32000 / finish=length
+        # once the relay's default was hit. Both ``max_completion_tokens``
+        # (OpenAI-style) and the legacy ``max_tokens`` are sent so either
+        # server generation honours it. ``max_output_tokens`` is always > 0
+        # (GenerationConfig default 70000; audit/repair carry their own).
+        body["max_completion_tokens"] = int(request.max_output_tokens)
+        body["max_tokens"] = int(request.max_output_tokens)
         if self._cfg.structured_output_mode == "json_schema" and request.response_schema is not None:
             body["format"] = {
                 "type": "json_schema",
