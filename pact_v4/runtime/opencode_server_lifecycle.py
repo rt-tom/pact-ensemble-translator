@@ -239,6 +239,14 @@ class OpenCodeServerProcess:
         env = dict(os.environ)
         env["OPENCODE_SERVER_USERNAME"] = username
         env["OPENCODE_SERVER_PASSWORD"] = password
+        # WORKAROUND (2026-08-21, owner): opencode serve (v1) hard-caps the
+        # model output at ~32k tokens (32768), silently ignoring our
+        # max_completion_tokens. Whole-chapter generations (e.g. Muse) were
+        # truncated at exactly 32000 total tokens (finish=length). The
+        # official escape hatch is this experimental env var; verified on
+        # chapter 0026: generation then reached 41514 tokens with
+        # finish=stop. Raised to 1MiB so even the longest chapter fits.
+        env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = "1048576"
 
         stdout_path: Optional[Path] = None
         stderr_path: Optional[Path] = None
