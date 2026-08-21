@@ -60,6 +60,21 @@ providers:
         ref: opencode/muse-spark-1.2-contributor-free
         reasoning_contract:
           variants: [minimal, low, medium, high, xhigh]
+      # Hy3 Free (added 2026-08-21, owner). CLI alias hy3free. Provider is
+      # "opencode" (NOT opencode-go) per owner-specified exact ref
+      # opencode/hy3-free. Catalog: limit.output 64000, reasoning true,
+      # variants [low, medium, high].
+      hy3free:
+        ref: opencode/hy3-free
+        reasoning_contract:
+          variants: [low, medium, high]
+      # Ox Alpha Free (added 2026-08-21, owner). CLI alias oxfree.
+      # Exact ref opencode-go/ox-alpha-free. Catalog: limit.output 131072,
+      # reasoning true, variants [low, high, max].
+      oxfree:
+        ref: opencode-go/ox-alpha-free
+        reasoning_contract:
+          variants: [low, high, max]
   openai:
     kind: opencode_server
     models:
