@@ -931,43 +931,65 @@ class BackendRegionFidelityGate:
         verdict is directly comparable to a narrow one on a fixture. A
         transport failure yields one failing ``GateResult`` per region
         (debt, never a semantic verdict), mirroring the single-region path.
+
+        v41-runtime-efficiency 3.1: per-region tokens are 4096; the batch
+        ceiling is ``MAX_TOKENS_CEILING`` (24576) so large batches are
+        chunked into ``ceiling//4096``-sized groups and the output budget
+        is ``min(ceiling, 4096*len)``. Chunk count is deterministic from
+        ``MAX_TOKENS_CEILING``.
         """
-        prompt = render_region_fidelity_gate_batch_prompt(
-            items=[dict(item) for item in items],
-            template=self._config.batch_template,
-        )
-        request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("fidelity_reviewer", "qwen_fidelity")
-            ),
-            messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens * max(1, len(items)),
-            temperature=0.0,
-            response_schema=JSON_OBJECT_SCHEMA,
-            label=self._config.label,
-        )
+        if not items:
+            return ()
+        # v41 3.1: batch ceiling and chunking — deterministic, resumption-safe.
+        per_item_tokens = self._max_tokens if self._max_tokens else 4096
+        # Fixed 4096 as the spec's per-item unit; ceiling//4096 is the max batch size.
+        max_batch = max(1, MAX_TOKENS_CEILING // 4096)
+        # Also respect per_item_tokens if config differs: effective max batch by ceiling.
+        alt_max = max(1, MAX_TOKENS_CEILING // per_item_tokens) if per_item_tokens else max_batch
+        chunk_size = min(max_batch, alt_max)
+        results: List[GateResult] = []
+        for start in range(0, len(items), chunk_size):
+            chunk = list(items[start:start + chunk_size])
+            prompt = render_region_fidelity_gate_batch_prompt(
+                items=[dict(item) for item in chunk],
+                template=self._config.batch_template,
+            )
+            max_tokens = min(MAX_TOKENS_CEILING, per_item_tokens * max(1, len(chunk)))
+            request = CompletionRequest(
+                model_ref=_model_ref_for(
+                    self._backend, ("fidelity_reviewer", "qwen_fidelity")
+                ),
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tokens,
+                temperature=0.0,
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=self._config.label,
+            )
 
-        def _complete() -> str:
+            def _complete(req: CompletionRequest = request) -> str:  # type: ignore[no-redef]
+                try:
+                    return self._backend.complete(req).text
+                except CompletionError as exc:
+                    LOG.error("BackendRegionFidelityGate.batch: backend failure: %s", exc)
+                    raise
+
             try:
-                return self._backend.complete(request).text
-            except CompletionError as exc:
-                LOG.error("BackendRegionFidelityGate.batch: backend failure: %s", exc)
-                raise
-
-        try:
-            raw = retry_json_call(
-                _complete, self._config.retry, label=self._config.label,
-            )
-        except CompletionError as exc:
-            return tuple(
-                GateResult(
-                    gate="qwen_fidelity",
-                    passed=False,
-                    detail=f"qwen_fidelity: API failure: {exc}",
+                raw = retry_json_call(
+                    _complete, self._config.retry, label=self._config.label,
                 )
-                for _ in items
-            )
-        return _parse_qwen_verdicts(raw, count=len(items))
+            except CompletionError as exc:
+                chunk_results = tuple(
+                    GateResult(
+                        gate="qwen_fidelity",
+                        passed=False,
+                        detail=f"qwen_fidelity: API failure: {exc}",
+                    )
+                    for _ in chunk
+                )
+                results.extend(chunk_results)
+                continue
+            results.extend(list(_parse_qwen_verdicts(raw, count=len(chunk))))
+        return tuple(results)
 
 
 __all__ = [

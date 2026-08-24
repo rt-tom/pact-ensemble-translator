@@ -1183,16 +1183,15 @@ class OpenCodeServerBackend:
             self._cfg, observed_server_version=self._server_version
         )
 
-    def complete(self, request: CompletionRequest) -> CompletionResponse:
+    # v41-runtime-efficiency 4.1: complete() split into four steps for
+    # testability while preserving exact retry/session/logging behavior.
+    def _ensure_session(self, request: CompletionRequest) -> Tuple[str, str]:
+        """Admission checks + preflight; return (provider_id, model_id)."""
         if self._closed:
             raise CompletionError(
                 "OpenCodeServerBackend: backend is closed; cannot complete a request"
             )
         if request.request_options:
-            # The verified server lines have no per-request sampling fields
-            # except the top-level ``reasoningEffort`` (V4.1, transported via
-            # request_options key "reasoning"); silently dropping any other
-            # option would change behaviour without being honest (plan §5.1).
             unsupported = set(request.request_options) - {"reasoning"}
             if unsupported:
                 raise OpenCodeError(
@@ -1201,21 +1200,12 @@ class OpenCodeServerBackend:
                     f"{OPENCODE_SERVER_TRANSPORT_VERSION} (got {sorted(request.request_options)})",
                 )
         if self._cfg.structured_output_mode == "json_schema" and request.response_schema is None:
-            # json_schema mode without a schema would silently ignore a
-            # server-returned ``info.structured``; fail loudly instead.
             raise OpenCodeError(
                 ERROR_REQUEST_NOT_SUPPORTED,
                 "OpenCodeServerBackend: json_schema mode requires a response_schema",
             )
         self.preflight()
-
         provider_id, model_id = _parse_model_ref(request.model_ref)
-
-        # The request's model must be one of the role->model bindings this
-        # backend was configured with (like LocalOpenAIBackend rejects a
-        # model_ref that is not the model it actually serves). A request
-        # outside the bindings fails loudly instead of being routed
-        # somewhere unexpected.
         bound_models = set(self._cfg.model_bindings.values())
         if bound_models and request.model_ref not in bound_models:
             raise OpenCodeError(
@@ -1224,27 +1214,57 @@ class OpenCodeServerBackend:
                 f"bound for any role (bindings: {sorted(bound_models)})",
             )
         self._check_provider_model(provider_id, model_id)
+        return provider_id, model_id
 
-        started = time.perf_counter()
+    def _normalize(self, info: Mapping[str, Any], parts: Sequence[Mapping[str, Any]], request: CompletionRequest) -> Tuple[str, str, Any]:
+        """Extract text/reasoning/structured and deliver reasoning sink (best-effort)."""
+        text = self._extract_text(parts)
+        reasoning = self._extract_reasoning(parts)
+        if request.on_reasoning_chunk is not None and reasoning:
+            try:
+                request.on_reasoning_chunk(reasoning)
+            except Exception:  # noqa: BLE001
+                LOG.warning(
+                    "OpenCodeServerBackend: on_reasoning_chunk callback "
+                    "raised; reasoning delivery is best-effort",
+                    exc_info=True,
+                )
+        structured = info.get("structured")
+        if self._cfg.structured_output_mode == "json_schema" and structured is not None:
+            text = _canonical_structured_text(structured)
+        return text, reasoning, structured
+
+    def _record_cost(self, info: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Normalize usage and accumulate reported cost; return usage dict."""
+        usage = _normalize_usage(info)
+        self._accumulate_reported_cost(info)
+        return usage
+
+    def _retry_loop(
+        self,
+        request: CompletionRequest,
+        provider_id: str,
+        model_id: str,
+        started: float,
+        attempt_log: list,
+        max_transport_attempts: int,
+        max_structured_attempts: int,
+    ) -> Tuple[Mapping[str, Any], Sequence[Mapping[str, Any]], int, str, int, int]:
+        """Core retry loop for one completion; returns (info, parts, status, session_id, transport_attempts, structured_attempts).
+
+        Mirrors the pre-v41 complete() while loop: session creation,
+        message POST, message-level error mapping, transport/structured
+        retries with backoff and budget checks. On success returns the
+        successful attempt; on terminal failure it raises via
+        _raise_final/_raise_budget_exhausted (never returns).
+        """
         transport_attempts = 0
-        max_transport_attempts = self._cfg.http_retries + 1
         structured_attempts = 0
-        max_structured_attempts = self._cfg.structured_output_retry_count + 1
-        attempt_log: list[dict] = []
-
         while True:
             try:
                 session_id = self._create_session(request.label)
             except OpenCodeError as exc:
-                # Session creation (POST /session) or request-budget
-                # admission failed after a successful preflight. This is a
-                # failed remote completion call and must be journaled exactly
-                # once (D1 acceptance §1). No session/request id exists yet,
-                # so the record carries only the real error_class, the label
-                # and the attempt entry — never fabricated ids or usage.
-                attempt_log.append(
-                    _attempt_entry(exc, exc.session_id, request.model_ref)
-                )
+                attempt_log.append(_attempt_entry(exc, exc.session_id, request.model_ref))
                 self._raise_final(exc, attempt_log, started, request)
             try:
                 info, parts, status = self._post_message(
@@ -1254,10 +1274,7 @@ class OpenCodeServerBackend:
                 exc.session_id = session_id
                 self._owned_sessions[session_id] = "failed"
                 attempt_log.append(_attempt_entry(exc, session_id, request.model_ref))
-                if (
-                    exc.error_class in _RETRYABLE_ERROR_CLASSES
-                    and transport_attempts < max_transport_attempts - 1
-                ):
+                if exc.error_class in _RETRYABLE_ERROR_CLASSES and transport_attempts < max_transport_attempts - 1:
                     if not self._can_retry():
                         if not self._cfg.retain_failed_sessions:
                             self._delete_own_session(session_id)
@@ -1269,24 +1286,11 @@ class OpenCodeServerBackend:
                 if not self._cfg.retain_failed_sessions:
                     self._delete_own_session(session_id)
                 self._raise_final(exc, attempt_log, started, request)
-
             message_error = self._map_message_error(info, session_id=session_id)
             if message_error is not None:
                 self._owned_sessions[session_id] = "failed"
                 self._accumulate_reported_cost(info)
-                attempt_log.append(
-                    _attempt_entry(message_error, session_id, request.model_ref)
-                )
-                # R-RETRY (t_8ab8ab35, run_remote_002 chunk2): the message-
-                # level path retried ONLY structured-output failures, so a
-                # transport-class error surfacing through info.error
-                # ('Type validation failed: Value: {}' from a dead session,
-                # mapped to transport_network) fell straight to
-                # _raise_final and the chunk was lost. Transport-class
-                # message errors are now retried too — bounded like the
-                # HTTP path (same transport counter + backoff) — and the
-                # `continue` re-creates the session at the loop top (the
-                # old one is dead).
+                attempt_log.append(_attempt_entry(message_error, session_id, request.model_ref))
                 structured_retryable = (
                     message_error.error_class in _STRUCTURED_RETRYABLE_ERROR_CLASSES
                     and self._cfg.structured_output_mode == "json_schema"
@@ -1300,9 +1304,7 @@ class OpenCodeServerBackend:
                     if not self._can_retry():
                         if not self._cfg.retain_failed_sessions:
                             self._delete_own_session(session_id)
-                        self._raise_budget_exhausted(
-                            message_error, attempt_log, started, request
-                        )
+                        self._raise_budget_exhausted(message_error, attempt_log, started, request)
                     if transport_retryable:
                         transport_attempts += 1
                         self._reserve_retry()
@@ -1314,123 +1316,91 @@ class OpenCodeServerBackend:
                 if not self._cfg.retain_failed_sessions:
                     self._delete_own_session(session_id)
                 self._raise_final(message_error, attempt_log, started, request)
-
-            # Success path.
-            self._owned_sessions[session_id] = "success"
-            text = self._extract_text(parts)
-            reasoning = self._extract_reasoning(parts)
-            # REASONING-STREAM: POST /session/{id}/message is NOT an SSE
-            # stream — the verified server lines return the complete message
-            # (info + parts) in one JSON response; opencode streams via the
-            # separate /event SSE endpoint (message.part.updated), which this
-            # transport does not consume. So reasoning is delivered once,
-            # AFTER completion, through the optional on_reasoning_chunk sink
-            # (documented fallback; the phase's *_reasoning.txt file is
-            # written after the call returns, not live). A raise inside the
-            # sink is best-effort — it must never fail the model call.
-            if request.on_reasoning_chunk is not None and reasoning:
-                try:
-                    request.on_reasoning_chunk(reasoning)
-                except Exception:  # noqa: BLE001 — a sink failure is best-effort
-                    LOG.warning(
-                        "OpenCodeServerBackend: on_reasoning_chunk callback "
-                        "raised; reasoning delivery is best-effort",
-                        exc_info=True,
-                    )
             structured = info.get("structured")
-            if self._cfg.structured_output_mode == "json_schema":
-                if structured is None:
-                    # Account cost even on structured-missing failures so retries respect max_reported_cost.
-                    self._accumulate_reported_cost(info)
-                    # Server claimed json_schema but returned no structured
-                    # object; treat as a structured-output failure (bounded
-                    # retry above, then structured_output_failed).
-                    err = OpenCodeError(
-                        ERROR_STRUCTURED_OUTPUT_FAILED,
-                        "opencode server returned no structured output for "
-                        "json_schema request",
-                        session_id=session_id,
-                        request_id=info.get("id"),
-                    )
-                    self._owned_sessions[session_id] = "failed"
-                    attempt_log.append(_attempt_entry(err, session_id, request.model_ref))
-                    if structured_attempts < max_structured_attempts - 1:
-                        if not self._can_retry():
-                            if not self._cfg.retain_failed_sessions:
-                                self._delete_own_session(session_id)
-                            self._raise_budget_exhausted(
-                                err, attempt_log, started, request
-                            )
-                        structured_attempts += 1
-                        self._reserve_retry()
-                        continue
-                    if not self._cfg.retain_failed_sessions:
-                        self._delete_own_session(session_id)
-                    self._raise_final(err, attempt_log, started, request)
-                text = _canonical_structured_text(structured)
+            if self._cfg.structured_output_mode == "json_schema" and structured is None:
+                self._accumulate_reported_cost(info)
+                err = OpenCodeError(
+                    ERROR_STRUCTURED_OUTPUT_FAILED,
+                    "opencode server returned no structured output for json_schema request",
+                    session_id=session_id,
+                    request_id=info.get("id"),
+                )
+                self._owned_sessions[session_id] = "failed"
+                attempt_log.append(_attempt_entry(err, session_id, request.model_ref))
+                if structured_attempts < max_structured_attempts - 1:
+                    if not self._can_retry():
+                        if not self._cfg.retain_failed_sessions:
+                            self._delete_own_session(session_id)
+                        self._raise_budget_exhausted(err, attempt_log, started, request)
+                    structured_attempts += 1
+                    self._reserve_retry()
+                    continue
+                if not self._cfg.retain_failed_sessions:
+                    self._delete_own_session(session_id)
+                self._raise_final(err, attempt_log, started, request)
+            return info, parts, status, session_id, transport_attempts, structured_attempts
 
-            request_id = info.get("id")
-            finish_reason = info.get("finish")
-            usage = _normalize_usage(info)
-            # Track accumulated reported_cost for max_reported_cost enforcement (checked
-            # before the NEXT request in _check_budget_request). Validates finite non-negative.
-            self._accumulate_reported_cost(info)
-            wall = time.perf_counter() - started
-            attempt_log.append(
-                {
-                    "session_id": session_id,
-                    "request_id": request_id,
-                    "error_class": None,
-                    "http_status": status,
-                    "model_ref": request.model_ref,
-                }
-            )
+    def complete(self, request: CompletionRequest) -> CompletionResponse:
+        provider_id, model_id = self._ensure_session(request)
 
-            response = CompletionResponse(
-                text=text,
-                structured=dict(structured) if isinstance(structured, Mapping) else None,
-                provider=info.get("providerID") or provider_id,
-                model=info.get("modelID") or model_id,
-                finish_reason=finish_reason,
-                usage=usage,
-                wall_seconds=round(wall, 3),
+        started = time.perf_counter()
+        max_transport_attempts = self._cfg.http_retries + 1
+        max_structured_attempts = self._cfg.structured_output_retry_count + 1
+        attempt_log: list[dict] = []
+        info, parts, status, session_id, transport_attempts, structured_attempts = self._retry_loop(
+            request, provider_id, model_id, started, attempt_log, max_transport_attempts, max_structured_attempts
+        )
+        self._owned_sessions[session_id] = "success"
+        text, reasoning, structured = self._normalize(info, parts, request)
+        usage = self._record_cost(info)
+        request_id = info.get("id")
+        finish_reason = info.get("finish")
+        wall = time.perf_counter() - started
+        attempt_log.append(
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "error_class": None,
+                "http_status": status,
+                "model_ref": request.model_ref,
+            }
+        )
+        response = CompletionResponse(
+            text=text,
+            structured=dict(structured) if isinstance(structured, Mapping) else None,
+            provider=info.get("providerID") or provider_id,
+            model=info.get("modelID") or model_id,
+            finish_reason=finish_reason,
+            usage=usage,
+            wall_seconds=round(wall, 3),
+            request_id=request_id,
+            session_id=session_id,
+            retry_count=transport_attempts + structured_attempts,
+            raw_metadata={
+                "server_version": self._server_version,
+                "attempts": attempt_log,
+                "structured_output_mode": self._cfg.structured_output_mode,
+                "reasoning": reasoning,
+                "reasoning_streamed": False,
+            },
+        )
+        if not self._cfg.retain_success_sessions:
+            self._delete_own_session(session_id)
+        self._records.append(
+            BackendCallRecord(
+                label=request.label,
+                model_ref=request.model_ref,
                 request_id=request_id,
                 session_id=session_id,
-                retry_count=transport_attempts + structured_attempts,
-                raw_metadata={
-                    "server_version": self._server_version,
-                    "attempts": attempt_log,
-                    "structured_output_mode": self._cfg.structured_output_mode,
-                    "reasoning": reasoning,
-                    # REASONING-STREAM: the opencode message POST is batch —
-                    # reasoning is never streamed live on this transport (see
-                    # the comment at the delivery site). Marker for phases/
-                    # tests to distinguish live from post-completion writes.
-                    "reasoning_streamed": False,
-                },
+                retry_count=response.retry_count,
+                finish_reason=finish_reason,
+                usage=usage,
+                wall_seconds=response.wall_seconds,
+                raw_metadata=response.raw_metadata,
             )
-
-            if not self._cfg.retain_success_sessions:
-                self._delete_own_session(session_id)
-
-            self._records.append(
-                BackendCallRecord(
-                    label=request.label,
-                    model_ref=request.model_ref,
-                    request_id=request_id,
-                    session_id=session_id,
-                    retry_count=response.retry_count,
-                    finish_reason=finish_reason,
-                    usage=usage,
-                    wall_seconds=response.wall_seconds,
-                    raw_metadata=response.raw_metadata,
-                )
-            )
-            # D1: per-call usage write at completion (crash-safe: the call
-            # is in usage.ndjson the moment it finishes, not at a phase
-            # boundary). Local lifecycle calls never reach this backend.
-            self._emit_usage(self._records[-1])
-            return response
+        )
+        self._emit_usage(self._records[-1])
+        return response
 
     def _raise_final(
         self,
