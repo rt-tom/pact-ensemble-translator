@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from pact_full_pipeline_runner_v1 import v4_phase_progress as tracker
 from pact_v4.pipeline.phase_progress import PHASE_PROGRESS_FILENAME
 
@@ -112,6 +114,85 @@ def test_backend_region_gate_batch_10_splits_deterministically(tmp_path: Path):
     assert backend.requests[1].max_output_tokens == min(24576, 4096 * 4)
 
 
+def test_backend_region_gate_batch_fixed_4096_independent_of_config(tmp_path: Path):
+    """Fixed 4096 per-item unit independent of config.max_tokens (MEDIUM pact-rev)."""
+    from pact_v4.phase1.models import Region
+    from pact_v4.runtime.backend_role_adapters import BackendRegionFidelityGate, BackendRegionFidelityGateConfig
+    from pact_v4.runtime.backend_protocol import BackendDescriptor, CompletionResponse
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+
+    class ScriptedBackend:
+        _DEFAULT_BINDINGS = {
+            "default": "gemma-4-26B",
+            "generator": "gemma-4-26B",
+            "fidelity_reviewer": "qwen-3",
+            "qwen_fidelity": "qwen-3",
+        }
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.requests = []
+            self._idx = 0
+        @property
+        def descriptor(self):
+            return BackendDescriptor(
+                kind="local_llama",
+                transport_version="openai-chat-completions/v1",
+                endpoint_family="openai_chat_completions",
+                public_endpoint="http://127.0.0.1:8080/v1/chat/completions",
+                model_bindings=self._DEFAULT_BINDINGS,
+                effective_options={"temperature": 0.0},
+            )
+        def complete(self, request):
+            self.requests.append(request)
+            resp = self._responses[self._idx]
+            if self._idx < len(self._responses) - 1:
+                self._idx += 1
+            return resp
+
+    def _text(txt: str) -> CompletionResponse:
+        return CompletionResponse(text=txt, finish_reason="stop")
+
+    verdict = lambda n: json.dumps({"verdicts": [
+        {"faithful_to_source": True, "completeness": True, "introduced_errors": False,
+         "confidence": "high", "reason": "ok", "passed": True} for _ in range(n)
+    ]}, ensure_ascii=False)
+
+    # Non-default small config: 512 would imply chunk_size 48 and 512*len if not fixed;
+    # fixed 4096 forces chunk_size 6 (24576//4096) and 4096*len.
+    for cfg_tokens in (512, 8192, 100):
+        backend = ScriptedBackend([_text(verdict(6)), _text(verdict(4))])
+        gate = BackendRegionFidelityGate(
+            backend,
+            config=BackendRegionFidelityGateConfig(
+                max_tokens=cfg_tokens, retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
+            ),
+        )
+        items = [
+            {"source_text": f"src {i}", "repaired_text": f"rep {i}", "region": Region(pid=f"p{i:04d}", start=0, end=5)}
+            for i in range(10)
+        ]
+        results = gate.batch(items)
+        assert len(results) == 10
+        # Must still split 6+4 despite config (fixed 4096 unit)
+        assert len(backend.requests) == 2, f"cfg {cfg_tokens}: fixed batch should still split 6+4"
+        assert backend.requests[0].max_output_tokens == min(24576, 4096 * 6), f"cfg {cfg_tokens}"
+        assert backend.requests[1].max_output_tokens == min(24576, 4096 * 4), f"cfg {cfg_tokens}"
+        # Also single-chunk case must use 4096*n not cfg*n
+        backend2 = ScriptedBackend([_text(verdict(3))])
+        gate2 = BackendRegionFidelityGate(
+            backend2,
+            config=BackendRegionFidelityGateConfig(
+                max_tokens=cfg_tokens, retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0)
+            ),
+        )
+        items3 = [
+            {"source_text": f"s {i}", "repaired_text": f"r {i}", "region": Region(pid=f"q{i:04d}", start=0, end=5)}
+            for i in range(3)
+        ]
+        gate2.batch(items3)
+        assert backend2.requests[0].max_output_tokens == min(24576, 4096 * 3), f"cfg {cfg_tokens} single chunk"
+
+
 # ---------------------------------------------------------------------------
 # Incremental NDJSON: partial line preservation and rotation
 # ---------------------------------------------------------------------------
@@ -200,40 +281,49 @@ def test_incremental_ndjson_same_size_mtime_rewrite_invalidates(tmp_path: Path):
 
 
 def test_incremental_ndjson_inode_change_genuine_replacement(tmp_path: Path):
-    """Genuine inode invalidation: file replacement via unlink+create yields new inode and fresh read."""
+    """Genuine inode invalidation via os.replace(): same size + same mtime isolates inode path."""
     tracker._NDJSON_WATCH_CACHE.clear()
     path = tmp_path / "phase_progress.ndjson"
-    path.write_bytes(b'{"event": "a"}\n')
+    # Same-size payloads so size-based invalidation cannot trigger.
+    a_bytes = b'{"event": "a"}\n'
+    b_bytes = b'{"event": "b"}\n'
+    assert len(a_bytes) == len(b_bytes), "test requires same-size payloads to isolate inode"
+    path.write_bytes(a_bytes)
     rows = tracker._read_ndjson_incremental(path)
     assert len(rows) == 1 and rows[0]["event"] == "a"
     key = str(path.resolve())
-    inode_before = tracker._NDJSON_WATCH_CACHE.get(key, {}).get("inode")
-    # Genuine replacement: unlink then create new file (new inode on Linux)
-    path.unlink()
-    # Small delay to avoid mtime collision on coarse FS
-    import time
-    time.sleep(0.02)
-    path.write_bytes(b'{"event": "b"}\n')
-    # On some FS/overlay inode may coincidentally reuse, but mtime/size also changes;
-    # the key check is that incremental read returns new content, not stale "a".
+    cached_before = tracker._NDJSON_WATCH_CACHE.get(key, {})
+    inode_before = cached_before.get("inode")
+    mtime_before = cached_before.get("mtime")
+    size_before = cached_before.get("size")
+    if inode_before is None:
+        pytest.skip("filesystem does not provide inodes")
+    # Genuine replacement via atomic os.replace() onto same path.
+    tmp = tmp_path / "phase_progress.tmp"
+    tmp.write_bytes(b_bytes)
+    assert len(b_bytes) == size_before, "same size must be preserved"
+    os.replace(tmp, path)
+    stat_after = path.stat()
+    inode_after = int(getattr(stat_after, "st_ino", 0) or 0) or None
+    if inode_after is None:
+        pytest.skip("filesystem does not provide inodes")
+    assert inode_after != inode_before, f"os.replace must yield new inode, got {inode_after}=={inode_before}"
+    assert stat_after.st_size == size_before, "same size must be preserved after replace"
+    # Restore/hold mtime explicitly so fresh read isolates inode invalidation rather than size/mtime.
+    try:
+        os.utime(path, (stat_after.st_atime, float(mtime_before)))
+    except OSError:
+        pytest.skip("cannot restore mtime")
+    stat_restored = path.stat()
+    assert abs(stat_restored.st_mtime - float(mtime_before)) < 1e-6, "mtime must be held equal to isolate inode"
+    assert stat_restored.st_size == size_before
+    # Incremental read must return new content despite same size and mtime — only inode differed.
     rows2 = tracker._read_ndjson_incremental(path)
     assert len(rows2) == 1
-    assert rows2[0]["event"] == "b", "stale cache after genuine file replacement"
-    cached = tracker._NDJSON_WATCH_CACHE.get(key, {})
-    # If inode is tracked, it should differ; if FS reuses inode, at least rows are fresh
-    if inode_before is not None and cached.get("inode") is not None:
-        # Accept either new inode or at least fresh content (inode reuse is FS-dependent)
-        assert cached["rows"][0]["event"] == "b"
-    # Also test atomic replace via temp file + os.replace for rotation case
-    tracker._NDJSON_WATCH_CACHE.clear()
-    path.write_bytes(b'{"event": "c"}\n')
-    tracker._read_ndjson_incremental(path)
-    inode_c = tracker._NDJSON_WATCH_CACHE.get(key, {}).get("inode")
-    tmp = tmp_path / "phase_progress.tmp"
-    tmp.write_bytes(b'{"event": "d"}\n')
-    os.replace(tmp, path)
-    rows3 = tracker._read_ndjson_incremental(path)
-    assert len(rows3) == 1 and rows3[0]["event"] == "d"
+    assert rows2[0]["event"] == "b", "stale cache after genuine inode replacement (same size & mtime)"
+    cached_after = tracker._NDJSON_WATCH_CACHE.get(key, {})
+    assert cached_after.get("inode") == inode_after
+    assert cached_after.get("rows", [{}])[0].get("event") == "b"
     tracker._NDJSON_WATCH_CACHE.clear()
 
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase1.models import GateResult
 from pact_v4.phase2.generation import ModelCaller, PromptBundle
@@ -940,13 +940,10 @@ class BackendRegionFidelityGate:
         """
         if not items:
             return ()
-        # v41 3.1: batch ceiling and chunking — deterministic, resumption-safe.
-        per_item_tokens = self._max_tokens if self._max_tokens else 4096
-        # Fixed 4096 as the spec's per-item unit; ceiling//4096 is the max batch size.
-        max_batch = max(1, MAX_TOKENS_CEILING // 4096)
-        # Also respect per_item_tokens if config differs: effective max batch by ceiling.
-        alt_max = max(1, MAX_TOKENS_CEILING // per_item_tokens) if per_item_tokens else max_batch
-        chunk_size = min(max_batch, alt_max)
+        # v41 3.1: fixed 4096 output-token unit per item (approved spec);
+        # independent of config.max_tokens. Batch size is ceiling//4096,
+        # budget is min(ceiling, 4096*len(chunk)).
+        chunk_size = max(1, MAX_TOKENS_CEILING // 4096)
         results: List[GateResult] = []
         for start in range(0, len(items), chunk_size):
             chunk = list(items[start:start + chunk_size])
@@ -954,7 +951,7 @@ class BackendRegionFidelityGate:
                 items=[dict(item) for item in chunk],
                 template=self._config.batch_template,
             )
-            max_tokens = min(MAX_TOKENS_CEILING, per_item_tokens * max(1, len(chunk)))
+            max_tokens = min(MAX_TOKENS_CEILING, 4096 * len(chunk))
             request = CompletionRequest(
                 model_ref=_model_ref_for(
                     self._backend, ("fidelity_reviewer", "qwen_fidelity")
