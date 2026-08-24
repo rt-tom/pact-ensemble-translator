@@ -97,6 +97,19 @@ For approved implementation work:
 - Historical Hermes/Vibe Kanban procedures are not active workflow rules. Consult
   `AGENTS_REFERENCE_RU.md` only for historical context when it is relevant.
 
+## Mandatory dev skills (auto, no user prompt)
+
+All agents (Architect, `pact-dev`, `pact-rev`) MUST auto-load these project skills when relevant — do not wait for `/skill:` from user:
+
+- Before any edit/write/bash: `pact-workspace-guard` (isolated worktree, no RT production edit)
+- Before/after code change: `pact-risk-test` (Low/Medium/High + narrowest tests)
+- When touching prompts/selection/audit/glossary/entity: `pact-fidelity-lint` (static, no pipeline)
+- Before commit/PR: `pact-git-hygiene` (focused diff, no secrets)
+- Starting substantial change: `pact-openspec-dev` (+ `grill-me` if ambiguous)
+- After implementation: `pact-pi-review` (pact-dev→pact-rev, max 4 rounds, convergence)
+
+Skills are in `.pi/skills/pact-*/SKILL.md` — load via `read` when their trigger matches.
+
 ## Risk and testing
 
 Classify work before editing:
