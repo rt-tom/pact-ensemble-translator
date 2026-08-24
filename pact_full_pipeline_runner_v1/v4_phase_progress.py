@@ -169,6 +169,178 @@ def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Snapshot (v41-runtime-efficiency 2.1): one read per render cycle
+# ---------------------------------------------------------------------------
+
+def _read_snapshot(out_dir: Path, incremental: bool = False) -> Dict[str, Any]:
+    """Read the snapshot of the run artifacts for one render cycle.
+
+    One pass per render instead of repeated ``read_json``/``read_ndjson``
+    for ``chunk_plan``/``journal``/``usage``/audit cache/events. The dict
+    is threaded through render helpers so the same file is never read
+    twice within a single ``render_report`` / ``render_book_report`` cycle.
+    A fresh snapshot is built on every ``render`` call so ``--watch`` never
+    shows stale data.
+    When ``incremental`` is True (watch mode) NDJSON files are read via
+    ``_read_ndjson_incremental`` so large ``phase_progress.ndjson`` /
+    ``usage.ndjson`` tails do not re-read the whole file each poll; if
+    the file was truncated the incremental cache falls back to a full read.
+    """
+    out_dir = Path(out_dir)
+    _ndjson = _read_ndjson_incremental if incremental else _read_ndjson
+    return {
+        "chunk_plan": _read_json(out_dir / "chunk_plan.json"),
+        "journal": _read_ndjson(out_dir / "journal.ndjson"),
+        "usage": _ndjson(out_dir / USAGE_FILENAME),
+        "events": _ndjson(out_dir / PHASE_PROGRESS_FILENAME),
+        "b3_events": _ndjson(out_dir / B3_AUDIT_JOURNAL_FILENAME),
+        "audit_cache": _read_audit_cache(out_dir),
+        "b2_handoff": _read_json(out_dir / "b2_handoff.json"),
+        "repair_report": _read_json(out_dir / "repair_report.json"),
+        "strict_record": _read_json(out_dir / "strict_chapter_trial_record.json"),
+        "entity_context": _read_json(out_dir / "entity_context_cache.json"),
+        "translations_raw": _read_json(out_dir / "translations_raw.json"),
+        "formatting_report": _read_json(out_dir / "formatting_report.json"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Incremental NDJSON cache for watch mode (v41-runtime-efficiency 5.1)
+# ---------------------------------------------------------------------------
+
+_NDJSON_WATCH_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _ndjson_offset_for_bytes(raw: bytes) -> int:
+    """Bytes consumed by complete NDJSON lines (partial trailing preserved)."""
+    if not raw:
+        return 0
+    if raw.endswith(b"\n"):
+        return len(raw)
+    # No trailing newline — check if last line is valid JSON dict.
+    parts = raw.splitlines()
+    if not parts:
+        return 0
+    last = parts[-1].strip()
+    if not last:
+        # trailing whitespace-only line -> consider complete
+        return len(raw)
+    try:
+        obj = json.loads(last.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError):
+        last_valid = False
+    else:
+        last_valid = isinstance(obj, dict)
+    if last_valid:
+        return len(raw)
+    # Incomplete trailing line — preserve its bytes for next poll.
+    nl = raw.rfind(b"\n")
+    return nl + 1 if nl != -1 else 0
+
+
+def _read_ndjson_incremental(path: Path) -> List[Dict[str, Any]]:
+    """Incremental tail read for watch mode keyed by path/size/mtime/inode.
+
+    Tracks ``offset`` (bytes of complete lines consumed) plus ``size``/
+    ``mtime``/``inode`` per file; on each poll only the new tail is parsed
+    and appended.  If the file was truncated (``size < offset``), its
+    ``mtime`` regressed, or its ``inode`` changed (rotation), the cache is
+    invalidated and a full re-read is done.  A trailing incomplete line
+    (no newline + invalid JSON) does not advance ``offset`` so the bytes
+    are re-read once the line completes on the next poll.
+    Crash-safety (partial trailing line, non-object JSON) matches
+    ``_read_ndjson``.  Diagnostics-only: never raises, never aborts.
+    """
+    key = str(path.resolve()) if path.exists() else str(path)
+    try:
+        stat = path.stat()
+        size = int(stat.st_size)
+        mtime = float(stat.st_mtime)
+        inode = int(getattr(stat, "st_ino", 0) or 0) or None
+    except OSError:
+        _NDJSON_WATCH_CACHE.pop(key, None)
+        return []
+    cached = _NDJSON_WATCH_CACHE.get(key)
+    if cached is not None:
+        prev_offset = int(cached.get("offset", cached.get("size", 0)))
+        prev_size = int(cached.get("size", prev_offset))
+        prev_mtime = float(cached.get("mtime", 0.0))
+        prev_inode = cached.get("inode")
+        prev_rows: List[Dict[str, Any]] = cached.get("rows", [])
+        # Rotation / truncate detection: inode change, size shrink, or mtime regress.
+        if inode is not None and prev_inode is not None and inode != prev_inode:
+            _NDJSON_WATCH_CACHE.pop(key, None)
+        elif size < prev_offset or mtime < prev_mtime - 1e-6:
+            _NDJSON_WATCH_CACHE.pop(key, None)
+        elif size == prev_size and abs(mtime - prev_mtime) > 1e-6:
+            # Same-size rewrite: content may have changed (stale cache).
+            # mtime forward (or any drift) with identical size must
+            # invalidate — otherwise a same-size rewrite stays stale.
+            _NDJSON_WATCH_CACHE.pop(key, None)
+        elif size == prev_size and prev_offset == prev_size:
+            return list(prev_rows)
+        elif size == prev_size:
+            # Size unchanged but offset < size means a partial trailing line
+            # is still pending — no new bytes to consume (mtime unchanged).
+            return list(prev_rows)
+        else:
+            # Append-only growth: read only the new tail from prev_offset.
+            try:
+                with path.open("rb") as f:
+                    f.seek(prev_offset)
+                    tail_bytes = f.read()
+            except OSError:
+                _NDJSON_WATCH_CACHE.pop(key, None)
+                return _read_ndjson(path)
+            tail = tail_bytes.decode("utf-8", errors="replace")
+            new_rows: List[Dict[str, Any]] = []
+            for line in tail.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    new_rows.append(row)
+            # Determine how many bytes of the tail were complete.
+            if tail_bytes and not tail_bytes.endswith(b"\n"):
+                # Check if last line was valid -> complete, else partial.
+                parts = tail_bytes.splitlines()
+                last_raw = parts[-1].strip() if parts else b""
+                try:
+                    last_obj = json.loads(last_raw.decode("utf-8", errors="replace")) if last_raw else None
+                    last_valid = isinstance(last_obj, dict)
+                except (json.JSONDecodeError, ValueError):
+                    last_valid = False
+                if not last_valid:
+                    # Last line incomplete — only advance to last newline.
+                    nl = tail_bytes.rfind(b"\n")
+                    complete_len = nl + 1 if nl != -1 else 0
+                    # Filter new_rows to only those from the complete prefix:
+                    # new_rows already excludes the invalid last line, so keep it.
+                    merged = list(prev_rows) + new_rows
+                    next_offset = prev_offset + complete_len
+                    _NDJSON_WATCH_CACHE[key] = {"offset": next_offset, "size": size, "mtime": mtime, "inode": inode, "rows": merged}
+                    return list(merged)
+            merged = list(prev_rows) + new_rows
+            next_offset = prev_offset + len(tail_bytes)
+            _NDJSON_WATCH_CACHE[key] = {"offset": next_offset, "size": size, "mtime": mtime, "inode": inode, "rows": merged}
+            return list(merged)
+    # Cache miss or invalidated: full read and seed cache with offset adjusted for partial tail.
+    rows = _read_ndjson(path)
+    try:
+        raw = path.read_bytes()
+        offset = _ndjson_offset_for_bytes(raw)
+        stat2 = path.stat()
+        _NDJSON_WATCH_CACHE[key] = {"offset": offset, "size": int(stat2.st_size), "mtime": float(stat2.st_mtime), "inode": int(getattr(stat2, "st_ino", 0) or 0) or None, "rows": list(rows)}
+    except OSError:
+        pass
+    return rows
+
+
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
@@ -278,8 +450,11 @@ def _last_usage_record(out_dir: Path) -> Optional[Dict[str, Any]]:
     return rows[-1] if rows else None
 
 
-def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
-    record = _read_json(out_dir / "strict_chapter_trial_record.json")
+def _identity(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if snapshot is not None and "strict_record" in snapshot:
+        record = snapshot.get("strict_record")
+    else:
+        record = _read_json(out_dir / "strict_chapter_trial_record.json")
     started = _run_started_event(events)
     terminal = _terminal_event(events)
 
@@ -317,7 +492,11 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # after server start on remote runs (opencode_serve_*.log), so they are
     # NOT a liveness indicator. Liveness comes from the last usage.ndjson
     # record (written per remote call) and the last phase_progress event.
-    last_usage = _last_usage_record(out_dir)
+    if snapshot is not None and "usage" in snapshot:
+        usage_rows = snapshot.get("usage") or []
+        last_usage = usage_rows[-1] if usage_rows else None
+    else:
+        last_usage = _last_usage_record(out_dir)
     usage_age: Optional[float] = None
     if last_usage is not None and last_usage.get("ts"):
         usage_age = _ts_age(str(last_usage["ts"]))
@@ -330,7 +509,10 @@ def _identity(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # journal's own events (audit_chunk_started/done, repair_round, ...).
     # Read it read-only: a fresh journal event keeps the run alive, nothing
     # more (no writing, no gating).
-    b3_events = _load_b3_events(out_dir)
+    if snapshot is not None and "b3_events" in snapshot:
+        b3_events = snapshot.get("b3_events") or []
+    else:
+        b3_events = _load_b3_events(out_dir)
     b3_age = _recent_event_age(b3_events)
     recent_b3 = b3_age <= FRESHNESS_WINDOW_SECONDS
 
@@ -435,8 +617,11 @@ def _local_log_freshness(out_dir: Path) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 
-def _detect_phase(out_dir: Path, events: List[Dict[str, Any]]) -> Tuple[str, str]:
-    record = _read_json(out_dir / "strict_chapter_trial_record.json")
+def _detect_phase(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    if snapshot is not None and "strict_record" in snapshot:
+        record = snapshot.get("strict_record")
+    else:
+        record = _read_json(out_dir / "strict_chapter_trial_record.json")
     if record is not None:
         return "done", "strict_chapter_trial_record.json exists"
     if _terminal_event(events) is not None:
@@ -449,13 +634,19 @@ def _detect_phase(out_dir: Path, events: List[Dict[str, Any]]) -> Tuple[str, str
     # holds N chunks, and the 10-minute generation has no journal entry at
     # all yet.
     if _whole_chapter_mode(events):
-        return _detect_whole_chapter_phase(out_dir, events)
+        return _detect_whole_chapter_phase(out_dir, events, snapshot)
 
-    b2 = _read_json(out_dir / "b2_handoff.json")
-    repair_report = _read_json(out_dir / "repair_report.json")
-    chunk_plan = _read_json(out_dir / "chunk_plan.json")
+    if snapshot is not None:
+        b2 = snapshot.get("b2_handoff")
+        repair_report = snapshot.get("repair_report")
+        chunk_plan = snapshot.get("chunk_plan")
+        journal = snapshot.get("journal") or []
+    else:
+        b2 = _read_json(out_dir / "b2_handoff.json")
+        repair_report = _read_json(out_dir / "repair_report.json")
+        chunk_plan = _read_json(out_dir / "chunk_plan.json")
+        journal = _read_ndjson(out_dir / "journal.ndjson")
     total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else None
-    journal = _read_ndjson(out_dir / "journal.ndjson")
 
     if repair_report is not None:
         return "step8", "repair_report.json exists; final record not yet written"
@@ -478,7 +669,7 @@ def _whole_chapter_mode(events: List[Dict[str, Any]]) -> bool:
 
 
 def _detect_whole_chapter_phase(
-    out_dir: Path, events: List[Dict[str, Any]]
+    out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None
 ) -> Tuple[str, str]:
     """Whole-chapter phase: gen -> step6 (B3 audit) -> step7 (repair) -> step8.
 
@@ -496,7 +687,10 @@ def _detect_whole_chapter_phase(
                  "whole-chapter generation started")
         return "gen", basis
 
-    b3 = _load_b3_events(out_dir)
+    if snapshot is not None and "b3_events" in snapshot:
+        b3 = snapshot.get("b3_events") or []
+    else:
+        b3 = _load_b3_events(out_dir)
     if not b3:
         return "steps1-5", ("whole-chapter generation done; B3 audit/repair "
                             "not running (generation-only or awaiting stage)")
@@ -656,7 +850,7 @@ def _handoff_by_chunk(out_dir: Path) -> Dict[str, Dict[str, Any]]:
     }
 
 
-def _repair_state_by_chunk(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _repair_state_by_chunk(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     """Repair state per chunk: ``committed``/``debt``/``in_progress`` from
     ``repair_report.json`` + ``repair_cache.json`` + region events.
 
@@ -666,7 +860,10 @@ def _repair_state_by_chunk(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[
     """
     states: Dict[str, Dict[str, Any]] = {}
 
-    report = _read_json(out_dir / "repair_report.json")
+    if snapshot is not None and "repair_report" in snapshot:
+        report = snapshot.get("repair_report")
+    else:
+        report = _read_json(out_dir / "repair_report.json")
     if report:
         for round_payload in report.get("rounds", []):
             for rec in round_payload.get("records", []):
@@ -773,18 +970,45 @@ def _repair_status(chunk_id: str, repair_state: Dict[str, Any]) -> Tuple[str, st
     return "not_started", "no repair records"
 
 
-def _chunk_table(out_dir: Path, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    chunk_plan = _read_json(out_dir / "chunk_plan.json")
-    journal_by_chunk = _journal_by_chunk(out_dir)
-    handoff_by_chunk = _handoff_by_chunk(out_dir)
-    repair_state = _repair_state_by_chunk(out_dir, events)
+def _chunk_table(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if snapshot is not None and "chunk_plan" in snapshot:
+        chunk_plan = snapshot.get("chunk_plan")
+        journal = snapshot.get("journal") or []
+        journal_by_chunk = {e.get("chunk_id"): e for e in journal if e.get("chunk_id")}
+        b2 = snapshot.get("b2_handoff")
+        handoff_by_chunk = {r.get("chunk_id"): r for r in (b2 or {}).get("chunks", []) if r.get("chunk_id")} if b2 else {}
+        # repair_state still needs events for region events; read report/cache from snapshot when available
+        repair_state = _repair_state_by_chunk(out_dir, events, snapshot)
+    else:
+        chunk_plan = _read_json(out_dir / "chunk_plan.json")
+        journal_by_chunk = _journal_by_chunk(out_dir)
+        handoff_by_chunk = _handoff_by_chunk(out_dir)
+        repair_state = _repair_state_by_chunk(out_dir, events)
 
-    # V4.1 whole-chapter mode: ONE processing unit (whole_chapter), not the
-    # planner's N chunks — the journal holds a single whole_chapter entry and
-    # the plan rows would all read "pending". Show the unit's own status from
-    # the wc_*/B3 events instead.
+    # V4.1 whole-chapter mode: ONE generation unit (whole_chapter) plus
+    # per-chunk audit/repair visibility. The design requires both branches
+    # from the same snapshot, not hiding chunk tables. The journal holds a
+    # single whole_chapter entry, so per-chunk trial columns stay pending
+    # while audit/repair per chunk comes from the same snapshot sources.
     if _whole_chapter_mode(events):
-        return [_whole_chapter_chunk_row(out_dir, events)]
+        wc_row = _whole_chapter_chunk_row(out_dir, events, snapshot)
+        # Build per-chunk rows from the same snapshot for audit/repair visibility.
+        chunk_ids = [row.get("chunk_id") for row in (chunk_plan or {}).get("chunks", []) if row.get("chunk_id")]
+        chunk_rows: List[Dict[str, Any]] = []
+        for chunk_id in chunk_ids:
+            trial, trial_basis = _trial_status(chunk_id, journal_by_chunk, events)
+            audit, audit_basis = _audit_status(chunk_id, handoff_by_chunk, events)
+            repair, repair_basis = _repair_status(chunk_id, repair_state)
+            chunk_rows.append({
+                "chunk_id": chunk_id,
+                "trial": trial,
+                "trial_basis": trial_basis,
+                "audit": audit,
+                "audit_basis": audit_basis,
+                "repair": repair,
+                "repair_basis": repair_basis,
+            })
+        return [wc_row] + chunk_rows
 
     chunk_ids = [row.get("chunk_id") for row in (chunk_plan or {}).get("chunks", []) if row.get("chunk_id")]
     rows: List[Dict[str, Any]] = []
@@ -804,7 +1028,7 @@ def _chunk_table(out_dir: Path, events: List[Dict[str, Any]]) -> List[Dict[str, 
     return rows
 
 
-def _whole_chapter_chunk_row(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _whole_chapter_chunk_row(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Single-row chunk table for whole-chapter runs (generation -> B3)."""
     gen = _wc_gen_status(events)
     if gen is None:
@@ -826,7 +1050,10 @@ def _whole_chapter_chunk_row(out_dir: Path, events: List[Dict[str, Any]]) -> Dic
         ) else "generated"
         trial_basis = "wc_generation in flight / done (no wc_validated yet)"
 
-    b3 = _load_b3_events(out_dir)
+    if snapshot is not None and "b3_events" in snapshot:
+        b3 = snapshot.get("b3_events") or []
+    else:
+        b3 = _load_b3_events(out_dir)
     if not b3:
         return {
             "chunk_id": "whole_chapter",
@@ -904,7 +1131,7 @@ def _reaudit_counts(events: List[Dict[str, Any]]) -> Dict[str, int]:
     return {"started": len(started), "done": len(done)}
 
 
-def _formatting_counts(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _formatting_counts(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     fmt_events = [e for e in events if e.get("event") == "formatting_done"]
     if fmt_events:
         last = fmt_events[-1]
@@ -913,7 +1140,10 @@ def _formatting_counts(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str,
             "blocking": last.get("blocking"),
             "basis": "formatting_done event",
         }
-    report = _read_json(out_dir / "formatting_report.json")
+    if snapshot is not None and "formatting_report" in snapshot:
+        report = snapshot.get("formatting_report")
+    else:
+        report = _read_json(out_dir / "formatting_report.json")
     if report and isinstance(report.get("outcome"), dict):
         outcome = report["outcome"]
         return {
@@ -924,14 +1154,20 @@ def _formatting_counts(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str,
     return {"incidents": None, "blocking": None, "basis": "no formatting artifacts"}
 
 
-def _terminal_counts(out_dir: Path, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _terminal_counts(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     terminal = _terminal_event(events)
     if terminal is not None:
         return {"status": terminal.get("status"), "basis": "terminal event"}
-    record = _read_json(out_dir / "strict_chapter_trial_record.json")
+    if snapshot is not None and "strict_record" in snapshot:
+        record = snapshot.get("strict_record")
+    else:
+        record = _read_json(out_dir / "strict_chapter_trial_record.json")
     if record is not None:
         return {"status": record.get("step8", {}).get("status"), "basis": "strict_chapter_trial_record.json"}
-    report = _read_json(out_dir / "repair_report.json")
+    if snapshot is not None and "repair_report" in snapshot:
+        report = snapshot.get("repair_report")
+    else:
+        report = _read_json(out_dir / "repair_report.json")
     if report is not None:
         return {"status": report.get("status"), "basis": "repair_report.json status"}
     return {"status": None, "basis": "no terminal artifact yet"}
@@ -1080,9 +1316,12 @@ _SHORT_STATUS = {
 }
 
 
-def _usage_block_lines(out_dir: Path) -> List[str]:
+def _usage_block_lines(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> List[str]:
     """``-- usage by step x model --`` block (from usage.ndjson)."""
-    rows = _read_usage_rows(out_dir)
+    if snapshot is not None and "usage" in snapshot:
+        rows = snapshot.get("usage") or []
+    else:
+        rows = _read_usage_rows(out_dir)
     if not rows:
         # MEDIUM (RV t_c9f9ea90): distinguish "never written" from
         # "exists but corrupt/unreadable" — both render a diagnostic, never
@@ -1186,9 +1425,12 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _phase_extraction(out_dir: Path) -> Optional[str]:
+def _phase_extraction(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Extraction line from ``entity_context_cache.json`` (read-only)."""
-    payload = _read_json(out_dir / "entity_context_cache.json")
+    if snapshot is not None and "entity_context" in snapshot:
+        payload = snapshot.get("entity_context")
+    else:
+        payload = _read_json(out_dir / "entity_context_cache.json")
     if not payload:
         return None
     entries = payload.get("entries")
@@ -1238,12 +1480,18 @@ def _phase_extraction(out_dir: Path) -> Optional[str]:
             f"| claims: verified {verified} / candidate {candidate}")
 
 
-def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[str]:
+def _phase_translation(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Translation line from ``translations_raw.json`` + wc events."""
-    raw = _read_json(out_dir / "translations_raw.json")
+    if snapshot is not None and "translations_raw" in snapshot:
+        raw = snapshot.get("translations_raw")
+    else:
+        raw = _read_json(out_dir / "translations_raw.json")
     if raw is None:
         return None
-    plan = _read_json(out_dir / "chunk_plan.json")
+    if snapshot is not None and "chunk_plan" in snapshot:
+        plan = snapshot.get("chunk_plan")
+    else:
+        plan = _read_json(out_dir / "chunk_plan.json")
     source_words = 0
     if plan:
         chunks = plan.get("chunks")
@@ -1264,7 +1512,7 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]]) -> Optional[
             f"перевод {translation_words} слов")
 
 
-def _phase_r_editor(out_dir: Path) -> Optional[str]:
+def _phase_r_editor(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """R_editor line from ``audit_cache_b3.json``.
 
     Final cache: top-level ``r_editor.outcome`` (chunk_count /
@@ -1279,7 +1527,10 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
     FINDING 3: ``applied_count`` / ``candidate_count`` from the production
     cache are preserved when available (not recomputed from lists).
     """
-    cache = _read_audit_cache(out_dir)
+    if snapshot is not None and "audit_cache" in snapshot:
+        cache = snapshot.get("audit_cache")
+    else:
+        cache = _read_audit_cache(out_dir)
     if cache is None:
         return None
     if cache.get("__malformed"):
@@ -1396,7 +1647,7 @@ def _phase_r_editor(out_dir: Path) -> Optional[str]:
             f"| safe (применено)={applied} | review (предложено)={candidates}")
 
 
-def _phase_audit(out_dir: Path) -> Optional[str]:
+def _phase_audit(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Audit line from ``audit_cache_b3.json``.
 
     Final cache: top-level ``chunks`` + ``issue_count``. Incremental cache:
@@ -1405,7 +1656,10 @@ def _phase_audit(out_dir: Path) -> Optional[str]:
     FINDING 1: cache-authoritative — a present but malformed cache renders
     an explicit error.
     """
-    cache = _read_audit_cache(out_dir)
+    if snapshot is not None and "audit_cache" in snapshot:
+        cache = snapshot.get("audit_cache")
+    else:
+        cache = _read_audit_cache(out_dir)
     if cache is None:
         return None
     if cache.get("__malformed"):
@@ -1438,7 +1692,7 @@ def _phase_audit(out_dir: Path) -> Optional[str]:
             f"| findings per chunk: {findings} | всего {total}")
 
 
-def _phase_repair(out_dir: Path) -> Optional[str]:
+def _phase_repair(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Repair line from ``audit_cache_b3.json``.
 
     Final cache: top-level ``repair.batches`` (+ committed / eligible_count).
@@ -1453,7 +1707,10 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
     FINDING 3: preserve production ``applied_count`` / ``candidate_count``
     when available (not recomputed from lists).
     """
-    cache = _read_audit_cache(out_dir)
+    if snapshot is not None and "audit_cache" in snapshot:
+        cache = snapshot.get("audit_cache")
+    else:
+        cache = _read_audit_cache(out_dir)
     if cache is None:
         return None
     if cache.get("__malformed"):
@@ -1549,7 +1806,7 @@ def _phase_repair(out_dir: Path) -> Optional[str]:
             f"| findings eligible: {eligible_count} | PID edits committed: {committed_count}")
 
 
-def _phase_reaudit(out_dir: Path) -> Optional[str]:
+def _phase_reaudit(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Re-audit line from ``audit_cache_b3.json``.
 
     Final cache: ``repair.reaudit`` (complete/failed/issues); done = persisted
@@ -1560,7 +1817,10 @@ def _phase_reaudit(out_dir: Path) -> Optional[str]:
     FINDING 1: cache-authoritative — a present but malformed cache renders
     an explicit error.
     """
-    cache = _read_audit_cache(out_dir)
+    if snapshot is not None and "audit_cache" in snapshot:
+        cache = snapshot.get("audit_cache")
+    else:
+        cache = _read_audit_cache(out_dir)
     if cache is None:
         return None
     if cache.get("__malformed"):
@@ -1604,7 +1864,7 @@ def _phase_reaudit(out_dir: Path) -> Optional[str]:
             f"| residual: {residual} | debt: {debt}")
 
 
-def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]]) -> List[str]:
+def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> List[str]:
     """``-- Phase --`` block: per-pipeline-phase progress (MONITOR-V2 1.1).
 
     One line per phase whose artifact exists (Extraction / Translation /
@@ -1618,7 +1878,10 @@ def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]]) -> List[str]
 
     # Pre-read the audit cache once so the malformed-sentinel error is
     # rendered exactly once, not once per cache-reading phase function.
-    audit_cache = _read_audit_cache(out_dir)
+    if snapshot is not None and "audit_cache" in snapshot:
+        audit_cache = snapshot.get("audit_cache")
+    else:
+        audit_cache = _read_audit_cache(out_dir)
     _cache_malformed = (
         isinstance(audit_cache, dict) and audit_cache.get("__malformed")
     )
@@ -1627,29 +1890,29 @@ def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]]) -> List[str]
         if _cache_malformed:
             return ("R-editor: audit_cache_b3.json present but malformed "
                     "(fail-closed)")
-        return _phase_r_editor(d)
+        return _phase_r_editor(d, snapshot)
 
     def _audit(d: Path) -> Optional[str]:
         if _cache_malformed:
             return ("Chapter audit: audit_cache_b3.json present but malformed "
                     "(fail-closed)")
-        return _phase_audit(d)
+        return _phase_audit(d, snapshot)
 
     def _repair(d: Path) -> Optional[str]:
         if _cache_malformed:
             return ("Selective repair: audit_cache_b3.json present but "
                     "malformed (fail-closed)")
-        return _phase_repair(d)
+        return _phase_repair(d, snapshot)
 
     def _reaudit(d: Path) -> Optional[str]:
         if _cache_malformed:
             return ("Re-audit scope: audit_cache_b3.json present but "
                     "malformed (fail-closed)")
-        return _phase_reaudit(d)
+        return _phase_reaudit(d, snapshot)
 
     line_builders = [
-        _phase_extraction,
-        lambda d: _phase_translation(d, events),
+        lambda d: _phase_extraction(d, snapshot),
+        lambda d: _phase_translation(d, events, snapshot),
         _r_editor,
         _audit,
         _repair,
@@ -1817,13 +2080,16 @@ def _local_thinking_lines(out_dir: Path) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _last_call_block_lines(out_dir: Path) -> List[str]:
+def _last_call_block_lines(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> List[str]:
     """``-- последний вызов (из usage.ndjson) --`` block (MONITOR-V2 1.5).
 
     One line with the human phase, model, in/out/reasoning tokens and wall
     seconds of the most recent usage row. Absent usage.ndjson -> no block.
     """
-    rows = _read_usage_rows(out_dir)
+    if snapshot is not None and "usage" in snapshot:
+        rows = snapshot.get("usage") or []
+    else:
+        rows = _read_usage_rows(out_dir)
     if not rows:
         return []
     row = rows[-1]
@@ -1846,7 +2112,7 @@ def _last_call_block_lines(out_dir: Path) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str:
+def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str, snapshot: Optional[Dict[str, Any]] = None) -> str:
     """Compact one-line status (V4.1 M card)::
 
         [0001] Whole-chapter translation | attempt 2/3 (reason: malformed) | Chapter audit chunk 3/8 |
@@ -1869,13 +2135,20 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
     elif phase not in ("gen", "steps1-5", "unknown"):
         # Chunked runs: show the chunked generation progress (journal) as the
         # GEN segment so the status line stays meaningful outside whole-chapter.
-        journal = _read_ndjson(out_dir / "journal.ndjson")
-        chunk_plan = _read_json(out_dir / "chunk_plan.json")
+        if snapshot is not None and "journal" in snapshot and "chunk_plan" in snapshot:
+            journal = snapshot.get("journal") or []
+            chunk_plan = snapshot.get("chunk_plan")
+        else:
+            journal = _read_ndjson(out_dir / "journal.ndjson")
+            chunk_plan = _read_json(out_dir / "chunk_plan.json")
         total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
         if total:
             segments.append(f"Entity extraction chunks {len(journal)}/{total}")
 
-    b3 = _load_b3_events(out_dir)
+    if snapshot is not None and "b3_events" in snapshot:
+        b3 = snapshot.get("b3_events") or []
+    else:
+        b3 = _load_b3_events(out_dir)
     audit_chunks = [e for e in b3 if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
     if audit_chunks:
         last = audit_chunks[-1]
@@ -1903,35 +2176,42 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str) -> str
             )
 
     if phase == "done":
-        terminal = _terminal_counts(out_dir, events)
+        terminal = _terminal_counts(out_dir, events, snapshot)
         segments.append(f"DONE ({terminal['status']})" if terminal["status"] else "DONE")
     return " | ".join(segments)
 
 
-def render_report(out_dir: Path) -> str:
+def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> str:
     """Read-only text report over one run directory."""
-    events = _load_events(out_dir)
-    fine = bool(events)
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         return f"<no such directory: {out_dir}>"
+    # v41 snapshot: one read per cycle, threaded through all helpers so
+    # chunk_plan/journal/usage are never read twice; rebuilt every render
+    # cycle so watch never stalls. Incremental NDJSON is handled inside
+    # _read_snapshot when caller sets incremental=True (watch main loop).
+    if snapshot is None:
+        snapshot = _read_snapshot(out_dir)
+    events = snapshot.get("events") or []
+    fine = bool(events)
 
-    identity = _identity(out_dir, events)
-    phase, phase_basis = _detect_phase(out_dir, events)
+    identity = _identity(out_dir, events, snapshot)
+    phase, phase_basis = _detect_phase(out_dir, events, snapshot)
     wc_mode = _whole_chapter_mode(events)
-    rows = _chunk_table(out_dir, events)
-    chunk_plan = _read_json(out_dir / "chunk_plan.json")
+    rows = _chunk_table(out_dir, events, snapshot)
+    chunk_plan = snapshot.get("chunk_plan")
     total_chunks = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
-    journal_by_chunk = _journal_by_chunk(out_dir)
+    journal = snapshot.get("journal") or []
+    journal_by_chunk = {e.get("chunk_id"): e for e in journal if e.get("chunk_id")}
     trial_counts = _trial_counts(journal_by_chunk)
     audit_counts = _audit_unit_counts(events, total_chunks) if fine else {}
     region_counts = _region_counts(events)
     reaudit_counts = _reaudit_counts(events)
-    formatting = _formatting_counts(out_dir, events)
-    terminal = _terminal_counts(out_dir, events)
+    formatting = _formatting_counts(out_dir, events, snapshot)
+    terminal = _terminal_counts(out_dir, events, snapshot)
     in_flight = _in_flight_model_activity(events)
     gen = _wc_gen_status(events) if wc_mode else None
-    b3_events = _load_b3_events(out_dir)
+    b3_events = snapshot.get("b3_events") or []
 
     lines: List[str] = []
     lines.append(f"== V4 run progress: {out_dir} ==")
@@ -1943,7 +2223,7 @@ def render_report(out_dir: Path) -> str:
         lines.append(f"elapsed: {identity['elapsed_seconds']:.0f}s")
     if identity["resumed_from_index"] is not None:
         lines.append(f"resumed_from_index: {identity['resumed_from_index']}")
-    lines.append(f"status: {_status_line(out_dir, events, phase)}")
+    lines.append(f"status: {_status_line(out_dir, events, phase, snapshot)}")
     # MONITOR-V2 finding 5: show canonical phase name, not raw internal code.
     lines.append(f"phase: {_PHASE_DISPLAY.get(phase, phase)} -- {phase_basis}")
 
@@ -1951,7 +2231,7 @@ def render_report(out_dir: Path) -> str:
     # after the alive header, then the local generation-speed block (local
     # runs only — remote runs never render a speed block).
     lines.append("")
-    lines.extend(_phase_block_lines(out_dir, events))
+    lines.extend(_phase_block_lines(out_dir, events, snapshot))
     speed_lines = _server_speed_lines(out_dir)
     if speed_lines:
         lines.append("")
@@ -2066,12 +2346,12 @@ def render_report(out_dir: Path) -> str:
             lines.append(f"Formatting: incidents={formatting['incidents']} blocking={formatting['blocking']}"
                          f" ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
     lines.append("")
-    lines.extend(_usage_block_lines(out_dir))
+    lines.extend(_usage_block_lines(out_dir, snapshot))
 
     # MONITOR-V2 (1.5): last completed call block (only when usage.ndjson
     # exists), placed right after the usage block.
     lines.append("")
-    lines.extend(_last_call_block_lines(out_dir))
+    lines.extend(_last_call_block_lines(out_dir, snapshot))
 
     lines.append("")
     lines.append("-- model activity --")
@@ -2119,16 +2399,18 @@ def _discover_chapters(out_base: Path) -> List[Path]:
     return chapters
 
 
-def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
+def _chapter_summary_row(chapter_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One row of the chapters table: id, mode/unit, step, status, calls, tokens, cost."""
-    events = _load_events(chapter_dir)
-    phase, _ = _detect_phase(chapter_dir, events)
+    if snapshot is None:
+        snapshot = _read_snapshot(chapter_dir)
+    events = snapshot.get("events") or []
+    phase, _ = _detect_phase(chapter_dir, events, snapshot)
 
-    chunk_plan = _read_json(chapter_dir / "chunk_plan.json")
+    chunk_plan = snapshot.get("chunk_plan")
     total = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
-    journal = _journal_by_chunk(chapter_dir)
+    journal = {e.get("chunk_id"): e for e in (snapshot.get("journal") or []) if e.get("chunk_id")}
 
-    usage = _read_usage_rows(chapter_dir)
+    usage = snapshot.get("usage") or []
     calls = len(usage)
     costs = [_as_float(row.get("reported_cost")) for row in usage
              if row.get("reported_cost") is not None]
@@ -2192,8 +2474,15 @@ def _chapter_summary_row(chapter_dir: Path) -> Dict[str, Any]:
     }
 
 
-def _render_chapters_table(chapters: List[Path]) -> List[str]:
-    rows = [_chapter_summary_row(ch) for ch in chapters]
+def _render_chapters_table(chapters: List[Path], incremental: bool = False, snapshots: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
+    # v41: each chapter's row is built from a single snapshot per chapter
+    # so the table does not re-read chunk_plan/journal/usage multiple times.
+    # When snapshots dict is provided (book watch), reuse it to avoid extra reads.
+    def _snap(ch: Path) -> Dict[str, Any]:
+        if snapshots is not None and str(ch) in snapshots:
+            return snapshots[str(ch)]
+        return _read_snapshot(ch, incremental=incremental)
+    rows = [_chapter_summary_row(ch, _snap(ch)) for ch in chapters]
     total_calls = sum(r["calls"] for r in rows)
     total_cost = sum(r["cost"] for r in rows)
     total_input = sum(r["input_tokens"] for r in rows)
@@ -2249,18 +2538,31 @@ def _render_chapters_table(chapters: List[Path]) -> List[str]:
     return lines
 
 
-def _active_chapter(chapters: List[Path]) -> Optional[Path]:
+def _active_chapter(chapters: List[Path], snapshots: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Path]:
     """The chapter being processed now: the newest activity among those
     that have not reached a terminal state; fall back to the newest overall.
+
+    When snapshots are provided (book watch), activity/terminal checks reuse
+    the same snapshots instead of re-reading events/usage per chapter.
     """
+    def _snapshot_for(chapter_dir: Path) -> Optional[Dict[str, Any]]:
+        if snapshots is not None and str(chapter_dir) in snapshots:
+            return snapshots[str(chapter_dir)]
+        return None
+
     def _activity_ts(chapter_dir: Path) -> str:
-        events = _load_events(chapter_dir)
+        snap = _snapshot_for(chapter_dir)
+        if snap is not None:
+            events = snap.get("events") or []
+            usage = snap.get("usage") or []
+        else:
+            events = _load_events(chapter_dir)
+            usage = _read_usage_rows(chapter_dir)
         latest = ""
         for event in events:
             ts = event.get("ts") or ""
             if ts > latest:
                 latest = ts
-        usage = _read_usage_rows(chapter_dir)
         for row in usage:
             ts = row.get("ts") or ""
             if ts > latest:
@@ -2268,8 +2570,13 @@ def _active_chapter(chapters: List[Path]) -> Optional[Path]:
         return latest
 
     def _not_terminal(chapter_dir: Path) -> bool:
-        events = _load_events(chapter_dir)
-        record = _read_json(chapter_dir / "strict_chapter_trial_record.json")
+        snap = _snapshot_for(chapter_dir)
+        if snap is not None:
+            events = snap.get("events") or []
+            record = snap.get("strict_record")
+        else:
+            events = _load_events(chapter_dir)
+            record = _read_json(chapter_dir / "strict_chapter_trial_record.json")
         return record is None and _terminal_event(events) is None
 
     active = [c for c in chapters if _not_terminal(c)]
@@ -2278,7 +2585,7 @@ def _active_chapter(chapters: List[Path]) -> Optional[Path]:
     return max(active, key=_activity_ts) if active else None
 
 
-def render_book_report(out_base: Path) -> str:
+def render_book_report(out_base: Path, incremental: bool = False) -> str:
     """Read-only multi-chapter (book-run) report over ``--out-base``."""
     out_base = Path(out_base)
     if not out_base.is_dir():
@@ -2290,13 +2597,20 @@ def render_book_report(out_base: Path) -> str:
         lines.append("(no chapter_*/ with phase_progress.ndjson found yet)")
         return "\n".join(lines)
 
-    lines.extend(_render_chapters_table(chapters))
+    # v41 6.1/2.2: build one snapshot per chapter and thread it through
+    # both the chapters table and the active-chapter selection/detail so
+    # watch does not re-read events/usage per chapter multiple times.
+    snapshots: Dict[str, Dict[str, Any]] = {str(ch): _read_snapshot(ch, incremental=incremental) for ch in chapters}
+    lines.extend(_render_chapters_table(chapters, incremental=incremental, snapshots=snapshots))
 
-    active = _active_chapter(chapters)
+    active = _active_chapter(chapters, snapshots=snapshots)
     if active is not None:
         lines.append("")
         lines.append(f"-- active chapter: {active.name} --")
-        lines.append(render_report(active))
+        active_snap = snapshots.get(str(active))
+        if active_snap is None:
+            active_snap = _read_snapshot(active, incremental=incremental)
+        lines.append(render_report(active, active_snap))
     return "\n".join(lines)
 
 
@@ -2322,11 +2636,15 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_argparser().parse_args(argv)
+    watch_incremental = bool(args.watch is not None and args.watch > 0)
     while True:
         if args.out_base is not None:
-            print(render_book_report(args.out_base))
+            print(render_book_report(args.out_base, incremental=watch_incremental))
         else:
-            print(render_report(args.out_dir))
+            if watch_incremental:
+                print(render_report(args.out_dir, _read_snapshot(args.out_dir, incremental=True)))
+            else:
+                print(render_report(args.out_dir))
         if args.watch is None or args.watch <= 0:
             break
         time.sleep(args.watch)
