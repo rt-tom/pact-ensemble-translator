@@ -498,16 +498,44 @@ class CompositeRuntimeCoordinator:
         remote: Optional[RemoteRuntimeCoordinator],
         descriptor: BackendDescriptor,
         backend: Optional[CompletionBackend] = None,
+        *,
+        locals: Optional[Sequence[LocalLifecycleCoordinator]] = None,
+        remotes: Optional[Sequence[RemoteRuntimeCoordinator]] = None,
     ) -> None:
-        if local is None and remote is None:
+        # Aggregate all coordinators: single local/remote (legacy) plus optional
+        # lists. A composite that had 2 locals / 2 remotes previously kept only
+        # the first coordinator's events/usage, silently dropping the others.
+        # Now every sub-coordinator contributes to events/summary/usage sink.
+        _locals: List[LocalLifecycleCoordinator] = []
+        _remotes: List[RemoteRuntimeCoordinator] = []
+        if locals is not None:
+            _locals.extend(locals)
+        elif local is not None:
+            _locals.append(local)
+        if remotes is not None:
+            _remotes.extend(remotes)
+        elif remote is not None:
+            _remotes.append(remote)
+        if not _locals and not _remotes:
             raise ValueError(
                 "CompositeRuntimeCoordinator: need at least one sub-coordinator"
             )
-        self._local = local
-        self._remote = remote
+        self._locals = _locals
+        self._remotes = _remotes
+        # Backward-compat aliases: first of each type
+        self._local = _locals[0] if _locals else None
+        self._remote = _remotes[0] if _remotes else None
         self._descriptor = descriptor
         self._backend = backend
         self._closed = False
+        # Stable merged event stream: append-only list where each new
+        # event (local or remote) is appended once and never reordered.
+        # This keeps indices stable even when later local events appear
+        # after remote events have been exposed (previous local-first
+        # rebuild shifted remote indices and broke resumability).
+        self._events: List[BackendEvent] = []
+        self._locals_seen: List[int] = [0] * len(_locals)
+        self._remotes_seen: List[int] = [0] * len(_remotes)
 
     @property
     def local(self) -> Optional[LocalLifecycleCoordinator]:
@@ -534,11 +562,12 @@ class CompositeRuntimeCoordinator:
         (see ``LocalLifecycleCoordinator.set_usage_writer``) so a composite
         run writes local usage rows exactly like a local-only run. Local
         *switch* events stay filtered out by the writer itself.
+        Aggregates over ALL sub-coordinators so no backend's telemetry is lost.
         """
-        if self._remote is not None:
-            self._remote.set_usage_writer(writer)
-        if self._local is not None:
-            self._local.set_usage_writer(writer)
+        for coord in self._remotes:
+            coord.set_usage_writer(writer)
+        for coord in self._locals:
+            coord.set_usage_writer(writer)
 
     @property
     def backend_descriptor(self) -> BackendDescriptor:
@@ -579,58 +608,108 @@ class CompositeRuntimeCoordinator:
                 version = getter()
                 if version:
                     return version
-        if self._remote is not None:
+        for coord in self._remotes:
             descriptor = getattr(
-                getattr(self._remote, "backend", None), "descriptor", None,
+                getattr(coord, "backend", None), "descriptor", None,
             )
             if descriptor is not None:
-                return getattr(descriptor, "observed_server_version", None)
+                version = getattr(descriptor, "observed_server_version", None)
+                if version:
+                    return version
         return None
 
+    def _all_events_snapshot(self) -> List[BackendEvent]:
+        """All events ordered local-first then remote (snapshot helper)."""
+        events: List[BackendEvent] = []
+        for coord in self._locals:
+            events.extend(coord.events_since(0))
+        for coord in self._remotes:
+            events.extend(coord.events_since(0))
+        return events
+
+    def _sync(self) -> None:
+        """Append new events to the stable merged stream without reordering."""
+        # Track per-coordinator offsets so interleaved emissions do not
+        # duplicate or omit events (previous aggregate offset flattened
+        # all coordinators of one kind into a single list; if coordinator
+        # A emitted after B the slice duplicated B's tail or omitted A's
+        # new tail). Each sub-coordinator advances independently.
+        for idx, coord in enumerate(self._locals):
+            events = coord.events_since(0)
+            seen = self._locals_seen[idx]
+            if len(events) > seen:
+                self._events.extend(events[seen:])
+                self._locals_seen[idx] = len(events)
+        for idx, coord in enumerate(self._remotes):
+            events = coord.events_since(0)
+            seen = self._remotes_seen[idx]
+            if len(events) > seen:
+                self._events.extend(events[seen:])
+                self._remotes_seen[idx] = len(events)
+
     def event_count(self) -> int:
-        return (self._local.event_count() if self._local else 0) + (
-            self._remote.event_count() if self._remote else 0
-        )
+        self._sync()
+        return len(self._events)
 
     def events_since(self, index: int) -> Sequence[BackendEvent]:
-        local_count = self._local.event_count() if self._local else 0
-        remote_count = self._remote.event_count() if self._remote else 0
-        total = local_count + remote_count
+        self._sync()
+        total = len(self._events)
         if not 0 <= index <= total:
             raise IndexError(
                 f"CompositeRuntimeCoordinator: index {index} out of range "
                 f"[0, {total}]"
             )
-        events: List[BackendEvent] = []
-        for i in range(index, total):
-            if i < local_count:
-                events.append(self._local.events_since(i)[0])
-            else:
-                events.append(self._remote.events_since(i - local_count)[0])
-        return events
+        return self._events[index:]
 
     def local_switch_event_indices(self, start: int) -> List[int]:
-        local_count = self._local.event_count() if self._local else 0
-        total = self.event_count()
-        return [i for i in range(start, total) if i < local_count]
+        self._sync()
+        return [
+            i for i in range(start, len(self._events))
+            if self._events[i].kind == EVENT_KIND_LOCAL_SWITCH
+        ]
 
     def release(self) -> None:
-        if self._local is not None:
-            self._local.release()
+        for coord in self._locals:
+            coord.release()
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._local is not None:
-            self._local.close()
-        if self._remote is not None:
-            self._remote.close()
+        for coord in self._locals:
+            coord.close()
+        for coord in self._remotes:
+            coord.close()
 
     def summary(self) -> Mapping[str, Any]:
-        local = self._local.summary()["local_lifecycle"] if self._local else None
-        remote = self._remote.summary()["remote_calls"] if self._remote else None
-        return {"local_lifecycle": local, "remote_calls": remote}
+        # Aggregate local switches across all local coordinators
+        local_summary = None
+        if self._locals:
+            all_switches = []
+            for coord in self._locals:
+                # LocalLifecycleCoordinator stores router.switches
+                try:
+                    all_switches.extend(coord._router.switches)  # type: ignore[attr-defined]
+                except AttributeError:
+                    # Fallback: use summary's switches if router not exposed
+                    s = coord.summary().get("local_lifecycle")
+                    if s and s.get("switches"):
+                        all_switches.extend(s["switches"])
+            # Build combined local lifecycle summary
+            from pact_v4.runtime.runtime_coordinator import local_lifecycle_summary as _lls
+            # Need SwitchRecord objects; if we fell back to dicts, reconstruct minimally
+            try:
+                local_summary = _lls(all_switches)  # type: ignore[arg-type]
+            except Exception:
+                local_summary = self._locals[0].summary()["local_lifecycle"]
+        # Aggregate remote calls across all remote coordinators
+        remote_summary = None
+        if self._remotes:
+            all_records = []
+            for coord in self._remotes:
+                all_records.extend(coord.backend.call_records())
+            remote_summary = remote_calls_summary(all_records)
+        return {"local_lifecycle": local_summary, "remote_calls": remote_summary}
 
 
 __all__ = [

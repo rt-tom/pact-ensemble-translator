@@ -89,6 +89,7 @@ Design rules (plan §5, §7, §10, §12)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -255,6 +256,15 @@ class RemoteBudget:
             raise ValueError("RemoteBudget: max_retry_requests_per_chapter must be >= 0")
         if self.max_wait_seconds_on_rate_limit < 0:
             raise ValueError("RemoteBudget: max_wait_seconds_on_rate_limit must be >= 0")
+        if self.max_reported_cost is not None:
+            import math
+            try:
+                v = float(self.max_reported_cost)
+            except (TypeError, ValueError):
+                raise ValueError("RemoteBudget: max_reported_cost must be a finite non-negative number") from None
+            if not math.isfinite(v) or v < 0:
+                raise ValueError("RemoteBudget: max_reported_cost must be a finite non-negative number")
+            object.__setattr__(self, "max_reported_cost", v)
 
 
 @dataclass(frozen=True)
@@ -424,11 +434,13 @@ def build_opencode_descriptor(
     descriptor before any server contact leave it ``None``.
     """
     bindings = dict(cfg.model_bindings) or {"default": ""}
+    system_prompt_hash = hashlib.sha256(cfg.system_prompt.encode("utf-8")).hexdigest()
     effective_options = {
         "server_version_policy": cfg.server_version_policy,
         "pinned_server_version": cfg.pinned_server_version,
         "agent": cfg.agent or "server-default",
         "system_prompt_version": cfg.system_prompt_version,
+        "system_prompt_hash": system_prompt_hash,
         "session_policy": {
             "scope": cfg.session_scope,
             "retain_success": cfg.retain_success_sessions,
@@ -449,6 +461,7 @@ def build_opencode_descriptor(
             "max_requests_per_chapter": cfg.remote_budget.max_requests_per_chapter,
             "max_retry_requests_per_chapter": cfg.remote_budget.max_retry_requests_per_chapter,
             "max_wait_seconds_on_rate_limit": cfg.remote_budget.max_wait_seconds_on_rate_limit,
+            "max_reported_cost": cfg.remote_budget.max_reported_cost,
         },
     }
     # PROVIDERS-REGISTRY: the reasoning-effort map is serialized ONLY when
@@ -472,11 +485,25 @@ def build_opencode_descriptor(
 
 
 def _major_minor(version: str) -> Tuple[int, int]:
-    pieces = version.split(".")
+    v = version.strip().lstrip("vV")
+    pieces = v.split(".")
     try:
         return int(pieces[0]), int(pieces[1])
     except (IndexError, ValueError):
         raise ValueError(f"cannot parse version {version!r}")
+
+
+def _is_variant_reasoning_server(version: Optional[str]) -> Optional[bool]:
+    """True when the server moved reasoningEffort to the model variant.
+    Returns None when version is missing or unparsable (unknown).
+    """
+    if not version:
+        return None
+    try:
+        major, minor = _major_minor(version)
+    except ValueError:
+        return None
+    return (major, minor) >= (1, 18)
 
 
 def _version_compatible(
@@ -579,6 +606,7 @@ class OpenCodeServerBackend:
         self._request_count = 0
         self._retry_request_count = 0
         self._wait_seconds = 0.0
+        self._reported_cost_total = 0.0
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -917,7 +945,23 @@ class OpenCodeServerBackend:
                     f"{reasoning!r} in request_options (allowed: 1=low, "
                     "2=medium, 3=high)",
                 )
-            body["reasoningEffort"] = effort
+            variant_mode = _is_variant_reasoning_server(self._server_version)
+            if variant_mode is True:
+                # 1.18+ moved reasoningEffort to the model variant (Effect Struct
+                # silently ignores the old top-level key -> reasoning was silently lost).
+                # Send the variant (effective contract) and keep reasoningEffort for
+                # backward compatibility with 1.4 servers / existing test expectations
+                # (1.18 ignores it, so it is harmless).
+                body["model"]["variant"] = effort
+                body["reasoningEffort"] = effort
+            elif variant_mode is None:
+                # Unknown/unparsable version (e.g. "v1.18.18", "nightly"):
+                # fail-safe sends BOTH fields so reasoning is not lost regardless
+                # of server line (either field ignored on the other line).
+                body["model"]["variant"] = effort
+                body["reasoningEffort"] = effort
+            else:
+                body["reasoningEffort"] = effort
         return body
 
     def _post_message(
@@ -1067,6 +1111,18 @@ class OpenCodeServerBackend:
     # Budgets (plan §10)
     # ------------------------------------------------------------------
 
+    def _accumulate_reported_cost(self, info: Mapping[str, Any]) -> None:
+        usage = _normalize_usage(info)
+        if "reported_cost" in usage:
+            import math
+            try:
+                v = float(usage["reported_cost"])
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(v) or v < 0:
+                return
+            self._reported_cost_total += v
+
     def _check_budget_request(self) -> None:
         if self._request_count >= self._cfg.remote_budget.max_requests_per_chapter:
             raise OpenCodeError(
@@ -1074,6 +1130,18 @@ class OpenCodeServerBackend:
                 "remote budget exhausted: "
                 f"max_requests_per_chapter={self._cfg.remote_budget.max_requests_per_chapter}",
             )
+        max_cost = self._cfg.remote_budget.max_reported_cost
+        if max_cost is not None:
+            import math
+            # NaN/inf already rejected at config validation; total is kept finite.
+            if not math.isfinite(self._reported_cost_total):
+                self._reported_cost_total = 0.0
+            if self._reported_cost_total >= float(max_cost):
+                raise OpenCodeError(
+                    ERROR_REMOTE_BUDGET_EXHAUSTED,
+                    "remote budget exhausted: "
+                    f"max_reported_cost={max_cost} (reported {self._reported_cost_total})",
+                )
         self._request_count += 1
 
     def _can_retry(self) -> bool:
@@ -1205,6 +1273,7 @@ class OpenCodeServerBackend:
             message_error = self._map_message_error(info, session_id=session_id)
             if message_error is not None:
                 self._owned_sessions[session_id] = "failed"
+                self._accumulate_reported_cost(info)
                 attempt_log.append(
                     _attempt_entry(message_error, session_id, request.model_ref)
                 )
@@ -1271,6 +1340,8 @@ class OpenCodeServerBackend:
             structured = info.get("structured")
             if self._cfg.structured_output_mode == "json_schema":
                 if structured is None:
+                    # Account cost even on structured-missing failures so retries respect max_reported_cost.
+                    self._accumulate_reported_cost(info)
                     # Server claimed json_schema but returned no structured
                     # object; treat as a structured-output failure (bounded
                     # retry above, then structured_output_failed).
@@ -1301,6 +1372,9 @@ class OpenCodeServerBackend:
             request_id = info.get("id")
             finish_reason = info.get("finish")
             usage = _normalize_usage(info)
+            # Track accumulated reported_cost for max_reported_cost enforcement (checked
+            # before the NEXT request in _check_budget_request). Validates finite non-negative.
+            self._accumulate_reported_cost(info)
             wall = time.perf_counter() - started
             attempt_log.append(
                 {

@@ -691,23 +691,13 @@ class CompositeBackendConfig:
     def build_runtime(
         self, *, log_dir: Optional[Path] = None
     ) -> RuntimeCoordinator:
-        # Composite shape limitation (PR #107 review): only the FIRST
-        # LocalLifecycleCoordinator and FIRST RemoteRuntimeCoordinator are
-        # kept for event accounting/summary; any additional sub-backend of
-        # the same kind is still closed on close() but its switch/call
-        # events never reach runtime.events_since()/summary(). Today the
-        # only config kinds are local_llama and opencode_server, so a
-        # realistic composite is 1-local + 1-remote; if a future profile
-        # needs 2-local or 2-remote sub-backends, the coordinator must
-        # merge multiple event sources instead of discarding the extras.
         sub_backends: Dict[str, CompletionBackend] = {}
-        local_coord: Optional[LocalLifecycleCoordinator] = None
-        remote_coord: Optional[RemoteRuntimeCoordinator] = None
+        local_coords: List[LocalLifecycleCoordinator] = []
+        remote_coords: List[RemoteRuntimeCoordinator] = []
         for name, cfg in self.backends.items():
             runtime = cfg.build_runtime(log_dir=log_dir)
             if isinstance(runtime, LocalLifecycleCoordinator):
-                if local_coord is None:
-                    local_coord = runtime
+                local_coords.append(runtime)
                 sub_backend = LocalRoutingBackend(runtime.router, cfg)
                 # MONITOR-V2 (2.3): register the local routing backend on
                 # the sub-coordinator so the composite coordinator's
@@ -715,8 +705,7 @@ class CompositeBackendConfig:
                 runtime.set_usage_backend(sub_backend)
                 sub_backends[name] = sub_backend
             elif isinstance(runtime, RemoteRuntimeCoordinator):
-                if remote_coord is None:
-                    remote_coord = runtime
+                remote_coords.append(runtime)
                 sub_backends[name] = runtime.backend
             else:
                 raise TypeError(
@@ -728,8 +717,15 @@ class CompositeBackendConfig:
         # ``Backend*`` role adapters can serve Phase 1-2/Step 6 calls over
         # the same sub-backends the coordinator owns.
         composite_backend = CompositeCompletionBackend(sub_backends, descriptor)
+        # Aggregating coordinator now keeps ALL sub-coordinators so second
+        # backends' events/usage/summary are not lost.
         return CompositeRuntimeCoordinator(
-            local_coord, remote_coord, descriptor, backend=composite_backend,
+            local_coords[0] if local_coords else None,
+            remote_coords[0] if remote_coords else None,
+            descriptor,
+            backend=composite_backend,
+            locals=local_coords,
+            remotes=remote_coords,
         )
 
 
@@ -1560,12 +1556,51 @@ def _load_local(payload: Mapping[str, Any]) -> LocalLlamaBackendConfig:
 
 
 def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
-    auth = payload.get("auth") or {}
+    _auth_raw = payload.get("auth")
+    if _auth_raw is None:
+        auth: Mapping[str, Any] = {}
+    elif not isinstance(_auth_raw, Mapping):
+        raise ValueError(
+            "load_runtime_config[opencode_server]: auth must be a "
+            f"mapping, got {type(_auth_raw).__name__}: {_auth_raw!r} "
+            "(expected a block with type, username_env, password_env; omit the key or use null for defaults)"
+        )
+    else:
+        auth = _auth_raw
+    # Nested auth validation: fail-closed on unsupported auth keys (e.g. type must be declared)
+    if isinstance(auth, Mapping) and auth:
+        _allowed_auth_keys = {"type", "username_env", "password_env"}
+        _unknown_auth = set(auth) - _allowed_auth_keys
+        if _unknown_auth:
+            raise ValueError(
+                "load_runtime_config[opencode_server]: unsupported auth key(s) "
+                f"{sorted(_unknown_auth)} — allowed: {sorted(_allowed_auth_keys)}"
+            )
+        if "type" in auth:
+            auth_type = auth.get("type")
+            if auth_type not in ("basic_env", None):
+                raise ValueError(
+                    "load_runtime_config[opencode_server]: unsupported auth.type "
+                    f"{auth_type!r} — expected 'basic_env'"
+                )
     username_env = auth.get("username_env") if isinstance(auth, Mapping) else None
     password_env = auth.get("password_env") if isinstance(auth, Mapping) else None
     managed = payload.get("managed")
     managed_spec: Optional[ManagedServerSpec] = None
+    if managed is not None and not isinstance(managed, Mapping):
+        raise ValueError(
+            "load_runtime_config[opencode_server]: managed must be a "
+            f"mapping, got {type(managed).__name__}: {managed!r} "
+            "(expected a block with hostname, port, pinned_server_version, server_version_policy; omit the key or use null for defaults)"
+        )
     if isinstance(managed, Mapping):
+        _allowed_managed_keys = {"hostname", "port", "pinned_server_version", "server_version_policy"}
+        _unknown_managed = set(managed) - _allowed_managed_keys
+        if _unknown_managed:
+            raise ValueError(
+                "load_runtime_config[opencode_server]: unsupported managed key(s) "
+                f"{sorted(_unknown_managed)} — allowed: {sorted(_allowed_managed_keys)}"
+            )
         managed_spec = ManagedServerSpec(
             hostname=managed.get("hostname", DEFAULT_HOSTNAME),
             port=int(managed.get("port", 4096)),
@@ -1581,6 +1616,13 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
     remote_budget_payload = payload.get("remote_budget")
     remote_budget: Optional[RemoteBudget] = None
     if isinstance(remote_budget_payload, Mapping):
+        _allowed_budget_keys = {"max_requests_per_chapter", "max_retry_requests_per_chapter", "max_wait_seconds_on_rate_limit", "max_reported_cost"}
+        _unknown_budget = set(remote_budget_payload) - _allowed_budget_keys
+        if _unknown_budget:
+            raise ValueError(
+                "load_runtime_config[opencode_server]: unsupported remote_budget key(s) "
+                f"{sorted(_unknown_budget)} — allowed: {sorted(_allowed_budget_keys)}"
+            )
         remote_budget = RemoteBudget(
             max_requests_per_chapter=int(
                 remote_budget_payload.get(
@@ -1615,7 +1657,45 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             "max_retry_requests_per_chapter / max_wait_seconds_on_rate_limit "
             "/ max_reported_cost; omit the key or use null for the 500 default)"
         )
-    server_kwargs = dict(
+    # FAIL-CLOSED on unsupported keys: every key that can change the model
+    # answer must either be deserialized or rejected loudly — silently dropping
+    # a field would let a config claim one identity while the backend runs with
+    # another's defaults (determinism/auditability violation). Known keys are
+    # enumerated explicitly; any other top-level key is rejected.
+    _allowed_opencode_keys = {
+        "kind", "server_mode", "managed", "base_url",
+        "server_version_policy", "pinned_server_version", "auth",
+        "remote_budget", "model_bindings", "structured_output_mode",
+        "structured_output_retry_count", "default_temperature",
+        "default_max_output_tokens", "timeout_seconds", "http_retries",
+        "retry_delay_seconds", "agent", "system_prompt",
+        "system_prompt_version", "session_scope", "retain_success_sessions",
+        "retain_failed_sessions", "tools_disabled", "reasoning_effort_map",
+    }
+    _unknown = set(payload) - _allowed_opencode_keys
+    if _unknown:
+        raise ValueError(
+            "load_runtime_config[opencode_server]: unsupported key(s) "
+            f"{sorted(_unknown)} — add deserialization or remove the key"
+        )
+    # Optional session/retry/tool policy fields: deserialize when present,
+    # otherwise keep the dataclass defaults (preserves existing identity).
+    reasoning_effort_map = None
+    if "reasoning_effort_map" in payload and payload["reasoning_effort_map"] is not None:
+        raw_map = payload["reasoning_effort_map"]
+        if not isinstance(raw_map, Mapping):
+            raise ValueError(
+                "load_runtime_config[opencode_server]: reasoning_effort_map must be "
+                f"a mapping, got {type(raw_map).__name__}"
+            )
+        try:
+            reasoning_effort_map = {int(k): str(v) for k, v in raw_map.items()}
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "load_runtime_config[opencode_server]: reasoning_effort_map keys "
+                f"must be int levels 1/2/3, got {raw_map!r}: {exc}"
+            ) from exc
+    server_kwargs: dict = dict(
         base_url=str(payload.get("base_url", "http://127.0.0.1:4096")),
         server_version_policy=str(
             payload.get("server_version_policy", "compatible_minor")
@@ -1635,6 +1715,28 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
             payload.get("timeout_seconds", OpenCodeServerBackendConfig().timeout_seconds)
         ),
     )
+    if "agent" in payload:
+        server_kwargs["agent"] = payload["agent"]
+    if "system_prompt" in payload:
+        server_kwargs["system_prompt"] = str(payload["system_prompt"])
+    if "system_prompt_version" in payload:
+        server_kwargs["system_prompt_version"] = str(payload["system_prompt_version"])
+    if "session_scope" in payload:
+        server_kwargs["session_scope"] = str(payload["session_scope"])
+    if "retain_success_sessions" in payload:
+        server_kwargs["retain_success_sessions"] = bool(payload["retain_success_sessions"])
+    if "retain_failed_sessions" in payload:
+        server_kwargs["retain_failed_sessions"] = bool(payload["retain_failed_sessions"])
+    if "tools_disabled" in payload:
+        server_kwargs["tools_disabled"] = bool(payload["tools_disabled"])
+    if "structured_output_retry_count" in payload:
+        server_kwargs["structured_output_retry_count"] = int(payload["structured_output_retry_count"])
+    if "http_retries" in payload:
+        server_kwargs["http_retries"] = int(payload["http_retries"])
+    if "retry_delay_seconds" in payload:
+        server_kwargs["retry_delay_seconds"] = float(payload["retry_delay_seconds"])
+    if reasoning_effort_map is not None:
+        server_kwargs["reasoning_effort_map"] = reasoning_effort_map
     if remote_budget is not None:
         # None keeps the dataclass default (``RemoteBudget()``); only an
         # explicit ``remote_budget`` YAML block overrides it.
