@@ -140,6 +140,7 @@ Classify work before editing:
   but must not launch it.
 - Before a requested production action, state the exact target checkout, config,
   input, intended output location, and irreversible effects.
+- After every deploy, sync production checkout `D:\pact\pact_translator_v4_1` with `main` (`git pull --ff-only` on `RT`); deployment is not complete until `RT` reports `Already up to date` or the deployed commit.
 
 ## Data and external boundaries
 
