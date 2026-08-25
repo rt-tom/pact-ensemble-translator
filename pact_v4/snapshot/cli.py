@@ -220,6 +220,9 @@ def _receive_candidate_stream(store: BookStore, candidate_id: str, data: bytes) 
         for fname in CANONICAL_FILES:
             if not (tmp_root / "state" / fname).is_file():
                 raise ValidationError(f"Candidate missing state/{fname}")
+        # Boundary validation (shared validator) before commit — fail-closed
+        from .promote import validate_candidate_boundary
+        validate_candidate_boundary(tmp_root)
         # Atomic move tmp_root -> cand_dir
         os.replace(str(tmp_root), str(cand_dir))
         # tmp_root no longer exists after replace, avoid cleanup double

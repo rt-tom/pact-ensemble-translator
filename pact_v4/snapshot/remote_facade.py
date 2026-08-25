@@ -41,6 +41,28 @@ def _validate_candidate_id(candidate_id: str) -> None:
     except ValueError as e:
         raise ValidationError(str(e)) from e
 
+def _scoped_book_id() -> str | None:
+    """Return configured scoped book-id if set via env, otherwise None."""
+    scoped = os.environ.get("PACT_SNAPSHOT_BOOK_ID")
+    if scoped is None:
+        return None
+    scoped = scoped.strip()
+    if scoped == "":
+        return None
+    # Validate syntax to avoid misconfiguration escape; fail-closed if invalid
+    try:
+        _validate_component(scoped, "book_id")
+    except ValueError as e:
+        raise ValidationError(f"Invalid scoped book-id PACT_SNAPSHOT_BOOK_ID: {e}") from e
+    return scoped
+
+def _enforce_scoped(book_id: str) -> int | None:
+    """Return rejection exit code if book_id does not match scoped value, else None."""
+    scoped = _scoped_book_id()
+    if scoped is not None and book_id != scoped:
+        return _reject(f"book-id not allowed (scoped to {scoped!r}): {book_id!r}")
+    return None
+
 def _print_json(obj) -> None:
     json.dump(obj, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
     sys.stdout.write("\n")
@@ -97,6 +119,9 @@ def handle_request(tokens: List[str], *, root: str = "/home/rt/pact_runs") -> in
                 return _reject(f"fetch-current requires exactly 1 arg (book-id), got {tokens[1:]}")
             book_id = tokens[1]
             _validate_book_id(book_id)
+            scoped_rc = _enforce_scoped(book_id)
+            if scoped_rc is not None:
+                return scoped_rc
             # Trust check done; now dispatch to CLI fetch-current handler
             from .cli import _fetch_current_stream
             store = BookStore(book_id, root=root)
@@ -108,6 +133,9 @@ def handle_request(tokens: List[str], *, root: str = "/home/rt/pact_runs") -> in
             book_id, candidate_id = tokens[1], tokens[2]
             _validate_book_id(book_id)
             _validate_candidate_id(candidate_id)
+            scoped_rc = _enforce_scoped(book_id)
+            if scoped_rc is not None:
+                return scoped_rc
             from .cli import _receive_candidate_stream
             store = BookStore(book_id, root=root)
             data = sys.stdin.buffer.read()
@@ -119,6 +147,9 @@ def handle_request(tokens: List[str], *, root: str = "/home/rt/pact_runs") -> in
             book_id, candidate_id = tokens[1], tokens[2]
             _validate_book_id(book_id)
             _validate_candidate_id(candidate_id)
+            scoped_rc = _enforce_scoped(book_id)
+            if scoped_rc is not None:
+                return scoped_rc
             from .promote import promote
             from .lease import read_lease
             store = BookStore(book_id, root=root)
@@ -156,6 +187,9 @@ def handle_request(tokens: List[str], *, root: str = "/home/rt/pact_runs") -> in
                 return _reject("release-lease only allows: release-lease <book-id> --check-expired")
             book_id = tokens[1]
             _validate_book_id(book_id)
+            scoped_rc = _enforce_scoped(book_id)
+            if scoped_rc is not None:
+                return scoped_rc
             from .lease import check_expired
             store = BookStore(book_id, root=root)
             report = check_expired(store)

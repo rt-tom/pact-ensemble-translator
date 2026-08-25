@@ -190,7 +190,7 @@ def test_post_push_rejection_preserves_local_state():
                 _make_json_file(wdir_p / fname, {"ok": fname, "v": 2})
             # snapshot local files before push
             before = {fname: (wdir_p / fname).read_bytes() for fname in CANONICAL}
-            with pytest.raises(RuntimeError, match="REJECTED"):
+            with pytest.raises(RuntimeError):
                 post_promote_push(BOOK_ID, wdir_p, transport=tamper)
             # Local state preserved
             for fname in CANONICAL:

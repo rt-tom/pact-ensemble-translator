@@ -82,15 +82,59 @@ def post_promote_push(
             raise RuntimeError(f"post_promote_push: transport failure for {candidate_id}: {e}") from e
         if verdict.get("status") == "ACCEPTED":
             LOG.info("post_promote_push ACCEPTED %s -> %s", candidate_id, verdict.get("revision_id"))
+            # Advance local parent pointer so next per-chapter push uses new revision
+            try:
+                cur_path = wdir / "CURRENT.json"
+                # Prefer verdict current dict if present, else minimal
+                new_current: Dict[str, Any]
+                if isinstance(verdict.get("current"), dict):
+                    new_current = dict(verdict["current"])
+                else:
+                    # Fallback: read existing and update revision_id
+                    if cur_path.is_file() and not cur_path.is_symlink():
+                        try:
+                            new_current = json.loads(cur_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            new_current = {}
+                    else:
+                        new_current = {}
+                    new_current["revision_id"] = verdict.get("revision_id")
+                    if "manifest_sha256" in verdict:
+                        new_current["manifest_sha256"] = verdict["manifest_sha256"]
+                    new_current["book_id"] = book_id
+                # Ensure revision_id present
+                if "revision_id" not in new_current and "revision_id" in verdict:
+                    new_current["revision_id"] = verdict["revision_id"]
+                # Atomic write via tmp + replace
+                tmp_path = cur_path.with_suffix(".tmp")
+                tmp_path.write_text(json.dumps(new_current, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                tmp_path.replace(cur_path)
+            except Exception as e:
+                LOG.warning("Failed to advance local parent pointer after ACCEPTED: %s", e)
             return verdict
         reason = verdict.get("reason")
         if reason == "STALE_PARENT" and attempt < max_retries:
             LOG.warning("STALE_PARENT for %s, re-pulling and retrying (attempt %d/%d)", candidate_id, attempt + 1, max_retries)
-            # Bounded re-pull: fetch again
+            # Preserve completed canonical state before any re-pull (do not lose RT update)
+            preserved: Dict[str, bytes | None] = {}
+            for fname in CANONICAL_FILES:
+                p = wdir / fname
+                try:
+                    preserved[fname] = p.read_bytes() if p.is_file() and not p.is_symlink() else None
+                except Exception:
+                    preserved[fname] = None
+            # Bounded re-pull: fetch new parent revision (may overwrite working dir)
             try:
                 pre_init_fetch(book_id, wdir, transport=transport, ssh_target=ssh_target, root=root)
             except Exception as e:
                 raise RuntimeError(f"post_promote_push: re-pull after STALE_PARENT failed: {e}") from e
+            # Restore RT-updated canonical files without overwriting the new CURRENT.json parent pointer
+            for fname, data in preserved.items():
+                if data is not None:
+                    try:
+                        (wdir / fname).write_bytes(data)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to restore preserved state {fname} after re-pull: {e}") from e
             # Need new candidate_id for retry (promote quarantined previous)
             candidate_id = f"cand-{uuid.uuid4().hex[:8]}"
             last_verdict = verdict
