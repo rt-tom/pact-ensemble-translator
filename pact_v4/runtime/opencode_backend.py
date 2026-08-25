@@ -331,6 +331,14 @@ class OpenCodeServerBackendConfig:
     # backend identity — a contract change invalidates cache/resume.
     reasoning_effort_map: Optional[Mapping[int, str]] = None
 
+    # Remote default reasoning level (profile-bearing, identity-bearing).
+    # Explicitly records the generation reasoning budget for this backend
+    # (0=off baseline, 1=low, 2=medium, 3=high). Code default 0 is fallback
+    # only when profile omits the field to preserve backward compatibility;
+    # canonical remote profile MUST set it explicitly. Part of effective_options
+    # identity so a policy change invalidates cache/resume.
+    reasoning: Optional[int] = None
+
     # Effective sampling settings (plan §5.4). The verified server lines
     # cannot send these in the message body, but they belong in backend
     # identity so a change in requested sampling invalidates cache/resume
@@ -399,6 +407,17 @@ class OpenCodeServerBackendConfig:
                     f"non-empty reasoningEffort strings (bad levels: {empty})"
                 )
             object.__setattr__(self, "reasoning_effort_map", effort_map)
+        if self.reasoning is not None:
+            if isinstance(self.reasoning, bool) or not isinstance(self.reasoning, int):
+                raise ValueError(
+                    "OpenCodeServerBackendConfig: reasoning must be an integer 0-3, "
+                    f"got {self.reasoning!r}"
+                )
+            if self.reasoning not in (0, 1, 2, 3):
+                raise ValueError(
+                    "OpenCodeServerBackendConfig: reasoning must be 0-3, "
+                    f"got {self.reasoning!r}"
+                )
 
 
 def _parse_model_ref(model_ref: str) -> Tuple[str, str]:
@@ -473,6 +492,8 @@ def build_opencode_descriptor(
         effective_options["reasoning_effort_map"] = dict(
             sorted(cfg.reasoning_effort_map.items())
         )
+    if cfg.reasoning is not None:
+        effective_options["reasoning"] = int(cfg.reasoning)
     return BackendDescriptor(
         kind=KIND_OPENCODE_SERVER,
         transport_version=cfg.transport_version,

@@ -818,7 +818,9 @@ def _reasoning_budget_from_server_args(args: Sequence[str]) -> Optional[int]:
         ) from None
 
 
-def validate_reasoning_backend(reasoning: int, backend: Any) -> None:
+def validate_reasoning_backend(reasoning: Optional[int], backend: Any) -> None:
+    if reasoning is None:
+        reasoning = 0
     """Validate the Phase 2B reasoning budget against the generator backend.
 
     V4.1 A2 principle (owner-verified 2026-08-08: ``reasoning-budget 2048``
@@ -1100,13 +1102,60 @@ class ProvidersRegistry:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "providers", dict(self.providers))
+        norm_providers: Dict[str, str] = {}
+        for provider_id in self.providers:
+            lower = provider_id.lower()
+            if lower in norm_providers:
+                raise ValueError(
+                    f"ProvidersRegistry: duplicate provider id case-insensitively {provider_id!r} "
+                    f"collides with {norm_providers[lower]!r}"
+                )
+            norm_providers[lower] = provider_id
+        object.__setattr__(self, "_norm_provider_map", norm_providers)  # type: ignore[attr-defined]
+        alias_lower_to_ref: Dict[str, Tuple[str, str]] = {}
+        for provider_id, models in self.providers.items():
+            for alias in models:
+                lower = alias.lower()
+                if lower in alias_lower_to_ref:
+                    prev_provider, prev_alias = alias_lower_to_ref[lower]
+                    raise ValueError(
+                        f"ProvidersRegistry: duplicate alias {alias!r} (normalized {lower!r}) "
+                        f"across providers {prev_provider!r}/{prev_alias!r} and {provider_id!r}/{alias!r} — "
+                        f"aliases must be globally unique case-insensitively; use provider-qualified resolution only after fixing the registry"
+                    )
+                alias_lower_to_ref[lower] = (provider_id, alias)
+        object.__setattr__(self, "_alias_index", alias_lower_to_ref)  # type: ignore[attr-defined]
+        bare_map: Dict[str, ProviderModel] = {}
+        for (provider_id, alias), model in self._iter_alias_models():  # type: ignore[attr-defined]
+            bare_map[alias.lower()] = model
+        object.__setattr__(self, "_bare_index", bare_map)  # type: ignore[attr-defined]
+
+    def _iter_alias_models(self):  # type: ignore[no-untyped-def]
+        for provider_id, models in self.providers.items():
+            for alias, model in models.items():
+                yield (provider_id, alias), model
+
+    def resolve_bare(self, alias: str) -> ProviderModel:
+        """Resolve a bare alias case-insensitively via the global index."""
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError(f"providers registry: bare alias must be a non-empty string, got {alias!r}")
+        lower = alias.lower()
+        bare_index: Dict[str, ProviderModel] = getattr(self, "_bare_index", {})  # type: ignore[attr-defined]
+        model = bare_index.get(lower)
+        if model is None:
+            raise ValueError(
+                f"providers registry: unknown bare alias {alias!r} "
+                f"(known aliases: {sorted(bare_index)})"
+            )
+        return model
 
     def resolve(self, spec: str) -> ProviderModel:
         """Resolve ``<provider>/<alias>`` (CLI flag value) to a model entry.
 
         The flag format uses a SLASH (not a dash) because model ids already
         contain dashes (``deepseek-v4-flash``) — a dash separator would be
-        ambiguous (owner decision 2026-08-14).
+        ambiguous (owner decision 2026-08-14). Lookup is case-insensitive for
+        both provider and alias; duplicates are rejected at load time.
         """
         if not isinstance(spec, str):
             raise ValueError(f"providers registry: spec must be a string, got {spec!r}")
@@ -1117,19 +1166,23 @@ class ProvidersRegistry:
                 "(slash separator; e.g. opencode-go/deepseek4flash)"
             )
         provider, alias = parts
-        models = self.providers.get(provider)
-        if models is None:
+        norm_map: Dict[str, str] = getattr(self, "_norm_provider_map", {})  # type: ignore[attr-defined]
+        canonical_provider = norm_map.get(provider.lower())
+        if canonical_provider is None:
             raise ValueError(
                 f"providers registry: unknown provider {provider!r} "
                 f"(known: {sorted(self.providers)})"
             )
-        model = models.get(alias)
-        if model is None:
-            raise ValueError(
-                f"providers registry: unknown alias {provider!r}/{alias!r} "
-                f"(known: {sorted(models)})"
-            )
-        return model
+        models = self.providers.get(canonical_provider)
+        assert models is not None
+        lower_alias = alias.lower()
+        for key, model in models.items():
+            if key.lower() == lower_alias:
+                return model
+        raise ValueError(
+            f"providers registry: unknown alias {canonical_provider!r}/{alias!r} "
+            f"(known: {sorted(models)})"
+        )
 
 
 def load_providers_registry(path: Path) -> ProvidersRegistry:
@@ -1536,20 +1589,121 @@ def load_runtime_config(payload: Mapping[str, Any]) -> BackendRuntimeConfig:
     raise ValueError(f"load_runtime_config: unknown kind {kind!r}")
 
 
+SUPPORTED_LOCAL_MODEL_KEYS = frozenset({"gemma", "qwen"})
+_ALLOWED_LOCAL_KEYS = frozenset({
+    "kind", "exe", "device", "host", "port",
+    "startup_timeout", "unload_timeout",
+    "model_paths", "model_names", "server_args",
+})
+
+
 def _load_local(payload: Mapping[str, Any]) -> LocalLlamaBackendConfig:
-    model_paths = {k: Path(v) for k, v in (payload.get("model_paths") or {}).items()}
-    model_names = dict(payload.get("model_names") or {})
-    server_args = {k: list(v) for k, v in (payload.get("server_args") or {}).items()}
-    if not model_paths:
-        raise ValueError("load_runtime_config[local_llama]: model_paths required")
+    unknown = set(payload) - _ALLOWED_LOCAL_KEYS
+    if unknown:
+        raise ValueError(
+            "load_runtime_config[local_llama]: unsupported key(s) "
+            f"{sorted(unknown)} — allowed: {sorted(_ALLOWED_LOCAL_KEYS)}"
+        )
+    exe_raw = payload.get("exe")
+    if not isinstance(exe_raw, str) or not exe_raw.strip():
+        raise ValueError(
+            "load_runtime_config[local_llama]: exe is required and must be a non-empty string"
+        )
+    device = payload.get("device", "SYCL0")
+    if not isinstance(device, str) or not device.strip():
+        raise ValueError("load_runtime_config[local_llama]: device must be a non-empty string")
+    host = payload.get("host", "127.0.0.1")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("load_runtime_config[local_llama]: host must be a non-empty string")
+    # Host locality: only loopback hosts are permitted for local profile.
+    # Reject external, malformed, or non-local hosts before lifecycle.
+    host_stripped = host.strip()
+    allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+    if host_stripped not in allowed_hosts:
+        # Also allow 127.x.x.x loopback range via ipaddress check
+        import ipaddress as _ipaddr
+        try:
+            ip = _ipaddr.ip_address(host_stripped)
+            if not ip.is_loopback:
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                "load_runtime_config[local_llama]: host must be a local loopback host "
+                f"(allowed: {sorted(allowed_hosts)} or 127.* loopback), got {host!r}"
+            ) from None
+    port_raw = payload.get("port", 8093)
+    if isinstance(port_raw, bool):
+        raise ValueError(f"load_runtime_config[local_llama]: port must be an integer 1-65535, got {port_raw!r} (bool is not a valid port)")
+    if not isinstance(port_raw, int):
+        raise ValueError(f"load_runtime_config[local_llama]: port must be an integer 1-65535, got {port_raw!r}")
+    port = port_raw
+    if not 1 <= port <= 65535:
+        raise ValueError(f"load_runtime_config[local_llama]: port must be 1-65535, got {port}")
+    for timeout_key in ("startup_timeout", "unload_timeout"):
+        if timeout_key in payload:
+            try:
+                val = float(payload[timeout_key])
+            except (TypeError, ValueError):
+                raise ValueError(f"load_runtime_config[local_llama]: {timeout_key} must be a number, got {payload[timeout_key]!r}") from None
+            if timeout_key == "startup_timeout" and val <= 0:
+                raise ValueError(f"load_runtime_config[local_llama]: startup_timeout must be > 0, got {val}")
+            if timeout_key == "unload_timeout" and val < 0:
+                raise ValueError(f"load_runtime_config[local_llama]: unload_timeout must be >= 0, got {val}")
+    raw_model_paths = payload.get("model_paths")
+    if not isinstance(raw_model_paths, Mapping) or not raw_model_paths:
+        raise ValueError("load_runtime_config[local_llama]: model_paths is required and must be a non-empty mapping")
+    raw_model_names = payload.get("model_names")
+    if not isinstance(raw_model_names, Mapping) or not raw_model_names:
+        raise ValueError("load_runtime_config[local_llama]: model_names is required and must be a non-empty mapping")
+    raw_server_args = payload.get("server_args")
+    if not isinstance(raw_server_args, Mapping) or not raw_server_args:
+        raise ValueError("load_runtime_config[local_llama]: server_args is required and must be a non-empty mapping")
+    for key in raw_model_paths:
+        if key not in SUPPORTED_LOCAL_MODEL_KEYS:
+            raise ValueError(f"load_runtime_config[local_llama]: unsupported model key {key!r} in model_paths (allowed: {sorted(SUPPORTED_LOCAL_MODEL_KEYS)})")
+    for key in raw_model_names:
+        if key not in SUPPORTED_LOCAL_MODEL_KEYS:
+            raise ValueError(f"load_runtime_config[local_llama]: unsupported model key {key!r} in model_names (allowed: {sorted(SUPPORTED_LOCAL_MODEL_KEYS)})")
+    for key in raw_server_args:
+        if key not in SUPPORTED_LOCAL_MODEL_KEYS:
+            raise ValueError(f"load_runtime_config[local_llama]: unsupported model key {key!r} in server_args (allowed: {sorted(SUPPORTED_LOCAL_MODEL_KEYS)})")
+    keys_paths = set(raw_model_paths)
+    keys_names = set(raw_model_names)
+    keys_args = set(raw_server_args)
+    if not (keys_paths == keys_names == keys_args):
+        raise ValueError(
+            "load_runtime_config[local_llama]: model_paths, model_names and server_args must describe the same "
+            f"non-empty model keys; got model_paths={sorted(keys_paths)}, model_names={sorted(keys_names)}, server_args={sorted(keys_args)}"
+        )
+    model_paths: Dict[str, Path] = {}
+    for k, v in raw_model_paths.items():
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"load_runtime_config[local_llama]: model_paths[{k!r}] must be a non-empty string path, got {v!r}")
+        model_paths[k] = Path(v)
+    model_names: Dict[str, str] = {}
+    for k, v in raw_model_names.items():
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"load_runtime_config[local_llama]: model_names[{k!r}] must be a non-empty string, got {v!r}")
+        model_names[k] = v
+    server_args: Dict[str, List[str]] = {}
+    for k, v in raw_server_args.items():
+        if not isinstance(v, list):
+            raise ValueError(f"load_runtime_config[local_llama]: server_args[{k!r}] must be a list of strings, got {type(v).__name__}")
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError(
+                    "load_runtime_config[local_llama]: server_args must contain only strings, got "
+                    f"{k}: {v!r} (quote YAML 1.1 bool words like `on`/`off`/`yes`/`no` in the runtime config)"
+                )
+        server_args[k] = list(v)
     return LocalLlamaBackendConfig(
-        exe=Path(payload["exe"]),
-        device=payload.get("device", "SYCL0"),
-        host=payload.get("host", "127.0.0.1"),
+        exe=Path(exe_raw),
+        device=device,
+        host=host,
         model_paths=model_paths,
         model_names=model_names,
         server_args=server_args,
-        port=int(payload.get("port", 8093)),
+        port=port,
         startup_timeout=float(payload.get("startup_timeout", 240.0)),
         unload_timeout=float(payload.get("unload_timeout", 30.0)),
     )
@@ -1671,6 +1825,7 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
         "retry_delay_seconds", "agent", "system_prompt",
         "system_prompt_version", "session_scope", "retain_success_sessions",
         "retain_failed_sessions", "tools_disabled", "reasoning_effort_map",
+        "reasoning",
     }
     _unknown = set(payload) - _allowed_opencode_keys
     if _unknown:
@@ -1735,6 +1890,23 @@ def _load_opencode(payload: Mapping[str, Any]) -> OpenCodeBackendConfig:
         server_kwargs["http_retries"] = int(payload["http_retries"])
     if "retry_delay_seconds" in payload:
         server_kwargs["retry_delay_seconds"] = float(payload["retry_delay_seconds"])
+    # Profile-bearing reasoning default (identity-bearing, 0-3).
+    # When present, CLI omission uses profile value; explicit CLI overrides.
+    if "reasoning" in payload and payload["reasoning"] is not None:
+        raw_reasoning = payload["reasoning"]
+        if isinstance(raw_reasoning, bool):
+            raise ValueError(
+                f"load_runtime_config[opencode_server]: reasoning must be an integer 0-3, got {raw_reasoning!r} (bool is not valid)"
+            )
+        if not isinstance(raw_reasoning, int):
+            raise ValueError(
+                f"load_runtime_config[opencode_server]: reasoning must be an integer 0-3, got {raw_reasoning!r}"
+            )
+        if raw_reasoning not in (0, 1, 2, 3):
+            raise ValueError(
+                f"load_runtime_config[opencode_server]: reasoning must be 0-3, got {raw_reasoning!r}"
+            )
+        server_kwargs["reasoning"] = int(raw_reasoning)
     if reasoning_effort_map is not None:
         server_kwargs["reasoning_effort_map"] = reasoning_effort_map
     if remote_budget is not None:
@@ -1764,6 +1936,182 @@ def _load_composite(payload: Mapping[str, Any]) -> CompositeBackendConfig:
     return CompositeBackendConfig(
         backends=backends,
         role_backend_map=role_backend_map,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Offline host-local preflight (host filesystem/port/env checks only)
+# ---------------------------------------------------------------------------
+
+import json as _json
+import os as _os
+import socket as _socket
+
+
+@dataclass(frozen=True)
+class PreflightCheck:
+    """One host-local check result (never contains credential values)."""
+
+    name: str
+    ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class PreflightReport:
+    """Sanitized, offline preflight result for a resolved runtime profile."""
+
+    ok: bool
+    kind: str
+    identity_hash: str
+    public_record: Mapping[str, Any]
+    model_bindings: Mapping[str, str]
+    effective_options: Mapping[str, Any]
+    checks: Sequence[PreflightCheck]
+    errors: Sequence[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "kind": self.kind,
+            "identity_hash": self.identity_hash,
+            "public_record": dict(self.public_record),
+            "model_bindings": dict(self.model_bindings),
+            "effective_options": dict(self.effective_options),
+            "checks": [{"name": c.name, "ok": c.ok, "detail": c.detail} for c in self.checks],
+            "errors": list(self.errors),
+        }
+
+    def to_json(self) -> str:
+        return _json.dumps(self.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+
+    def format_human(self) -> str:
+        lines: List[str] = []
+        lines.append(f"Runtime preflight: {'PASS' if self.ok else 'FAIL'}")
+        lines.append(f"  kind: {self.kind}")
+        lines.append(f"  identity: {self.identity_hash}")
+        if self.model_bindings:
+            lines.append(f"  bindings: {dict(self.model_bindings)}")
+        if self.effective_options:
+            # Only top-level effective_options keys for readability
+            lines.append(f"  policy: {dict(self.effective_options)}")
+        lines.append("  checks:")
+        for c in self.checks:
+            status = "OK" if c.ok else "FAIL"
+            lines.append(f"    - {c.name}: {status} {c.detail}")
+        if self.errors:
+            lines.append("  errors:")
+            for e in self.errors:
+                lines.append(f"    - {e}")
+        return "\n".join(lines)
+
+
+def _preflight_check_local(cfg: LocalLlamaBackendConfig) -> List[PreflightCheck]:
+    checks: List[PreflightCheck] = []
+    exe = Path(cfg.exe)
+    if exe.is_file():
+        checks.append(PreflightCheck(name=f"exe {exe}", ok=True, detail="present"))
+    else:
+        checks.append(PreflightCheck(name=f"exe {exe}", ok=False, detail="missing or not a file"))
+    for key in sorted(cfg.model_paths):
+        p = Path(cfg.model_paths[key])
+        if p.is_file():
+            checks.append(PreflightCheck(name=f"model_path {key}:{p}", ok=True, detail="present"))
+        else:
+            checks.append(PreflightCheck(name=f"model_path {key}:{p}", ok=False, detail="missing or not a file"))
+    # Port range already validated at load; here check host/port readiness without starting server
+    try:
+        port_ok = 1 <= int(cfg.port) <= 65535
+    except Exception:
+        port_ok = False
+    if port_ok:
+        # Try to see if port is obviously invalid on localhost without binding aggressively.
+        # We attempt a non-blocking bind to detect EADDRINUSE, but treat any failure conservatively as FAIL.
+        # Select address family to match host: ::1 requires AF_INET6, otherwise AF_INET (preserves safe-local-host validation).
+        try:
+            bind_host = cfg.host if cfg.host not in ("", "0.0.0.0") else "127.0.0.1"
+            is_ipv6 = ":" in bind_host
+            family = _socket.AF_INET6 if is_ipv6 else _socket.AF_INET
+            with _socket.socket(family, _socket.SOCK_STREAM) as s:
+                s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                if is_ipv6:
+                    s.bind((bind_host, int(cfg.port), 0, 0))
+                else:
+                    s.bind((bind_host, int(cfg.port)))
+            checks.append(PreflightCheck(name=f"port {cfg.host}:{cfg.port}", ok=True, detail="available"))
+        except OSError as exc:
+            # If the port is already in use or host invalid, report as FAIL but do not start server.
+            checks.append(PreflightCheck(name=f"port {cfg.host}:{cfg.port}", ok=False, detail=f"unavailable: {exc.strerror or exc}"))
+    else:
+        checks.append(PreflightCheck(name=f"port {cfg.host}:{cfg.port}", ok=False, detail="invalid port range"))
+    return checks
+
+
+def _preflight_check_opencode(cfg: OpenCodeBackendConfig) -> List[PreflightCheck]:
+    checks: List[PreflightCheck] = []
+    for env_name in (cfg.server.username_env, cfg.server.password_env):
+        val = _os.environ.get(env_name)
+        if val:
+            checks.append(PreflightCheck(name=f"env {env_name}", ok=True, detail="present"))
+        else:
+            checks.append(PreflightCheck(name=f"env {env_name}", ok=False, detail="missing or empty"))
+    # Config syntax already validated at load; report that as a check
+    checks.append(PreflightCheck(name="config syntax", ok=True, detail="valid"))
+    return checks
+
+
+def run_runtime_preflight(
+    cfg: BackendRuntimeConfig,
+    *,
+    reasoning: Optional[int] = None,
+) -> PreflightReport:
+    """Offline, host-local preflight for a resolved runtime config.
+
+    No server is started, no network request is made, no artifacts are
+    created, and no credential values are read or emitted — only the
+    presence of required environment variables is reported by name.
+    The ``cfg`` should already include any translator/reviewer overrides
+    so the reported identity/bindings are exactly what the run would use.
+    """
+    errors: List[str] = []
+    checks: List[PreflightCheck] = []
+    if reasoning is not None:
+        try:
+            validate_reasoning_backend(reasoning, cfg)
+            checks.append(PreflightCheck(name=f"reasoning {reasoning}", ok=True, detail="compatible with generator backend"))
+        except ValueError as exc:
+            errors.append(str(exc))
+            checks.append(PreflightCheck(name=f"reasoning {reasoning}", ok=False, detail=str(exc)))
+    # Collect host checks per kind
+    if isinstance(cfg, LocalLlamaBackendConfig):
+        checks.extend(_preflight_check_local(cfg))
+    elif isinstance(cfg, OpenCodeBackendConfig):
+        checks.extend(_preflight_check_opencode(cfg))
+    elif isinstance(cfg, CompositeBackendConfig):
+        for name in sorted(cfg.backends):
+            sub = cfg.backends[name]
+            sub_checks: List[PreflightCheck] = []
+            if isinstance(sub, LocalLlamaBackendConfig):
+                sub_checks = _preflight_check_local(sub)
+            elif isinstance(sub, OpenCodeBackendConfig):
+                sub_checks = _preflight_check_opencode(sub)
+            else:
+                sub_checks = [PreflightCheck(name=f"backend {name}", ok=True, detail="unknown kind, no host checks")]
+            for c in sub_checks:
+                checks.append(PreflightCheck(name=f"{name}/{c.name}", ok=c.ok, detail=c.detail))
+    else:
+        errors.append(f"unknown config kind {type(cfg).__name__}")
+    ok = all(c.ok for c in checks) and not errors
+    descriptor = cfg.build_descriptor()
+    return PreflightReport(
+        ok=ok,
+        kind=descriptor.kind,
+        identity_hash=descriptor.identity_hash,
+        public_record=descriptor.public_record(),
+        model_bindings=dict(descriptor.model_bindings or {}),
+        effective_options=dict(descriptor.effective_options or {}),
+        checks=tuple(checks),
+        errors=tuple(errors),
     )
 
 
@@ -1803,4 +2151,8 @@ __all__ = [
     "build_role_adapters",
     "build_repair_adapters",
     "JsonRetryPolicy",
+    "PreflightCheck",
+    "PreflightReport",
+    "run_runtime_preflight",
+    "SUPPORTED_LOCAL_MODEL_KEYS",
 ]

@@ -201,8 +201,13 @@ def test_remote_config_reasoning_still_reaches_run_config(tmp_path: Path, level:
 
 def test_remote_config_reasoning_zero_is_baseline(tmp_path: Path):
     # reasoning=0 (default) is untouched by the policy on any backend.
+    # Parser default is None to distinguish omission (profile default) from explicit 0;
+    # legacy no-config helper treats None as 0 baseline.
     args = cli.build_argparser().parse_args(_base_args(tmp_path))
-    assert args.reasoning == 0
+    assert args.reasoning is None
+    # legacy helper and validate treat None as baseline 0
+    assert cli._gemma_server_args_for_reasoning(args.reasoning)[cli._gemma_server_args_for_reasoning(args.reasoning).index("--reasoning-budget") + 1] == "0"
+    cli.validate_reasoning_backend(args.reasoning, _remote_cfg())
     cfg = cli._build_run_config(args, _remote_cfg())
     assert cfg.reasoning == 0
 

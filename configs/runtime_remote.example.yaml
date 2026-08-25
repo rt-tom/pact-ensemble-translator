@@ -1,50 +1,17 @@
-# V4 C3 example: fully remote profile over an `opencode serve` endpoint
-# (no secrets).
+# Canonical remote opencode_server profile — portable, policy-bearing.
+# No credentials or host-specific model paths in this file. Authentication
+# is via environment-variable names only; Pact resolves values at startup
+# and never persists them. Copy this file to the execution host and set
+# the declared env vars there.
 #
-# Auth is via environment variables only (plan §12): OPENCODE_SERVER_USERNAME
-# / OPENCODE_SERVER_PASSWORD are the basic-auth pair of the serve endpoint.
-# Pact reads the values from the environment at backend construction time and
-# never persists them. Edit the env-var names if your endpoint uses different
-# ones; never put the values themselves in this file.
-#
-# server_mode:
-#   external -- talk to a pre-started `opencode serve` on base_url;
-#   managed  -- Pact starts its own `opencode serve` (pinned version) and
-#               stops it after the run. Equivalent to `--managed-server`.
-#
-# V4.1 experiment flags (CLI, not this file):
-#   --reasoning {0,1,2,3}  -- Phase 2B generation reasoning budget only
-#       (0=off baseline, 1=low, 2=medium, 3=high). Sent to the remote
-#       provider as the top-level `reasoningEffort` on each generation
-#       request; the Qwen audit / formatting phases are untouched.
-#   --stop-after-generation -- halt right after Phase 1-2 (generation +
-#       selection): the chunked translation lands in translations.json and
-#       step6/step7/step8 are recorded as skipped_stop_after_generation.
-#   Both flags are part of the run's config identity, so such a run needs a
-#   NEW --out-dir (a prior out-base is NOT resumable under the new identity).
-#
-# Repair batches (B2) run with reasoning low (1) by default (REPAIR-ROBUST,
-# card t_b6fd6cbd): deepseek high burned 32k reasoning tokens on a repair
-# batch and exhausted max_tokens before content (run_0005 batch1). The
-# effort is a run-config knob (audit_repair_reasoning, identity-bearing),
-# NOT this file; it is sent via request_options ONLY to remote transports
-# (opencode reasoningEffort). Local llama-server transports receive their
-# budget from the server args (--reasoning-budget) and reject
-# request_options, so the local path is untouched.
-#
-# Running this profile sends the chapter text to the remote provider(s)
-# referenced by the model_bindings (plan §12 acknowledgement).
+# All identity-bearing policy is explicit here: role model bindings,
+# reasoning policy, timeout, remote budget, and structured-output policy.
+# Code defaults are compatibility fallbacks; omitted overrides use profile values.
+# Optional invocation overrides: --translator / --reviewer (provider/alias)
+# and --reasoning {0,1,2,3} (reasoning level) when supplied replace these defaults.
 kind: opencode_server
 server_mode: external
-# Port of the opencode serve endpoint. In managed mode (--managed-server /
-# server_mode: managed) this is the port Pact binds its OWN server to, so it
-# must be free: 4096 is commonly taken by other tools' opencode servers, so
-# the example uses 4097.
 base_url: http://127.0.0.1:4097
-# Version-agnostic since 2026-08-14 (owner decision): no version pin.
-# Any `opencode serve` (PATH shim or managed) is accepted; the running
-# version is logged into the preflight report / backend identity. The
-# fields below are informational (log-only) and keep config compatibility.
 server_version_policy: compatible_minor
 pinned_server_version: latest
 auth:
@@ -52,27 +19,18 @@ auth:
   username_env: OPENCODE_SERVER_USERNAME
   password_env: OPENCODE_SERVER_PASSWORD
 structured_output_mode: prompt_only
-# TIMEOUT-FIX (2026-08-13): whole-chapter generation with --reasoning 3
-# (high) takes up to ~10 min (run_remote_003: attempt 2 was cut at
-# exactly 600s, 003 streamed for 10+ min). 900s = 15 min transport budget
-# per HTTP request (owner decision 2026-08-13: 900, explicitly NOT 2400 —
-# headroom over the real 7-10 min) so long generations are not aborted.
-# This is an IDENTITY parameter (build_opencode_descriptor serializes
-# timeout_seconds): changing it invalidates cache/resume — change it only
-# BETWEEN runs (like --run-label), never mid-run.
 timeout_seconds: 900
-# Remote budget (B11): max_requests_per_chapter caps model requests per
-# chapter (full cycle ~350-400 incl. convergence/repair/formatting/
-# quarantined-retry; default 500 keeps a reserve). This is an
-# IDENTITY parameter — changing it invalidates cache/resume, so change it
-# only BETWEEN runs (like --run-label), never mid-run.
 remote_budget:
   max_requests_per_chapter: 500
+reasoning: 0
 model_bindings:
   generator: opencode-go/deepseek-v4-flash
   fidelity_reviewer: opencode-go/qwen3.7-plus
   russian_selector: opencode-go/qwen3.7-plus
   qwen_audit: opencode-go/qwen3.7-plus
   gemma_audit: opencode-go/deepseek-v4-flash
-  # Phase 4A region repair (B2). Falls back to `generator` when unset.
   repair: opencode-go/deepseek-v4-flash
+reasoning_effort_map:
+  1: low
+  2: medium
+  3: high

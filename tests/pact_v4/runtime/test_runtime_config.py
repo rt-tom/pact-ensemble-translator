@@ -486,7 +486,7 @@ def test_load_composite_config():
                 "exe": "C:/llama/llama-server.exe",
                 "model_paths": {"gemma": "C:/m/gemma.gguf"},
                 "model_names": {"gemma": "gemma"},
-                "server_args": {},
+                "server_args": {"gemma": []},
             },
             "remote": {
                 "kind": "opencode_server",

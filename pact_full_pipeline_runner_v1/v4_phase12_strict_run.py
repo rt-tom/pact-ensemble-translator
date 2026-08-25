@@ -61,6 +61,7 @@ from pact_v4.runtime.runtime_config import (
     build_role_backend,
     load_providers_registry,
     load_runtime_config,
+    run_runtime_preflight,
     validate_reasoning_backend,
 )
 from pact_v4.runtime.runtime_coordinator import LocalLifecycleCoordinator
@@ -133,7 +134,7 @@ QWEN_SERVER_ARGS = [
 ]
 
 
-def _gemma_server_args_for_reasoning(reasoning: int) -> list:
+def _gemma_server_args_for_reasoning(reasoning: Optional[int]) -> list:
     """The §3.4 sycl-edge Gemma server args bound to the selected reasoning.
 
     V4.1 A2 review fix (RV, commit 4ab250b): the local generator's reasoning
@@ -146,7 +147,8 @@ def _gemma_server_args_for_reasoning(reasoning: int) -> list:
     the identity denies. The base §3.4 args (``GEMMA_SERVER_ARGS``) are
     unchanged — only the budget value is derived here.
     """
-    budget = "2048" if reasoning > 0 else "0"
+    effective = 0 if reasoning is None else int(reasoning)
+    budget = "2048" if effective > 0 else "0"
     args = list(GEMMA_SERVER_ARGS)
     for index, arg in enumerate(args):
         if arg == "--reasoning-budget" and index + 1 < len(args):
@@ -213,13 +215,16 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Start Pact's own 'opencode serve' for every OpenCode "
                          "backend in the runtime config (server_mode=managed) and "
                          "stop it after the run. Ignored without --runtime-config.")
-    p.add_argument("--reasoning", type=int, choices=(0, 1, 2, 3), default=0,
+    p.add_argument("--reasoning", type=int, choices=(0, 1, 2, 3), default=None,
                    help="V4.1: Phase 2B generation reasoning budget (0=off, "
                         "1=low, 2=medium, 3=high). Applied ONLY to generation "
                         "(opencode serve 'reasoningEffort'); the Qwen audit / "
                         "repair / formatting phases are untouched. Part of the "
                         "config identity — a reasoning change invalidates "
-                        "cache/resume, so use a NEW --out-dir.")
+                        "cache/resume, so use a NEW --out-dir. When --runtime-config "
+                        "is used and this flag is omitted, the profile's explicit "
+                        "reasoning value is used (canonical remote profile sets 0); "
+                        "otherwise 0 is the code fallback.")
     p.add_argument("--stop-after-generation", action="store_true",
                    help="V4.1 A1: early exit right after Phase 1-2 generation "
                         "(chunked runs: generation + per-chunk selection). "
@@ -302,6 +307,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="PROVIDERS-REGISTRY: path to providers.yaml (default: "
                         "configs/providers.yaml next to this module). Only "
                         "read when --translator or --reviewer is given.")
+    p.add_argument("--preflight", action="store_true",
+                    help="Offline host-local preflight: validate the resolved runtime profile, print sanitized report and exit without running the pipeline. Runs by default before every configured run.")
+    p.add_argument("--preflight-json", action="store_true",
+                    help="With --preflight, emit JSON report instead of human-readable (for automation).")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -511,7 +520,122 @@ def _load_arc_names(args: argparse.Namespace) -> Tuple[Tuple[str, str], ...]:
     return ()
 
 
-def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig:
+def _resolve_effective_reasoning(args: argparse.Namespace, backend: Any) -> int:
+    """Resolve generation reasoning: explicit CLI overrides profile, profile fallback to 0."""
+    if args.reasoning is not None:
+        return int(args.reasoning)
+    # Profile-bearing default (canonical remote profile explicitly sets reasoning;
+    # canonical local profile pins Gemma --reasoning-budget 2048)
+    if isinstance(backend, OpenCodeBackendConfig):
+        if backend.server.reasoning is not None:
+            return int(backend.server.reasoning)
+    elif isinstance(backend, LocalLlamaBackendConfig):
+        try:
+            from pact_v4.runtime.runtime_config import (
+                _local_generator_server_args,
+                _reasoning_budget_from_server_args,
+            )
+            budget = _reasoning_budget_from_server_args(_local_generator_server_args(backend))
+            if budget is not None and budget > 0:
+                # Canonical local profile uses 2048 for any >0 budget; choose medium (2) as default
+                return 2
+            return 0
+        except Exception:
+            return 0
+    elif isinstance(backend, CompositeBackendConfig):
+        # Prefer generator role's backend reasoning when composite
+        try:
+            from pact_v4.runtime.runtime_config import _generator_backend_cfg
+            gen = _generator_backend_cfg(backend)
+            if isinstance(gen, OpenCodeBackendConfig) and gen.server.reasoning is not None:
+                return int(gen.server.reasoning)
+            if isinstance(gen, LocalLlamaBackendConfig):
+                from pact_v4.runtime.runtime_config import (
+                    _local_generator_server_args,
+                    _reasoning_budget_from_server_args,
+                )
+                budget = _reasoning_budget_from_server_args(_local_generator_server_args(gen))
+                if budget is not None and budget > 0:
+                    return 2
+                return 0
+            for sub in backend.backends.values():
+                if isinstance(sub, OpenCodeBackendConfig) and sub.server.reasoning is not None:
+                    return int(sub.server.reasoning)
+                if isinstance(sub, LocalLlamaBackendConfig):
+                    from pact_v4.runtime.runtime_config import (
+                        _local_generator_server_args,
+                        _reasoning_budget_from_server_args,
+                    )
+                    b = _reasoning_budget_from_server_args(_local_generator_server_args(sub))
+                    if b is not None and b > 0:
+                        return 2
+        except Exception:
+            pass
+    return 0
+
+
+def _with_reasoning_override(backend: Any, reasoning: int) -> Any:
+    """Return backend copy with reasoning overridden (for identity/report)."""
+    if isinstance(backend, LocalLlamaBackendConfig):
+        # Derive coherent Gemma server args from explicit reasoning, mirroring no-config path
+        new_args = dict(backend.server_args)
+        new_args["gemma"] = _gemma_server_args_for_reasoning(int(reasoning))
+        return replace(backend, server_args=new_args)
+    if isinstance(backend, OpenCodeBackendConfig):
+        return replace(backend, server=replace(backend.server, reasoning=int(reasoning)))
+    if isinstance(backend, CompositeBackendConfig):
+        try:
+            from pact_v4.runtime.runtime_config import _generator_backend_cfg as _gen_cfg
+            gen = _gen_cfg(backend)
+            if isinstance(gen, OpenCodeBackendConfig):
+                name = None
+                # Find generator backend name
+                for n, sub in backend.backends.items():
+                    if sub is gen:
+                        name = n
+                        break
+                if name is None:
+                    # Fallback scan by identity
+                    for n, sub in backend.backends.items():
+                        if isinstance(sub, OpenCodeBackendConfig) and sub is gen:
+                            name = n
+                            break
+                if name is not None:
+                    new_backends = dict(backend.backends)
+                    new_backends[name] = replace(gen, server=replace(gen.server, reasoning=int(reasoning)))
+                    return replace(backend, backends=new_backends)
+            elif isinstance(gen, LocalLlamaBackendConfig):
+                name = None
+                for n, sub in backend.backends.items():
+                    if sub is gen:
+                        name = n
+                        break
+                if name is not None:
+                    new_args = dict(gen.server_args)
+                    new_args["gemma"] = _gemma_server_args_for_reasoning(int(reasoning))
+                    new_backends = dict(backend.backends)
+                    new_backends[name] = replace(gen, server_args=new_args)
+                    return replace(backend, backends=new_backends)
+        except Exception:
+            pass
+        # Fallback: update first opencode or local sub-backend with coherent args
+        for n, sub in backend.backends.items():
+            if isinstance(sub, OpenCodeBackendConfig):
+                new_backends = dict(backend.backends)
+                new_backends[n] = replace(sub, server=replace(sub.server, reasoning=int(reasoning)))
+                return replace(backend, backends=new_backends)
+        for n, sub in backend.backends.items():
+            if isinstance(sub, LocalLlamaBackendConfig):
+                new_args = dict(sub.server_args)
+                new_args["gemma"] = _gemma_server_args_for_reasoning(int(reasoning))
+                new_backends = dict(backend.backends)
+                new_backends[n] = replace(sub, server_args=new_args)
+                return replace(backend, backends=new_backends)
+    return backend
+
+
+def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Optional[int] = None) -> StrictRunConfig:
+    effective_reasoning = reasoning if reasoning is not None else _resolve_effective_reasoning(args, backend)
     return StrictRunConfig(
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
         out_dir=args.out_dir, backend=backend,
@@ -526,7 +650,7 @@ def _build_run_config(args: argparse.Namespace, backend: Any) -> StrictRunConfig
         # (StrictRunConfig.to_config_artifact), so a run with either set is
         # NOT resumable from a prior out-dir — the owner must pass a NEW
         # --out-dir for these experiment runs.
-        reasoning=args.reasoning,
+        reasoning=effective_reasoning,
         stop_after=("generation" if args.stop_after_generation else ""),
         # V4.1 A1: whole-chapter mode (one generation call per chapter).
         whole_chapter=args.whole_chapter,
@@ -887,6 +1011,7 @@ def run_local_default(args: argparse.Namespace) -> int:
     calls through the backend boundary (``build_repair_adapters``), so local
     and remote profiles run the identical Phase 4 algorithm.
     """
+    effective_reasoning = int(args.reasoning) if args.reasoning is not None else 0
     backend = StrictBackendConfig(
         # V4.1 §3.4: sycl-edge build (reasoning-budget 2048 works; MTP off).
         exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
@@ -899,7 +1024,7 @@ def run_local_default(args: argparse.Namespace) -> int:
         # actual transport always agree — a default --reasoning 0 run never
         # starts the server with a reasoning budget the identity denies.
         server_args={
-            "gemma": _gemma_server_args_for_reasoning(args.reasoning),
+            "gemma": _gemma_server_args_for_reasoning(effective_reasoning),
             "qwen": QWEN_SERVER_ARGS,
         },
         port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
@@ -907,12 +1032,12 @@ def run_local_default(args: argparse.Namespace) -> int:
     # V4.1 A2: local no longer blocks --reasoning > 0 — the Gemma reasoning
     # budget is transported via the server args (--reasoning-budget 2048),
     # not request_options (validate_reasoning_backend accepts local now).
-    validate_reasoning_backend(args.reasoning, backend)
+    validate_reasoning_backend(effective_reasoning, backend)
     # F3 (B3 review): when the B3 audit will run, the local Qwen profile
     # must be B3-capable (MTP draft, reasoning 8192, context 49k) or the
     # run fails loudly — never silently audits with a non-B3 server.
     _validate_b3_qwen_profile(args, backend)
-    cfg = _build_run_config(args, backend)
+    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     # A2 review fix (whole-chapter retry ownership): in whole-chapter mode
@@ -956,14 +1081,34 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     backend = _apply_provider_flags(args, backend)
     if args.managed_server:
         backend = force_managed(backend)
+    effective_reasoning = _resolve_effective_reasoning(args, backend)
+    # Profile-bearing reasoning: explicit CLI override updates backend identity/report.
+    if args.reasoning is not None:
+        backend = _with_reasoning_override(backend, effective_reasoning)
     # V4.1 A2: local no longer blocks --reasoning > 0 — reasoning for local
     # is transported via server args (--reasoning-budget), not
     # request_options; validate_reasoning_backend accepts local now.
-    validate_reasoning_backend(args.reasoning, backend)
+    validate_reasoning_backend(effective_reasoning, backend)
     # F3 (B3 review): a local runtime profile that will run the B3 audit
     # must be B3-capable (MTP draft, reasoning 8192, context 49k) — fail
     # loudly instead of silently auditing with a non-B3 server profile.
     _validate_b3_qwen_profile(args, backend)
+    # Offline host-local preflight: runs by default before every configured run
+    # and as explicit --preflight check-and-exit. Sanitized report, no server/
+    # network/artifact side effects, no credential values.
+    preflight_report = run_runtime_preflight(backend, reasoning=effective_reasoning)
+    if args.preflight or args.preflight_json:
+        if args.preflight_json:
+            print(preflight_report.to_json())
+        else:
+            print(preflight_report.format_human())
+        return 0 if preflight_report.ok else 1
+    if not preflight_report.ok:
+        LOG.error("Offline preflight failed — refusing to start pipeline:\n%s", preflight_report.format_human())
+        # Do not create out_dir / artifacts on preflight failure
+        return 3
+    # Preflight passed — log sanitized report for auditability before startup
+    LOG.info("Offline preflight PASS:\n%s", preflight_report.format_human())
     _warn_remote_acknowledgement(backend)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
@@ -982,7 +1127,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
             backend, runtime, bible_text=bible_text, json_retry_policy=json_retry,
         )
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
-    cfg = _build_run_config(args, backend)
+    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
     b3_audit_repair = _build_b3_audit_repair(cfg, backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
@@ -1015,6 +1160,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "opencode_server or composite profile); the historical local "
             "llama-server path has no remote model bindings"
         )
+    if (args.preflight or args.preflight_json) and args.runtime_config is None:
+        raise ValueError("--preflight/--preflight-json require --runtime-config (offline preflight is only for the configured profile path)")
     if args.runtime_config is not None:
         return run_with_runtime_config(args)
     return run_local_default(args)
