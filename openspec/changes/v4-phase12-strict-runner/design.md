@@ -46,7 +46,18 @@ Constraints: any modularization must preserve file formats, field names, flush s
 
 - No migration. This change commits docs only. Later Phase 2 implementation change (still owner-approved) will propose actual splits, gated by re-validating this contract map and running `tests/pact_v4/pipeline/test_v4_phase12_strict_runner*` green.
 
+## Owner-approved future sequencing (2026-08-24)
+
+This planning change remains docs-only. The owner authorizes preparation of **separate, implementation-specific OpenSpec changes** for these bounded future stages, in order:
+
+1. characterization baseline tests for the frozen contracts;
+2. verbatim pure utility extraction (`_atomic_write_json`, `_left_context_hash`, `_pid_diffs`, simple artifact-path helpers);
+3. pure validation/view helpers (`_gates_passed`, `_pick_best_variant`, candidate/audit mapping);
+4. whole-chapter validation boundary (`_validate_whole_chapter_generation_record`, validation flags, reasoning persistence), preserving identical retry/event/error behavior.
+
+Every stage still requires its own approved implementation scope, isolated review, and relevant strict-runner tests. **Phase 5** (resume sidecars, identity-bearing cache/merge helpers, atomic/flush ordering, audit/repair cache loading) is explicitly blocked pending a separate high-risk design review and owner approval. The chunk loop, whole-chapter orchestrator, B3 wiring, `StrictRunConfig`, and journal writer/loader remain outside the authorized stages.
+
 ## Open Questions
 
-- Exact Phase 2 split granularity (e.g., `journal`, `whole_chapter`, `b3_pipeline`, `artifact_io`) will be decided after map review; not in this change.
+- Exact module boundaries and test fixtures for each owner-authorized future stage will be proposed in its own implementation OpenSpec; this planning change implements none.
 - `MAX_TOKENS_CEILING` style follow-ups stay in `v41-runtime-efficiency`; no overlap.

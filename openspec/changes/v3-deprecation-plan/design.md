@@ -40,6 +40,7 @@ Current state constraints:
   - Alternatives considered — keep v31 stage protocol as fallback for v4: rejected (v4 has its own strict runner contracts; mixing would re-introduce v3 failure modes like `max_consecutive_terminal_nonselections` vs `max_consecutive_nonselections`).
 
 - **Gates are owner-operated, not agent-operated:** every bucket transition from `historical`/`recovery` → `removable` requires explicit owner approval recorded in `DECISIONS.md` and a tag/provenance check.
+- **Owner decisions (2026-08-24):** Gate G1 inventory classification is approved; `v4_measurement_harness.py` is **historical**. For the future Gate G2, the selected retention policy is **C (tag-only)**: historical material may be removed from the working branch only after the required gates/evidence, while `archive/v3-main-20260802` remains the immutable retention source. This planning change still performs no move or deletion.
 
 ## Risks / Trade-offs
 
@@ -55,7 +56,7 @@ Planning-only change — no migration executes.
 
 **Future implementation (gated, not in this change) — ordered steps:**
 1. Gate G1 — Owner approves inventory/contract map (this change) and records decision in `DECISIONS.md`.
-2. Gate G2 — Owner selects disposition per bucket: `historical` → keep in-repo read-only (optionally move to `archive/v3/` with `git mv` preserving history) or extract to `archive/v3-main-20260802` tag only; `recovery` → keep until G3; `removable` → delete.
+2. Gate G2 — **Owner selection recorded 2026-08-24: policy C (tag-only).** After all required per-file evidence and G3 recovery checks, historical material may be removed from the working branch and retained through immutable `archive/v3-main-20260802`; no `archive/v3/` move is selected. `recovery` remains until G3; `removable` remains eligible only for a separate approved deletion change.
 3. Preparation — create `archive/v3/` mirror (if chosen) via `git mv` (not `rm`), verify `archive/v3-main-20260802` tag still resolves and `v31_common.VERSION` matches; run `openspec validate --strict` and `git diff --stat` hygiene.
 4. Execution — gated PR deletes only `removable` bucket files; CI must show `pytest tests/pact_v4 -q` and `compileall` still green (v4 has no import of legacy surface — verified by grep).
 5. Verification — `git log --follow -- <archived-path>` retains history; `docs/audits/pact_translation_benchmark_report_v4_1.md` still renders.
@@ -66,5 +67,5 @@ Planning-only change — no migration executes.
 
 ## Open Questions
 
-- Exact `archive/v3/` layout if owner prefers in-repo archival vs. tag-only retention — decision at G2 (inventory supports either; table records original path for both).
-- Whether `v4_measurement_harness.py` (shared Phase0A helper) is considered legacy or v4 historical — currently classified `historical` (read-only, no v4 runtime import), but could be reclassified `supported` if v4 book-run measurement still needs it; pending owner confirmation at G1 review.
+- Per-file implementation order and the evidence required to remove each historical path under policy C remain for the future implementation change.
+- `v4_measurement_harness.py` is confirmed **historical** (owner decision 2026-08-24); it is not a v4 production runtime dependency.

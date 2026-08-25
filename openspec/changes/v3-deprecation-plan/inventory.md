@@ -1,13 +1,13 @@
 # Inventory & Contract Map — v3/v31 legacy surface (read-only)
 
-> Planning-only artifact. No file was moved, deleted, or executed. Classification is advisory until Gates G1/G2 owner approval (see `design.md` §Migration Plan, `tasks.md` §3). Original paths are preserved for both in-repo and tag-only retention options.
+> Planning-only artifact. No file was moved, deleted, or executed. Owner approved Gate G1 classification and selected future Gate G2 policy C (tag-only) on 2026-08-24; implementation still requires the remaining per-file evidence and recovery gates. Original paths remain recorded for provenance.
 
 ## Legend
 
 | Bucket | Meaning | Retention | Requires owner gate to delete? |
 |---|---|---|---|
 | **supported** | Active production contract on `main` (v4). Not assigned to legacy files; listed for contrast. | keep, actively evolved | — |
-| **historical** | Frozen read-only reference; keep for audit/forensics; never executed in production. | keep (in-repo or `archive/v3-main-20260802` tag) | yes (G2) |
+| **historical** | Frozen read-only reference; keep for audit/forensics; never executed in production. | future policy C: immutable `archive/v3-main-20260802` tag only after approved gated removal from working branch | yes (G2) |
 | **test** | Offline harness / self-test / benchmark helper; never production. | keep while harness is useful; removable after harness retired | yes (G2) |
 | **recovery** | Minimal set to reproduce/roll back last v3.1.3 release (`archive/v3-main-20260802`) if ordered. | keep until explicit G2 retire | yes (G2+G3) |
 | **removable** | No history/recovery value; candidate for deletion after G2. No file is deleted in this change. | delete candidate (future gated PR) | yes (G2) |
@@ -59,7 +59,7 @@ Line counts are `wc -l` on the worktree HEAD `263398f`.
 | `pact_full_pipeline_runner_v1/self_test_v4_phase0c_gate.py` | 608 | Self-test for gate bench | **test** | As above; no live run | — |
 | `pact_full_pipeline_runner_v1/self_test_v4_phase12_strict_run.py` | 282 | Self-test for strict runner chapter trial | **test** | Validates strict runner harness | — |
 | `pact_full_pipeline_runner_v1/self_test_v4_v3_draft_compare.py` | 349 | Self-test for `v4_v3_draft_compare.py` | **test** | Compare harness test | — |
-| `pact_full_pipeline_runner_v1/v4_measurement_harness.py` | 538 | Phase 0A shared helpers (hashing, JSON/read, word count) | **historical** | Imported by Phase0C baseline; not a production runner; DECISIONS.md 2026-07-28/30 reserves it as read-only | `v4_measurement` helpers |
+| `pact_full_pipeline_runner_v1/v4_measurement_harness.py` | 538 | Phase 0A shared helpers (hashing, JSON/read, word count) | **historical** | Imported by Phase0C baseline; not a production runner; DECISIONS.md 2026-07-28/30 reserves it as read-only; owner confirmed this classification 2026-08-24 | `v4_measurement` helpers |
 | `pact_full_pipeline_runner_v1/v4_v3_draft_compare.py` | 479 | `v4_vs_v3` draft compare (read-only) | **test** | Measurement/comparison harness, not production translation | compare contract |
 | `pact_full_pipeline_runner_v1/compare_pipeline_review.py` | 1319 | Pipeline review comparator | **test** | Offline comparator; not production | — |
 | `pact_full_pipeline_runner_v1/verify_pipeline_issues.py` | 673 | Verify audit issues (v3) | **historical** | Invoked by `run_full_pipeline.ps1`; frozen | — |
