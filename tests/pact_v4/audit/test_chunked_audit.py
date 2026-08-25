@@ -37,6 +37,7 @@ from pact_v4.audit.chunked_audit import (
     pair_token_estimate,
     validate_chunk_json,
     validate_input_budget,
+    PROMPT_VERSION,
 )
 from pact_v4.runtime.backend_protocol import (
     BackendCallRecord,
@@ -480,6 +481,31 @@ def test_chunked_run_sends_v41_prompt_with_context_blocks() -> None:
         assert request.max_output_tokens == 12000
         # reasoning budget must NOT travel via request_options (server arg)
         assert request.request_options == {}
+
+
+def test_audit_prompt_v42_lenses_includes_literary_consistency_rules() -> None:
+    # Locks the LAIT-driven literary-consistency extension (change
+    # v41-audit-literary-lenses): the v4.1 prompt gains a RULE 19 section
+    # (voice/register continuity, cross-chunk seam, dialogue translationese,
+    # ambiguity flattening) scoped to the audited window, and the version
+    # bumps v4.1 -> v4.2-lenses. Zero real model calls.
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 41)]  # 2 chunks (36+4)
+    backend = ScriptedBackend([_ok_response([]), _ok_response([])])
+    evaluator = ChunkedAuditEvaluator(backend)
+    evaluator(chapter_id="0001", pairs=pairs)
+    assert PROMPT_VERSION == "pact-v4-reviewer-qwen-audit/v4.2-lenses"
+    prompt = backend.requests[0].messages[0].content
+    assert "LITERARY CONSISTENCY CHECKS" in prompt
+    assert "LAIT 2026" in prompt
+    assert "DO NOT OVER-POLICE STYLE rule (RULE 14)" in prompt
+    assert "AUDIT_PAIRS" in prompt  # unchanged surrounding contract
+    # existing categories unchanged; no new category invented
+    assert (
+        "omission | addition | referent | invented_gender | changed_fact | negation"
+        in prompt
+    )
+    # legacy rules still present (no regression of the 18 existing rules)
+    assert "CHECK ALL ERROR CLASSES FOR EACH PAIR" in prompt
 
 
 def test_chunked_run_second_chunk_gets_context_only_overlap() -> None:

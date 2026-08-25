@@ -86,7 +86,7 @@ AUDIT_V4_CONFIDENCES = frozenset({"high", "medium", "low"})
 
 SCHEMA = "pact-audit/v4"
 HARNESS_VERSION = "4.1"
-PROMPT_VERSION = "pact-v4-reviewer-qwen-audit/v4.1"
+PROMPT_VERSION = "pact-v4-reviewer-qwen-audit/v4.2-lenses"
 
 DEFAULT_MAX_INPUT_TOKENS = 3600   # reasoning_budget/2 x 0.88 (12% reserve)
 DEFAULT_MAX_TOKENS = 12000        # reasoning (8192) + ~3500 content headroom
