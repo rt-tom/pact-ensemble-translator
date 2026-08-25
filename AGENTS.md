@@ -95,10 +95,12 @@ For approved implementation work:
 - **Review economy (token efficiency, no quality loss):** preserve the independent
   fresh-review model (it caught real defects an implementer missed, e.g. symlink
   path-escape), but cut redundant re-work: (a) brief `pact-dev` to implement
-  boundary/security hardening proactively (reject symlinks for candidate/state/manifest/
-  inbox dirs and files, validate `book_id`/`candidate_id` as safe single path components
-  with containment, enforce the exact canonical file set, assign revision ids on the
-  authority side) on the FIRST pass, referencing the no-secrets/boundary intent; (b) after
+  boundary/security hardening proactively on the FIRST pass: enumerate EVERY boundary
+  layer (entry TYPE + symlink chain through all ancestors + exact canonical file set +
+  JSON/hash), require a negative test matrix (extra top-level file/dir, symlink at each
+  level, non-regular special file FIFO/socket/device, post-lock TOCTOU mutation), and
+  assign revision ids on the authority side; see `.pi/agents/pact-dev.md` 'Boundary
+  hardening' standing section, which pact-dev MUST follow; (b) after
   a review, hand ALL outstanding findings to `pact-dev` in ONE fix pass, not one per round;
   (c) require `pact-dev` to self-review its diff against the findings and spec and run the
   checks before reporting done; (d) keep Architect briefs short (point to verdict + files,

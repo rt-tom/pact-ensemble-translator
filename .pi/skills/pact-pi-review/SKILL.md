@@ -55,5 +55,12 @@ but reduce token waste from per-round re-reading and one-finding-per-round churn
   (the agent re-reads them).
 - **Lean review.** Let `pact-rev` rely on the test suite + `openspec validate` and read
   only changed files; full re-reads of unchanged modules are the main cost.
+- **Verify boundary coverage.** In review, confirm `pact-dev`'s coverage map enumerates
+  EVERY layer (entry type + symlink chain through all ancestors + exact canonical file
+  set + JSON/hash), the regular-file requirement is enforced, the identical pre-move
+  re-validation is present, and the negative test matrix exists (extra top-level
+  file/dir, symlink at each level, non-regular special file FIFO/socket/device, post-lock
+  TOCTOU mutation). This is the cheapest way to catch the partial-boundary class of
+  defects that otherwise burns extra rounds.
 - **Do NOT** merge dev+rev into one agent, and do NOT drop review rounds in a way that
   sacrifices independence.
