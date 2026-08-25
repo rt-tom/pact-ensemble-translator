@@ -155,16 +155,6 @@ Dedicated key only; `restrict` + `no-pty`; wrapper path is `remote_facade.py` (n
 - Read-only lease check: `ssh media pact-snapshot release-lease <book-id> --check-expired` (facade allow-listed).
 - State-only: exactly the four canonical files move; translation bodies never.
 
-### Transport (documented, not implemented this slice)
-
-No SSH/SFTP client is implemented. The intended restricted media command for RT is:
-
-```
-command="/home/rt/pact_runs/venv/bin/python -m pact_v4.snapshot.cli promote <book-id> <candidate-id>",restrict,no-pty <rt-public-key>
-```
-
-The RT key is limited to bundle upload and this `promote` command, not an interactive shell. Key generation, `authorized_keys` edits, and SFTP/SSH setup are owner operations outside this repository.
-
 ## v3 (archived, non-operational)
 
 v3 code and prior operational procedures are archived and not executed from this tree.
