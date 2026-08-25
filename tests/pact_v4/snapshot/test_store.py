@@ -989,3 +989,103 @@ def test_z2_validate_candidate_boundary_rejects_mutated_state_file():
         (cand_dir / "state" / "glossary.json").unlink()
         with pytest.raises((ValidationError, HashMismatch)):
             validate_candidate_boundary(cand_dir)
+
+
+# --- Round 7 class-fix: FIFO / special-file rejection ---
+
+def test_aa_reject_fifo_in_state():
+    """Candidate whose state/ contains a FIFO (smuggled-fifo) -> REJECTED, quarantined, CURRENT unchanged, no rev-0002."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        assert store.read_current()["revision_id"] == "rev-0001"
+        cand_dir, _ = _create_candidate(store, "cand-fifo-state", parent_rev="rev-0001")
+        fifo_path = cand_dir / "state" / "smuggled-fifo"
+        os.mkfifo(str(fifo_path))
+        # Also ensure FIFO exists and is not regular file/dir/symlink
+        assert fifo_path.exists()
+        # is_file/dir should be False for FIFO (with follow_symlinks=False)
+        with pytest.raises(ValidationError):
+            promote(store, "cand-fifo-state")
+        assert store.quarantine_candidate_path("cand-fifo-state").exists()
+        assert not store.incoming_candidate_path("cand-fifo-state").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        assert not store.snapshot_dir("rev-0002").exists()
+        assert not store.lease_path().exists()
+        # quarantine preserves CURRENT and contains the FIFO artifact (or its replacement)
+        # direct boundary validator also rejects
+        # Recreate fresh candidate to test validator directly
+        cand_dir2, _ = _create_candidate(store, "cand-fifo-direct", parent_rev="rev-0001")
+        fifo2 = cand_dir2 / "state" / "smuggled-fifo"
+        os.mkfifo(str(fifo2))
+        from pact_v4.snapshot.promote import validate_candidate_boundary
+        with pytest.raises(ValidationError):
+            validate_candidate_boundary(cand_dir2)
+
+
+def test_ab_reject_fifo_at_top_level():
+    """Top-level FIFO smuggled as extra entry -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-fifo-top", parent_rev="rev-0001")
+        fifo_path = cand_dir / "smuggled-top-fifo"
+        os.mkfifo(str(fifo_path))
+        with pytest.raises(ValidationError):
+            promote(store, "cand-fifo-top")
+        assert store.quarantine_candidate_path("cand-fifo-top").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        assert not store.snapshot_dir("rev-0002").exists()
+
+
+def test_ac_reject_directory_in_state():
+    """state/ entry that is a directory (or socket) -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-dir-in-state", parent_rev="rev-0001")
+        extra_dir = cand_dir / "state" / "extra_subdir"
+        extra_dir.mkdir()
+        (extra_dir / "inner.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(ValidationError):
+            promote(store, "cand-dir-in-state")
+        assert store.quarantine_candidate_path("cand-dir-in-state").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        assert not store.snapshot_dir("rev-0002").exists()
+        # Also test validator directly
+        cand_dir2, _ = _create_candidate(store, "cand-dir-direct", parent_rev="rev-0001")
+        (cand_dir2 / "state" / "evil-dir").mkdir()
+        from pact_v4.snapshot.promote import validate_candidate_boundary
+        with pytest.raises(ValidationError):
+            validate_candidate_boundary(cand_dir2)
+
+
+def test_ad_bootstrap_rejects_fifo_ancestor():
+    """Bootstrap ancestor path that is a FIFO (non-regular directory) -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        # Create a FIFO where an ancestor directory should be, e.g., replace books dir with FIFO
+        # Instead simulate: create external FIFO and symlink ancestor? Easier: make bootstrap_inbox_dir's parent be checked.
+        # We'll replace the book_dir with a FIFO and ensure bootstrap rejects before reading CURRENT.
+        # First, remove book_dir and replace with FIFO
+        import shutil as _sh
+        book_dir = store.book_dir
+        _sh.rmtree(book_dir)
+        fifo_path = book_dir  # path where directory should be
+        os.mkfifo(str(fifo_path))
+        with pytest.raises(ValidationError):
+            bootstrap(store)
+        # CURRENT must not be created
+        # Since book_dir is now FIFO, store.read_current will try to read inside FIFO path -> not exists
+        # Just verify no snapshot created
+        # Cleanup FIFO for next sanity check
+        os.unlink(str(fifo_path))
+        # Sanity: legitimate bootstrap still works after cleanup
+        store2 = BookStore(BOOK_ID, root=tmp)
+        store2.init_store()
+        _seed_inbox(store2, ts="20260826T120000Z")
+        result = bootstrap(store2)
+        assert result["revision_id"] == "rev-0001"

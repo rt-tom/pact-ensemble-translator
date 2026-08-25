@@ -71,34 +71,55 @@ def validate_candidate_boundary(candidate_dir: Path) -> Manifest:
     """Full boundary validation used BOTH before lease and at pre-move recheck.
 
     Re-asserts against live on-disk candidate:
-    - top-level entries are EXACTLY regular file manifest.json + regular directory state/ (no symlink, no extra)
+    - top-level entries are EXACTLY regular file manifest.json + regular directory state/ (no symlink, no extra, no special file)
     - manifest.json is regular file, valid JSON, state_files exactly four canonical
     - state/ is regular directory containing EXACTLY four canonical JSON files, each regular file, valid JSON, hash matches manifest
+    Class-fix: every checked entry must be exactly the expected regular non-symlink type; FIFOs/sockets/devices are rejected.
     """
     _reject_if_symlink(candidate_dir, "candidate_dir")
     if not candidate_dir.is_dir():
         raise ValidationError(f"Candidate not found: {candidate_dir}")
-    # Top-level boundary
-    top_entries = list(candidate_dir.iterdir())
-    for _p in top_entries:
-        if _p.is_symlink():
-            raise ValidationError(f"Top-level symlink rejected: {_p.name}")
-    top_names = {p.name for p in top_entries}
-    allowed_top = {"manifest.json", "state"}
-    unexpected_top = top_names - allowed_top
-    if unexpected_top:
-        raise ValidationError(f"Unexpected top-level entry in candidate: {sorted(unexpected_top)}")
-    missing_top = allowed_top - top_names
-    if missing_top:
-        raise ValidationError(f"Candidate top-level missing required entry: {sorted(missing_top)}")
-    if top_names != allowed_top or len(top_entries) != 2:
-        raise ValidationError(f"Candidate top-level must contain exactly manifest.json and state/: found {sorted(top_names)}")
+    # Top-level boundary — class fix: use os.scandir + follow_symlinks=False to reject ALL non-regular entries
+    allowed_top = {"manifest.json": "file", "state": "dir"}
+    seen_top: set[str] = set()
+    top_count = 0
+    with os.scandir(candidate_dir) as it:
+        for entry in it:
+            top_count += 1
+            name = entry.name
+            if entry.is_symlink():
+                raise ValidationError(f"Top-level symlink rejected: {name}")
+            is_file = entry.is_file(follow_symlinks=False)
+            is_dir = entry.is_dir(follow_symlinks=False)
+            # Reject special files (FIFO/socket/device) — neither regular file nor regular dir
+            if not is_file and not is_dir:
+                raise ValidationError(f"Top-level special file rejected: {name}")
+            if name not in allowed_top:
+                raise ValidationError(f"Unexpected top-level entry in candidate: {name}")
+            expected = allowed_top[name]
+            if expected == "file":
+                if not is_file:
+                    raise ValidationError(f"manifest.json is not a regular file (rejected): {entry.path}")
+            else:  # dir
+                if not is_dir:
+                    raise ValidationError(f"state is not a regular directory (rejected): {entry.path}")
+            seen_top.add(name)
+    if top_count != 2 or seen_top != set(allowed_top.keys()):
+        raise ValidationError(f"Candidate top-level must contain exactly manifest.json and state/: found {sorted(seen_top)} (count={top_count})")
     manifest_path = candidate_dir / "manifest.json"
     state_dir = candidate_dir / "state"
     _ensure_regular_file(manifest_path, "manifest.json")
     if state_dir.is_symlink():
         raise ValidationError(f"state/ is a symlink (rejected): {state_dir}")
     if not state_dir.is_dir() or not os.path.isdir(str(state_dir)):
+        raise ValidationError(f"state is not a regular directory: {state_dir}")
+    # Additional lstat check: state_dir must not be FIFO/socket/device (is_dir already covers, but explicit)
+    try:
+        st = state_dir.lstat()
+        import stat as _stat
+        if not _stat.S_ISDIR(st.st_mode):
+            raise ValidationError(f"state is not a regular directory (rejected): {state_dir}")
+    except FileNotFoundError:
         raise ValidationError(f"state is not a regular directory: {state_dir}")
     _assert_within(state_dir, candidate_dir, "state_dir")
 
@@ -123,27 +144,48 @@ def validate_candidate_boundary(candidate_dir: Path) -> Manifest:
                 f"Hash/size mismatch for {entry.rel_path}: expected {entry.sha256}/{entry.size}, got {actual_sha}/{actual_size}"
             )
 
-    # Scope A: reject smuggled extra files in candidate state/ and validate JSON
+    # Scope A: reject smuggled extra files in candidate state/ and validate JSON — class fix: reject ALL non-regular entries
     if state_dir.is_symlink():
         raise ValidationError(f"state/ is a symlink (rejected): {state_dir}")
     if state_dir.is_dir():
         _assert_within(state_dir, candidate_dir, "state_dir")
         allowed = {e.rel_path for e in manifest.state_files}
-        for p in state_dir.iterdir():
-            if p.is_symlink():
-                raise ValidationError(f"Symlink rejected in state/: {p.name}")
-            if p.is_file():
-                _ensure_regular_file(p, f"state file state/{p.name}")
-                rel = f"state/{p.name}"
+        seen: set[str] = set()
+        count = 0
+        with os.scandir(state_dir) as it:
+            for entry in it:
+                count += 1
+                name = entry.name
+                if entry.is_symlink():
+                    raise ValidationError(f"Symlink rejected in state/: {name}")
+                is_file = entry.is_file(follow_symlinks=False)
+                is_dir = entry.is_dir(follow_symlinks=False)
+                # Reject FIFOs/sockets/devices and directories — every entry must be a regular non-symlink file
+                if is_dir:
+                    raise ValidationError(f"Unexpected subdirectory in state/: {name}")
+                if not is_file:
+                    raise ValidationError(f"State entry is not a regular file (rejected): state/{name}")
+                # At this point entry is guaranteed regular file (non-symlink)
+                rel = f"state/{name}"
                 if rel not in allowed:
                     raise ValidationError(f"Extra file in state/ not listed in state_files: {rel}")
+                # Validate JSON well-formed
                 try:
-                    with open(p, "r", encoding="utf-8") as jf:
+                    with open(entry.path, "r", encoding="utf-8") as jf:
                         json.load(jf)
                 except Exception as e:
                     raise ValidationError(f"Canonical state file not valid JSON: {rel}: {e}") from e
-            elif p.is_dir():
-                raise ValidationError(f"Unexpected subdirectory in state/: {p.name}")
+                seen.add(rel)
+        if count != 4 or seen != allowed:
+            # Covers missing, extra, or special-file that was rejected above (but also handles count mismatch)
+            missing = allowed - seen
+            extra = seen - allowed
+            if missing:
+                raise ValidationError(f"Missing canonical state file(s): {sorted(missing)}")
+            if extra:
+                raise ValidationError(f"Extra file in state/: {sorted(extra)}")
+            if count != 4:
+                raise ValidationError(f"state/ must contain exactly four canonical files; found {count}: {sorted(seen)}")
     return manifest
 
 

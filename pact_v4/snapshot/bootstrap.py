@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,32 +47,42 @@ def _assert_within(child: Path, parent: Path, label: str) -> None:
 
 
 def _reject_symlink_chain(target: Path, root: Path, label: str) -> None:
-    """Reject if target or any lexical ancestor up to root inclusive is a symlink."""
+    """Reject if target or any lexical ancestor up to root inclusive is a symlink or non-regular directory/special file."""
+    def _ensure_regular_dir(p: Path) -> None:
+        if p.is_symlink():
+            raise ValidationError(f"{label} path component is a symlink (rejected): {p}")
+        if p.exists():
+            # lstat check: must be a regular directory, not FIFO/socket/device/file
+            try:
+                st = p.lstat()
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(st.st_mode):
+                raise ValidationError(f"{label} path component is not a regular directory (rejected): {p}")
+            # is_dir also covers special files (FIFO returns False)
+            if not p.is_dir():
+                raise ValidationError(f"{label} path component is not a regular directory (rejected): {p}")
     cur = target
     # Walk lexical parents up to root inclusive
     while True:
-        if cur.is_symlink():
-            raise ValidationError(f"{label} path component is a symlink (rejected): {cur}")
+        _ensure_regular_dir(cur)
         if cur == root:
             break
         parent = cur.parent
         if parent == cur:  # filesystem root
-            # Never hit store.root lexically; ensure root itself is not a symlink
-            if root.is_symlink():
-                raise ValidationError(f"{label} path component is a symlink (rejected): {root}")
+            # Never hit store.root lexically; ensure root itself is not a symlink/special
+            _ensure_regular_dir(root)
             break
         # If we've walked above root depth without hitting root, ensure root checked and stop
         if len(cur.parts) < len(root.parts) or len(parent.parts) < len(root.parts):
-            if root.is_symlink():
-                raise ValidationError(f"{label} path component is a symlink (rejected): {root}")
+            _ensure_regular_dir(root)
             # Still need to check remaining ancestors up to parent? already checked cur, now check parent chain quickly
             # Walk remaining parents from parent up to root if not yet visited, but root already checked
             break
         cur = parent
         # If cur depth is less than root depth, we have exited the store subtree
         if len(cur.parts) < len(root.parts):
-            if root.is_symlink():
-                raise ValidationError(f"{label} path component is a symlink (rejected): {root}")
+            _ensure_regular_dir(root)
             break
 
 
@@ -185,15 +196,20 @@ def bootstrap(
             except ValueError:
                 raise ValidationError(f"Canonical file escape: {fpath}")
 
-    # Collect excludes: any file in inbox not in canonical list (reject symlinks in inbox)
+    # Collect excludes: any file in inbox not in canonical list (reject symlinks/special files in inbox)
     excludes: List[str] = []
     for p in inbox_dir.iterdir():
         if p.is_symlink():
             raise ValidationError(f"Symlink rejected in inbox: {p.name}")
-        if p.is_file() and p.name not in CANONICAL_FILES:
+        # Class-fix: reject FIFOs/sockets/devices at inbox top-level
+        is_file = p.is_file()
+        is_dir = p.is_dir()
+        if not is_file and not is_dir:
+            raise ValidationError(f"Special file rejected in inbox: {p.name}")
+        if is_file and p.name not in CANONICAL_FILES:
             excludes.append(p.name)
         # Also handle directories? Treat top-level files only; subdirs ignored but listed
-        if p.is_dir():
+        if is_dir:
             # Not part of excludes per spec but we could note
             pass
 
