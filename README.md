@@ -142,8 +142,9 @@ RT syncs the four canonical `pact_chapters` files (`glossary.json`, `book_memory
 
 **Owner host-config** (`~/.ssh/authorized_keys` on media, dedicated RT key):
 ```
-restrict,command="/home/rt/pact_runs/venv/bin/python -m pact_v4.snapshot.remote_facade",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding <rt-public-key>
+restrict,command="PACT_SNAPSHOT_BOOK_ID=pact-book-ru /home/rt/pact_runs/venv/bin/python -m pact_v4.snapshot.remote_facade",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding <rt-public-key>
 ```
+The `PACT_SNAPSHOT_BOOK_ID=<id>` prefix scopes the facade to exactly one book-id (fail-closed — unset/empty rejects every request); the deployed facade MUST be scoped, never unscoped.
 Dedicated key only; `restrict` + `no-pty`; wrapper path is `remote_facade.py` (not direct CLI) so only the four allow-listed subcommands execute. The `command=` string itself is host-config outside the repo; the repo ships wrapper + CLI surface `fetch-current`/`receive-candidate`.
 
 **Runbook**

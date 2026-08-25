@@ -41,14 +41,14 @@ def _validate_candidate_id(candidate_id: str) -> None:
     except ValueError as e:
         raise ValidationError(str(e)) from e
 
-def _scoped_book_id() -> str | None:
-    """Return configured scoped book-id if set via env, otherwise None."""
+def _scoped_book_id() -> str:
+    """Return configured scoped book-id; fail-closed if unset/empty/invalid."""
     scoped = os.environ.get("PACT_SNAPSHOT_BOOK_ID")
     if scoped is None:
-        return None
+        raise ValidationError("PACT_SNAPSHOT_BOOK_ID is not set (fail-closed: facade is unscoped and rejects all requests)")
     scoped = scoped.strip()
     if scoped == "":
-        return None
+        raise ValidationError("PACT_SNAPSHOT_BOOK_ID is empty (fail-closed: facade is unscoped and rejects all requests)")
     # Validate syntax to avoid misconfiguration escape; fail-closed if invalid
     try:
         _validate_component(scoped, "book_id")
@@ -57,9 +57,16 @@ def _scoped_book_id() -> str | None:
     return scoped
 
 def _enforce_scoped(book_id: str) -> int | None:
-    """Return rejection exit code if book_id does not match scoped value, else None."""
-    scoped = _scoped_book_id()
-    if scoped is not None and book_id != scoped:
+    """Return rejection exit code if book_id does not match scoped value, else None.
+
+    Fail-closed: if PACT_SNAPSHOT_BOOK_ID is unset/empty/invalid, REJECT every
+    request with FACADE_REJECTED BEFORE creating any BookStore.
+    """
+    try:
+        scoped = _scoped_book_id()
+    except ValidationError as e:
+        return _reject(str(e))
+    if book_id != scoped:
         return _reject(f"book-id not allowed (scoped to {scoped!r}): {book_id!r}")
     return None
 

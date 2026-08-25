@@ -216,3 +216,86 @@ def test_state_only_boundary_never_translation_bodies():
             snap = store.snapshot_dir(verdict["revision_id"])
             assert not (snap / "chapter_0001.txt").exists()
             assert not (snap / "state" / "chapter_0001.txt").exists()
+
+
+def test_main_exits_nonzero_when_media_confirmation_failed():
+    """CLI main() must exit nonzero when media sync was configured but confirmation failed."""
+    from unittest.mock import patch
+    from pact_full_pipeline_runner_v1 import v4_book_run
+
+    fake_error = {
+        "chapters": [
+            {
+                "chapter_id": "0001",
+                "terminal_status": "complete",
+                "promoted": True,
+                "media_error": "push failed: transport unreachable",
+                "media_confirmation": None,
+                "candidates": {},
+                "book_memory_candidates": {},
+            }
+        ]
+    }
+    fake_missing = {
+        "chapters": [
+            {
+                "chapter_id": "0001",
+                "terminal_status": "complete",
+                "promoted": True,
+                "media_error": None,
+                "media_confirmation": None,
+                "candidates": {},
+                "book_memory_candidates": {},
+            }
+        ]
+    }
+    fake_ok = {
+        "chapters": [
+            {
+                "chapter_id": "0001",
+                "terminal_status": "complete",
+                "promoted": True,
+                "media_error": None,
+                "media_confirmation": {"revision_id": "rev-0002", "status": "ACCEPTED"},
+                "candidates": {},
+                "book_memory_candidates": {},
+            }
+        ]
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        memory_dir = tmp_p / "memory"
+        out_base = tmp_p / "out"
+        memory_dir.mkdir(parents=True)
+        out_base.mkdir(parents=True)
+        (tmp_p / "0001.html").write_text("<html></html>", encoding="utf-8")
+        argv_media = [
+            "--memory-dir", str(memory_dir),
+            "--chapters", "0001",
+            "--chapter-html-pattern", str(tmp_p / "{chapter_id}.html"),
+            "--out-base", str(out_base),
+            "--media-book-id", BOOK_ID,
+        ]
+        argv_no_media = [
+            "--memory-dir", str(memory_dir),
+            "--chapters", "0001",
+            "--chapter-html-pattern", str(tmp_p / "{chapter_id}.html"),
+            "--out-base", str(out_base),
+        ]
+        # media configured + media_error => nonzero (fail-closed), local state preserved
+        with patch.object(v4_book_run, "run_book", return_value=fake_error):
+            rc = v4_book_run.main(argv_media)
+            assert rc != 0, "main must exit nonzero when media_error present"
+        # media configured + missing confirmation (no error string) => nonzero
+        with patch.object(v4_book_run, "run_book", return_value=fake_missing):
+            rc2 = v4_book_run.main(argv_media)
+            assert rc2 != 0, "main must exit nonzero when media_confirmation missing"
+        # media configured + confirmation present => success
+        with patch.object(v4_book_run, "run_book", return_value=fake_ok):
+            rc3 = v4_book_run.main(argv_media)
+            assert rc3 == 0, "main should exit 0 when confirmation present"
+        # media NOT configured — even if record had media_error, should not be treated as media failure
+        # (main only checks media when --media-book-id given)
+        with patch.object(v4_book_run, "run_book", return_value=fake_ok):
+            rc4 = v4_book_run.main(argv_no_media)
+            assert rc4 == 0

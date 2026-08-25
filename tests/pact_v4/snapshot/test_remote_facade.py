@@ -14,6 +14,20 @@ from pact_v4.snapshot.bootstrap import bootstrap
 
 BOOK_ID = "facade-book"
 CANONICAL = ["book_memory.json", "glossary.json", "chapter_index.json", "observations.json"]
+@pytest.fixture(autouse=True)
+def _scoped_env():
+    # Fail-closed default: every test runs scoped to BOOK_ID unless it explicitly clears env
+    prev = os.environ.get("PACT_SNAPSHOT_BOOK_ID")
+    os.environ["PACT_SNAPSHOT_BOOK_ID"] = BOOK_ID
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("PACT_SNAPSHOT_BOOK_ID", None)
+        else:
+            os.environ["PACT_SNAPSHOT_BOOK_ID"] = prev
+
+
 
 
 def _make_json_file(path: Path, obj):
@@ -33,6 +47,58 @@ def _seed_store(tmp):
     bootstrap(store)
     return store
 
+def test_facade_rejects_when_scoped_unset_or_empty():
+    """Fail-closed: unset/empty PACT_SNAPSHOT_BOOK_ID must REJECT every request."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _seed_store(tmp)
+        import sys
+        from io import BytesIO
+        for scoped_val in (None, "", "   "):
+            old = os.environ.pop("PACT_SNAPSHOT_BOOK_ID", None)
+            try:
+                if scoped_val is not None:
+                    os.environ["PACT_SNAPSHOT_BOOK_ID"] = scoped_val
+                buf = BytesIO()
+                class DummyStdout:
+                    def __init__(self, b):
+                        self.buffer = b
+                    def write(self, s):
+                        b = s.encode("utf-8") if isinstance(s, str) else s
+                        buf.write(b)
+                    def flush(self): pass
+                orig_stdout = sys.stdout
+                sys.stdout = DummyStdout(buf)  # type: ignore
+                try:
+                    rc = handle_request(["fetch-current", BOOK_ID], root=tmp)
+                finally:
+                    sys.stdout = orig_stdout
+                assert rc != 0, f"should reject when scoped={scoped_val!r}"
+                out = buf.getvalue().decode("utf-8", errors="replace")
+                assert "FACADE_REJECTED" in out, out
+                assert "PACT_SNAPSHOT_BOOK_ID" in out, out
+                fresh = "new-book-should-not-exist"
+                fresh_path = Path(tmp) / "books" / fresh
+                assert not fresh_path.exists(), "facade must not create BookStore when unscoped"
+                store = BookStore(BOOK_ID, root=tmp)
+                assert store.current_path.exists()
+                buf2 = BytesIO()
+                sys.stdout = DummyStdout(buf2)  # type: ignore
+                try:
+                    rc2 = handle_request(["promote", fresh, "cand-1"], root=tmp)
+                finally:
+                    sys.stdout = orig_stdout
+                assert rc2 != 0
+                assert not (Path(tmp) / "books" / fresh).exists()
+            finally:
+                if old is not None:
+                    os.environ["PACT_SNAPSHOT_BOOK_ID"] = old
+                elif scoped_val is not None:
+                    os.environ.pop("PACT_SNAPSHOT_BOOK_ID", None)
+                # autouse fixture will restore after test; ensure scoped restored for next iteration
+                # keep BOOK_ID for next loop by not relying on fixture inside loop
+                # re-set to BOOK_ID if needed for next outer setup? loop itself handles env
+                # but ensure not left empty for next iteration's start where we pop again
+                # pop already handled; next iteration will pop again
 
 def test_facade_allowed_fetch_current(tmp_path_factory=None):
     with tempfile.TemporaryDirectory() as tmp:

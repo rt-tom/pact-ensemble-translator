@@ -1601,10 +1601,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if status not in ("complete", "accepted_degraded"):
             failed += 1
+    # Fail-closed media sync: if run was configured for media sync, any
+    # promoted chapter with media_error or missing media_confirmation is a
+    # failure (local state already preserved/recorded, but no confirmation).
+    media_failed = 0
+    if args.media_book_id is not None:
+        for rec in result["chapters"]:
+            if rec.get("promoted"):
+                if rec.get("media_error") or not rec.get("media_confirmation"):
+                    media_failed += 1
     if failed:
         print(
             f"\n{failed} chapter(s) did not reach complete/accepted_degraded. "
             "See book_run.json for details.",
+            file=sys.stderr,
+        )
+        return 1
+    if media_failed:
+        print(
+            f"\n{media_failed} chapter(s) failed media sync confirmation "
+            f"(media_error/missing confirmation). See book_run.json for details.",
             file=sys.stderr,
         )
         return 1
