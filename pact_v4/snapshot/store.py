@@ -4,9 +4,57 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+_SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_component(name: str, kind: str) -> None:
+    """Validate single path component is safe (no escape). Raises ValueError on invalid."""
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{kind} must be non-empty string")
+    # Absolute paths (POSIX, Windows drive, UNC)
+    if os.path.isabs(name):
+        raise ValueError(f"{kind} must not be absolute: {name!r}")
+    if name.startswith("/") or name.startswith("\\"):
+        raise ValueError(f"{kind} must not be absolute: {name!r}")
+    # Path separators
+    if "/" in name or "\\" in name or os.sep in name:
+        raise ValueError(f"{kind} must not contain path separator: {name!r}")
+    # Dot segments
+    if name in (".", ".."):
+        raise ValueError(f"{kind} must not be '.' or '..': {name!r}")
+    # Charset
+    if not _SAFE_COMPONENT_RE.match(name):
+        raise ValueError(f"{kind} contains illegal characters (allowed [A-Za-z0-9._-]): {name!r}")
+
+
+def _ensure_within(child: Path, parent: Path) -> None:
+    """Ensure resolved child is strictly within resolved parent. Raises ValueError if not."""
+    try:
+        # resolve without strict to handle non-existent paths
+        p_res = parent.resolve()
+        c_res = child.resolve()
+    except Exception:
+        # fallback to absolute
+        p_res = parent.absolute()
+        c_res = child.absolute()
+    # child must be strictly under parent (not equal)
+    try:
+        is_within = c_res.is_relative_to(p_res)
+    except AttributeError:
+        # Python <3.9 fallback
+        try:
+            c_res.relative_to(p_res)
+            is_within = True
+        except ValueError:
+            is_within = False
+    if not is_within or c_res == p_res:
+        raise ValueError(f"Path {c_res} is not within {p_res}")
 
 
 DEFAULT_ROOT = "/home/rt/pact_runs"
@@ -16,8 +64,7 @@ class BookStore:
     """Book-scoped store under <root>/books/<book-id>/."""
 
     def __init__(self, book_id: str, root: str = DEFAULT_ROOT) -> None:
-        if not book_id:
-            raise ValueError("book_id must be non-empty")
+        _validate_component(book_id, "book_id")
         self.book_id = book_id
         self.root = Path(root)
         # Design: <root>/books/<book-id>/
@@ -59,13 +106,26 @@ class BookStore:
         return self.locks_dir / f"{self.book_id}.lease_audit.jsonl"
 
     def snapshot_dir(self, revision_id: str) -> Path:
-        return self.snapshots_dir / revision_id
+        # revision_id itself is validated elsewhere (rev-NNNN pattern), but also ensure safe component
+        _validate_component(revision_id, "revision_id")
+        p = self.snapshots_dir / revision_id
+        _ensure_within(p, self.root)
+        return p
 
     def incoming_candidate_path(self, candidate_id: str) -> Path:
-        return self.incoming_dir / candidate_id
+        _validate_component(candidate_id, "candidate_id")
+        p = self.incoming_dir / candidate_id
+        _ensure_within(p, self.root)
+        # defense-in-depth: must be strictly under incoming_dir
+        _ensure_within(p, self.incoming_dir)
+        return p
 
     def quarantine_candidate_path(self, candidate_id: str) -> Path:
-        return self.quarantine_dir / candidate_id
+        _validate_component(candidate_id, "candidate_id")
+        p = self.quarantine_dir / candidate_id
+        _ensure_within(p, self.root)
+        _ensure_within(p, self.quarantine_dir)
+        return p
 
     # -- operations --
 

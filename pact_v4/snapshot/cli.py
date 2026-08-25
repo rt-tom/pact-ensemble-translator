@@ -12,7 +12,14 @@ from .bootstrap import bootstrap
 from .errors import HashMismatch, LeaseHeld, SnapshotError, StaleParent, ValidationError
 from .lease import check_expired, release_with_audit
 from .promote import promote
-from .store import BookStore
+from .store import BookStore, _validate_component
+
+
+def _validate_arg_component(name: str, kind: str) -> None:
+    try:
+        _validate_component(name, kind)
+    except ValueError as e:
+        raise ValidationError(str(e)) from e
 
 
 def _print_json(obj) -> None:
@@ -78,12 +85,14 @@ def main(argv=None) -> int:
 
     try:
         if args.cmd == "init-store":
+            _validate_arg_component(args.book_id, "book_id")
             store = BookStore(args.book_id, root=args.root)
             current = store.init_store()
             _print_json({"status": "ACCEPTED", "book_id": args.book_id, "current": current, "root": str(store.book_dir)})
             return 0
 
         elif args.cmd == "bootstrap":
+            _validate_arg_component(args.book_id, "book_id")
             store = BookStore(args.book_id, root=args.root)
             result = bootstrap(
                 store,
@@ -98,6 +107,8 @@ def main(argv=None) -> int:
             return 0
 
         elif args.cmd == "promote":
+            _validate_arg_component(args.book_id, "book_id")
+            _validate_arg_component(args.candidate_id, "candidate_id")
             store = BookStore(args.book_id, root=args.root)
             try:
                 result = promote(
@@ -114,6 +125,7 @@ def main(argv=None) -> int:
                 return _handle_snapshot_error(e, candidate_id=args.candidate_id)
 
         elif args.cmd == "release-lease":
+            _validate_arg_component(args.book_id, "book_id")
             store = BookStore(args.book_id, root=args.root)
             if args.check_expired:
                 report = check_expired(store)

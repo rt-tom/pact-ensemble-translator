@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -20,22 +21,30 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _reject_if_symlink(p: Path, label: str) -> None:
+    if p.is_symlink():
+        raise ValidationError(f"{label} is a symlink (rejected): {p}")
+
+
 def _resolve_inbox_dir(store: BookStore, ts: Optional[str] = None) -> Path:
     base = store.bootstrap_inbox_dir
     if not base.exists():
         raise ValidationError(f"_bootstrap_inbox not found: {base}")
     if ts is not None:
         p = base / ts
+        _reject_if_symlink(p, "_bootstrap_inbox/<ts>")
         if not p.is_dir():
             raise ValidationError(f"_bootstrap_inbox/<ts> not found: {p}")
         return p
     # latest = most recent subdir by name (lexicographically max)
-    subdirs = [d for d in base.iterdir() if d.is_dir()]
+    subdirs = [d for d in base.iterdir() if d.is_dir() and not d.is_symlink()]
     if not subdirs:
         raise ValidationError(f"No subdirs in _bootstrap_inbox: {base}")
     # Sort by name descending, pick first
     subdirs.sort(key=lambda p: p.name, reverse=True)
-    return subdirs[0]
+    cand = subdirs[0]
+    _reject_if_symlink(cand, "_bootstrap_inbox/<ts>")
+    return cand
 
 
 def bootstrap(
@@ -68,22 +77,37 @@ def bootstrap(
         raise ValidationError("CURRENT already points to a revision; bootstrap only for first revision")
 
     inbox_dir = _resolve_inbox_dir(store, ts)
+    _reject_if_symlink(inbox_dir, "_bootstrap_inbox/<ts>")
 
-    # Validate exactly four canonical files
+    # Validate exactly four canonical files — reject symlinks for consistency (Finding 1)
     for fname in CANONICAL_FILES:
         fpath = inbox_dir / fname
-        if not fpath.is_file():
+        _reject_if_symlink(fpath, f"Canonical file {fname}")
+        if not fpath.is_file() or not os.path.isfile(str(fpath)):
             raise ValidationError(f"Canonical file missing: {fname} in {inbox_dir}")
+        # Reject symlink source that points outside (copyfile would follow, but reject for consistency)
         # Validate well-formed JSON
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 json.load(f)
         except Exception as e:
             raise ValidationError(f"Canonical file not valid JSON: {fname}: {e}") from e
+        # Also ensure no symlink nesting inside inbox_dir itself (already checked file)
+        # Defense: resolved file must be within inbox_dir
+        try:
+            if not fpath.resolve().is_relative_to(inbox_dir.resolve()):
+                raise ValidationError(f"Canonical file escape: {fpath}")
+        except AttributeError:
+            try:
+                fpath.resolve().relative_to(inbox_dir.resolve())
+            except ValueError:
+                raise ValidationError(f"Canonical file escape: {fpath}")
 
-    # Collect excludes: any file in inbox not in canonical list
+    # Collect excludes: any file in inbox not in canonical list (reject symlinks in inbox)
     excludes: List[str] = []
     for p in inbox_dir.iterdir():
+        if p.is_symlink():
+            raise ValidationError(f"Symlink rejected in inbox: {p.name}")
         if p.is_file() and p.name not in CANONICAL_FILES:
             excludes.append(p.name)
         # Also handle directories? Treat top-level files only; subdirs ignored but listed

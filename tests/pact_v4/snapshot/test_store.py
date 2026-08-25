@@ -191,6 +191,15 @@ def test_d_promote_accepts():
         assert not store.incoming_candidate_path("cand-001").exists()
         # not quarantined
         assert not store.quarantine_candidate_path("cand-001").exists()
+        # Finding 3 (Medium) — manifest_sha256 integrity: stored manifest hash equals CURRENT and result
+        stored_manifest_path = snap_dir / "manifest.json"
+        computed_sha, _ = compute_sha256_and_size(stored_manifest_path)
+        assert computed_sha == cur_after["manifest_sha256"]
+        assert computed_sha == result["manifest_sha256"]
+        # Also verify CURRENT manifest_sha matches final rewritten manifest content
+        with open(stored_manifest_path, "rb") as f:
+            raw_bytes = f.read()
+        assert hashlib.sha256(raw_bytes).hexdigest() == cur_after["manifest_sha256"]
 
 
 # (e) promote REJECTS stale parent
@@ -457,3 +466,165 @@ def test_n_bootstrap_success_without_prior_init_store():
         cur = store.read_current()
         assert cur["revision_id"] == "rev-0001"
         assert store.snapshot_dir("rev-0001").exists()
+
+
+# --- Finding 1 High: symlink rejection ---
+
+def test_o_reject_symlink_in_state():
+    """Candidate with state/book_memory.json as symlink outside candidate -> REJECTED + quarantined + CURRENT unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, manifest_dict = _create_candidate(store, "cand-symlink", parent_rev="rev-0001")
+        # Create external temp file with JSON content
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", encoding="utf-8") as ext:
+            json.dump({"evil": "outside", "file": "book_memory.json"}, ext)
+            ext_path = ext.name
+        try:
+            target = cand_dir / "state" / "book_memory.json"
+            # Remove original regular file and replace with symlink
+            target.unlink()
+            os.symlink(ext_path, str(target))
+            # Update manifest hash to match external file so hash check would pass but symlink rejection triggers first
+            sha, size = compute_sha256_and_size(Path(ext_path))
+            # Patch manifest entry
+            new_manifest = dict(manifest_dict)
+            new_files = []
+            for e in manifest_dict["state_files"]:
+                if e["rel_path"] == "state/book_memory.json":
+                    new_files.append({"rel_path": e["rel_path"], "sha256": sha, "size": size})
+                else:
+                    new_files.append(dict(e))
+            new_manifest["state_files"] = new_files
+            _make_json_file(cand_dir / "manifest.json", new_manifest)
+            with pytest.raises(ValidationError):
+                promote(store, "cand-symlink")
+            assert store.quarantine_candidate_path("cand-symlink").exists()
+            # CURRENT unchanged
+            assert store.read_current()["revision_id"] == "rev-0001"
+            # Ensure quarantined entry still contains symlink (or at least exists)
+            q_target = store.quarantine_candidate_path("cand-symlink") / "state" / "book_memory.json"
+            # quarantined target should be symlink or at least path exists as symlink
+            assert q_target.is_symlink() or q_target.exists()
+        finally:
+            try:
+                os.unlink(ext_path)
+            except OSError:
+                pass
+
+
+def test_o2_reject_symlinked_candidate_dir():
+    """Candidate directory itself is a symlink -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        # Create a real dir elsewhere and symlink candidate name to it
+        real = Path(tmp) / "real_cand"
+        real.mkdir()
+        # Need to create manifest inside real dir to be plausible, but we won't because symlink dir check happens first
+        # Create a valid candidate then replace its path with symlink to outside
+        # First create a temp valid candidate and move its contents to real dir, then symlink
+        _create_candidate(store, "cand-real", parent_rev="rev-0001")
+        src = store.incoming_candidate_path("cand-real")
+        # Move contents to real dir
+        import shutil as _shutil
+        for item in src.iterdir():
+            _shutil.move(str(item), str(real / item.name))
+        src.rmdir()
+        os.symlink(str(real), str(src))
+        # Now promote should reject due to symlink candidate_dir
+        with pytest.raises(ValidationError):
+            promote(store, "cand-real")
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+# --- Finding 2 High: path escape validation ---
+
+def test_p_reject_candidate_id_escape():
+    """candidate_id with path traversal is rejected before promotion."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        with pytest.raises((ValidationError, ValueError)):
+            promote(store, "../escape")
+        # Ensure no file escaped and CURRENT unchanged
+        assert store.read_current()["revision_id"] == "rev-0001"
+        # Also absolute path
+        with pytest.raises((ValidationError, ValueError)):
+            promote(store, "/etc/passwd")
+        assert store.read_current()["revision_id"] == "rev-0001"
+        # Windows-style absolute
+        with pytest.raises((ValidationError, ValueError)):
+            promote(store, "C:\\Windows\\secret")
+        assert store.read_current()["revision_id"] == "rev-0001"
+        # Backslash separator
+        with pytest.raises((ValidationError, ValueError)):
+            promote(store, "cand\\escape")
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+def test_q_reject_book_id_separator():
+    """BookStore with separator in book_id raises ValueError/ValidationError."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises((ValueError, ValidationError)):
+            BookStore("bad/book", root=tmp)
+        with pytest.raises((ValueError, ValidationError)):
+            BookStore("bad\\book", root=tmp)
+        with pytest.raises((ValueError, ValidationError)):
+            BookStore("../escape", root=tmp)
+        with pytest.raises((ValueError, ValidationError)):
+            BookStore("/etc/passwd", root=tmp)
+        with pytest.raises((ValueError, ValidationError)):
+            BookStore("", root=tmp)
+        with pytest.raises((ValueError, ValidationError)):
+            BookStore("bad:colon", root=tmp)
+        # Valid remains allowed
+        s = BookStore("valid-book_123.test", root=tmp)
+        assert s.book_id == "valid-book_123.test"
+
+
+def test_r_cli_rejects_escape_candidate_id():
+    """CLI promote with escaping candidate_id exits REJECTED (2) and preserves CURRENT."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cli_main(["--root", tmp, "init-store", BOOK_ID])
+        store = BookStore(BOOK_ID, root=tmp)
+        _seed_inbox(store)
+        cli_main(["--root", tmp, "bootstrap", BOOK_ID])
+        rc = cli_main(["--root", tmp, "promote", BOOK_ID, "../escape"])
+        assert rc == 2
+        assert store.read_current()["revision_id"] == "rev-0001"
+        rc2 = cli_main(["--root", tmp, "promote", BOOK_ID, "/etc/passwd"])
+        assert rc2 == 2
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+def test_s_bootstrap_rejects_symlinked_inbox_file():
+    """Bootstrap rejects when canonical inbox file is a symlink."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        inbox_ts_dir = store.bootstrap_inbox_dir / "20260826T120000Z"
+        inbox_ts_dir.mkdir(parents=True, exist_ok=True)
+        for fname in CANONICAL:
+            _make_json_file(inbox_ts_dir / fname, {"ok": fname})
+        # Replace one file with symlink to external
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", encoding="utf-8") as ext:
+            json.dump({"outside": True}, ext)
+            ext_path = ext.name
+        try:
+            target = inbox_ts_dir / "glossary.json"
+            target.unlink()
+            os.symlink(ext_path, str(target))
+            with pytest.raises(ValidationError):
+                bootstrap(store)
+            # CURRENT must still be null (bootstrap failed) — for init-store case revision is None
+            cur = store.read_current()
+            assert cur is None or cur.get("revision_id") is None
+            assert not store.snapshot_dir("rev-0001").exists()
+        finally:
+            try:
+                os.unlink(ext_path)
+            except OSError:
+                pass

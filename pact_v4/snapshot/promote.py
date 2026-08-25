@@ -12,12 +12,52 @@ from typing import Any, Dict
 from .errors import HashMismatch, LeaseHeld, StaleParent, ValidationError
 from .lease import acquire_lease, read_lease, release_lease
 from .manifest import Manifest, compute_sha256_and_size
-from .store import BookStore
+from .store import BookStore, _validate_component
+
+
+def _validate_candidate_id(candidate_id: str) -> None:
+    try:
+        _validate_component(candidate_id, "candidate_id")
+    except ValueError as e:
+        raise ValidationError(str(e)) from e
+
+
+def _reject_if_symlink(p: Path, label: str) -> None:
+    if p.is_symlink():
+        raise ValidationError(f"{label} is a symlink (rejected): {p}")
+
+
+def _ensure_regular_file(p: Path, label: str) -> None:
+    _reject_if_symlink(p, label)
+    if not os.path.isfile(str(p)):
+        raise ValidationError(f"{label} is not a regular file: {p}")
+
+
+def _assert_within(child: Path, parent: Path, label: str) -> None:
+    try:
+        c_res = child.resolve()
+        p_res = parent.resolve()
+    except Exception:
+        c_res = child.absolute()
+        p_res = parent.absolute()
+    try:
+        is_within = c_res.is_relative_to(p_res)
+    except AttributeError:
+        try:
+            c_res.relative_to(p_res)
+            is_within = True
+        except ValueError:
+            is_within = False
+    if not is_within or c_res == p_res:
+        raise ValidationError(f"{label} path escape: {c_res} not within {p_res}")
 
 
 def _quarantine_candidate(store: BookStore, candidate_id: str) -> None:
-    src = store.incoming_candidate_path(candidate_id)
-    if not src.exists():
+    try:
+        src = store.incoming_candidate_path(candidate_id)
+    except (ValueError, ValidationError):
+        return
+    if not src.exists() and not src.is_symlink():
         return
     dst = store.quarantine_candidate_path(candidate_id)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -35,17 +75,31 @@ def promote(
     run_id: str | None = None,
 ) -> Dict[str, Any]:
     """Validate candidate, acquire lease, atomically promote."""
-    candidate_dir = store.incoming_candidate_path(candidate_id)
+    _validate_candidate_id(candidate_id)
     # We need to ensure quarantine on any failure, preserving CURRENT.
     # Validation phase before lease acquisition is still quarantined on failure.
     lease_acquired = False
+    candidate_dir = None  # will be set inside try
     # Store original CURRENT for recovery check (not needed but preserve)
     try:
+        try:
+            candidate_dir = store.incoming_candidate_path(candidate_id)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        # Defense-in-depth: resolved candidate must be strictly under incoming dir
+        try:
+            _assert_within(candidate_dir, store.incoming_dir, "candidate_dir")
+            _assert_within(candidate_dir, store.root, "candidate_dir")
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
         # --- Phase 1: validate manifest schema ---
+        # Reject symlinked candidate directory before any further checks
+        _reject_if_symlink(candidate_dir, "candidate_dir")
         if not candidate_dir.is_dir():
             raise ValidationError(f"Candidate not found: {candidate_dir}")
         manifest_path = candidate_dir / "manifest.json"
-        if not manifest_path.is_file():
+        _reject_if_symlink(manifest_path, "manifest.json")
+        if not manifest_path.is_file() or not os.path.isfile(str(manifest_path)):
             raise ValidationError(f"manifest.json missing in candidate {candidate_id}")
 
         try:
@@ -66,11 +120,15 @@ def promote(
         if manifest.book_id != store.book_id:
             raise ValidationError(f"book_id mismatch: manifest {manifest.book_id} vs store {store.book_id}")
 
-        # Verify each state_files entry's actual bytes
+        # Verify each state_files entry's actual bytes - reject symlinks first
         for entry in manifest.state_files:
             file_path = candidate_dir / entry.rel_path
-            if not file_path.is_file():
+            _reject_if_symlink(file_path, f"state file {entry.rel_path}")
+            # Also reject if parent state/ dir is a symlink (checked below, but double-check file parent)
+            if not file_path.is_file() or not os.path.isfile(str(file_path)):
                 raise ValidationError(f"state file missing: {entry.rel_path}")
+            # Ensure resolved file is still within candidate_dir (no escape via symlink)
+            _assert_within(file_path, candidate_dir, f"state file {entry.rel_path}")
             actual_sha, actual_size = compute_sha256_and_size(file_path)
             if actual_sha != entry.sha256 or actual_size != entry.size:
                 raise HashMismatch(
@@ -79,11 +137,20 @@ def promote(
 
         # Scope A: reject smuggled extra files in candidate state/ and validate JSON (Finding 2)
         state_dir = candidate_dir / "state"
+        # Reject symlinked state directory
+        if state_dir.is_symlink():
+            raise ValidationError(f"state/ is a symlink (rejected): {state_dir}")
         if state_dir.is_dir():
+            # Ensure state_dir is regular directory within candidate
+            _assert_within(state_dir, candidate_dir, "state_dir")
             allowed = {e.rel_path for e in manifest.state_files}
             for p in state_dir.iterdir():
+                # Reject any symlink inside state/ (file or dir)
+                if p.is_symlink():
+                    raise ValidationError(f"Symlink rejected in state/: {p.name}")
                 # Only consider files (ignore subdirs)
                 if p.is_file():
+                    _ensure_regular_file(p, f"state file state/{p.name}")
                     rel = f"state/{p.name}"
                     if rel not in allowed:
                         raise ValidationError(f"Extra file in state/ not listed in state_files: {rel}")
@@ -123,11 +190,17 @@ def promote(
         # Media assigns revision id after lease (Finding 1)
         next_rev = store.compute_next_revision_id()
         snap_dir = store.snapshot_dir(next_rev)
-        if snap_dir.exists():
+        # Defense-in-depth: snapshot path must be under store root
+        _assert_within(snap_dir, store.root, "snapshot_dir")
+        _assert_within(snap_dir, store.snapshots_dir, "snapshot_dir")
+        if snap_dir.exists() or snap_dir.is_symlink():
             raise ValidationError(f"Snapshot dir already exists: {snap_dir}")
         # Atomic move via os.replace (candidate dir -> snapshot dir)
         # Ensure snapshots parent exists
         snap_dir.parent.mkdir(parents=True, exist_ok=True)
+        # Final symlink re-check before move (TOCTOU defense)
+        _reject_if_symlink(candidate_dir, "candidate_dir")
+        _reject_if_symlink(state_dir, "state_dir")
         # os.replace works for directories on POSIX
         os.replace(str(candidate_dir), str(snap_dir))
 
@@ -190,8 +263,8 @@ def promote(
         # Simpler: if candidate_dir still exists in incoming, quarantine it.
         # If it was already moved to snapshots/next_rev, move that snapshot dir to quarantine as well to avoid dangling snapshot not referenced by CURRENT.
         try:
-            # Check if candidate still in incoming
-            if candidate_dir.exists():
+            # Check if candidate still in incoming (candidate_dir may be None if validation failed before path resolution)
+            if candidate_dir is not None and (candidate_dir.exists() or candidate_dir.is_symlink()):
                 _quarantine_candidate(store, candidate_id)
             else:
                 # It may have been moved to snapshots/next_rev; if CURRENT was not advanced, move snapshots dir to quarantine
@@ -217,7 +290,7 @@ def promote(
     except Exception as e:
         # Unexpected error also quarantines if possible
         try:
-            if candidate_dir.exists():
+            if candidate_dir is not None and (candidate_dir.exists() or candidate_dir.is_symlink()):
                 _quarantine_candidate(store, candidate_id)
         except Exception:
             pass
