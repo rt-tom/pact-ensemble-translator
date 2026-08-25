@@ -894,3 +894,98 @@ def test_u_bootstrap_symlinked_ancestor_malformed_current_regression():
         cur = store2.read_current()
         assert cur["revision_id"] == "rev-0001"
         assert store2.snapshot_dir("rev-0001").exists()
+
+
+# --- Round 6: TOCTOU full boundary re-validation (promote pre-move hardening) ---
+
+def test_z_toctou_state_dir_replaced_with_file_during_compute_next_revision_id():
+    """TOCTOU integration: mutate candidate state/ into regular file during compute_next_revision_id -> REJECTED."""
+    import shutil as _sh
+    from pact_v4.snapshot import promote as _promote_mod
+    from pact_v4.snapshot.store import BookStore as _BS
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        assert store.read_current()["revision_id"] == "rev-0001"
+        _create_candidate(store, "cand-toctou", parent_rev="rev-0001")
+        cand_dir = store.incoming_candidate_path("cand-toctou")
+        assert (cand_dir / "state").is_dir()
+        orig_compute = _BS.compute_next_revision_id
+
+        def _mutating_compute(self):
+            # TOCTOU side effect: replace state/ directory with regular file on disk
+            state_path = cand_dir / "state"
+            if state_path.is_dir() and not state_path.is_symlink():
+                _sh.rmtree(state_path)
+                state_path.write_text("replaced state with file", encoding="utf-8")
+            return orig_compute(self)
+
+        # Monkeypatch bound method via class
+        _BS.compute_next_revision_id = _mutating_compute
+        try:
+            with pytest.raises((ValidationError, HashMismatch)):
+                promote(store, "cand-toctou")
+        finally:
+            _BS.compute_next_revision_id = orig_compute
+        # Must be quarantined, CURRENT unchanged, no rev-0002 created
+        assert store.quarantine_candidate_path("cand-toctou").exists()
+        assert not store.incoming_candidate_path("cand-toctou").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        assert not store.snapshot_dir("rev-0002").exists()
+        assert not (store.snapshots_dir / "rev-0002").exists()
+        # Snapshot state must not be a file
+        assert not store.lease_path().exists()
+        # Ensure quarantined candidate does not become a valid snapshot
+        q = store.quarantine_candidate_path("cand-toctou")
+        # state is now a file inside quarantine (the mutated artifact was quarantined)
+        assert (q / "state").is_file()
+
+
+def test_z2_validate_candidate_boundary_rejects_mutated_state_file():
+    """Direct unit: validate_candidate_boundary rejects state/ replaced with file."""
+    import shutil as _sh
+    from pact_v4.snapshot.promote import validate_candidate_boundary
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-validate", parent_rev="rev-0001")
+        # Valid first
+        m = validate_candidate_boundary(cand_dir)
+        assert m.book_id == BOOK_ID
+        # Mutate state/ into regular file
+        _sh.rmtree(cand_dir / "state")
+        (cand_dir / "state").write_text("not a dir", encoding="utf-8")
+        with pytest.raises(ValidationError):
+            validate_candidate_boundary(cand_dir)
+        # Restore to valid then mutate via extra top-level
+        _sh.rmtree(cand_dir / "state") if (cand_dir / "state").is_symlink() else None
+        try:
+            (cand_dir / "state").unlink()
+        except Exception:
+            pass
+        (cand_dir / "state").mkdir()
+        for fname in CANONICAL:
+            _make_json_file(cand_dir / "state" / fname, {"file": fname, "v": 1})
+        # Need to recreate manifest hashes to be valid again for next check
+        # Rebuild manifest with correct hashes for restored state
+        import json as _json
+        raw = _json.loads((cand_dir / "manifest.json").read_text(encoding="utf-8"))
+        new_files = []
+        for fname in CANONICAL:
+            sha, size = compute_sha256_and_size(cand_dir / "state" / fname)
+            new_files.append({"rel_path": f"state/{fname}", "sha256": sha, "size": size})
+        raw["state_files"] = new_files
+        _make_json_file(cand_dir / "manifest.json", raw)
+        # Now valid again
+        validate_candidate_boundary(cand_dir)
+        # Extra top-level file
+        (cand_dir / "credentials.env").write_text("SECRET=1", encoding="utf-8")
+        with pytest.raises(ValidationError):
+            validate_candidate_boundary(cand_dir)
+        (cand_dir / "credentials.env").unlink()
+        # Missing canonical file
+        (cand_dir / "state" / "glossary.json").unlink()
+        with pytest.raises((ValidationError, HashMismatch)):
+            validate_candidate_boundary(cand_dir)
