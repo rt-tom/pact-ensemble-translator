@@ -54,7 +54,7 @@ def _seed_inbox(store: BookStore, ts="20260826T120000Z", extra_files=None, corru
     return inbox_ts_dir
 
 
-def _create_candidate(store: BookStore, candidate_id, parent_rev, terminal="complete", tamper_hash=False):
+def _create_candidate(store: BookStore, candidate_id, parent_rev, terminal="complete", tamper_hash=False, revision_id=None):
     cand_dir = store.incoming_candidate_path(candidate_id)
     state_dir = cand_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -71,10 +71,13 @@ def _create_candidate(store: BookStore, candidate_id, parent_rev, terminal="comp
             # corrupt hash
             sha = "0" * 64
         state_files.append({"rel_path": f"state/{fname}", "sha256": sha, "size": size})
+    # Allow caller to inject arbitrary revision_id (Finding 1)
+    if revision_id is None:
+        revision_id = store.compute_next_revision_id()
     manifest_dict = {
         "schema_version": "1.0.0",
         "book_id": store.book_id,
-        "revision_id": store.compute_next_revision_id(),
+        "revision_id": revision_id,
         "parent_revision_id": parent_rev,
         "created_at": "2026-08-26T12:00:00Z",
         "published_at": "2026-08-26T12:00:00Z",
@@ -158,7 +161,7 @@ def test_c_bootstrap_fails_closed_non_json():
         assert list(store.snapshots_dir.iterdir()) == []
 
 
-# (d) promote ACCEPTS valid candidate
+# (d) promote ACCEPTS valid candidate with ARBITRARY/WRONG revision_id — media assigns next_rev (Finding 1)
 def test_d_promote_accepts():
     with tempfile.TemporaryDirectory() as tmp:
         store = _init_store(tmp)
@@ -166,16 +169,24 @@ def test_d_promote_accepts():
         bootstrap(store)
         cur_before = store.read_current()
         assert cur_before["revision_id"] == "rev-0001"
-        _create_candidate(store, "cand-001", parent_rev="rev-0001")
+        expected_next = store.compute_next_revision_id()
+        assert expected_next == "rev-0002"
+        # Candidate declares a completely wrong revision_id — must still be ACCEPTED and media-assigned
+        _create_candidate(store, "cand-001", parent_rev="rev-0001", revision_id="rev-9999")
         result = promote(store, "cand-001")
         assert result["status"] == "ACCEPTED"
         assert result["revision_id"] == "rev-0002"
         cur_after = store.read_current()
         assert cur_after["revision_id"] == "rev-0002"
+        # Finding 1: snapshot directory name, stored manifest revision_id, and CURRENT must all agree on next_rev
+        snap_dir = store.snapshot_dir("rev-0002")
+        assert snap_dir.exists()
+        stored_manifest = Manifest.read(snap_dir / "manifest.json")
+        assert stored_manifest.revision_id == "rev-0002"
+        assert cur_after["revision_id"] == stored_manifest.revision_id == "rev-0002"
+        assert snap_dir.name == "rev-0002"
         # lease must be released (no lease file)
         assert not store.lease_path().exists()
-        # snapshot exists
-        assert store.snapshot_dir("rev-0002").exists()
         # candidate no longer in incoming
         assert not store.incoming_candidate_path("cand-001").exists()
         # not quarantined
@@ -249,7 +260,7 @@ def test_g_lease_held_and_release():
         assert rec["reason"] == "stale promote crashed"
         assert rec["prior_staging_reviewed"] is True
         # Now retry with new candidate (since previous quarantined, create fresh)
-        _create_candidate(store, "cand-lease-retry", parent_rev="rev-0001")
+        _create_candidate(store, "cand-lease-retry", parent_rev="rev-0001", revision_id="rev-1234")
         result = promote(store, "cand-lease-retry")
         assert result["status"] == "ACCEPTED"
         assert store.read_current()["revision_id"] == "rev-0002"
@@ -307,3 +318,142 @@ def test_cli_promote_and_quarantine():
         assert rc == 2
         assert store.quarantine_candidate_path("cand-cli-stale").exists()
         assert store.read_current()["revision_id"] == "rev-0001"
+
+# --- Finding 2 rejection tests ---
+
+def test_i_reject_extra_file_in_state():
+    """Candidate contains extra file not in state_files -> REJECTED + quarantined + CURRENT unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-extra", parent_rev="rev-0001")
+        # Add smuggled extra file in candidate state/
+        extra_path = cand_dir / "state" / "secret_backup.json"
+        _make_json_file(extra_path, {"secret": "leak"})
+        with pytest.raises(ValidationError):
+            promote(store, "cand-extra")
+        assert store.quarantine_candidate_path("cand-extra").exists()
+        assert not store.incoming_candidate_path("cand-extra").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+def test_j_reject_traversal_or_non_canonical_manifest():
+    """Manifest state_files includes traversal or non-canonical path -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, manifest_dict = _create_candidate(store, "cand-traversal", parent_rev="rev-0001")
+        # Inject traversal path into manifest
+        bad_manifest = dict(manifest_dict)
+        # replace one entry with traversal
+        bad_manifest["state_files"] = list(manifest_dict["state_files"])
+        bad_manifest["state_files"][0] = {"rel_path": "state/../secret.json", "sha256": manifest_dict["state_files"][0]["sha256"], "size": manifest_dict["state_files"][0]["size"]}
+        _make_json_file(cand_dir / "manifest.json", bad_manifest)
+        with pytest.raises(ValidationError):
+            promote(store, "cand-traversal")
+        assert store.quarantine_candidate_path("cand-traversal").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        # Also test non-canonical path (not in canonical four)
+        cand_dir2, manifest_dict2 = _create_candidate(store, "cand-noncanon", parent_rev="rev-0001")
+        bad2 = dict(manifest_dict2)
+        bad2["state_files"] = list(manifest_dict2["state_files"])
+        bad2["state_files"][0] = {"rel_path": "state/extra.json", "sha256": manifest_dict2["state_files"][0]["sha256"], "size": manifest_dict2["state_files"][0]["size"]}
+        _make_json_file(cand_dir2 / "manifest.json", bad2)
+        with pytest.raises(ValidationError):
+            promote(store, "cand-noncanon")
+        assert store.quarantine_candidate_path("cand-noncanon").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+def test_k_reject_duplicate_state_files():
+    """Duplicate state_files paths -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, manifest_dict = _create_candidate(store, "cand-dup", parent_rev="rev-0001")
+        bad = dict(manifest_dict)
+        # duplicate first entry
+        bad["state_files"] = list(manifest_dict["state_files"])
+        bad["state_files"].append(dict(manifest_dict["state_files"][0]))
+        _make_json_file(cand_dir / "manifest.json", bad)
+        with pytest.raises(ValidationError):
+            promote(store, "cand-dup")
+        assert store.quarantine_candidate_path("cand-dup").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+def test_l_reject_non_json_canonical_file():
+    """Canonical state file that is not valid JSON -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, manifest_dict = _create_candidate(store, "cand-badjson", parent_rev="rev-0001")
+        # Corrupt one canonical file to be non-JSON, but keep hash correct? Need to adjust: first corrupt file content, then also update manifest? Actually promote will check JSON validity before hash? We corrupted file after manifest hash computed.
+        # Easiest: overwrite file after candidate creation
+        bad_file = cand_dir / "state" / "glossary.json"
+        with open(bad_file, "w", encoding="utf-8") as f:
+            f.write("{ not valid json }")
+        # Update manifest entry to match new bytes so hash check would pass but JSON validation fails
+        sha, size = compute_sha256_and_size(bad_file)
+        # Find glossary entry and update
+        new_manifest = dict(manifest_dict)
+        new_files = []
+        for e in manifest_dict["state_files"]:
+            if e["rel_path"] == "state/glossary.json":
+                new_files.append({"rel_path": e["rel_path"], "sha256": sha, "size": size})
+            else:
+                new_files.append(dict(e))
+        new_manifest["state_files"] = new_files
+        _make_json_file(cand_dir / "manifest.json", new_manifest)
+        with pytest.raises(ValidationError):
+            promote(store, "cand-badjson")
+        assert store.quarantine_candidate_path("cand-badjson").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+
+
+# --- Finding 3 CLI regression test ---
+
+def test_m_bootstrap_cli_no_current_on_failure():
+    """Start with NO CURRENT.json (store never initialized) and run bootstrap against non-JSON inbox -> fails and CURRENT still absent."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BookStore(BOOK_ID, root=tmp)
+        # Do NOT call init_store — store never initialized, no CURRENT.json
+        assert not store.current_path.exists()
+        # Create inbox dir structure manually (since init_store not called)
+        inbox_ts_dir = store.bootstrap_inbox_dir / "20260826T120000Z"
+        inbox_ts_dir.mkdir(parents=True, exist_ok=True)
+        for fname in CANONICAL:
+            data = {"file": fname, "content": "hello"}
+            _make_json_file(inbox_ts_dir / fname, data)
+        # corrupt one file
+        with open(inbox_ts_dir / "glossary.json", "w", encoding="utf-8") as f:
+            f.write("{ not valid json")
+        # Run bootstrap via CLI — should fail
+        rc = cli_main(["--root", tmp, "bootstrap", BOOK_ID])
+        assert rc in (2, 3)  # SnapshotError -> 2
+        # CURRENT.json must still be absent (bootstrap must not have pre-created it via init_store)
+        assert not store.current_path.exists(), "CURRENT.json must not be created on bootstrap failure"
+        # No snapshot created
+        if store.snapshots_dir.exists():
+            assert list(store.snapshots_dir.iterdir()) == []
+
+
+def test_n_bootstrap_success_without_prior_init_store():
+    """Successful bootstrap without prior init-store still creates rev-0001 + CURRENT (ensures dirs are created)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BookStore(BOOK_ID, root=tmp)
+        assert not store.current_path.exists()
+        inbox_ts_dir = store.bootstrap_inbox_dir / "20260826T120000Z"
+        inbox_ts_dir.mkdir(parents=True, exist_ok=True)
+        for fname in CANONICAL:
+            _make_json_file(inbox_ts_dir / fname, {"ok": fname})
+        rc = cli_main(["--root", tmp, "bootstrap", BOOK_ID])
+        assert rc == 0
+        assert store.current_path.exists()
+        cur = store.read_current()
+        assert cur["revision_id"] == "rev-0001"
+        assert store.snapshot_dir("rev-0001").exists()

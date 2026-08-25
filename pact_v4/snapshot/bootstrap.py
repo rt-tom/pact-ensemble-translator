@@ -48,6 +48,14 @@ def bootstrap(
     code_commit: str = "unknown",
 ) -> Dict[str, Any]:
     """Create rev-0001 from inbox. Fail closed if missing/non-JSON."""
+    # Ensure required directories exist WITHOUT creating CURRENT.json (Finding 3)
+    # Only mkdir parents; CURRENT.json is written only after successful validation/seed.
+    store.book_dir.mkdir(parents=True, exist_ok=True)
+    store.snapshots_dir.mkdir(parents=True, exist_ok=True)
+    store.locks_dir.mkdir(parents=True, exist_ok=True)
+    store.quarantine_dir.mkdir(parents=True, exist_ok=True)
+    store.incoming_dir.mkdir(parents=True, exist_ok=True)
+    # Note: _bootstrap_inbox must already exist (owner-copied); do not create it here.
     # Reject if snapshots already exist (bootstrap is first-revision only)
     if store.snapshots_dir.exists():
         existing = [p.name for p in store.snapshots_dir.iterdir() if p.is_dir()]

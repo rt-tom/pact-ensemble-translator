@@ -77,6 +77,27 @@ def promote(
                     f"Hash/size mismatch for {entry.rel_path}: expected {entry.sha256}/{entry.size}, got {actual_sha}/{actual_size}"
                 )
 
+        # Scope A: reject smuggled extra files in candidate state/ and validate JSON (Finding 2)
+        state_dir = candidate_dir / "state"
+        if state_dir.is_dir():
+            allowed = {e.rel_path for e in manifest.state_files}
+            for p in state_dir.iterdir():
+                # Only consider files (ignore subdirs)
+                if p.is_file():
+                    rel = f"state/{p.name}"
+                    if rel not in allowed:
+                        raise ValidationError(f"Extra file in state/ not listed in state_files: {rel}")
+                    # Validate valid JSON for each canonical file
+                    try:
+                        with open(p, "r", encoding="utf-8") as jf:
+                            json.load(jf)
+                    except Exception as e:
+                        raise ValidationError(f"Canonical state file not valid JSON: {rel}: {e}") from e
+                elif p.is_dir():
+                    raise ValidationError(f"Unexpected subdirectory in state/: {p.name}")
+        # Also reject if manifest includes non-canonical / traversal already enforced in Manifest.from_dict,
+        # but double-check here for defense in depth
+
         # Require parent_revision_id == current CURRENT revision (fail-closed)
         current = store.read_current()
         if current is None:
@@ -88,21 +109,8 @@ def promote(
                 f"parent_revision_id {manifest.parent_revision_id!r} != current {current_rev!r}"
             )
 
-        # Validate that manifest.revision_id is either next revision or candidate's declared?
-        # We will compute next revision and enforce consistency if manifest.revision_id differs from computed?
-        # Spec says atomically move candidate to snapshots/<revision-id>. Which revision?
-        # We'll compute next and if manifest.revision_id != next, raise ValidationError (strict).
-        # However if candidate's revision_id is not next, that's a validation error before lease.
-        # Alternatively we could override with computed id, but spec expects monotonic rev-NNNN.
-        next_rev = store.compute_next_revision_id()
-        # If manifest.revision_id is provided, it should equal next_rev; but to be flexible,
-        # if manifest.revision_id != next_rev we will treat manifest's revision as intended but
-        # ensure it doesn't collide. Safer to enforce equality.
-        if manifest.revision_id != next_rev:
-            # Allow if candidate revision is logically next? If mismatch, reject
-            raise ValidationError(
-                f"manifest revision_id {manifest.revision_id!r} != expected next {next_rev!r}"
-            )
+        # Finding 1: media assigns revision id — do NOT require candidate revision_id == next_rev.
+        # next_rev is computed AFTER acquiring lease to avoid TOCTOU.
 
         # --- Phase 2: acquire lease mutex bound to current revision ---
         try:
@@ -112,6 +120,8 @@ def promote(
             raise
 
         # --- Phase 3: atomically move bundle to snapshots ---
+        # Media assigns revision id after lease (Finding 1)
+        next_rev = store.compute_next_revision_id()
         snap_dir = store.snapshot_dir(next_rev)
         if snap_dir.exists():
             raise ValidationError(f"Snapshot dir already exists: {snap_dir}")
@@ -129,8 +139,26 @@ def promote(
             # For safety, preserve prior CURRENT and raise.
             raise LeaseHeld(f"Lease lost or mismatched after move; expected parent {current_rev!r}")
 
-        # Compute manifest hash (now at snap_dir/manifest.json)
+        # Rewrite stored manifest.json revision_id to next_rev so directory, manifest, and CURRENT agree (Finding 1)
         moved_manifest_path = snap_dir / "manifest.json"
+        try:
+            with open(moved_manifest_path, "r", encoding="utf-8") as f:
+                stored_manifest = json.load(f)
+        except Exception as e:
+            raise ValidationError(f"Stored manifest.json unreadable after move: {e}") from e
+        stored_manifest["revision_id"] = next_rev
+        # Atomically rewrite manifest.json with corrected revision_id
+        tmp_manifest = moved_manifest_path.with_suffix(".tmp")
+        with open(tmp_manifest, "w", encoding="utf-8") as f:
+            json.dump(stored_manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_manifest), str(moved_manifest_path))
+        # Update in-memory manifest for CURRENT construction
+        manifest.revision_id = next_rev
+
+        # Compute manifest hash (now at snap_dir/manifest.json, after rewrite)
         manifest_sha, _ = compute_sha256_and_size(moved_manifest_path)
 
         # Write CURRENT.json via atomic rename

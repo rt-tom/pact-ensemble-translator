@@ -85,8 +85,6 @@ def main(argv=None) -> int:
 
         elif args.cmd == "bootstrap":
             store = BookStore(args.book_id, root=args.root)
-            # Ensure store skeleton exists (init if needed)
-            store.init_store()
             result = bootstrap(
                 store,
                 ts=args.ts,

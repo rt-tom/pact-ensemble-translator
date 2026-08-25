@@ -30,6 +30,36 @@ TOP_LEVEL_KEYS = {
 SOURCE_ALLOWED_KEYS = {"path_on_rt", "operator", "host", "run_id"}
 
 CANONICAL_REL_PREFIX = "state/"
+CANONICAL_STATE_PATHS = {
+    "state/book_memory.json",
+    "state/glossary.json",
+    "state/chapter_index.json",
+    "state/observations.json",
+}
+
+
+def _is_normalized_rel_path(rel_path: str) -> bool:
+    """Return True iff rel_path is normalized POSIX relative path without traversal."""
+    if not rel_path:
+        return False
+    if rel_path.startswith("/") or rel_path.startswith("\\"):
+        return False
+    if "\\" in rel_path:
+        return False
+    if "//" in rel_path:
+        return False
+    # No .. segments, no . segments, no empty segments
+    parts = rel_path.split("/")
+    for part in parts:
+        if part in ("", ".", ".."):
+            return False
+        if part != part.strip():
+            return False
+    # Reconstruct and ensure no normalization change (e.g. a/./b)
+    normalized = "/".join(parts)
+    if normalized != rel_path:
+        return False
+    return True
 
 
 def compute_sha256_and_size(path: Path) -> tuple[str, int]:
@@ -68,6 +98,8 @@ class StateFileEntry:
         size = d["size"]
         if not isinstance(rel_path, str) or not rel_path.startswith(CANONICAL_REL_PREFIX):
             raise ValidationError(f"rel_path must be under state/: {rel_path}")
+        if not _is_normalized_rel_path(rel_path):
+            raise ValidationError(f"rel_path must be normalized without traversal: {rel_path}")
         if not isinstance(sha256, str):
             raise ValidationError("sha256 must be string")
         _validate_hex64(sha256)
@@ -168,6 +200,19 @@ class Manifest:
             if not isinstance(entry, dict):
                 raise ValidationError("state_files entry must be object")
             state_files.append(StateFileEntry.from_dict(entry))
+        # Enforce Scope A exact four-file state boundary (Finding 2)
+        rel_paths = [e.rel_path for e in state_files]
+        if len(rel_paths) != len(set(rel_paths)):
+            raise ValidationError(f"Duplicate state_files paths rejected: {rel_paths}")
+        for rp in rel_paths:
+            if not _is_normalized_rel_path(rp):
+                raise ValidationError(f"state_files rel_path not normalized: {rp}")
+            if ".." in rp.split("/"):
+                raise ValidationError(f"state_files rel_path traversal rejected: {rp}")
+        if set(rel_paths) != CANONICAL_STATE_PATHS:
+            raise ValidationError(
+                f"state_files must be exactly {sorted(CANONICAL_STATE_PATHS)}, got {sorted(set(rel_paths))}"
+            )
         if not isinstance(excludes, list) or any(not isinstance(x, str) for x in excludes):
             raise ValidationError("excludes must be list of strings")
         if not isinstance(code_commit, str):
