@@ -92,6 +92,19 @@ For approved implementation work:
   the Architect stops the cycle, consolidates findings into a single list, and
   allows one fix iteration (preserved from former `AGENTS.md` analytical-task
   convergence rule 2026-08-07).
+- **Review economy (token efficiency, no quality loss):** preserve the independent
+  fresh-review model (it caught real defects an implementer missed, e.g. symlink
+  path-escape), but cut redundant re-work: (a) brief `pact-dev` to implement
+  boundary/security hardening proactively (reject symlinks for candidate/state/manifest/
+  inbox dirs and files, validate `book_id`/`candidate_id` as safe single path components
+  with containment, enforce the exact canonical file set, assign revision ids on the
+  authority side) on the FIRST pass, referencing the no-secrets/boundary intent; (b) after
+  a review, hand ALL outstanding findings to `pact-dev` in ONE fix pass, not one per round;
+  (c) require `pact-dev` to self-review its diff against the findings and spec and run the
+  checks before reporting done; (d) keep Architect briefs short (point to verdict + files,
+  do not restate file contents); (e) let `pact-rev` lean on the test suite + `openspec
+  validate` and read only changed files. Do NOT merge dev+rev into one agent and do NOT cut
+  review rounds in a way that sacrifices independence.
 - Escalate blocked decisions, ambiguous requirements, or material disagreement to
   the Architect/owner; do not invent product policy.
 - Historical Hermes/Vibe Kanban procedures are not active workflow rules. Consult
