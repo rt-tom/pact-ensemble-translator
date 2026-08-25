@@ -14,7 +14,7 @@ When editing prompts, selection/audit logic, glossary, memory, or entity handlin
 ## Checks (on git diff, no model calls)
 
 ```bash
-./scripts/lint.sh
+bash .pi/skills/pact-fidelity-lint/scripts/lint.sh
 # or
 git diff origin/main...HEAD -- pact_v4/
 ```

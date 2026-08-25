@@ -10,7 +10,7 @@ Implements AGENTS.md "Git, merge, deployment" dev subset.
 ## Checks (before commit/PR)
 
 ```bash
-./scripts/check.sh
+bash .pi/skills/pact-git-hygiene/scripts/check.sh
 # manual:
 git diff --stat
 git diff origin/main...HEAD --stat

@@ -13,10 +13,12 @@ MANDATORY before ANY edit/write/bash that touches code, config, or artifacts. Th
 
 ## Checks
 
-Run the script:
+Run the script from repo root:
 
 ```bash
-./scripts/check.sh
+bash .pi/skills/pact-workspace-guard/scripts/check.sh
+# or
+bash /home/rt/projects/pact-ensemble-translator/.pi/skills/pact-workspace-guard/scripts/check.sh
 ```
 
 It verifies:
