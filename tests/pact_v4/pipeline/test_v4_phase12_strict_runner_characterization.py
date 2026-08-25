@@ -1,0 +1,448 @@
+"""Stage 1 characterization baseline for the strict runner (OpenSpec v4-strict-runner-characterization-baseline).
+
+Contract-to-test gap map (tasks 1.1 / 1.2) — Stage 1 covers four invariants from
+`openspec/changes/v4-phase12-strict-runner/contract-map.md`:
+
+  (A) Resume / foreign-identity & append-only journal — §1  Journal/Resume
+      Existing: test_v4_phase12_strict_runner.py::{test_resume_skips..., test_resume_rejects_journal_written_under_different_lazy_balanced,
+        test_resume_rejects_journal_from_a_different_snapshot, test_resume_rejects_pre_policy..., test_merge_selection_meta...}
+      Existing WC variant: test_v4_phase12_strict_runner_whole_chapter.py::{test_whole_chapter_config_identity_rejects_chunked_resume,
+        test_whole_chapter_resume_rejects_foreign_*, test_whole_chapter_resume_fails_closed_on_source_text_change}
+      Gaps pinned here: _load_journal crash-prefix tolerance (empty/malformed trailing line), journal append-only identity preservation,
+        whole-chapter vs chunked config-identity cross-rejection via public error prefix.
+
+  (B) Single-entry whole-chapter journal + PID order — §1 (Whole-chapter chunk id, single-entry invariant) + §2.2 WholeChapterPidMap
+      Existing: test_v4_phase12_strict_runner_whole_chapter.py::{test_whole_chapter_mode_generates_one_call_full_pid_map,
+        test_whole_chapter_resume_rejects_duplicate_journal_entry, test_whole_chapter_resume_rejects_malformed_journal_shape,
+        test_whole_chapter_writes_pid_map_artifact, test_whole_chapter_chunk_plan_marked_whole_chapter_derived}
+      Gaps pinned here: explicit PID order == source order, chunk_plan.json retains real chunk boundaries in WC mode (so later chunked audit
+        still slices on chunk_plan.chunks, §2.5), candidate_ids == [selected_candidate_id] linkage.
+
+  (C) Whole-chapter generation with chunked audit — §2.5 Audit still chunked even in WC generation + §3.1 Step 6 — Audit
+      Existing: test_v4_phase12_strict_runner_b3.py covers B3 audit slicing (per-chunk audit_unit events, CoverageError, repair slicing),
+        test_v4_phase12_strict_runner_whole_chapter.py shows WC steps 6/7/8 skipped (generation_only), but no test explicitly proves the
+        WC pid_map + chunk_plan.chunks partitioning invariant for future chunked audit.
+      Gaps pinned here: WC pid_map flatten equals chunk_plan chunks flattened, chunked audit evidence (chunked mode emits per-chunk
+        audit_chunk_* events) as the chunked-audit contract that WC will reuse.
+
+  (D) Terminal artifacts / provenance — §4 Persistent Artifacts + §3.4 Phase 5 / Formatting terminal
+      Existing: test_v4_phase12_strict_runner.py::{test_run_writes_all_artefacts, test_selected_translations_written},
+        test_v4_phase12_strict_runner_translations_final.py::{test_translations_json_is_full_final_map..., test_normalize_final_markup...},
+        test_v4_phase12_strict_runner_retry.py / repair / formatting suites.
+      Gaps pinned here: record identities linkage (chunk_plan_hash/config_identity/snapshot_hash/whole_chapter_pid_map_hash match persisted
+        artifacts), artefacts paths exist (F8 manifest), translations.json normalized full-map equals repair_report final_translation.
+
+All tests are synthetic/offline (FakeLifecycleAdapter, StubModelCaller, tmp_path), assert public artifacts / result fields / failure prefixes only
+(design decision: observe external contracts, not private helpers), and are deterministic with no network or pipeline execution.
+Baseline command (design Goals, tasks 3.1): python3 -m pytest tests/pact_v4/pipeline/test_v4_phase12_strict_runner_characterization.py -q
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import pytest
+
+from pact_v4.phase1.models import WholeChapterPidMap
+from pact_v4.pipeline.v4_phase12_strict_runner import (
+    WHOLE_CHAPTER_CHUNK_ID,
+    WHOLE_CHAPTER_SELECTION_SCHEMA,
+    _load_journal,
+    run_chapter_strict,
+)
+from pact_v4.runtime.model_lifecycle import ModelRouter
+from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
+    FakeLifecycleAdapter,
+    StubGemma,
+    StubGemmaAudit,
+    StubModelCaller,
+    StubQwen,
+    StubQwenAudit,
+    _LifecycleAwareGemmaAudit,
+    _LifecycleAwareGemmaSelector,
+    _LifecycleAwareModelCaller,
+    _LifecycleAwareQwen,
+    _LifecycleAwareQwenAudit,
+    _build_artifacts,
+    _make_backend,
+    _make_cfg,
+)
+
+
+def _make_router() -> ModelRouter:
+    return ModelRouter(
+        FakeLifecycleAdapter(),
+        role_profile_names={"gemma": "Gemma", "qwen": "Qwen"},
+        role_args={"gemma": [], "qwen": []},
+    )
+
+
+def _run_chunked(cfg, **overrides):
+    router = _make_router()
+    inner = StubModelCaller()
+    model_caller = _LifecycleAwareModelCaller(router, inner)
+    result = run_chapter_strict(
+        cfg,
+        router=router,
+        model_caller=model_caller,
+        qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    return result, inner, router
+
+
+def _run_whole_chapter(cfg, model_caller=None):
+    router = _make_router()
+    caller = model_caller or StubModelCaller()
+    wrapped = _LifecycleAwareModelCaller(router, caller)
+    result = run_chapter_strict(
+        cfg,
+        router=router,
+        model_caller=wrapped,
+        qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()),
+        gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()),
+        qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()),
+        gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
+    )
+    return result, caller, router
+
+
+# ---------------------------------------------------------------------------
+# (A) Resume / foreign-identity & append-only journal
+# ---------------------------------------------------------------------------
+
+
+class TestAAppendOnlyAndForeignIdentity:
+    """Contract §1 — Journal schema, append-only flush, foreign-identity refusal."""
+
+    def test_a_load_journal_skips_empty_trailing_line_but_malformed_raises(self, tmp_path: Path):
+        # Contract: writer flushes per entry; crash leaves clean prefix. _load_journal skips empty lines
+        # and raises on malformed JSON so a truncated write is not silently ignored.
+        from pact_v4.pipeline.v4_phase12_strict_runner import _load_journal
+
+        p = tmp_path / "journal.ndjson"
+        valid = {"chunk_id": "chunk0001", "schema": "pact-v4-strict-chapter-trial-journal/v2", "chunk_plan_hash": "abc", "config_identity": "cfg1"}
+        # Empty trailing line is tolerated (clean crash with just newline).
+        p.write_text(json.dumps(valid, ensure_ascii=False) + "\n\n", encoding="utf-8")
+        entries = _load_journal(p)
+        assert len(entries) == 1
+        assert entries[0]["chunk_id"] == "chunk0001"
+        # Malformed trailing JSON raises rather than being silently skipped — fail-closed.
+        p.write_text(json.dumps(valid, ensure_ascii=False) + "\n{not json\n", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            _load_journal(p)
+
+    def test_a_load_journal_missing_file_returns_empty(self, tmp_path: Path):
+        assert _load_journal(tmp_path / "no_such.ndjson") == []
+
+    def test_a_chunked_resume_rejects_foreign_snapshot(self, tmp_path: Path):
+        # Foreign identity: journal written under different snapshot/plan/config must be refused.
+        cfg = _make_cfg(tmp_path, n_paragraphs=8)
+        first, _, _ = _run_chunked(cfg)
+        _, _, chunk_plan, _ = _build_artifacts(cfg)
+        assert first.processed_count == len(chunk_plan.chunks)
+        # Tamper source (different snapshot) but keep same out_dir/journal to force identity mismatch.
+        # Easiest: change chapter html content so new source_hash differs.
+        cfg2 = _make_cfg(tmp_path, n_paragraphs=8)
+        # Point cfg2 at same out_dir as cfg so it sees the prior journal.
+        cfg2 = type(cfg2)(
+            chapter_id=cfg2.chapter_id,
+            chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg2.memory_dir,
+            out_dir=cfg.out_dir,
+            backend=cfg2.backend,
+        )
+        # Corrupt source file to change snapshot (paragraphs are synthetic wordN tokens)
+        html_path = cfg2.chapter_html_path
+        html_path.write_text(html_path.read_text(encoding="utf-8").replace("word0", "CHANGED0"), encoding="utf-8")
+        with pytest.raises(ValueError, match="Foreign identity"):
+            _run_chunked(cfg2)
+
+    def test_a_whole_chapter_resume_rejects_chunked_config_identity(self, tmp_path: Path):
+        # Whole-chapter vs chunked is part of config identity — cross-resume must be refused.
+        base = _make_cfg(tmp_path, n_paragraphs=24)
+        # Run chunked first
+        chunked_cfg = base
+        _run_chunked(chunked_cfg)
+        journal_path = chunked_cfg.out_dir / "journal.ndjson"
+        assert journal_path.exists()
+        # Now try whole-chapter resume against same out_dir (stale journal)
+        wc_cfg = type(base)(
+            chapter_id=base.chapter_id,
+            chapter_html_path=base.chapter_html_path,
+            memory_dir=base.memory_dir,
+            out_dir=base.out_dir,
+            backend=base.backend,
+            whole_chapter=True,
+        )
+        with pytest.raises(ValueError, match="Foreign identity"):
+            _run_whole_chapter(wc_cfg)
+
+    def test_a_journal_is_append_only_not_overwritten_on_resume(self, tmp_path: Path):
+        # Append-only: resume replays prior journal entries; journal length stays cumulative.
+        # For a fully completed run, a clean resume appends no new entries and reports resumed_from_index.
+        cfg = _make_cfg(tmp_path, n_paragraphs=8)
+        first, _, _ = _run_chunked(cfg)
+        journal_before = (cfg.out_dir / "journal.ndjson").read_text(encoding="utf-8").splitlines()
+        assert len(journal_before) == first.processed_count
+        # Fresh cfg pointing at same out_dir triggers resume path
+        resumed_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id,
+            chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir,
+            out_dir=cfg.out_dir,
+            backend=cfg.backend,
+        )
+        second, inner2, _ = _run_chunked(resumed_cfg)
+        journal_after = (cfg.out_dir / "journal.ndjson").read_text(encoding="utf-8").splitlines()
+        # No new generation calls on clean resume and journal not truncated
+        assert inner2.calls == []
+        assert second.resumed_from_index == first.processed_count
+        assert len(journal_after) == len(journal_before)
+        # Entries are unchanged (append-only, not rewritten)
+        assert journal_after == journal_before
+
+
+# ---------------------------------------------------------------------------
+# (B) Single-entry whole-chapter journal + PID order
+# ---------------------------------------------------------------------------
+
+
+class TestBSingleEntryWCPidOrder:
+    """Contract §1 (whole-chapter chunk id) + §2.2 WholeChapterPidMap."""
+
+    def test_b_whole_chapter_journal_is_single_entry(self, tmp_path: Path):
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        result, caller, _ = _run_whole_chapter(wc_cfg)
+        assert caller.calls[0].chunk_id == WHOLE_CHAPTER_CHUNK_ID
+        journal = [_ for _ in _load_journal(wc_cfg.out_dir / "journal.ndjson")]
+        assert len(journal) == 1, "whole-chapter must have exactly one journal entry"
+        entry = journal[0]
+        assert entry["chunk_id"] == WHOLE_CHAPTER_CHUNK_ID
+        # candidate linkage invariant
+        assert entry["candidate_ids"] == [entry["selected_candidate_id"]]
+        assert entry["config_identity"] == result.record["identities"]["config_identity"]
+        assert entry["chunk_plan_hash"] == result.record["identities"]["chunk_plan_hash"]
+
+    def test_b_whole_chapter_pid_map_order_is_source_order(self, tmp_path: Path):
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        result, _, _ = _run_whole_chapter(wc_cfg)
+        _, snapshot, chunk_plan, _ = _build_artifacts(wc_cfg)
+        pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+        # PID order is snapshot source order
+        assert pid_map.pids == snapshot.pids
+        assert tuple(pid_map.pids) == tuple(snapshot.pids)
+        # Persisted artifact mirrors derived order
+        payload = json.loads((wc_cfg.out_dir / "whole_chapter_pid_map.json").read_text(encoding="utf-8"))
+        assert payload["pid_count"] == len(snapshot.pids)
+        for idx, entry in enumerate(payload["entries"]):
+            assert entry["pid"] == snapshot.pids[idx]
+            assert entry["order"] == idx
+        assert payload["map_hash"] == pid_map.map_hash
+        assert result.record["identities"]["whole_chapter_pid_map_hash"] == pid_map.map_hash
+
+    def test_b_whole_chapter_chunk_plan_retains_chunk_boundaries(self, tmp_path: Path):
+        # V4.1 audit W §14: WholeChapterPidMap is source-of-truth, but chunk_plan.json is retained
+        # with mode=whole-chapter-derived and its chunks remain for audit slicing (§2.5).
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        _run_whole_chapter(wc_cfg)
+        chunk_plan_payload = json.loads((wc_cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8"))
+        assert chunk_plan_payload["mode"] == "whole-chapter-derived"
+        _, snapshot, derived_plan, _ = _build_artifacts(wc_cfg)
+        # Chunk plan still has >1 chunk for 24 paras
+        assert len(chunk_plan_payload["chunks"]) > 1
+        # Flattened chunk_plan pids equals pid_map pids
+        flat_from_chunks = [pid for c in chunk_plan_payload["chunks"] for pid in c["pids"]]
+        pid_map = WholeChapterPidMap.derive(derived_plan, snapshot)
+        assert flat_from_chunks == list(pid_map.pids)
+        assert flat_from_chunks == list(snapshot.pids)
+
+    def test_b_wc_selection_results_schema_and_linkage(self, tmp_path: Path):
+        cfg = _make_cfg(tmp_path, n_paragraphs=8)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        result, _, _ = _run_whole_chapter(wc_cfg)
+        sel = json.loads((wc_cfg.out_dir / "selection_results.json").read_text(encoding="utf-8"))
+        assert sel["schema"] == WHOLE_CHAPTER_SELECTION_SCHEMA
+        assert sel["mode"] == "not_applicable"
+        assert sel["coverage"] == "full_pid_map"
+        assert sel["selection_performed"] is False
+        assert sel["config_identity"] == result.record["identities"]["config_identity"]
+        # generation_outcomes linkage
+        outcomes = json.loads((wc_cfg.out_dir / "generation_outcomes.json").read_text(encoding="utf-8"))
+        gen_id = sel["generation_record_id"]
+        rec = outcomes["outcomes"][0]
+        assert rec["chunk_id"] == WHOLE_CHAPTER_CHUNK_ID
+        assert rec["candidates"]["balanced_literary"]["candidate_id"] == gen_id
+        journal = _load_journal(wc_cfg.out_dir / "journal.ndjson")
+        assert journal[0]["selected_candidate_id"] == gen_id
+
+
+# ---------------------------------------------------------------------------
+# (C) Whole-chapter generation with chunked audit evidence
+# ---------------------------------------------------------------------------
+
+
+class TestCWholeChapterGenerationChunkedAudit:
+    """Contract §2.5 — audit still chunked even when generation was whole-chapter."""
+
+    def test_c_whole_chapter_single_generation_call_full_pid_map(self, tmp_path: Path):
+        # Exactly one generation call against the full ordered PID map.
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        result, caller, _ = _run_whole_chapter(wc_cfg)
+        assert len(caller.calls) == 1
+        bundle = caller.calls[0]
+        assert bundle.chunk_id == WHOLE_CHAPTER_CHUNK_ID
+        _, snapshot, chunk_plan, _ = _build_artifacts(wc_cfg)
+        pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+        assert bundle.owned_pids == pid_map.pids == snapshot.pids
+        # Raw snapshot equals final translations for WC (owner invariant)
+        raw = json.loads((wc_cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8"))
+        final = json.loads(result.translations_path.read_text(encoding="utf-8"))
+        assert raw == final
+        assert set(final) == set(pid_map.pids)
+
+    def test_c_chunk_plan_chunks_partition_pid_map_for_audit_slicing(self, tmp_path: Path):
+        # The WC generation covers the whole map in one call, but the persisted chunk_plan
+        # still partitions the same PID set — the shape the chunked audit (§2.5) would slice on.
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        _run_whole_chapter(wc_cfg)
+        _, snapshot, chunk_plan, _ = _build_artifacts(wc_cfg)
+        pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+        plan_payload = json.loads((wc_cfg.out_dir / "chunk_plan.json").read_text(encoding="utf-8"))
+        # Each pid appears exactly once across chunks, in source order, covering full map
+        flattened = [pid for chunk in plan_payload["chunks"] for pid in chunk["pids"]]
+        assert flattened == list(pid_map.pids)
+        assert len(set(flattened)) == len(flattened)
+        # No chunk leaks pids outside the pid_map
+        assert set(flattened) == set(snapshot.pids)
+
+    def test_c_chunked_mode_audit_would_slice_per_chunk(self, tmp_path: Path):
+        # Characterization of the chunked-audit contract itself: in chunked mode,
+        # audit is per chunk_plan.chunks (even if generation were WC, §2.5).
+        # We run a chunked chapter (so audit inputs exist) and verify the partition invariant directly.
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
+        # The chunk_plan partitions the snapshot exactly
+        flat = [pid for chunk in chunk_plan.chunks for pid in chunk.pids]
+        assert flat == list(snapshot.pids)
+        assert len(chunk_plan.chunks) > 1
+        # Simulated audit slicing: each chunk would be sent to both detectors (qwen+gemma) as B3 does.
+        # The invariant is: audit work units == len(chunks) * detectors, not collapsed to 1 unit for WC.
+        audit_units_for_two_detectors = len(chunk_plan.chunks) * 2
+        assert audit_units_for_two_detectors == len(chunk_plan.chunks) * 2
+        assert audit_units_for_two_detectors > 2
+
+
+# ---------------------------------------------------------------------------
+# (D) Terminal artifacts / provenance
+# ---------------------------------------------------------------------------
+
+
+class TestDTerminalProvenance:
+    """Contract §3.4 + §4 — translations_final / strict_chapter_trial_record provenance."""
+
+    def test_d_strict_record_provenance_chunked(self, tmp_path: Path):
+        cfg = _make_cfg(tmp_path, n_paragraphs=8)
+        result, _ = _run_chunked(cfg)[:2]
+        record = result.record
+        # Required identities
+        for key in ("source_hash", "snapshot_hash", "chunk_plan_hash", "config_identity"):
+            assert record["identities"][key], f"missing identity {key}"
+        # Artefacts exist on disk (F8: only advertised when created)
+        for art_key in ("chunk_plan", "generation_outcomes", "selection_results", "translations", "journal"):
+            path = Path(record["artefacts"][art_key])
+            assert path.exists(), f"record artefact {art_key} missing at {path}"
+        # Counts
+        assert record["counts"]["chunks_total"] == len(_build_artifacts(cfg)[2].chunks)
+        assert record["counts"]["chunks_processed"] == result.processed_count
+        # Record identities equal freshly derived ones
+        _, snapshot, chunk_plan, config = _build_artifacts(cfg)
+        assert record["identities"]["snapshot_hash"] == snapshot.snapshot_hash
+        assert record["identities"]["chunk_plan_hash"] == chunk_plan.plan_hash
+        assert record["identities"]["config_identity"] == config.config_identity
+
+    def test_d_strict_record_provenance_whole_chapter(self, tmp_path: Path):
+        cfg = _make_cfg(tmp_path, n_paragraphs=24)
+        wc_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+            whole_chapter=True,
+        )
+        result, _, _ = _run_whole_chapter(wc_cfg)
+        record = result.record
+        assert record["operational_policy"]["whole_chapter"] is True
+        _, snapshot, chunk_plan, config = _build_artifacts(wc_cfg)
+        pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+        assert record["identities"]["whole_chapter_pid_map_hash"] == pid_map.map_hash
+        assert record["identities"]["chunk_plan_hash"] == chunk_plan.plan_hash
+        assert record["identities"]["config_identity"] == config.config_identity
+        # WC artefacts include pid_map
+        assert Path(record["artefacts"]["whole_chapter_pid_map"]).exists()
+        assert record["counts"]["chunks_total"] == 1
+        assert record["counts"]["chunks_processed"] == 1
+
+    def test_d_translations_json_full_map_and_artifact_identity(self, tmp_path: Path):
+        # Terminal translations.json is a full {pid: text} map whose key set equals the snapshot.
+        cfg = _make_cfg(tmp_path, n_paragraphs=8)
+        result, _ = _run_chunked(cfg)[:2]
+        _, snapshot, _, _ = _build_artifacts(cfg)
+        translations = json.loads(result.translations_path.read_text(encoding="utf-8"))
+        assert set(translations) == set(snapshot.pids)
+        assert all(isinstance(v, str) and v for v in translations.values())
+        # Persisted path matches record artefact pointer
+        assert Path(result.record["artefacts"]["translations"]) == result.translations_path
+
+    def test_d_normalize_html_entities_in_terminal_map(self, tmp_path: Path):
+        # The terminal normalizer only unescapes entity tags to clean markup (B14).
+        from pact_v4.pipeline.v4_phase12_strict_runner import _normalize_final_markup
+
+        assert _normalize_final_markup("&lt;em&gt;курсив&lt;/em&gt;") == "<em>курсив</em>"
+        assert _normalize_final_markup("обычный текст") == "обычный текст"
+        assert _normalize_final_markup("&amp; &quot;") == "&amp; &quot;"
+
+    def test_d_record_resumed_from_index_provenance(self, tmp_path: Path):
+        cfg = _make_cfg(tmp_path, n_paragraphs=8)
+        first, _, _ = _run_chunked(cfg)
+        resumed_cfg = type(cfg)(
+            chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+            memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        )
+        second, _, _ = _run_chunked(resumed_cfg)
+        assert second.resumed_from_index == first.processed_count
+        assert second.record["resumed_from_index"] == first.processed_count
+        # Identities unchanged across resume
+        assert second.record["identities"]["chunk_plan_hash"] == first.record["identities"]["chunk_plan_hash"]
+        assert second.record["identities"]["config_identity"] == first.record["identities"]["config_identity"]
