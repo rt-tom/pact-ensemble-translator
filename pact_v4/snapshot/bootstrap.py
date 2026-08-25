@@ -125,6 +125,17 @@ def bootstrap(
     code_commit: str = "unknown",
 ) -> Dict[str, Any]:
     """Create rev-0001 from inbox. Fail closed if missing/non-JSON."""
+    # REGRESSION FIX (round 4): validate inbox/ancestor symlink chain and containment
+    # BEFORE any store-path read/listing/write (before read_current, before snapshots/
+    # iteration, before mkdir). Prevents symlinked books/<book-id> with malformed
+    # CURRENT.json from raising JSONDecodeError instead of controlled ValidationError.
+    inbox_dir = _resolve_inbox_dir(store, ts)
+    # Defense-in-depth: re-assert same chain/containment immediately (still before any mkdir/read_current)
+    _reject_symlink_chain(inbox_dir, store.root, "_bootstrap_inbox/<ts>")
+    _reject_symlink_chain(store.bootstrap_inbox_dir, store.root, "_bootstrap_inbox")
+    _assert_within(inbox_dir, store.bootstrap_inbox_dir, "_bootstrap_inbox/<ts>")
+    _reject_if_symlink(inbox_dir, "_bootstrap_inbox/<ts>")
+
     # Ensure required directories exist WITHOUT creating CURRENT.json (Finding 3)
     # Only mkdir parents; CURRENT.json is written only after successful validation/seed.
     store.book_dir.mkdir(parents=True, exist_ok=True)
@@ -144,8 +155,7 @@ def bootstrap(
     if current is not None and current.get("revision_id") is not None:
         raise ValidationError("CURRENT already points to a revision; bootstrap only for first revision")
 
-    inbox_dir = _resolve_inbox_dir(store, ts)
-    # High finding: ensure inbox selection did not escape via symlink and confirm containment before any file I/O
+    # Reuse already-validated inbox_dir; still enforce invariants (no second _resolve listing that could race)
     _reject_symlink_chain(inbox_dir, store.root, "_bootstrap_inbox/<ts>")
     _reject_symlink_chain(store.bootstrap_inbox_dir, store.root, "_bootstrap_inbox")
     _assert_within(inbox_dir, store.bootstrap_inbox_dir, "_bootstrap_inbox/<ts>")

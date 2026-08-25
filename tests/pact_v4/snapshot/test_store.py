@@ -723,3 +723,66 @@ def test_t2_bootstrap_rejects_symlinked_ancestor():
             cur = store.read_current()
             # If current was read via symlinked book_dir, it would be inside fake_book/CURRENT.json which doesn't exist
             assert cur is None or cur.get("revision_id") is None
+
+
+def test_u_bootstrap_symlinked_ancestor_malformed_current_regression():
+    """Round 4 regression: symlinked books/<book-id> ancestor whose target contains malformed CURRENT.json
+    must raise ValidationError (NOT JSONDecodeError) BEFORE any store-path read, and must NOT create/advance snapshot."""
+    import json as _json
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        # Prepare external target that will be the symlink target of books/<book-id>
+        with tempfile.TemporaryDirectory() as external:
+            ext_book = Path(external) / "ext_book"
+            ext_book.mkdir(parents=True)
+            # Valid inbox inside external target
+            inbox = ext_book / "_bootstrap_inbox" / "20260826T120000Z"
+            inbox.mkdir(parents=True)
+            for fname in CANONICAL:
+                _make_json_file(inbox / fname, {"ok": fname})
+            # Malformed CURRENT.json inside symlink target (would raise JSONDecodeError if read before symlink check)
+            malformed = ext_book / "CURRENT.json"
+            with open(malformed, "w", encoding="utf-8") as f:
+                f.write("{ not valid json }\n")
+            # Replace real book_dir with symlink to ext_book
+            real_book = store.book_dir
+            import shutil as _sh4
+            if real_book.is_symlink():
+                real_book.unlink()
+            elif real_book.exists():
+                _sh4.rmtree(real_book)
+            os.symlink(str(ext_book), str(real_book))
+            # Bootstrap must fail with ValidationError, not JSONDecodeError
+            with pytest.raises(ValidationError):
+                bootstrap(store)
+            # Also ensure calling with explicit ts also rejects before CURRENT read
+            with pytest.raises(ValidationError):
+                bootstrap(store, ts="20260826T120000Z")
+            # Ensure the malformed CURRENT was NOT overwritten/advanced and no snapshot was created
+            assert malformed.exists()
+            assert "{ not valid json" in malformed.read_text(encoding="utf-8")
+            # Snapshot must not exist (even via symlinked path)
+            assert not (store.snapshots_dir / "rev-0001").exists()
+            # Reading CURRENT via store (which follows symlink) must still be malformed / not a valid revision
+            # Direct store.read_current would raise JSONDecodeError if we called it; we verify bootstrap did NOT
+            # advance CURRENT to a valid revision by checking raw file still malformed
+            # and that no new CURRENT was created via alternate path
+            # Also ensure JSONDecodeError was not raised by bootstrap (already asserted via ValidationError)
+            try:
+                _ = store.read_current()
+                # If read somehow succeeded, it must not be a valid rev-0001
+                assert False, "read_current should still be malformed JSON, not a valid revision"
+            except _json.JSONDecodeError:
+                pass  # expected — malformed remains, bootstrap did not fix it
+            except ValidationError:
+                pass
+            # Sanity: legitimate (non-symlinked) bootstrap still seeds correctly after cleanup
+        # Separate sanity scope: non-symlinked bootstrap succeeds
+    with tempfile.TemporaryDirectory() as tmp2:
+        store2 = _init_store(tmp2)
+        _seed_inbox(store2, ts="20260826T120000Z")
+        result = bootstrap(store2)
+        assert result["revision_id"] == "rev-0001"
+        cur = store2.read_current()
+        assert cur["revision_id"] == "rev-0001"
+        assert store2.snapshot_dir("rev-0001").exists()
