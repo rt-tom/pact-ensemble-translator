@@ -78,6 +78,66 @@ Workspace:
 - `DECISIONS.md` — architectural decisions
 - `docs/` — additional architecture, plans, and handoff notes
 
+## Book-state snapshot handoff — Scope A (state-only)
+
+Media-side immutable store for book *state* only (`book_memory.json`, `glossary.json`, `chapter_index.json`, `observations.json` copied from the authoritative RT `D:\pact\pact_chapters` directory). Per-chapter translated bodies are NOT included (deferred to `pact-collect-book`). No pipeline, model-server, or provider calls are made from media; all commands are offline filesystem operations.
+
+Store layout (default root `/home/rt/pact_runs`):
+
+```
+<root>/books/<book-id>/
+  CURRENT.json                       # atomically renamed pointer
+  locks/<book-id>.lease.json         # promote-time mutex (absent when idle)
+  locks/<book-id>.lease_audit.jsonl  # owner-only release audit
+  incoming/<candidate-id>/           # uploaded candidate staging
+  _bootstrap_inbox/<ts>/             # owner-copied pact_chapters bundle
+  quarantine/<candidate-id>/         # rejected candidate
+  snapshots/<revision-id>/           # immutable: manifest.json + state/
+```
+
+### Bootstrap (owner-only, first revision)
+
+1. Quiesce RT `pact_chapters` and copy it into `_bootstrap_inbox/<ts>/` on media (manual `scp`/`rsync` or SFTP — no SSH/SFTP client is implemented in this slice).
+2. Run `python -m pact_v4.snapshot.cli --root <root> bootstrap <book-id>` (or `pact-bootstrap`). The command selects exactly the four canonical state files, validates well-formed JSON, records other files in `excludes[]`, writes `snapshots/rev-0001/state/` + `manifest.json`, and atomically advances `CURRENT.json` to `rev-0001`. Non-JSON canonical files cause a fail-closed error with no `CURRENT` advance.
+3. Subsequent snapshots use `promote`, not `bootstrap` (`bootstrap` rejects if snapshots already exist).
+
+```bash
+# Example (media host):
+python -m pact_v4.snapshot.cli --root /home/rt/pact_runs init-store pact-book-ru
+# owner copies D:\pact\pact_chapters -> /home/rt/pact_runs/books/pact-book-ru/_bootstrap_inbox/20260826T120000Z/
+python -m pact_v4.snapshot.cli --root /home/rt/pact_runs bootstrap pact-book-ru
+```
+
+### Promote (candidate bundle)
+
+RT uploads a complete candidate to `incoming/<candidate-id>/` (`manifest.json` + `state/`), then media runs:
+
+```bash
+python -m pact_v4.snapshot.cli --root /home/rt/pact_runs promote pact-book-ru <candidate-id>
+```
+
+`pact-promote` validates the manifest schema (strict allow-list — unknown/credential/env/server/model-cache fields are rejected), verifies each `state_files` byte SHA-256/size, requires an eligible `terminal_status`, requires `parent_revision_id` equal to the current revision (fail-closed `StaleParent`), acquires the promote-time lease mutex via atomic `O_EXCL` (`LeaseHeld` on contention), atomically moves the bundle to `snapshots/<next-rev>/`, writes `CURRENT.json` via atomic rename only while the lease still references the same parent, releases the lease, and prints `ACCEPTED` (exit 0). On any failure the candidate is moved to `quarantine/<candidate-id>/`, prior `CURRENT.json` is preserved, and a `REJECTED` JSON verdict is printed (exit 2).
+
+### Lease recovery (owner-only)
+
+A crashed promote may leave `locks/<book-id>.lease.json` held. Automatic TTL takeover is prohibited; expiry is informational only. Media does NOT auto-release. The owner reviews prior staging and runs:
+
+```bash
+python -m pact_v4.snapshot.cli --root /home/rt/pact_runs release-lease pact-book-ru --operator rt --reason "stale promote crashed" --prior-staging-reviewed --recovery-decision released
+```
+
+This appends a JSONL record to `locks/<book-id>.lease_audit.jsonl` and clears the lease. `release-lease --check-expired` is a read-only report that never deletes or audits.
+
+### Transport (documented, not implemented this slice)
+
+No SSH/SFTP client is implemented. The intended restricted media command for RT is:
+
+```
+command="/home/rt/pact_runs/venv/bin/python -m pact_v4.snapshot.cli promote <book-id> <candidate-id>",restrict,no-pty <rt-public-key>
+```
+
+The RT key is limited to bundle upload and this `promote` command, not an interactive shell. Key generation, `authorized_keys` edits, and SFTP/SSH setup are owner operations outside this repository.
+
 ## v3 (archived, non-operational)
 
 v3 code and prior operational procedures are archived and not executed from this tree.
