@@ -126,9 +126,9 @@ def test_whole_chapter_mode_generates_one_call_full_pid_map(tmp_path):
     cand = outcomes["outcomes"][0]["candidates"]["balanced_literary"]
     assert cand["candidate_id"] == sel["generation_record_id"]
 
-    # max_output_tokens=32768 is in the run identity (Gate 0 §8.5).
+    # max_output_tokens=70000 is in the run identity (Gate 0 §8.5; raised 2026-08-19 from 32768).
     artifact = cfg.to_config_artifact(model_profile="test")
-    assert artifact.values["generation"]["max_tokens"] == 32768
+    assert artifact.values["generation"]["max_tokens"] == 70000
 
 
 def test_whole_chapter_run_emits_wc_progress_events(tmp_path):
@@ -406,11 +406,11 @@ def test_whole_chapter_config_identity_rejects_chunked_resume(tmp_path):
 
 
 def test_whole_chapter_max_tokens_in_identity_and_cli_default(tmp_path):
-    # StrictRunConfig default max_tokens is 32768 (A1 owner decision).
+    # StrictRunConfig default max_tokens is 70000 (A1 owner decision; raised 2026-08-19 from 32768).
     cfg = _make_cfg(tmp_path, n_paragraphs=24)
-    assert cfg.max_tokens == 32768
+    assert cfg.max_tokens == 70000
     artifact = cfg.to_config_artifact(model_profile="test")
-    assert artifact.values["generation"]["max_tokens"] == 32768
+    assert artifact.values["generation"]["max_tokens"] == 70000
 
 
 # ---------------------------------------------------------------------------
