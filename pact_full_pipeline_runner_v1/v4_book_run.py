@@ -123,6 +123,8 @@ class BookRunRecord:
     book_memory_promotions: List[Dict[str, Any]] = field(default_factory=list)
     index_built: bool = False
     error: Optional[str] = None
+    media_confirmation: Optional[Dict[str, Any]] = None
+    media_error: Optional[str] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -142,6 +144,8 @@ class BookRunRecord:
             "book_memory_promotions": self.book_memory_promotions,
             "index_built": self.index_built,
             "error": self.error,
+            "media_confirmation": self.media_confirmation,
+            "media_error": self.media_error,
         }
 
 
@@ -927,7 +931,16 @@ def run_book(
     bm_min_name_occurrences: int = DEFAULT_MIN_NAME_OCCURRENCES,
     bm_min_name_chapters: int = DEFAULT_MIN_NAME_CHAPTERS,
     promote_existing_dir: Optional[Path] = None,
+    media_book_id: Optional[str] = None,
+    media_transport: Optional[Any] = None,
+    media_root: str = "/home/rt/pact_runs",
+    media_target: str = "media",
+    media_max_retries: int = 1,
 ) -> Dict[str, Any]:
+    # Media sync pre-init hook: fetch authoritative state before MemoryManager init
+    if media_book_id is not None:
+        from pact_v4.snapshot.run_hooks import pre_init_fetch
+        pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root)
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
     manager = MemoryManager(str(memory_dir))
@@ -1387,6 +1400,25 @@ def run_book(
         else:
             index_built = False
 
+        # Media sync post-promote hook: push updated state after promote
+        media_confirmation: Optional[Dict[str, Any]] = None
+        media_error: Optional[str] = None
+        if media_book_id is not None and promoted:
+            from pact_v4.snapshot.run_hooks import post_promote_push
+            try:
+                media_confirmation = post_promote_push(
+                    media_book_id,
+                    memory_dir,
+                    transport=media_transport,
+                    ssh_target=media_target,
+                    root=media_root,
+                    max_retries=media_max_retries,
+                )
+            except Exception as e:
+                # Preserve local state, report error, do not crash run
+                media_error = str(e)
+                LOG.error("Media sync push failed for chapter %s: %s", chapter_id, e)
+
         # B9: committed = how many of the proposed candidates actually
         # landed in glossary.json after promote. Counted as the glossary key
         # diff (before/after promote). For B9-generated observations
@@ -1445,6 +1477,8 @@ def run_book(
             book_memory_promotions=bm_promotions,
             index_built=index_built,
             error=error_msg,
+            media_confirmation=media_confirmation,
+            media_error=media_error,
         ))
 
     book_run_path = out_base / "book_run.json"
@@ -1513,6 +1547,9 @@ def build_argparser() -> argparse.ArgumentParser:
              "translator model (e.g. Muse) is no longer available. Only one "
              "chapter is supported in this mode; --chapters width is ignored.",
     )
+    parser.add_argument("--media-book-id", type=str, default=None, help="Media sync: book-id for RT<->media state sync (requires media SSH)")
+    parser.add_argument("--media-root", type=str, default="/home/rt/pact_runs", help="Media store root")
+    parser.add_argument("--media-target", type=str, default="media", help="SSH target for media (default 'media')")
     return parser
 
 
@@ -1540,6 +1577,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bm_min_name_occurrences=args.bm_min_name_occurrences,
         bm_min_name_chapters=args.bm_min_name_chapters,
         promote_existing_dir=args.promote_existing,
+        media_book_id=args.media_book_id,
+        media_root=args.media_root,
+        media_target=args.media_target,
     )
     failed = 0
     for rec in result["chapters"]:

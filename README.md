@@ -128,6 +128,32 @@ python -m pact_v4.snapshot.cli --root /home/rt/pact_runs release-lease pact-book
 
 This appends a JSONL record to `locks/<book-id>.lease_audit.jsonl` and clears the lease. `release-lease --check-expired` is a read-only report that never deletes or audits.
 
+### RT<->media state-only sync (book-state-rt-runner-integration)
+
+RT syncs the four canonical `pact_chapters` files (`glossary.json`, `book_memory.json`, `chapter_index.json`, `observations.json`) with media via a restricted SSH facade.
+
+**Media facade** (`pact_v4/snapshot/remote_facade.py`) invoked through `authorized_keys command=` — allow-list: `fetch-current <book-id>`, `receive-candidate <book-id> <candidate-id>` (tar on stdin), `promote <book-id> <candidate-id>`, `release-lease <book-id> --check-expired`. Any other subcommand/argument/book-id is rejected without side effects.
+
+**RT client** (`pact_v4/snapshot/remote_client.py`) shells out to system `ssh`/`scp` (no library), injectable transport for tests: `fetch_current(book_id, dest_dir)`, `push_candidate(book_id, candidate_id, local_dir)` (=receive+promote verdict), `check_expired(book_id)`.
+
+**Run hooks** (`pact_v4/snapshot/run_hooks.py`) in `pact_full_pipeline_runner_v1/v4_book_run.py` (`--media-book-id`):
+- Pre-init: `fetch_current` -> validate four files (regular, non-symlink, allowed names, valid JSON) -> `MemoryManager` init. Fail-fast on unreachable (no stale fallback).
+- Post-`promote('complete')`: build candidate manifest+four files, `push_candidate`, record `revision_id`; `STALE_PARENT` -> bounded re-pull+retry (1) then report; other rejections/transport failure -> report, preserve local state.
+
+**Owner host-config** (`~/.ssh/authorized_keys` on media, dedicated RT key):
+```
+restrict,command="/home/rt/pact_runs/venv/bin/python -m pact_v4.snapshot.remote_facade",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding <rt-public-key>
+```
+Dedicated key only; `restrict` + `no-pty`; wrapper path is `remote_facade.py` (not direct CLI) so only the four allow-listed subcommands execute. The `command=` string itself is host-config outside the repo; the repo ships wrapper + CLI surface `fetch-current`/`receive-candidate`.
+
+**Runbook**
+- Normal: `python -m pact_full_pipeline_runner_v1.v4_book_run --memory-dir <dir> --media-book-id pact-book-ru ...` pulls at start, pushes+confirms at end (confirmation = promote `revision_id`).
+- Media unreachable at start: run fails fast, local `pact_chapters` intact, no silent fallback. Fix SSH/network, re-run.
+- `STALE_PARENT` on push: run re-pulls and retries once (bounded). If still stale, reports rejection; re-run to pick up newest media revision.
+- Other REJECTED (`VALIDATION_ERROR`, `HASH_MISMATCH`, `LEASE_HELD`): reported, local state preserved, candidate quarantined on media. Recover lease with `release-lease --operator ... --reason ... --prior-staging-reviewed` after reviewing `quarantine/<candidate-id>/` and `CURRENT.json`.
+- Read-only lease check: `ssh media pact-snapshot release-lease <book-id> --check-expired` (facade allow-listed).
+- State-only: exactly the four canonical files move; translation bodies never.
+
 ### Transport (documented, not implemented this slice)
 
 No SSH/SFTP client is implemented. The intended restricted media command for RT is:
