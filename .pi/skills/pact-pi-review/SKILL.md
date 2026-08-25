@@ -35,3 +35,25 @@ For approved implementation work in one isolated branch/worktree:
 - pact-rev must inspect independently, never edit implementation files
 - Escalate blocked decisions/ambiguous requirements to Architect/owner
 - Report changed files and checks run on completion
+
+## Economy mode
+
+Keep the independent fresh-review model (it catches real defects a single agent misses),
+but reduce token waste from per-round re-reading and one-finding-per-round churn:
+
+- **Proactive hardening in the first dev brief.** Brief `pact-dev` to implement
+  boundary/security hardening up front: reject symlinks (candidate/state/manifest/inbox
+  dirs and files), validate `book_id`/`candidate_id` as safe single path components with
+  containment, enforce the exact canonical file set, and assign revision ids on the
+  authority side. This removes whole later rounds.
+- **Batch findings into one fix pass.** After any review, hand `pact-dev` ALL outstanding
+  findings at once (not one per round), in the same worktree.
+- **Dev self-review before done.** Require `pact-dev` to re-read its own diff against the
+  findings and spec and run the checks before reporting; the first independent review is
+  then more often `APPROVED`.
+- **Short Architect briefs.** Point to the verdict + files; do not restate file contents
+  (the agent re-reads them).
+- **Lean review.** Let `pact-rev` rely on the test suite + `openspec validate` and read
+  only changed files; full re-reads of unchanged modules are the main cost.
+- **Do NOT** merge dev+rev into one agent, and do NOT drop review rounds in a way that
+  sacrifices independence.
