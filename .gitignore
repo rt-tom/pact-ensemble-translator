@@ -57,3 +57,8 @@ deployment_backups/
 /golden_sets/
 /pact_v4/**/_out/
 .pytest_basetmp*
+
+# Local ephemeral state (worktree-only, not pipeline artifacts)
+/.pi-web/
+/.tmp/
+/.pi/ACTIVE_CONTEXT.md
