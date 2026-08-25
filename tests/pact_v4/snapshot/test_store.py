@@ -628,3 +628,98 @@ def test_s_bootstrap_rejects_symlinked_inbox_file():
                 os.unlink(ext_path)
             except OSError:
                 pass
+
+
+def test_t_bootstrap_rejects_symlinked_inbox_dir():
+    """Regression: _bootstrap_inbox/<ts> as SYMLINK to outside dir must be REJECTED and must NOT create/advance CURRENT.json."""
+    # Case 1: store without CURRENT (never bootstrapped) — symlink inbox outside root
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        # Create external directory outside store root containing valid canonical JSON
+        with tempfile.TemporaryDirectory() as external:
+            ext_dir = Path(external) / "evil_inbox"
+            ext_dir.mkdir(parents=True)
+            for fname in CANONICAL:
+                _make_json_file(ext_dir / fname, {"ok": fname, "external": True})
+            # Replace inbox ts with symlink to external dir
+            ts = "20260826T120000Z"
+            link = store.bootstrap_inbox_dir / ts
+            # Ensure clean: if real dir exists from _seed_inbox etc, remove; _init_store leaves inbox empty
+            if link.exists() or link.is_symlink():
+                import shutil as _sh
+                if link.is_symlink():
+                    link.unlink()
+                else:
+                    _sh.rmtree(link)
+            os.symlink(str(ext_dir), str(link))
+            with pytest.raises(ValidationError):
+                bootstrap(store)
+            # CURRENT must NOT be created/advanced — still null
+            cur = store.read_current()
+            assert cur is not None
+            assert cur.get("revision_id") is None
+            assert not store.snapshot_dir("rev-0001").exists()
+            # Also via explicit ts argument
+            if link.is_symlink():
+                # keep symlink for second attempt with explicit ts
+                with pytest.raises(ValidationError):
+                    bootstrap(store, ts=ts)
+                cur2 = store.read_current()
+                assert cur2.get("revision_id") is None
+    # Case 2: bootstrap_inbox_dir itself is a symlink -> also rejected
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        with tempfile.TemporaryDirectory() as external:
+            ext_inbox = Path(external) / "fake_inbox"
+            ext_inbox.mkdir()
+            ts_dir = ext_inbox / "20260826T120000Z"
+            ts_dir.mkdir()
+            for fname in CANONICAL:
+                _make_json_file(ts_dir / fname, {"ok": fname})
+            # Replace bootstrap_inbox_dir with symlink to external inbox
+            inbox = store.bootstrap_inbox_dir
+            import shutil as _sh2
+            _sh2.rmtree(inbox)
+            os.symlink(str(ext_inbox), str(inbox))
+            with pytest.raises(ValidationError):
+                bootstrap(store)
+            cur = store.read_current()
+            assert cur.get("revision_id") is None
+            assert not store.snapshot_dir("rev-0001").exists()
+    # Case 3: legitimate non-symlinked bootstrap still succeeds (sanity)
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store, ts="20260826T120000Z")
+        result = bootstrap(store)
+        assert result["revision_id"] == "rev-0001"
+        cur = store.read_current()
+        assert cur["revision_id"] == "rev-0001"
+        assert store.snapshot_dir("rev-0001").exists()
+
+
+def test_t2_bootstrap_rejects_symlinked_ancestor():
+    """Regression: symlink on ancestor between store.root and inbox must be rejected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        # Make books dir component a symlink to external (simulate ancestor escape)
+        # store.root/tmp/books is created by _init_store; replace books/<book_id> with symlink
+        with tempfile.TemporaryDirectory() as external:
+            fake_book = Path(external) / "fake_book"
+            fake_book.mkdir()
+            # create _bootstrap_inbox inside fake_book
+            inbox_ts = fake_book / "_bootstrap_inbox" / "20260826T120000Z"
+            inbox_ts.mkdir(parents=True)
+            for fname in CANONICAL:
+                _make_json_file(inbox_ts / fname, {"ok": fname})
+            # Replace real book dir with symlink to fake_book
+            real_book = store.book_dir
+            import shutil as _sh3
+            _sh3.rmtree(real_book)
+            os.symlink(str(fake_book), str(real_book))
+            with pytest.raises(ValidationError):
+                bootstrap(store)
+            # CURRENT should not be advanced (may be missing because book_dir was replaced)
+            # After rejection, the symlink still exists; read_current will follow it
+            cur = store.read_current()
+            # If current was read via symlinked book_dir, it would be inside fake_book/CURRENT.json which doesn't exist
+            assert cur is None or cur.get("revision_id") is None
