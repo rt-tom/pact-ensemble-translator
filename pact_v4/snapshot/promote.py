@@ -97,10 +97,28 @@ def promote(
         _reject_if_symlink(candidate_dir, "candidate_dir")
         if not candidate_dir.is_dir():
             raise ValidationError(f"Candidate not found: {candidate_dir}")
+        # Top-level boundary: candidate must contain EXACTLY manifest.json (regular file) + state/ (regular dir), no extra entries or symlinks.
+        # This runs before lease acquisition and before any move so quarantine still works on rejection.
+        top_entries = list(candidate_dir.iterdir())
+        for _p in top_entries:
+            if _p.is_symlink():
+                raise ValidationError(f"Top-level symlink rejected: {_p.name}")
+        top_names = {p.name for p in top_entries}
+        allowed_top = {"manifest.json", "state"}
+        unexpected_top = top_names - allowed_top
+        if unexpected_top:
+            raise ValidationError(f"Unexpected top-level entry in candidate: {sorted(unexpected_top)}")
+        missing_top = allowed_top - top_names
+        if missing_top:
+            raise ValidationError(f"Candidate top-level missing required entry: {sorted(missing_top)}")
+        if top_names != allowed_top or len(top_entries) != 2:
+            raise ValidationError(f"Candidate top-level must contain exactly manifest.json and state/: found {sorted(top_names)}")
         manifest_path = candidate_dir / "manifest.json"
-        _reject_if_symlink(manifest_path, "manifest.json")
-        if not manifest_path.is_file() or not os.path.isfile(str(manifest_path)):
-            raise ValidationError(f"manifest.json missing in candidate {candidate_id}")
+        state_dir_pre = candidate_dir / "state"
+        _ensure_regular_file(manifest_path, "manifest.json")
+        if not state_dir_pre.is_dir() or not os.path.isdir(str(state_dir_pre)):
+            raise ValidationError(f"state is not a regular directory: {state_dir_pre}")
+        _assert_within(state_dir_pre, candidate_dir, "state_dir")
 
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
@@ -201,6 +219,14 @@ def promote(
         # Final symlink re-check before move (TOCTOU defense)
         _reject_if_symlink(candidate_dir, "candidate_dir")
         _reject_if_symlink(state_dir, "state_dir")
+        # Re-check top-level boundary before move (defense against smuggled extra after validation)
+        _final_top = list(candidate_dir.iterdir())
+        for _fp in _final_top:
+            if _fp.is_symlink():
+                raise ValidationError(f"Top-level symlink rejected before move: {_fp.name}")
+        _final_names = {p.name for p in _final_top}
+        if _final_names != {"manifest.json", "state"} or len(_final_top) != 2:
+            raise ValidationError(f"Candidate top-level boundary violated before move: found {sorted(_final_names)}")
         # os.replace works for directories on POSIX
         os.replace(str(candidate_dir), str(snap_dir))
 

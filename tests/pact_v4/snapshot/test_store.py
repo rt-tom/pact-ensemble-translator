@@ -725,6 +725,114 @@ def test_t2_bootstrap_rejects_symlinked_ancestor():
             assert cur is None or cur.get("revision_id") is None
 
 
+# --- Round 5: top-level boundary rejection (credentials.env etc) ---
+
+def test_v_reject_top_level_extra_file():
+    """Candidate with top-level extra file credentials.env -> REJECTED, quarantined, CURRENT unchanged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-top-extra-file", parent_rev="rev-0001")
+        extra = cand_dir / "credentials.env"
+        extra.write_text("SECRET=leak\n", encoding="utf-8")
+        with pytest.raises(ValidationError):
+            promote(store, "cand-top-extra-file")
+        assert store.quarantine_candidate_path("cand-top-extra-file").exists()
+        assert not store.incoming_candidate_path("cand-top-extra-file").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        # quarantine must contain the smuggled file, snapshot must NOT
+        assert (store.quarantine_candidate_path("cand-top-extra-file") / "credentials.env").exists()
+        assert not (store.snapshot_dir("rev-0002") / "credentials.env").exists()
+        assert not store.snapshot_dir("rev-0002").exists()
+        # lease must be released
+        assert not store.lease_path().exists()
+
+
+def test_w_reject_top_level_extra_directory():
+    """Candidate with top-level extra directory -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-top-extra-dir", parent_rev="rev-0001")
+        (cand_dir / "extra_dir").mkdir()
+        (cand_dir / "extra_dir" / "junk.json").write_text("{\"x\":1}", encoding="utf-8")
+        with pytest.raises(ValidationError):
+            promote(store, "cand-top-extra-dir")
+        assert store.quarantine_candidate_path("cand-top-extra-dir").exists()
+        assert store.read_current()["revision_id"] == "rev-0001"
+        assert not store.snapshot_dir("rev-0002").exists()
+        assert not store.lease_path().exists()
+
+
+def test_x_reject_top_level_symlinked_manifest():
+    """Candidate whose manifest.json is a top-level symlink -> REJECTED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, manifest_dict = _create_candidate(store, "cand-top-symlink-manifest", parent_rev="rev-0001")
+        # Create external file with same manifest content
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", encoding="utf-8") as ext:
+            json.dump(manifest_dict, ext)
+            ext_path = ext.name
+        try:
+            target = cand_dir / "manifest.json"
+            target.unlink()
+            os.symlink(ext_path, str(target))
+            with pytest.raises(ValidationError):
+                promote(store, "cand-top-symlink-manifest")
+            assert store.quarantine_candidate_path("cand-top-symlink-manifest").exists()
+            assert store.read_current()["revision_id"] == "rev-0001"
+            assert not store.snapshot_dir("rev-0002").exists()
+            assert not store.lease_path().exists()
+            # also ensure state symlink is rejected (completeness)
+        finally:
+            try:
+                os.unlink(ext_path)
+            except OSError:
+                pass
+        # also verify symlinked state/ is rejected at top-level
+        with tempfile.TemporaryDirectory() as tmp2:
+            store2 = _init_store(tmp2)
+            _seed_inbox(store2)
+            bootstrap(store2)
+            cand_dir2, _ = _create_candidate(store2, "cand-top-symlink-state", parent_rev="rev-0001")
+            # replace state dir with symlink
+            import shutil as _sh
+            real_state = cand_dir2 / "state"
+            external_state = Path(tmp2) / "ext_state"
+            _sh.move(str(real_state), str(external_state))
+            os.symlink(str(external_state), str(real_state))
+            with pytest.raises(ValidationError):
+                promote(store2, "cand-top-symlink-state")
+            assert store2.quarantine_candidate_path("cand-top-symlink-state").exists()
+            assert store2.read_current()["revision_id"] == "rev-0001"
+
+
+def test_y_legitimate_promote_still_accepted_after_top_level_fix():
+    """Legitimate four-file candidate still promotes to rev-0002 with CURRENT advanced."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        _seed_inbox(store)
+        bootstrap(store)
+        cand_dir, _ = _create_candidate(store, "cand-legit", parent_rev="rev-0001")
+        # sanity: candidate has exactly two top-level entries
+        assert {p.name for p in cand_dir.iterdir()} == {"manifest.json", "state"}
+        result = promote(store, "cand-legit")
+        assert result["status"] == "ACCEPTED"
+        assert result["revision_id"] == "rev-0002"
+        assert store.read_current()["revision_id"] == "rev-0002"
+        snap = store.snapshot_dir("rev-0002")
+        assert snap.exists()
+        assert (snap / "manifest.json").exists()
+        for fname in CANONICAL:
+            assert (snap / "state" / fname).exists()
+        # no extra top-level file persisted
+        assert {p.name for p in snap.iterdir()} == {"manifest.json", "state"}
+
+
 def test_u_bootstrap_symlinked_ancestor_malformed_current_regression():
     """Round 4 regression: symlinked books/<book-id> ancestor whose target contains malformed CURRENT.json
     must raise ValidationError (NOT JSONDecodeError) BEFORE any store-path read, and must NOT create/advance snapshot."""
