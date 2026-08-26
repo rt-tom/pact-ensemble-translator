@@ -34,7 +34,7 @@ def _validate_working_dir_files(working_dir: Path) -> None:
         except Exception as e:
             raise RuntimeError(f"Working dir file not valid JSON: {fname}: {e}") from e
 
-def pre_init_fetch(book_id: str, working_dir: str | Path, *, transport=None, ssh_target: str = "media", root: str = "/home/rt/pact_runs") -> Dict[str, Any]:
+def pre_init_fetch(book_id: str, working_dir: str | Path, *, transport=None, ssh_target: str = "media", root: str = "/home/rt/pact_runs", execution_host: str | None = None) -> Dict[str, Any]:
     """Pre-init hook: fetch authoritative state from media into working_dir.
 
     Validates four files (regular, non-symlink, allowed names, valid JSON).
@@ -44,7 +44,7 @@ def pre_init_fetch(book_id: str, working_dir: str | Path, *, transport=None, ssh
     wdir = Path(working_dir)
     wdir.mkdir(parents=True, exist_ok=True)
     try:
-        cur = remote_client.fetch_current(book_id, wdir, transport=transport, ssh_target=ssh_target, root=root)
+        cur = remote_client.fetch_current(book_id, wdir, transport=transport, ssh_target=ssh_target, root=root, execution_host=execution_host)
     except Exception as e:
         raise RuntimeError(f"pre_init_fetch: media unreachable or validation failed for book {book_id!r}: {e}") from e
     # Validate after fetch
@@ -60,6 +60,7 @@ def post_promote_push(
     root: str = "/home/rt/pact_runs",
     candidate_id: Optional[str] = None,
     max_retries: int = 1,
+    execution_host: str | None = None,
 ) -> Dict[str, Any]:
     """Post-promote hook: build candidate from working_dir and push to media.
 
@@ -77,7 +78,7 @@ def post_promote_push(
     last_verdict: Optional[Dict[str, Any]] = None
     for attempt in range(max_retries + 1):
         try:
-            verdict = remote_client.push_candidate(book_id, candidate_id, wdir, transport=transport, ssh_target=ssh_target, root=root)
+            verdict = remote_client.push_candidate(book_id, candidate_id, wdir, transport=transport, ssh_target=ssh_target, root=root, execution_host=execution_host)
         except Exception as e:
             raise RuntimeError(f"post_promote_push: transport failure for {candidate_id}: {e}") from e
         if verdict.get("status") == "ACCEPTED":
@@ -125,7 +126,7 @@ def post_promote_push(
                     preserved[fname] = None
             # Bounded re-pull: fetch new parent revision (may overwrite working dir)
             try:
-                pre_init_fetch(book_id, wdir, transport=transport, ssh_target=ssh_target, root=root)
+                pre_init_fetch(book_id, wdir, transport=transport, ssh_target=ssh_target, root=root, execution_host=execution_host)
             except Exception as e:
                 raise RuntimeError(f"post_promote_push: re-pull after STALE_PARENT failed: {e}") from e
             # Restore RT-updated canonical files without overwriting the new CURRENT.json parent pointer
@@ -157,6 +158,7 @@ def run_book_with_media_sync(
     ssh_target: str = "media",
     root: str = "/home/rt/pact_runs",
     max_retries: int = 1,
+    execution_host: str | None = None,
     **kwargs,
 ) -> Any:
     """Wrap a book-run function with pre-init fetch and post-promote push.
@@ -167,9 +169,9 @@ def run_book_with_media_sync(
       2. run_fn(*args, **kwargs)
       3. post_promote_push (with STALE_PARENT retry)
     """
-    pre_init_fetch(book_id, working_dir, transport=transport, ssh_target=ssh_target, root=root)
+    pre_init_fetch(book_id, working_dir, transport=transport, ssh_target=ssh_target, root=root, execution_host=execution_host)
     result = run_fn(*args, **kwargs)
-    verdict = post_promote_push(book_id, working_dir, transport=transport, ssh_target=ssh_target, root=root, max_retries=max_retries)
+    verdict = post_promote_push(book_id, working_dir, transport=transport, ssh_target=ssh_target, root=root, max_retries=max_retries, execution_host=execution_host)
     # Attach confirmation to result if dict
     if isinstance(result, dict):
         result["media_confirmation"] = verdict

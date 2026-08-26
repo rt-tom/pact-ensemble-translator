@@ -93,21 +93,27 @@ def _build_candidate_tar_bytes(local_dir: Path, manifest_dict: Dict[str, Any]) -
             tar.addfile(ti2, io.BytesIO(data))
     return bio.getvalue()
 
-def _should_use_local_facade(ssh_target: str, root: str) -> bool:
-    """Return True if local BookStore should be used instead of SSH (media self-loop avoidance)."""
-    # Only for the approved media root; on RT (Windows) the Linux path won't exist.
+def _should_use_local_facade(ssh_target: str, root: str, execution_host: str | None = None) -> bool:
+    """Return True if local BookStore should be used instead of SSH (media self-loop avoidance).
+
+    Trusted host signal: the execution host identity comes from the launcher/layout
+    ("media" or "rt"), not from local path existence. The local facade is
+    selected ONLY when execution_host == "media" (trusted), regardless of
+    whether /home/rt/pact_runs exists locally. On RT ("rt") it always uses SSH.
+    When execution_host is None and PACT_EXEC_HOST env is unset, fail-closed
+    to SSH (never silent local).
+    """
+    if execution_host is None:
+        execution_host = os.environ.get("PACT_EXEC_HOST")
+        if execution_host is None:
+            return False
+    if execution_host != "media":
+        return False
     if root != "/home/rt/pact_runs":
         return False
-    # Media host has the store parent directory locally.
-    try:
-        if Path(root).is_dir() and Path(root).exists():
-            # Distinguish media host by Linux directory existence; on RT this path doesn't exist.
-            # If ssh_target is the restricted facade alias, use local path when store is locally reachable.
-            if ssh_target in ("media-snap", "media"):
-                return True
-    except Exception:
+    if ssh_target not in ("media-snap", "media"):
         return False
-    return False
+    return True
 
 
 def _local_fetch_current(book_id: str, dest_dir: Path, root: str) -> Dict[str, Any]:
@@ -230,7 +236,7 @@ def _has_fake_transport(transport) -> bool:
 
 # Public API
 
-def fetch_current(book_id: str, dest_dir: str | Path, *, transport=None, ssh_target: str = "media", root: str = "/home/rt/pact_runs", timeout: int = 30) -> Dict[str, Any]:
+def fetch_current(book_id: str, dest_dir: str | Path, *, transport=None, ssh_target: str = "media", root: str = "/home/rt/pact_runs", timeout: int = 30, execution_host: str | None = None) -> Dict[str, Any]:
     """Fetch current state from media and write four canonical files to dest_dir.
 
     Returns parsed CURRENT.json. Validates files are regular, non-symlink, allowed names, valid JSON.
@@ -243,12 +249,11 @@ def fetch_current(book_id: str, dest_dir: str | Path, *, transport=None, ssh_tar
     dest.mkdir(parents=True, exist_ok=True)
     _check_no_symlink_chain(dest)
     # Local facade for media self-loop avoidance (media host): prefer BookStore direct I/O.
-    if transport is None and _should_use_local_facade(ssh_target, root):
+    # Trusted host signal threads from launcher/layout; never rely on local path existence.
+    if transport is None and _should_use_local_facade(ssh_target, root, execution_host=execution_host):
         try:
             return _local_fetch_current(book_id, dest, root)
         except Exception as e:
-            # If local facade fails due to missing store, fall through to SSH attempt?
-            # For safety, fail-closed: propagate local error rather than silently falling back.
             raise RuntimeError(f"local fetch_current failed: {e}") from e
     if transport is not None and hasattr(transport, "fetch_current"):
         # Fake transport may be callable or object
@@ -301,7 +306,7 @@ def fetch_current(book_id: str, dest_dir: str | Path, *, transport=None, ssh_tar
             raise RuntimeError(f"Fetched file missing after extract: {fname}")
     return cur
 
-def push_candidate(book_id: str, candidate_id: str, local_dir: str | Path, *, transport=None, ssh_target: str = "media", root: str = "/home/rt/pact_runs", timeout: int = 30, parent_revision_id: Optional[str] = None) -> Dict[str, Any]:
+def push_candidate(book_id: str, candidate_id: str, local_dir: str | Path, *, transport=None, ssh_target: str = "media", root: str = "/home/rt/pact_runs", timeout: int = 30, parent_revision_id: Optional[str] = None, execution_host: str | None = None) -> Dict[str, Any]:
     """Build candidate from local_dir four files, push via receive-candidate + promote, return verdict dict.
 
     verdict contains status ACCEPTED/REJECTED, revision_id on ACCEPTED, reason on REJECTED.
@@ -336,7 +341,7 @@ def push_candidate(book_id: str, candidate_id: str, local_dir: str | Path, *, tr
                 # Real ssh: fetch CURRENT via helper (reuse fetch to temp)
                 with tempfile.TemporaryDirectory() as tmp:
                     try:
-                        cur = fetch_current(book_id, tmp, ssh_target=ssh_target, root=root, timeout=timeout)
+                        cur = fetch_current(book_id, tmp, ssh_target=ssh_target, root=root, timeout=timeout, execution_host=execution_host)
                         parent_revision_id = cur.get("revision_id")
                     except Exception as e:
                         raise RuntimeError(f"push_candidate: failed to determine parent_revision_id: {e}") from e
@@ -400,7 +405,7 @@ def push_candidate(book_id: str, candidate_id: str, local_dir: str | Path, *, tr
         "code_commit": "unknown",
     }
     # Local facade for media self-loop avoidance: use BookStore directly when on media host.
-    if transport is None and _should_use_local_facade(ssh_target, root):
+    if transport is None and _should_use_local_facade(ssh_target, root, execution_host=execution_host):
         try:
             return _local_push_candidate(book_id, candidate_id, ldir, manifest_dict, root)
         except Exception as e:

@@ -306,6 +306,20 @@ def range_label(start: int, end: int) -> str:
 # Host-aware layout and source discovery (hardened)
 # ---------------------------------------------------------------------------
 
+def _detect_execution_host(host_hint: Optional[str] = None) -> str:
+    """Trusted execution host identity: 'media' or 'rt'."""
+    import os as _os
+    import sys as _sys
+    if host_hint in ("rt", "media"):
+        return host_hint  # type: ignore[return-value]
+    env = _os.environ.get("PACT_V4_HOST") or _os.environ.get("PACT_EXEC_HOST")
+    if env in ("rt", "media"):
+        return env
+    if _sys.platform == "win32":
+        return "rt"
+    return "media"
+
+
 def _host_layout(host_hint: Optional[str] = None) -> dict[str, Path]:
     """Select RT or media layout. host_hint: 'rt'|'media'|None (auto)."""
     import os as _os
@@ -986,7 +1000,8 @@ def _handle_book(argv: Sequence[str]) -> int:
     # Whole-chapter default for every book mode
     if "--whole-chapter" not in delegated and "--whole_chapter" not in delegated:
         delegated += ["--whole-chapter"]
-    # Media sync defaults for every simple book mode
+    # Media sync defaults for every simple book mode — thread trusted execution host
+    execution_host = _detect_execution_host()
     if is_simple:
         media_book_id = args.media_book_id or _DEFAULT_MEDIA_BOOK_ID
         media_target = args.media_target or _DEFAULT_MEDIA_TARGET
@@ -994,6 +1009,7 @@ def _handle_book(argv: Sequence[str]) -> int:
         delegated += ["--media-book-id", media_book_id]
         delegated += ["--media-target", media_target]
         delegated += ["--media-root", media_root]
+        delegated += ["--media-exec-host", execution_host]
     else:
         # Advanced: forward explicit media flags if supplied
         if args.media_book_id:
@@ -1002,6 +1018,9 @@ def _handle_book(argv: Sequence[str]) -> int:
             delegated += ["--media-target", args.media_target]
         if args.media_root:
             delegated += ["--media-root", args.media_root]
+        if args.media_book_id is not None:
+            # Thread trusted host for any media-synced advanced run too
+            delegated += ["--media-exec-host", execution_host]
     if args.providers_config:
         pass  # already added
     delegated += list(remaining)

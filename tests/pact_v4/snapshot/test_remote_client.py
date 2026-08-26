@@ -238,28 +238,64 @@ def test_no_duplicate_state_mirror(tmp_path=None):
 
 
 def test_local_facade_no_self_ssh(tmp_path=None):
-    # Real predicate must select local facade for media-snap/media when canonical root is reachable,
-    # and fetch_current must not spawn ssh in that case.
+    # Real predicate must select local facade ONLY when execution_host == "media" (trusted),
+    # regardless of local path existence, and NOT when execution_host == "rt".
     from unittest.mock import patch
     with tempfile.TemporaryDirectory() as dest:
         dest_p = Path(dest)
-        # Mock canonical root availability via Path methods on the remote_client module.
+        # Trusted host signal: media uses local, rt never does (even if path exists)
+        assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host="media") is True
+        assert remote_client._should_use_local_facade("media", "/home/rt/pact_runs", execution_host="media") is True
+        assert remote_client._should_use_local_facade("other-host", "/home/rt/pact_runs", execution_host="media") is False
+        assert remote_client._should_use_local_facade("media-snap", "/tmp/other_root", execution_host="media") is False
+        assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host="rt") is False
+        assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host=None) is False
+        # fetch_current on media host must use local facade and NOT call subprocess.run
+        with patch("pact_v4.snapshot.remote_client._local_fetch_current", return_value={"revision_id": "rev-0001"}) as mock_local:
+            with patch("subprocess.run") as mock_run:
+                result = remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root="/home/rt/pact_runs", execution_host="media")
+                assert result == {"revision_id": "rev-0001"}
+                assert mock_local.called
+                assert not mock_run.called
+
+
+def test_local_facade_rt_stays_on_ssh_when_path_exists(tmp_path=None):
+    # RT must ALWAYS use SSH even when /home/rt/pact_runs is locally available (fail-closed).
+    from unittest.mock import patch, MagicMock
+    import subprocess as _subprocess
+    with tempfile.TemporaryDirectory() as dest:
+        dest_p = Path(dest)
+        # Even with Path.exists/is_dir mocked to True, RT host signal keeps SSH path
         with patch.object(remote_client.Path, "is_dir", return_value=True):
             with patch.object(remote_client.Path, "exists", return_value=True):
-                # Real predicate: True for facade aliases, False for others / non-canonical root.
-                assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs") is True
-                assert remote_client._should_use_local_facade("media", "/home/rt/pact_runs") is True
-                assert remote_client._should_use_local_facade("other-host", "/home/rt/pact_runs") is False
-                assert remote_client._should_use_local_facade("media-snap", "/tmp/other_root") is False
-                # fetch_current with facade alias must use local path and NOT call subprocess.run
-                with patch("pact_v4.snapshot.remote_client._local_fetch_current", return_value={"revision_id": "rev-0001"}) as mock_local:
-                    with patch("subprocess.run") as mock_run:
-                        result = remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root="/home/rt/pact_runs")
-                        assert result == {"revision_id": "rev-0001"}
-                        assert mock_local.called
-                        assert not mock_run.called
-                # Non-facade target must not use local facade (would attempt ssh, but we avoid real ssh by using transport)
-                # Verify predicate already returned False above; no subprocess assertion needed here.
+                assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host="rt") is False
+        # fetch_current on RT must invoke subprocess.run (SSH) and NOT local facade,
+        # even when canonical path appears locally available.
+        with patch.object(remote_client.Path, "is_dir", return_value=True):
+            with patch.object(remote_client.Path, "exists", return_value=True):
+                with patch("pact_v4.snapshot.remote_client._local_fetch_current") as mock_local:
+                    # Need _extract_fetch_tar to succeed, so mock subprocess.run to return valid tar
+                    import io, tarfile, json as _json
+                    bio = io.BytesIO()
+                    with tarfile.open(fileobj=bio, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                        for name, obj in [("CURRENT.json", {"revision_id": "rev-0001"}), ("manifest.json", {"schema_version": "1.0.0"})]:
+                            data = (_json.dumps(obj) + "\n").encode()
+                            ti = tarfile.TarInfo(name=name); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                            tar.addfile(ti, io.BytesIO(data))
+                        for fname in CANONICAL:
+                            data = _json.dumps({"seed": fname}).encode()
+                            ti = tarfile.TarInfo(name=f"state/{fname}"); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                            tar.addfile(ti, io.BytesIO(data))
+                    tar_bytes = bio.getvalue()
+                    mock_proc = MagicMock(returncode=0, stdout=tar_bytes, stderr=b"")
+                    with patch("subprocess.run", return_value=mock_proc) as mock_run:
+                        result = remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root="/home/rt/pact_runs", execution_host="rt")
+                        assert result["revision_id"] == "rev-0001"
+                        assert not mock_local.called
+                        assert mock_run.called
+                        # Verify SSH target is media-snap
+                        called_cmd = mock_run.call_args[0][0]
+                        assert "media-snap" in called_cmd
 
 
 def test_fetch_tar_negative_matrix():

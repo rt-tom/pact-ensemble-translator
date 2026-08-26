@@ -914,6 +914,23 @@ def _strip_book_memory_observation_fields(memory_dir: Path) -> None:
         atomic_write(str(path), data)
 
 
+def _detect_execution_host() -> str:
+    """Trusted execution host: where this process runs (media vs rt).
+
+    Uses explicit env PACT_V4_HOST / PACT_EXEC_HOST first, then platform.
+    This is the trusted signal the launcher threads to the transport decision
+    so RT never silently uses the local facade even if its Linux path exists.
+    """
+    import os as _os
+    import sys as _sys
+    env = _os.environ.get("PACT_V4_HOST") or _os.environ.get("PACT_EXEC_HOST")
+    if env in ("rt", "media"):
+        return env
+    if _sys.platform == "win32":
+        return "rt"
+    return "media"
+
+
 def run_book(
     *,
     memory_dir: Path,
@@ -936,11 +953,13 @@ def run_book(
     media_root: str = "/home/rt/pact_runs",
     media_target: str = "media",
     media_max_retries: int = 1,
+    media_exec_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
         from pact_v4.snapshot.run_hooks import pre_init_fetch
-        pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root)
+        _exec_host = media_exec_host if media_exec_host is not None else _detect_execution_host()
+        pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root, execution_host=_exec_host)
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
     manager = MemoryManager(str(memory_dir))
@@ -1406,6 +1425,7 @@ def run_book(
         if media_book_id is not None and promoted:
             from pact_v4.snapshot.run_hooks import post_promote_push
             try:
+                _exec_host2 = media_exec_host if media_exec_host is not None else _detect_execution_host()
                 media_confirmation = post_promote_push(
                     media_book_id,
                     memory_dir,
@@ -1413,6 +1433,7 @@ def run_book(
                     ssh_target=media_target,
                     root=media_root,
                     max_retries=media_max_retries,
+                    execution_host=_exec_host2,
                 )
             except Exception as e:
                 # Preserve local state, report error, do not crash run
@@ -1550,6 +1571,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--media-book-id", type=str, default=None, help="Media sync: book-id for RT<->media state sync (requires media SSH)")
     parser.add_argument("--media-root", type=str, default="/home/rt/pact_runs", help="Media store root")
     parser.add_argument("--media-target", type=str, default="media", help="SSH target for media (default 'media')")
+    parser.add_argument("--media-exec-host", type=str, default=None, choices=["media", "rt"], help="Trusted execution host for media sync (media vs rt); auto-detected from platform/env when omitted")
     return parser
 
 
@@ -1580,6 +1602,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         media_book_id=args.media_book_id,
         media_root=args.media_root,
         media_target=args.media_target,
+        media_exec_host=args.media_exec_host,
     )
     failed = 0
     for rec in result["chapters"]:
