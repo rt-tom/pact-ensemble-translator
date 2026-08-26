@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -86,18 +87,22 @@ def test_facade_rejects_when_scoped_unset_or_empty(scoped_val, tokens):
             class DummyStdin:
                 def __init__(self, b):
                     self.buffer = b
-            sys.stdout = DummyStdout(buf)  # type: ignore
-            sys.stdin = DummyStdin(dummy_stdin_buf)  # type: ignore
-            try:
-                rc = handle_request(tokens, root=tmp)
-            finally:
-                sys.stdout = orig_stdout
-                sys.stdin = orig_stdin
+            # Spy on the symbol the facade actually instantiates: pact_v4.snapshot.remote_facade.BookStore
+            with unittest.mock.patch("pact_v4.snapshot.remote_facade.BookStore") as mock_bookstore:
+                sys.stdout = DummyStdout(buf)  # type: ignore
+                sys.stdin = DummyStdin(dummy_stdin_buf)  # type: ignore
+                try:
+                    rc = handle_request(tokens, root=tmp)
+                finally:
+                    sys.stdout = orig_stdout
+                    sys.stdin = orig_stdin
+                # Prove BookStore was never constructed for every fail-closed case (12 total: 4 forms × 3 scope values)
+                mock_bookstore.assert_not_called()
             assert rc != 0, f"should reject tokens={tokens} when scoped={scoped_val!r}"
             out = buf.getvalue().decode("utf-8", errors="replace")
             assert "FACADE_REJECTED" in out, out
             assert "PACT_SNAPSHOT_BOOK_ID" in out, out
-            # NO BookStore construction: sentinel fresh dir must not exist
+            # NO BookStore construction: sentinel fresh dir must not exist (complements mock assertion)
             assert not fresh_path.exists(), "facade must not create BookStore when unscoped"
             # Also ensure the token's book dir was not newly created beyond the seeded one
             # (if tokens used a fresh id we check it; here tokens use seeded BOOK_ID which already exists,
