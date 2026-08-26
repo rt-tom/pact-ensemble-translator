@@ -755,6 +755,37 @@ def test_validate_layout_forbidden_root_precedence(tmp_path):
         _validate_layout(layout3)
 
 
+def test_validate_layout_symmetric_isolation(tmp_path):
+    """Source/output must not be inside state (symmetric guard)."""
+    from pact_full_pipeline_runner_v1.v4_run import _validate_layout
+    # Legitimate layouts must still validate
+    layout_rt = {"source": Path("D:/pact/pact_chapters"), "state": Path("D:/pact/book_state"), "output": Path("D:/pact/gate_bench_runs")}
+    # Use tmp-based equivalent that mimics non-nesting
+    legit = {"source": tmp_path / "csrc", "state": tmp_path / "cstate", "output": tmp_path / "cout"}
+    for p in legit.values():
+        p.mkdir(parents=True, exist_ok=True)
+    _validate_layout(legit)  # should not raise
+    # Source inside state must be rejected
+    state = tmp_path / "state_iso"
+    state.mkdir(exist_ok=True)
+    src_inside = state / "chapters"
+    src_inside.mkdir(exist_ok=True)
+    out_ok = tmp_path / "out_iso_ok"
+    out_ok.mkdir(exist_ok=True)
+    with pytest.raises(ValueError, match="inside state"):
+        _validate_layout({"source": src_inside, "state": state, "output": out_ok})
+    # Output inside state must be rejected
+    src_ok = tmp_path / "src_iso_ok2"
+    src_ok.mkdir(exist_ok=True)
+    out_inside = state / "runs"
+    out_inside.mkdir(exist_ok=True)
+    with pytest.raises(ValueError, match="inside state"):
+        _validate_layout({"source": src_ok, "state": state, "output": out_inside})
+    # Equality output==state also rejected
+    with pytest.raises(ValueError, match="output and state"):
+        _validate_layout({"source": src_ok, "state": state, "output": state})
+
+
 def test_host_layout_env_overrides(tmp_path, monkeypatch):
     from pact_full_pipeline_runner_v1.v4_run import _host_layout
     monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(tmp_path / "csrc"))

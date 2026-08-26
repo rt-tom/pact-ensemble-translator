@@ -363,11 +363,15 @@ def _validate_layout(layout: dict[str, Path]) -> None:
     try:
         src_res = src.resolve() if src.exists() else src.absolute()
         state_res = state.resolve() if state.exists() else state.absolute()
+        out_res = out.resolve() if out.exists() else out.absolute()
     except Exception:
         src_res = src.absolute()
         state_res = state.absolute()
+        out_res = out.absolute()
     if src_res == state_res:
         raise ValueError(f"source and state must not be the same directory: {src}")
+    if out_res == state_res:
+        raise ValueError(f"output and state must not be the same directory: {out}")
     try:
         # state inside source is forbidden
         state_res.relative_to(src_res)
@@ -376,6 +380,21 @@ def _validate_layout(layout: dict[str, Path]) -> None:
         if "inside source" in str(e):
             raise
         # not inside -> ok
+        pass
+    # Symmetric isolation: source/output must not be inside state
+    try:
+        src_res.relative_to(state_res)
+        raise ValueError(f"source directory must not be inside state root: {src} inside {state}")
+    except ValueError as e:
+        if "inside state" in str(e):
+            raise
+        pass
+    try:
+        out_res.relative_to(state_res)
+        raise ValueError(f"output directory must not be inside state root: {out} inside {state}")
+    except ValueError as e:
+        if "inside state" in str(e):
+            raise
         pass
     # Also ensure snapshot canonical dir not used as state (hardening)
     # state should not be exactly /home/rt/pact_runs/books/1

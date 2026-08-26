@@ -238,35 +238,28 @@ def test_no_duplicate_state_mirror(tmp_path=None):
 
 
 def test_local_facade_no_self_ssh(tmp_path=None):
-    # When root is canonical media root and target is media-snap/media, local facade must be used without spawning ssh
-    with tempfile.TemporaryDirectory() as tmp:
-        # Use tmp as fake media root but also test logic with canonical path via mock
-        store = _seed_store(tmp)
-        # Create real fetch via local facade path by patching _should_use_local_facade to True
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as dest:
-            dest_p = Path(dest)
-            # Patch Path.is_dir to simulate canonical root exists
-            with patch.object(remote_client.Path, "is_dir", return_value=True):
-                with patch("pact_v4.snapshot.remote_client._local_fetch_current") as mock_local:
-                    mock_local.return_value = {"revision_id": "rev-0001"}
-                    # Need to also avoid Path.exists checks? Patch correctly by using side_effect
-                    # Instead test _should_use_local_facade directly and ensure fetch doesn't call subprocess
-                    assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs") is True or True  # best-effort
-                    # Verify that fetch with transport=None and mocked _local_fetch_current does not call subprocess.run
+    # Real predicate must select local facade for media-snap/media when canonical root is reachable,
+    # and fetch_current must not spawn ssh in that case.
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as dest:
+        dest_p = Path(dest)
+        # Mock canonical root availability via Path methods on the remote_client module.
+        with patch.object(remote_client.Path, "is_dir", return_value=True):
+            with patch.object(remote_client.Path, "exists", return_value=True):
+                # Real predicate: True for facade aliases, False for others / non-canonical root.
+                assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs") is True
+                assert remote_client._should_use_local_facade("media", "/home/rt/pact_runs") is True
+                assert remote_client._should_use_local_facade("other-host", "/home/rt/pact_runs") is False
+                assert remote_client._should_use_local_facade("media-snap", "/tmp/other_root") is False
+                # fetch_current with facade alias must use local path and NOT call subprocess.run
+                with patch("pact_v4.snapshot.remote_client._local_fetch_current", return_value={"revision_id": "rev-0001"}) as mock_local:
                     with patch("subprocess.run") as mock_run:
-                        # Need a real media root directory to trigger facade; create it
-                        import os
-                        fake_root = "/tmp/fake_media_root_for_test"
-                        Path(fake_root).mkdir(parents=True, exist_ok=True)
-                        try:
-                            with patch.object(remote_client, "_should_use_local_facade", return_value=True):
-                                with patch("pact_v4.snapshot.remote_client._local_fetch_current", return_value={"revision_id": "rev-0001"}) as ml:
-                                    remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root=fake_root)
-                                    assert ml.called
-                                    assert not mock_run.called
-                        finally:
-                            import shutil; shutil.rmtree(fake_root, ignore_errors=True)
+                        result = remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root="/home/rt/pact_runs")
+                        assert result == {"revision_id": "rev-0001"}
+                        assert mock_local.called
+                        assert not mock_run.called
+                # Non-facade target must not use local facade (would attempt ssh, but we avoid real ssh by using transport)
+                # Verify predicate already returned False above; no subprocess assertion needed here.
 
 
 def test_fetch_tar_negative_matrix():
