@@ -1,12 +1,12 @@
 ## 1. Host-aware book layout and source resolution
 
 - [ ] 1.1 Add a declarative RT/media launcher-layout contract with the approved RT roots and isolated media worker state/output roots — verify: unit tests resolve each host layout and reject a source/state path collision.
-- [ ] 1.2 Implement safe numeric source discovery for exactly one regular non-symlink `NNNN_*.html` per requested chapter — verify: tests cover variable suffix success, zero matches, multiple matches, symlink/non-regular rejection, and actual full-ID forwarding.
+- [ ] 1.2 Implement safe numeric source discovery for exactly one regular non-symlink `NNNN_*.html` per requested chapter, accepting single `N` as shorthand for `N-N` — verify: tests cover variable suffix success, single/range expansion, zero matches, multiple matches, symlink/non-regular rejection, and actual full-ID forwarding.
 - [ ] 1.3 Extend book check-only preflight with source-range readability and state/output readiness checks without directory creation or network/state-sync side effects — verify: preflight/JSON tests assert reports and failure behavior for RT-like Windows and media-like Linux fixture layouts.
 
 ## 2. Simple command and remote policy
 
-- [ ] 2.1 Implement mutually exclusive `book --local` and `book --remote <translator>/<reviewer>` selection while retaining explicit `--runtime-config` advanced compatibility — verify: dispatcher tests cover valid selection, invalid combinations, and exact delegated argv/exit propagation.
+- [ ] 2.1 Implement mutually exclusive `book --local` and `book --remote [translator/reviewer]` selection, where bare remote uses profile defaults, while retaining explicit `--runtime-config` advanced compatibility — verify: dispatcher tests cover bare/overridden remote selection, invalid combinations, and exact delegated argv/exit propagation.
 - [ ] 2.2 Make all book modes inject `--whole-chapter`; make simple remote mode inject `--managed-server` and resolve remote defaults — verify: forwarding tests prove defaults and reject incompatible explicit topology choices.
 - [ ] 2.3 Update the canonical remote example to reasoning `3`, Muse Free generator/repair, Luna standard reviewer bindings, and explicit entity-extractor binding — verify: runtime-config/profile tests assert bindings, reasoning transport, identity, and provider-registry resolution without provider contact.
 - [ ] 2.4 Update safe help and preflight output for host roots, source discovery, local/remote modes, whole-chapter, managed-server, model/reasoning defaults, and advanced compatibility — verify: help/check-only tests have no pipeline, lifecycle, provider, state-sync, or artifact side effects.

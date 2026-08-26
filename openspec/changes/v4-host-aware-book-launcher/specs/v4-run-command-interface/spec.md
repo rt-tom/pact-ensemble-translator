@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Unified v4 command selection
-The system SHALL expose one supported v4 command with explicit `book` and `chapter` modes, with `book` as the documented primary workflow. Book mode SHALL require a closed numeric chapter range and exactly one of `--local` or `--remote <translator>/<reviewer>`; it SHALL select the approved host-aware profile and delegate to the existing book entrypoint without changing translation, audit, formatting, or markup semantics for an equivalent resolved invocation. Existing explicit `--runtime-config` invocation SHALL remain available as an advanced compatibility path. The launcher SHALL enable `--whole-chapter` for every book invocation.
+The system SHALL expose one supported v4 command with explicit `book` and `chapter` modes, with `book` as the documented primary workflow. Book mode SHALL accept either one numeric chapter (`28`) or a closed numeric range (`28-29`) and require exactly one of `--local` or `--remote [translator/reviewer]`;  it SHALL select the approved host-aware profile and delegate to the existing book entrypoint without changing translation, audit, formatting, or markup semantics for an equivalent resolved invocation. Existing explicit `--runtime-config` invocation SHALL remain available as an advanced compatibility path. The launcher SHALL enable `--whole-chapter` for every book invocation.
 
 #### Scenario: Simple local book selection
 - **WHEN** an operator invokes `book --chapters 27-32 --local`
@@ -10,6 +10,14 @@ The system SHALL expose one supported v4 command with explicit `book` and `chapt
 #### Scenario: Simple remote book selection
 - **WHEN** an operator invokes `book --chapters 27-32 --remote musefree/luna`
 - **THEN** the command SHALL resolve the approved remote profile and role selections, enable managed-server and whole-chapter mode, and invoke the supported book-run path
+
+#### Scenario: Bare remote selection uses profile defaults
+- **WHEN** an operator invokes `book --chapters 28 --remote` without role aliases
+- **THEN** the command SHALL use the canonical remote profile's default models and reasoning policy
+
+#### Scenario: Single chapter shorthand
+- **WHEN** an operator supplies `--chapters 28`
+- **THEN** the command SHALL resolve and execute the one zero-padded chapter `0028`
 
 #### Scenario: Invalid book selection is rejected
 - **WHEN** an operator omits a mode, combines `--local` and `--remote`, supplies malformed remote roles, or supplies a malformed/reversed range

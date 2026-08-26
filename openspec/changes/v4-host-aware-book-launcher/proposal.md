@@ -8,7 +8,7 @@ The current `v4_run book` launcher assumes Windows paths, resolves only exact `{
 - Resolve numeric chapter ranges deterministically from exactly one `NNNN_*.html` source file per number; reject absent or ambiguous matches before a pipeline starts.
 - Extend offline launcher preflight to validate the complete requested source range and local writable state/output locations without contacting model providers.
 - Make `D:\pact\book_state` the RT mutable state directory, never the source directory; stop duplicating fetched state into an unused local `state/` subdirectory.
-- Provide simple explicit selection: `--local` or `--remote <translator>/<reviewer>`. Remote defaults use Muse Free for translator/repair, Luna for the standard reviewer roles, reasoning level `3`, and `--managed-server`; all launcher variants enable `--whole-chapter` by default.
+- Provide simple explicit selection: `--local` or `--remote [translator/reviewer]`. Bare `--remote` uses remote-profile defaults; supplied role aliases override them. Remote defaults use Muse Free for translator/repair, Luna for the standard reviewer roles, reasoning level `3`, and `--managed-server`; all launcher variants enable `--whole-chapter` by default.
 - Enable the existing state-only media synchronization by default for simple remote runs on RT and media with book id `1`, target `media-snap`, and media root `/home/rt/pact_runs`. The media-host path must avoid a self-SSH loop while retaining equivalent fail-closed facade validation and a terminal media publish verdict.
 - Retain explicit compatibility overrides for non-default book ID and advanced invocation paths; do not change the separate future full terminal-bundle artifact protocol.
 
