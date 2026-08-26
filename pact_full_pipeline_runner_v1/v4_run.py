@@ -43,11 +43,31 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants and host-aware layout
 # ---------------------------------------------------------------------------
 
 _DEFAULT_OUT_ROOT = Path("D:/pact/gate_bench_runs")
 _TIMESTAMP_FMT = "%Y%m%d_%H%M%S"
+
+# Declarative host-aware book layout (RT vs media). Transport profiles remain
+# separate; this layout selects source/state/output roots per execution host.
+_RT_LAYOUT = {
+    "source": Path("D:/pact/pact_chapters"),
+    "state": Path("D:/pact/book_state"),
+    "output": Path("D:/pact/gate_bench_runs"),
+}
+_MEDIA_LAYOUT = {
+    "source": Path("/home/rt/pact_chapters"),
+    "state": Path("/home/rt/pact_runs/workers/media/book-1/state"),
+    "output": Path("/home/rt/pact_runs/outputs"),
+}
+# Media canonical source is /home/rt/pact_chapters (owner-approved 150 HTML).
+# RT mirror is D:/pact/pact_chapters (owner-managed).
+
+# Default media sync for every simple book mode
+_DEFAULT_MEDIA_BOOK_ID = "1"
+_DEFAULT_MEDIA_TARGET = "media-snap"
+_DEFAULT_MEDIA_ROOT = "/home/rt/pact_runs"
 
 # ---------------------------------------------------------------------------
 # Help text — curated top-level, offline
@@ -56,11 +76,12 @@ _TIMESTAMP_FMT = "%Y%m%d_%H%M%S"
 _TOP_LEVEL_HELP = """\
 v4 — unified v4 pipeline launcher (book-first)
 
-Production runs are owner-started on RT only (D:\\pact\\pact_translator_v4_1).
-Do not start pipelines from the media dev host or from worktrees.
-Agents inspect code and artifacts only.
+Production runs are owner-started on RT or media via the host-aware launcher.
+Do not start pipelines from worktrees. Agents inspect code and artifacts only.
 
 Usage:
+  python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28 --local
+  python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28-32 --remote [translator/reviewer]
   python -m pact_full_pipeline_runner_v1.v4_run book --chapters START-END --runtime-config FILE [options]
   python -m pact_full_pipeline_runner_v1.v4_run chapter --chapter-id ID --chapter-html FILE --memory-dir DIR --out-dir DIR [options]
   python -m pact_full_pipeline_runner_v1.v4_run --help
@@ -69,44 +90,71 @@ Usage:
 
 Modes:
   book      Primary workflow — sequential chapters sharing memory, cross-chapter promotion.
-            Requires --chapters START-END and --runtime-config FILE.
+            Simple: --chapters 28 or 28-32 plus --local or --remote [translator/reviewer].
+            Advanced: --chapters + --runtime-config FILE (compatibility).
   chapter   Single-chapter strict run (retained). Requires --chapter-id / --chapter-html / --memory-dir / --out-dir.
 
-Book range and source-pattern resolution:
-  --chapters START-END   Closed numeric range, e.g. 27-32 or 0027-0032. Validated before startup;
-                         reversed or malformed ranges are rejected. Expanded to zero-padded
-                         IDs (0027 0028 ... 0032) and resolved via --chapter-html-pattern
-                         '{chapter_id}' (default: D:/pact/pact_chapters/{chapter_id}.html).
+Book range and source-pattern discovery:
+  --chapters N | N-M      Single chapter (28) or closed range (28-32). Accepts bare numbers
+                         and zero-padded forms; validated before startup. Each numeric value
+                         is resolved to exactly one regular non-symlink file matching
+                         NNNN_*.html in the host source root (RT: D:/pact/pact_chapters,
+                         media: /home/rt/pact_chapters). Ambiguous or missing matches fail
+                         before pipeline startup. Advanced: explicit --chapter-html-pattern
+                         remains available but must pass the same uniqueness checks.
+
+Host-aware layout:
+  RT: source D:/pact/pact_chapters, mutable state D:/pact/book_state,
+      automatic outputs under D:\\pact\\gate_bench_runs.
+  media: source /home/rt/pact_chapters, state /home/rt/pact_runs/workers/media/book-1/state,
+        outputs under /home/rt/pact_runs/outputs.
+  Mutable state is never written under a source root. Explicit --memory-dir / --out-base
+  and --chapter-html-pattern override the layout for advanced use.
 
 Automatic output naming:
-  Each book run creates a distinct subdirectory below D:\\pact\\gate_bench_runs
-  named book_0027-0032_local_<timestamp> or book_0027-0032_remote_<timestamp>.
-  The local/remote label is derived from the resolved runtime descriptor after
-  profile defaults and explicit overrides, not a user-supplied topology claim.
+  Each book run creates a distinct subdirectory below the host output root
+  named book_0027-0032_local_<timestamp> or book_0027-0032_remote_<timestamp>
+  (or book_0028_* for a single chapter). The local/remote label is derived from
+  the resolved runtime descriptor after profile defaults and explicit overrides,
+  not a user-supplied topology claim.
+
+Simple book selection:
+  --local                  Select the canonical local profile (RT or media local runtime).
+  --remote [translator/reviewer]  Select the canonical remote profile. Bare --remote uses
+                           profile defaults (Muse Free translator/repair + Luna standard
+                           reviewer roles, reasoning 3, managed server). Supplied aliases
+                           override those roles via providers.yaml (e.g. musefree/luna).
+  Exactly one of --local or --remote is required for simple mode; they are mutually
+  exclusive. Advanced: --runtime-config FILE remains available (compatibility) and is
+  mutually exclusive with --local/--remote. Bare --remote without alias is valid.
 
 Runtime configuration — profile defaults and optional overrides:
-  --runtime-config FILE    Tagged runtime profile (local_llama | opencode_server | composite).
-                           The profile supplies default role models, reasoning, transport,
-                           and identity-bearing policy. Without it the historical no-config
-                           local CLI is used (compatibility, chapter mode only).
-  --translator PROVIDER/ALIAS   Override Translator role model via providers.yaml (e.g. opencode-go/deepseek4flash).
+  --runtime-config FILE    Tagged runtime profile (local_llama | opencode_server | composite)
+                           for advanced use. The profile supplies default role models,
+                           reasoning, transport, and identity-bearing policy.
+  --translator PROVIDER/ALIAS   Override Translator role model via providers.yaml.
   --reviewer PROVIDER/ALIAS     Override Reviewer role models via providers.yaml.
   --reasoning {0,1,2,3}         Override generation reasoning budget (profile default when omitted).
   Omitted selections use profile defaults and do not introduce launcher-specific quality defaults.
-  Explicit overrides are validated against the runtime/provider contract, forwarded to the
-  underlying entrypoint, and included in resolved identity/reporting. Aliases are
-  case-insensitive and fail-closed on ambiguous duplicates.
+  Explicit overrides are validated against the runtime/provider contract, forwarded, and
+  included in resolved identity/reporting. Aliases are case-insensitive and fail-closed.
+  Remote defaults: reasoning 3, generator/repair opencode/muse-spark-1.2-contributor-free,
+  standard reviewer roles openai/gpt-5.6-luna, managed server enabled, whole-chapter enabled
+  for every book run.
 
 Automatic offline preflight and check-only modes:
-  Offline host-local preflight (profile syntax, local paths/ports, required env vars)
-  runs by default before every configured execution — before any output directory is created
-  or a pipeline starts. On failure the command exits with a clear error and no artifacts.
+  Offline host-local preflight (profile syntax, local paths/ports, required env vars,
+  plus host source/state/output resolution) runs by default before every configured
+  execution — before any output directory is created or a pipeline starts. It validates
+  that every requested chapter resolves to exactly one regular non-symlink HTML file
+  and that state/output locations are present and writable. On failure the command
+  exits with a clear error and no artifacts.
   --preflight              Validate and print a sanitized human-readable preflight report and exit.
   --preflight --json       Machine-readable JSON preflight report (or --preflight-json alias).
   --preflight-json         Alias for --preflight --json.
   Check-only modes do NOT start the pipeline, open a model session, contact a provider,
-  submit source text, or create run artifacts. Remote endpoint preflight remains a separate
-  transport check during actual execution.
+  submit source text, synchronize state, or create run artifacts. Remote endpoint
+  preflight remains a separate transport check during actual execution.
 
 Runtime/provider, topology and resume:
   Runtime/provider configuration is resolved through the profile and exposed via preflight
@@ -121,10 +169,16 @@ Audit/formatting and markup:
                            This is the only accepted markup value; unsupported values are
                            rejected before startup and no new tag transformation is performed.
 
+Media synchronization:
+  Every simple book run (local or remote, RT or media) defaults to media book id 1,
+  target media-snap, root /home/rt/pact_runs. Override with --media-book-id for
+  another book. On media the local restricted facade is used instead of self-SSH.
+  A final MEDIA PUBLISH verdict (ACCEPTED/REJECTED) is printed; rejection is non-zero.
+
 Safety and owner-run boundary:
-  Production runs are owner-started on RT only. The launcher does not add hidden defaults,
-  does not silently alter identity, and never starts providers or model servers in
-  --help or --preflight modes.
+  Runs are owner-started via the host-aware launcher. The launcher does not add hidden
+  defaults beyond documented simple-mode policy, does not silently alter identity, and
+  never starts providers or model servers in --help or --preflight modes.
 
 Get mode-specific detail:
   python -m pact_full_pipeline_runner_v1.v4_run book --help
@@ -134,9 +188,17 @@ Get mode-specific detail:
 _BOOK_HELP_EXTRA = """\
 book mode — batch chapters sharing memory
 
-Required:
-  --chapters START-END       Closed range (e.g. 27-32). Validated and expanded to 0027 ... 0032.
-  --runtime-config FILE      Tagged runtime profile (source of truth for models/reasoning/policy).
+Simple (host-aware):
+  --chapters N | N-M          Single chapter (28) or range (28-32). Each numeric value resolves
+                              to exactly one NNNN_*.html file in the host source root.
+  --local | --remote [translator/reviewer]  Exactly one required. Bare --remote uses
+                              canonical remote defaults (Muse Free + Luna, reasoning 3,
+                              managed server). Every simple run defaults to whole-chapter
+                              and media sync (book 1, media-snap, /home/rt/pact_runs).
+
+Advanced (compatibility):
+  --runtime-config FILE      Tagged runtime profile (source of truth). Mutually exclusive
+                              with --local/--remote.
 
 Optional (profile-aware):
   --translator PROVIDER/ALIAS
@@ -144,11 +206,14 @@ Optional (profile-aware):
   --reasoning {0,1,2,3}
   --markup preserve          Only 'preserve' is accepted.
 
-Output / source:
-  --chapter-html-pattern PATTERN   Pattern with {chapter_id} (default: D:/pact/pact_chapters/{chapter_id}.html)
-  --memory-dir DIR                 (default: D:/pact/pact_chapters)
-  --out-base DIR                   Overrides automatic D:\\pact\\gate_bench_runs/book_XXXX-XXXX_local|remote_<timestamp>
-  Automatic output: D:\\pact\\gate_bench_runs/book_0027-0032_local|remote_<timestamp> (label from resolved descriptor).
+Host/layout and source (advanced overrides):
+  --chapter-html-pattern PATTERN   Advanced: pattern with {chapter_id}. Default is host source
+                                   root with discovered NNNN_*.html files.
+  --memory-dir DIR                 Advanced: overrides host mutable state root (RT: D:/pact/book_state,
+                                   media: /home/rt/pact_runs/workers/media/book-1/state).
+  --out-base DIR                   Overrides automatic host output root/book_XXXX-XXXX_local|remote_<timestamp>
+  Automatic output: host_output/book_0027-0032_local|remote_<timestamp> (label from descriptor).
+  Source and mutable state must not be the same directory.
 
 Topology/resume (forwarded to strict per-chapter):
   --runtime-config FILE, --managed-server, --providers-config FILE;
@@ -194,29 +259,39 @@ Forwarding: remaining arguments are forwarded to the existing strict chapter ent
 # ---------------------------------------------------------------------------
 
 _RANGE_RE = re.compile(r"^\s*0*(\d+)\s*-\s*0*(\d+)\s*$")
+_SINGLE_RE = re.compile(r"^\s*0*(\d+)\s*$")
 
 
 def parse_range(text: str) -> tuple[int, int]:
-    """Parse START-END range, return (start, end) as ints. Fail with ValueError on invalid."""
+    """Parse START-END or single N, return (start, end) as ints. Fail with ValueError on invalid."""
     if text is None or not str(text).strip():
-        raise ValueError(f"chapter range must be START-END, got {text!r}")
+        raise ValueError(f"chapter range must be START-END or single N, got {text!r}")
     m = _RANGE_RE.match(str(text))
-    if not m:
-        raise ValueError(
-            f"invalid chapter range {text!r}: expected START-END (e.g. 27-32 or 0027-0032)"
-        )
-    try:
-        start = int(m.group(1))
-        end = int(m.group(2))
-    except ValueError as exc:
-        raise ValueError(f"invalid chapter range {text!r}: non-numeric") from exc
-    if start < 1 or end < 1:
-        raise ValueError(f"invalid chapter range {text!r}: chapters start at 1")
-    if start > end:
-        raise ValueError(f"invalid chapter range {text!r}: start > end (reversed range)")
-    if end - start > 500:
-        raise ValueError(f"invalid chapter range {text!r}: range too large (>500 chapters)")
-    return start, end
+    if m:
+        try:
+            start = int(m.group(1))
+            end = int(m.group(2))
+        except ValueError as exc:
+            raise ValueError(f"invalid chapter range {text!r}: non-numeric") from exc
+        if start < 1 or end < 1:
+            raise ValueError(f"invalid chapter range {text!r}: chapters start at 1")
+        if start > end:
+            raise ValueError(f"invalid chapter range {text!r}: start > end (reversed range)")
+        if end - start > 500:
+            raise ValueError(f"invalid chapter range {text!r}: range too large (>500 chapters)")
+        return start, end
+    ms = _SINGLE_RE.match(str(text))
+    if ms:
+        try:
+            n = int(ms.group(1))
+        except ValueError as exc:
+            raise ValueError(f"invalid chapter range {text!r}: non-numeric") from exc
+        if n < 1:
+            raise ValueError(f"invalid chapter range {text!r}: chapters start at 1")
+        return n, n
+    raise ValueError(
+        f"invalid chapter range {text!r}: expected N or START-END (e.g. 28 or 27-32)"
+    )
 
 
 def expand_range(start: int, end: int) -> list[str]:
@@ -225,6 +300,190 @@ def expand_range(start: int, end: int) -> list[str]:
 
 def range_label(start: int, end: int) -> str:
     return f"{start:04d}-{end:04d}"
+
+
+# ---------------------------------------------------------------------------
+# Host-aware layout and source discovery (hardened)
+# ---------------------------------------------------------------------------
+
+def _detect_execution_host(host_hint: Optional[str] = None) -> str:
+    """Trusted execution host identity: 'media' or 'rt'."""
+    import os as _os
+    import sys as _sys
+    if host_hint in ("rt", "media"):
+        return host_hint  # type: ignore[return-value]
+    env = _os.environ.get("PACT_V4_HOST") or _os.environ.get("PACT_EXEC_HOST")
+    if env in ("rt", "media"):
+        return env
+    if _sys.platform == "win32":
+        return "rt"
+    return "media"
+
+
+def _host_layout(host_hint: Optional[str] = None) -> dict[str, Path]:
+    """Select RT or media layout. host_hint: 'rt'|'media'|None (auto)."""
+    import os as _os
+    import sys as _sys
+    # Explicit hint first
+    if host_hint == "rt":
+        base = dict(_RT_LAYOUT)
+    elif host_hint == "media":
+        base = dict(_MEDIA_LAYOUT)
+    elif _os.environ.get("PACT_V4_HOST") == "rt":
+        base = dict(_RT_LAYOUT)
+    elif _os.environ.get("PACT_V4_HOST") == "media":
+        base = dict(_MEDIA_LAYOUT)
+    elif _sys.platform == "win32":
+        base = dict(_RT_LAYOUT)
+    else:
+        base = dict(_MEDIA_LAYOUT)
+    # Env overrides for tests (allow tmp_path injection)
+    if _os.environ.get("PACT_V4_SOURCE_ROOT"):
+        base["source"] = Path(_os.environ["PACT_V4_SOURCE_ROOT"])
+    if _os.environ.get("PACT_V4_STATE_ROOT"):
+        base["state"] = Path(_os.environ["PACT_V4_STATE_ROOT"])
+    if _os.environ.get("PACT_V4_OUT_ROOT"):
+        base["output"] = Path(_os.environ["PACT_V4_OUT_ROOT"])
+    return base
+
+
+def _check_no_symlink_chain(path: Path) -> None:
+    for anc in [path] + list(path.parents):
+        try:
+            if anc.exists() and anc.is_symlink():
+                raise ValueError(f"Symlink in path chain rejected: {anc}")
+        except OSError as e:
+            raise ValueError(f"Failed to stat path chain {anc}: {e}") from e
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    import stat as _stat
+    return _stat.S_ISREG(st.st_mode)
+
+
+def _validate_layout(layout: dict[str, Path]) -> None:
+    for key in ("source", "state", "output"):
+        if key not in layout:
+            raise ValueError(f"layout missing key {key!r}")
+    src = layout["source"]
+    state = layout["state"]
+    out = layout["output"]
+    # Resolve without requiring existence (for existence checks later)
+    # But ensure source and state not same and state not inside source
+    try:
+        src_res = src.resolve() if src.exists() else src.absolute()
+        state_res = state.resolve() if state.exists() else state.absolute()
+        out_res = out.resolve() if out.exists() else out.absolute()
+    except Exception:
+        src_res = src.absolute()
+        state_res = state.absolute()
+        out_res = out.absolute()
+    if src_res == state_res:
+        raise ValueError(f"source and state must not be the same directory: {src}")
+    if out_res == state_res:
+        raise ValueError(f"output and state must not be the same directory: {out}")
+    try:
+        # state inside source is forbidden
+        state_res.relative_to(src_res)
+        raise ValueError(f"state directory must not be inside source root: {state} inside {src}")
+    except ValueError as e:
+        if "inside source" in str(e):
+            raise
+        # not inside -> ok
+        pass
+    # Symmetric isolation: source/output must not be inside state
+    try:
+        src_res.relative_to(state_res)
+        raise ValueError(f"source directory must not be inside state root: {src} inside {state}")
+    except ValueError as e:
+        if "inside state" in str(e):
+            raise
+        pass
+    try:
+        out_res.relative_to(state_res)
+        raise ValueError(f"output directory must not be inside state root: {out} inside {state}")
+    except ValueError as e:
+        if "inside state" in str(e):
+            raise
+        pass
+    # Output must not equal or be nested under source (contamination)
+    if out_res == src_res:
+        raise ValueError(f"output directory must not be the same as source root: {out}")
+    try:
+        out_res.relative_to(src_res)
+        raise ValueError(f"output directory must not be inside source root: {out} inside {src}")
+    except ValueError as e:
+        if "inside source" in str(e):
+            raise
+        pass
+    # Also ensure snapshot canonical dir not used as state (hardening)
+    # state should not be exactly /home/rt/pact_runs/books/1
+    for forbidden in [Path("/home/rt/pact_runs/books/1"), Path("/home/rt/pact_runs/books")]:
+        try:
+            forbidden_root = forbidden.resolve() if forbidden.exists() else forbidden.absolute()
+            if state_res == forbidden_root:
+                raise ValueError(f"state directory must not be canonical snapshot storage: {state}")
+            state_res.relative_to(forbidden_root)
+            # if state is inside forbidden, also bad
+            if str(state_res).startswith(str(forbidden_root) + "/") or str(state_res) == str(forbidden_root):
+                raise ValueError(f"state directory must be outside canonical snapshot storage: {state}")
+        except ValueError as ve:
+            if "snapshot" in str(ve):
+                raise
+            pass
+    # Output must also not be equal to or inside canonical snapshot roots
+    for forbidden in [Path("/home/rt/pact_runs/books/1"), Path("/home/rt/pact_runs/books")]:
+        try:
+            forbidden_root = forbidden.resolve() if forbidden.exists() else forbidden.absolute()
+            if out_res == forbidden_root:
+                raise ValueError(f"output directory must not be canonical snapshot storage: {out}")
+            out_res.relative_to(forbidden_root)
+            if str(out_res).startswith(str(forbidden_root) + "/") or str(out_res) == str(forbidden_root):
+                raise ValueError(f"output directory must not be inside canonical snapshot storage: {out}")
+        except ValueError as ve:
+            if "snapshot" in str(ve):
+                raise
+            pass
+
+
+def _discover_chapter_sources(source_root: Path, chapter_numbers: Sequence[int]) -> dict[int, Path]:
+    """Resolve each numeric chapter to exactly one NNNN_*.html regular file."""
+    _check_no_symlink_chain(source_root)
+    if not source_root.exists() or not source_root.is_dir() or source_root.is_symlink():
+        raise ValueError(f"source root missing or not a directory: {source_root}")
+    result: dict[int, Path] = {}
+    for n in chapter_numbers:
+        prefix = f"{n:04d}_"
+        # Non-recursive scan, hardened
+        candidates: list[Path] = []
+        try:
+            for entry in source_root.iterdir():
+                # Hardening: reject symlinked entries, check regular file
+                if entry.name.startswith(prefix) and entry.name.endswith(".html"):
+                    if entry.is_symlink():
+                        raise ValueError(f"source file is symlink (rejected): {entry}")
+                    if not entry.is_file() or not _is_regular_file(entry):
+                        raise ValueError(f"source file not regular: {entry}")
+                    _check_no_symlink_chain(entry)
+                    candidates.append(entry)
+        except OSError as e:
+            raise ValueError(f"failed to list source root {source_root}: {e}") from e
+        if len(candidates) == 0:
+            raise ValueError(f"no source file for chapter {n:04d} in {source_root} (expected {prefix}*.html)")
+        if len(candidates) > 1:
+            names = sorted(p.name for p in candidates)
+            raise ValueError(f"ambiguous source files for chapter {n:04d} in {source_root}: {names}")
+        result[n] = candidates[0]
+    return result
+
+
+def _host_layout_for_simple(is_local: bool, host_hint: Optional[str] = None) -> dict[str, Path]:
+    # For simple mode, same layout for local/remote on given host; remote vs local only affects runtime profile.
+    return _host_layout(host_hint)
 
 
 # ---------------------------------------------------------------------------
@@ -256,15 +515,38 @@ def _load_runtime_config_file(path: Path):
 
 
 def _apply_overrides(cfg, translator: Optional[str], reviewer: Optional[str], reasoning: Optional[int], providers_config: Optional[str | Path] = None):
-    # Apply provider aliases first — must use effective providers registry (honors --providers-config)
+    # Apply provider aliases — support bare globally-unique aliases (fail-closed on duplicate)
     if translator or reviewer:
-        from pact_v4.runtime.runtime_config import load_providers_registry, apply_provider_flags
+        from pact_v4.runtime.runtime_config import load_providers_registry, apply_provider_flags, apply_role_models, build_reasoning_effort_map, TRANSLATOR_ROLES, REVIEWER_ROLES, _set_generator_reasoning_effort_map
         if providers_config is not None:
             prov_path = Path(providers_config)
         else:
             prov_path = Path(__file__).resolve().parent.parent / "configs" / "providers.yaml"
         registry = load_providers_registry(prov_path)
-        cfg = apply_provider_flags(cfg, registry, translator=translator, reviewer=reviewer)
+        # Resolve bare aliases via global index when slash missing
+        def _resolve_spec(spec: Optional[str]):
+            if not spec:
+                return None
+            if "/" in spec:
+                return registry.resolve(spec)
+            return registry.resolve_bare(spec)
+        # Build role models manually to support bare
+        role_models: dict[str, str] = {}
+        translator_model = None
+        if translator:
+            translator_model = _resolve_spec(translator)
+            for role in TRANSLATOR_ROLES:
+                role_models[role] = translator_model.ref
+        if reviewer:
+            reviewer_model = _resolve_spec(reviewer)
+            for role in REVIEWER_ROLES:
+                role_models[role] = reviewer_model.ref
+        if role_models:
+            cfg = apply_role_models(cfg, role_models)
+            if translator_model is not None:
+                cfg = _set_generator_reasoning_effort_map(cfg, build_reasoning_effort_map(translator_model))
+        else:
+            cfg = apply_provider_flags(cfg, registry, translator=translator, reviewer=reviewer)
     if reasoning is not None:
         # Validate reasoning value
         if reasoning not in (0, 1, 2, 3):
@@ -380,11 +662,13 @@ def _error_exit(msg: str, code: int = 2) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_book(argv: Sequence[str]) -> int:
-    # Minimal arg parsing for book mode, forwarding remainder.
+    # Book mode supports simple (--local/--remote) and advanced (--runtime-config) paths.
     parser = argparse.ArgumentParser(prog="v4_run book", add_help=False)
     parser.add_argument("--chapters", required=False, default=None)
     parser.add_argument("--runtime-config", dest="runtime_config", required=False, default=None)
     parser.add_argument("--profile", dest="profile", required=False, default=None)
+    parser.add_argument("--local", action="store_true", default=False, help="Select canonical local profile")
+    parser.add_argument("--remote", nargs="?", const="__DEFAULT__", default=None, help="Select canonical remote profile; optional translator/reviewer alias")
     parser.add_argument("--chapter-html-pattern", dest="chapter_html_pattern", required=False, default=None)
     parser.add_argument("--memory-dir", dest="memory_dir", required=False, default=None)
     parser.add_argument("--out-base", dest="out_base", required=False, default=None)
@@ -396,22 +680,21 @@ def _handle_book(argv: Sequence[str]) -> int:
     parser.add_argument("--preflight-json", action="store_true", default=False)
     parser.add_argument("--json", action="store_true", default=False)
     parser.add_argument("-h", "--help", action="store_true", default=False)
-    # Accept --managed-server forwarding? include for completeness
     parser.add_argument("--managed-server", action="store_true", default=False)
     parser.add_argument("--providers-config", required=False, default=None)
+    parser.add_argument("--media-book-id", dest="media_book_id", required=False, default=None)
+    parser.add_argument("--media-target", dest="media_target", required=False, default=None)
+    parser.add_argument("--media-root", dest="media_root", required=False, default=None)
 
     args, remaining = parser.parse_known_args(argv)
 
     if args.help:
-        # Curated extra plus delegated parser help — include both book and forwarded strict options
         print(_BOOK_HELP_EXTRA)
-        # Also print underlying book parser help for source-of-truth
         try:
             from pact_full_pipeline_runner_v1.v4_book_run import build_argparser as _book_parser
             _book_parser().print_help()
         except Exception:
             pass
-        # Forwarded strict operational options (topology/resume, audit/formatting, whole-chapter)
         try:
             from pact_full_pipeline_runner_v1.v4_phase12_strict_run import build_argparser as _strict_parser
             print("\n--- Forwarded strict per-chapter options (topology/resume, audit/formatting, whole-chapter) ---")
@@ -424,80 +707,284 @@ def _handle_book(argv: Sequence[str]) -> int:
     if args.json and not args.preflight and not args.preflight_json:
         _error_exit("--json requires --preflight (use --preflight --json or --preflight-json)")
 
-    # Require range and runtime profile
-    profile_path = args.runtime_config or args.profile
+    # Determine mode: simple (--local or --remote) vs advanced (--runtime-config)
+    is_simple_local = bool(args.local)
+    is_simple_remote = args.remote is not None
+    is_advanced = bool(args.runtime_config or args.profile)
+    # Mutual exclusivity
+    if is_simple_local and is_simple_remote:
+        _error_exit("--local and --remote are mutually exclusive")
+    if (is_simple_local or is_simple_remote) and is_advanced:
+        _error_exit("--local/--remote and --runtime-config are mutually exclusive (use simple or advanced, not both)")
+    if not (is_simple_local or is_simple_remote or is_advanced):
+        _error_exit("book mode requires --local or --remote [translator/reviewer] (simple) or --runtime-config FILE (advanced)")
     if not args.chapters:
-        _error_exit("--chapters START-END is required for book mode (e.g. --chapters 27-32)")
-    if not profile_path:
-        _error_exit("--runtime-config FILE is required for book mode")
-
-    # Parse range
+        _error_exit("--chapters N or N-M is required for book mode (e.g. --chapters 28 or --chapters 27-32)")
+    # Simple mode: --translator/--reviewer must not be combined with --remote alias pair (avoid ambiguity)
+    if (is_simple_remote or is_simple_local) and (args.translator or args.reviewer):
+        # Allow translator/reviewer as explicit overrides only if --remote not using alias pair? For simplicity, require they use --remote alias form or advanced mode
+        # But spec says simple remote may override via alias pair; separate --translator/--reviewer are advanced. Reject mixing.
+        _error_exit("--translator/--reviewer cannot be combined with --local/--remote; use --remote alias pair or advanced --runtime-config mode")
+    # Parse remote alias pair when simple remote
+    remote_translator = None
+    remote_reviewer = None
+    if is_simple_remote:
+        val = args.remote
+        if val == "__DEFAULT__" or val is None:
+            remote_translator = None
+            remote_reviewer = None
+        else:
+            # Expect bare aliases like musefree/luna
+            if "/" in val:
+                parts = val.split("/", 1)
+                remote_translator = parts[0].strip() if parts[0].strip() else None
+                remote_reviewer = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+            else:
+                remote_translator = val.strip() if val.strip() else None
+                remote_reviewer = None
+            # Validate aliases are simple (no path separators beyond one, alphanumeric/hyphen)
+            import re as _re
+            alias_re = _re.compile(r"^[A-Za-z0-9._-]+")
+            # Actually handled by provider registry; keep permissive here
+    # Parse range (single or range)
     try:
         start, end = parse_range(args.chapters)
     except ValueError as exc:
         _error_exit(str(exc))
-    chapter_ids = expand_range(start, end)
+    chapter_numbers = list(range(start, end + 1))
     label_range = range_label(start, end)
 
-    # Load profile and apply overrides
-    cfg_path = Path(profile_path)
+    # Resolve host layout
+    layout = _host_layout()
+    try:
+        _validate_layout(layout)
+    except Exception as exc:
+        _error_exit(str(exc))
+    is_simple = is_simple_local or is_simple_remote
+    # Determine memory_dir and output root for simple vs advanced
+    if is_simple:
+        memory_dir = Path(args.memory_dir) if args.memory_dir else layout["state"]
+        output_root = Path(args.out_base) if args.out_base else layout["output"]
+        # Check source/state collision (simple must not be same)
+        try:
+            _validate_layout({"source": layout["source"], "state": memory_dir, "output": output_root})
+        except Exception as exc:
+            _error_exit(str(exc))
+    else:
+        # Advanced: preserve historical defaults (do not enforce layout collision)
+        import os as _os_adv
+        memory_dir = Path(args.memory_dir) if args.memory_dir else (Path(_os_adv.environ["PACT_V4_STATE_ROOT"]) if _os_adv.environ.get("PACT_V4_STATE_ROOT") else Path("D:/pact/pact_chapters"))
+        output_root = None  # derived later from env or default
+
+    # Resolve chapter sources for simple mode; advanced keeps zero-padded IDs
+    discovered: dict[int, Path] = {}
+    chapter_ids: list[str] = []
+    chapter_html_pattern: str
+    if is_simple:
+        try:
+            discovered = _discover_chapter_sources(layout["source"], chapter_numbers)
+        except Exception as exc:
+            _error_exit(str(exc))
+        chapter_ids = [discovered[n].stem for n in chapter_numbers]
+        chapter_html_pattern = str(layout["source"] / "{chapter_id}.html")
+        if args.chapter_html_pattern:
+            chapter_html_pattern = args.chapter_html_pattern
+    else:
+        chapter_ids = expand_range(start, end)
+        chapter_html_pattern = args.chapter_html_pattern or "D:/pact/pact_chapters/{chapter_id}.html"
+
+    # Select runtime profile for simple mode
+    if is_simple_local:
+        # Canonical local profile
+        cfg_candidates = [
+            Path(__file__).resolve().parent.parent / "configs" / "runtime_local.example.yaml",
+            Path("configs/runtime_local.example.yaml"),
+        ]
+        cfg_path = next((p for p in cfg_candidates if p.is_file()), cfg_candidates[0])
+        # Simple local must not use managed-server (local_llama restriction)
+        if args.managed_server:
+            _error_exit("--managed-server not allowed with --local")
+        effective_managed = False
+        translator_override = None
+        reviewer_override = None
+        reasoning_override = args.reasoning
+    elif is_simple_remote:
+        cfg_candidates = [
+            Path(__file__).resolve().parent.parent / "configs" / "runtime_remote.example.yaml",
+            Path("configs/runtime_remote.example.yaml"),
+        ]
+        cfg_path = next((p for p in cfg_candidates if p.is_file()), cfg_candidates[0])
+        effective_managed = True  # simple remote defaults to managed-server
+        # Allow explicit --managed-server to be redundant, but not to disable
+        if args.managed_server:
+            effective_managed = True
+        translator_override = remote_translator
+        reviewer_override = remote_reviewer
+        reasoning_override = args.reasoning  # None -> profile default 3
+    else:
+        cfg_path = Path(args.runtime_config or args.profile)  # type: ignore[arg-type]
+        effective_managed = bool(args.managed_server)
+        translator_override = args.translator
+        reviewer_override = args.reviewer
+        reasoning_override = args.reasoning
+
     if not cfg_path.is_file():
         _error_exit(f"runtime profile not found: {cfg_path}")
     try:
         cfg = _load_runtime_config_file(cfg_path)
     except Exception as exc:
         _error_exit(f"invalid runtime profile {cfg_path}: {exc}")
-
     try:
-        cfg = _apply_overrides(cfg, args.translator, args.reviewer, args.reasoning, providers_config=args.providers_config)
-        cfg = _apply_managed(cfg, bool(args.managed_server))
+        cfg = _apply_overrides(cfg, translator_override, reviewer_override, reasoning_override, providers_config=args.providers_config)
+        cfg = _apply_managed(cfg, effective_managed)
     except Exception as exc:
         _error_exit(str(exc))
 
-    # Reasoning for preflight (resolve effective)
-    effective_reasoning: Optional[int] = args.reasoning
+    # Reasoning for preflight
+    effective_reasoning: Optional[int] = reasoning_override
     if effective_reasoning is None:
-        # Derive from cfg if profile bears reasoning
         try:
             from pact_v4.runtime.runtime_config import OpenCodeBackendConfig, LocalLlamaBackendConfig
             if isinstance(cfg, OpenCodeBackendConfig) and cfg.server.reasoning is not None:
                 effective_reasoning = int(cfg.server.reasoning)
             elif isinstance(cfg, LocalLlamaBackendConfig):
-                # Keep None -> preflight will treat as 0 baseline
                 effective_reasoning = None
         except Exception:
             pass
 
-    # Preflight (check-only or default gate) — uses effective cfg with managed-server applied
     from pact_v4.runtime.runtime_config import run_runtime_preflight
-    # Check-only modes — support --preflight, --preflight --json, --preflight-json, --preflight-json --json
     is_check_only = bool(args.preflight or args.preflight_json)
     is_json = bool(args.json or args.preflight_json)
+    # Determine output root early for preflight reporting
+    if is_simple:
+        _pre_out_root = Path(args.out_base) if args.out_base else output_root
+    else:
+        import os as _os_pre
+        _pre_out_root = Path(args.out_base) if args.out_base else (Path(_os_pre.environ.get("PACT_V4_OUT_ROOT")) if _os_pre.environ.get("PACT_V4_OUT_ROOT") else layout["output"])
+    out_root = _pre_out_root
+    # Build extended preflight report (runtime + book layout)
+    # First runtime preflight
+    runtime_report = run_runtime_preflight(cfg, reasoning=effective_reasoning if effective_reasoning is not None else None)
+    # Book layout checks
+    book_checks = []
+    book_errors = []
+    # Source discovery check
+    if is_simple:
+        try:
+            # Already discovered above; verify again for preflight report
+            for n in chapter_numbers:
+                p = discovered.get(n)
+                if p is None:
+                    book_errors.append(f"missing source for chapter {n:04d}")
+                    book_checks.append(type(runtime_report.checks[0])(name=f"source {n:04d}", ok=False, detail="missing"))
+                else:
+                    # Verify readable and regular
+                    if not p.is_file() or p.is_symlink():
+                        book_errors.append(f"source not regular: {p}")
+                        book_checks.append(type(runtime_report.checks[0])(name=f"source {n:04d}:{p.name}", ok=False, detail="not regular/symlink"))
+                    else:
+                        book_checks.append(type(runtime_report.checks[0])(name=f"source {n:04d}:{p.name}", ok=True, detail=str(layout["source"])))
+        except Exception as e:
+            book_errors.append(str(e))
+    else:
+        # Advanced: check pattern directory exists if possible (best effort, not fail if pattern is template)
+        try:
+            pat_dir = Path(chapter_html_pattern).parent
+            if pat_dir.exists() and pat_dir.is_symlink():
+                book_errors.append(f"pattern dir is symlink: {pat_dir}")
+        except Exception:
+            pass
+    # State/output readiness (without creation) — check existing dir OR writable existing ancestor
+    import os as _os_state
+    def _ready_or_ancestor_writable(p: Path, label: str):
+        _check_no_symlink_chain(p)
+        if p.exists():
+            if p.is_symlink():
+                raise ValueError(f"{label} path is symlink: {p}")
+            if not p.is_dir():
+                raise ValueError(f"{label} path not a directory: {p}")
+            if not _os_state.access(p, _os_state.W_OK):
+                raise ValueError(f"{label} path not writable: {p}")
+            return f"ready ({label} exists)"
+        # p does not exist — find writable existing ancestor without creating
+        cur = p.parent
+        while True:
+            if cur.exists():
+                if cur.is_symlink():
+                    raise ValueError(f"{label} ancestor is symlink: {cur}")
+                if not cur.is_dir():
+                    raise ValueError(f"{label} ancestor not a directory: {cur}")
+                if not _os_state.access(cur, _os_state.W_OK):
+                    raise ValueError(f"{label} ancestor not writable: {cur}")
+                return f"ready (writable ancestor {cur})"
+            if cur == cur.parent:  # reached filesystem root with no existing ancestor
+                raise ValueError(f"{label} path has no existing writable ancestor: {p}")
+            cur = cur.parent
+    try:
+        detail = _ready_or_ancestor_writable(memory_dir, "state")
+        book_checks.append(type(runtime_report.checks[0])(name=f"state {memory_dir}", ok=True, detail=detail))
+    except Exception as e:
+        book_errors.append(str(e))
+        book_checks.append(type(runtime_report.checks[0])(name=f"state {memory_dir}", ok=False, detail=str(e)))
+    try:
+        detail = _ready_or_ancestor_writable(out_root, "output")
+        book_checks.append(type(runtime_report.checks[0])(name=f"output {out_root}", ok=True, detail=detail))
+    except Exception as e:
+        book_errors.append(str(e))
+        book_checks.append(type(runtime_report.checks[0])(name=f"output {out_root}", ok=False, detail=str(e)))
+    # Layout collision already validated
+    # Combine reports
+    from pact_v4.runtime.runtime_config import PreflightReport
+    combined_ok = runtime_report.ok and not book_errors
+    combined_checks = tuple(list(runtime_report.checks) + book_checks)
+    combined_errors = tuple(list(runtime_report.errors) + book_errors)
+    report = PreflightReport(
+        ok=combined_ok,
+        kind=runtime_report.kind,
+        identity_hash=runtime_report.identity_hash,
+        public_record=runtime_report.public_record,
+        model_bindings=runtime_report.model_bindings,
+        effective_options=runtime_report.effective_options,
+        checks=combined_checks,
+        errors=combined_errors,
+    )
+    # For simple mode, enrich human output with layout info
+    def _format_with_layout(rep):
+        base = rep.format_human()
+        extra = f"\\n  source: {layout['source']}\\n  state: {memory_dir}\\n  outputs: {out_root}"
+        if is_simple and discovered:
+            extra += "\\n  chapters: " + ", ".join(discovered[n].name for n in chapter_numbers)
+        return base + extra
     if is_check_only:
-        report = run_runtime_preflight(cfg, reasoning=effective_reasoning if effective_reasoning is not None else None)
         if is_json:
-            print(report.to_json())
+            # Enrich JSON with layout
+            j = report.to_dict()
+            j["layout"] = {"source": str(layout["source"]), "state": str(memory_dir), "output": str(out_root)}
+            if is_simple:
+                j["resolved_chapters"] = {f"{n:04d}": discovered[n].name for n in chapter_numbers if n in discovered}
+            import json as _j
+            print(_j.dumps(j, ensure_ascii=False, indent=2, sort_keys=True))
         else:
-            print(report.format_human())
+            print(_format_with_layout(report))
         return 0 if report.ok else 1
-
-    # Default preflight gate — before any output dir creation
-    report = run_runtime_preflight(cfg, reasoning=effective_reasoning if effective_reasoning is not None else None)
     if not report.ok:
-        # Emit report to stderr and fail
-        print(report.format_human(), file=sys.stderr)
+        print(_format_with_layout(report), file=sys.stderr)
         _error_exit(f"offline preflight failed — refusing to start book run (see report above)", code=3)
 
-    # Derive label after overrides and preflight success
     try:
         label = _derive_label(cfg)
     except Exception as exc:
         _error_exit(f"cannot derive local/remote label from runtime descriptor: {exc}")
-
     if label not in ("local", "remote"):
         _error_exit(f"unknown runtime descriptor label {label!r}; expected local or remote")
 
-    # Automatic output directory — collision-safe
+    # Re-validate final output before creation (covers custom --out-base bypass)
+    try:
+        _final_out = Path(args.out_base) if args.out_base else out_root
+        _validate_layout({"source": layout["source"], "state": memory_dir, "output": _final_out})
+    except Exception as exc:
+        _error_exit(str(exc))
+    # Automatic output directory — collision-safe (use out_root)
     if args.out_base:
         out_base = Path(args.out_base)
         try:
@@ -506,16 +993,12 @@ def _handle_book(argv: Sequence[str]) -> int:
             _error_exit(f"cannot create output directory {out_base}: {exc}")
     else:
         import os
-        root_env = os.environ.get("PACT_V4_OUT_ROOT")
-        root = Path(root_env) if root_env else _DEFAULT_OUT_ROOT
+        # Use layout output root unless env overrides
+        root = out_root
         try:
             out_base = _allocate_book_out_dir(root, label_range, label)
         except Exception as exc:
             _error_exit(f"cannot create output directory {root}: {exc}")
-
-    # Defaults for forwarded required args
-    chapter_html_pattern = args.chapter_html_pattern or "D:/pact/pact_chapters/{chapter_id}.html"
-    memory_dir = args.memory_dir or "D:/pact/pact_chapters"
 
     # Build delegated argv for v4_book_run.main
     delegated: list[str] = []
@@ -523,24 +1006,55 @@ def _handle_book(argv: Sequence[str]) -> int:
     delegated += ["--chapter-html-pattern", chapter_html_pattern]
     delegated += ["--memory-dir", str(memory_dir)]
     delegated += ["--out-base", str(out_base)]
-    # Forward profile and overrides as extra_args (book_run forwards to strict per chapter)
     delegated += ["--runtime-config", str(cfg_path)]
-    if args.translator:
-        delegated += ["--translator", args.translator]
-    if args.reviewer:
-        delegated += ["--reviewer", args.reviewer]
-    if args.reasoning is not None:
-        delegated += ["--reasoning", str(args.reasoning)]
-    # --markup preserve is consumed as a guard; do not forward unsupported syntax
-    if args.managed_server:
+    # Translator/reviewer for simple remote
+    if is_simple_remote:
+        if remote_translator:
+            delegated += ["--translator", remote_translator]
+        if remote_reviewer:
+            delegated += ["--reviewer", remote_reviewer]
+        if reasoning_override is not None:
+            delegated += ["--reasoning", str(reasoning_override)]
+    else:
+        if args.translator:
+            delegated += ["--translator", args.translator]
+        if args.reviewer:
+            delegated += ["--reviewer", args.reviewer]
+        if args.reasoning is not None:
+            delegated += ["--reasoning", str(args.reasoning)]
+    if effective_managed:
         delegated += ["--managed-server"]
     if args.providers_config:
         delegated += ["--providers-config", str(args.providers_config)]
-    # Forward remaining unknown args (e.g. --whole-chapter, --skip-audit, etc.)
+    # Whole-chapter default for every book mode
+    if "--whole-chapter" not in delegated and "--whole_chapter" not in delegated:
+        delegated += ["--whole-chapter"]
+    # Media sync defaults for every simple book mode — thread trusted execution host
+    execution_host = _detect_execution_host()
+    if is_simple:
+        media_book_id = args.media_book_id or _DEFAULT_MEDIA_BOOK_ID
+        media_target = args.media_target or _DEFAULT_MEDIA_TARGET
+        media_root = args.media_root or _DEFAULT_MEDIA_ROOT
+        delegated += ["--media-book-id", media_book_id]
+        delegated += ["--media-target", media_target]
+        delegated += ["--media-root", media_root]
+        delegated += ["--media-exec-host", execution_host]
+    else:
+        # Advanced: forward explicit media flags if supplied
+        if args.media_book_id:
+            delegated += ["--media-book-id", args.media_book_id]
+        if args.media_target:
+            delegated += ["--media-target", args.media_target]
+        if args.media_root:
+            delegated += ["--media-root", args.media_root]
+        if args.media_book_id is not None:
+            # Thread trusted host for any media-synced advanced run too
+            delegated += ["--media-exec-host", execution_host]
+    if args.providers_config:
+        pass  # already added
     delegated += list(remaining)
 
-    # Log sanitized preflight summary for auditability (before pipeline)
-    print(report.format_human())
+    print(_format_with_layout(report))
 
     from pact_full_pipeline_runner_v1.v4_book_run import main as book_main
     return int(book_main(delegated))

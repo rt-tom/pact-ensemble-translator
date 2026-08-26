@@ -22,14 +22,15 @@ structured_output_mode: prompt_only
 timeout_seconds: 900
 remote_budget:
   max_requests_per_chapter: 500
-reasoning: 0
+reasoning: 3
 model_bindings:
-  generator: opencode-go/deepseek-v4-flash
-  fidelity_reviewer: opencode-go/qwen3.7-plus
-  russian_selector: opencode-go/qwen3.7-plus
-  qwen_audit: opencode-go/qwen3.7-plus
+  generator: opencode/muse-spark-1.2-contributor-free
+  fidelity_reviewer: openai/gpt-5.6-luna
+  russian_selector: openai/gpt-5.6-luna
+  qwen_audit: openai/gpt-5.6-luna
+  entity_extractor: openai/gpt-5.6-luna
   gemma_audit: opencode-go/deepseek-v4-flash
-  repair: opencode-go/deepseek-v4-flash
+  repair: opencode/muse-spark-1.2-contributor-free
 reasoning_effort_map:
   1: low
   2: medium

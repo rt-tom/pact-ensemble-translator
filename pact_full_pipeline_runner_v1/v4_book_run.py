@@ -914,6 +914,23 @@ def _strip_book_memory_observation_fields(memory_dir: Path) -> None:
         atomic_write(str(path), data)
 
 
+def _detect_execution_host() -> str:
+    """Trusted execution host: where this process runs (media vs rt).
+
+    Uses explicit env PACT_V4_HOST / PACT_EXEC_HOST first, then platform.
+    This is the trusted signal the launcher threads to the transport decision
+    so RT never silently uses the local facade even if its Linux path exists.
+    """
+    import os as _os
+    import sys as _sys
+    env = _os.environ.get("PACT_V4_HOST") or _os.environ.get("PACT_EXEC_HOST")
+    if env in ("rt", "media"):
+        return env
+    if _sys.platform == "win32":
+        return "rt"
+    return "media"
+
+
 def run_book(
     *,
     memory_dir: Path,
@@ -936,11 +953,13 @@ def run_book(
     media_root: str = "/home/rt/pact_runs",
     media_target: str = "media",
     media_max_retries: int = 1,
+    media_exec_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
         from pact_v4.snapshot.run_hooks import pre_init_fetch
-        pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root)
+        _exec_host = media_exec_host if media_exec_host is not None else _detect_execution_host()
+        pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root, execution_host=_exec_host)
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
     manager = MemoryManager(str(memory_dir))
@@ -1406,6 +1425,7 @@ def run_book(
         if media_book_id is not None and promoted:
             from pact_v4.snapshot.run_hooks import post_promote_push
             try:
+                _exec_host2 = media_exec_host if media_exec_host is not None else _detect_execution_host()
                 media_confirmation = post_promote_push(
                     media_book_id,
                     memory_dir,
@@ -1413,6 +1433,7 @@ def run_book(
                     ssh_target=media_target,
                     root=media_root,
                     max_retries=media_max_retries,
+                    execution_host=_exec_host2,
                 )
             except Exception as e:
                 # Preserve local state, report error, do not crash run
@@ -1550,6 +1571,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--media-book-id", type=str, default=None, help="Media sync: book-id for RT<->media state sync (requires media SSH)")
     parser.add_argument("--media-root", type=str, default="/home/rt/pact_runs", help="Media store root")
     parser.add_argument("--media-target", type=str, default="media", help="SSH target for media (default 'media')")
+    parser.add_argument("--media-exec-host", type=str, default=None, choices=["media", "rt"], help="Trusted execution host for media sync (media vs rt); auto-detected from platform/env when omitted")
     return parser
 
 
@@ -1580,6 +1602,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         media_book_id=args.media_book_id,
         media_root=args.media_root,
         media_target=args.media_target,
+        media_exec_host=args.media_exec_host,
     )
     failed = 0
     for rec in result["chapters"]:
@@ -1601,15 +1624,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if status not in ("complete", "accepted_degraded"):
             failed += 1
-    # Fail-closed media sync: if run was configured for media sync, any
-    # promoted chapter with media_error or missing media_confirmation is a
-    # failure (local state already preserved/recorded, but no confirmation).
+    # Fail-closed media sync + final cross-host publication verdict
     media_failed = 0
     if args.media_book_id is not None:
-        for rec in result["chapters"]:
-            if rec.get("promoted"):
-                if rec.get("media_error") or not rec.get("media_confirmation"):
-                    media_failed += 1
+        promoted = [r for r in result["chapters"] if r.get("promoted")]
+        if promoted:
+            accepted = []
+            rejected = []
+            for rec in promoted:
+                if rec.get("media_error"):
+                    rejected.append((rec["chapter_id"], str(rec["media_error"])[:500]))
+                elif not rec.get("media_confirmation"):
+                    rejected.append((rec["chapter_id"], "missing confirmation"))
+                else:
+                    conf = rec["media_confirmation"]
+                    if conf.get("status") != "ACCEPTED":
+                        reason = conf.get("reason") or conf.get("message") or json.dumps(conf)[:500]
+                        rejected.append((rec["chapter_id"], str(reason)[:500]))
+                    else:
+                        rev = conf.get("revision_id") or conf.get("revision") or "unknown"
+                        accepted.append((rec["chapter_id"], str(rev)))
+            # Machine-readable: patch book_run.json with global media_publish verdict
+            try:
+                _br_path = Path(args.out_base) / "book_run.json"
+                if _br_path.is_file():
+                    _br_data = json.loads(_br_path.read_text(encoding="utf-8"))
+                    if rejected:
+                        _br_data["media_publish"] = {
+                            "status": "REJECTED",
+                            "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted],
+                            "rejected": [{"chapter_id": cid, "reason": msg} for cid, msg in rejected],
+                        }
+                    else:
+                        _br_data["media_publish"] = {
+                            "status": "ACCEPTED",
+                            "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted],
+                            "rejected": [],
+                        }
+                    _br_path.write_text(json.dumps(_br_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            if rejected:
+                media_failed = len(rejected)
+                details = "; ".join(f"{cid}: {msg}" for cid, msg in rejected)
+                if accepted:
+                    details += "; accepted: " + ", ".join(f"{cid}={rev}" for cid, rev in accepted)
+                # Human-readable final verdict (required)
+                print(f"MEDIA PUBLISH: REJECTED {details}")
+                # Machine-readable final verdict (required)
+                print(json.dumps({"media_publish": {"status": "REJECTED", "rejected": [{"chapter_id": cid, "reason": msg} for cid, msg in rejected], "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted]}}, ensure_ascii=False))
+            else:
+                details = ", ".join(f"{cid}={rev}" for cid, rev in accepted)
+                print(f"MEDIA PUBLISH: ACCEPTED revision={details}")
+                print(json.dumps({"media_publish": {"status": "ACCEPTED", "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted], "rejected": []}}, ensure_ascii=False))
     if failed:
         print(
             f"\n{failed} chapter(s) did not reach complete/accepted_degraded. "

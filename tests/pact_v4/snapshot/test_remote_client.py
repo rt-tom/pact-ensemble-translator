@@ -198,3 +198,223 @@ def test_no_network_import_in_store_package():
         assert "ssh" not in lowered or fname in ("remote_client.py", "remote_facade.py"), f"ssh found in {fname}"
         # Ensure subprocess ssh not in store
         assert "subprocess" not in content or "ssh" not in lowered, f"subprocess ssh in {fname}"
+
+
+def test_no_duplicate_state_mirror(tmp_path=None):
+    # fetch_current via _extract_fetch_tar must NOT create state/ subdir mirror
+    import io, tarfile, json
+    dest = Path(tempfile.mkdtemp())
+    try:
+        # Build a minimal valid fetch tar
+        bio = io.BytesIO()
+        with tarfile.open(fileobj=bio, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name, obj in [("CURRENT.json", {"revision_id": "rev-0001"}), ("manifest.json", {"schema_version": "1.0.0"})]:
+                data = (json.dumps(obj) + "\n").encode()
+                ti = tarfile.TarInfo(name=name); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                tar.addfile(ti, io.BytesIO(data))
+            for fname in CANONICAL:
+                data = json.dumps({"seed": fname}).encode()
+                ti = tarfile.TarInfo(name=f"state/{fname}"); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                tar.addfile(ti, io.BytesIO(data))
+        tar_bytes = bio.getvalue()
+        cur = remote_client._extract_fetch_tar(tar_bytes, dest)
+        assert cur["revision_id"] == "rev-0001"
+        # Flat files must exist
+        for fname in CANONICAL:
+            assert (dest / fname).is_file()
+        # No state/ mirror
+        assert not (dest / "state").exists(), "duplicate state/ mirror must not be created"
+        # Via FakeTransport path as well
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _seed_store(tmp)
+            transport = FakeTransport(tmp)
+            with tempfile.TemporaryDirectory() as dest2:
+                transport.fetch_current(BOOK_ID, Path(dest2))
+                assert not (Path(dest2) / "state").exists()
+                for fname in CANONICAL:
+                    assert (Path(dest2) / fname).is_file()
+    finally:
+        import shutil; shutil.rmtree(str(dest), ignore_errors=True)
+
+
+def test_local_facade_no_self_ssh(tmp_path=None):
+    # Real predicate must select local facade ONLY when execution_host == "media" (trusted),
+    # regardless of local path existence, and NOT when execution_host == "rt".
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as dest:
+        dest_p = Path(dest)
+        # Trusted host signal: media uses local, rt never does (even if path exists)
+        assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host="media") is True
+        assert remote_client._should_use_local_facade("media", "/home/rt/pact_runs", execution_host="media") is True
+        assert remote_client._should_use_local_facade("other-host", "/home/rt/pact_runs", execution_host="media") is False
+        assert remote_client._should_use_local_facade("media-snap", "/tmp/other_root", execution_host="media") is False
+        assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host="rt") is False
+        assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host=None) is False
+        # fetch_current on media host must use local facade and NOT call subprocess.run
+        with patch("pact_v4.snapshot.remote_client._local_fetch_current", return_value={"revision_id": "rev-0001"}) as mock_local:
+            with patch("subprocess.run") as mock_run:
+                result = remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root="/home/rt/pact_runs", execution_host="media")
+                assert result == {"revision_id": "rev-0001"}
+                assert mock_local.called
+                assert not mock_run.called
+
+
+def test_local_facade_rt_stays_on_ssh_when_path_exists(tmp_path=None):
+    # RT must ALWAYS use SSH even when /home/rt/pact_runs is locally available (fail-closed).
+    from unittest.mock import patch, MagicMock
+    import subprocess as _subprocess
+    with tempfile.TemporaryDirectory() as dest:
+        dest_p = Path(dest)
+        # Even with Path.exists/is_dir mocked to True, RT host signal keeps SSH path
+        with patch.object(remote_client.Path, "is_dir", return_value=True):
+            with patch.object(remote_client.Path, "exists", return_value=True):
+                assert remote_client._should_use_local_facade("media-snap", "/home/rt/pact_runs", execution_host="rt") is False
+        # fetch_current on RT must invoke subprocess.run (SSH) and NOT local facade,
+        # even when canonical path appears locally available.
+        with patch.object(remote_client.Path, "is_dir", return_value=True):
+            with patch.object(remote_client.Path, "exists", return_value=True):
+                with patch("pact_v4.snapshot.remote_client._local_fetch_current") as mock_local:
+                    # Need _extract_fetch_tar to succeed, so mock subprocess.run to return valid tar
+                    import io, tarfile, json as _json
+                    bio = io.BytesIO()
+                    with tarfile.open(fileobj=bio, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                        for name, obj in [("CURRENT.json", {"revision_id": "rev-0001"}), ("manifest.json", {"schema_version": "1.0.0"})]:
+                            data = (_json.dumps(obj) + "\n").encode()
+                            ti = tarfile.TarInfo(name=name); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                            tar.addfile(ti, io.BytesIO(data))
+                        for fname in CANONICAL:
+                            data = _json.dumps({"seed": fname}).encode()
+                            ti = tarfile.TarInfo(name=f"state/{fname}"); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                            tar.addfile(ti, io.BytesIO(data))
+                    tar_bytes = bio.getvalue()
+                    mock_proc = MagicMock(returncode=0, stdout=tar_bytes, stderr=b"")
+                    with patch("subprocess.run", return_value=mock_proc) as mock_run:
+                        result = remote_client.fetch_current(BOOK_ID, dest_p, ssh_target="media-snap", root="/home/rt/pact_runs", execution_host="rt")
+                        assert result["revision_id"] == "rev-0001"
+                        assert not mock_local.called
+                        assert mock_run.called
+                        # Verify SSH target is media-snap
+                        called_cmd = mock_run.call_args[0][0]
+                        assert "media-snap" in called_cmd
+
+
+def test_fetch_tar_negative_matrix():
+    import io, tarfile, json
+    def _build(names):
+        bio = io.BytesIO()
+        with tarfile.open(fileobj=bio, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name in names:
+                data = b"{}"
+                if name in ("CURRENT.json", "manifest.json"):
+                    data = (json.dumps({"x": 1}) + "\n").encode()
+                elif name.startswith("state/"):
+                    data = json.dumps({"seed": name}).encode()
+                else:
+                    data = b"extra"
+                ti = tarfile.TarInfo(name=name); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                tar.addfile(ti, io.BytesIO(data))
+        return bio.getvalue()
+    dest = Path(tempfile.mkdtemp())
+    try:
+        # Missing file
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            missing = _build(["CURRENT.json", "manifest.json"] + [f"state/{f}" for f in CANONICAL[:-1]])
+            try:
+                remote_client._extract_fetch_tar(missing, td_p)
+                assert False, "should reject missing file"
+            except RuntimeError as e:
+                assert "exactly" in str(e).lower()
+        # Extra top-level file
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            extra = _build(["CURRENT.json", "manifest.json", "extra.txt"] + [f"state/{f}" for f in CANONICAL])
+            try:
+                remote_client._extract_fetch_tar(extra, td_p)
+                assert False, "should reject extra file"
+            except RuntimeError as e:
+                assert "exactly" in str(e).lower()
+        # Symlink entry
+        import io as _io
+        bio = _io.BytesIO()
+        with tarfile.open(fileobj=bio, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name in ["CURRENT.json", "manifest.json"] + [f"state/{f}" for f in CANONICAL]:
+                data = (json.dumps({"x": 1}) + "\n").encode()
+                ti = tarfile.TarInfo(name=name); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                tar.addfile(ti, _io.BytesIO(data))
+            ti = tarfile.TarInfo(name="state/link"); ti.type = tarfile.SYMTYPE; ti.linkname = "book_memory.json"; ti.size=0; ti.mtime=0
+            tar.addfile(ti)
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                remote_client._extract_fetch_tar(bio.getvalue(), Path(td))
+                assert False, "should reject symlink"
+            except RuntimeError as e:
+                assert "symlink" in str(e).lower() or "exactly" in str(e).lower()
+        # FIFO entry is not easily constructed via tarfile without special type; simulate by setting type
+        bio2 = _io.BytesIO()
+        with tarfile.open(fileobj=bio2, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name in ["CURRENT.json", "manifest.json"] + [f"state/{f}" for f in CANONICAL]:
+                data = (json.dumps({"x": 1}) + "\n").encode()
+                ti = tarfile.TarInfo(name=name); ti.size=len(data); ti.mtime=0; ti.mode=0o644
+                tar.addfile(ti, _io.BytesIO(data))
+            ti = tarfile.TarInfo(name="state/fifo"); ti.type = tarfile.FIFOTYPE; ti.size=0; ti.mtime=0
+            tar.addfile(ti)
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                remote_client._extract_fetch_tar(bio2.getvalue(), Path(td))
+                assert False, "should reject special file"
+            except RuntimeError as e:
+                assert "special" in str(e).lower() or "exactly" in str(e).lower()
+    finally:
+        import shutil; shutil.rmtree(str(dest), ignore_errors=True)
+
+
+def test_validate_local_files_negative(tmp_path):
+    # Missing file
+    p = Path(tmp_path) / "ldir"
+    p.mkdir()
+    for fname in CANONICAL[:-1]:
+        _make_json_file(p / fname, {"a": 1})
+    try:
+        remote_client._validate_local_files(p)
+        assert False
+    except ValueError as e:
+        assert "missing or not regular" in str(e)
+    # Non-JSON
+    for fname in CANONICAL:
+        _make_json_file(p / fname, {"a": 1})
+    (p / CANONICAL[0]).write_text("not json", encoding="utf-8")
+    try:
+        remote_client._validate_local_files(p)
+        assert False
+    except ValueError as e:
+        assert "not valid JSON" in str(e)
+    # Symlink
+    (p / CANONICAL[0]).unlink()
+    _make_json_file(p / CANONICAL[0], {"a": 1})
+    link = p / CANONICAL[1]
+    link.unlink()
+    target = p / "real.json"
+    _make_json_file(target, {"a": 1})
+    try:
+        link.symlink_to(target)
+        try:
+            remote_client._validate_local_files(p)
+            assert False
+        except ValueError as e:
+            assert "symlink" in str(e).lower()
+    except OSError:
+        pass
+    # FIFO
+    try:
+        import os
+        fifo_path = p / CANONICAL[2]
+        fifo_path.unlink(missing_ok=True)
+        os.mkfifo(fifo_path)
+        try:
+            remote_client._validate_local_files(p)
+            assert False
+        except ValueError:
+            pass
+    except OSError:
+        pass

@@ -1547,21 +1547,28 @@ def apply_provider_flags(
     change invalidates cache/resume.
     """
     role_models: Dict[str, str] = {}
+    translator_model = None
+    reviewer_model = None
     if translator:
-        model = registry.resolve(translator)
+        if "/" in translator:
+            translator_model = registry.resolve(translator)
+        else:
+            translator_model = registry.resolve_bare(translator)
         for role in TRANSLATOR_ROLES:
-            role_models[role] = model.ref
+            role_models[role] = translator_model.ref
     if reviewer:
-        model = registry.resolve(reviewer)
+        if "/" in reviewer:
+            reviewer_model = registry.resolve(reviewer)
+        else:
+            reviewer_model = registry.resolve_bare(reviewer)
         for role in REVIEWER_ROLES:
-            role_models[role] = model.ref
+            role_models[role] = reviewer_model.ref
     if not role_models:
         return cfg
     cfg = apply_role_models(cfg, role_models)
-    if translator:
-        model = registry.resolve(translator)
+    if translator_model is not None:
         cfg = _set_generator_reasoning_effort_map(
-            cfg, build_reasoning_effort_map(model)
+            cfg, build_reasoning_effort_map(translator_model)
         )
     return cfg
 

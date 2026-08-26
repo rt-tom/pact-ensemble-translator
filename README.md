@@ -24,44 +24,61 @@ Pipeline and runtime:
 - `configs/providers.yaml` — provider/model registry for `--translator`/`--reviewer` aliases (case-insensitive, fail-closed on duplicates)
 - `pact_v4/pipeline/phase_progress.py` — progress reporting (see `docs/plans/V4_PHASE12_RUN_PROGRESS_TRACKER_TASK_RU.md`)
 
-## v4 run command (unified dispatcher, book-first)
+## v4 run command (unified dispatcher, book-first, host-aware)
 
 The supported launch surface is the thin dispatcher `pact_full_pipeline_runner_v1.v4_run` with primary `book`
 and retained `chapter` modes. It forwards to the existing strict/book entrypoints without changing pipeline semantics.
+Simple book mode is host-aware (RT vs media) with deterministic source discovery; advanced `--runtime-config` remains for compatibility.
 
 ```powershell
-# Book — chapters 27-32 on a local profile (automatic output D:\pact\gate_bench_runs/book_0027-0032_local_<timestamp>)
-python -m pact_full_pipeline_runner_v1.v4_run book --chapters 27-32 --runtime-config configs/runtime_local.example.yaml
+# Simple — single chapter 28, local runtime (whole-chapter enabled, media sync book 1)
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28 --local
 
-# Book — remote profile, explicit model aliases and reasoning override
-python -m pact_full_pipeline_runner_v1.v4_run book --chapters 27-32 --runtime-config configs/runtime_remote.example.yaml --translator opencode-go/musefree --reviewer openai/luna --reasoning 2
+# Simple — chapters 28-32, remote runtime defaults (Muse Free translator/repair + Luna reviewer, reasoning 3, managed server)
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28-32 --remote
 
-# Book — explicit markup (preserve only; the existing preservation/normalization policy)
+# Simple — remote with explicit bare aliases (translator/reviewer)
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28 --remote musefree/luna
+
+# Simple — remote on another book (override media book id)
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28 --remote --media-book-id 2
+
+# Advanced — explicit runtime profile (compatibility)
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 27-32 --runtime-config configs/runtime_remote.example.yaml --translator opencode-go/musefree --reviewer openai/luna --reasoning 3
+
+# Advanced — explicit markup (preserve only)
 python -m pact_full_pipeline_runner_v1.v4_run book --chapters 27-32 --runtime-config configs/runtime_local.example.yaml --markup preserve
 
-# Chapter — single chapter, no-config local compatibility (no profile) or with profile
-python -m pact_full_pipeline_runner_v1.v4_run chapter --chapter-id 0001 --chapter-html D:/pact/pact_chapters/0001.html --memory-dir D:/pact/pact_chapters --out-dir D:/pact/gate_bench_runs/chapter_0001
-python -m pact_full_pipeline_runner_v1.v4_run chapter --chapter-id 0001 --chapter-html D:/pact/pact_chapters/0001.html --memory-dir D:/pact/pact_chapters --out-dir D:/pact/gate_bench_runs/chapter_0001 --runtime-config configs/runtime_remote.example.yaml
+# Chapter — single strict chapter (retained)
+python -m pact_full_pipeline_runner_v1.v4_run chapter --chapter-id 0001 --chapter-html D:/pact/pact_chapters/0001_bonds-1-1.html --memory-dir D:/pact/book_state --out-dir D:/pact/gate_bench_runs/chapter_0001
 ```
 
+Host-aware layout:
+- RT: source `D:/pact/pact_chapters` (read-only, owner-managed mirror), mutable state `D:/pact/book_state`, outputs `D:/pact/gate_bench_runs`
+- media: source `/home/rt/pact_chapters` (canonical 150 HTML), state `/home/rt/pact_runs/workers/media/book-1/state`, outputs `/home/rt/pact_runs/outputs`
+- Canonical media snapshot storage (`/home/rt/pact_runs/books/1`) is never used as mutable state. Source and state roots must not be the same directory.
+
+Source naming: each numeric chapter `N` must match exactly one regular non-symlink file `NNNN_*.html` in the host source root (e.g., `0149_judgment-16-13.html`). Zero, multiple, symlink, FIFO/socket/device, or unreadable matches fail before pipeline startup. Use `NNNN_*.html` discovery, not fabricated `NNNN.html`.
+
 Runtime profile defaults: the selected profile supplies default role models, reasoning, transport, and
-identity-bearing policy. Omitted `--translator`/`--reviewer`/`--reasoning` use profile values; explicit values
-are validated against the runtime/provider contract, are identity-bearing, and alias selection is
-case-insensitive and fail-closed.
+identity-bearing policy. Remote canonical defaults are Muse Free generator/repair (`opencode/muse-spark-1.2-contributor-free`), Luna standard reviewer roles (`openai/gpt-5.6-luna`), reasoning 3, managed server, and whole-chapter for every book run. Omitted `--translator`/`--reviewer`/`--reasoning` use profile values; explicit values are validated against the runtime/provider contract, are identity-bearing, and bare alias selection is globally unique and fail-closed.
+
+Media prerequisites: every simple book run (local or remote, RT or media) fetches current media state before `MemoryManager` init and publishes accepted updates afterward. Defaults are book `1`, target `media-snap`, root `/home/rt/pact_runs`. On media the local restricted facade is used (no self-SSH). A final `MEDIA PUBLISH: ACCEPTED` or `REJECTED` verdict is printed; rejection is non-zero and preserves local diagnostics. SSH `media-snap` must be a restricted facade key (see Book-state snapshot handoff below). Use `ssh media-snap pact-snapshot ...` only via the dispatcher; never direct shared writes.
 
 Offline preflight (host-local, no network/model/source/artifact side effects) runs by default before every
 configured execution and before any output directory is created:
 ```powershell
-python -m pact_full_pipeline_runner_v1.v4_run book --chapters 27-32 --runtime-config configs/runtime_remote.example.yaml --preflight
-python -m pact_full_pipeline_runner_v1.v4_run book --chapters 27-32 --runtime-config configs/runtime_remote.example.yaml --preflight --json
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28 --local --preflight
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 28 --remote --preflight --json
 # alias: --preflight-json
 ```
-Check-only modes report the sanitized resolved profile, model bindings, effective policy, topology, and
-identity and exit without starting the pipeline or creating artifacts.
+Check-only modes report the sanitized resolved profile, model bindings, effective policy, topology, identity, selected host layout, resolved chapter file names, and exit without starting the pipeline or creating artifacts. Source/state/output readiness is validated without network or state-sync side effects.
 
-Output naming: a distinct subdirectory below `D:\pact\gate_bench_runs` is created automatically,
-named `book_0027-0032_local_<timestamp>` or `book_0027-0032_remote_<timestamp>` — the `local|remote` label
+Output naming: a distinct subdirectory below the host output root is created automatically,
+named `book_0028_local_<timestamp>` or `book_0027-0032_remote_<timestamp>` — the `local|remote` label
 is derived from the resolved runtime descriptor after profile defaults and explicit overrides.
+
+Whole-chapter and managed-server: `--whole-chapter` is injected for every book run; `--managed-server` is injected for every simple remote run. Explicit incompatible topology flags fail rather than silently override.
 
 Help is offline-only (no pipeline/model/artifact side effects):
 ```powershell
@@ -69,6 +86,8 @@ python -m pact_full_pipeline_runner_v1.v4_run --help
 python -m pact_full_pipeline_runner_v1.v4_run book --help
 python -m pact_full_pipeline_runner_v1.v4_run chapter --help
 ```
+
+No live pipeline, provider, SSH/key/server, or source download is performed by the dispatcher or preflight. Deployment is only `git pull --ff-only` on RT; rollback selects the advanced explicit invocation.
 
 Historical `run_full_pipeline*.ps1` / v3 launchers are not supported v4 commands.
 
