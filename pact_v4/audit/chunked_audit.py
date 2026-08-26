@@ -18,7 +18,7 @@ logic:
   ``GOOD_RETRIED`` (the harness bug where ``$pending`` was not cleared on
   success — false ``FAILED_RETRIED`` — is fixed here);
 * fail-closed strict JSON validation: categories
-  ``omission/addition/referent/invented_gender/changed_fact/negation``,
+  ``omission/addition/referent/invented_gender/changed_fact/negation/voice_continuity/seam/dialogue_translationese/ambiguity_flattening``,
   severity ``major/minor``, confidence ``high/medium/low``, ``id`` must be a
   PID of the CURRENT chunk; a failed chunk is never silently read as
   ``issues=[]`` — ``audit_complete`` is false whenever any chunk failed;
@@ -80,13 +80,14 @@ LOG = logging.getLogger(__name__)
 
 AUDIT_V4_CATEGORIES = frozenset({
     "omission", "addition", "referent", "invented_gender", "changed_fact", "negation",
+    "voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening",
 })
 AUDIT_V4_SEVERITIES = frozenset({"major", "minor"})
 AUDIT_V4_CONFIDENCES = frozenset({"high", "medium", "low"})
 
 SCHEMA = "pact-audit/v4"
 HARNESS_VERSION = "4.1"
-PROMPT_VERSION = "pact-v4-reviewer-qwen-audit/v4.2-lenses"
+PROMPT_VERSION = "pact-v4-reviewer-qwen-audit/v4.3-lenses"
 
 DEFAULT_MAX_INPUT_TOKENS = 3600   # reasoning_budget/2 x 0.88 (12% reserve)
 DEFAULT_MAX_TOKENS = 12000        # reasoning (8192) + ~3500 content headroom

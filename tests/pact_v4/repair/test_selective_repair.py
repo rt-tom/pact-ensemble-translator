@@ -3291,3 +3291,28 @@ def test_repair_prompt_dialogue_marker_rule_present():
     instructions = REPAIR_AS_VERIFIER_V1.instructions
     assert "DIALOGUE MARKER RULE" in instructions
     assert "em-dash dialogue marker" in instructions
+
+def test_new_literary_category_high_medium_eligible_low_ineligible():
+    """v41: new categories high/medium -> tier-B eligible; low -> ineligible."""
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        eligible, _, ineligible = select_eligible([_issue_with(f"p_{cat}_high", category=cat, confidence="high", _verdict=TIER_B)])
+        assert len(eligible) == 1 and eligible[0].category == cat
+        eligible, _, _ = select_eligible([_issue_with(f"p_{cat}_med", category=cat, confidence="medium", _verdict=TIER_B)])
+        assert len(eligible) == 1
+        eligible, _, ineligible = select_eligible([_issue_with(f"p_{cat}_low", category=cat, confidence="low", _verdict=TIER_B)])
+        assert not eligible and len(ineligible) == 1
+
+def test_render_finding_block_renders_new_category():
+    from pact_v4.runtime.prompts_runtime import render_selective_repair_prompt, DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY
+    source = {f"p{i:05d}": f"source {i}" for i in range(1, 10)}
+    translation = {f"p{i:05d}": f"перевод {i}" for i in range(1, 10)}
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        findings = [_issue_with("p00005", category=cat, confidence="high", _verdict=TIER_B)]
+        eligible, _, _ = select_eligible(findings)
+        prompt = render_selective_repair_prompt(chapter_id="0001", source=source, translation=translation, findings=eligible)
+        assert cat in prompt
+    # repair context windows: voice_continuity:10 seam:10 others 3
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY["voice_continuity"] == 10
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY["seam"] == 10
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY["dialogue_translationese"] == 3
+    assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY["ambiguity_flattening"] == 3

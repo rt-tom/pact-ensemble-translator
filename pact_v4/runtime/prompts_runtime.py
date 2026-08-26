@@ -145,7 +145,7 @@ QWEN_AUDIT_V1 = ReviewerPrompt(
 # only the fixed instruction text.
 QWEN_AUDIT_V4_1 = ReviewerPrompt(
     role="qwen_chapter_audit",
-    version="pact-v4-reviewer-qwen-audit/v4.2-lenses",
+    version="pact-v4-reviewer-qwen-audit/v4.3-lenses",
     instructions=(
         "You are a strict but conservative fidelity auditor for an English-to-Russian\n"
         "literary translation.\n"
@@ -523,8 +523,9 @@ QWEN_AUDIT_V4_1 = ReviewerPrompt(
         "evidence, not an invitation to rewrite toward 'more literary'. When a difference\n"
         "is stylistic preference rather than consistency/meaning loss -> PASS.\n"
         "\n"
-        "Report literary-consistency findings under the existing categories (typically\n"
-        "changed_fact or referent). Do not invent new categories.\n"
+        "Report each literary-consistency finding under exactly ONE of the four new\n"
+        "categories: voice_continuity | seam | dialogue_translationese |\n"
+        "ambiguity_flattening.\n"
         "\n"
         "\n"
         "OUTPUT\n"
@@ -537,7 +538,7 @@ QWEN_AUDIT_V4_1 = ReviewerPrompt(
         "  \"issues\": [\n"
         "    {\n"
         "      \"id\": \"p00045\",\n"
-        "      \"category\": \"omission | addition | referent | invented_gender | changed_fact | negation\",\n"
+        "      \"category\": \"omission | addition | referent | invented_gender | changed_fact | negation | voice_continuity | seam | dialogue_translationese | ambiguity_flattening\",\n"
         "      \"severity\": \"major | minor\",\n"
         "      \"confidence\": \"high | medium | low\",\n"
         "      \"note\": \"short description of confirmed semantic error\",\n"
@@ -820,7 +821,7 @@ RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
     # of the PID text (one sentence or a shorter span), not the whole PID.
     # The parse/apply contract mirrors this (substring validation +
     # substring-replace). Identity-bearing: bumping invalidates the R cache.
-    version="pact-v4.2-russian-editor/v3",
+    version="pact-v4.2-russian-editor/v4",
     instructions=(
         "You are a Russian-language editor for a Russian literary "
         "translation. You are given the RUSSIAN text of a chapter as a map "
@@ -837,15 +838,16 @@ RUSSIAN_EDITOR_V4_2_R1 = ReviewerPrompt(
         "- preposition: wrong, missing, or extra preposition\n"
         "\n"
         "REVIEW classes (need verification, do NOT apply automatically):\n"
-        "- calque: a construction copied literally from English\n"
+        "- calque: a construction copied literally from English (translationese framing)\n"
         "- logic: a logical inconsistency (pronoun/referent/number/tense)\n"
         "- ambiguity: a phrase that can be read in two ways\n"
-        "- unnatural: an unidiomatic or awkward Russian phrasing\n"
-        "- register: a stylistic register mismatch\n"
+        "- unnatural: non-idiomatic / machine / translationese Russian (smoothness/immersion)\n"
+        "- register: character voice / register continuity within Russian text (shift of character register without narrative trigger; register inconsistency between chunks, cross-chunk)\n"
         "\n"
         "Rules:\n"
         "- Only edit the target PID; keep every other PID verbatim.\n"
-        "- Fix only the stated defect; do not rewrite the whole paragraph.\n"
+        "- Fix only the stated defect; do not rewrite the whole paragraph. Make minimal single-defect edits.\n"
+        "- Literary judgements (voice/register continuity, smoothness/immersion/translationese) ONLY in REVIEW classes (calque/unnatural/register) — never in SAFE.\n"
         "- original is the exact fragment you are fixing, quoted verbatim "
         "from the PID text (may be one sentence or a shorter span); it must "
         "appear in the PID text word-for-word.\n"
@@ -1199,6 +1201,10 @@ DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY: Mapping[str, int] = {
     "invented_gender": 10,
     "referent": 10,
     "omission": 10,
+    "voice_continuity": 10,
+    "seam": 10,
+    "dialogue_translationese": 3,
+    "ambiguity_flattening": 3,
 }
 
 
