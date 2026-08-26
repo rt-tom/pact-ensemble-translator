@@ -13,10 +13,10 @@
 
 ## 3. Run-hook integration (v4 run command)
 
-- [ ] 3.1 Add a pre-init hook to the v4 run command that calls `remote_client.fetch_current`, validates the four files (regular, non-symlink, allowed names, valid JSON) before `MemoryManager` init, and fails fast on media unreachable; verify the run starts from media-authoritative state and fails clearly when media is down.
-- [ ] 3.2 Add a post-`MemoryManager.promote('complete')` hook that builds the candidate (manifest + four canonical files from the working dir), calls `remote_client.push_candidate`, and records the returned `revision_id` as confirmation; verify the confirmation is captured on ACCEPTED.
-- [ ] 3.3 Handle `STALE_PARENT` with a bounded re-pull + retry (default 1) and otherwise report the rejection; verify a stale base triggers one retry then a clear report.
-- [ ] 3.4 Ensure rejected/transport failures preserve local RT state and are reported, not silently dropped; verify local `pact_chapters\` is intact after a failed push.
+- [x] 3.1 Add a pre-init hook to the v4 run command that calls `remote_client.fetch_current`, validates the four files (regular, non-symlink, allowed names, valid JSON) before `MemoryManager` init, and fails fast on media unreachable; verify the run starts from media-authoritative state and fails clearly when media is down.
+- [x] 3.2 Add a post-`MemoryManager.promote('complete')` hook that builds the candidate (manifest + four canonical files from the working dir), calls `remote_client.push_candidate`, and records the returned `revision_id` as confirmation; verify the confirmation is captured on ACCEPTED.
+- [x] 3.3 Handle `STALE_PARENT` with a bounded re-pull + retry (default 1) and otherwise report the rejection; verify a stale base triggers one retry then a clear report.
+- [x] 3.4 Ensure rejected/transport failures preserve local RT state and are reported, not silently dropped; verify local `pact_chapters\` is intact after a failed push.
 
 ## 4. Tests
 
