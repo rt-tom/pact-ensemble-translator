@@ -1,15 +1,15 @@
 ## 1. Media restricted facade + CLI surface
 
-- [ ] 1.1 Add `fetch-current <book-id>` to `pact_v4.snapshot` CLI that streams the current state (CURRENT.json, referenced manifest.json, and the four canonical files) to stdout/tar; verify it returns the exact four files for a seeded book (use the `books/1` store).
-- [ ] 1.2 Implement `remote_facade.py` (or shell wrapper) that parses subcommand + `book-id`, allows ONLY `fetch-current`, `receive-candidate`, `promote`, `release-lease --check-expired`, and rejects any other subcommand/argument/book-id; verify a disallowed request is refused without side effects.
-- [ ] 1.3 Have `receive-candidate <book-id> <candidate-id>` read a candidate archive from stdin and write it under `incoming/<candidate-id>/`; verify the candidate lands where media `promote` expects it.
+- [x] 1.1 Add `fetch-current <book-id>` to `pact_v4.snapshot` CLI that streams the current state (CURRENT.json, referenced manifest.json, and the four canonical files) to stdout/tar; verify it returns the exact four files for a seeded book (use the `books/1` store).
+- [x] 1.2 Implement `remote_facade.py` (or shell wrapper) that parses subcommand + `book-id`, allows ONLY `fetch-current`, `receive-candidate`, `promote`, `release-lease --check-expired`, and rejects any other subcommand/argument/book-id; verify a disallowed request is refused without side effects.
+- [x] 1.3 Have `receive-candidate <book-id> <candidate-id>` read a candidate archive from stdin and write it under `incoming/<candidate-id>/`; verify the candidate lands where media `promote` expects it.
 
 ## 2. RT remote client (system ssh/scp, offline store untouched)
 
-- [ ] 2.1 Create `pact_v4/snapshot/remote_client.py` that shells out to the system `ssh`/`scp` (no SSH library, no code in the store package); verify `pact_v4/snapshot` store modules still import with zero network imports.
-- [ ] 2.2 Implement `fetch_current(book_id)` → downloads the four canonical files to a target dir; verify the four files arrive and nothing else.
-- [ ] 2.3 Implement `push_candidate(book_id, candidate_id, local_dir)` → `receive-candidate` + `promote` over SSH, returning the parsed media verdict; verify it surfaces ACCEPTED/`revision_id` and REJECTED/reason.
-- [ ] 2.4 Implement `check_expired(book_id)` via `release-lease --check-expired`; verify the read-only report is returned.
+- [x] 2.1 Create `pact_v4/snapshot/remote_client.py` that shells out to the system `ssh`/`scp` (no SSH library, no code in the store package); verify `pact_v4/snapshot` store modules still import with zero network imports.
+- [x] 2.2 Implement `fetch_current(book_id)` → downloads the four canonical files to a target dir; verify the four files arrive and nothing else.
+- [x] 2.3 Implement `push_candidate(book_id, candidate_id, local_dir)` → `receive-candidate` + `promote` over SSH, returning the parsed media verdict; verify it surfaces ACCEPTED/`revision_id` and REJECTED/reason.
+- [x] 2.4 Implement `check_expired(book_id)` via `release-lease --check-expired`; verify the read-only report is returned.
 
 ## 3. Run-hook integration (v4 run command)
 
