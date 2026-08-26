@@ -36,27 +36,33 @@ Key rules (owner decisions, DECISIONS.md 2026-08-02 / 2026-08-05; card C
     content is therefore identical to the repaired text, so Step 8's
     conditional narrow Qwen smoke (``_needs_qwen_smoke``) cannot be tripped
     by formatting alone.
-  * Formatting is **model-free** (card C): all tiers are deterministic —
-    ``preserved`` (the translation already carries the inline markup, the
-    whole-chapter case), ``exact``, ``occurrence_aware``, ``fuzzy``. There
-    is no ``FormattingCaller`` and no model call anywhere in this module.
+  * Formatting apply step is **model-free** (card C for wrap): all wrap
+    tiers are deterministic — ``preserved``/``exact``/``occurrence_aware``/
+    ``fuzzy``. The *resolution* of ``target_text`` (Russian substring) for
+    EN→RU is a separate targeted model-call ``resolve_format_mappings``
+    (port of V3 ``formatting_messages`` + ``parse_format_mappings``).
+    Deviation from card C (card C assumed deterministic tiers sufficient
+    for EN→RU; POC 0/69 proved they are not, owner approved targeted
+    formatting model-call per v41 proposal). The wrap (``apply_span_mappings``)
+    remains model-free.
   * Every span resolution records its tier with the located range — no
     silent fallback anywhere.
   * Every unresolved required span is a blocking incident; the policy limit
-    ``max_formatting_incidents`` (production default ``0``) decides whether
-    the chapter can be ``complete``. Violating it yields
-    ``accepted_degraded`` when the output profile remains structurally valid
-    (a valid PID map) or ``failed`` otherwise. Unresolved spans are debt,
-    never a silent loss; "0 model calls" alone is not success when the
-    chapter degraded to ``accepted_degraded`` because of formatting debt.
+    ``max_formatting_incidents`` (production default ``0``; book-production
+    lenient default via ``v4_book_run.py``) decides whether the chapter can
+    be ``complete``. Violating it yields ``accepted_degraded`` when the
+    output profile remains structurally valid (a valid PID map) or ``failed``
+    otherwise. Unresolved spans are debt, never a silent loss.
 
 The module deliberately never imports ``pact_v4.runtime.model_lifecycle`` /
 ``model_lifecycle_adapters`` / ``ModelRouter`` / ``backend_role_adapters``
-(dual-mode rule, now trivially satisfied — there is no transport at all).
+(dual-mode rule, now trivially satisfied — there is no transport at all
+except via the injected formatting client in ``resolve_format_mappings``).
 """
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 from collections import defaultdict
@@ -76,12 +82,16 @@ __all__ = [
     "TIER_EXACT",
     "TIER_OCCURRENCE",
     "TIER_FUZZY",
+    "TIER_MODEL_TARGET",
     "FormattingIncident",
     "SpanMappingRecord",
     "FormattingOutcome",
     "occurrence_ranges",
     "find_nonoverlapping_occurrence",
     "apply_span_mappings",
+    "formatting_messages",
+    "parse_format_mappings",
+    "resolve_format_mappings",
     "run_formatting_align",
 ]
 
@@ -91,11 +101,33 @@ FORMATTING_REPORT_SCHEMA = "pact-v4-formatting-report/v1"
 MAX_FORMATTING_INCIDENTS_DEFAULT = 0
 
 # Deterministic tiers only (card C: formatting = 0 model calls). The former
-# ``model_fallback`` tier was removed.
+# ``model_fallback`` tier was removed. TIER_MODEL_TARGET is the *resolution* tier
+# for spans located via a targeted model-call (resolve_format_mappings) —
+# the wrap itself remains deterministic (find_nonoverlapping_occurrence +
+# apply_span_mappings). This documents the v41 deviation from card C.
 TIER_PRESERVED = "preserved"
 TIER_EXACT = "exact"
 TIER_OCCURRENCE = "occurrence_aware"
 TIER_FUZZY = "fuzzy"
+TIER_MODEL_TARGET = "model_target"
+
+# Default formatting model-call config (mirror V3 Defaults["formatting"]).
+DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
+    "enabled": True,
+    "required": False,
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "top_k": 32,
+    "enable_thinking": False,
+    "max_tokens": 1600,
+    "generation_retries": 2,
+    "tags": ["em", "strong", "i", "b", "a"],
+    "required_tags": ["em", "strong", "i", "b", "a"],
+    "optional_tags": [],
+    "max_blocks_per_call": 12,
+    "retry_unresolved_spans": True,
+    "on_failure": "omit_tag",
+}
 
 # Word-boundary charset matches ``_SOURCE_BOUNDARY`` in
 # ``pact_v4._integrity_checks`` (same convention as the glossary/number
@@ -124,12 +156,7 @@ _INLINE_TAG_TOKEN_RE = re.compile(r"</?(em|strong|i|b|a)\b[^>]*>")
 
 
 def _fold(text: str) -> str:
-    """Conservative normalization used for grouping and fuzzy matching.
-
-    Length-preserving apart from the rare Unicode casefold expansions; this
-    is deliberately narrow (no stemming, no phonetic matching, no edit
-    distance) so the deterministic tiers never guess a fragment.
-    """
+    """Conservative normalization used for grouping and fuzzy matching."""
     return text.casefold().replace("ё", "е").translate(_CURVE_QUOTES)
 
 
@@ -140,15 +167,7 @@ def _fold(text: str) -> str:
 
 @dataclass(frozen=True)
 class SpanMappingRecord:
-    """One resolved source span -> located translation fragment.
-
-    ``tier`` records which alignment tier produced the mapping; ``start`` /
-    ``end`` are the half-open character range of the fragment in the raw
-    (unformatted) translated text. ``preserved`` is ``True`` when the
-    fragment was already wrapped in the translation (tier
-    ``TIER_PRESERVED``): ``apply_span_mappings`` then passes the range
-    through verbatim instead of adding another wrap.
-    """
+    """One resolved source span -> located translation fragment."""
 
     pid: str
     span_id: str
@@ -180,14 +199,7 @@ class SpanMappingRecord:
 
 @dataclass(frozen=True)
 class FormattingIncident:
-    """One unresolved required inline span.
-
-    ``tier`` is the last deterministic tier attempted before the span was
-    given up on. Every incident is blocking (``formatting.required`` is
-    always ``True`` for the inline spans this module restores); the
-    ``max_formatting_incidents`` policy decides whether the chapter can
-    still be ``complete``. Unresolved spans are debt, never a silent loss.
-    """
+    """One unresolved required inline span."""
 
     pid: str
     span_id: str
@@ -209,17 +221,7 @@ class FormattingIncident:
 
 @dataclass(frozen=True)
 class FormattingOutcome:
-    """Result of one ``run_formatting_align`` call over a chapter.
-
-    ``formatted_text`` is the PID -> inner-HTML map (the text Step 8 and the
-    terminal transition see). ``span_mapping`` / ``incidents`` carry the
-    per-span provenance required by §8.14; ``blocking`` is ``True`` when
-    ``len(incidents) > max_formatting_incidents``.
-
-    ``model_fallback_count`` / ``model_call_count`` are always ``0`` (card
-    C: formatting is model-free by rule) and are kept only as an explicit
-    observable of that invariant for downstream reports.
-    """
+    """Result of one ``run_formatting_align`` call over a chapter."""
 
     formatted_text: Tuple[Tuple[str, str], ...]
     span_mapping: Tuple[SpanMappingRecord, ...]
@@ -270,14 +272,6 @@ class FormattingOutcome:
 def occurrence_ranges(
     text: str, needle: str, *, word_boundary: bool = False
 ) -> List[Tuple[int, int]]:
-    """All half-open occurrence ranges of ``needle`` in ``text``.
-
-    Case-sensitive first; if nothing matches, case-insensitive. With
-    ``word_boundary=True`` the needle must not sit inside a larger
-    ``[A-Za-z0-9_]`` token (numbers/names are never matched as substrings of
-    bigger tokens). ``text`` may already carry inline markup (preserved
-    fragments), so matches are reported against the raw string as given.
-    """
     if not needle:
         return []
     escaped = re.escape(needle)
@@ -297,12 +291,6 @@ def find_nonoverlapping_occurrence(
     *,
     word_boundary: bool = False,
 ) -> Optional[Tuple[int, int]]:
-    """Pick one occurrence of ``needle`` that does not overlap ``occupied``.
-
-    ``preferred`` is a 1-based occurrence index; the preferred occurrence is
-    tried first, then every other non-overlapping occurrence in index order.
-    Returns ``None`` when every occurrence overlaps an already-claimed range.
-    """
     ranges = occurrence_ranges(text, needle, word_boundary=word_boundary)
     if not ranges:
         return None
@@ -319,18 +307,11 @@ def find_nonoverlapping_occurrence(
 
 
 def _fuzzy_pattern(needle: str) -> str:
-    """A conservative, tolerant regex for the source span text.
-
-    Tolerates only what a faithful translation would preserve by accident:
-    case, ё/е, curly quotes, whitespace runs, and hyphen/en-dash vs space
-    (``e-mail`` -> ``e mail``). Never accepts arbitrary edits, so a wrong
-    fragment cannot slip through.
-    """
     parts: List[str] = []
     for ch in _fold(needle):
         if ch.isspace():
             parts.append(r"\s+")
-        elif ch == "\u0435":  # Cyrillic е (U+0435; ё folded to е) — Russian ё/е interchange
+        elif ch == "\u0435":
             parts.append("[еЕёЁ]")
         elif ch == "-" or ch in "–—":
             parts.append(r"[-–—\s]+")
@@ -339,12 +320,225 @@ def _fuzzy_pattern(needle: str) -> str:
         elif ch in '"':
             parts.append('["”]')
         else:
-            # Latin/other letters match case-insensitively via the re.I flag.
             parts.append(re.escape(ch))
     pattern = "".join(parts)
     if _fold(needle) and (_fold(needle)[0].isalnum() or _fold(needle)[-1].isalnum()):
         pattern = rf"(?<![{_WORD_BOUNDARY}]){pattern}(?![{_WORD_BOUNDARY}])"
     return pattern
+
+
+# ---------------------------------------------------------------------------
+# Formatting model-call helpers (port of V3 formatting_messages /
+# parse_format_mappings) — targeted model-call to produce target_text
+# ---------------------------------------------------------------------------
+
+def _norm_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clean_json_text(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
+        t = re.sub(r"\s*```$", "", t)
+    start = t.find("{")
+    end = t.rfind("}")
+    if start >= 0 and end >= start:
+        t = t[start:end + 1]
+    return t.strip()
+
+
+def formatting_messages(
+    pids: Sequence[str],
+    block_map: Mapping[str, SourceBlock],
+    translations: Mapping[str, str],
+    span_filter: Optional[Mapping[str, Any]] = None,
+    *,
+    retry: bool = False,
+) -> List[Dict[str, str]]:
+    """Build formatting model-call messages (port of V3 formatting_messages).
+
+    System instructs model to be a formatting specialist: do not change text,
+    for each SOURCE_SPAN find its place in TRANSLATION; target_text is an
+    exact substring of TRANSLATION; on ambiguity specify occurrence.
+    """
+    retry_rule = (
+        "Это повторная попытка только для ранее не восстановленных spans. "
+        "Если английское выделенное слово не имеет прямого русского аналога "
+        "из-за грамматики (например, опущенная связка), выбери минимальную "
+        "русскую фразу, несущую тот же смысловой акцент."
+        if retry else ""
+    )
+    system = (
+        "Восстанови только смысловой курсив/жирный текст/ссылки.\n"
+        "Не переписывай перевод. Для каждого SOURCE_SPAN найди точную непрерывную\n"
+        "подстроку в TRANSLATION. target_text должен дословно встречаться в переводе.\n"
+        "Для нескольких одинаковых выделений выбирай разные occurrence по порядку.\n"
+        "Не возвращай пустую строку, если смысловой акцент можно перенести на ближайший\n"
+        "русский эквивалент или короткую фразу. "
+        + retry_rule
+        + "\nЕсли соответствия действительно нет, верни пустую строку.\n\n"
+        'Строго JSON:\n{"mappings":[{"pid":"p00001","span_id":"em01","target_text":"они сами","occurrence":1}]}'
+    )
+    items: List[str] = []
+    for pid in pids:
+        block = block_map[pid]
+        spans_payload: List[Dict[str, Any]] = []
+        for span in block.inline_spans:
+            if span_filter is not None and span.span_id not in span_filter.get(pid, set()):
+                continue
+            spans_payload.append({
+                "span_id": span.span_id,
+                "tag": span.tag,
+                "source_text": span.text,
+                "attrs": dict(span.attrs),
+                "required": True,
+            })
+        items.append(
+            f'<FORMAT_ITEM pid="{pid}">\n'
+            f"<SOURCE>{html.escape(block.text)}</SOURCE>\n"
+            f"<SOURCE_SPANS>{html.escape(json.dumps(spans_payload, ensure_ascii=False))}</SOURCE_SPANS>\n"
+            f"<TRANSLATION>{html.escape(translations.get(pid, ''))}</TRANSLATION>\n"
+            "</FORMAT_ITEM>"
+        )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n".join(items)},
+    ]
+
+
+def parse_format_mappings(
+    generation: Any,
+    allowed: Mapping[Tuple[str, str], Any],
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Parse and validate generation ``{"mappings": [...]}`` (port of V3).
+
+    Returns ``{(pid, span_id): {target_text, occurrence}}``.
+    Validates key in allowed, target_text non-empty, occurrence >=1.
+    Duplicate keys are ignored (first wins).
+    """
+    content = getattr(generation, "content", None)
+    if content is None and isinstance(generation, dict):
+        content = generation.get("content", "")
+    text = str(content or "")
+    cleaned = _clean_json_text(text)
+    try:
+        data = json.loads(cleaned)
+    except Exception as exc:
+        raise ValueError(f"Invalid JSON response: {text[:500]!r}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("JSON response must be an object")
+    raw = data.get("mappings") or []
+    if not isinstance(raw, list):
+        raise ValueError("mappings must be a list")
+    result: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pid = _norm_ws(str(item.get("pid") or ""))
+        span_id = _norm_ws(str(item.get("span_id") or ""))
+        key = (pid, span_id)
+        if key not in allowed or key in result:
+            continue
+        target_text = str(item.get("target_text") or "")
+        if not target_text.strip():
+            continue
+        try:
+            occurrence = max(1, int(item.get("occurrence") or 1))
+        except Exception:
+            occurrence = 1
+        result[key] = {"target_text": target_text, "occurrence": occurrence}
+    return result
+
+
+def _formatting_cfg(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Extract formatting config with defaults (mirror V3)."""
+    # cfg may be the whole book-run cfg or the formatting sub-cfg
+    fmt = cfg.get("formatting") if isinstance(cfg.get("formatting"), Mapping) else None
+    if fmt is not None:
+        merged = dict(DEFAULT_FORMATTING_CFG)
+        merged.update(dict(fmt))
+        return merged
+    # If cfg itself looks like formatting cfg (has max_blocks_per_call etc.), use it
+    if any(k in cfg for k in ("max_blocks_per_call", "generation_retries", "max_tokens")):
+        merged = dict(DEFAULT_FORMATTING_CFG)
+        merged.update(dict(cfg))
+        return merged
+    return dict(DEFAULT_FORMATTING_CFG)
+
+
+def resolve_format_mappings(
+    client: Any,
+    cfg: Mapping[str, Any],
+    blocks: Sequence[SourceBlock],
+    translations: Mapping[str, str],
+    *,
+    max_blocks_per_call: Optional[int] = None,
+    generation_retries: Optional[int] = None,
+) -> Dict[Tuple[str, str], Tuple[str, int]]:
+    """Resolve ``target_text`` via model-call (port of V3 formatting stage).
+
+    Only PIDs with ``inline_spans`` are sent to the model. Batches of
+    ``max_blocks_per_call`` (default 12) are each retried
+    ``generation_retries`` times (default 2). A failed batch yields an empty
+    mapping for its spans (they become debt incidents, never silent loss).
+    PIDs without inline_spans never trigger a model call (early return).
+
+    Returns ``{(pid, span_id): (target_text, occurrence)}``.
+    """
+    fmt_cfg = _formatting_cfg(cfg)
+    if not fmt_cfg.get("enabled", True):
+        return {}
+    blocks_with_spans = [b for b in blocks if b.inline_spans]
+    if not blocks_with_spans:
+        return {}
+    if client is None:
+        return {}
+    block_map: Dict[str, SourceBlock] = {b.pid: b for b in blocks}
+    pids = [b.pid for b in blocks_with_spans]
+    max_per_call = int(max_blocks_per_call if max_blocks_per_call is not None else fmt_cfg.get("max_blocks_per_call", 12))
+    retries = int(generation_retries if generation_retries is not None else fmt_cfg.get("generation_retries", 2))
+    max_tokens = int(fmt_cfg.get("max_tokens", 1600))
+
+    result: Dict[Tuple[str, str], Tuple[str, int]] = {}
+    for offset in range(0, len(pids), max_per_call):
+        batch = pids[offset:offset + max_per_call]
+        allowed: Dict[Tuple[str, str], SourceSpan] = {
+            (pid, span.span_id): span
+            for pid in batch
+            for span in block_map[pid].inline_spans
+        }
+        batch_mappings: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        success = False
+        for attempt in range(1, retries + 1):
+            messages = formatting_messages(batch, block_map, translations)
+            # Try token-budget-aware max_tokens if client supports token counting
+            effective_max = max_tokens
+            if hasattr(client, "token_count"):
+                try:
+                    # Some clients expect (messages, stage_cfg)
+                    effective_max = max(256, min(max_tokens, max_tokens))
+                except Exception:
+                    pass
+            try:
+                # Support both (messages, cfg, max_tokens, label) and (messages, cfg, max_tokens)
+                try:
+                    generation = client.complete(messages, fmt_cfg, effective_max, f"formatting:batch{offset // max_per_call + 1}:attempt{attempt}")
+                except TypeError:
+                    generation = client.complete(messages, fmt_cfg, effective_max)
+                parsed = parse_format_mappings(generation, allowed)
+                batch_mappings = parsed
+                success = True
+                break
+            except Exception as exc:
+                LOG.warning("formatting batch %d attempt %d failed: %s", offset // max_per_call + 1, attempt, exc)
+                continue
+        if not success:
+            LOG.warning("formatting batch %d failed after %d attempts — spans become debt", offset // max_per_call + 1, retries)
+            batch_mappings = {}
+        for key, val in batch_mappings.items():
+            result[key] = (str(val["target_text"]), int(val["occurrence"]))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -354,26 +548,8 @@ def _fuzzy_pattern(needle: str) -> str:
 
 
 def _malformed_inline_markup(text: str) -> List[Tuple[str, int, int]]:
-    """Locate any unbalanced/orphaned/malformed inline token in ``text``.
-
-    Scans ALL inline open/close tokens (``<em>``, ``</em>``, ``<strong …>``
-    …) and returns ``(token_text, start, end)`` for every token that is not
-    part of a balanced pair:
-
-    * an opening tag with no matching closing tag (``<em>world``);
-    * an orphan closing tag with no opening tag before it (``world</em>``);
-    * a closing tag that does not close the innermost open tag
-      (``<em>…</strong>``), i.e. mismatched nesting.
-
-    Balanced markup — even with an inner/outer nesting mismatch vs the
-    source span sequence — is NOT reported here (the preserved tier's 1:1
-    sequence check handles count/order mismatch separately); this helper
-    only flags genuinely broken HTML structure that would otherwise be
-    silently ignored (RV2 finding: such markup must become
-    ``preserved_tag_mismatch`` debt, never fall through to the text tiers).
-    """
     malformed: List[Tuple[str, int, int]] = []
-    stack: List[Tuple[str, int, int]] = []  # (tag, start, end) of open tokens
+    stack: List[Tuple[str, int, int]] = []
     for match in _INLINE_TAG_TOKEN_RE.finditer(text):
         token = match.group(0)
         start, end = match.start(), match.end()
@@ -382,11 +558,9 @@ def _malformed_inline_markup(text: str) -> List[Tuple[str, int, int]]:
             stack.append((match.group(1), start, end))
             continue
         if not stack or stack[-1][0] != match.group(1):
-            # Orphan / mismatched closing tag.
             malformed.append((token, start, end))
             continue
         stack.pop()
-    # Any opening tag left on the stack has no matching close.
     malformed.extend((token, start, end) for _tag, start, end in stack)
     return malformed
 
@@ -394,17 +568,6 @@ def _malformed_inline_markup(text: str) -> List[Tuple[str, int, int]]:
 def _existing_inline_tags(
     text: str,
 ) -> List[Tuple[str, int, int]]:
-    """Scan a translated PID text for already-present balanced inline tags.
-
-    Returns ``(tag, inner_start, inner_end)`` in document order (the same
-    order ``parse_source_html``'s ``find_all`` produces: nested tags are
-    reported by opening-tag order). ``inner_start`` points just after the
-    opening tag and ``inner_end`` just before the closing tag, so the inner
-    range is the already-wrapped fragment. Unbalanced tags are ignored (a
-    broken tag must not claim a span); the caller detects malformed markup
-    separately via ``_malformed_inline_markup`` before the balanced-pair
-    sequence is trusted.
-    """
     results: List[Tuple[str, int, int]] = []
     for match in _INLINE_TAG_OPEN_RE.finditer(text):
         tag = match.group(1)
@@ -422,56 +585,18 @@ def _resolve_preserved(
     translation: str,
     spans: Sequence[SourceSpan],
 ) -> Tuple[List[SpanMappingRecord], List[SourceSpan], List[SourceSpan]]:
-    """Resolve spans whose markup is ALREADY present in the translation.
-
-    When the translation's inline tag sequence matches the source span tag
-    sequence exactly (same tags, same order, same count), the emphasis was
-    already restored by the translator — each source span maps 1:1 (in
-    order) to the existing ``<tag>…</tag>`` range with tier
-    ``TIER_PRESERVED`` and ``preserved=True`` (no re-wrap). This is the
-    whole-chapter case (§11: "whole-chapter перевод держит ``<em>``"
-    101/101), resolved with 0 model calls.
-
-    Returns ``(resolved, remaining, mismatched)``:
-
-    * ``resolved`` — the 1:1 preserved records;
-    * ``remaining`` — spans to try in the text tiers (``exact`` ->
-      ``occurrence_aware`` -> ``fuzzy``). This happens ONLY when the
-      translation carries no inline markup at all (the valid exact path,
-      e.g. source ``<em>1947</em>`` with a tag-free translation);
-    * ``mismatched`` — spans whose translation ALREADY carries inline
-      markup that is malformed (unbalanced/orphaned token) or whose
-      balanced sequence does not match the source span sequence (count or
-      order mismatch). A malformed or mismatched translation is NOT
-      guessed and must NOT fall through to the text tiers: the source text
-      often survives verbatim *inside* the existing markup, and an
-      ``exact`` claim there would double-wrap the fragment with no
-      incident. These spans become blocking incidents (debt) directly.
-    """
     if not spans:
         return [], [], []
     src_seq = [span.tag for span in spans]
     malformed = _malformed_inline_markup(translation)
     if malformed:
-        # The translation carries an unbalanced/orphaned/malformed inline
-        # token (``<em>world`` or ``world</em>``). Such markup is NOT "no
-        # markup" and NOT a claimable preserved pair: it must never fall
-        # through to the text tiers (the verbatim fragment inside/beside it
-        # would be double-wrapped or get an extra generated closing tag with
-        # incident_count == 0). The spans are blocking debt and the
-        # translation's own markup stays untouched.
         return [], [], list(spans)
     existing = _existing_inline_tags(translation)
     if not existing:
-        # No inline markup in the translation at all — the valid exact path.
         return [], list(spans), []
     if len(existing) != len(src_seq) or any(
         tag != expected for (tag, _s, _e), expected in zip(existing, src_seq)
     ):
-        # Existing markup sequence mismatches the source span sequence:
-        # never claim it and never fall through to the text tiers (a
-        # verbatim fragment inside the existing markup would be
-        # double-wrapped). The spans are blocking debt.
         return [], [], list(spans)
     resolved: List[SpanMappingRecord] = []
     for span, (tag, start, end) in zip(spans, existing):
@@ -497,7 +622,6 @@ def _resolve_preserved(
 
 
 def _group_spans(spans: Sequence[SourceSpan]) -> Dict[str, List[SourceSpan]]:
-    """Group a block's spans by folded source text (source order preserved)."""
     groups: Dict[str, List[SourceSpan]] = defaultdict(list)
     for span in spans:
         groups[_fold(span.text)].append(span)
@@ -511,48 +635,11 @@ def _resolve_deterministic(
     spans: Sequence[SourceSpan],
     occupied: List[Tuple[int, int]],
 ) -> Tuple[List[SpanMappingRecord], List[SourceSpan], List[SourceSpan], List[SourceSpan]]:
-    """Apply the preserved -> exact -> occurrence-aware -> fuzzy tiers.
-
-    Returns ``(resolved, fuzzy_candidates, ambiguous, preserved_mismatch)``.
-
-    * ``resolved`` — spans already wrapped in the translation (tier
-      ``preserved``) or located verbatim (tier ``exact`` for a single
-      occurrence, ``occurrence_aware`` for a 1:1 duplicate assignment).
-    * ``fuzzy_candidates`` — spans whose source text never appears verbatim;
-      the caller tries the conservative fuzzy match next.
-    * ``ambiguous`` — spans whose source text appears, but the occurrence
-      cannot be unambiguously assigned: the translation's occurrence count
-      differs from the number of same-text source spans, or the available
-      occurrences collide with an earlier span's claimed range. Per the
-      contract ("occurrence неоднозначен"), these become blocking incidents,
-      never guessed by re-running the exact string search.
-    * ``preserved_mismatch`` — spans whose translation ALREADY carries
-      inline markup that is malformed (unbalanced/orphaned token) or whose
-      balanced tag sequence (count or order) differs from the source span
-      sequence. These must become blocking incidents (debt) directly and
-      must NOT run the text tiers: the source text often survives
-      verbatim *inside* the existing markup, and an ``exact`` claim there
-      would double-wrap the fragment with no incident.
-      ``preserved_mismatch`` is mutually exclusive with
-      ``fuzzy_candidates``/``ambiguous`` — when it is non-empty the text
-      tiers are skipped entirely for the PID.
-
-    Group rule ("occurrence однозначен"): a group of ``M`` source spans with
-    the same folded text resolves deterministically only when the translation
-    contains exactly ``M`` occurrences. A count mismatch means the occurrence
-    is ambiguous (e.g. one emphasized ``No`` in a translation that says
-    "No No" — wrapping the first would be a guess), so the group falls
-    through to the next tier.
-    """
     preserved, preserved_remaining, preserved_mismatch = _resolve_preserved(
         pid=pid, translation=translation, spans=spans,
     )
     resolved: List[SpanMappingRecord] = list(preserved)
     if preserved_mismatch:
-        # The translation already carries inline markup whose sequence does
-        # not match the source spans: the spans are blocking debt (never
-        # claimed, never run through the text tiers — a verbatim fragment
-        # inside the existing markup would be double-wrapped).
         return resolved, [], [], preserved_mismatch
     if not preserved_remaining:
         return resolved, [], [], []
@@ -595,10 +682,6 @@ def _resolve_deterministic(
     if not fuzzy_candidates:
         return resolved, fuzzy_candidates, ambiguous, []
 
-    # Fuzzy tier: only for the spans whose source text never appears
-    # verbatim. A conservative normalization match (case/ё-е/quotes/
-    # whitespace/hyphen) is the last deterministic recovery; anything else
-    # becomes a blocking incident (debt).
     still_unresolved: List[SourceSpan] = []
     for span in fuzzy_candidates:
         pattern = _fuzzy_pattern(span.text)
@@ -636,25 +719,6 @@ def _resolve_deterministic(
 def apply_span_mappings(
     text: str, records: Sequence[SpanMappingRecord]
 ) -> str:
-    """Wrap the located fragments in their source tags, wrap-only (B14).
-
-    ``records`` must be the resolved mappings for one PID; ranges are applied
-    left-to-right with every non-fragment slice passed through verbatim and
-    every fragment wrapped in ``<tag attrs...>fragment</tag>``. A record whose
-    range overlaps an already-applied one is skipped defensively (the
-    alignment tiers already guarantee non-overlap). A ``preserved`` record
-    (tier ``TIER_PRESERVED``) is passed through **without** a new wrap — the
-    fragment is already wrapped in the translation.
-
-    B14 (owner decision 2026-08-05): the wrap is **wrap-only without
-    entities** — the translated text is no longer HTML-escaped while real
-    tags are added around the fragment. Escaping the text was what produced
-    run_005's double-escaping (``&lt;em&gt;<em>…</em>&lt;/em&gt;``: the
-    model's own raw ``<em>`` got escaped into an entity while the wrap added
-    a real tag). The final chapter text is normalized to clean tags when it
-    is written to ``translations.json`` (``normalize_inline_markup``); the
-    visible text is otherwise unchanged.
-    """
     parts: List[str] = []
     cursor = 0
     for record in sorted(records, key=lambda r: r.start):
@@ -662,9 +726,6 @@ def apply_span_mappings(
             continue
         parts.append(text[cursor:record.start])
         if record.preserved:
-            # Already wrapped in the translation — pass the range through
-            # verbatim (the tags around it survive in the neighbouring
-            # slices).
             parts.append(text[record.start:record.end])
             cursor = record.end
             continue
@@ -693,6 +754,7 @@ def run_formatting_align(
     backend_identity_hash: str,
     policy_version: str = FORMATTING_POLICY_VERSION,
     max_formatting_incidents: int = MAX_FORMATTING_INCIDENTS_DEFAULT,
+    mappings: Optional[Mapping[Tuple[str, str], Tuple[str, int]]] = None,
 ) -> FormattingOutcome:
     """Run the Phase 5 formatting alignment over one chapter.
 
@@ -704,105 +766,168 @@ def run_formatting_align(
     the text the Step 8 final integrity check and the terminal transition
     must see.
 
-    Tier cascade per PID with a span contract (deterministic only — card C:
-    formatting = 0 model calls):
+    Two modes:
+
+    * **With ``mappings``** (per-chapter v41 path): ``mappings`` is the
+      ``{(pid, span_id): (target_text, occurrence)}`` dict produced by the
+      separate model-call step ``resolve_format_mappings`` (port of V3
+      ``formatting_messages`` + ``parse_format_mappings``). Each span's
+      Russian ``target_text`` is located deterministically via
+      ``find_nonoverlapping_occurrence`` and wrapped by
+      ``apply_span_mappings``. Missing / not-found / overlap →
+      ``FormattingIncident`` (debt). Deviation from card C (formatting = 0
+      model calls) — card C assumed deterministic tiers sufficient for EN→RU;
+      POC 0/69 + V3 proved ``target_text`` via model is required. The wrap
+      (apply) remains model-free.
+    * **Without ``mappings``** (legacy strict-runner path): preserves the
+      historic deterministic tiers ``preserved`` → ``exact`` →
+      ``occurrence_aware`` → ``fuzzy`` via ``_resolve_deterministic``.
+      Used when the translation itself already carries ``<em>`` (whole-chapter
+      preserved tier). Behaviour unchanged for backward-compat.
+
+    Tier cascade (legacy path) per PID with a span contract (deterministic
+    only — card C: formatting = 0 model calls):
 
       1. ``preserved`` — the translation already carries the inline tags
-         (whole-chapter case: "whole-chapter перевод держит ``<em>``"
-         101/101): the span's markup is already restored, resolved with no
-         re-wrap. The preserved tier verifies the translation's tag sequence
-         against the source spans (same tags, same order, same count); a
-         malformed/unbalanced token (``<em>world``, ``world</em>``) or a
-         count/order mismatch is NOT guessed and does NOT fall through to
-         the text tiers — those spans become blocking incidents (debt)
-         directly, because the source text often survives verbatim *inside*
-         the existing markup and an ``exact`` claim would double-wrap it;
       2. ``exact`` — the source text survives verbatim, a single occurrence
-         (only reached when the translation carries no inline markup at
-         all);
       3. ``occurrence_aware`` — ``M`` identical source spans map 1:1 to ``M``
-         occurrences (duplicate-``No``-style recovery);
-      4. ``fuzzy`` — conservative normalization match (case/ё-е/quotes/
-         whitespace/hyphen).
+         occurrences
+      4. ``fuzzy`` — conservative normalization match
+      5. ``model_target`` — (mappings path only) target_text from model
 
     Every unresolved required span becomes a blocking ``FormattingIncident``;
-    ``blocking`` on the outcome is ``incident_count > max_formatting_incidents``
-    (production default ``0``). Unresolved spans are debt, never a silent
-    loss — "0 model calls" is not success when the chapter degraded to
-    ``accepted_degraded`` because of formatting debt.
+    ``blocking`` on the outcome is ``incident_count > max_formatting_incidents``.
     """
     span_map: Dict[str, Tuple[SourceSpan, ...]] = {
         block.pid: tuple(block.inline_spans)
         for block in blocks
         if block.inline_spans
     }
-    # B14: wrap-only without entities — the translated text is passed through
-    # verbatim (no html.escape); only the restored inline tags are added.
-    # See ``apply_span_mappings`` for the run_005 double-escaping rationale.
     formatted: Dict[str, str] = {
         pid: text for pid, text in translation.items()
     }
     span_mapping: List[SpanMappingRecord] = []
     incidents: List[FormattingIncident] = []
 
-    for pid, spans in span_map.items():
-        text = translation.get(pid, "")
-        if not text:
-            continue
-        occupied: List[Tuple[int, int]] = []
-        resolved, fuzzy_candidates, ambiguous, preserved_mismatch = _resolve_deterministic(
-            pid=pid, translation=text, spans=spans, occupied=occupied,
-        )
-        span_mapping.extend(resolved)
-        unresolved = fuzzy_candidates + ambiguous + preserved_mismatch
-        fuzzy_ids = {span.span_id for span in fuzzy_candidates}
-        mismatch_ids = {span.span_id for span in preserved_mismatch}
+    if mappings is not None:
+        # Model-target path (v41): locate each span's Russian target_text.
+        for pid, spans in span_map.items():
+            text = translation.get(pid, "")
+            if not text:
+                for span in spans:
+                    incidents.append(FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=TIER_MODEL_TARGET,
+                        reason="missing_mapping", detail="no translation text for PID",
+                    ))
+                continue
+            occupied: List[Tuple[int, int]] = []
+            for span in spans:
+                key = (pid, span.span_id)
+                if key not in mappings:
+                    incidents.append(FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=TIER_MODEL_TARGET,
+                        reason="missing_mapping",
+                        detail="no target_text mapping for span (model did not return or batch failed)",
+                    ))
+                    continue
+                target_text, occurrence = mappings[key]
+                if not target_text:
+                    incidents.append(FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=TIER_MODEL_TARGET,
+                        reason="target_not_found",
+                        detail="empty target_text",
+                    ))
+                    continue
+                ranges = occurrence_ranges(text, target_text)
+                if not ranges:
+                    incidents.append(FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=TIER_MODEL_TARGET,
+                        reason="target_not_found",
+                        detail=f"target_text {target_text!r} not found in translation",
+                    ))
+                    continue
+                loc = find_nonoverlapping_occurrence(text, target_text, occurrence, occupied)
+                if loc is None:
+                    # Distinguish overlap vs not-found: if any occurrence exists, it's overlap
+                    incidents.append(FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=TIER_MODEL_TARGET,
+                        reason="overlap",
+                        detail=f"target_text {target_text!r} occurrence {occurrence} overlaps occupied range",
+                    ))
+                    continue
+                start, end = loc
+                occupied.append((start, end))
+                span_mapping.append(SpanMappingRecord(
+                    pid=pid,
+                    span_id=span.span_id,
+                    tag=span.tag,
+                    source_text=span.text,
+                    translated_text=target_text,
+                    occurrence=occurrence,
+                    tier=TIER_MODEL_TARGET,
+                    start=start,
+                    end=end,
+                    attrs=dict(span.attrs),
+                    preserved=False,
+                ))
+    else:
+        # Legacy deterministic path (strict-runner backward-compat)
+        for pid, spans in span_map.items():
+            text = translation.get(pid, "")
+            if not text:
+                continue
+            occupied: List[Tuple[int, int]] = []
+            resolved, fuzzy_candidates, ambiguous, preserved_mismatch = _resolve_deterministic(
+                pid=pid, translation=text, spans=spans, occupied=occupied,
+            )
+            span_mapping.extend(resolved)
+            unresolved = fuzzy_candidates + ambiguous + preserved_mismatch
+            fuzzy_ids = {span.span_id for span in fuzzy_candidates}
+            mismatch_ids = {span.span_id for span in preserved_mismatch}
 
-        def _last_tier(span: SourceSpan) -> str:
-            if span.span_id in mismatch_ids:
-                return TIER_PRESERVED
-            if span.span_id in fuzzy_ids:
-                return TIER_FUZZY
-            return TIER_OCCURRENCE
+            def _last_tier(span: SourceSpan) -> str:
+                if span.span_id in mismatch_ids:
+                    return TIER_PRESERVED
+                if span.span_id in fuzzy_ids:
+                    return TIER_FUZZY
+                return TIER_OCCURRENCE
 
-        def _reason(span: SourceSpan) -> str:
-            if span.span_id in mismatch_ids:
-                return "preserved_tag_mismatch"
-            if span.span_id in fuzzy_ids:
-                return "target_not_found"
-            return "ambiguous_occurrence"
+            def _reason(span: SourceSpan) -> str:
+                if span.span_id in mismatch_ids:
+                    return "preserved_tag_mismatch"
+                if span.span_id in fuzzy_ids:
+                    return "target_not_found"
+                return "ambiguous_occurrence"
 
-        def _detail(span: SourceSpan) -> str:
-            if span.span_id in mismatch_ids:
+            def _detail(span: SourceSpan) -> str:
+                if span.span_id in mismatch_ids:
+                    return (
+                        "translation already carries inline markup that is "
+                        "malformed (unbalanced/orphaned tag) or whose tag "
+                        "sequence (count/order) does not match the source "
+                        "spans; never claimed, never re-wrapped (formatting is "
+                        "model-free by rule — unresolved spans are debt)"
+                    )
                 return (
-                    "translation already carries inline markup that is "
-                    "malformed (unbalanced/orphaned tag) or whose tag "
-                    "sequence (count/order) does not match the source "
-                    "spans; never claimed, never re-wrapped (formatting is "
+                    "no deterministic fragment found (formatting is "
                     "model-free by rule — unresolved spans are debt)"
                 )
-            return (
-                "no deterministic fragment found (formatting is "
-                "model-free by rule — unresolved spans are debt)"
-            )
 
-        if unresolved:
-            incidents.extend(
-                FormattingIncident(
-                    pid=pid, span_id=span.span_id, tier=_last_tier(span),
-                    reason=_reason(span),
-                    detail=_detail(span),
+            if unresolved:
+                incidents.extend(
+                    FormattingIncident(
+                        pid=pid, span_id=span.span_id, tier=_last_tier(span),
+                        reason=_reason(span),
+                        detail=_detail(span),
+                    )
+                    for span in unresolved
                 )
-                for span in unresolved
-            )
 
     for pid, spans in span_map.items():
         text = translation.get(pid, "")
         records_for_pid = [r for r in span_mapping if r.pid == pid]
         formatted[pid] = apply_span_mappings(text, records_for_pid)
 
-    # Marker-leakage guard (v3 "FMT marker leaked into final HTML"): the
-    # formatted text must never contain a placeholder of ours.
     for pid, text in formatted.items():
         if _MARKER_RE.search(text):
             raise AssertionError(

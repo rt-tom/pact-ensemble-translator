@@ -101,6 +101,26 @@ from pact_v4.phase1.glossary_candidates import (
 from pact_v4.phase1.memory import MemoryManager, atomic_write
 from pact_v4.runtime.bible_renderer import render_bible_section
 
+# v41 italics: formatting model-call defaults (mirror V3 Defaults["formatting"])
+_DEFAULT_FORMATTING_CFG: dict = {
+    "enabled": True,
+    "required": False,
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "top_k": 32,
+    "enable_thinking": False,
+    "max_tokens": 1600,
+    "generation_retries": 2,
+    "tags": ["em", "strong", "i", "b", "a"],
+    "required_tags": ["em", "strong", "i", "b", "a"],
+    "optional_tags": [],
+    "max_blocks_per_call": 12,
+    "retry_unresolved_spans": True,
+    "on_failure": "omit_tag",
+}
+# lenient default: do not block chapter on unresolved italics (debt)
+_DEFAULT_MAX_FORMATTING_INCIDENTS = 999
+
 LOG = logging.getLogger(__name__)
 
 BOOK_RUN_SCHEMA = "pact-v4-book-run/v1"
@@ -954,6 +974,9 @@ def run_book(
     media_target: str = "media",
     media_max_retries: int = 1,
     media_exec_host: Optional[str] = None,
+    formatting_cfg: Optional[Mapping[str, Any]] = None,
+    formatting_client: Optional[Any] = None,
+    max_formatting_incidents: int = _DEFAULT_MAX_FORMATTING_INCIDENTS,
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
@@ -1021,6 +1044,87 @@ def run_book(
             error_msg = result.get("error")
 
         quarantined = _quarantined_chunks_from_record(out_dir)
+
+        # v41 italics: formatting restoration (per-chapter B7/B9). After
+        # finalization (post-repair/edit) the plain Russian translation is
+        # wrapped with <em> via a targeted model-call (resolve_format_mappings)
+        # + deterministic wrap (run_formatting_align). Plain translation stays
+        # plain until this point (phase2/prompts.py untouched). Lenient debt
+        # policy: unresolved spans become FormattingIncident debt, chapter does
+        # not fail. Source html is available via chapter_html_pattern.
+        if terminal_status in _PROMOTING_STATUSES:
+            try:
+                fmt_cfg = dict(_DEFAULT_FORMATTING_CFG)
+                if formatting_cfg:
+                    fmt_cfg.update(dict(formatting_cfg))
+                # formatting disabled or no inline spans -> no model call, still write report via wrap path
+                if fmt_cfg.get("enabled", True) and chapter_html.exists():
+                    _trans_path = out_dir / "translations.json"
+                    _translations = _load_json(_trans_path, {})
+                    if _translations:
+                        try:
+                            from pact_v4.phase5.formatting import (
+                                FORMATTING_POLICY_VERSION,
+                                resolve_format_mappings,
+                                run_formatting_align,
+                            )
+                        except Exception:
+                            raise
+                        _blocks = parse_source_html(chapter_html.read_text(encoding="utf-8-sig"))
+                        has_spans = any(b.inline_spans for b in _blocks)
+                        if has_spans:
+                            # Resolve target_text via model (only PIDs with spans)
+                            _mappings: dict = {}
+                            if formatting_client is not None:
+                                _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations)
+                            else:
+                                # No client injected (e.g. real run without explicit client):
+                                # produce empty mappings -> spans become lenient debt, report still written.
+                                # Caller can inject formatting_client for actual model-call.
+                                _mappings = {}
+                            # Determine backend hash for report (from run_record lifecycle if available)
+                            _backend_hash = ""
+                            try:
+                                _backend_hash = str((run_record.get("identities") or {}).get("backend_identity_hash") or run_record.get("backend_identity_hash") or "")
+                            except Exception:
+                                _backend_hash = ""
+                            if not _backend_hash:
+                                import hashlib as _hashlib
+                                _backend_hash = _hashlib.sha256(chapter_id.encode("utf-8")).hexdigest()[:16]
+                            _outcome = run_formatting_align(
+                                blocks=_blocks,
+                                translation=_translations,
+                                backend_identity_hash=_backend_hash,
+                                policy_version=FORMATTING_POLICY_VERSION,
+                                max_formatting_incidents=int(max_formatting_incidents),
+                                mappings=_mappings,
+                            )
+                            # Overwrite translations.json with formatted text (with <em>)
+                            _formatted_map = dict(_outcome.formatted_text)
+                            atomic_write(str(_trans_path), _formatted_map)
+                            # Write formatting_report.json next to translations.json
+                            (_trans_path.parent / "formatting_report.json").write_text(
+                                json.dumps(_outcome.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8"
+                            )
+                        else:
+                            # No inline spans in chapter -> ensure formatting_report exists (empty)
+                            try:
+                                from pact_v4.phase5.formatting import FORMATTING_POLICY_VERSION as _FPV, run_formatting_align as _RFA
+                                _empty_blocks: list = []
+                                _backend_hash2 = ""
+                                try:
+                                    _backend_hash2 = str((run_record.get("identities") or {}).get("backend_identity_hash") or "")
+                                except Exception:
+                                    pass
+                                if not _backend_hash2:
+                                    import hashlib as _hashlib2
+                                    _backend_hash2 = _hashlib2.sha256(chapter_id.encode("utf-8")).hexdigest()[:16]
+                                _out2 = _RFA(blocks=_empty_blocks, translation=_translations, backend_identity_hash=_backend_hash2, policy_version=_FPV, max_formatting_incidents=int(max_formatting_incidents), mappings={})
+                                (_trans_path.parent / "formatting_report.json").write_text(json.dumps(_out2.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8")
+                            except Exception:
+                                pass
+            except Exception as exc:  # noqa: BLE001 -- formatting debt, never break a run
+                LOG.warning("v41 formatting step skipped for %s: %s", chapter_id, exc)
 
         # GLOSSARY-FROM-ENTITY (owner decision 2026-08-15, variant B): the
         # deterministic B9 scan (generate_candidates + v3-threshold
@@ -1572,6 +1676,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--media-root", type=str, default="/home/rt/pact_runs", help="Media store root")
     parser.add_argument("--media-target", type=str, default="media", help="SSH target for media (default 'media')")
     parser.add_argument("--media-exec-host", type=str, default=None, choices=["media", "rt"], help="Trusted execution host for media sync (media vs rt); auto-detected from platform/env when omitted")
+    # v41 formatting (lenient debt) — mirror V3 formatting cfg, max incidents soft by default
+    parser.add_argument("--max-formatting-incidents", type=int, default=_DEFAULT_MAX_FORMATTING_INCIDENTS, help="v41 italics: max formatting incidents before blocking (lenient debt default 999)")
+    parser.add_argument("--formatting-enabled", action="store_true", default=True, help="Enable v41 italics formatting (default: enabled)")
+    parser.add_argument("--no-formatting", dest="formatting_enabled", action="store_false", help="Disable v41 italics formatting")
     return parser
 
 
@@ -1583,6 +1691,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # exactly the same input (no divergent duplicate flag).
     for entry in (args.mixed_script_allow or ()):
         extra += ["--mixed-script-allow", str(entry)]
+    _fmt_cfg: dict = dict(_DEFAULT_FORMATTING_CFG)
+    _fmt_cfg["enabled"] = bool(args.formatting_enabled)
     result = run_book(
         memory_dir=args.memory_dir,
         chapter_ids=args.chapters,
@@ -1603,6 +1713,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         media_root=args.media_root,
         media_target=args.media_target,
         media_exec_host=args.media_exec_host,
+        formatting_cfg=_fmt_cfg,
+        max_formatting_incidents=int(args.max_formatting_incidents),
     )
     failed = 0
     for rec in result["chapters"]:
