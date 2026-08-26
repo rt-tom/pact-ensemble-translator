@@ -13,7 +13,7 @@
 
 ## 3. Media state synchronization integration
 
-- [ ] 3.1 Apply default simple-remote media arguments (`book-id=1`, `target=media-snap`, `root=/home/rt/pact_runs`) with an explicit safe book-id override — verify: dispatcher/book-run tests assert exact forwarding and override behavior.
+- [ ] 3.1 Apply default media arguments (`book-id=1`, `target=media-snap`, `root=/home/rt/pact_runs`) to every simple local/remote book mode with an explicit safe book-id override — verify: dispatcher/book-run tests assert RT local and remote pre-init fetch/post-promotion forwarding plus override behavior.
 - [ ] 3.2 Add a media-host local restricted-facade transport path with behavior equivalent to the reviewed SSH facade and no self-SSH — verify: transport tests assert the media path does not spawn SSH and preserves allowlist/rejection behavior.
 - [ ] 3.3 Stop creating a duplicate `memory_dir/state/` mirror during current-state fetch while retaining root canonical files, `CURRENT.json`, and `manifest.json` — verify: snapshot tests assert no nested state copy and existing root-state consumers still pass.
 - [ ] 3.4 Emit one final machine-readable and human-readable `MEDIA PUBLISH: ACCEPTED` or `REJECTED` verdict with revision/reason evidence, and return non-zero for failed/missing confirmation — verify: book-run tests cover accepted, rejected, transport failure, and missing confirmation.

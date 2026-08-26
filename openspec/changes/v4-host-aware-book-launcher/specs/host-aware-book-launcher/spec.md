@@ -34,7 +34,11 @@ The book preflight SHALL validate the entire resolved requested source range and
 - **THEN** preflight SHALL return non-zero with the missing chapter number and source root before pipeline startup
 
 ### Requirement: State-only media synchronization is host-safe
-Simple remote book mode SHALL default to media book id `1`, media target `media-snap`, and media root `/home/rt/pact_runs`, with an explicit book-id override for another book. It SHALL use the existing fail-closed state-only synchronization contract and report a terminal media acceptance or rejection verdict. On media, it SHALL use an equivalent local restricted facade path rather than require a self-SSH connection. Fetching state SHALL materialize the four canonical mutable JSON files only at the selected mutable state root; it SHALL NOT create a duplicate `state/` mirror there.
+Every simple book mode, local or remote, SHALL default to media book id `1`, media target `media-snap`, and media root `/home/rt/pact_runs`, with an explicit book-id override for another book. Before mutable book state initialization, it SHALL fetch the current media state; after an accepted local promotion, it SHALL use the existing fail-closed state-only synchronization contract and report a terminal media acceptance or rejection verdict. On media, it SHALL use an equivalent local restricted facade path rather than require a self-SSH connection. Fetching state SHALL materialize the four canonical mutable JSON files only at the selected mutable state root; it SHALL NOT create a duplicate `state/` mirror there.
+
+#### Scenario: RT local publication is accepted
+- **WHEN** an RT simple local run promotes a chapter and the media facade accepts the state candidate
+- **THEN** the command SHALL print `MEDIA PUBLISH: ACCEPTED` with the returned revision evidence
 
 #### Scenario: RT remote publication is accepted
 - **WHEN** an RT simple remote run promotes a chapter and the media facade accepts the state candidate
