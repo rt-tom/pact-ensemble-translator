@@ -1010,8 +1010,10 @@ def _build_formatting_client(args, extra, fmt_cfg):
         rc_path = str(getattr(args, "runtime_config"))
     if translator is None and hasattr(args, "translator") and getattr(args, "translator", None):
         translator = str(getattr(args, "translator"))
-    if rc_path is None and translator is None and reviewer is None:
-        return None
+    if reviewer is None and hasattr(args, "reviewer") and getattr(args, "reviewer", None):
+        reviewer = str(getattr(args, "reviewer"))
+    if providers_cfg is None and hasattr(args, "providers_config") and getattr(args, "providers_config", None):
+        providers_cfg = str(getattr(args, "providers_config"))
     try:
         backend = None
         runtime = None
@@ -1028,7 +1030,32 @@ def _build_formatting_client(args, extra, fmt_cfg):
                 tmp.providers_config = Path(providers_cfg) if providers_cfg else None
                 backend = _apf(tmp, backend)
         else:
-            return None
+            # Historical local default — same backend as strict-runner run_local_default
+            # (required so the ordinary CLI path without --runtime-config still resolves
+            # formatting via the generator role instead of falling back to debt).
+            from pact_full_pipeline_runner_v1.v4_phase12_strict_run import GEMMA_PATH, QWEN_PATH, QWEN_SERVER_ARGS, _gemma_server_args_for_reasoning
+            from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig
+            backend = LocalLlamaBackendConfig(
+                exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+                device="SYCL0",
+                host="127.0.0.1",
+                model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
+                model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
+                server_args={"gemma": _gemma_server_args_for_reasoning(0), "qwen": list(QWEN_SERVER_ARGS)},
+                port=8094,
+            )
+            if translator or reviewer:
+                try:
+                    from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _apply_provider_flags as _apf2
+                    class _Tmp2:
+                        pass
+                    tmp2 = _Tmp2()
+                    tmp2.translator = translator
+                    tmp2.reviewer = reviewer
+                    tmp2.providers_config = Path(providers_cfg) if providers_cfg else None
+                    backend = _apf2(tmp2, backend)
+                except Exception:
+                    pass
         if backend is None:
             return None
         log_dir = Path(getattr(args, "memory_dir", Path("/tmp"))) / "server_logs_fmt" if hasattr(args, "memory_dir") else Path("/tmp")
