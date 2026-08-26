@@ -1,0 +1,25 @@
+## 1. Host-aware book layout and source resolution
+
+- [ ] 1.1 Add a declarative RT/media launcher-layout contract with the approved RT roots and isolated media worker state/output roots — verify: unit tests resolve each host layout and reject a source/state path collision.
+- [ ] 1.2 Implement safe numeric source discovery for exactly one regular non-symlink `NNNN_*.html` per requested chapter — verify: tests cover variable suffix success, zero matches, multiple matches, symlink/non-regular rejection, and actual full-ID forwarding.
+- [ ] 1.3 Extend book check-only preflight with source-range readability and state/output readiness checks without directory creation or network/state-sync side effects — verify: preflight/JSON tests assert reports and failure behavior for RT-like Windows and media-like Linux fixture layouts.
+
+## 2. Simple command and remote policy
+
+- [ ] 2.1 Implement mutually exclusive `book --local` and `book --remote <translator>/<reviewer>` selection while retaining explicit `--runtime-config` advanced compatibility — verify: dispatcher tests cover valid selection, invalid combinations, and exact delegated argv/exit propagation.
+- [ ] 2.2 Make all book modes inject `--whole-chapter`; make simple remote mode inject `--managed-server` and resolve remote defaults — verify: forwarding tests prove defaults and reject incompatible explicit topology choices.
+- [ ] 2.3 Update the canonical remote example to reasoning `3`, Muse Free generator/repair, Luna standard reviewer bindings, and explicit entity-extractor binding — verify: runtime-config/profile tests assert bindings, reasoning transport, identity, and provider-registry resolution without provider contact.
+- [ ] 2.4 Update safe help and preflight output for host roots, source discovery, local/remote modes, whole-chapter, managed-server, model/reasoning defaults, and advanced compatibility — verify: help/check-only tests have no pipeline, lifecycle, provider, state-sync, or artifact side effects.
+
+## 3. Media state synchronization integration
+
+- [ ] 3.1 Apply default simple-remote media arguments (`book-id=1`, `target=media-snap`, `root=/home/rt/pact_runs`) with an explicit safe book-id override — verify: dispatcher/book-run tests assert exact forwarding and override behavior.
+- [ ] 3.2 Add a media-host local restricted-facade transport path with behavior equivalent to the reviewed SSH facade and no self-SSH — verify: transport tests assert the media path does not spawn SSH and preserves allowlist/rejection behavior.
+- [ ] 3.3 Stop creating a duplicate `memory_dir/state/` mirror during current-state fetch while retaining root canonical files, `CURRENT.json`, and `manifest.json` — verify: snapshot tests assert no nested state copy and existing root-state consumers still pass.
+- [ ] 3.4 Emit one final machine-readable and human-readable `MEDIA PUBLISH: ACCEPTED` or `REJECTED` verdict with revision/reason evidence, and return non-zero for failed/missing confirmation — verify: book-run tests cover accepted, rejected, transport failure, and missing confirmation.
+
+## 4. Validation and documentation
+
+- [ ] 4.1 Add focused regression tests across runtime profile, dispatcher, book run, and snapshot transport boundaries — verify: run the narrowest relevant pytest suites and `python -m compileall` for changed Python modules.
+- [ ] 4.2 Update v4 operator documentation with the supported simple commands, canonical RT/media paths, source naming rules, media prerequisites, and explicit no-live-run boundary — verify: documentation/link review and `openspec validate v4-host-aware-book-launcher --strict` pass.
+- [ ] 4.3 Perform pact-dev self-review and independent pact-rev review in the same isolated implementation worktree before any merge — verify: review verdict follows the project `APPROVED`/`REQUEST_CHANGES` workflow and recorded checks cover the declared scope.
