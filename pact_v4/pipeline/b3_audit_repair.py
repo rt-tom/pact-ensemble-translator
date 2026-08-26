@@ -4432,9 +4432,26 @@ class B3AuditRepair:
                 repair_complete=repair_outcome.repair_complete,
                 skipped=repair_outcome.skipped,
             )
+            self._emit_progress(
+                "repair_round",
+                round=1,
+                eligible_count=repair_outcome.eligible_count,
+                committed_pids=[pid for pid, _ in repair_outcome.committed],
+                passed_pids=list(repair_outcome.passed_pids),
+                debt_trace=list(repair_outcome.debt_trace),
+                warnings=list(repair_outcome.warnings),
+                repair_complete=repair_outcome.repair_complete,
+            )
             reaudit = repair_outcome.reaudit
             if reaudit is not None:
                 journal.emit(
+                    "reaudit_scope",
+                    scope_pids=list(reaudit.scope),
+                    full=reaudit.full,
+                    issue_count=len(reaudit.issues),
+                    failed=reaudit.failed,
+                )
+                self._emit_progress(
                     "reaudit_scope",
                     scope_pids=list(reaudit.scope),
                     full=reaudit.full,

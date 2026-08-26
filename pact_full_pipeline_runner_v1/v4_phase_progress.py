@@ -1530,6 +1530,136 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]], snapshot: Op
             f"перевод {translation_words} слов")
 
 
+def _phase_r_editor_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
+    """R-editor line from ``phase_progress.ndjson`` mirrored B3 events.
+
+    Source of truth when those events are present (see Finding 1):
+    ``r_editor_chunk_started``/``r_editor_chunk_done``/``r_editor_done``
+    mirrored by ``B3AuditRepair._emit_progress``. Returns None when no
+    such events exist so the caller can fall back to ``audit_cache``/
+    ``audit_journal``.
+    """
+    r_done_chunks = [e for e in events if e.get("event") == "r_editor_chunk_done"]
+    r_started_chunks = [e for e in events if e.get("event") == "r_editor_chunk_started"]
+    r_done = [e for e in events if e.get("event") == "r_editor_done"]
+    if not r_done_chunks and not r_started_chunks and not r_done:
+        return None
+    totals = [e.get("total") for e in (r_done_chunks + r_started_chunks) if isinstance(e.get("total"), int) and not isinstance(e.get("total"), bool)]
+    total: Optional[int] = totals[-1] if totals else None
+    done = len(r_done_chunks)
+    if total is not None and isinstance(done, int) and done > total:
+        done = total
+    applied = 0
+    candidates = 0
+    if r_done:
+        last = r_done[-1]
+        if "applied_count" in last or "candidate_count" in last:
+            applied = _as_int(last.get("applied_count"))
+            candidates = _as_int(last.get("candidate_count"))
+        else:
+            applied = sum(_as_int(e.get("edit_count")) for e in r_done_chunks)
+            candidates = 0
+        if total is not None:
+            return f"R-editor: chunks done={done}/{total} | safe (применено)={applied} | review (предложено)={candidates}"
+        cc = last.get("chunk_count")
+        if isinstance(cc, int) and not isinstance(cc, bool) and cc >= 0:
+            if done > cc:
+                done = cc
+            return f"R-editor: chunks done={done}/{cc} | safe (применено)={applied} | review (предложено)={candidates}"
+        return f"R-editor: chunks done={done} | safe (применено)={applied} | review (предложено)={candidates}"
+    applied = sum(_as_int(e.get("edit_count")) for e in r_done_chunks)
+    if total is not None:
+        return f"R-editor: chunks done={done}/{total} | safe (применено)={applied} | review (предложено)={candidates}"
+    return f"R-editor: chunks done={done} | safe (применено)={applied} | review (предложено)={candidates}"
+
+
+def _phase_audit_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
+    """Chapter audit line from ``phase_progress.ndjson`` mirrored B3 events.
+
+    Source of truth when ``audit_chunk_*``/``b3_audit_done`` events are
+    present. Falls back to cache only when no such events exist.
+    """
+    started = [e for e in events if e.get("event") == "audit_chunk_started"]
+    done = [e for e in events if e.get("event") == "audit_chunk_done"]
+    b3_done = [e for e in events if e.get("event") == "b3_audit_done"]
+    if not started and not done and not b3_done:
+        return None
+    totals = [e.get("total") for e in (done + started) if isinstance(e.get("total"), int) and not isinstance(e.get("total"), bool)]
+    total: Optional[int] = totals[-1] if totals else None
+    if total is None and b3_done:
+        cc = b3_done[-1].get("chunk_count")
+        if isinstance(cc, int) and not isinstance(cc, bool) and cc >= 0:
+            total = cc
+    done_n = len(done)
+    if total is not None and isinstance(done_n, int) and done_n > total:
+        done_n = total
+    sorted_done = sorted(done, key=lambda e: _as_int(e.get("chunk"), 9999) if e.get("chunk") is not None else 9999)
+    findings = [_as_int(e.get("issue_count")) for e in sorted_done]
+    total_issues = sum(findings)
+    if b3_done and b3_done[-1].get("issue_count") is not None:
+        # Prefer explicit issue_count from the terminal event when present;
+        # keep sum as fallback.
+        try:
+            explicit = int(b3_done[-1].get("issue_count"))
+            if explicit >= 0:
+                total_issues = explicit
+        except (TypeError, ValueError):
+            pass
+    if total is not None:
+        return f"Chapter audit: chunks done={done_n}/{total} | findings per chunk: {findings} | всего {total_issues}"
+    return f"Chapter audit: chunks done={done_n} | findings per chunk: {findings} | всего {total_issues}"
+
+
+def _phase_repair_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
+    """Selective repair line from ``phase_progress.ndjson`` mirrored B3 events.
+
+    Source of truth when ``repair_round``/``b3_repair_done`` events are
+    present. Falls back to cache only when absent.
+    """
+    repair_rounds = [e for e in events if e.get("event") == "repair_round"]
+    repair_dones = [e for e in events if e.get("event") in ("b3_repair_done", "repair_done")]
+    if not repair_rounds and not repair_dones:
+        return None
+    if repair_rounds:
+        last = repair_rounds[-1]
+        eligible = _as_int(last.get("eligible_count"))
+        committed_raw = last.get("committed_pids")
+        if isinstance(committed_raw, list):
+            committed_n = len(committed_raw)
+        elif isinstance(committed_raw, dict):
+            committed_n = len(committed_raw)
+        else:
+            committed_n = _as_int(committed_raw)
+        # Single repair round -> batches done=1/1 with per-batch repaired/eligible
+        per = f"{committed_n}/{eligible}" if eligible or committed_n else f"{committed_n}/0"
+        # Try to infer per-batch breakdown if available (batches field)
+        batches = last.get("batches")
+        if isinstance(batches, list) and batches:
+            per_parts = []
+            for b in batches:
+                if not isinstance(b, dict):
+                    continue
+                fr = b.get("findings")
+                fcnt = len(fr) if isinstance(fr, list) else _as_int(fr)
+                rr = b.get("results")
+                riter = rr if isinstance(rr, list) else ()
+                repaired = sum(1 for r in riter if isinstance(r, dict) and str(r.get("decision")).lower() == "repair")
+                per_parts.append(f"{repaired}/{fcnt}")
+            per = ", ".join(per_parts) if per_parts else per
+            return f"Selective repair: batches done={len(batches)}/{len(batches)} | repaired per batch: [{per}] | findings eligible: {eligible} | PID edits committed: {committed_n}"
+        return f"Selective repair: batches done=1/1 | repaired per batch: [{per}] | findings eligible: {eligible} | PID edits committed: {committed_n}"
+    # Only b3_repair_done without a round
+    last = repair_dones[-1]
+    committed_raw = last.get("committed_pids")
+    if isinstance(committed_raw, list):
+        committed_n = len(committed_raw)
+    elif isinstance(committed_raw, dict):
+        committed_n = len(committed_raw)
+    else:
+        committed_n = _as_int(committed_raw)
+    return f"Selective repair: batches done=1/1 | repaired per batch: [] | findings eligible: 0 | PID edits committed: {committed_n}"
+
+
 def _phase_r_editor(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """R_editor line from ``audit_cache_b3.json``.
 
@@ -1824,6 +1954,47 @@ def _phase_repair(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> O
             f"| findings eligible: {eligible_count} | PID edits committed: {committed_count}")
 
 
+def _phase_reaudit_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
+    """Re-audit line from ``phase_progress.ndjson`` mirrored B3 events."""
+    reaudit_events = [e for e in events if e.get("event") in ("reaudit_scope", "reaudit_chunk_done", "reaudit_chunk_started")]
+    if not reaudit_events:
+        return None
+    # Use reaudit_scope last event for residual/debt hint
+    scope_events = [e for e in events if e.get("event") == "reaudit_scope"]
+    if scope_events:
+        last = scope_events[-1]
+        issues = last.get("issues")
+        if isinstance(issues, list):
+            residual = len(issues)
+        else:
+            residual = _as_int(last.get("issue_count"))
+        failed = bool(last.get("failed"))
+        complete = last.get("complete")
+        # Determine done/total from chunk events if present
+        chunk_done = [e for e in events if e.get("event") == "reaudit_chunk_done"]
+        # Try total from any reaudit event
+        totals = [e.get("total") for e in events if e.get("event") in ("reaudit_chunk_started","reaudit_chunk_done") and isinstance(e.get("total"), int)]
+        total = totals[-1] if totals else (len(chunk_done) if chunk_done else None)
+        done = len(chunk_done) if chunk_done else (1 if scope_events else 0)
+        if total is not None and done > total:
+            done = total
+        debt = 1 if failed or not complete else 0
+        if total is not None:
+            return f"Re-audit scope: chunks done={done}/{total} | residual: {residual} | debt: {debt}"
+        return f"Re-audit scope: chunks done={done} | residual: {residual} | debt: {debt}"
+    # Fallback: only chunk events
+    chunk_done = [e for e in events if e.get("event") == "reaudit_chunk_done"]
+    if chunk_done:
+        done = len(chunk_done)
+        totals = [e.get("total") for e in chunk_done if isinstance(e.get("total"), int)]
+        total = totals[-1] if totals else done
+        if done > total:
+            done = total
+        residual = 0
+        return f"Re-audit scope: chunks done={done}/{total} | residual: {residual} | debt: 0"
+    return None
+
+
 def _phase_reaudit(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Re-audit line from ``audit_cache_b3.json``.
 
@@ -1905,24 +2076,36 @@ def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]], snapshot: Op
     )
 
     def _r_editor(d: Path) -> Optional[str]:
+        ev = _phase_r_editor_from_events(events)
+        if ev is not None:
+            return ev
         if _cache_malformed:
             return ("R-editor: audit_cache_b3.json present but malformed "
                     "(fail-closed)")
         return _phase_r_editor(d, snapshot)
 
     def _audit(d: Path) -> Optional[str]:
+        ev = _phase_audit_from_events(events)
+        if ev is not None:
+            return ev
         if _cache_malformed:
             return ("Chapter audit: audit_cache_b3.json present but malformed "
                     "(fail-closed)")
         return _phase_audit(d, snapshot)
 
     def _repair(d: Path) -> Optional[str]:
+        ev = _phase_repair_from_events(events)
+        if ev is not None:
+            return ev
         if _cache_malformed:
             return ("Selective repair: audit_cache_b3.json present but "
                     "malformed (fail-closed)")
         return _phase_repair(d, snapshot)
 
     def _reaudit(d: Path) -> Optional[str]:
+        ev = _phase_reaudit_from_events(events)
+        if ev is not None:
+            return ev
         if _cache_malformed:
             return ("Re-audit scope: audit_cache_b3.json present but "
                     "malformed (fail-closed)")

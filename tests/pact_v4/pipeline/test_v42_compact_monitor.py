@@ -16,7 +16,7 @@ from pact_v4.pipeline.phase_progress import PHASE_PROGRESS_FILENAME
 from pact_v4.pipeline.usage_record import USAGE_FILENAME
 from pact_v4.runtime.backend_protocol import CompletionRequest, CompletionResponse, Message, BackendDescriptor
 from pact_v4.runtime.runtime_coordinator import BackendDescriptor as BD
-from tests.pact_v4.pipeline.test_v4_phase12_strict_runner_b3 import _B3MockBackend, _whole_chapter_cfg
+from tests.pact_v4.pipeline.test_v4_phase12_strict_runner_b3 import _B3MockBackend, _DefectiveWholeChapterCaller, _whole_chapter_cfg
 from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _make_router
 from pact_v4.pipeline.v4_phase12_strict_runner import run_chapter_strict
 
@@ -42,12 +42,13 @@ class _SinkB3Backend(_B3MockBackend):
         # Simulate local server_logs parsing: prompt_tokens / n_decoded -> input/output tokens
         if self._sink is not None:
             from pact_v4.runtime.backend_protocol import BackendCallRecord
-            # Provide tokens >0 for every call
+            # Provide tokens >0 for every call; unique session_id per backend instance
+            # avoids UsageRecordWriter durable dedup (session_id+request_id) collision
             rec = BackendCallRecord(
                 label=request.label or "b3_label",
                 model_ref="local/llama",
-                request_id=f"req_{len(self.requests)}",
-                session_id="ses_local",
+                request_id=f"req_{id(self)}_{len(self.requests)}",
+                session_id=f"ses_{id(self)}",
                 retry_count=0,
                 finish_reason="stop",
                 usage={"input_tokens": 123, "output_tokens": 456, "reasoning_tokens": 0},
@@ -64,34 +65,76 @@ class _WrappedView:
         self._sink = None
     def set_usage_sink(self, sink):
         self._sink = sink
-        # also forward to wrapped
+        # also forward to wrapped so both wrapper and inner record usage
         if hasattr(self._wrapped, "set_usage_sink"):
             self._wrapped.set_usage_sink(sink)
+    def complete(self, request):
+        return self._wrapped.complete(request)
+    @property
+    def descriptor(self):
+        return self._wrapped.descriptor
+    def close(self):
+        return self._wrapped.close()
+    def call_records(self):
+        return self._wrapped.call_records()
 
 def test_local_whole_chapter_b3_sink_writes_usage(tmp_path: Path):
-    # Whole-chapter local with B3 audit/repair; should write usage with tokens >0 via sink on _audit/_repair/_entity
+    # Whole-chapter local with B3 audit/repair; must exercise three distinct
+    # backends (audit / repair / wrapped entity) with tokenized usage.
     cfg = _whole_chapter_cfg(tmp_path)
-    backend = _SinkB3Backend(audit_issues=[], repair_results=[], reaudit_issues=[])
-    # Create bundle with separate backends to test wrapping
-    entity_backend = _SinkB3Backend()
-    # Wrap entity to test _wrapped path
-    wrapped_entity = _WrappedView(entity_backend)
-    bundle = B3AuditRepair(audit_backend=backend, repair_backend=backend, entity_backend=wrapped_entity, config=B3AuditRepairConfig(entity_context_enabled=False))
+    _audit_backend = _SinkB3Backend(
+        audit_issues=[{"id": "p00001", "category": "addition", "severity": "major", "confidence": "high", "note": "dup", "excerpt": "номер1 номер1"}],
+        repair_results=[],
+        reaudit_issues=[],
+    )
+    _repair_backend = _SinkB3Backend(
+        audit_issues=[],
+        repair_results=[{"index": 1, "decision": "repair", "pid": "p00001", "repaired_translation": "<current> fixed", "reason": "fix"}],
+        reaudit_issues=[],
+    )
+    _entity_inner = _SinkB3Backend()
+    wrapped_entity = _WrappedView(_entity_inner)
+    bundle = B3AuditRepair(
+        audit_backend=_audit_backend,
+        repair_backend=_repair_backend,
+        entity_backend=wrapped_entity,
+        config=B3AuditRepairConfig(entity_context_enabled=True),
+    )
     router = _make_router()
-    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _LifecycleAwareModelCaller, StubModelCaller, _LifecycleAwareQwen, _LifecycleAwareGemmaSelector, _LifecycleAwareQwenAudit, _LifecycleAwareGemmaAudit, StubQwen, StubGemma, StubQwenAudit, StubGemmaAudit
-    result = run_chapter_strict(cfg, router=router, model_caller=_LifecycleAwareModelCaller(router, StubModelCaller()), qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()), gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()), qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()), gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()), b3_audit_repair=bundle)
-    # Check sink was wired for audit/repair/entity
-    assert backend._sink is not None, "audit/repair sink not wired"
-    assert wrapped_entity._sink is not None or entity_backend._sink is not None, "entity sink not wired via wrapped"
+    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _LifecycleAwareModelCaller, StubQwen, StubGemma, StubQwenAudit, StubGemmaAudit, _LifecycleAwareQwen, _LifecycleAwareGemmaSelector, _LifecycleAwareQwenAudit, _LifecycleAwareGemmaAudit
+    result = run_chapter_strict(cfg, router=router, model_caller=_LifecycleAwareModelCaller(router, _DefectiveWholeChapterCaller()), qwen_evaluator=_LifecycleAwareQwen(router, StubQwen()), gemma_selector=_LifecycleAwareGemmaSelector(router, StubGemma()), qwen_audit_evaluator=_LifecycleAwareQwenAudit(router, StubQwenAudit()), gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()), b3_audit_repair=bundle)
+    # Distinct sinks must be wired for all three paths (wrapped view forwards to inner)
+    assert _audit_backend._sink is not None, "audit sink not wired"
+    assert _repair_backend._sink is not None, "repair sink not wired"
+    assert wrapped_entity._sink is not None, "wrapped entity sink not wired"
+    assert _entity_inner._sink is not None, "wrapped entity inner sink not wired via _wrapped"
+    # Each backend must have been actually called (entity prepass + audit + repair)
+    assert _audit_backend.audit_calls() > 0, "audit backend never called"
+    assert _repair_backend.repair_calls() > 0, "repair backend never called (empty audit issues?)"
+    assert _entity_inner.entity_calls() > 0, "wrapped entity backend never called (entity_context_enabled=False?)"
+    assert _audit_backend.sink_calls > 0
+    assert _repair_backend.sink_calls > 0
+    assert _entity_inner.sink_calls > 0
     path = cfg.out_dir / USAGE_FILENAME
     assert path.exists(), "usage.ndjson not written for local B3"
     rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert rows, "no usage rows"
+    # Every row must be tokenized
     for r in rows:
         assert r.get("input_tokens", 0) > 0, f"row missing input_tokens >0: {r}"
         assert r.get("output_tokens", 0) > 0, f"row missing output_tokens >0: {r}"
-    # Also ensure that at least one row corresponds to audit/repair
-    assert backend.sink_calls > 0
+    # Usage rows per backend path (label distinguishes the three)
+    def _has_label(substr: str) -> bool:
+        return any(substr in str(r.get("label", "")) for r in rows)
+    # Audit / repair labels contain their phase names; entity extractor label contains entity_extractor
+    assert _has_label("qwen_chapter_audit") or _has_label("audit"), f"no audit usage row, labels={[r.get('label') for r in rows]}"
+    assert _has_label("selective_repair") or _has_label("repair"), f"no repair usage row, labels={[r.get('label') for r in rows]}"
+    assert _has_label("entity_extractor") or _has_label("entity"), f"no entity usage row, labels={[r.get('label') for r in rows]}"
+    # Tokenized rows per path (at least one row per backend has tokens>0)
+    for substr in ("audit", "repair", "entity"):
+        matching = [r for r in rows if substr in str(r.get("label", "")).lower()]
+        assert matching, f"no usage row for {substr}"
+        assert any(r.get("input_tokens", 0) > 0 and r.get("output_tokens", 0) > 0 for r in matching), f"{substr} rows not tokenized"
 
 def test_compact_6_lines_local_and_remote(tmp_path: Path):
     # Synthetic 31-chapter-like setup
