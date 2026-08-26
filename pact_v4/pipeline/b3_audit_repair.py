@@ -3459,6 +3459,7 @@ class B3AuditRepair:
                     chunk=fields.get("chunk"),
                     total=fields.get("total"),
                 )
+                self._emit_progress("r_editor_chunk_started", chunk=fields.get("chunk"), total=fields.get("total"))
             elif kind == "retry":
                 # R-RETRY (t_8ab8ab35): a bounded retry attempt (transport
                 # or invalid JSON/empty body) is journaled so retry
@@ -3472,6 +3473,7 @@ class B3AuditRepair:
                     error=fields.get("error"),
                     delay=fields.get("delay"),
                 )
+                self._emit_progress("r_editor_chunk_retry", chunk=fields.get("chunk"), attempt=fields.get("attempt"), total=fields.get("total"), error=fields.get("error"), delay=fields.get("delay"))
             else:
                 journal.emit(
                     "r_editor_chunk_done",
@@ -3485,6 +3487,7 @@ class B3AuditRepair:
                     # cache (0 model calls), not freshly edited.
                     reused=fields.get("reused"),
                 )
+                self._emit_progress("r_editor_chunk_done", chunk=fields.get("chunk"), total=fields.get("total"), status=fields.get("status"), edit_count=fields.get("edit_count", 0), warning_count=fields.get("warning_count", 0), error=fields.get("error"), reused=fields.get("reused"))
 
         evaluator = RussianEditorEvaluator(
             self._audit_backend,
@@ -4043,6 +4046,7 @@ class B3AuditRepair:
                         total=fields.get("total"),
                         sub=fields.get("sub") or "",
                     )
+                    self._emit_progress("audit_chunk_started", chunk=fields.get("chunk"), total=fields.get("total"), sub=fields.get("sub") or "")
                 elif kind == "retry":
                     # R-RETRY (t_8ab8ab35): a TRANSPORT_ERROR chunk is retried
                     # with a NEW session — the retry attempt is journaled so
@@ -4055,6 +4059,7 @@ class B3AuditRepair:
                         error=fields.get("error"),
                         delay=fields.get("delay"),
                     )
+                    self._emit_progress("audit_chunk_retry", chunk=fields.get("chunk"), total=fields.get("total"), attempt=fields.get("attempt"), error=fields.get("error"), delay=fields.get("delay"))
                 else:
                     journal.emit(
                         "audit_chunk_done",
@@ -4072,6 +4077,7 @@ class B3AuditRepair:
                         # partial cache (0 model calls), not freshly audited.
                         reused=fields.get("reused"),
                     )
+                    self._emit_progress("audit_chunk_done", chunk=fields.get("chunk"), total=fields.get("total"), status=fields.get("status"), issue_count=fields.get("issue_count", 0), dropped_count=fields.get("dropped_count", 0), error=fields.get("error"), reused=fields.get("reused"))
 
             def _on_audit_progress(kind: str, fields: Dict[str, Any]) -> None:
                 if kind != "chunk_done":
@@ -4426,6 +4432,28 @@ class B3AuditRepair:
                 repair_complete=repair_outcome.repair_complete,
                 skipped=repair_outcome.skipped,
             )
+            self._emit_progress(
+                "repair_round",
+                round=1,
+                eligible_count=repair_outcome.eligible_count,
+                committed_pids=[pid for pid, _ in repair_outcome.committed],
+                passed_pids=list(repair_outcome.passed_pids),
+                debt_trace=list(repair_outcome.debt_trace),
+                warnings=list(repair_outcome.warnings),
+                repair_complete=repair_outcome.repair_complete,
+                batches=[
+                    {
+                        "batch_index": b.batch_index,
+                        "status": b.status,
+                        "findings": [{"index": f.index, "pid": f.pid} for f in b.findings],
+                        "results": [{"index": r.index, "decision": r.decision, "pid": r.pid} for r in b.results],
+                    }
+                    for b in repair_outcome.batches
+                ],
+                batch_count=len(repair_outcome.batches),
+                batches_done=len(repair_outcome.batches),
+                batches_total=len(repair_outcome.batches),
+            )
             reaudit = repair_outcome.reaudit
             if reaudit is not None:
                 journal.emit(
@@ -4433,7 +4461,18 @@ class B3AuditRepair:
                     scope_pids=list(reaudit.scope),
                     full=reaudit.full,
                     issue_count=len(reaudit.issues),
+                    issues=[dict(i) for i in reaudit.issues],
                     failed=reaudit.failed,
+                    complete=reaudit.complete,
+                )
+                self._emit_progress(
+                    "reaudit_scope",
+                    scope_pids=list(reaudit.scope),
+                    full=reaudit.full,
+                    issue_count=len(reaudit.issues),
+                    issues=[dict(i) for i in reaudit.issues],
+                    failed=reaudit.failed,
+                    complete=reaudit.complete,
                 )
 
         committed = (

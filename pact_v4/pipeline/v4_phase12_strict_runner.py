@@ -2597,6 +2597,22 @@ def run_chapter_strict(
     attach = getattr(runtime, "set_usage_writer", None)
     if attach is not None:
         attach(usage_writer)
+    # v42: whole-chapter B3 also needs usage sink for local usage (server_logs prompt/n_decoded)
+    if b3_audit_repair is not None:
+        for _attr in ("_audit_backend", "_repair_backend", "_entity_backend"):
+            _b = getattr(b3_audit_repair, _attr, None)
+            if _b is not None and hasattr(_b, "set_usage_sink"):
+                try:
+                    _b.set_usage_sink(usage_writer.write_call)
+                except Exception:
+                    pass
+            # unwrap view wrappers (e.g. _EntityRoleView)
+            _inner = getattr(_b, "_wrapped", None) or getattr(_b, "_backend", None) or getattr(_b, "_inner", None)
+            if _inner is not None and hasattr(_inner, "set_usage_sink"):
+                try:
+                    _inner.set_usage_sink(usage_writer.write_call)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Rebuild source/snapshot/plan -- identical to run_chapter/run_generate.
@@ -4680,6 +4696,27 @@ def _run_whole_chapter_strict_impl(
         and b3_audit_repair is not None
         and raw_final_text_by_pid
     ):
+        # v42: ensure B3 backends have usage sink for local whole-chapter (prompt/n_decoded)
+        # Also wire phase_progress writer as B3 progress so audit_chunk events go to phase_progress (source of truth)
+        if b3_audit_repair is not None:
+            try:
+                setattr(b3_audit_repair, "_progress", progress)
+            except Exception:
+                pass
+        try:
+            from pact_v4.pipeline.usage_record import UsageRecordWriter as _URW
+            # usage_writer is the same writer attached at top; if still alive, attach to B3
+            _sink = getattr(usage_writer, "write_call", None) if 'usage_writer' in locals() else None
+            if _sink is not None:
+                for _attr in ("_audit_backend", "_repair_backend", "_entity_backend"):
+                    _b = getattr(b3_audit_repair, _attr, None)
+                    if _b is not None and hasattr(_b, "set_usage_sink"):
+                        try:
+                            _b.set_usage_sink(_sink)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         try:
             b3_audit_result = b3_audit_repair.run(
                 chapter_id=cfg.chapter_id,
