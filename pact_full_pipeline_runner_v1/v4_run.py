@@ -410,6 +410,16 @@ def _validate_layout(layout: dict[str, Path]) -> None:
         if "inside state" in str(e):
             raise
         pass
+    # Output must not equal or be nested under source (contamination)
+    if out_res == src_res:
+        raise ValueError(f"output directory must not be the same as source root: {out}")
+    try:
+        out_res.relative_to(src_res)
+        raise ValueError(f"output directory must not be inside source root: {out} inside {src}")
+    except ValueError as e:
+        if "inside source" in str(e):
+            raise
+        pass
     # Also ensure snapshot canonical dir not used as state (hardening)
     # state should not be exactly /home/rt/pact_runs/books/1
     for forbidden in [Path("/home/rt/pact_runs/books/1"), Path("/home/rt/pact_runs/books")]:
@@ -421,6 +431,19 @@ def _validate_layout(layout: dict[str, Path]) -> None:
             # if state is inside forbidden, also bad
             if str(state_res).startswith(str(forbidden_root) + "/") or str(state_res) == str(forbidden_root):
                 raise ValueError(f"state directory must be outside canonical snapshot storage: {state}")
+        except ValueError as ve:
+            if "snapshot" in str(ve):
+                raise
+            pass
+    # Output must also not be equal to or inside canonical snapshot roots
+    for forbidden in [Path("/home/rt/pact_runs/books/1"), Path("/home/rt/pact_runs/books")]:
+        try:
+            forbidden_root = forbidden.resolve() if forbidden.exists() else forbidden.absolute()
+            if out_res == forbidden_root:
+                raise ValueError(f"output directory must not be canonical snapshot storage: {out}")
+            out_res.relative_to(forbidden_root)
+            if str(out_res).startswith(str(forbidden_root) + "/") or str(out_res) == str(forbidden_root):
+                raise ValueError(f"output directory must not be inside canonical snapshot storage: {out}")
         except ValueError as ve:
             if "snapshot" in str(ve):
                 raise
@@ -955,6 +978,12 @@ def _handle_book(argv: Sequence[str]) -> int:
     if label not in ("local", "remote"):
         _error_exit(f"unknown runtime descriptor label {label!r}; expected local or remote")
 
+    # Re-validate final output before creation (covers custom --out-base bypass)
+    try:
+        _final_out = Path(args.out_base) if args.out_base else out_root
+        _validate_layout({"source": layout["source"], "state": memory_dir, "output": _final_out})
+    except Exception as exc:
+        _error_exit(str(exc))
     # Automatic output directory — collision-safe (use out_root)
     if args.out_base:
         out_base = Path(args.out_base)

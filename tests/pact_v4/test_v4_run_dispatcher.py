@@ -984,6 +984,64 @@ def test_book_media_verdict_missing_confirmation(capsys, tmp_path):
         assert rc == 1
 
 
+def test_output_rejected_inside_source_and_canonical_snapshot(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1.v4_run import _validate_layout
+    src = tmp_path / "src"
+    src.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    # Output inside source must be rejected
+    out_inside_src = src / "runs"
+    with pytest.raises(ValueError, match="inside source"):
+        _validate_layout({"source": src, "state": state, "output": out_inside_src})
+    # Output equal to source must be rejected
+    with pytest.raises(ValueError, match="same as source"):
+        _validate_layout({"source": src, "state": state, "output": src})
+    # Output inside canonical snapshot root must be rejected
+    out_inside_snap = Path("/home/rt/pact_runs/books/1") / "evil"
+    with pytest.raises(ValueError, match="snapshot"):
+        _validate_layout({"source": src, "state": state, "output": out_inside_snap})
+    out_snap_exact = Path("/home/rt/pact_runs/books")
+    with pytest.raises(ValueError, match="snapshot"):
+        _validate_layout({"source": src, "state": state, "output": out_snap_exact})
+    # Legitimate output outside both must still validate
+    out_ok = tmp_path / "out_ok2"
+    out_ok.mkdir()
+    _validate_layout({"source": src, "state": state, "output": out_ok})
+
+
+def test_book_out_base_inside_source_or_snapshot_fails_before_mkdir(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1.v4_run import main
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0028_a.html").write_text("<html/>")
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
+    # Use a bad out_base inside source — must fail before creation
+    bad_out = src / "nested_out"
+    assert not bad_out.exists()
+    ok = _ok_report()
+    with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+        with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
+            with pytest.raises(SystemExit) as exc:
+                main(["book", "--chapters", "28", "--local", "--out-base", str(bad_out)])
+            assert exc.value.code == 2
+            assert not mock_book.called
+            assert not bad_out.exists()
+    # Bad out_base inside canonical snapshot root — must also fail before creation
+    bad_snap = Path("/home/rt/pact_runs/books/1/evil_out")
+    # Ensure underlying /home/rt/pact_runs/books does not get created by mkdir
+    # by mocking mkdir if it were called, but validation should exit before mkdir
+    with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+        with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
+            with pytest.raises(SystemExit) as exc:
+                main(["book", "--chapters", "28", "--local", "--out-base", str(bad_snap)])
+            assert exc.value.code == 2
+            assert not mock_book.called
+
+
 def test_preflight_path_readiness_missing_and_unwritable(tmp_path, monkeypatch):
     from pact_full_pipeline_runner_v1.v4_run import main
     src = tmp_path / "src"
