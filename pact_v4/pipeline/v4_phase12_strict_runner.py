@@ -4697,6 +4697,12 @@ def _run_whole_chapter_strict_impl(
         and raw_final_text_by_pid
     ):
         # v42: ensure B3 backends have usage sink for local whole-chapter (prompt/n_decoded)
+        # Also wire phase_progress writer as B3 progress so audit_chunk events go to phase_progress (source of truth)
+        if b3_audit_repair is not None:
+            try:
+                setattr(b3_audit_repair, "_progress", progress)
+            except Exception:
+                pass
         try:
             from pact_v4.pipeline.usage_record import UsageRecordWriter as _URW
             # usage_writer is the same writer attached at top; if still alive, attach to B3

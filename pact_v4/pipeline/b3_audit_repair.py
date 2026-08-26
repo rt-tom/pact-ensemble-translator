@@ -3459,6 +3459,7 @@ class B3AuditRepair:
                     chunk=fields.get("chunk"),
                     total=fields.get("total"),
                 )
+                self._emit_progress("r_editor_chunk_started", chunk=fields.get("chunk"), total=fields.get("total"))
             elif kind == "retry":
                 # R-RETRY (t_8ab8ab35): a bounded retry attempt (transport
                 # or invalid JSON/empty body) is journaled so retry
@@ -3472,6 +3473,7 @@ class B3AuditRepair:
                     error=fields.get("error"),
                     delay=fields.get("delay"),
                 )
+                self._emit_progress("r_editor_chunk_retry", chunk=fields.get("chunk"), attempt=fields.get("attempt"), total=fields.get("total"), error=fields.get("error"), delay=fields.get("delay"))
             else:
                 journal.emit(
                     "r_editor_chunk_done",
@@ -3485,6 +3487,7 @@ class B3AuditRepair:
                     # cache (0 model calls), not freshly edited.
                     reused=fields.get("reused"),
                 )
+                self._emit_progress("r_editor_chunk_done", chunk=fields.get("chunk"), total=fields.get("total"), status=fields.get("status"), edit_count=fields.get("edit_count", 0), warning_count=fields.get("warning_count", 0), error=fields.get("error"), reused=fields.get("reused"))
 
         evaluator = RussianEditorEvaluator(
             self._audit_backend,
@@ -4043,6 +4046,7 @@ class B3AuditRepair:
                         total=fields.get("total"),
                         sub=fields.get("sub") or "",
                     )
+                    self._emit_progress("audit_chunk_started", chunk=fields.get("chunk"), total=fields.get("total"), sub=fields.get("sub") or "")
                 elif kind == "retry":
                     # R-RETRY (t_8ab8ab35): a TRANSPORT_ERROR chunk is retried
                     # with a NEW session — the retry attempt is journaled so
@@ -4055,6 +4059,7 @@ class B3AuditRepair:
                         error=fields.get("error"),
                         delay=fields.get("delay"),
                     )
+                    self._emit_progress("audit_chunk_retry", chunk=fields.get("chunk"), total=fields.get("total"), attempt=fields.get("attempt"), error=fields.get("error"), delay=fields.get("delay"))
                 else:
                     journal.emit(
                         "audit_chunk_done",
@@ -4072,6 +4077,7 @@ class B3AuditRepair:
                         # partial cache (0 model calls), not freshly audited.
                         reused=fields.get("reused"),
                     )
+                    self._emit_progress("audit_chunk_done", chunk=fields.get("chunk"), total=fields.get("total"), status=fields.get("status"), issue_count=fields.get("issue_count", 0), dropped_count=fields.get("dropped_count", 0), error=fields.get("error"), reused=fields.get("reused"))
 
             def _on_audit_progress(kind: str, fields: Dict[str, Any]) -> None:
                 if kind != "chunk_done":

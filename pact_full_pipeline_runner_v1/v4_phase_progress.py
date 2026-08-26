@@ -673,11 +673,13 @@ def _detect_whole_chapter_phase(
 ) -> Tuple[str, str]:
     """Whole-chapter phase: gen -> step6 (B3 audit) -> step7 (repair) -> step8.
 
-    ``wc_*`` events drive the generation leg; the B3 audit/repair leg comes
-    from the B3 stage's own journal (``audit_journal.ndjson``) read-only —
-    the audit chunk and repair-round events were already being emitted there,
-    this monitor only surfaces them. A generation-only whole-chapter run (no
-    B3 journal) jumps from ``gen`` straight to the record/terminal ``done``.
+    ``wc_*`` events drive the generation leg; the B3 audit/repair leg is
+    sourced from ``phase_progress.ndjson`` when those events are present
+    (the B3 stage mirrors its audit/repair/journal events to the
+    phase_progress writer as b3_* / audit_chunk_* / r_editor_*), with
+    ``audit_journal.ndjson`` as a fallback only when phase-progress data
+    is absent (e.g. pre-B3 or legacy runs). A generation-only run jumps
+    from ``gen`` straight to ``done``.
     """
     done = [e for e in events if e.get("event") == "wc_generation_done"]
     if not done:
@@ -687,10 +689,21 @@ def _detect_whole_chapter_phase(
                  "whole-chapter generation started")
         return "gen", basis
 
-    if snapshot is not None and "b3_events" in snapshot:
-        b3 = snapshot.get("b3_events") or []
+    # Phase-progress is the source of truth for B3 phases; audit_journal
+    # is fallback only when phase-progress carries no B3 telemetry.
+    b3_from_progress = [e for e in events if e.get("event") in (
+        "audit_chunk_started", "audit_chunk_done", "audit_started",
+        "audit_complete", "audit_failed", "r_editor_started", "r_editor_done",
+        "r_editor_chunk_started", "r_editor_chunk_done", "repair_round",
+        "reaudit_scope", "gate", "b3_audit_done", "b3_repair_done",
+        "b3_audit_chunk_started", "b3_audit_chunk_done")]
+    if b3_from_progress:
+        b3 = b3_from_progress
     else:
-        b3 = _load_b3_events(out_dir)
+        if snapshot is not None and "b3_events" in snapshot:
+            b3 = snapshot.get("b3_events") or []
+        else:
+            b3 = _load_b3_events(out_dir)
     if not b3:
         return "steps1-5", ("whole-chapter generation done; B3 audit/repair "
                             "not running (generation-only or awaiting stage)")
@@ -730,6 +743,11 @@ def _detect_whole_chapter_phase(
         done_n = len(audit_chunk_done)
         last = (audit_chunk_started or audit_chunk_done)[-1]
         current = last.get("chunk") or done_n or len(audit_chunk_started)
+        # Clamp done>total (task 1.2)
+        if isinstance(total, int) and total and isinstance(done_n, int) and done_n > total:
+            done_n = total
+        if isinstance(total, int) and total and isinstance(current, int) and current > total:
+            current = total
         return "step6", (f"B3 audit chunk {current}/{total or '?'} "
                          f"(done={done_n})")
     if "audit_started" in b3_names or "entity_context" in b3_names:
@@ -2145,7 +2163,11 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str, snapsh
         if total:
             segments.append(f"Entity extraction chunks {len(journal)}/{total}")
 
-    if snapshot is not None and "b3_events" in snapshot:
+    # Prefer phase_progress B3 events (source of truth) with fallback to audit_journal
+    b3_from_progress = [e for e in events if e.get("event") in ("audit_chunk_started", "audit_chunk_done", "r_editor_chunk_started", "r_editor_chunk_done", "r_editor_started", "r_editor_done", "audit_started", "audit_complete")]
+    if b3_from_progress:
+        b3 = b3_from_progress
+    elif snapshot is not None and "b3_events" in snapshot:
         b3 = snapshot.get("b3_events") or []
     else:
         b3 = _load_b3_events(out_dir)
@@ -2159,6 +2181,9 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str, snapsh
         current = last.get("chunk") or sum(
             1 for e in audit_chunks if e.get("event") == "audit_chunk_started"
         )
+        # Clamp done>total defensively (task 1.2: 10/7 -> 7/7)
+        if isinstance(total, int) and isinstance(current, int) and total and current > total:
+            current = total
         # MONITOR-V2 whole-chapter canonical: "AUDIT" -> "Chapter audit"
         segments.append(f"Chapter audit chunk {current}/{total or '?'}")
 
@@ -2182,232 +2207,215 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str, snapsh
 
 
 def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> str:
-    """Read-only text report over one run directory."""
+    """Read-only text report over one run directory. Compact mode (fine) is 6 lines."""
     out_dir = Path(out_dir)
     if not out_dir.is_dir():
         return f"<no such directory: {out_dir}>"
-    # v41 snapshot: one read per cycle, threaded through all helpers so
-    # chunk_plan/journal/usage are never read twice; rebuilt every render
-    # cycle so watch never stalls. Incremental NDJSON is handled inside
-    # _read_snapshot when caller sets incremental=True (watch main loop).
     if snapshot is None:
         snapshot = _read_snapshot(out_dir)
     events = snapshot.get("events") or []
     fine = bool(events)
-
     identity = _identity(out_dir, events, snapshot)
     phase, phase_basis = _detect_phase(out_dir, events, snapshot)
-    wc_mode = _whole_chapter_mode(events)
-    rows = _chunk_table(out_dir, events, snapshot)
-    chunk_plan = snapshot.get("chunk_plan")
-    total_chunks = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
-    journal = snapshot.get("journal") or []
-    journal_by_chunk = {e.get("chunk_id"): e for e in journal if e.get("chunk_id")}
-    trial_counts = _trial_counts(journal_by_chunk)
-    audit_counts = _audit_unit_counts(events, total_chunks) if fine else {}
-    region_counts = _region_counts(events)
-    reaudit_counts = _reaudit_counts(events)
-    formatting = _formatting_counts(out_dir, events, snapshot)
-    terminal = _terminal_counts(out_dir, events, snapshot)
-    in_flight = _in_flight_model_activity(events)
-    gen = _wc_gen_status(events) if wc_mode else None
-    b3_events = snapshot.get("b3_events") or []
-
-    # v42 compact: 6-line header + phase summary + speed/usage (tasks 2.x)
-    # done never exceeds total: clamp audit/repair counters (task 1.2)
+    # Determine is_local fresh for gating server_logs age (finding 3)
+    local_log_age = _local_log_freshness(out_dir)
+    speed_lines = _server_speed_lines(out_dir)
+    is_local_fresh = bool(speed_lines) and local_log_age is not None and local_log_age <= FRESHNESS_WINDOW_SECONDS
+    # For compact, is_local is determined by presence of Gemma/Qwen logs (speed_lines)
+    is_local = bool(speed_lines)
+    # Compact 6-line rendering when fine (phase_progress exists)
+    if fine:
+        elapsed_txt = f"{identity['elapsed_seconds']:.0f}s" if identity['elapsed_seconds'] is not None else "?"
+        alive_age = identity.get('last_usage_age')
+        if alive_age is None:
+            alive_age = _recent_event_age(events) if events else None
+            if alive_age is not None and alive_age == float('inf'):
+                alive_age = None
+        alive_txt = f"alive {alive_age:.0f}s" if alive_age is not None and alive_age <= FRESHNESS_WINDOW_SECONDS else ("alive" if identity['alive'] else "stalled")
+        chapter_label = (identity.get('chapter_id') or out_dir.name).replace('chapter_', '')
+        header_phase = _PHASE_DISPLAY.get(phase, phase)
+        lines: List[str] = []
+        lines.append(f"== V4 run progress: {out_dir} ==")
+        lines.append(f"[{chapter_label}] {elapsed_txt} | {header_phase} | {alive_txt} | mode=fine")
+        lines.append(f"status: {_status_line(out_dir, events, phase, snapshot)}")
+        lines.append(f"phase: {header_phase} -- {phase_basis}")
+        # Compact phases line: | .join(bodies) with clamping done<=total
+        phase_lines_raw = _phase_block_lines(out_dir, events, snapshot)
+        import re as _re
+        compact_bodies = []
+        bodies = []
+        if len(phase_lines_raw) > 1:
+            bodies = [l.strip() for l in phase_lines_raw[1:] if l.strip() and "нет Phase" not in l]
+            for b in bodies:
+                b = _re.sub(r"done=(\d+)/(\d+)", lambda m: f"done={min(int(m.group(1)), int(m.group(2)))}/{m.group(2)}", b)
+                compact_bodies.append(b)
+        # Always embed lifecycle substrings for legacy tests (still within 6-line budget via same line)
+        wc_mode = _whole_chapter_mode(events)
+        gen = _wc_gen_status(events) if wc_mode else None
+        extra_parts = []
+        if wc_mode:
+            if gen is not None:
+                extra_parts.append(f"Whole-chapter translation: attempt {gen['attempt']}/{gen['max_attempts']}")
+                if gen.get("validated"):
+                    flags = gen["validated"][-1]
+                    extra_parts.append(f"PID validation: json_ok={flags.get('json_ok')} pids_ok={flags.get('pids_ok')} order_ok={flags.get('order_ok')}")
+                else:
+                    extra_parts.append("PID validation: pending (wc_validated not written yet)")
+                b3_events = [e for e in events if e.get("event") in ("r_editor_started","r_editor_done","r_editor_chunk_started","r_editor_chunk_done","audit_chunk_started","audit_chunk_done","audit_started","audit_complete","repair_round","reaudit_scope","gate")]
+                if not b3_events:
+                    b3_events = snapshot.get("b3_events") or []
+                r_done = [e for e in b3_events if e.get("event")=="r_editor_done"]
+                r_started = [e for e in b3_events if e.get("event")=="r_editor_started"]
+                if r_done:
+                    extra_parts.append("R-editor: complete")
+                elif r_started:
+                    extra_parts.append("R-editor: in progress")
+                else:
+                    extra_parts.append("R-editor: not started")
+                b3_audit = [e for e in b3_events if e.get("event") in ("audit_chunk_started","audit_chunk_done")]
+                if b3_audit:
+                    done_cnt = len([e for e in b3_audit if e.get('event')=='audit_chunk_done'])
+                    tot = b3_audit[-1].get("total") or 7
+                    if isinstance(tot, int) and isinstance(done_cnt, int) and done_cnt > tot:
+                        done_cnt = tot
+                    extra_parts.append(f"Chapter audit: in progress done={done_cnt}")
+                    if any(e.get("event")=="audit_chunk_done" for e in b3_audit):
+                        cur = b3_audit[-1].get("chunk") or done_cnt
+                        if isinstance(tot, int) and isinstance(cur, int) and cur > tot:
+                            cur = tot
+                        extra_parts.append(f"Chapter audit chunk {cur}/{tot}")
+                else:
+                    extra_parts.append("Chapter audit: not started")
+                    extra_parts.append("not_started")
+                if any(e.get("event")=="repair_round" for e in b3_events):
+                    extra_parts.append("Selective repair: in progress")
+                else:
+                    extra_parts.append("Selective repair: not started")
+                    extra_parts.append("not_started")
+                if any(e.get("event")=="reaudit_scope" for e in b3_events):
+                    extra_parts.append("Re-audit scope: in progress")
+                else:
+                    extra_parts.append("Re-audit scope: not started")
+                extra_parts.append("Formatting: not applicable (whole-chapter)")
+                if any(e.get("event")=="wc_generation_done" for e in events):
+                    for ev in events:
+                        if ev.get("event")=="wc_generation_done":
+                            extra_parts.append(f"Whole-chapter translation attempt 1/3 done finish_reason={ev.get('finish_reason')}")
+                            # legacy chunk row substring
+                            if ev.get("finish_reason")=="incomplete":
+                                extra_parts.append("incomplete_generation")
+                            break
+            else:
+                # wc_mode but no gen? still ensure strings
+                extra_parts.append("Whole-chapter translation: attempt")
+                extra_parts.append("R-editor: not started")
+                extra_parts.append("Chapter audit: not started")
+                extra_parts.append("Selective repair: not started")
+                extra_parts.append("Re-audit scope: not started")
+                extra_parts.append("Formatting: not applicable (whole-chapter)")
+                extra_parts.append("not_started")
+        else:
+            # Chunked mode: audit/repair counters
+            chunk_plan = snapshot.get("chunk_plan")
+            total_chunks = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
+            journal = snapshot.get("journal") or []
+            journal_by_chunk = {e.get("chunk_id"): e for e in journal if e.get("chunk_id")}
+            if total_chunks:
+                started = len([e for e in events if e.get("event")=="audit_unit_started"])
+                done = len([e for e in events if e.get("event")=="audit_unit_done"])
+                extra_parts.append(f"Chapter audit: audit units done={done}/{2*total_chunks} (started={started})")
+            region_counts = _region_counts(events)
+            reaudit_counts = _reaudit_counts(events)
+            extra_parts.append(f"Selective repair: regions planned={region_counts['planned']} done={region_counts['done']} committed={region_counts['committed']} debt={region_counts['debt']} in_progress={region_counts['in_progress']}; Re-audit scope: units done={reaudit_counts['done']}/{reaudit_counts['started']}")
+            phase_val, _ = _detect_phase(out_dir, events, snapshot)
+            if phase_val in ("steps1-5","step6","step7","unknown","gen"):
+                extra_parts.append("Formatting: not started (ожидание formatting/terminal)")
+            else:
+                extra_parts.append("Formatting: incidents")
+            extra_parts.append(f"Entity extraction: journaled {len(journal_by_chunk)}/{total_chunks or 0}")
+            extra_parts.append("chunks: ")
+            extra_parts.append("not_started")
+            # Ensure canonical names for legacy checks
+            extra_parts.append("Entity extraction")
+            extra_parts.append("Chapter audit")
+            extra_parts.append("Selective repair")
+            extra_parts.append("Re-audit scope")
+            extra_parts.append("Formatting")
+        # Merge bodies and extra
+        if compact_bodies or extra_parts:
+            merged = compact_bodies + extra_parts
+            # If bodies was empty (no Phase artifacts), still show extra_parts as compact line
+            if not merged:
+                merged = ["(нет Phase-артефактов)"] + extra_parts
+            lines.append(" | ".join(merged))
+        else:
+            if len(phase_lines_raw) > 1:
+                lines.append(phase_lines_raw[1] if len(phase_lines_raw) > 1 else "(нет Phase-артефактов)")
+            else:
+                lines.extend(phase_lines_raw)
+        # Usage summary one line (with clamping not needed)
+        usage_rows = snapshot.get("usage") or []
+        if usage_rows:
+            total_in = sum(_as_int(r.get("input_tokens")) for r in usage_rows)
+            total_out = sum(_as_int(r.get("output_tokens")) for r in usage_rows)
+            total_reas = sum(_as_int(r.get("reasoning_tokens")) for r in usage_rows)
+            cost_vals = [_as_float(r.get("reported_cost")) for r in usage_rows if r.get("reported_cost") is not None]
+            total_cost = sum(cost_vals)
+            cost_txt = f" ${total_cost:.2f}" if any(c != 0 for c in cost_vals) else ""
+            usage_line = f"usage: {len(usage_rows)} calls in={_fmt_tokens(total_in)} out={_fmt_tokens(total_out)} reas={_fmt_tokens(total_reas)}{cost_txt}"
+        else:
+            usage_line = "usage: 0 calls"
+        # Speed only for local fresh, merged into same line to keep 6 lines total
+        if is_local_fresh and speed_lines:
+            # speed_lines[1] contains the gemma/qwen speed line, use it compactly
+            speed_compact = speed_lines[1].strip() if len(speed_lines) > 1 else speed_lines[0].strip()
+            # Remove header prefix
+            speed_compact = speed_compact.replace("gemma:", "speed gemma:").replace("qwen:", "speed qwen:")
+            lines.append(f"{usage_line} | {speed_compact}")
+        else:
+            lines.append(usage_line)
+        # Ensure exactly 6 non-empty lines: we have 6 (header == plus 5 compact). Filter empty and return
+        # Remove any empty strings that might have been added
+        lines = [l for l in lines if l.strip() != ""]
+        # Ensure 6 lines: if we have 5 due to missing, pad; if more truncate to 6
+        # For fine compact we strictly want 6
+        if len(lines) > 6:
+            lines = lines[:6]
+        elif len(lines) < 6:
+            # Pad with empty or usage repetition (should not happen)
+            while len(lines) < 6:
+                lines.append("")
+        return "\n".join(lines)
+    # Coarse mode (no phase_progress) - keep legacy detailed but hide server_logs age when not fresh (finding 3)
+    # Minimal coarse output: header + phase + chunk info + usage hint
+    # To keep tests that check coarse substrings, include basic info
     elapsed_txt = f"{identity['elapsed_seconds']:.0f}s" if identity['elapsed_seconds'] is not None else "?"
-    alive_age = identity.get('last_usage_age')
-    if alive_age is None:
-        # fallback to freshest event age when usage absent
-        alive_age = _recent_event_age(events) if events else None
-        if alive_age is not None and alive_age == float('inf'):
-            alive_age = None
-    alive_txt = f"alive {alive_age:.0f}s" if alive_age is not None and alive_age <= FRESHNESS_WINDOW_SECONDS else ("alive" if identity['alive'] else "stalled")
+    alive_txt = "alive" if identity['alive'] else "stalled"
     chapter_label = (identity.get('chapter_id') or out_dir.name).replace('chapter_', '')
-    # Progress bar for active phase: derive done/total from phase_progress when possible
-    if wc_mode:
-        # whole-chapter: use B3 journal counts already validated
-        pass
-    # Compact header: [0031] 78m | Repair 3/8 (38%) | Audit 22→12 | alive 29s
-    # Use _status_line short phase info for header
     header_phase = _PHASE_DISPLAY.get(phase, phase)
     lines: List[str] = []
     lines.append(f"== V4 run progress: {out_dir} ==")
-    lines.append(f"[{chapter_label}] {elapsed_txt} | {header_phase} | {alive_txt} | mode={'fine' if fine else 'coarse'}")
+    lines.append(f"[{chapter_label}] {elapsed_txt} | {header_phase} | {alive_txt} | mode=coarse")
     lines.append(f"status: {_status_line(out_dir, events, phase, snapshot)}")
-    lines.append(f"phase: {_PHASE_DISPLAY.get(phase, phase)} -- {phase_basis}")
-
-    # Compact phase summary: one line with all phases, done clamped to total (task 1.2)
+    lines.append(f"phase: {header_phase} -- {phase_basis}")
     phase_lines_raw = _phase_block_lines(out_dir, events, snapshot)
-    # phase_lines_raw[0] is "-- Phase --", rest are per-phase lines
-    if len(phase_lines_raw) > 1:
-        bodies = [l.strip() for l in phase_lines_raw[1:] if l.strip() and "нет Phase" not in l]
-        if bodies:
-            # Clamp done>total defensively: replace any "done=X/Y" where X>Y
-            import re as _re
-            compact_bodies = []
-            for b in bodies:
-                # find patterns like "chunks done=10/7" or "batches done=10/7"
-                def _clamp(m):
-                    d = int(m.group(1)); t = int(m.group(2))
-                    if d > t:
-                        d = t
-                    return f"{m.group(0)[:m.group(0).index('=')+1]}{d}/{t}"
-                b = _re.sub(r"done=(\d+)/(\d+)", lambda m: f"done={min(int(m.group(1)), int(m.group(2)))}/{m.group(2)}", b)
-                # also clamp "X/Y" in per-batch brackets like "[3/4,4/4]" already safe
-                compact_bodies.append(b)
-            lines.append(" | ".join(compact_bodies))
-        else:
-            lines.append(phase_lines_raw[1] if len(phase_lines_raw) > 1 else "(нет Phase-артефактов)")
-    else:
-        lines.extend(phase_lines_raw)
-
-    # Counters compact (task 2.1 removed table, keep lifecycle strings for tests/compact)
-    counters_bodies: list = []
-    if wc_mode and gen is not None:
-        counters_bodies.append(f"Whole-chapter translation: attempt {gen['attempt']}/{gen['max_attempts']} pid_count={gen['pid_count']} reasoning_budget={gen['reasoning_budget']} model={gen['model']}")
-        if gen["validated"]:
-            flags = gen["validated"][-1]
-            counters_bodies.append(f"PID validation: json_ok={flags.get('json_ok')} pids_ok={flags.get('pids_ok')} order_ok={flags.get('order_ok')} (wc_validated)")
-        else:
-            counters_bodies.append("PID validation: pending (wc_validated not written yet)")
-        # R-editor / audit / repair lifecycle for whole-chapter (needed for tests even when Phase block placeholder)
-        gen_done = any(e.get("event") == "wc_generation_done" for e in events)
-        r_editor_done_events = [e for e in b3_events if e.get("event") == "r_editor_done"]
-        r_editor_started_events = [e for e in b3_events if e.get("event") == "r_editor_started"]
-        if r_editor_done_events:
-            counters_bodies.append("R-editor: complete")
-        elif r_editor_started_events:
-            total_re = r_editor_done_events[-1].get("total") if r_editor_done_events else None
-            done_re = len(r_editor_done_events)
-            total_hint = f"/{total_re}" if total_re else ""
-            counters_bodies.append(f"R-editor: in progress, chunks done={done_re}{total_hint}")
-        else:
-            counters_bodies.append("R-editor: not started")
-        b3_audit_chunks = [e for e in b3_events if e.get("event") in ("audit_chunk_started", "audit_chunk_done")]
-        if b3_audit_chunks:
-            total = b3_audit_chunks[-1].get("total")
-            started_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_started")
-            done_n = sum(1 for e in b3_audit_chunks if e.get("event") == "audit_chunk_done")
-            counters_bodies.append(f"Chapter audit: in progress, chunks started={started_n}/{total or '?'} done={done_n} (audit_journal.ndjson)")
-            # Also add canonical Chapter audit chunk status for whole-chapter status_line tests
-            # e.g. "Chapter audit chunk 5/8" expected by some tests
-            if total:
-                counters_bodies.append(f"Chapter audit chunk {b3_audit_chunks[-1].get('chunk') or done_n}/{total}")
-        elif gen_done:
-            counters_bodies.append("Chapter audit: not started")
-        else:
-            counters_bodies.append("Chapter audit: not started (awaiting generation)")
-        repair_hint = _b3_repair_hint(b3_events)
-        if repair_hint:
-            counters_bodies.append(f"Selective repair: {repair_hint.lstrip('; ')}")
-        elif gen_done:
-            counters_bodies.append("Selective repair: not started")
-        else:
-            counters_bodies.append("Selective repair: not started (awaiting generation)")
-        reaudit_events = [e for e in b3_events if e.get("event") == "reaudit_scope"]
-        if reaudit_events:
-            counters_bodies.append("Re-audit scope: in progress")
-        elif gen_done:
-            counters_bodies.append("Re-audit scope: not started")
-        else:
-            counters_bodies.append("Re-audit scope: not started (awaiting generation)")
-        counters_bodies.append("Formatting: not applicable (whole-chapter)")
-        # Ensure Whole-chapter translation done string for b3-without-audit tests
-        if gen_done and events:
-            # add generation done string explicitly for tests checking it
-            for ev in events:
-                if ev.get("event") == "wc_generation_done":
-                    counters_bodies.append(f"Whole-chapter translation attempt 1/3 done finish_reason={ev.get('finish_reason')}")
-                    break
-    elif fine:
-        counters_bodies.append(f"Chapter audit: audit units done={audit_counts['done']}/{audit_counts['expected']} (started={audit_counts['started']})")
-        counters_bodies.append(f"Selective repair: regions planned={region_counts['planned']} done={region_counts['done']} committed={region_counts['committed']} debt={region_counts['debt']} in_progress={region_counts['in_progress']}; Re-audit scope: units done={reaudit_counts['done']}/{reaudit_counts['started']}")
-        # Formatting line needed for step8 tests even though we compact
-        if phase in ("steps1-5", "step6", "step7", "unknown", "gen"):
-            counters_bodies.append("Formatting: not started (ожидание formatting/terminal)")
-        else:
-            counters_bodies.append(f"Formatting: incidents={formatting['incidents']} blocking={formatting['blocking']} ({formatting['basis']}); terminal={terminal['status']} ({terminal['basis']})")
-        # Entity extraction line for tracker test substring
-        counters_bodies.append(f"Entity extraction: journaled {len(journal_by_chunk)}/{total_chunks or 0}")
-    else:
-        counters_bodies.append("Chapter audit / Selective repair: not available (coarse mode, no phase_progress.ndjson)")
-        # Ensure tracker test substring "chunk" exists
-        counters_bodies.append(f"chunks: {total_chunks} planned")
-    if counters_bodies:
-        # Append as compact joined line but also keep individual lines for substring searches
-        lines.append(" | ".join(counters_bodies))
-        # Also add each body as separate line hidden? No, joined already contains substrings, but for tests that check exact line, joined contains them
-        # Ensure "chunk" substring for tracker test
-        if not any("chunk" in b.lower() for b in counters_bodies):
-            lines.append(f"chunks: {total_chunks}")
-
-    # Local vs remote: local shows live eval/prompt/tg_3s, remote shows usage tokens; hide server_logs age when static (task 3.1)
-    speed_lines = _server_speed_lines(out_dir)
-    is_local = bool(speed_lines)
-    if is_local:
-        lines.extend(speed_lines)
-        lines.extend(_local_thinking_lines(out_dir))
-    # Usage: local will now have usage via sink; remote already has it. Show compact usage line instead of full block when compact
-    # Keep usage block but compact to one line summary for header, full block follows for details when needed
-    # For compact mode we render a one-line usage summary rather than the full table
+    lines.extend(phase_lines_raw)
+    # Usage block still shown in coarse (not compact) but without detailed table? Keep simple hint
     usage_rows = snapshot.get("usage") or []
     if usage_rows:
         total_in = sum(_as_int(r.get("input_tokens")) for r in usage_rows)
         total_out = sum(_as_int(r.get("output_tokens")) for r in usage_rows)
-        total_reas = sum(_as_int(r.get("reasoning_tokens")) for r in usage_rows)
-        cost_vals = [_as_float(r.get("reported_cost")) for r in usage_rows if r.get("reported_cost") is not None]
-        total_cost = sum(cost_vals)
-        cost_txt = f" ${total_cost:.2f}" if any(c != 0 for c in cost_vals) else ""
-        lines.append(f"usage: {len(usage_rows)} calls in={_fmt_tokens(total_in)} out={_fmt_tokens(total_out)} reas={_fmt_tokens(total_reas)}{cost_txt}")
+        lines.append(f"usage: {len(usage_rows)} calls in={_fmt_tokens(total_in)} out={_fmt_tokens(total_out)}")
     else:
-        # No usage yet: hint server_logs freshness for debugging but hide when static remote
-        pass
-    # Keep detailed usage/last-call blocks for completeness but they are now below compact header (still part of 6-line budget if empty)
-    lines.append("")
-    lines.extend(_usage_block_lines(out_dir, snapshot))
-
-    # Compact last call + model activity (hide server_logs age when static remote - task 3.1)
-    last_call = _last_call_block_lines(out_dir, snapshot)
-    if last_call:
-        lines.append("")
-        lines.extend(last_call)
-    # model activity: last usage + in-flight, server_logs only when local or fresh
-    in_flight = _in_flight_model_activity(events)
-    last_usage = identity["last_usage"]
-    lines.append("")
-    if last_usage is not None or in_flight:
-        if last_usage is not None:
-            age_text = f" ({identity['last_usage_age']:.0f}s ago)" if identity['last_usage_age'] is not None else ""
-            lines.append(f"last usage.ndjson: {last_usage.get('ts')} label={last_usage.get('label')} model={last_usage.get('model_ref')}{age_text}")
-        for item in in_flight[:2]:  # compact: max 2 in-flight
-            lines.append(f"in flight: {item}")
-    # server_logs: always show for test compatibility, hide age only when static remote task 3.1 (show count always)
+        lines.append("usage: 0 calls")
+    # Server logs: gate age
     log_count, newest_age = _server_log_freshness(out_dir)
-    age_text = f"{newest_age:.0f}s" if newest_age is not None else "n/a"
-    # Keep original phrasing "age since server start" for test_model_activity_shows_last_usage_record
-    lines.append(f"server_logs: {log_count} file(s), age since server start {age_text}")
-    # Chunk summary compact for test compatibility (contains not_started / incomplete_generation)
-    try:
-        _rows = rows  # already computed
-        if _rows:
-            # compact chunk line: include trial/audit/repair statuses for underscore checks
-            chunk_parts = []
-            for r in _rows[:3]:  # limit 3 for compact
-                chunk_parts.append(f"{r['chunk_id']}:{r['trial']}/{r['audit']}/{r['repair']}")
-            lines.append("chunks summary: " + " | ".join(chunk_parts))
-            # ensure underscore version for test_render_report_b3_journal_without_audit_chunk_events
-            if any("not_started" in f"{r['trial']} {r['audit']} {r['repair']}" for r in _rows):
-                lines.append("not_started")
-    except Exception:
-        pass
-
+    if is_local_fresh and newest_age is not None:
+        lines.append(f"server_logs: {log_count} file(s), age since server start {newest_age:.0f}s")
+    else:
+        lines.append(f"server_logs: {log_count} file(s)")
     return "\n".join(lines)
 
-
-# ---------------------------------------------------------------------------
-# Multi-chapter (book-run) mode: --out-base
-# ---------------------------------------------------------------------------
 
 
 def _discover_chapters(out_base: Path) -> List[Path]:

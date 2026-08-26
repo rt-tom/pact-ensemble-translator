@@ -154,16 +154,20 @@ def test_usage_block_hides_cost_column_when_all_zero(tmp_path: Path):
         _usage_row("phase2b/balanced_literary/chunk0001", cost=0.0),
         _usage_row("phase3/qwen_chapter_audit", model="qwen3.7-plus", cost=None),
     ])
-    report = tracker.render_report(out)
-    block = report.split("-- usage by step x model", 1)[1]
+    # Detailed block helper still hides cost correctly; compact report shows usage summary without cost
+    block = "\n".join(tracker._usage_block_lines(out))
     assert "cost" not in block
     assert "calls" in block and "input" in block
+    report = tracker.render_report(out)
+    # Compact usage line should not show cost when all zero
+    assert "$0.01" not in report
 
     # With real cost the column reappears.
     _write_ndjson(out / USAGE_FILENAME, [_usage_row("phase2b/balanced_literary/chunk0001", cost=0.01)])
-    report2 = tracker.render_report(out)
-    block2 = report2.split("-- usage by step x model", 1)[1]
+    block2 = "\n".join(tracker._usage_block_lines(out))
     assert "cost" in block2 and "$0.01" in block2
+    report2 = tracker.render_report(out)
+    assert "$0.01" in report2
 
 
 def test_usage_block_reasoning_cached_columns_only_when_nonzero(tmp_path: Path):
@@ -171,13 +175,13 @@ def test_usage_block_reasoning_cached_columns_only_when_nonzero(tmp_path: Path):
     _write_ndjson(out / USAGE_FILENAME, [
         _usage_row("phase2b/balanced_literary/chunk0001", reasoning_tokens=0, cached_input_tokens=0),
     ])
-    block = tracker.render_report(out).split("-- usage by step x model", 1)[1]
+    block = "\n".join(tracker._usage_block_lines(out))
     assert "reasoning" not in block and "cached" not in block
 
     _write_ndjson(out / USAGE_FILENAME, [
         _usage_row("phase2b/balanced_literary/chunk0001", reasoning_tokens=5, cached_input_tokens=7),
     ])
-    block2 = tracker.render_report(out).split("-- usage by step x model", 1)[1]
+    block2 = "\n".join(tracker._usage_block_lines(out))
     assert "reasoning" in block2 and "cached" in block2
 
 
@@ -358,10 +362,14 @@ def test_model_activity_shows_last_usage_record(tmp_path: Path):
         _usage_row("phase3/qwen_chapter_audit", model="qwen3.7-plus", seconds_ago=5),
     ])
     report = tracker.render_report(out)
-    assert "last usage.ndjson:" in report
-    assert "label=phase3/qwen_chapter_audit" in report
-    assert "model=opencode-go/qwen3.7-plus" in report
-    assert "age since server start" in report
+    # Compact report shows usage summary with label/model via phase summary; detailed last usage block removed from compact
+    # Check that usage summary is present and does not crash
+    assert "usage:" in report
+    # Detailed helper still works
+    assert tracker._last_call_block_lines(out)[1].find("qwen3.7-plus") != -1
+    # Age since server start is gated on local fresh logs, not always rendered
+    # With no server_logs, compact hides it
+    assert "age since server start" not in report
 
 
 # ---------------------------------------------------------------------------
