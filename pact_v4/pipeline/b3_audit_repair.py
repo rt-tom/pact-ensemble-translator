@@ -4441,6 +4441,18 @@ class B3AuditRepair:
                 debt_trace=list(repair_outcome.debt_trace),
                 warnings=list(repair_outcome.warnings),
                 repair_complete=repair_outcome.repair_complete,
+                batches=[
+                    {
+                        "batch_index": b.batch_index,
+                        "status": b.status,
+                        "findings": [{"index": f.index, "pid": f.pid} for f in b.findings],
+                        "results": [{"index": r.index, "decision": r.decision, "pid": r.pid} for r in b.results],
+                    }
+                    for b in repair_outcome.batches
+                ],
+                batch_count=len(repair_outcome.batches),
+                batches_done=len(repair_outcome.batches),
+                batches_total=len(repair_outcome.batches),
             )
             reaudit = repair_outcome.reaudit
             if reaudit is not None:
@@ -4449,14 +4461,18 @@ class B3AuditRepair:
                     scope_pids=list(reaudit.scope),
                     full=reaudit.full,
                     issue_count=len(reaudit.issues),
+                    issues=[dict(i) for i in reaudit.issues],
                     failed=reaudit.failed,
+                    complete=reaudit.complete,
                 )
                 self._emit_progress(
                     "reaudit_scope",
                     scope_pids=list(reaudit.scope),
                     full=reaudit.full,
                     issue_count=len(reaudit.issues),
+                    issues=[dict(i) for i in reaudit.issues],
                     failed=reaudit.failed,
+                    complete=reaudit.complete,
                 )
 
         committed = (

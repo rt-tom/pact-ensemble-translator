@@ -1630,7 +1630,7 @@ def _phase_repair_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
             committed_n = len(committed_raw)
         else:
             committed_n = _as_int(committed_raw)
-        # Single repair round -> batches done=1/1 with per-batch repaired/eligible
+        # Single repair round -> batches done derived from mirrored counts
         per = f"{committed_n}/{eligible}" if eligible or committed_n else f"{committed_n}/0"
         # Try to infer per-batch breakdown if available (batches field)
         batches = last.get("batches")
@@ -1647,6 +1647,26 @@ def _phase_repair_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
                 per_parts.append(f"{repaired}/{fcnt}")
             per = ", ".join(per_parts) if per_parts else per
             return f"Selective repair: batches done={len(batches)}/{len(batches)} | repaired per batch: [{per}] | findings eligible: {eligible} | PID edits committed: {committed_n}"
+        # Fallback to explicit batch counts when batches list absent (mirrored batch_count)
+        batch_count = None
+        for _k in ("batch_count", "batches_total", "batchesTotal"):
+            _v = last.get(_k)
+            if isinstance(_v, int) and not isinstance(_v, bool) and _v >= 0:
+                batch_count = _v
+                break
+        batches_done = None
+        for _k in ("batches_done", "batchesDone", "batch_done"):
+            _v = last.get(_k)
+            if isinstance(_v, int) and not isinstance(_v, bool) and _v >= 0:
+                batches_done = _v
+                break
+        if batch_count is not None or batches_done is not None:
+            done_n = batches_done if batches_done is not None else batch_count
+            total_n = batch_count if batch_count is not None else batches_done
+            # clamp done <= total
+            if done_n is not None and total_n is not None and done_n > total_n:
+                done_n = total_n
+            return f"Selective repair: batches done={done_n}/{total_n} | repaired per batch: [{per}] | findings eligible: {eligible} | PID edits committed: {committed_n}"
         return f"Selective repair: batches done=1/1 | repaired per batch: [{per}] | findings eligible: {eligible} | PID edits committed: {committed_n}"
     # Only b3_repair_done without a round
     last = repair_dones[-1]
@@ -1969,7 +1989,12 @@ def _phase_reaudit_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
         else:
             residual = _as_int(last.get("issue_count"))
         failed = bool(last.get("failed"))
-        complete = last.get("complete")
+        complete_raw = last.get("complete")
+        if complete_raw is None:
+            # legacy fallback: missing complete -> infer from failed
+            complete = not failed
+        else:
+            complete = bool(complete_raw)
         # Determine done/total from chunk events if present
         chunk_done = [e for e in events if e.get("event") == "reaudit_chunk_done"]
         # Try total from any reaudit event
