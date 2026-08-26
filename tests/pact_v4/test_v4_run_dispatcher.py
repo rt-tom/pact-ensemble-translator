@@ -730,3 +730,262 @@ def test_chapter_no_config_invalid_translator_fails_closed(tmp_path):
             ])
         # Ensure the invalid alias was actually forwarded, not dropped
         assert "unknown_alias_xyz" in str(mock_strict.call_args[0][0])
+
+
+# ---------------------------------------------------------------------------
+# Host-aware layout, source discovery, media defaults, media verdict, preflight readiness (P1)
+# ---------------------------------------------------------------------------
+
+def test_validate_layout_forbidden_root_precedence(tmp_path):
+    """_validate_layout must not always reject; forbidden check uses resolve-if-exists else absolute."""
+    from pact_full_pipeline_runner_v1.v4_run import _validate_layout
+    # Use tmp paths that do not exist under forbidden — should NOT raise
+    layout = {"source": tmp_path / "src", "state": tmp_path / "state", "output": tmp_path / "out"}
+    (layout["source"]).mkdir(); (layout["state"]).mkdir(); (layout["output"]).mkdir()
+    _validate_layout(layout)  # should not raise
+    # Forbidden exact should raise
+    layout2 = {"source": tmp_path / "src2", "state": Path("/home/rt/pact_runs/books/1"), "output": tmp_path / "out2"}
+    (layout2["source"]).mkdir(parents=True, exist_ok=True); (layout2["output"]).mkdir(parents=True, exist_ok=True)
+    with pytest.raises(ValueError, match="snapshot"):
+        _validate_layout(layout2)
+    # State inside forbidden should also raise
+    layout3 = {"source": tmp_path / "src3", "state": Path("/home/rt/pact_runs/books/1/sub"), "output": tmp_path / "out3"}
+    (layout3["source"]).mkdir(parents=True, exist_ok=True); (layout3["output"]).mkdir(parents=True, exist_ok=True)
+    with pytest.raises(ValueError, match="snapshot"):
+        _validate_layout(layout3)
+
+
+def test_host_layout_env_overrides(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1.v4_run import _host_layout
+    monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(tmp_path / "csrc"))
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(tmp_path / "cstate"))
+    monkeypatch.setenv("PACT_V4_OUT_ROOT", str(tmp_path / "cout"))
+    layout = _host_layout()
+    assert layout["source"] == Path(tmp_path / "csrc")
+    assert layout["state"] == Path(tmp_path / "cstate")
+    assert layout["output"] == Path(tmp_path / "cout")
+    # Env PACT_V4_HOST hint
+    monkeypatch.setenv("PACT_V4_HOST", "rt")
+    monkeypatch.delenv("PACT_V4_SOURCE_ROOT", raising=False)
+    monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
+    monkeypatch.delenv("PACT_V4_OUT_ROOT", raising=False)
+    layout_rt = _host_layout()
+    assert layout_rt["source"] == Path("D:/pact/pact_chapters")
+    monkeypatch.setenv("PACT_V4_HOST", "media")
+    layout_media = _host_layout()
+    assert layout_media["source"] == Path("/home/rt/pact_chapters")
+
+
+def test_source_discovery_variable_suffix_and_single_shorthand(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1.v4_run import _discover_chapter_sources
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0028_foo.html").write_text("<html>28</html>")
+    (src / "0149_judgment-16-13.html").write_text("<html>149</html>")
+    # Single chapter discovery
+    res = _discover_chapter_sources(src, [28])
+    assert 28 in res and res[28].name == "0028_foo.html"
+    res2 = _discover_chapter_sources(src, [149])
+    assert 149 in res2 and res2[149].name == "0149_judgment-16-13.html"
+    # Missing should fail
+    with pytest.raises(ValueError, match="no source"):
+        _discover_chapter_sources(src, [9999])
+    # Ambiguous should fail
+    (src / "0028_bar.html").write_text("<html>dup</html>")
+    with pytest.raises(ValueError, match="ambiguous"):
+        _discover_chapter_sources(src, [28])
+
+
+def test_source_discovery_rejects_symlink_and_fifo(tmp_path):
+    from pact_full_pipeline_runner_v1.v4_run import _discover_chapter_sources
+    import os
+    src = tmp_path / "src2"
+    src.mkdir()
+    real = src / "0029_real.html"
+    real.write_text("<html/>")
+    link = src / "0029_link.html"
+    try:
+        link.symlink_to(real)
+    except OSError:
+        pytest.skip("symlink not supported")
+    with pytest.raises(ValueError, match="symlink"):
+        _discover_chapter_sources(src, [29])
+    # Clean symlink and test FIFO
+    link.unlink()
+    fifo = src / "0030_fifo.html"
+    try:
+        os.mkfifo(fifo)
+    except OSError:
+        pytest.skip("fifo not supported")
+    with pytest.raises(ValueError, match="not regular"):
+        _discover_chapter_sources(src, [30])
+
+
+def test_simple_local_injects_media_defaults_and_whole_chapter(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1 import v4_run
+    src = tmp_path / "src"
+    state = tmp_path / "state"
+    out = tmp_path / "out"
+    src.mkdir(); state.mkdir(); out.mkdir()
+    (src / "0028_alpha.html").write_text("<html/>")
+    monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
+    monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out))
+    ok = _ok_report(kind="local_llama")
+    with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+        with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
+            mock_book.return_value = 0
+            rc = v4_run.main(["book", "--chapters", "28", "--local"])
+            assert rc == 0
+            delegated = mock_book.call_args[0][0]
+            # Whole-chapter injected
+            assert "--whole-chapter" in delegated
+            # Media defaults
+            assert "--media-book-id" in delegated
+            assert delegated[delegated.index("--media-book-id")+1] == "1"
+            assert "--media-target" in delegated and delegated[delegated.index("--media-target")+1] == "media-snap"
+            assert "--media-root" in delegated and delegated[delegated.index("--media-root")+1] == "/home/rt/pact_runs"
+            # Single shorthand 28 -> delegated contains full stem 0028_alpha
+            assert "0028_alpha" in delegated
+            # No duplicate --local leakage
+            assert "--local" not in delegated
+
+
+def test_simple_bare_remote_uses_profile_defaults(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1 import v4_run
+    src = tmp_path / "src"
+    state = tmp_path / "state"
+    out = tmp_path / "out"
+    src.mkdir(); state.mkdir(); out.mkdir()
+    (src / "0030_b.html").write_text("<html/>")
+    monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
+    monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out))
+    ok = _ok_report(kind="opencode_server")
+    with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+        with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
+            mock_book.return_value = 0
+            rc = v4_run.main(["book", "--chapters", "30", "--remote"])
+            assert rc == 0
+            delegated = mock_book.call_args[0][0]
+            assert "--managed-server" in delegated
+            assert "--whole-chapter" in delegated
+            assert "--media-book-id" in delegated
+
+
+def test_simple_remote_with_alias_override(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1 import v4_run
+    src = tmp_path / "src"
+    state = tmp_path / "state"
+    out = tmp_path / "out"
+    src.mkdir(); state.mkdir(); out.mkdir()
+    (src / "0031_x.html").write_text("<html/>")
+    monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
+    monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out))
+    ok = _ok_report(kind="opencode_server")
+    with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+        with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
+            mock_book.return_value = 0
+            rc = v4_run.main(["book", "--chapters", "31", "--remote", "musefree/luna"])
+            assert rc == 0
+            delegated = mock_book.call_args[0][0]
+            assert "--translator" in delegated and "musefree" in delegated[delegated.index("--translator")+1]
+            assert "--reviewer" in delegated and "luna" in delegated[delegated.index("--reviewer")+1]
+
+
+def test_book_media_verdict_accepted(capsys, tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1 import v4_book_run
+    # Mock run_book to return accepted with confirmation
+    payload = {"schema": "pact-v4-book-run/v1", "memory_dir": str(tmp_path), "candidates_ledger": str(tmp_path / "gl.json"), "book_memory_candidates_ledger": str(tmp_path / "bm.json"), "chapters": [{"chapter_id": "0028", "terminal_status": "complete", "book_memory_hash_before": "a", "book_memory_hash_after": "b", "promoted": True, "promote_detail": "", "out_dir": str(tmp_path), "candidates": {}, "book_memory_candidates": {}, "book_memory_promotions": [], "index_built": False, "error": None, "media_confirmation": {"status": "ACCEPTED", "revision_id": "rev-0002"}, "media_error": None}]}
+    out_base = tmp_path / "outbase"
+    out_base.mkdir()
+    (out_base / "book_run.json").write_text(json.dumps(payload))
+    with patch("pact_full_pipeline_runner_v1.v4_book_run.run_book", return_value=payload):
+        rc = v4_book_run.main(["--memory-dir", str(tmp_path), "--chapters", "0028", "--chapter-html-pattern", str(tmp_path / "{chapter_id}.html"), "--out-base", str(out_base), "--media-book-id", "1"])
+        out = capsys.readouterr().out
+        assert "MEDIA PUBLISH: ACCEPTED" in out
+        assert "rev-0002" in out
+        assert rc == 0
+        data = json.loads((out_base / "book_run.json").read_text())
+        assert data["media_publish"]["status"] == "ACCEPTED"
+
+
+def test_book_media_verdict_rejected(capsys, tmp_path):
+    from pact_full_pipeline_runner_v1 import v4_book_run
+    payload = {"schema": "pact-v4-book-run/v1", "memory_dir": str(tmp_path), "candidates_ledger": str(tmp_path / "gl.json"), "book_memory_candidates_ledger": str(tmp_path / "bm.json"), "chapters": [{"chapter_id": "0028", "terminal_status": "complete", "book_memory_hash_before": "a", "book_memory_hash_after": "b", "promoted": True, "promote_detail": "", "out_dir": str(tmp_path), "candidates": {}, "book_memory_candidates": {}, "book_memory_promotions": [], "index_built": False, "error": None, "media_confirmation": {"status": "REJECTED", "reason": "STALE_PARENT"}, "media_error": None}]}
+    out_base = tmp_path / "outbase2"
+    out_base.mkdir()
+    (out_base / "book_run.json").write_text(json.dumps(payload))
+    with patch("pact_full_pipeline_runner_v1.v4_book_run.run_book", return_value=payload):
+        rc = v4_book_run.main(["--memory-dir", str(tmp_path), "--chapters", "0028", "--chapter-html-pattern", str(tmp_path / "{chapter_id}.html"), "--out-base", str(out_base), "--media-book-id", "1"])
+        out = capsys.readouterr().out
+        assert "MEDIA PUBLISH: REJECTED" in out
+        assert "STALE_PARENT" in out
+        assert rc == 1
+
+
+def test_book_media_verdict_transport_failure(capsys, tmp_path):
+    from pact_full_pipeline_runner_v1 import v4_book_run
+    payload = {"schema": "pact-v4-book-run/v1", "memory_dir": str(tmp_path), "candidates_ledger": str(tmp_path / "gl.json"), "book_memory_candidates_ledger": str(tmp_path / "bm.json"), "chapters": [{"chapter_id": "0028", "terminal_status": "complete", "book_memory_hash_before": "a", "book_memory_hash_after": "b", "promoted": True, "promote_detail": "", "out_dir": str(tmp_path), "candidates": {}, "book_memory_candidates": {}, "book_memory_promotions": [], "index_built": False, "error": None, "media_confirmation": None, "media_error": "ssh timeout"}]}
+    out_base = tmp_path / "outbase3"
+    out_base.mkdir()
+    (out_base / "book_run.json").write_text(json.dumps(payload))
+    with patch("pact_full_pipeline_runner_v1.v4_book_run.run_book", return_value=payload):
+        rc = v4_book_run.main(["--memory-dir", str(tmp_path), "--chapters", "0028", "--chapter-html-pattern", str(tmp_path / "{chapter_id}.html"), "--out-base", str(out_base), "--media-book-id", "1"])
+        out = capsys.readouterr().out
+        assert "MEDIA PUBLISH: REJECTED" in out
+        assert "ssh timeout" in out or "missing confirmation" in out
+        assert rc == 1
+
+
+def test_book_media_verdict_missing_confirmation(capsys, tmp_path):
+    from pact_full_pipeline_runner_v1 import v4_book_run
+    payload = {"schema": "pact-v4-book-run/v1", "memory_dir": str(tmp_path), "candidates_ledger": str(tmp_path / "gl.json"), "book_memory_candidates_ledger": str(tmp_path / "bm.json"), "chapters": [{"chapter_id": "0028", "terminal_status": "complete", "book_memory_hash_before": "a", "book_memory_hash_after": "b", "promoted": True, "promote_detail": "", "out_dir": str(tmp_path), "candidates": {}, "book_memory_candidates": {}, "book_memory_promotions": [], "index_built": False, "error": None, "media_confirmation": None, "media_error": None}]}
+    out_base = tmp_path / "outbase4"
+    out_base.mkdir()
+    (out_base / "book_run.json").write_text(json.dumps(payload))
+    with patch("pact_full_pipeline_runner_v1.v4_book_run.run_book", return_value=payload):
+        rc = v4_book_run.main(["--memory-dir", str(tmp_path), "--chapters", "0028", "--chapter-html-pattern", str(tmp_path / "{chapter_id}.html"), "--out-base", str(out_base), "--media-book-id", "1"])
+        out = capsys.readouterr().out
+        assert "MEDIA PUBLISH: REJECTED" in out
+        assert "missing confirmation" in out
+        assert rc == 1
+
+
+def test_preflight_path_readiness_missing_and_unwritable(tmp_path, monkeypatch):
+    from pact_full_pipeline_runner_v1.v4_run import main
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "0028_a.html").write_text("<html/>")
+    # Use a nonexistent state dir whose parent exists and is writable -> should pass
+    state_ok = tmp_path / "state_ok" / "nested"
+    (tmp_path / "state_ok").mkdir()
+    out_ok = tmp_path / "out_ok"
+    out_ok.mkdir()
+    monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state_ok))
+    monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out_ok))
+    ok = _ok_report()
+    with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+        with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
+            mock_book.return_value = 0
+            rc = main(["book", "--chapters", "28", "--local", "--preflight"])
+            assert rc == 0
+    # Now make parent unwritable via mock
+    unwritable_parent = tmp_path / "unwritable"
+    unwritable_parent.mkdir()
+    state_bad = unwritable_parent / "nested_state"
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state_bad))
+    with patch("os.access", return_value=False):
+        with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+            rc = main(["book", "--chapters", "28", "--local", "--preflight"])
+            assert rc == 1
+    # Output unwritable similarly
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state_ok))
+    out_bad = unwritable_parent / "out_bad"
+    monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out_bad))
+    with patch("os.access", return_value=False):
+        with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
+            rc = main(["book", "--chapters", "28", "--local", "--preflight"])
+            assert rc == 1

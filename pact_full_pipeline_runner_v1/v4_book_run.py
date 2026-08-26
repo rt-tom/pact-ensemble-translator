@@ -1601,15 +1601,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if status not in ("complete", "accepted_degraded"):
             failed += 1
-    # Fail-closed media sync: if run was configured for media sync, any
-    # promoted chapter with media_error or missing media_confirmation is a
-    # failure (local state already preserved/recorded, but no confirmation).
+    # Fail-closed media sync + final cross-host publication verdict
     media_failed = 0
     if args.media_book_id is not None:
-        for rec in result["chapters"]:
-            if rec.get("promoted"):
-                if rec.get("media_error") or not rec.get("media_confirmation"):
-                    media_failed += 1
+        promoted = [r for r in result["chapters"] if r.get("promoted")]
+        if promoted:
+            accepted = []
+            rejected = []
+            for rec in promoted:
+                if rec.get("media_error"):
+                    rejected.append((rec["chapter_id"], str(rec["media_error"])[:500]))
+                elif not rec.get("media_confirmation"):
+                    rejected.append((rec["chapter_id"], "missing confirmation"))
+                else:
+                    conf = rec["media_confirmation"]
+                    if conf.get("status") != "ACCEPTED":
+                        reason = conf.get("reason") or conf.get("message") or json.dumps(conf)[:500]
+                        rejected.append((rec["chapter_id"], str(reason)[:500]))
+                    else:
+                        rev = conf.get("revision_id") or conf.get("revision") or "unknown"
+                        accepted.append((rec["chapter_id"], str(rev)))
+            # Machine-readable: patch book_run.json with global media_publish verdict
+            try:
+                _br_path = Path(args.out_base) / "book_run.json"
+                if _br_path.is_file():
+                    _br_data = json.loads(_br_path.read_text(encoding="utf-8"))
+                    if rejected:
+                        _br_data["media_publish"] = {
+                            "status": "REJECTED",
+                            "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted],
+                            "rejected": [{"chapter_id": cid, "reason": msg} for cid, msg in rejected],
+                        }
+                    else:
+                        _br_data["media_publish"] = {
+                            "status": "ACCEPTED",
+                            "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted],
+                            "rejected": [],
+                        }
+                    _br_path.write_text(json.dumps(_br_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            if rejected:
+                media_failed = len(rejected)
+                details = "; ".join(f"{cid}: {msg}" for cid, msg in rejected)
+                if accepted:
+                    details += "; accepted: " + ", ".join(f"{cid}={rev}" for cid, rev in accepted)
+                # Human-readable final verdict (required)
+                print(f"MEDIA PUBLISH: REJECTED {details}")
+                # Machine-readable final verdict (required)
+                print(json.dumps({"media_publish": {"status": "REJECTED", "rejected": [{"chapter_id": cid, "reason": msg} for cid, msg in rejected], "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted]}}, ensure_ascii=False))
+            else:
+                details = ", ".join(f"{cid}={rev}" for cid, rev in accepted)
+                print(f"MEDIA PUBLISH: ACCEPTED revision={details}")
+                print(json.dumps({"media_publish": {"status": "ACCEPTED", "accepted": [{"chapter_id": cid, "revision_id": rev} for cid, rev in accepted], "rejected": []}}, ensure_ascii=False))
     if failed:
         print(
             f"\n{failed} chapter(s) did not reach complete/accepted_degraded. "

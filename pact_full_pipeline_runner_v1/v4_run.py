@@ -381,11 +381,12 @@ def _validate_layout(layout: dict[str, Path]) -> None:
     # state should not be exactly /home/rt/pact_runs/books/1
     for forbidden in [Path("/home/rt/pact_runs/books/1"), Path("/home/rt/pact_runs/books")]:
         try:
-            if state_res == forbidden.resolve() if forbidden.exists() else forbidden.absolute():
+            forbidden_root = forbidden.resolve() if forbidden.exists() else forbidden.absolute()
+            if state_res == forbidden_root:
                 raise ValueError(f"state directory must not be canonical snapshot storage: {state}")
-            state_res.relative_to(forbidden.resolve() if forbidden.exists() else forbidden.absolute())
+            state_res.relative_to(forbidden_root)
             # if state is inside forbidden, also bad
-            if str(state_res).startswith(str(forbidden)):
+            if str(state_res).startswith(str(forbidden_root) + "/") or str(state_res) == str(forbidden_root):
                 raise ValueError(f"state directory must be outside canonical snapshot storage: {state}")
         except ValueError as ve:
             if "snapshot" in str(ve):
@@ -837,26 +838,44 @@ def _handle_book(argv: Sequence[str]) -> int:
                 book_errors.append(f"pattern dir is symlink: {pat_dir}")
         except Exception:
             pass
-    # State/output readiness (without creation)
+    # State/output readiness (without creation) — check existing dir OR writable existing ancestor
+    import os as _os_state
+    def _ready_or_ancestor_writable(p: Path, label: str):
+        _check_no_symlink_chain(p)
+        if p.exists():
+            if p.is_symlink():
+                raise ValueError(f"{label} path is symlink: {p}")
+            if not p.is_dir():
+                raise ValueError(f"{label} path not a directory: {p}")
+            if not _os_state.access(p, _os_state.W_OK):
+                raise ValueError(f"{label} path not writable: {p}")
+            return f"ready ({label} exists)"
+        # p does not exist — find writable existing ancestor without creating
+        cur = p.parent
+        while True:
+            if cur.exists():
+                if cur.is_symlink():
+                    raise ValueError(f"{label} ancestor is symlink: {cur}")
+                if not cur.is_dir():
+                    raise ValueError(f"{label} ancestor not a directory: {cur}")
+                if not _os_state.access(cur, _os_state.W_OK):
+                    raise ValueError(f"{label} ancestor not writable: {cur}")
+                return f"ready (writable ancestor {cur})"
+            if cur == cur.parent:  # reached filesystem root with no existing ancestor
+                raise ValueError(f"{label} path has no existing writable ancestor: {p}")
+            cur = cur.parent
     try:
-        _check_no_symlink_chain(memory_dir)
-        if memory_dir.exists() and not memory_dir.is_dir():
-            book_errors.append(f"state path not a directory: {memory_dir}")
-            book_checks.append(type(runtime_report.checks[0])(name=f"state {memory_dir}", ok=False, detail="not a directory"))
-        else:
-            # Check parent writable (if exists) or parent chain
-            parent = memory_dir.parent if memory_dir.exists() else memory_dir
-            # For check-only, don't create; just report exists or parent exists
-            book_checks.append(type(runtime_report.checks[0])(name=f"state {memory_dir}", ok=True, detail="ready"))
+        detail = _ready_or_ancestor_writable(memory_dir, "state")
+        book_checks.append(type(runtime_report.checks[0])(name=f"state {memory_dir}", ok=True, detail=detail))
     except Exception as e:
         book_errors.append(str(e))
         book_checks.append(type(runtime_report.checks[0])(name=f"state {memory_dir}", ok=False, detail=str(e)))
-    # Output root readiness
     try:
-        _check_no_symlink_chain(out_root)
-        book_checks.append(type(runtime_report.checks[0])(name=f"output {out_root}", ok=True, detail="ready"))
+        detail = _ready_or_ancestor_writable(out_root, "output")
+        book_checks.append(type(runtime_report.checks[0])(name=f"output {out_root}", ok=True, detail=detail))
     except Exception as e:
         book_errors.append(str(e))
+        book_checks.append(type(runtime_report.checks[0])(name=f"output {out_root}", ok=False, detail=str(e)))
     # Layout collision already validated
     # Combine reports
     from pact_v4.runtime.runtime_config import PreflightReport
