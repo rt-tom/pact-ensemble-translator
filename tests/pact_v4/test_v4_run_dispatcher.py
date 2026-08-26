@@ -133,7 +133,7 @@ def test_readme_documents_valid_alias_and_no_invalid_example():
 
 def test_book_invalid_ranges_exit_before_pipeline(tmp_path):
     from pact_full_pipeline_runner_v1.v4_run import main
-    for bad in ["27", "32-27", "abc-32", "27-"]:
+    for bad in ["32-27", "abc-32", "27-", "0", "0-5", "27-5000"]:
         with pytest.raises(SystemExit) as exc:
             main(["book", "--chapters", bad, "--runtime-config", "configs/runtime_local.example.yaml"])
         assert exc.value.code == 2

@@ -35,12 +35,35 @@ def _validate_candidate_id(candidate_id: str) -> None:
         from .errors import ValidationError
         raise ValidationError(str(e)) from e
 
+def _check_no_symlink_chain(path: Path) -> None:
+    """Reject if path or any existing ancestor is a symlink (hardening)."""
+    # Check the path itself and each existing ancestor up to filesystem root.
+    candidates = [path] + list(path.parents)
+    for anc in candidates:
+        try:
+            if anc.exists() and anc.is_symlink():
+                raise RuntimeError(f"Symlink in path chain rejected: {anc}")
+        except OSError as e:
+            raise RuntimeError(f"Failed to stat path chain {anc}: {e}") from e
+
+
+def _is_regular_file(path: Path) -> bool:
+    """Return True iff path is a regular file (not FIFO/socket/device/dir/symlink)."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    import stat as _stat
+    return _stat.S_ISREG(st.st_mode)
+
+
 def _validate_local_files(local_dir: Path) -> None:
+    _check_no_symlink_chain(local_dir)
     for fname in CANONICAL_FILES:
         p = local_dir / fname
         if p.is_symlink():
             raise ValueError(f"Local file is symlink (rejected): {fname}")
-        if not p.is_file():
+        if not p.is_file() or not _is_regular_file(p):
             raise ValueError(f"Local file missing or not regular: {fname}")
         # Valid JSON
         try:
@@ -70,6 +93,80 @@ def _build_candidate_tar_bytes(local_dir: Path, manifest_dict: Dict[str, Any]) -
             tar.addfile(ti2, io.BytesIO(data))
     return bio.getvalue()
 
+def _should_use_local_facade(ssh_target: str, root: str) -> bool:
+    """Return True if local BookStore should be used instead of SSH (media self-loop avoidance)."""
+    # Only for the approved media root; on RT (Windows) the Linux path won't exist.
+    if root != "/home/rt/pact_runs":
+        return False
+    # Media host has the store parent directory locally.
+    try:
+        if Path(root).is_dir() and Path(root).exists():
+            # Distinguish media host by Linux directory existence; on RT this path doesn't exist.
+            # If ssh_target is the restricted facade alias, use local path when store is locally reachable.
+            if ssh_target in ("media-snap", "media"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _local_fetch_current(book_id: str, dest_dir: Path, root: str) -> Dict[str, Any]:
+    """Local facade fetch: copy from BookStore snapshots without SSH."""
+    store = BookStore(book_id, root=root)
+    _check_no_symlink_chain(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    current = store.read_current()
+    if current is None or current.get("revision_id") is None:
+        raise RuntimeError("CURRENT.json not found or no revision (local facade)")
+    revision_id = current.get("revision_id")
+    snap_dir = store.snapshot_dir(revision_id)
+    if snap_dir.is_symlink():
+        raise RuntimeError(f"snapshot dir is symlink: {snap_dir}")
+    _check_no_symlink_chain(snap_dir)
+    if not snap_dir.is_dir():
+        raise RuntimeError(f"snapshot dir missing: {snap_dir}")
+    manifest_path = snap_dir / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file() or not _is_regular_file(manifest_path):
+        raise RuntimeError(f"manifest.json missing or not regular: {manifest_path}")
+    # Validate and copy CURRENT.json / manifest.json
+    cur_bytes = json.dumps(current, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    (dest_dir / "CURRENT.json").write_bytes(cur_bytes)
+    (dest_dir / "manifest.json").write_bytes(manifest_path.read_bytes())
+    # Copy four canonical files from snapshot state/
+    state_dir = snap_dir / "state"
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise RuntimeError(f"state dir missing or symlink: {state_dir}")
+    _check_no_symlink_chain(state_dir)
+    for fname in CANONICAL_FILES:
+        src = state_dir / fname
+        if src.is_symlink() or not src.is_file() or not _is_regular_file(src):
+            raise RuntimeError(f"state file missing or not regular: {fname}")
+        _check_no_symlink_chain(src)
+        content = src.read_bytes()
+        # Validate JSON
+        json.loads(content.decode("utf-8"))
+        (dest_dir / fname).write_bytes(content)
+    return current
+
+
+def _local_push_candidate(book_id: str, candidate_id: str, local_dir: Path, manifest_dict: Dict[str, Any], root: str) -> Dict[str, Any]:
+    """Local facade push: receive-candidate + promote via BookStore."""
+    store = BookStore(book_id, root=root)
+    tar_bytes = _build_candidate_tar_bytes(local_dir, manifest_dict)
+    from pact_v4.snapshot.cli import _receive_candidate_stream
+    from pact_v4.snapshot.promote import promote as _promote
+    from pact_v4.snapshot.errors import SnapshotError
+    rc = _receive_candidate_stream(store, candidate_id, tar_bytes)
+    if rc != 0:
+        raise RuntimeError(f"local receive-candidate failed rc={rc}")
+    try:
+        verdict = _promote(store, candidate_id, operator="rt", host="RT")
+        return verdict
+    except SnapshotError as e:
+        # Promote already quarantined; return REJECTED verdict dict
+        return {"status": "REJECTED", "reason": getattr(e, "code", type(e).__name__), "message": str(e), "candidate_id": candidate_id}
+
+
 def _extract_fetch_tar(tar_bytes: bytes, dest_dir: Path) -> Dict[str, Any]:
     """Validate and extract fetch-current tar (CURRENT.json, manifest.json, state/*) into dest_dir.
 
@@ -78,6 +175,7 @@ def _extract_fetch_tar(tar_bytes: bytes, dest_dir: Path) -> Dict[str, Any]:
     """
     if not tar_bytes:
         raise RuntimeError("Empty fetch-current response")
+    _check_no_symlink_chain(dest_dir)
     bio = io.BytesIO(tar_bytes)
     # Validate members
     with tarfile.open(fileobj=bio, mode="r:*") as tar:
@@ -117,11 +215,8 @@ def _extract_fetch_tar(tar_bytes: bytes, dest_dir: Path) -> Dict[str, Any]:
                         raise RuntimeError(f"Unexpected state file: {fname}")
                     # Validate JSON
                     json.loads(content.decode("utf-8"))
-                    # Write flat to dest_dir/<fname> and also preserve state/ layout if needed
+                    # Write flat to dest_dir/<fname> only (single copy, no state/ mirror)
                     (dest_dir / fname).write_bytes(content)
-                    # Also write to state subdir for completeness
-                    (dest_dir / "state").mkdir(parents=True, exist_ok=True)
-                    (dest_dir / "state" / fname).write_bytes(content)
     # Return CURRENT
     cur_path = dest_dir / "CURRENT.json"
     if cur_path.exists():
@@ -144,8 +239,17 @@ def fetch_current(book_id: str, dest_dir: str | Path, *, transport=None, ssh_tar
     """
     _validate_book_id(book_id)
     dest = Path(dest_dir)
+    _check_no_symlink_chain(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    # Fail-closed: dest_dir must not contain symlinked ancestor? Not needed RT side.
+    _check_no_symlink_chain(dest)
+    # Local facade for media self-loop avoidance (media host): prefer BookStore direct I/O.
+    if transport is None and _should_use_local_facade(ssh_target, root):
+        try:
+            return _local_fetch_current(book_id, dest, root)
+        except Exception as e:
+            # If local facade fails due to missing store, fall through to SSH attempt?
+            # For safety, fail-closed: propagate local error rather than silently falling back.
+            raise RuntimeError(f"local fetch_current failed: {e}") from e
     if transport is not None and hasattr(transport, "fetch_current"):
         # Fake transport may be callable or object
         result = transport.fetch_current(book_id, dest)  # type: ignore
@@ -295,6 +399,12 @@ def push_candidate(book_id: str, candidate_id: str, local_dir: str | Path, *, tr
         "excludes": [],
         "code_commit": "unknown",
     }
+    # Local facade for media self-loop avoidance: use BookStore directly when on media host.
+    if transport is None and _should_use_local_facade(ssh_target, root):
+        try:
+            return _local_push_candidate(book_id, candidate_id, ldir, manifest_dict, root)
+        except Exception as e:
+            raise RuntimeError(f"local push_candidate failed: {e}") from e
     tar_bytes = _build_candidate_tar_bytes(ldir, manifest_dict)
 
     # Step 1: receive-candidate
