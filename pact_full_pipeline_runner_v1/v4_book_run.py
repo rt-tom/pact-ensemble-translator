@@ -951,6 +951,100 @@ def _detect_execution_host() -> str:
     return "media"
 
 
+def _flag_value(extra, flag):
+    for i, val in enumerate(extra):
+        if val == flag and i + 1 < len(extra):
+            return str(extra[i + 1])
+        if isinstance(val, str) and val.startswith(flag + "="):
+            return val.split("=", 1)[1]
+    return None
+
+
+class _FormattingBackendClient:
+    """Adapter wrapping a CompletionBackend for resolve_format_mappings."""
+    def __init__(self, backend, runtime=None):
+        self._backend = backend
+        self._runtime = runtime
+    def complete(self, messages, cfg, max_tokens, label=None):
+        from pact_v4.runtime.backend_protocol import CompletionRequest, Message
+        msgs = tuple(Message(role=str(m.get("role", "user")), content=str(m.get("content", ""))) for m in messages)
+        model_ref = "default"
+        try:
+            from pact_v4.runtime.backend_role_adapters import _model_ref_for
+            model_ref = _model_ref_for(self._backend, ("generator", "default"))
+        except Exception:
+            try:
+                bindings = getattr(getattr(self._backend, "descriptor", None), "model_bindings", {}) or {}
+                model_ref = bindings.get("generator") or bindings.get("default") or "default"
+            except Exception:
+                model_ref = "default"
+        req = CompletionRequest(
+            model_ref=model_ref,
+            messages=msgs,
+            max_output_tokens=int(max_tokens),
+            temperature=float(cfg.get("temperature", 0.1)),
+            response_schema={"type": "json_object"},
+            label=label or "formatting",
+        )
+        resp = self._backend.complete(req)
+        class _Gen:
+            def __init__(self, text):
+                self.content = text
+        return _Gen(resp.text if hasattr(resp, "text") else str(resp))
+    def close(self):
+        if self._runtime is not None:
+            try:
+                self._runtime.close()
+            except Exception:
+                pass
+
+
+def _build_formatting_client(args, extra, fmt_cfg):
+    if not fmt_cfg.get("enabled", True):
+        return None
+    rc_path = _flag_value(extra, "--runtime-config")
+    translator = _flag_value(extra, "--translator")
+    reviewer = _flag_value(extra, "--reviewer")
+    providers_cfg = _flag_value(extra, "--providers-config")
+    if rc_path is None and hasattr(args, "runtime_config") and getattr(args, "runtime_config", None):
+        rc_path = str(getattr(args, "runtime_config"))
+    if translator is None and hasattr(args, "translator") and getattr(args, "translator", None):
+        translator = str(getattr(args, "translator"))
+    if rc_path is None and translator is None and reviewer is None:
+        return None
+    try:
+        backend = None
+        runtime = None
+        if rc_path:
+            from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _load_runtime_config_file
+            backend = _load_runtime_config_file(Path(rc_path))
+            if translator or reviewer:
+                from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _apply_provider_flags as _apf
+                class _Tmp:
+                    pass
+                tmp = _Tmp()
+                tmp.translator = translator
+                tmp.reviewer = reviewer
+                tmp.providers_config = Path(providers_cfg) if providers_cfg else None
+                backend = _apf(tmp, backend)
+        else:
+            return None
+        if backend is None:
+            return None
+        log_dir = Path(getattr(args, "memory_dir", Path("/tmp"))) / "server_logs_fmt" if hasattr(args, "memory_dir") else Path("/tmp")
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        runtime = backend.build_runtime(log_dir=log_dir)
+        from pact_v4.runtime.runtime_config import build_role_backend
+        fmt_backend = build_role_backend(backend, runtime)
+        return _FormattingBackendClient(fmt_backend, runtime)
+    except Exception as exc:
+        LOG.warning("formatting client build failed (%s) — falling back to debt", exc)
+        return None
+
+
 def run_book(
     *,
     memory_dir: Path,
@@ -1693,7 +1787,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         extra += ["--mixed-script-allow", str(entry)]
     _fmt_cfg: dict = dict(_DEFAULT_FORMATTING_CFG)
     _fmt_cfg["enabled"] = bool(args.formatting_enabled)
-    result = run_book(
+    _formatting_client = _build_formatting_client(args, extra, _fmt_cfg)
+    try:
+        result = run_book(
         memory_dir=args.memory_dir,
         chapter_ids=args.chapters,
         chapter_html_pattern=args.chapter_html_pattern,
@@ -1714,8 +1810,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         media_target=args.media_target,
         media_exec_host=args.media_exec_host,
         formatting_cfg=_fmt_cfg,
+        formatting_client=_formatting_client,
         max_formatting_incidents=int(args.max_formatting_incidents),
     )
+    finally:
+        if _formatting_client is not None and hasattr(_formatting_client, "close"):
+            try:
+                _formatting_client.close()
+            except Exception:
+                pass
     failed = 0
     for rec in result["chapters"]:
         status = rec["terminal_status"]
