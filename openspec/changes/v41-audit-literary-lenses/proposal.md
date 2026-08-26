@@ -28,3 +28,6 @@
 - Regression suite (B1 §6) — добавление literary must-not-find контрактов.
 - Количество вызовов моделей: **без изменений** (те же 1 вызов Qwen на аудит-чанк; выходные токены в пределах `max_tokens=12000`).
 - Не затрагивает генерацию, repair, formatting, identity/resume детерминизм (кроме ожидаемого bump `prompt_version` в audit identity).
+
+---
+**Note 2026-08-26:** Superseded by `v41-literary-consistency-checks` (31 tasks, merged at 71a1f87). This change is kept for history.
