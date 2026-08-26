@@ -20,12 +20,12 @@
 
 ## 4. Tests
 
-- [ ] 4.1 Facade allow-list tests: allowed subcommands execute, disallowed subcommand / wrong `book-id` are rejected; verify with a mocked store.
-- [ ] 4.2 Client tests with a fake/loopback SSH target (or injected transport) confirming `fetch_current` returns exactly four files, `push_candidate` returns ACCEPTED/`revision_id`, and `STALE_PARENT` surfaces; verify no network import in the store package.
-- [ ] 4.3 Run-hook integration test: fake media returning a state → run pulls → promotes → pushes → confirmation recorded; and stale-parent retry path; verify state-only boundary (no translation bodies moved).
-- [ ] 4.4 Reuse the existing boundary/negative matrix (extra file, symlink, special file, post-lock mutation) to confirm the end-to-end path rejects smuggled candidates; verify the same 35+ snapshot tests still pass.
+- [x] 4.1 Facade allow-list tests: allowed subcommands execute, disallowed subcommand / wrong `book-id` are rejected; verify with a mocked store.
+- [x] 4.2 Client tests with a fake/loopback SSH target (or injected transport) confirming `fetch_current` returns exactly four files, `push_candidate` returns ACCEPTED/`revision_id`, and `STALE_PARENT` surfaces; verify no network import in the store package.
+- [x] 4.3 Run-hook integration test: fake media returning a state → run pulls → promotes → pushes → confirmation recorded; and stale-parent retry path; verify state-only boundary (no translation bodies moved).
+- [x] 4.4 Reuse the existing boundary/negative matrix (extra file, symlink, special file, post-lock mutation) to confirm the end-to-end path rejects smuggled candidates; verify the same 35+ snapshot tests still pass.
 
 ## 5. Docs / ops
 
-- [ ] 5.1 Document the `authorized_keys command=` snippet (dedicated RT key, `restrict`, `no-pty`, wrapper path + allowed args) as owner host-config; verify the snippet matches the facade's allow-list.
-- [ ] 5.2 Add a runbook section: RT run now pulls at start / pushes+confirms at end; what to do on media unreachable or `STALE_PARENT`; how to recover with `release-lease`.
+- [x] 5.1 Document the `authorized_keys command=` snippet (dedicated RT key, `restrict`, `no-pty`, wrapper path + allowed args) as owner host-config; verify the snippet matches the facade's allow-list.
+- [x] 5.2 Add a runbook section: RT run now pulls at start / pushes+confirms at end; what to do on media unreachable or `STALE_PARENT`; how to recover with `release-lease`.
