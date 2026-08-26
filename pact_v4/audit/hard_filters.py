@@ -101,7 +101,8 @@ TIER_B = "tier_b"
 
 # B1 issue-format contract (audit_v4.ps1 / B1 card).
 B1_AUDIT_CATEGORIES = frozenset(
-    {"omission", "addition", "referent", "invented_gender", "changed_fact", "negation"}
+    {"omission", "addition", "referent", "invented_gender", "changed_fact", "negation",
+     "voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"}
 )
 B1_SEVERITIES = frozenset({"major", "minor"})
 B1_CONFIDENCES = frozenset({"high", "medium", "low"})

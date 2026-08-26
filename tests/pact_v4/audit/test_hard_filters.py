@@ -763,3 +763,36 @@ def test_entity_context_evidence_dict_and_windows_combined():
     for pid in ("p00205", "p00206", "p00207"):
         assert result[pid].verdict == TIER_B
         assert result[pid].filter_name == "entity_context"
+
+def test_new_literary_category_not_rejected_and_tier_b():
+    """v41: new literary categories are allowed, not REJECTED, default to TIER_B."""
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        issue = _issue("p00100", cat, note="literary consistency", excerpt="текст")
+        result = _verdicts([issue], source={"p00100": "source"}, translation={"p00100": "перевод"})
+        assert result["p00100"].verdict == TIER_B
+        assert result["p00100"].filter_name == "semantic"  # default branch
+
+def test_b1_categories_has_10():
+    from pact_v4.audit.hard_filters import B1_AUDIT_CATEGORIES
+    assert len(B1_AUDIT_CATEGORIES) == 10
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        assert cat in B1_AUDIT_CATEGORIES
+
+def test_allowed_categories_accepts_new_category():
+    """reaudit-validation: new category passes allowed_categories check."""
+    from pact_v4.audit.chunked_audit import AUDIT_V4_CATEGORIES
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        assert cat in AUDIT_V4_CATEGORIES
+        issue = _issue("p00100", cat, note="literary", excerpt="x")
+        result = _verdicts([issue], source={"p00100": "src"}, translation={"p00100": "tr"}, allowed_categories=AUDIT_V4_CATEGORIES)
+        assert result["p00100"].verdict != REJECTED  # not rejected on category
+
+def test_new_categories_not_in_numeric_string_gender():
+    from pact_v4.audit.hard_filters import B1_AUDIT_CATEGORIES
+    # new categories must NOT be in the numeric/string/gender special sets — they fall through to TIER_B
+    # we check via B1 categories length and that numeric hint does not force CONFIRMED
+    # The module internals _NUMERIC etc are not exported, but we can verify new cats stay TIER_B even with numeric hint
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        issue = _issue("p00100", cat, note="12 cats", excerpt="12")
+        result = _verdicts([issue], source={"p00100": "Twelve cats"}, translation={"p00100": "Двенадцать кошек"})
+        assert result["p00100"].verdict == TIER_B

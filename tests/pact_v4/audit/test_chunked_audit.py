@@ -493,15 +493,14 @@ def test_audit_prompt_v42_lenses_includes_literary_consistency_rules() -> None:
     backend = ScriptedBackend([_ok_response([]), _ok_response([])])
     evaluator = ChunkedAuditEvaluator(backend)
     evaluator(chapter_id="0001", pairs=pairs)
-    assert PROMPT_VERSION == "pact-v4-reviewer-qwen-audit/v4.2-lenses"
+    assert PROMPT_VERSION == "pact-v4-reviewer-qwen-audit/v4.3-lenses"
     prompt = backend.requests[0].messages[0].content
     assert "LITERARY CONSISTENCY CHECKS" in prompt
     assert "LAIT 2026" in prompt
     assert "DO NOT OVER-POLICE STYLE rule (RULE 14)" in prompt
     assert "AUDIT_PAIRS" in prompt  # unchanged surrounding contract
-    # existing categories unchanged; no new category invented
     assert (
-        "omission | addition | referent | invented_gender | changed_fact | negation"
+        "omission | addition | referent | invented_gender | changed_fact | negation | voice_continuity | seam | dialogue_translationese | ambiguity_flattening"
         in prompt
     )
     # legacy rules still present (no regression of the 18 existing rules)
@@ -1170,3 +1169,55 @@ def test_audit_streams_reasoning_live_during_call(tmp_path) -> None:
     assert (tmp_path / "audit_chunk1_reasoning.txt").read_text(
         encoding="utf-8"
     ) == "full-reasoning"
+
+
+def test_audit_v4_categories_has_10_and_new_categories_validated() -> None:
+    """v41: AUDIT_V4_CATEGORIES extends to 10, new categories validate."""
+    assert len(AUDIT_V4_CATEGORIES) == 10
+    for cat in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"):
+        assert cat in AUDIT_V4_CATEGORIES
+        result = validate_chunk_json({"issues": [_issue("p00010", category=cat)]}, ["p00010"])
+        assert result.valid
+        assert len(result.issues) == 1
+        assert result.issues[0]["category"] == cat
+
+
+def test_gold_suite_4_new_literary_categories_must_find() -> None:
+    """v41: each new literary category must be collectable (mock backend)."""
+    new_cats = ["voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening"]
+    pairs = [_pair(f"p000{i+10}", src=f"source {i}", tr=f"перевод {i}") for i, _ in enumerate(new_cats)]
+    issues = [_issue(pairs[i].pid, category=cat, note=f"gold {cat}") for i, cat in enumerate(new_cats)]
+    backend = ScriptedBackend([_ok_response(issues)])
+    evaluator = ChunkedAuditEvaluator(backend)
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert outcome.audit_complete
+    assert outcome.issue_count == 4
+    found_cats = {i["category"] for i in outcome.issues}
+    assert found_cats == set(new_cats)
+
+
+def test_literary_style_variation_must_not_find_new_category() -> None:
+    """v41: style variation without semantic loss must PASS (no new category)."""
+    pairs = [_pair("p00050", src="He walked casually.", tr="Он шёл небрежной походкой.")]  # style variation
+    backend = ScriptedBackend([_ok_response([])])
+    evaluator = ChunkedAuditEvaluator(backend)
+    outcome = evaluator(chapter_id="0001", pairs=pairs)
+    assert outcome.audit_complete
+    assert outcome.issue_count == 0
+    # validate that a would-be style variation is not accepted as new category finding
+    # (if model emitted it as new category, it would be collected — here empty is the correct)
+    assert all(i["category"] not in ("voice_continuity", "seam", "dialogue_translationese", "ambiguity_flattening") for i in outcome.issues)
+
+
+def test_audit_prompt_v43_reports_under_new_categories_instruction() -> None:
+    """v41: RULE 19 must instruct reporting under exactly ONE of the 4 new categories."""
+    pairs = [_big_pair(f"p{i:05d}") for i in range(1, 5)]
+    backend = ScriptedBackend([_ok_response([])])
+    evaluator = ChunkedAuditEvaluator(backend)
+    evaluator(chapter_id="0001", pairs=pairs)
+    prompt = backend.requests[0].messages[0].content
+    assert "Report each literary-consistency finding under exactly ONE of the four new" in prompt
+    assert "voice_continuity | seam | dialogue_translationese" in prompt
+    assert "Do not invent new categories" not in prompt
+    # RULE 14 preserved
+    assert "DO NOT OVER-POLICE STYLE" in prompt

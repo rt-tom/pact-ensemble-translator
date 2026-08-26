@@ -1357,8 +1357,8 @@ def test_outcome_payload_roundtrip() -> None:
 
 def test_module_constants() -> None:
     assert RUSSIAN_EDITOR_SCHEMA == "pact-v4-russian-editor/v1"
-    # R-FIX2 (run_012): v3 = substring-original contract (fragment quotes).
-    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v3"
+    # R-FIX2 (run_012): v3 = substring-original contract (fragment quotes). v41 bumps to v4.
+    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v4"
     # DIALOGUE-TYPOGRAPHY (t_41da17ec): 4.3 — the R stage now ALSO emits
     # deterministic dialogue_format REVIEW candidates (0 LLM). Identity-
     # bearing: a cache written before this pass must not replay an outcome
@@ -1529,3 +1529,60 @@ def test_evaluator_streams_reasoning_live_during_call(tmp_path) -> None:
     assert (tmp_path / "r_editor_chunk1_reasoning.txt").read_text(
         encoding="utf-8"
     ) == "full-reasoning"
+
+def test_r_editor_register_break_and_translationese_must_find():
+    """v41: R-editor must flag Russian-internal register break and translationese."""
+    from pact_v4.runtime.prompts_runtime import RUSSIAN_EDITOR_V4_2_R1
+    # prompt must contain refined descriptions
+    assert "character voice / register continuity" in RUSSIAN_EDITOR_V4_2_R1.instructions
+    assert "smoothness/immersion" in RUSSIAN_EDITOR_V4_2_R1.instructions
+    assert "translationese framing" in RUSSIAN_EDITOR_V4_2_R1.instructions or "translationese" in RUSSIAN_EDITOR_V4_2_R1.instructions
+    assert "minimal single-defect" in RUSSIAN_EDITOR_V4_2_R1.instructions
+    assert "ONLY in REVIEW classes" in RUSSIAN_EDITOR_V4_2_R1.instructions
+    assert RUSSIAN_EDITOR_V4_2_R1.version == "pact-v4.2-russian-editor/v4"
+    # class enum stays 9 (typo|grammar|duplicate|preposition|calque|logic|ambiguity|unnatural|register)
+    # dialogue_format is in ALL_CLASSES but not in prompt enum
+    assert "dialogue_format" not in RUSSIAN_EDITOR_V4_2_R1.instructions
+    # must-find via evaluator mock: register break inside chunk
+    translation = {
+        "p00001": "— Здравствуйте, господин. — сказал он вежливо.",
+        "p00002": "— Ё, чё как, братан? — сказал тот же персонаж.",
+        "p00003": "Он сделал очень сделать работу.",  # calque/translationese
+    }
+    p1_text = translation["p00001"]
+    # mock backend returns register for p00002 and unnatural/calque for p00003
+    backend = _MockBackend(
+        _ok([
+            _edit("p00002", translation["p00002"], "— Добрый день, — сказал тот же персонаж.", "register break", "register"),
+            _edit("p00003", "очень сделать", "сделать", "translationese/unnatural", "unnatural"),
+        ])
+    )
+    evaluator = RussianEditorEvaluator(backend, config=RussianEditorConfig())
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    by_pid = {e.pid: e for e in outcome.edits}
+    assert "p00002" in by_pid and by_pid["p00002"].klass == "register"
+    assert "p00003" in by_pid and by_pid["p00003"].klass == "unnatural"
+    # parse still validates 9 classes
+    assert all(e.klass in ALL_CLASSES for e in outcome.edits)
+    assert len(ALL_CLASSES) == 10  # includes dialogue_format
+    # but prompt enum is 9 (without dialogue_format)
+    assert "typo|grammar|duplicate|preposition|calque|logic|ambiguity|unnatural|register" in RUSSIAN_EDITOR_V4_2_R1.instructions
+
+def test_r_editor_style_variation_must_not_find_and_not_safe():
+    """v41: style variation -> PASS, must NOT emit SAFE class for literary judgement."""
+    translation = {
+        "p00001": "Он шёл по улице, наслаждаясь вечером.",
+        "p00002": "Она улыбнулась ему.",
+    }
+    backend = _MockBackend(_ok([]))  # model correctly passes
+    evaluator = RussianEditorEvaluator(backend, config=RussianEditorConfig())
+    outcome = evaluator(chapter_id="0001", translation=translation)
+    assert outcome.edits == ()
+    assert outcome.applied == ()
+    # ensure no SAFE class would be used for literary judgement (prompt rule)
+    from pact_v4.runtime.prompts_runtime import RUSSIAN_EDITOR_V4_2_R1
+    assert "never in SAFE" in RUSSIAN_EDITOR_V4_2_R1.instructions or "ONLY in REVIEW" in RUSSIAN_EDITOR_V4_2_R1.instructions
+
+def test_russian_editor_prompt_version_is_v4():
+    from pact_v4.audit.russian_editor import RUSSIAN_EDITOR_PROMPT_VERSION
+    assert RUSSIAN_EDITOR_PROMPT_VERSION == "pact-v4.2-russian-editor/v4"
