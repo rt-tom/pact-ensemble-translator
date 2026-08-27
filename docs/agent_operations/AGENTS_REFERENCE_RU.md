@@ -103,6 +103,39 @@ numeric-валидация, duplicate-header, top-5 heading). Правило с�
 - v4_book_run.py НЕ собирает книгу (только book_run.json + кандидаты глоссария/памяти + promote). Склейка глав в book.html — отдельный шаг:
   python -m pact_full_pipeline_runner_v1.v4_book_html --out-base <out-base> --run-dirs chapter_*_bonds-1-* --chapter-html-pattern 'D:/pact/pact_chapters/{chapter_id}.html' --title 'Книга'
 
+### Команды запуска прогона (RT / media) (2026-08-27)
+Диспетчер: `pact_full_pipeline_runner_v1.v4_run`, подкоманда `book` (основной workflow — последовательные главы с общей памятью). Простой режим: `--local` / `--remote [translator/reviewer]` + `--chapters N|N-M`.
+
+Пример: перевод главы 01, переводчик `sol`, ревьюер `terra` (bare-алиасы резолвятся через `providers.yaml` → `openai/gpt-5.6-sol` / `openai/gpt-5.6-terra`).
+
+**Media (прямо на media, bash):**
+```bash
+cd ~/projects/pact-ensemble-translator
+python3 -m pact_full_pipeline_runner_v1.v4_run book --chapters 1 --remote "sol/terra"
+```
+- Источник глав — `/home/rt/pact_chapters` (резолв `--chapters 1` → `0001_*.html`).
+- В интерактивном shell владельца работает `python`; в агентской неинтерактивной сессии — только `python3`.
+
+**RT (прямо на RT, PowerShell в `D:\pact\pact_translator_v4_1`):**
+```powershell
+cd D:\pact\pact_translator_v4_1
+python -m pact_full_pipeline_runner_v1.v4_run book --chapters 1 --remote "sol/terra"
+```
+- Источник глав — `D:/pact/pact_chapters`.
+
+**RT (из media через ssh rt + powershell)** — см. раздел «Деплой на RT через ssh rt + powershell»:
+```bash
+ssh rt 'powershell -NoProfile -Command "cd D:/pact/pact_translator_v4_1; python -m pact_full_pipeline_runner_v1.v4_run book --chapters 1 --remote sol/terra"'
+```
+
+Ключевые нюансы:
+- `--remote "sol/terra"`: слэш в простом режиме = `переводчик/ревьюер` (Bare-алиасы). НЕ путать с `provider/alias`. `--translator`/`--reviewer` флаги НЕЛЬЗЯ комбинировать с `--remote` (взаимоисключающи, ошибка).
+- `--chapters N` → `NNNN_*.html`; диапазон `--chapters 1-5`. Каждый номер резолвится в ровно один файл (иначе fail-closed до старта).
+- `--preflight` — check-only: валидирует профиль/пути/env/резолв главы и алиасов, НЕ запускает пайплайн. Используйте перед полным прогоном.
+- `reasoning` по умолчанию 3; managed-сервер для simple remote включается автоматически.
+- Обязательные env-переменные (берутся из окружения интерактивной сессии владельца, НЕ из репозитория): `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD` (см. `configs/runtime_remote.example.yaml`, `auth.basic_env`). Агентская неинтерактивная оболочка их обычно не наследует — префлайт в ней покажет «missing env», хотя у владельца PASS.
+- Сам пайплайн запускает владелец вручную (manual-only); агент только готовит команды и валидирует префлайтом.
+
 ### Деплой на RT через ssh rt + powershell (2026-08-27)
 - Хост RT доступен по ssh-алиасу `rt` (ключ `~/.ssh/id_rt`, `IdentitiesOnly yes`). Дефолтный удалённый шелл — `cmd`, но `powershell`/`pwsh` вызываются явно и работают: `ssh rt 'powershell -NoProfile -Command "Write-Host OK"'`.
 - Деплой-синхронизация продакшн-чекаута (per AGENTS.md: после каждого деплоя `git pull --ff-only` на RT). Проверенный вариант:
