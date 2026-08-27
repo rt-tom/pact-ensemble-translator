@@ -2819,12 +2819,17 @@ def _active_chapter(chapters: List[Path], snapshots: Optional[Dict[str, Dict[str
 
 
 def _resolve_state_root() -> Path:
-    """Mirror v4_run._host_layout() state resolution for the monitor."""
+    """Mirror v4_run host/state resolution for the monitor.
+
+    Matches the run's effective host selection: ``PACT_V4_HOST`` takes
+    precedence over ``PACT_EXEC_HOST``, then platform (win32 == RT).
+    """
     import os as _os
     import sys as _sys
     if _os.environ.get("PACT_V4_STATE_ROOT"):
         return Path(_os.environ["PACT_V4_STATE_ROOT"])
-    if _os.environ.get("PACT_V4_HOST") == "rt" or _sys.platform == "win32":
+    env_host = _os.environ.get("PACT_V4_HOST") or _os.environ.get("PACT_EXEC_HOST")
+    if env_host == "rt" or _sys.platform == "win32":
         return Path("D:/pact/book_state")
     return Path("/home/rt/pact_runs/workers/media/book-1/state")
 

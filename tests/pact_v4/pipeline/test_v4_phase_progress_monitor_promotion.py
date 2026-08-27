@@ -111,11 +111,13 @@ def test_resolve_state_root_env(monkeypatch):
     monkeypatch.setenv("PACT_V4_STATE_ROOT", "/tmp/custom_state")
     # ensure HOST not interfering
     monkeypatch.delenv("PACT_V4_HOST", raising=False)
+    monkeypatch.delenv("PACT_EXEC_HOST", raising=False)
     assert tracker._resolve_state_root() == Path("/tmp/custom_state")
 
 
 def test_resolve_state_root_host_rt(monkeypatch):
     monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
+    monkeypatch.delenv("PACT_EXEC_HOST", raising=False)
     monkeypatch.setenv("PACT_V4_HOST", "rt")
     assert tracker._resolve_state_root() == Path("D:/pact/book_state")
 
@@ -123,7 +125,7 @@ def test_resolve_state_root_host_rt(monkeypatch):
 def test_resolve_state_root_win32(monkeypatch):
     monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
     monkeypatch.delenv("PACT_V4_HOST", raising=False)
-    monkeypatch.setattr(tracker.sys, "platform", "win32", raising=False) if hasattr(tracker, "sys") else monkeypatch.setattr("sys.platform", "win32", raising=False)
+    monkeypatch.delenv("PACT_EXEC_HOST", raising=False)
     # fallback: directly patch sys.platform via monkeypatch
     import sys as _sys
     monkeypatch.setattr(_sys, "platform", "win32", raising=False)
@@ -133,9 +135,43 @@ def test_resolve_state_root_win32(monkeypatch):
 def test_resolve_state_root_default(monkeypatch):
     monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
     monkeypatch.delenv("PACT_V4_HOST", raising=False)
+    monkeypatch.delenv("PACT_EXEC_HOST", raising=False)
     import sys as _sys
     monkeypatch.setattr(_sys, "platform", "linux", raising=False)
     assert tracker._resolve_state_root() == Path("/home/rt/pact_runs/workers/media/book-1/state")
+
+
+def test_resolve_state_root_exec_host_precedence(monkeypatch):
+    """PACT_EXEC_HOST mirrors run host selection with PACT_V4_HOST precedence."""
+    import sys as _sys
+
+    # PACT_EXEC_HOST=rt (PACT_V4_HOST unset, non-win32) -> RT dir
+    monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
+    monkeypatch.delenv("PACT_V4_HOST", raising=False)
+    monkeypatch.delenv("PACT_EXEC_HOST", raising=False)
+    monkeypatch.setattr(_sys, "platform", "linux", raising=False)
+    monkeypatch.setenv("PACT_EXEC_HOST", "rt")
+    assert tracker._resolve_state_root() == Path("D:/pact/book_state")
+
+    # PACT_EXEC_HOST=media -> media dir
+    monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
+    monkeypatch.delenv("PACT_V4_HOST", raising=False)
+    monkeypatch.setenv("PACT_EXEC_HOST", "media")
+    monkeypatch.setattr(_sys, "platform", "linux", raising=False)
+    assert tracker._resolve_state_root() == Path("/home/rt/pact_runs/workers/media/book-1/state")
+
+    # PACT_V4_HOST=rt takes precedence over PACT_EXEC_HOST=media -> RT dir
+    monkeypatch.delenv("PACT_V4_STATE_ROOT", raising=False)
+    monkeypatch.setenv("PACT_V4_HOST", "rt")
+    monkeypatch.setenv("PACT_EXEC_HOST", "media")
+    monkeypatch.setattr(_sys, "platform", "linux", raising=False)
+    assert tracker._resolve_state_root() == Path("D:/pact/book_state")
+
+    # PACT_V4_STATE_ROOT set -> returns that path regardless of host envs
+    monkeypatch.setenv("PACT_V4_STATE_ROOT", "/tmp/custom_state_exec")
+    monkeypatch.setenv("PACT_V4_HOST", "media")
+    monkeypatch.setenv("PACT_EXEC_HOST", "rt")
+    assert tracker._resolve_state_root() == Path("/tmp/custom_state_exec")
 
 
 # ---------------------------------------------------------------------------
