@@ -67,6 +67,7 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.phase0b.source_html import SourceBlock, SourceSpan
@@ -112,6 +113,9 @@ TIER_FUZZY = "fuzzy"
 TIER_MODEL_TARGET = "model_target"
 
 # Default formatting model-call config (mirror V3 Defaults["formatting"]).
+# v41 fix: max_tokens is dynamic sentinel (None) — _effective_max_tokens computes
+# per-batch budget (40*spans+500, min 800 cap 8192). None means "use dynamic"
+# without forcing the legacy 1600 which starved small calls.
 DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "enabled": True,
     "required": False,
@@ -119,7 +123,7 @@ DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "top_p": 0.9,
     "top_k": 32,
     "enable_thinking": False,
-    "max_tokens": 1600,
+    "max_tokens": None,
     "generation_retries": 2,
     "tags": ["em", "strong", "i", "b", "a"],
     "required_tags": ["em", "strong", "i", "b", "a"],
@@ -127,7 +131,29 @@ DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "max_blocks_per_call": 12,
     "retry_unresolved_spans": True,
     "on_failure": "omit_tag",
+    "formatting_single_call_whole_chapter": True,
 }
+
+# v41: dynamic max_tokens scaling constants
+_FORMATTING_TOKENS_PER_SPAN = 40
+_FORMATTING_TOKENS_OVERHEAD = 500
+_FORMATTING_MIN_TOKENS = 800
+_FORMATTING_MAX_TOKENS_CAP = 8192
+_FORMATTING_SINGLE_CALL_SPAN_LIMIT = 80
+_FORMATTING_SINGLE_CALL_PROMPT_LIMIT = 12000
+
+
+def _effective_max_tokens(span_count: int, cfg_max: Any) -> int:
+    """v41 dynamic budget: max(800, 40*span_count+500, cfg_max) capped at 8192."""
+    if cfg_max is None:
+        cfg_val = 0
+    else:
+        try:
+            cfg_val = int(cfg_max)
+        except Exception:
+            cfg_val = 0
+    needed = _FORMATTING_TOKENS_PER_SPAN * int(span_count) + _FORMATTING_TOKENS_OVERHEAD
+    return min(_FORMATTING_MAX_TOKENS_CAP, max(_FORMATTING_MIN_TOKENS, needed, cfg_val))
 
 # Word-boundary charset matches ``_SOURCE_BOUNDARY`` in
 # ``pact_v4._integrity_checks`` (same convention as the glossary/number
@@ -460,11 +486,17 @@ def _formatting_cfg(cfg: Mapping[str, Any]) -> Dict[str, Any]:
         merged.update(dict(fmt))
         return merged
     # If cfg itself looks like formatting cfg (has max_blocks_per_call etc.), use it
-    if any(k in cfg for k in ("max_blocks_per_call", "generation_retries", "max_tokens")):
+    if any(k in cfg for k in ("max_blocks_per_call", "generation_retries", "max_tokens", "formatting_single_call_whole_chapter")):
         merged = dict(DEFAULT_FORMATTING_CFG)
         merged.update(dict(cfg))
         return merged
     return dict(DEFAULT_FORMATTING_CFG)
+
+
+def _estimate_prompt_tokens(messages: Sequence[Mapping[str, str]]) -> int:
+    """Heuristic token estimate: ~4 chars per token."""
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    return max(1, total_chars // 4)
 
 
 def resolve_format_mappings(
@@ -475,6 +507,8 @@ def resolve_format_mappings(
     *,
     max_blocks_per_call: Optional[int] = None,
     generation_retries: Optional[int] = None,
+    out_dir: Optional[Any] = None,
+    single_call: Optional[bool] = None,
 ) -> Dict[Tuple[str, str], Tuple[str, int]]:
     """Resolve ``target_text`` via model-call (port of V3 formatting stage).
 
@@ -483,6 +517,10 @@ def resolve_format_mappings(
     ``generation_retries`` times (default 2). A failed batch yields an empty
     mapping for its spans (they become debt incidents, never silent loss).
     PIDs without inline_spans never trigger a model call (early return).
+
+    v41: dynamic max_tokens per batch/single-call (40*span_count+500,
+    min 800 cap 8192 respect cfg max), single-call for whole_chapter with
+    fallback to batches if prompt>12000 or spans>80, diagnostics artifacts.
 
     Returns ``{(pid, span_id): (target_text, occurrence)}``.
     """
@@ -498,43 +536,166 @@ def resolve_format_mappings(
     pids = [b.pid for b in blocks_with_spans]
     max_per_call = int(max_blocks_per_call if max_blocks_per_call is not None else fmt_cfg.get("max_blocks_per_call", 12))
     retries = int(generation_retries if generation_retries is not None else fmt_cfg.get("generation_retries", 2))
-    max_tokens = int(fmt_cfg.get("max_tokens", 1600))
+    raw_cfg_max = fmt_cfg.get("max_tokens")
+    if raw_cfg_max is None:
+        cfg_max: Any = None
+    else:
+        try:
+            cfg_max = int(raw_cfg_max)
+        except Exception:
+            cfg_max = None
+    # v41 single-call decision
+    use_single = single_call if single_call is not None else bool(fmt_cfg.get("formatting_single_call_whole_chapter", True))
+    total_spans = sum(len(block_map[pid].inline_spans) for pid in pids)
+    batches: List[List[str]]
+    if use_single and total_spans <= _FORMATTING_SINGLE_CALL_SPAN_LIMIT:
+        # Estimate prompt tokens for single-call; fallback if too large
+        try:
+            probe_msgs = formatting_messages(pids, block_map, translations)
+            est = _estimate_prompt_tokens(probe_msgs)
+        except Exception:
+            est = 0
+        if est <= _FORMATTING_SINGLE_CALL_PROMPT_LIMIT:
+            batches = [pids]
+        else:
+            batches = [pids[i:i + max_per_call] for i in range(0, len(pids), max_per_call)]
+    else:
+        batches = [pids[i:i + max_per_call] for i in range(0, len(pids), max_per_call)]
 
     result: Dict[Tuple[str, str], Tuple[str, int]] = {}
-    for offset in range(0, len(pids), max_per_call):
-        batch = pids[offset:offset + max_per_call]
+    # Resolve out_dir path once
+    out_path = Path(out_dir) if out_dir is not None else None
+    if out_path is not None:
+        try:
+            out_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    for batch_idx, batch in enumerate(batches):
         allowed: Dict[Tuple[str, str], SourceSpan] = {
             (pid, span.span_id): span
             for pid in batch
             for span in block_map[pid].inline_spans
         }
+        span_count = len(allowed)
+        effective_max = _effective_max_tokens(span_count, cfg_max)
         batch_mappings: Dict[Tuple[str, str], Dict[str, Any]] = {}
         success = False
         for attempt in range(1, retries + 1):
+            generation = None
             messages = formatting_messages(batch, block_map, translations)
-            # Try token-budget-aware max_tokens if client supports token counting
-            effective_max = max_tokens
-            if hasattr(client, "token_count"):
-                try:
-                    # Some clients expect (messages, stage_cfg)
-                    effective_max = max(256, min(max_tokens, max_tokens))
-                except Exception:
-                    pass
             try:
-                # Support both (messages, cfg, max_tokens, label) and (messages, cfg, max_tokens)
                 try:
-                    generation = client.complete(messages, fmt_cfg, effective_max, f"formatting:batch{offset // max_per_call + 1}:attempt{attempt}")
+                    generation = client.complete(messages, fmt_cfg, effective_max, f"formatting:batch{batch_idx + 1}:attempt{attempt}")
                 except TypeError:
                     generation = client.complete(messages, fmt_cfg, effective_max)
+                # Diagnostics: persist raw/reasoning/messages/meta per call (v41 3.3)
+                # v41 round2 fix: preserve per-attempt artifacts so retry overwrites do not lose failure evidence
+                if out_path is not None:
+                    try:
+                        raw_content = getattr(generation, "content", None)
+                        if raw_content is None and isinstance(generation, dict):
+                            raw_content = generation.get("content", "")
+                        raw_text = str(raw_content or getattr(generation, "text", "") or "")
+                        reasoning_text = str(getattr(generation, "reasoning", "") or getattr(generation, "reasoning_content", "") or "")
+                        meta = {
+                            "batch": batch_idx + 1,
+                            "attempt": attempt,
+                            "span_count": span_count,
+                            "effective_max_tokens": effective_max,
+                            "finish_reason": getattr(generation, "finish_reason", None),
+                            "usage": getattr(generation, "usage", None),
+                            "response_format_attempted": getattr(generation, "response_format_attempted", None),
+                        }
+                        # canonical (latest) for backward compat
+                        (out_path / f"formatting_batch{batch_idx + 1}_raw.txt").write_text(raw_text, encoding="utf-8")
+                        (out_path / f"formatting_batch{batch_idx + 1}_reasoning.txt").write_text(reasoning_text, encoding="utf-8")
+                        (out_path / f"formatting_batch{batch_idx + 1}_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+                        (out_path / f"formatting_batch{batch_idx + 1}_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                        # per-attempt (always) — retains failed-attempt diagnostics when retry succeeds
+                        (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_raw.txt").write_text(raw_text, encoding="utf-8")
+                        (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_reasoning.txt").write_text(reasoning_text, encoding="utf-8")
+                        (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+                        (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
                 parsed = parse_format_mappings(generation, allowed)
                 batch_mappings = parsed
                 success = True
                 break
             except Exception as exc:
-                LOG.warning("formatting batch %d attempt %d failed: %s", offset // max_per_call + 1, attempt, exc)
+                # Enhanced diagnostics on parse failure
+                # generation is reset to None at each attempt start, so transport failure (client.complete raises) yields None here
+                finish_reason = getattr(generation, "finish_reason", "") if generation is not None else ""
+                usage = getattr(generation, "usage", {}) if generation is not None else {}
+                response_format_attempted = getattr(generation, "response_format_attempted", "") if generation is not None else ""
+                # Also try generation object attributes for call record
+                if not finish_reason:
+                    try:
+                        finish_reason = getattr(generation, "finish_reason", "") or ""
+                    except Exception:
+                        finish_reason = ""
+                raw_preview = ""
+                try:
+                    raw = getattr(generation, "content", None)
+                    if raw is None and isinstance(generation, dict):
+                        raw = generation.get("content", "")
+                    raw_preview = str(raw or getattr(generation, "text", "") or "")[:500]
+                except Exception:
+                    raw_preview = ""
+                LOG.warning("formatting batch %d attempt %d failed: %s finish_reason=%r usage=%r response_format_attempted=%r max_tokens=%r content_preview=%r", batch_idx + 1, attempt, exc, finish_reason, usage, response_format_attempted, effective_max, raw_preview)
+                # Write diagnostics even on failure (raw may be empty) + meta
+                # v41 round2: always preserve per-attempt file; canonical only if not already written
+                if out_path is not None:
+                    try:
+                        gen_obj = generation
+                        if gen_obj is not None:
+                            rc = getattr(gen_obj, "content", None)
+                            if rc is None and isinstance(gen_obj, dict):
+                                rc = gen_obj.get("content", "")
+                            rt = str(rc or getattr(gen_obj, "text", "") or "")
+                            rs = str(getattr(gen_obj, "reasoning", "") or getattr(gen_obj, "reasoning_content", "") or "")
+                            meta_fail = {
+                                "batch": batch_idx + 1,
+                                "attempt": attempt,
+                                "span_count": span_count,
+                                "effective_max_tokens": effective_max,
+                                "finish_reason": getattr(gen_obj, "finish_reason", None),
+                                "usage": getattr(gen_obj, "usage", None),
+                                "response_format_attempted": getattr(gen_obj, "response_format_attempted", None),
+                            }
+                            # per-attempt always (failure evidence)
+                            (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_raw.txt").write_text(rt, encoding="utf-8")
+                            (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_reasoning.txt").write_text(rs, encoding="utf-8")
+                            (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+                            (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_meta.json").write_text(json.dumps(meta_fail, ensure_ascii=False, indent=2), encoding="utf-8")
+                            # canonical only if not already present (retry path already wrote canonical in try-block)
+                            if not (out_path / f"formatting_batch{batch_idx + 1}_raw.txt").exists():
+                                (out_path / f"formatting_batch{batch_idx + 1}_raw.txt").write_text(rt, encoding="utf-8")
+                            if not (out_path / f"formatting_batch{batch_idx + 1}_reasoning.txt").exists():
+                                (out_path / f"formatting_batch{batch_idx + 1}_reasoning.txt").write_text(rs, encoding="utf-8")
+                            if not (out_path / f"formatting_batch{batch_idx + 1}_messages.json").exists():
+                                (out_path / f"formatting_batch{batch_idx + 1}_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+                            if not (out_path / f"formatting_batch{batch_idx + 1}_meta.json").exists():
+                                (out_path / f"formatting_batch{batch_idx + 1}_meta.json").write_text(json.dumps(meta_fail, ensure_ascii=False, indent=2), encoding="utf-8")
+                        else:
+                            # client.complete raised before generation — still preserve per-attempt messages/meta
+                            meta_fail2 = {
+                                "batch": batch_idx + 1,
+                                "attempt": attempt,
+                                "span_count": span_count,
+                                "effective_max_tokens": effective_max,
+                                "finish_reason": None,
+                                "usage": None,
+                                "response_format_attempted": None,
+                                "error": str(exc)[:500],
+                            }
+                            (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+                            (out_path / f"formatting_batch{batch_idx + 1}_attempt{attempt}_meta.json").write_text(json.dumps(meta_fail2, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
                 continue
         if not success:
-            LOG.warning("formatting batch %d failed after %d attempts — spans become debt", offset // max_per_call + 1, retries)
+            LOG.warning("formatting batch %d failed after %d attempts — spans become debt", batch_idx + 1, retries)
             batch_mappings = {}
         for key, val in batch_mappings.items():
             result[key] = (str(val["target_text"]), int(val["occurrence"]))
