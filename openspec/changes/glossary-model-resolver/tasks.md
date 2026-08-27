@@ -5,7 +5,7 @@
 
 ## 2. Batched resolver в B3 (единый пост-процессинг путь)
 
-- [ ] 2.1 Реализовать `GlossaryResolver` (backend-agnostic, `model_bindings.glossary_resolver` → `local qwen_audit / remote russian_selector / composite` fallback, `max_tokens 1536`, `temperature 0`, `reasoning 0`, `response_schema glossary_proposal/v1`) — верификация: юнит-тест схемы, `3` главы без truncation, `glosaary` опечатка отсутствует
+- [ ] 2.1 Реализовать `GlossaryResolver` на `reviewer` транспорте (`russian_selector`/`fidelity_reviewer` → `local qwen_audit / remote Luna`, без отдельной роли/`max_tokens` — reuse существующих параметров, `response_schema glossary_proposal/v1`) — верификация: юнит-тест схемы, `3` главы без truncation
 - [ ] 2.2 Вызвать резолвер в `B3AuditRepair.run` после `repair/re-audit` по единому пост-процессингу пути (включая ранний `cache hit` `b3_audit_repair.py:3769`), до `release()`; детерм. `allowed_evidence_pids` из `entity`/`VERIFIED aliases`, quarantined исключение — верификация: `Roxanne→Бабуль` с evidence вне `allowed` отклоняется, quarantined evidence отклоняется
 - [ ] 2.3 Атомарная запись `glossary_proposals.json` (`tmp+rename`, `regular non-symlink`) с identity `chapter_id, snapshot_hash, config_identity, resolver_version, prompt_version, response_schema, model_ref/backend identity, candidate_input_hash, translation_hash(in-memory repairs)` — верификация: `sha256sum` sidecar совпадает с `candidate_input_hash`/`translation_hash`
 - [ ] 2.4 Строгая валидация чтения sidecar (тип файла, точная схема/ключи, размеры, `duplicate entries`, `duplicate ru` между сущностями, `proposed_ru` в `evidence` тексте, повторная `provenance` перед промоутом, `stale` при любом hash mismatch) — верификация: `symlink/dir/non-regular` и `extra fields` отклоняются, `TOCTOU` (замена после проверки) не промоутит
@@ -22,7 +22,7 @@
 
 ## 5. Модель и наблюдаемость
 
-- [ ] 5.1 `glossary_resolver` `usage.ndjson` (`label glossary_resolver`), `backend events`, `phase_progress` на каждый `attempt` (1 logical batch = ≤3 attempts), `failure → fail-closed`, глава не падает — верификация: `usage` содержит `glossary_resolver` запись
+- [ ] 5.1 `glossary_resolver` (на `reviewer` транспорте) `usage.ndjson` (`label glossary_resolver`), `backend events`, `phase_progress` на каждый `attempt` (1 logical batch = ≤3 attempts), `failure → fail-closed`, глава не падает — верификация: `usage` содержит `glossary_resolver` запись
 
 ## 6. Тесты persistent-data boundary
 

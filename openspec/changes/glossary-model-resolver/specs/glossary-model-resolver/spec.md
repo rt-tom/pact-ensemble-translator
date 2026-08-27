@@ -97,7 +97,7 @@
 - **THEN** `glossary_proposals.json` не читается и любые новые `glossary` observations от `B3` отклоняются
 
 ### Requirement: Model binding and failure semantics
-Система SHALL использовать отдельную роль `glossary_resolver` (`local→qwen_audit`, `remote→russian_selector/Luna`, `composite` fallback как у остальных), `max_tokens 1536`, `temperature 0`, `reasoning 0`, `response_schema glossary_proposal/v1`, bounded retry `≤3` transport attempts как `1 logical batch`, при `failure` глава не падает, promotion `fail-closed` (0 наблюдений), каждый `attempt` пишется в `usage.ndjson` (`glossary_resolver`), `backend events`, `phase_progress`.
+Система SHALL переиспользовать существующие параметры `reviewer` роли (`russian_selector`/`fidelity_reviewer` → `local qwen_audit / remote Luna`) для резолвера без отдельной роли и без отдельного `max_tokens` лимита (effectively unlimited для батча `~1k`, `reasoning` как у `reviewer`), `response_schema glossary_proposal/v1`, bounded retry `≤3` transport attempts как `1 logical batch`, при `failure` глава не падает, promotion `fail-closed` (0 наблюдений), каждый `attempt` пишется в `usage.ndjson` (`glossary_resolver`), `backend events`, `phase_progress`.
 
 #### Scenario: Resolver failure is fail-closed
 - **WHEN** резолвер вернул `truncated`/`invalid` после `3` попыток

@@ -36,7 +36,7 @@
 
 **D7. Алиасы.** Только один `canonical English key` становится `glossary` ключом; `source_aliases[]`/`aliases[]` (`Craig Dowght`, `C. Dowght`, `Dowght`) — не отдельные ключи, а `evidence` для одного `Dowght→Даут`. Дубликат `ru` внутри одной `alias-group` разрешён и не считается конфликтом; между разными `entity` записями `ru←[en]` остаётся `conflict`.
 
-**D8. Модель/ретрай/фейл.** Отдельная роль `glossary_resolver` (`runtime_config.py`, `ROLE_GLOSSARY_RESOLVER`), `local` → `qwen_audit`, `remote` → `russian_selector` (Luna), `composite` — fallback как у остальных роles. `max_tokens 1536`, `temperature 0`, `reasoning 0`, `response_schema glossary_proposal/v1` (strict). `1 logical batch` = `≤3` transport attempts (bounded JSON retry, exponential backoff). `Failure` → `LOG warning`, `sidecar` не пишется/помечается `failed`, глава не падает, `promotion fail-closed` (0 наблюдений). Каждый `attempt` пишется в `usage.ndjson` (label `glossary_resolver`), `backend events`, `phase_progress`.
+**D8. Модель/ретрай/фейл — reuse reviewer роли.** Отдельный `glossary_resolver` роль НЕ заводится; резолвер переиспользует существующие параметры `reviewer` роли (`russian_selector`/`fidelity_reviewer` → `local qwen_audit / remote Luna`, его `max_tokens`/`reasoning`/`temperature`/`response_schema glossary_proposal/v1` без отдельного `max_tokens` лимита — effectively unlimited для батча `~1k` content, `reasoning` как у reviewer). `1 logical batch` = `≤3` transport attempts (bounded JSON retry). `Failure` → `LOG warning`, `sidecar` не пишется/помечается `failed`, глава не падает, `promotion fail-closed`. Каждый `attempt` — в `usage.ndjson` (`glossary_resolver`), `backend events`, `phase_progress`.
 
 **D9. Term — отключить.** `generic term` (`door→дверь`) остаётся телеметрией в `glossary_candidates.json`, не резолвится.
 
@@ -59,4 +59,4 @@
 
 ## Open Questions
 
-* Точный `max_tokens` резолвера (`1536` vs `2048`) — подобрать на 3 главах без truncation.
+* Нет — модель/лимиты переиспользуют reviewer, отдельная настройка не требуется.

@@ -15,7 +15,7 @@
 * Отключить авто-промоут `kind=term` (generic terms только телеметрия), оставить только `proper_name` через новый путь.
 * Заменить suffix/translit hard lint на `blocklist` как incident regression + проверку пары `proposed_ru + evidence surface forms` с fixture-набором.
 * Ввести `glossary_resolver_mode = off | shadow | promote` (identity-bearing); `off` запрещает новые observations, отката к небезопасному `align` нет.
-* Зафиксировать роль `glossary_resolver`, его local/remote/composite fallback, `max_tokens`/temperature/reasoning, bounded JSON retry, `1 logical batch = N transport attempts`, `failure → fail-closed promotion, глава не падает`, запись в `usage.ndjson`/`backend events`/`phase_progress`.
+* Переиспользовать существующие параметры `reviewer` роли (`russian_selector`/`fidelity_reviewer` → `local Qwen / remote Luna`) для резолвера без отдельного `max_tokens`/модели — `1 logical batch = N transport attempts` (bounded JSON retry), `failure → fail-closed promotion, глава не падает`, запись в `usage.ndjson`/`backend events`/`phase_progress`.
 
 ## Capabilities
 
@@ -27,6 +27,6 @@
 
 ## Impact
 
-* Код: `pact_v4/audit/entity_extractor.py` (промпт, версия), `pact_v4/pipeline/b3_audit_repair.py` (резолвер, sidecar, post-processing), `pact_full_pipeline_runner_v1/v4_book_run.py` (чтение sidecar), `pact_v4/phase1/glossary_candidates.py` (депрекейт `align` для имён), `tools/pact_fidelity_lint`, `pact_v4/runtime/runtime_config.py`.
-* Рантайм: +1 `glossary_resolver` вызов/главу (батч 5-15 сущностей), `local Qwen` остаётся резидентным, `remote` — no-op `release()`.
+* Код: `pact_v4/audit/entity_extractor.py` (промпт, версия), `pact_v4/pipeline/b3_audit_repair.py` (резолвер на `reviewer` параметрах, sidecar, post-processing), `pact_full_pipeline_runner_v1/v4_book_run.py` (чтение sidecar), `pact_v4/phase1/glossary_candidates.py` (депрекейт `align` для имён), `tools/pact_fidelity_lint`.
+* Рантайм: +1 батчевый вызов/главу на `reviewer` транспорте (батч 5-15 сущностей), `local Qwen` остаётся резидентным, `remote` — no-op `release()`, без нового `max_tokens`/модели.
 * Данные: формат `glossary.json` без изменений; новый артефакт `glossary_proposals.json` в `out_dir` (persistent-data boundary).
