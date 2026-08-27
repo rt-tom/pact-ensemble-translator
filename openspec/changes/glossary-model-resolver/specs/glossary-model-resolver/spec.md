@@ -5,7 +5,7 @@
 ## ADDED Requirements
 
 ### Requirement: Glossary candidates come from validated B1.2 records
-Система SHALL брать кандидатов только из `ChapterEntityContext` записей, прошедших `validate_entity_context` (все 8 проверок), где `anchor.status=verified` и `canonical_type` в `anchor.span`, все `aliases[].status=verified` и surface в своём `pid`; `glossary_worthy` — модельный `advisory bool` (отдельное поле, не статус), финальный гейт — код: `title-case`, не `EN_STOP` (проверка English, а не `RU_STOP`), поверхность `entity`/`aliases` word-boundary в `source`. `glossary_worthy=false` + код `true` → исключается (advisory не переопределяет код-отказ). Отдельное `source_aliases[]` не вводится — используется существующее `aliases[]`.
+Система SHALL брать кандидатов только из `ChapterEntityContext` записей, прошедших `validate_entity_context` (все 8 проверок), где `anchor.status=verified` и `canonical_type` в `anchor.span`, все `aliases[].status=verified` и surface в своём `pid`; `glossary_worthy` — обязательный `model gate bool` (отдельное поле, не статус), `false` — финальный `veto` даже при проходе кодовой проверки; код-гейт — `title-case`, не `EN_STOP` (проверка English, а не `RU_STOP`), поверхность `entity`/`aliases` word-boundary в `source`. Оба гейта должны пройти. Отдельное `source_aliases[]` не вводится — используется `aliases[]`.
 
 #### Scenario: Validated record becomes candidate
 - **WHEN** в `entity_context` есть запись `entity="Shotgun" anchor.verified aliases[Shotgun].verified glossary_worthy=true` прошедшая валидацию
@@ -20,7 +20,7 @@
 - **THEN** старый `entity_context_cache` с прежней identity отклоняется и пересоздаётся, а не переиспользуется
 
 ### Requirement: Batched LLM resolver after repair on unified post-processing path
-Система SHALL вызывать один `glossary_resolver` LLM на главу после `B3 repair/re-audit` по единому пост-процессингу пути (включая ранний `B3 cache hit`), когда in-memory `translations_repaired` готов, до `release()` рантайма, и сохранять результат в `glossary_proposals.json`.
+Система SHALL вызывать **не более одного** `glossary_resolver` LLM-батча на главу после `B3 repair/re-audit` по единому пост-процессингу пути (включая ранний `B3 cache hit`), когда in-memory `translations_repaired` готов, до `release()` рантайма, и сохранять результат в `glossary_proposals.json`; при `mode=off`, пустом `candidate set` или валидном sidecar — `0` вызовов.
 
 #### Scenario: Resolver after repair
 - **WHEN** `B3AuditRepair.run` сформировал in-memory `translations_repaired` (включая случай полного `cache hit`)
@@ -45,8 +45,8 @@
 - **WHEN** глава `accepted_degraded` и `evidence_pid` входит в quarantined множество
 - **THEN** proposal с этим PID исключается до резолвера и отклоняется при чтении sidecar, даже если `proposed_ru` кириллица
 
-### Requirement: Resolver returns canonical nominative via versioned surface→lemma
-Резолвер SHALL для каждой сущности вернуть `proposed_ru` в именительном падеже (лемма, версия `lemma_v1` — token-wise `ru_stem` с `_RU_ENDINGS`, входит в `resolver_version`), `surface_forms[]` как в переводе, `evidence_pid` из `allowed`, `type` (`person/place/group/nickname`), `confidence`, `decision accept/reject`. Связь `surface_forms[]→proposed_ru` SHALL проверяться стем-эквивалентностью токен-по-токену, не точным вхождением `proposed_ru`.
+### Requirement: Resolver returns canonical nominative via versioned surface→lemma (link only)
+Резолвер SHALL для каждой сущности вернуть `proposed_ru` в именительном падеже (лемма), `surface_forms[]` как в переводе, `evidence_pid` из `allowed`, `type` (`person/place/group/nickname`), `confidence`, `decision accept/reject`. Связь `surface_forms[]→proposed_ru` SHALL проверяться versioned `lemma_v1` token-wise `ru_stem` с `_RU_ENDINGS` (входит в `resolver_version`) — она подтверждает связь поверхности с леммой и защищает от `Roxanne→Бабуль`, но **не гарантирует** именительный падеж (`Диониса` стем-равно `Дионис` и `Диониса`). Именительный обеспечивает модель (инструкция) и проверяется `shadow`-метрикой/морфологическим валидатором, а не стем-эквивалентностью.
 
 #### Scenario: Case canonicalization
 - **WHEN** в `evidence_pid` встречается `Диониса`, `Сандре`, `Завоевателю`
@@ -63,9 +63,9 @@
 ### Requirement: Sidecar identity and strict validation
 Система SHALL писать `glossary_proposals.json` атомарно (`tmp+rename`) только как `regular non-symlink` с точной схемой `glossary-proposal/v1`, полями `chapter_id`, `snapshot_hash`, `config_identity`, `resolver_version`, `prompt_version`, `response_schema`, `model_ref`/`backend identity`, `candidate_input_hash`, `translation_hash` (hash in-memory `translations_repaired`), `proposals[]`; при чтении валидировать тип файла, схему/ключи, размеры, отсутствие `duplicate entries`/`duplicate ru`, и повторно проверять `provenance` перед промоутом. `stale` = любой hash mismatch.
 
-#### Scenario: Stale sidecar recomputed
+#### Scenario: Stale sidecar recomputed or fail-closed by policy
 - **WHEN** `candidate_input_hash` или `translation_hash` sidecar не совпадает с текущим
-- **THEN** sidecar считается `stale` и пересоздаётся одним resolver вызовом
+- **THEN** при `policy=recompute` sidecar пересоздаётся одним resolver вызовом, при `policy=fail_closed` — остаётся `fail-closed` без вызова
 
 #### Scenario: Tampered sidecar rejected
 - **WHEN** sidecar — symlink, директория, не-regular, содержит `extra fields`, `duplicate ru` или ни один `surface_forms[]` вне русского текста `evidence_pid`
