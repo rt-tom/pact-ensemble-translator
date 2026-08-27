@@ -56,6 +56,63 @@ def test_snapshot_factory_missing_schema_fails_soft():
     assert snap_missing.snapshot_hash == snap_no.snapshot_hash
     assert snap_missing.chapter_index_hash == snap_no.chapter_index_hash
 
+# --- Finding 2 refinement: fail-soft on missing policy + alias rejection ---
+def test_bible_renderer_valid_schema_missing_policy_fails_soft():
+    bm = {
+        "pov": {"gender": "male"},
+        "facts": [{"fact": "seed fact A", "seed": True}, {"fact": "future fact B", "chapter": "0010"}],
+    }
+    idx = {
+        "$schema": CHAPTER_INDEX_V2_SCHEMA,
+        "0001": {"characters": ["LEAK_CHAR"], "facts": ["future fact B"], "address": []},
+    }  # valid $schema but missing $book_memory_policy_version -> must fail soft
+    out = render_bible_section("0001", idx, bm)
+    assert "Narrator: male" in out
+    assert "seed fact A" in out
+    assert "LEAK_CHAR" not in out
+    assert "future fact B" not in out
+
+def test_bible_renderer_alias_schema_fails_soft():
+    bm = {
+        "pov": {"gender": "female"},
+        "facts": [{"fact": "seed fact", "seed": True}],
+    }
+    idx = {
+        "schema": CHAPTER_INDEX_V2_SCHEMA,  # alias without $schema
+        "$book_memory_policy_version": BOOK_MEMORY_POLICY_VERSION,
+        "0001": {"characters": ["LEAK_ALIAS"], "facts": [], "address": []},
+    }
+    out = render_bible_section("0001", idx, bm)
+    assert "LEAK_ALIAS" not in out
+    assert "Narrator: female" in out
+    assert "seed fact" in out
+
+def test_snapshot_factory_missing_policy_fails_soft():
+    blocks = [_block("p00001", "Only.", 0)]
+    source = build_source_artifact(chapter_id="ch001", blocks=blocks)
+    base = ChapterMemory(glossary={}, book_memory={})
+    snap_no = build_snapshot(chapter_id="ch001", source=source, memory=base)
+    # valid $schema but missing $book_memory_policy_version -> must hash as no-index (seed/empty)
+    snap_missing_policy = build_snapshot(
+        chapter_id="ch001", source=source,
+        memory=ChapterMemory(glossary={}, book_memory={}, chapter_index={"$schema": CHAPTER_INDEX_V2_SCHEMA, "ch001": {"characters": ["LEAK"]}})
+    )
+    assert snap_missing_policy.snapshot_hash == snap_no.snapshot_hash
+    assert snap_missing_policy.chapter_index_hash == snap_no.chapter_index_hash
+
+def test_snapshot_factory_alias_schema_fails_soft():
+    blocks = [_block("p00001", "Only.", 0)]
+    source = build_source_artifact(chapter_id="ch001", blocks=blocks)
+    base = ChapterMemory(glossary={}, book_memory={})
+    snap_no = build_snapshot(chapter_id="ch001", source=source, memory=base)
+    # alias-only metadata: schema without $schema -> must fail soft
+    snap_alias = build_snapshot(
+        chapter_id="ch001", source=source,
+        memory=ChapterMemory(glossary={}, book_memory={}, chapter_index={"schema": CHAPTER_INDEX_V2_SCHEMA, "$book_memory_policy_version": BOOK_MEMORY_POLICY_VERSION, "ch001": {"characters": ["LEAK_ALIAS"]}})
+    )
+    assert snap_alias.snapshot_hash == snap_no.snapshot_hash
+    assert snap_alias.chapter_index_hash == snap_no.chapter_index_hash
+
 # --- Finding 3: rollback requires exact hashes ---
 def _make_store(tmp_path):
     from pact_v4.snapshot.store import BookStore

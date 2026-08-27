@@ -161,14 +161,12 @@ def render_bible_section(
             book_memory = chapter_id
         return _render_seed_bible(book_memory)
 
-    # v2 schema check: missing or foreign schema fails soft to narrator+seed (finding 2)
+    # v2 metadata check: BOTH $schema and $book_memory_policy_version must be present and exact (finding 2 refinement)
+    # No alias fallback ("schema" / "policy_version" etc.) — aliases fail soft. Missing/unknown of EITHER fails soft.
     if isinstance(chapter_index, Mapping):
-        schema = chapter_index.get("$schema") or chapter_index.get("schema")
-        if schema != CHAPTER_INDEX_V2_SCHEMA:
-            return _render_seed_bible(book_memory)
-        # Also validate policy version if present; unknown version fails soft
-        policy_ver = chapter_index.get("$book_memory_policy_version") or chapter_index.get("book_memory_policy_version")
-        if policy_ver is not None and policy_ver != BOOK_MEMORY_POLICY_VERSION:
+        schema = chapter_index.get("$schema")
+        policy_ver = chapter_index.get("$book_memory_policy_version")
+        if schema != CHAPTER_INDEX_V2_SCHEMA or policy_ver != BOOK_MEMORY_POLICY_VERSION:
             return _render_seed_bible(book_memory)
     entry = None
     if isinstance(chapter_index, Mapping):

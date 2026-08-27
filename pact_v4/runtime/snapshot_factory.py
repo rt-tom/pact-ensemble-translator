@@ -174,10 +174,10 @@ def build_snapshot(
         _IDX_SCHEMA = "pact-v4-chapter-index/v2"
     selected_chapter_index = None
     if isinstance(memory.chapter_index, Mapping):
-        _schema = memory.chapter_index.get("$schema") or memory.chapter_index.get("schema")
-        _policy = memory.chapter_index.get("$book_memory_policy_version") or memory.chapter_index.get("book_memory_policy_version")
+        _schema = memory.chapter_index.get("$schema")
+        _policy = memory.chapter_index.get("$book_memory_policy_version")
         _schema_ok = (_schema == _IDX_SCHEMA)
-        _policy_ok = (_policy is None or _policy == _BM_PV)
+        _policy_ok = (_policy == _BM_PV)
         if not _schema_ok or not _policy_ok:
             selected_chapter_index = None
             chapter_index_hash = _hash_canonical_json(selected_chapter_index)
@@ -188,8 +188,8 @@ def build_snapshot(
                 chapter_index_hash = _hash_canonical_json(selected_chapter_index)
             else:
                 # v2: bind to policy version and schema as well per spec 1.4/6.4 when entry exists
-                selected_policy_version = memory.chapter_index.get("$book_memory_policy_version") or memory.chapter_index.get("book_memory_policy_version")
-                selected_schema = memory.chapter_index.get("$schema") or memory.chapter_index.get("schema")
+                selected_policy_version = memory.chapter_index.get("$book_memory_policy_version")
+                selected_schema = memory.chapter_index.get("$schema")
                 chapter_index_hash = _hash_canonical_json({
                     "selected": selected_chapter_index,
                     "policy_version": selected_policy_version,
