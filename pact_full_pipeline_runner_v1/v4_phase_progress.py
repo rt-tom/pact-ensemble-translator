@@ -1526,8 +1526,12 @@ def _phase_translation(out_dir: Path, events: List[Dict[str, Any]], snapshot: Op
     )
     gen = _wc_gen_status(events)
     attempt = f"attempt {gen['attempt']}/{gen['max_attempts']} | " if gen else ""
+    pid = ""
+    if gen and gen.get("validated"):
+        flags = gen["validated"][-1]
+        pid = " · PID ok" if (flags.get("json_ok") and flags.get("pids_ok") and flags.get("order_ok")) else " · PID FAIL"
     return (f"Whole-chapter translation: {attempt}source {source_words} слов → "
-            f"перевод {translation_words} слов")
+            f"перевод {translation_words} слов{pid}")
 
 
 def _phase_r_editor_from_events(events: List[Dict[str, Any]]) -> Optional[str]:
@@ -2078,6 +2082,31 @@ def _phase_reaudit(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> 
             f"| residual: {residual} | debt: {debt}")
 
 
+def _phase_glossary(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Glossary proposals count from the B3 resolver sidecar."""
+    data = _read_json(Path(out_dir) / "glossary_proposals.json")
+    if not isinstance(data, dict):
+        return None
+    proposals = data.get("proposals")
+    if not isinstance(proposals, list):
+        return None
+    return f"Glossary: {len(proposals)} proposals"
+
+
+def _phase_formatting(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Aggregate inline-span restoration from ``formatting_report.json``."""
+    if snapshot is not None and "formatting_report" in snapshot:
+        report = snapshot.get("formatting_report")
+    else:
+        report = _read_json(Path(out_dir) / "formatting_report.json")
+    if not isinstance(report, dict):
+        return None
+    resolved = _as_int(report.get("resolved_count"))
+    incidents = _as_int(report.get("incident_count"))
+    original = resolved + incidents  # unresolved required spans == incidents (debt)
+    return f"Formatting: spans {resolved}/{original} · incidents {incidents}"
+
+
 def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> List[str]:
     """``-- Phase --`` block: per-pipeline-phase progress (MONITOR-V2 1.1).
 
@@ -2143,6 +2172,8 @@ def _phase_block_lines(out_dir: Path, events: List[Dict[str, Any]], snapshot: Op
         _audit,
         _repair,
         _reaudit,
+        lambda d: _phase_glossary(d, snapshot),
+        lambda d: _phase_formatting(d, snapshot),
     ]
     rendered = [line for b in line_builders if (line := b(out_dir)) is not None]
     if not rendered:
@@ -2414,6 +2445,43 @@ def _status_line(out_dir: Path, events: List[Dict[str, Any]], phase: str, snapsh
     return " | ".join(segments)
 
 
+def _align_phase_lines(bodies: List[str], phase: str) -> List[str]:
+    """Render per-phase bodies (one string per phase) as aligned lines.
+
+    Each body is ``Label: rest``; the label is padded to the max width and the
+    active phase (matching ``phase``) is prefixed with ``>``.
+    """
+    _PHASE_LABELS = {
+        "extraction": "Entity extraction",
+        "gen": "Whole-chapter translation",
+        "r_editor": "R-editor",
+        "audit": "Chapter audit",
+        "repair": "Selective repair",
+        "reaudit": "Re-audit scope",
+        "formatting": "Formatting",
+    }
+    active_label = _PHASE_LABELS.get(phase)
+    parsed: List[Tuple[str, str]] = []
+    max_w = 0
+    for b in bodies:
+        if ":" in b:
+            label, rest = b.split(":", 1)
+        else:
+            label, rest = b, ""
+        label = label.strip()
+        if len(label) > max_w:
+            max_w = len(label)
+        parsed.append((label, rest))
+    out: List[str] = []
+    for label, rest in parsed:
+        aligned = f"{label:<{max_w}}:{rest}"
+        if label == active_label:
+            out.append("> " + aligned)
+        else:
+            out.append("  " + aligned)
+    return out
+
+
 def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> str:
     """Read-only text report over one run directory. Compact mode (fine) is 6 lines."""
     out_dir = Path(out_dir)
@@ -2439,129 +2507,21 @@ def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> s
             alive_age = _recent_event_age(events) if events else None
             if alive_age is not None and alive_age == float('inf'):
                 alive_age = None
-        alive_txt = f"alive {alive_age:.0f}s" if alive_age is not None and alive_age <= FRESHNESS_WINDOW_SECONDS else ("alive" if identity['alive'] else "stalled")
+        alive_txt = f"quiet {alive_age:.0f}s" if alive_age is not None and alive_age <= FRESHNESS_WINDOW_SECONDS else ("quiet stalled" if identity['alive'] else "quiet ?")
         chapter_label = (identity.get('chapter_id') or out_dir.name).replace('chapter_', '')
-        header_phase = _PHASE_DISPLAY.get(phase, phase)
-        lines: List[str] = []
-        lines.append(f"== V4 run progress: {out_dir} ==")
-        lines.append(f"[{chapter_label}] {elapsed_txt} | {header_phase} | {alive_txt} | mode=fine")
-        lines.append(f"status: {_status_line(out_dir, events, phase, snapshot)}")
-        lines.append(f"phase: {header_phase} -- {phase_basis}")
-        # Compact phases line: | .join(bodies) with clamping done<=total
-        phase_lines_raw = _phase_block_lines(out_dir, events, snapshot)
-        import re as _re
-        compact_bodies = []
-        bodies = []
-        if len(phase_lines_raw) > 1:
-            bodies = [l.strip() for l in phase_lines_raw[1:] if l.strip() and "нет Phase" not in l]
-            for b in bodies:
-                b = _re.sub(r"done=(\d+)/(\d+)", lambda m: f"done={min(int(m.group(1)), int(m.group(2)))}/{m.group(2)}", b)
-                compact_bodies.append(b)
-        # Always embed lifecycle substrings for legacy tests (still within 6-line budget via same line)
-        wc_mode = _whole_chapter_mode(events)
-        gen = _wc_gen_status(events) if wc_mode else None
-        extra_parts = []
-        if wc_mode:
-            if gen is not None:
-                extra_parts.append(f"Whole-chapter translation: attempt {gen['attempt']}/{gen['max_attempts']}")
-                if gen.get("validated"):
-                    flags = gen["validated"][-1]
-                    extra_parts.append(f"PID validation: json_ok={flags.get('json_ok')} pids_ok={flags.get('pids_ok')} order_ok={flags.get('order_ok')}")
-                else:
-                    extra_parts.append("PID validation: pending (wc_validated not written yet)")
-                b3_events = [e for e in events if e.get("event") in ("r_editor_started","r_editor_done","r_editor_chunk_started","r_editor_chunk_done","audit_chunk_started","audit_chunk_done","audit_started","audit_complete","repair_round","reaudit_scope","gate")]
-                if not b3_events:
-                    b3_events = snapshot.get("b3_events") or []
-                r_done = [e for e in b3_events if e.get("event")=="r_editor_done"]
-                r_started = [e for e in b3_events if e.get("event")=="r_editor_started"]
-                if r_done:
-                    extra_parts.append("R-editor: complete")
-                elif r_started:
-                    extra_parts.append("R-editor: in progress")
-                else:
-                    extra_parts.append("R-editor: not started")
-                b3_audit = [e for e in b3_events if e.get("event") in ("audit_chunk_started","audit_chunk_done")]
-                if b3_audit:
-                    done_cnt = len([e for e in b3_audit if e.get('event')=='audit_chunk_done'])
-                    tot = b3_audit[-1].get("total") or 7
-                    if isinstance(tot, int) and isinstance(done_cnt, int) and done_cnt > tot:
-                        done_cnt = tot
-                    extra_parts.append(f"Chapter audit: in progress done={done_cnt}")
-                    if any(e.get("event")=="audit_chunk_done" for e in b3_audit):
-                        cur = b3_audit[-1].get("chunk") or done_cnt
-                        if isinstance(tot, int) and isinstance(cur, int) and cur > tot:
-                            cur = tot
-                        extra_parts.append(f"Chapter audit chunk {cur}/{tot}")
-                else:
-                    extra_parts.append("Chapter audit: not started")
-                    extra_parts.append("not_started")
-                if any(e.get("event")=="repair_round" for e in b3_events):
-                    extra_parts.append("Selective repair: in progress")
-                else:
-                    extra_parts.append("Selective repair: not started")
-                    extra_parts.append("not_started")
-                if any(e.get("event")=="reaudit_scope" for e in b3_events):
-                    extra_parts.append("Re-audit scope: in progress")
-                else:
-                    extra_parts.append("Re-audit scope: not started")
-                extra_parts.append("Formatting: not applicable (whole-chapter)")
-                if any(e.get("event")=="wc_generation_done" for e in events):
-                    for ev in events:
-                        if ev.get("event")=="wc_generation_done":
-                            extra_parts.append(f"Whole-chapter translation attempt 1/3 done finish_reason={ev.get('finish_reason')}")
-                            # legacy chunk row substring
-                            if ev.get("finish_reason")=="incomplete":
-                                extra_parts.append("incomplete_generation")
-                            break
-            else:
-                # wc_mode but no gen? still ensure strings
-                extra_parts.append("Whole-chapter translation: attempt")
-                extra_parts.append("R-editor: not started")
-                extra_parts.append("Chapter audit: not started")
-                extra_parts.append("Selective repair: not started")
-                extra_parts.append("Re-audit scope: not started")
-                extra_parts.append("Formatting: not applicable (whole-chapter)")
-                extra_parts.append("not_started")
+        lines_out: List[str] = []
+        lines_out.append(f"== V4 run progress: {out_dir} ==")
+        lines_out.append(f"[{chapter_label}] {elapsed_txt} · {alive_txt}")
+        # Single source of truth: one line per pipeline phase (no duplication,
+        # no forced line cap). Glossary + Formatting phases come from
+        # _phase_block_lines (which also drops the legacy extra_parts block).
+        phase_block = _phase_block_lines(out_dir, events, snapshot)
+        bodies = [l.strip() for l in phase_block[1:] if l.strip() and "нет Phase" not in l]
+        if bodies:
+            lines_out.extend(_align_phase_lines(bodies, phase))
         else:
-            # Chunked mode: audit/repair counters
-            chunk_plan = snapshot.get("chunk_plan")
-            total_chunks = len((chunk_plan or {}).get("chunks", [])) if chunk_plan else 0
-            journal = snapshot.get("journal") or []
-            journal_by_chunk = {e.get("chunk_id"): e for e in journal if e.get("chunk_id")}
-            if total_chunks:
-                started = len([e for e in events if e.get("event")=="audit_unit_started"])
-                done = len([e for e in events if e.get("event")=="audit_unit_done"])
-                extra_parts.append(f"Chapter audit: audit units done={done}/{2*total_chunks} (started={started})")
-            region_counts = _region_counts(events)
-            reaudit_counts = _reaudit_counts(events)
-            extra_parts.append(f"Selective repair: regions planned={region_counts['planned']} done={region_counts['done']} committed={region_counts['committed']} debt={region_counts['debt']} in_progress={region_counts['in_progress']}; Re-audit scope: units done={reaudit_counts['done']}/{reaudit_counts['started']}")
-            phase_val, _ = _detect_phase(out_dir, events, snapshot)
-            if phase_val in ("steps1-5","step6","step7","unknown","gen"):
-                extra_parts.append("Formatting: not started (ожидание formatting/terminal)")
-            else:
-                extra_parts.append("Formatting: incidents")
-            extra_parts.append(f"Entity extraction: journaled {len(journal_by_chunk)}/{total_chunks or 0}")
-            extra_parts.append("chunks: ")
-            extra_parts.append("not_started")
-            # Ensure canonical names for legacy checks
-            extra_parts.append("Entity extraction")
-            extra_parts.append("Chapter audit")
-            extra_parts.append("Selective repair")
-            extra_parts.append("Re-audit scope")
-            extra_parts.append("Formatting")
-        # Merge bodies and extra
-        if compact_bodies or extra_parts:
-            merged = compact_bodies + extra_parts
-            # If bodies was empty (no Phase artifacts), still show extra_parts as compact line
-            if not merged:
-                merged = ["(нет Phase-артефактов)"] + extra_parts
-            lines.append(" | ".join(merged))
-        else:
-            if len(phase_lines_raw) > 1:
-                lines.append(phase_lines_raw[1] if len(phase_lines_raw) > 1 else "(нет Phase-артефактов)")
-            else:
-                lines.extend(phase_lines_raw)
-        # Usage summary one line (with clamping not needed)
+            lines_out.append("(нет Phase-артефактов)")
+        # Usage summary one line (speed merged when local + fresh)
         usage_rows = snapshot.get("usage") or []
         if usage_rows:
             total_in = sum(_as_int(r.get("input_tokens")) for r in usage_rows)
@@ -2573,27 +2533,13 @@ def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> s
             usage_line = f"usage: {len(usage_rows)} calls in={_fmt_tokens(total_in)} out={_fmt_tokens(total_out)} reas={_fmt_tokens(total_reas)}{cost_txt}"
         else:
             usage_line = "usage: 0 calls"
-        # Speed only for local fresh, merged into same line to keep 6 lines total
         if is_local_fresh and speed_lines:
-            # speed_lines[1] contains the gemma/qwen speed line, use it compactly
             speed_compact = speed_lines[1].strip() if len(speed_lines) > 1 else speed_lines[0].strip()
-            # Remove header prefix
             speed_compact = speed_compact.replace("gemma:", "speed gemma:").replace("qwen:", "speed qwen:")
-            lines.append(f"{usage_line} | {speed_compact}")
+            lines_out.append(f"{usage_line} | {speed_compact}")
         else:
-            lines.append(usage_line)
-        # Ensure exactly 6 non-empty lines: we have 6 (header == plus 5 compact). Filter empty and return
-        # Remove any empty strings that might have been added
-        lines = [l for l in lines if l.strip() != ""]
-        # Ensure 6 lines: if we have 5 due to missing, pad; if more truncate to 6
-        # For fine compact we strictly want 6
-        if len(lines) > 6:
-            lines = lines[:6]
-        elif len(lines) < 6:
-            # Pad with empty or usage repetition (should not happen)
-            while len(lines) < 6:
-                lines.append("")
-        return "\n".join(lines)
+            lines_out.append(usage_line)
+        return "\n".join(lines_out)
     # Coarse mode (no phase_progress) - keep legacy detailed but hide server_logs age when not fresh (finding 3)
     # Minimal coarse output: header + phase + chunk info + usage hint
     # To keep tests that check coarse substrings, include basic info
@@ -2829,7 +2775,35 @@ def _active_chapter(chapters: List[Path], snapshots: Optional[Dict[str, Dict[str
     return max(active, key=_activity_ts) if active else None
 
 
-def render_book_report(out_base: Path, incremental: bool = False) -> str:
+def _resolve_state_root() -> Path:
+    """Mirror v4_run._host_layout() state resolution for the monitor."""
+    import os as _os
+    import sys as _sys
+    if _os.environ.get("PACT_V4_STATE_ROOT"):
+        return Path(_os.environ["PACT_V4_STATE_ROOT"])
+    if _os.environ.get("PACT_V4_HOST") == "rt" or _sys.platform == "win32":
+        return Path("D:/pact/book_state")
+    return Path("/home/rt/pact_runs/workers/media/book-1/state")
+
+
+def _book_promotion_summary(memory_dir: Optional[Path]) -> Optional[str]:
+    """Count promoted glossary/memory entries for a book run.
+
+    Promotion writes ``glossary.json`` / ``book_memory.json`` to the state
+    (memory) directory, not the book output directory.
+    """
+    if memory_dir is None:
+        return None
+    glossary = _read_json(Path(memory_dir) / "glossary.json") or {}
+    memory = _read_json(Path(memory_dir) / "book_memory.json") or {}
+    g = len(glossary) if isinstance(glossary, (dict, list)) else 0
+    m = len(memory) if isinstance(memory, (dict, list)) else 0
+    if g == 0 and m == 0:
+        return None
+    return f"Glossary promoted: {g} → glossary.json · {m} → memory"
+
+
+def render_book_report(out_base: Path, incremental: bool = False, memory_dir: Optional[Path] = None) -> str:
     """Read-only multi-chapter (book-run) report over ``--out-base``."""
     out_base = Path(out_base)
     if not out_base.is_dir():
@@ -2855,6 +2829,10 @@ def render_book_report(out_base: Path, incremental: bool = False) -> str:
         if active_snap is None:
             active_snap = _read_snapshot(active, incremental=incremental)
         lines.append(render_report(active, active_snap))
+    promotion = _book_promotion_summary(memory_dir)
+    if promotion:
+        lines.append("")
+        lines.append(promotion)
     return "\n".join(lines)
 
 
@@ -2873,6 +2851,9 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Run directory (contains phase_progress.ndjson and the run artifacts).")
     target.add_argument("--out-base", type=Path, default=None,
                         help="Book-run directory (contains chapter_*/ with phase_progress.ndjson).")
+    p.add_argument("--memory-dir", type=Path, default=None,
+                   help="State/memory directory where glossary.json and book_memory.json are promoted "
+                        "(defaults to the host layout state root, mirroring v4_run).")
     p.add_argument("--watch", type=float, default=None, metavar="SEC",
                     help="Re-render the report every SEC seconds until interrupted.")
     return p
@@ -2881,9 +2862,10 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_argparser().parse_args(argv)
     watch_incremental = bool(args.watch is not None and args.watch > 0)
+    memory_dir = args.memory_dir or _resolve_state_root()
     while True:
         if args.out_base is not None:
-            print(render_book_report(args.out_base, incremental=watch_incremental))
+            print(render_book_report(args.out_base, incremental=watch_incremental, memory_dir=memory_dir))
         else:
             if watch_incremental:
                 print(render_report(args.out_dir, _read_snapshot(args.out_dir, incremental=True)))
