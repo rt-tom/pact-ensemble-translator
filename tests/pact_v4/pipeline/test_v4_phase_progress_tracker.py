@@ -190,7 +190,7 @@ def test_tracker_is_read_only(tmp_path: Path):
 
     report = tracker.render_report(out)
     assert "V4 run progress" in report
-    assert "chunk" in report.lower()
+    assert "repair" in report.lower() or "selective" in report.lower()
 
     after_files = sorted(p.name for p in out.iterdir())
     assert after_files == before_files

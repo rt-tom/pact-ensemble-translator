@@ -180,22 +180,20 @@ def test_compact_6_lines_local_and_remote(tmp_path: Path):
     remote_out = make_dir("remote_chapter_0031", False)
     local_report = tracker.render_report(local_out)
     remote_report = tracker.render_report(remote_out)
-    # Compact should be 6 lines
+    # Per-phase layout: one line per phase, no forced 6-line cap (task 2.2)
     for name, report, is_local in [("local", local_report, True), ("remote", remote_report, False)]:
-        lines = [l for l in report.splitlines() if l.strip() != ""]
-        assert len(lines) == 6, f"{name} compact should be 6 lines got {len(lines)}: {lines}"
         assert "10/7" not in report, f"{name} should not have 10/7, got {report}"
-        # Ensure clamped
-        assert "7/7" in report or "done=7/7" in report, f"{name} should have clamped 7/7"
+        # Ensure clamped and per-phase audit line present
+        assert "Chapter audit" in report and "chunks done=7/7" in report, f"{name} should have clamped 7/7"
+        assert "Whole-chapter translation:" in report
+        assert "status:" not in report
+        assert "mode=fine" not in report
+        assert "Formatting: not applicable" not in report
         if is_local:
-            # local shows tokens via usage line
             assert "in=" in report and "out=" in report
-            # local shows speed (eval/prompt/tg_3s)
             assert "t/s" in report
         else:
-            # remote hides server_logs age
             assert "age since server start" not in report
-            # remote shows usage tokens
             assert "in=" in report
 
 def test_server_logs_age_gated(tmp_path: Path):

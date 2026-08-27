@@ -431,8 +431,11 @@ def test_whole_chapter_renders_both_wc_and_chunk_rows(tmp_path: Path):
     assert "c1" in ids
     assert "c2" in ids
     assert len(rows) == 3  # 1 wc + 2 chunks
-    # Chunk rows come from same snapshot without extra file reads — verify report contains both
+    # Per-phase layout: chunk table not rendered as per-chunk labels; report shows per-phase audit line instead
     report = tracker.render_report(out, snap)
-    assert "whole_chapter" in report
-    assert "c1" in report
-    assert "c2" in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "Chapter audit" in report and "chunks done=" in report
+    assert "status:" not in report
+    assert "mode=fine" not in report
+    # legacy per-chunk label no longer in per-phase output (no c1/c2 rows)
+    assert "phase:" not in report

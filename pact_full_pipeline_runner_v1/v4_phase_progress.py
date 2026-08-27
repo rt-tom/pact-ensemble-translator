@@ -1499,13 +1499,42 @@ def _phase_extraction(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) 
 
 
 def _phase_translation(out_dir: Path, events: List[Dict[str, Any]], snapshot: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Translation line from ``translations_raw.json`` + wc events."""
+    """Translation line from ``translations_raw.json`` + wc events.
+
+    Whole-chapter synthetic fixtures do NOT write ``translations_raw.json``
+    so the phase must still render from wc events alone (attempt + PID).
+    """
     if snapshot is not None and "translations_raw" in snapshot:
         raw = snapshot.get("translations_raw")
     else:
         raw = _read_json(out_dir / "translations_raw.json")
     if raw is None:
-        return None
+        gen = _wc_gen_status(events)
+        if gen is None:
+            return None
+        # Preserve OLD monitor behaviour: show attempt + PID even without translations_raw
+        if snapshot is not None and "chunk_plan" in snapshot:
+            plan = snapshot.get("chunk_plan")
+        else:
+            plan = _read_json(out_dir / "chunk_plan.json")
+        source_words = 0
+        if plan:
+            chunks = plan.get("chunks")
+            if isinstance(chunks, list):
+                for chunk in chunks:
+                    if not isinstance(chunk, dict):
+                        continue
+                    word_counts = chunk.get("word_counts")
+                    if isinstance(word_counts, list):
+                        for w in word_counts:
+                            source_words += _as_int(w)
+        attempt = f"attempt {gen['attempt']}/{gen['max_attempts']} | " if gen else ""
+        pid = ""
+        if gen.get("validated"):
+            flags = gen["validated"][-1]
+            pid = " · PID ok" if (flags.get("json_ok") and flags.get("pids_ok") and flags.get("order_ok")) else " · PID FAIL"
+        return (f"Whole-chapter translation: {attempt}source {source_words} слов → "
+                f"перевод 0 слов{pid}")
     if snapshot is not None and "chunk_plan" in snapshot:
         plan = snapshot.get("chunk_plan")
     else:

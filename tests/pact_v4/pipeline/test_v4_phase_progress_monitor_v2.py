@@ -220,11 +220,12 @@ def test_chapters_table_rows_and_total(tmp_path: Path):
     _write_ndjson(ch2 / USAGE_FILENAME, [_usage_row("phase3/qwen_chapter_audit", model="qwen3.7-plus", cost=2.0)])
 
     report = tracker.render_book_report(base)
-    assert "chunks" in report and "16/16" not in report  # 2/2 in this fixture
+    assert "mode/unit" in report
+    assert "chunks" not in report.split("\n")[1]  # column renamed to mode/unit
     assert "2/2" in report
     assert "TOTAL" in report
-    # calls 1+1=2, cost 1.00+2.00=3.00
     assert "$3.00" in report
+    assert "16/16" not in report
 
 
 def test_chapters_table_hides_cost_when_none_reported(tmp_path: Path):
@@ -292,8 +293,12 @@ def test_step8_not_started_wording(tmp_path: Path):
          "ts": _iso(20), "round_number": 1},
     ])
     report = tracker.render_report(out)
-    assert "Formatting: not started (ожидание formatting/terminal)" in report
+    assert "Formatting:" not in report
+    assert "Formatting: not started" not in report
     assert "incidents=None" not in report
+    assert "status:" not in report
+    assert "mode=fine" not in report
+    assert "phase:" not in report
 
 
 # ---------------------------------------------------------------------------
@@ -1017,28 +1022,27 @@ def test_book_table_mode_unit_chunked(tmp_path: Path):
 
 
 def test_counters_whole_chapter_canonical_lifecycle(tmp_path: Path):
-    """Counters block uses canonical phase names, not legacy Step N
-    (task req. 1)."""
+    """Per-phase layout uses canonical names and omits absent phases (no not_started)."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
         {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
          "max_attempts": 3},
     ])
     report = tracker.render_report(out)
-    # Canonical name for generation.
     assert "Whole-chapter translation: attempt 1/3" in report
-    # Canonical names for subsequent stages.
-    assert "R-editor: not started" in report
-    assert "Chapter audit: not started" in report
-    assert "Selective repair: not started" in report
-    assert "Re-audit scope: not started" in report
-    assert "Formatting: not applicable (whole-chapter)" in report
-    # Legacy names must not appear in user-facing output.
+    assert "R-editor:" not in report
+    assert "Chapter audit:" not in report
+    assert "Selective repair:" not in report
+    assert "Re-audit scope:" not in report
+    assert "Formatting: not applicable" not in report
+    assert "not_started" not in report
     assert "GEN:" not in report
     assert "Step 6" not in report
     assert "Step 7" not in report
     assert "Step 8" not in report
     assert "Steps 1-5" not in report
+    assert "status:" not in report
+    assert "mode=fine" not in report
 
 
 # ---------------------------------------------------------------------------
@@ -1046,8 +1050,7 @@ def test_counters_whole_chapter_canonical_lifecycle(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_r_editor_not_started_without_b3(tmp_path: Path):
-    """Generation done without B3 events must NOT claim R-editor complete
-    (finding 3 regression)."""
+    """Generation done without B3 events must NOT claim R-editor complete."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
         {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
@@ -1056,13 +1059,14 @@ def test_r_editor_not_started_without_b3(tmp_path: Path):
          "finish_reason": "complete", "pid_count": 100, "duration": 60.0},
     ])
     report = tracker.render_report(out)
-    # R-editor must be "not started" — no B3 r_editor events exist.
-    assert "R-editor: not started" in report
-    assert "R-editor: complete" not in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "R-editor:" not in report
+    assert "R-editor: not started" not in report
+    assert "status:" not in report
 
 
 def test_r_editor_in_progress_from_b3_started(tmp_path: Path):
-    """R-editor in progress when B3 has r_editor_started but no r_editor_done."""
+    """Audit journal alone does not drive per-phase R-editor line (phase_progress is source)."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
         {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
@@ -1077,13 +1081,13 @@ def test_r_editor_in_progress_from_b3_started(tmp_path: Path):
                                "event": "r_editor_started",
                                "ts": _iso(40)}) + "\n")
     report = tracker.render_report(out)
-    assert "R-editor: in progress" in report
-    assert "R-editor: complete" not in report
-    assert "R-editor: not started" not in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "R-editor:" not in report
+    assert "not_started" not in report
 
 
 def test_r_editor_complete_from_b3_done(tmp_path: Path):
-    """R-editor complete when B3 has r_editor_done events."""
+    """Audit journal alone does not drive per-phase R-editor line."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
         {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
@@ -1101,7 +1105,9 @@ def test_r_editor_complete_from_b3_done(tmp_path: Path):
                                "event": "r_editor_done",
                                "ts": _iso(30), "chunk": 1, "total": 1}) + "\n")
     report = tracker.render_report(out)
-    assert "R-editor: complete" in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "R-editor:" not in report
+    assert "not_started" not in report
 
 
 # ---------------------------------------------------------------------------
@@ -1188,16 +1194,17 @@ def test_status_line_uses_canonical_phase_names(tmp_path: Path):
 
 
 def test_render_report_phase_line_canonical(tmp_path: Path):
-    """render_report phase: line uses canonical name."""
+    """Per-phase line uses canonical name with aligned active marker."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
     _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
         {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
          "max_attempts": 3},
     ])
     report = tracker.render_report(out)
-    # phase: line uses canonical name, not raw "gen".
-    assert "phase: Whole-chapter translation --" in report
-    assert "phase: gen --" not in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "phase:" not in report
+    assert "mode=fine" not in report
+    assert "status:" not in report
 
 
 def test_chapter_table_step_uses_canonical(tmp_path: Path):
@@ -1636,27 +1643,36 @@ def test_r_editor_negative_successful_chunks_no_inference(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_no_legacy_labels_in_chunk_block(tmp_path: Path):
-    """The chunks block header and columns must use canonical names."""
+    """No legacy trial/chunk labels appear in per-phase output."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
     report = tracker.render_report(out)
-    assert "Entity extraction" in report
-    assert "Chapter audit" in report
-    assert "Selective repair" in report
-    lines = report.split("\n")
-    for line in lines:
+    assert "Whole-chapter translation:" in report
+    assert "not_started" not in report
+    assert "status:" not in report
+    assert "phase:" not in report
+    for line in report.split("\n"):
         if "chunks (" in line:
-            assert "trial" not in line.lower() or "Entity extraction" in line
+            assert "trial" not in line.lower()
 
 
 def test_no_legacy_labels_in_counters_block(tmp_path: Path):
-    """The counters block must use canonical names, not Step 6/7."""
+    """No legacy Step labels appear in per-phase output."""
     out = _chapter_dir(tmp_path, "chapter_0001", _iso(3600))
+    _write_ndjson(out / PHASE_PROGRESS_FILENAME, [
+        {"schema": "x", "event": "wc_generation_started", "ts": _iso(60),
+         "max_attempts": 3},
+    ])
     report = tracker.render_report(out)
     assert "Step 6" not in report
     assert "Step 7" not in report
     assert "Step 6/7" not in report
-    assert "Chapter audit:" in report
-    assert "Selective repair:" in report
+    assert "Whole-chapter translation:" in report
+    assert "not_started" not in report
+    assert "status:" not in report
 
 
 def test_no_legacy_labels_in_book_table(tmp_path: Path):

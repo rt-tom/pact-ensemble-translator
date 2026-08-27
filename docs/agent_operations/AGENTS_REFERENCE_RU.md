@@ -170,6 +170,23 @@ python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base /home/rt/pa
 cd ~/projects/pact-ensemble-translator
 python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$(ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1)" --watch 5
 ```
+Пример вывода (per-phase, без 6-line cap, `--out-base` добавляет book-таблицу + промошен):
+```
+== V4 run progress: /home/rt/pact_runs/outputs/book_0001-0001_remote_.../chapter_0001_... ==
+[0001] 123s · quiet 2s
+  Entity extraction        : сущностей: 12 | claims: verified 4 / candidate 2
+> Whole-chapter translation: attempt 1/3 | source 286 слов → перевод 1200 слов · PID ok
+  R-editor                 : chunks done=2/2 | safe (применено)=5 | review (предложено)=1
+  Chapter audit            : chunks done=8/8 | findings per chunk: [3, 0, 1, ...] | всего 12
+  Selective repair         : batches done=2/2 | repaired per batch: [1/1, 1/2] | findings eligible: 4 | PID edits committed: 2
+  Re-audit scope           : chunks done=2/2 | residual: 0 | debt: 0
+  Glossary                 : 12 proposals
+  Formatting               : spans 102/102 · incidents 0
+usage: 42 calls in=1.2k out=800 reas=500 $1.23
+Glossary promoted: 153 → glossary.json · 7 → memory
+```
+Формат заголовка — `[<id>] run <elapsed> · quiet <age>` (без `mode=fine`, без дублирующих `status:`/`phase:`); каждая фаза — одна строка, активная помечена `>`; `Glossary`/`Formatting` появляются только когда есть `glossary_proposals.json`/`formatting_report.json`; `Glossary promoted: … → glossary.json · … → memory` — book-уровень (`--out-base` + `--memory-dir`, по умолчанию state-root).
+
 Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`; артефакты прогона (`phase_progress.ndjson`, `server_logs`) лежат внутри `book_*/chapter_<NNNN>_*/`, НО для book-режима указывается сама папка книги (`--out-base`), а не подкаталог главы. Свежий book-каталог: `ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1`.
 
 **Ландшафт мониторов (чтобы не путаться):** `monitor_pipeline_v31.ps1` — устаревший v3.1-монитор (только в старых handoff-доках, к v4 не относится); `monitor_pipeline.ps1` — новый компактный v42-монитор (PowerShell/RT); `v4_phase_progress.py` — Python-ядро монитора (book/chapter режимы, работает на media). Изменение **v42-monitor-compact (PR #220, `aa08858`)** добавило/переработало новые мониторы; старый `v31` оставлен как legacy и v4-пайплайном не используется.

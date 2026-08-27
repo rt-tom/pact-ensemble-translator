@@ -523,11 +523,13 @@ def test_render_report_whole_chapter_shows_generation_and_validation(tmp_path: P
         _b3_event("audit_chunk_done", 440, chunk=5, total=8, status="ok"),
     ])
     report = tracker.render_report(out)
-    assert "status: [0001] Chapter audit" in report
-    assert "Whole-chapter translation attempt 1/3 done finish_reason=complete" in report
-    assert "Chapter audit chunk 5/8" in report
-    assert "PID validation: json_ok=True pids_ok=True order_ok=True" in report
-    assert "Formatting: not applicable (whole-chapter)" in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "· PID ok" in report
+    assert "source 0 слов → перевод 0 слов" in report
+    assert "status:" not in report
+    assert "PID validation:" not in report
+    assert "Formatting: not applicable" not in report
+    assert "mode=fine" not in report
 
 
 def test_render_report_whole_chapter_final_done(tmp_path: Path):
@@ -546,8 +548,12 @@ def test_render_report_whole_chapter_final_done(tmp_path: Path):
         _b3_event("gate", 400, audit_complete=True, released_as_audited=True),
     ])
     report = tracker.render_report(out)
-    assert "DONE (complete)" in report
-    assert "PID validation: json_ok=True pids_ok=True order_ok=True" in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "· PID ok" in report
+    assert "DONE (complete)" not in report
+    assert "PID validation:" not in report
+    assert "status:" not in report
+    assert "mode=fine" not in report
 
 
 def test_render_report_whole_chapter_incomplete_validation_flags(tmp_path: Path):
@@ -563,9 +569,11 @@ def test_render_report_whole_chapter_incomplete_validation_flags(tmp_path: Path)
         _wc_event("wc_validated", 469, json_ok=True, pids_ok=False, order_ok=False),
     ])
     report = tracker.render_report(out)
-    assert "PID validation: json_ok=True pids_ok=False order_ok=False" in report
-    assert "incomplete_generation" in report
-    assert "Whole-chapter translation attempt 3/3 done finish_reason=incomplete" in report
+    assert "Whole-chapter translation: attempt 3/3" in report
+    assert "· PID FAIL" in report
+    assert "PID validation:" not in report
+    assert "incomplete_generation" not in report
+    assert "status:" not in report
 
 
 def test_render_report_whole_chapter_is_read_only(tmp_path: Path):
@@ -629,9 +637,10 @@ def test_render_report_b3_journal_without_audit_chunk_events(tmp_path: Path):
     assert row["repair"] == "not_started"
 
     report = tracker.render_report(out)
-    assert "Whole-chapter translation attempt 1/3 done finish_reason=complete" in report
-    assert "B3 audit started" in report
-    assert "not_started" in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "· PID ok" in report
+    assert "not_started" not in report
+    assert "status:" not in report
 
 
 def test_monitor_audit_chunk_done_without_started_no_crash(tmp_path: Path):
@@ -659,7 +668,10 @@ def test_monitor_audit_chunk_done_without_started_no_crash(tmp_path: Path):
     assert "done=1/8" in row["audit_basis"]
 
     report = tracker.render_report(out)
-    assert "Chapter audit chunk 1/8" in report
+    assert "Whole-chapter translation: attempt 1/3" in report
+    assert "· PID ok" in report
+    assert "status:" not in report
+    assert "Chapter audit chunk 1/8" not in report
 
 
 # ---------------------------------------------------------------------------
