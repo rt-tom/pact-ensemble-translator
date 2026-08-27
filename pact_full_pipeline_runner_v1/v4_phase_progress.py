@@ -2834,6 +2834,27 @@ def _resolve_state_root() -> Path:
     return Path("/home/rt/pact_runs/workers/media/book-1/state")
 
 
+def _collect_promotion_debt_lines(out_base: Path) -> List[str]:
+    """Collect ``promotion_error`` debt lines from ``book_run.json``."""
+    data = _read_json(Path(out_base) / "book_run.json")
+    if not isinstance(data, dict):
+        return []
+    chapters = data.get("chapters")
+    if not isinstance(chapters, list):
+        return []
+    lines: List[str] = []
+    for ch in chapters:
+        if not isinstance(ch, dict):
+            continue
+        err = ch.get("promotion_error")
+        if err is not None and str(err).strip():
+            txt = str(err).strip().replace("\n", " ").replace("\r", " ")
+            if len(txt) > 300:
+                txt = txt[:300] + "\u2026"
+            lines.append(f"Promotion debt: {txt}")
+    return lines
+
+
 def _book_promotion_summary(out_base: Path, memory_dir: Optional[Path] = None) -> Optional[str]:
     """Book-level promotion summary from ``book_run.json`` (per-run) with fallback.
 
@@ -2923,6 +2944,9 @@ def render_book_report(out_base: Path, incremental: bool = False, memory_dir: Op
     if promotion:
         lines.append("")
         lines.append(promotion)
+    # Promotion debt: surface local-promote failures recorded in book_run.json
+    for debt_line in _collect_promotion_debt_lines(out_base):
+        lines.append(debt_line)
     return "\n".join(lines)
 
 

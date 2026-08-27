@@ -250,3 +250,77 @@ def test_memory_dir_cli_default(tmp_path: Path):
     base.mkdir()
     args = tracker.build_argparser().parse_args(["--out-base", str(base)])
     assert args.memory_dir is None
+
+
+# ---------------------------------------------------------------------------
+# Promotion debt (book-memory-boundary-allowlist)
+# ---------------------------------------------------------------------------
+
+def test_promotion_debt_rendered(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _make_chapter(base, "chapter_0001_bonds-1-1")
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    _write(base / "book_run.json", {
+        "schema": "pact-v4-book-run/v1",
+        "memory_dir": str(mem),
+        "chapters": [{
+            "chapter_id": "0001_bonds-1-1",
+            "promoted": False,
+            "promote_detail": "promotion / push to Media not completed: boom",
+            "promotion_error": "exact-four-file boundary violation before promotion: extra entry 'rogue.txt'",
+            "candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_promotions": [],
+        }],
+    })
+    report = tracker.render_book_report(base, memory_dir=mem)
+    assert "Promotion debt:" in report
+    assert "extra entry" in report
+
+
+def test_promotion_debt_truncated(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _make_chapter(base, "chapter_0001_bonds-1-1")
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    long_err = "x" * 500
+    _write(base / "book_run.json", {
+        "schema": "pact-v4-book-run/v1",
+        "chapters": [{
+            "chapter_id": "0001",
+            "promoted": False,
+            "promotion_error": long_err,
+            "candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_promotions": [],
+        }],
+    })
+    report = tracker.render_book_report(base, memory_dir=mem)
+    assert "Promotion debt:" in report
+    # truncated: full 500-char error must not appear verbatim
+    assert long_err not in report
+    assert "\u2026" in report or "..." in report
+
+
+def test_no_promotion_debt_when_success(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _make_chapter(base, "chapter_0001_bonds-1-1")
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    _write(base / "book_run.json", {
+        "schema": "pact-v4-book-run/v1",
+        "chapters": [{
+            "chapter_id": "0001",
+            "promoted": True,
+            "promotion_error": None,
+            "candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_promotions": [],
+        }],
+    })
+    report = tracker.render_book_report(base, memory_dir=mem)
+    assert "Promotion debt:" not in report

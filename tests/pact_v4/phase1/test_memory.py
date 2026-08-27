@@ -7,6 +7,7 @@ from pact_v4.phase1.memory import MemoryManager, atomic_write, load_json
 class TestMemoryManager(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
+        MemoryManager.initialize_canonical_files(self.test_dir)
         self.mm = MemoryManager(self.test_dir)
 
     def tearDown(self):

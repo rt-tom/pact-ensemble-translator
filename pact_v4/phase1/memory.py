@@ -94,9 +94,10 @@ def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
         entries = os.listdir(base_dir)
     except OSError as e:
         return f"cannot list dir: {e}"
-    # Strict allow-list: only canonical files plus exact marker and backup files are permitted
+    # Strict allow-list: only canonical files plus Media revision metadata plus exact marker and backup files are permitted
     # Any other .pact_*, *.tmp, extra file/dir, symlink, special file is rejected
-    allowed = set(CANONICAL_FILES)
+    # Media contract is the six-file set: four canonical + CURRENT.json + manifest.json (remote_client.py:190)
+    allowed = set(CANONICAL_FILES) | {"CURRENT.json", "manifest.json"}
     for e in entries:
         # Allow marker file exactly
         if e == MARKER_NAME:
@@ -122,6 +123,29 @@ def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
         fpath = os.path.join(base_dir, fname)
         if not os.path.lexists(fpath):
             return f"missing canonical file {fname}"
+        if os.path.islink(fpath):
+            return f"symlink not allowed: {fname}"
+        if not _validate_no_symlink_ancestors(base_dir, fname):
+            return f"symlink ancestor for {fname}"
+        try:
+            st = os.lstat(fpath)
+            import stat
+            if not stat.S_ISREG(st.st_mode):
+                return f"non-regular file {fname}: mode {oct(st.st_mode)}"
+            if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
+                return f"special file {fname}"
+        except OSError as e:
+            return f"cannot stat {fname}: {e}"
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                json.load(f)
+        except Exception as e:
+            return f"invalid JSON {fname}: {e}"
+    # Optional Media revision metadata: validate when present (regular file, no symlink, valid JSON)
+    for fname in ("CURRENT.json", "manifest.json"):
+        fpath = os.path.join(base_dir, fname)
+        if not os.path.lexists(fpath):
+            continue
         if os.path.islink(fpath):
             return f"symlink not allowed: {fname}"
         if not _validate_no_symlink_ancestors(base_dir, fname):
