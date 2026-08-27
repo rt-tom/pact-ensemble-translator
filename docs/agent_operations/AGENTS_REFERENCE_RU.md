@@ -166,11 +166,11 @@ cd ~/projects/pact-ensemble-translator
 # book-прогон: --out-base на ПАПКУ КНИГИ (скрипт сам обходит chapter_* и показывает активную главу)
 python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665
 
-# УПРОЩЁННЫЙ запуск: авто-поиск САМОГО СВЕЖЕГО book_*-каталога (любая книга), цикл раз в 5с.
+# УПРОЩЁННЫЙ запуск: авто-поиск САМОГО СВЕЖЕГО book_*-каталога (любая книга), цикл раз в 10с.
 # Тот же приём через переменную (можно переиспользовать для resume и других команд):
-latest=$(ls -dt /home/rt/pact_runs/outputs/book_*/ 2>/dev/null | head -1 | sed 's#/$##') && echo "Monitoring: $latest" && python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$latest" --watch 5
+latest=$(ls -dt /home/rt/pact_runs/outputs/book_*/ 2>/dev/null | head -1 | sed 's#/$##') && echo "Monitoring: $latest" && python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$latest" --watch 10
 
-# Ещё короче — алиас pactmon (см. ~/.bash_aliases на media): просто `pactmon` или `pactmon 10` (10с)
+# Ещё короче — алиас pactmon (см. ~/.bash_aliases на media): просто `pactmon` (10с по умолчанию) или `pactmon 30` (30с)
 pactmon
 # RT-вариант монитора — см. выше («Monitor прогона (v42-monitor-compact)»): -ProjectRoot мониторит все прогоны сразу.
 ```
