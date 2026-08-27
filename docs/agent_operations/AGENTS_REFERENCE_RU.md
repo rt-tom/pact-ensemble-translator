@@ -102,3 +102,10 @@ numeric-валидация, duplicate-header, top-5 heading). Правило с�
 - v4_book_html.py читает ИМЕННО translations.json из run-dir — это корректный финальный перевод (== repaired).
 - v4_book_run.py НЕ собирает книгу (только book_run.json + кандидаты глоссария/памяти + promote). Склейка глав в book.html — отдельный шаг:
   python -m pact_full_pipeline_runner_v1.v4_book_html --out-base <out-base> --run-dirs chapter_*_bonds-1-* --chapter-html-pattern 'D:/pact/pact_chapters/{chapter_id}.html' --title 'Книга'
+
+### Деплой на RT через ssh rt + powershell (2026-08-27)
+- Хост RT доступен по ssh-алиасу `rt` (ключ `~/.ssh/id_rt`, `IdentitiesOnly yes`). Дефолтный удалённый шелл — `cmd`, но `powershell`/`pwsh` вызываются явно и работают: `ssh rt 'powershell -NoProfile -Command "Write-Host OK"'`.
+- Деплой-синхронизация продакшн-чекаута (per AGENTS.md: после каждого деплоя `git pull --ff-only` на RT). Проверенный вариант:
+  `ssh rt 'powershell -NoProfile -Command "git -C D:/pact/pact_translator_v4_1 pull --ff-only"'`
+- Пути на RT — Windows; внутри powershell-команды используйте `D:/...` (прямой слэш). Внутри cmd-шелла одинарные кавычки не распознаются — оборачивайте удалённую команду внешними одинарными кавычками, а строки/пути внутри powershell — двойными.
+- Сам пайплайн удалённо НЕ запускать: владелец стартует его на RT вручную (manual-only).
