@@ -129,6 +129,37 @@ LOG = logging.getLogger(__name__)
 
 BOOK_RUN_SCHEMA = "pact-v4-book-run/v1"
 
+
+def _safe_promote(
+    manager: MemoryManager,
+    status: str,
+    *,
+    chapter_id: Optional[str] = None,
+    quarantined_chunks: Optional[set] = None,
+    chapter_html: Optional[str] = None,
+    chapter_ids: Optional[Sequence[str]] = None,
+    chapter_html_pattern: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Non-fatal wrapper for ``MemoryManager.promote``.
+
+    On success returns ``(True, None)``. On exception logs a warning
+    ``"promotion / push to Media not completed: %s"`` and returns
+    ``(False, str(err))`` so the book run can continue and record debt.
+    """
+    try:
+        manager.promote(
+            status,
+            quarantined_chunks=quarantined_chunks,
+            _chapter_id=chapter_id,
+            _chapter_html=chapter_html,
+            _chapter_ids=list(chapter_ids) if chapter_ids is not None else None,
+            _chapter_html_pattern=chapter_html_pattern,
+        )
+        return True, None
+    except Exception as err:  # noqa: BLE001 -- debt, not crash
+        LOG.warning("promotion / push to Media not completed: %s", err)
+        return False, str(err)
+
 # Terminal statuses after which ``MemoryManager.promote`` runs (B7).
 _PROMOTING_STATUSES = ("complete", "accepted_degraded")
 
@@ -149,6 +180,7 @@ class BookRunRecord:
     error: Optional[str] = None
     media_confirmation: Optional[Dict[str, Any]] = None
     media_error: Optional[str] = None
+    promotion_error: Optional[str] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -170,6 +202,7 @@ class BookRunRecord:
             "error": self.error,
             "media_confirmation": self.media_confirmation,
             "media_error": self.media_error,
+            "promotion_error": self.promotion_error,
         }
 
 
@@ -2125,6 +2158,7 @@ def run_book(
 
         promoted = False
         promote_detail = ""
+        promotion_error: Optional[str] = None
         # FINDING 1: independent mode gate — only promoting categories commit durable state
         _effective_bm_policy_for_promote = _effective_bm_policy if "_effective_bm_policy" in locals() else book_memory_policy
         _should_promote = terminal_status in _PROMOTING_STATUSES and (_mode == "promote" or _effective_bm_policy_for_promote == "promote_verified")
@@ -2135,28 +2169,44 @@ def run_book(
                     f"quarantined chunks: {sorted(quarantined)}"
                 )
                 # Stage REBUILT chapter_index.json inside same four-file transaction (finding 5)
-                manager.promote("complete", _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern)
-                promoted = True
-                promote_detail = "promoted after complete (all observations)"
+                promoted, promotion_error = _safe_promote(
+                    manager,
+                    "complete",
+                    chapter_id=chapter_id,
+                    chapter_html=str(chapter_html),
+                    chapter_ids=chapter_ids,
+                    chapter_html_pattern=chapter_html_pattern,
+                )
+                if promoted:
+                    promote_detail = "promoted after complete (all observations)"
+                else:
+                    promote_detail = f"promotion / push to Media not completed: {promotion_error}"
             elif terminal_status == "accepted_degraded":
-                manager.promote(
+                promoted, promotion_error = _safe_promote(
+                    manager,
                     "accepted_degraded",
+                    chapter_id=chapter_id,
                     quarantined_chunks=quarantined,
-                    _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern,
+                    chapter_html=str(chapter_html),
+                    chapter_ids=chapter_ids,
+                    chapter_html_pattern=chapter_html_pattern,
                 )
-                promoted = True
-                promote_detail = (
-                    f"promoted after accepted_degraded "
-                    f"(excluded {len(quarantined)} quarantined chunks)"
-                )
-            # B9: promote stores observation values verbatim — restore the
-            # flat {source: target} glossary contract for the promoted entries.
-            _flatten_promoted_glossary(memory_dir)
-            # BM: promote stores observation values verbatim — strip the
-            # quarantined-filter-only chunk_id field from promoted book_memory
-            # entries so the on-disk bible stays clean (no-op when nothing was
-            # promoted; bytes preserved).
-            _strip_book_memory_observation_fields(memory_dir)
+                if promoted:
+                    promote_detail = (
+                        f"promoted after accepted_degraded "
+                        f"(excluded {len(quarantined)} quarantined chunks)"
+                    )
+                else:
+                    promote_detail = f"promotion / push to Media not completed: {promotion_error}"
+            if promoted:
+                # B9: promote stores observation values verbatim — restore the
+                # flat {source: target} glossary contract for the promoted entries.
+                _flatten_promoted_glossary(memory_dir)
+                # BM: promote stores observation values verbatim — strip the
+                # quarantined-filter-only chunk_id field from promoted book_memory
+                # entries so the on-disk bible stays clean (no-op when nothing was
+                # promoted; bytes preserved).
+                _strip_book_memory_observation_fields(memory_dir)
         else:
             if terminal_status in _PROMOTING_STATUSES:
                 promote_detail = f"skipped promotion: glossary_mode={_mode} bm_policy={_effective_bm_policy_for_promote} (observation-only)"
@@ -2252,6 +2302,7 @@ def run_book(
             error=error_msg,
             media_confirmation=media_confirmation,
             media_error=media_error,
+            promotion_error=promotion_error,
         ))
 
     book_run_path = out_base / "book_run.json"
