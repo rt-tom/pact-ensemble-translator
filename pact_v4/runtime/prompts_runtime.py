@@ -646,6 +646,14 @@ REPAIR_REGION_V1 = ReviewerPrompt(
 # rewrite the PID twice in sequence (run_remote_001 p00303: the fidelity
 # repair wrote exact-but-clunky Russian, then the editor candidate rewrote it
 # back losing the meaning).
+#
+# OWNER RULES (owner analysis of p00158 'fuckup' -> 'ебанутая неудачница' and
+# p00198 'her' -> 'пациентку'): a fidelity finding can be technically correct
+# yet low-value when the only fix the repair model finds is a literal one that
+# wrecks natural Russian. Two new rules close both gaps — NOUN-FOR-PRONOUN
+# (allow harmless referent explicitation instead of a clunky pronoun stack) and
+# MODIFIER-INTENSITY (keep the source's insult/register when dropping an
+# unsupported modifier, instead of over-flattening to neutral Russian).
 REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
     role="selective_repair",
     version="pact-v4-repair-as-verifier/v5",
@@ -713,6 +721,30 @@ REPAIR_AS_VERIFIER_V1 = ReviewerPrompt(
         "the grammatical attachment of all surrounding clauses. Do not "
         "reassign a modifier or action to another entity unless SOURCE "
         "explicitly supports it.\n"
+        "\n"
+        "NOUN-FOR-PRONOUN RULE: a fidelity finding that an explicit noun "
+        "replaces a source PRONOUN does NOT require restoring the pronoun "
+        "literally. You MAY use a contextually established noun when that is "
+        "needed for natural Russian (e.g. to avoid an ugly or ambiguous "
+        "pronoun stack like «её в неё»), provided the noun introduces NO new "
+        "factual distinction beyond the clearly resolved referent — it must "
+        "not add a status, relation, or attribute absent from the source "
+        "(e.g. do NOT turn 'her' into 'пациентку' / a patient, which adds a "
+        "medical status). When the source referent is unambiguous in context "
+        "(e.g. 'her' clearly = 'бабушка'), a safe referent explicitation is "
+        "allowed; when it is genuinely ambiguous, keep the pronoun or return "
+        "PASS.\n"
+        "\n"
+        "MODIFIER-INTENSITY RULE: when a finding requires removing an "
+        "unsupported modifier or characterization, preserve the source's "
+        "emotional intensity and register with a semantically compatible "
+        "Russian expression. Do NOT over-flatten the wording into neutral "
+        "phrasing when the source is aggressive, crude, or emotionally loaded. "
+        "Example: if a finding flags that 'ебанутая' (crazy) adds an "
+        "unsupported mental-state meaning to 'fuckup', replace it with a "
+        "crude but semantically compatible insult ('ебаная неудачница' / "
+        "'конченая неудачница') that keeps the source's insult register "
+        "without inventing new facts.\n"
         "\n"
         "DIALOGUE MARKER RULE: if the original Russian TRANSLATION PID starts "
         "with «—» (em-dash dialogue marker), the repaired_translation MUST "
