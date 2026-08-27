@@ -87,3 +87,39 @@ def test_fail_soft_to_narrator_seed_on_unknown_schema():
     # Should contain only narrator
     assert "Narrator" in entry["characters"]
     assert "Blake" not in entry["characters"]
+
+def test_fail_soft_missing_schema():
+    # FINDING 3: missing $schema should fail soft to narrator+seed only, not legacy fallback
+    book_memory = {
+        # schema missing intentionally
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {"Blake": {"memory_class": "named_character", "chapters": ["0001"], "variants": {}, "field_provenance": {}}},
+        "entities": {"Hillsglade House": {"memory_class": "named_place", "chapters": ["0001"], "variants": {}, "field_provenance": {}}},
+        "facts": [{"fact": "Seed fact", "seed": True, "keys": ["Narrator"], "chapter": ""}, {"fact": "Some fact", "keys": ["Blake"], "chapter": "0001"}],
+        "pov": {"source_name": "Narrator"}
+    }
+    entry = build_chapter_index(chapter_id="0002", source_text="Blake and Hillsglade House", book_memory=book_memory, glossary=[])
+    assert entry["named_entities"] == []
+    assert entry["terms"] == []
+    assert "Narrator" in entry["characters"]
+    assert "Blake" not in entry["characters"]
+    # Should contain seed fact only
+    assert any("Seed fact" in f for f in entry["facts"])
+    assert not any("Some fact" in f for f in entry["facts"])
+
+def test_fail_soft_unknown_policy_version():
+    # FINDING 3: unknown $book_memory_policy_version should fail soft to narrator+seed only
+    book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v999",
+        "characters": {"Blake": {"memory_class": "named_character", "chapters": ["0001"], "variants": {}, "field_provenance": {}}},
+        "entities": {"Hillsglade House": {"memory_class": "named_place", "chapters": ["0001"], "variants": {}, "field_provenance": {}}},
+        "facts": [{"fact": "Seed fact", "seed": True, "keys": ["Narrator"], "chapter": ""}],
+        "pov": {"source_name": "Narrator"}
+    }
+    entry = build_chapter_index(chapter_id="0002", source_text="Blake and Hillsglade House", book_memory=book_memory, glossary=[])
+    assert entry["named_entities"] == []
+    assert entry["terms"] == []
+    assert "Narrator" in entry["characters"]
+    assert "Blake" not in entry["characters"]
+

@@ -23,6 +23,9 @@ from pact_v4.runtime.bible_renderer import render_bible_section
 
 def _book_memory() -> dict:
     return {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "policy": {"explicit_deny": [], "explicit_allow": {}, "aliases": {}, "approved_terms": [], "generic_patterns_version": "generic-memory-reject/v1"},
         "pov": {"gender": "male", "source_name": "Blake Thorburn"},
         "characters": {
             "Blake Thorburn": {
@@ -369,6 +372,7 @@ def test_book_run_builds_chapter_index_after_accepted_chapter(tmp_path, monkeypa
     )
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
 
     out_base = tmp_path / "out"
     src_dir = tmp_path / "src"
@@ -438,6 +442,7 @@ def test_book_run_skips_chapter_index_for_failed_chapter(tmp_path, monkeypatch):
     )
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
 
     out_base = tmp_path / "out"
     src_dir = tmp_path / "src"
@@ -504,6 +509,9 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
     memory = tmp_path / "memory"
     memory.mkdir()
     book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "policy": {"explicit_deny": [], "explicit_allow": {}, "aliases": {}, "approved_terms": [], "generic_patterns_version": "generic-memory-reject/v1"},
         "pov": {"gender": "male", "source_name": "Blake Thorburn"},
         "characters": {
             "Blake Thorburn": {
@@ -529,6 +537,7 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
     )
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
 
     out_base = tmp_path / "out"
     src_dir = tmp_path / "src"

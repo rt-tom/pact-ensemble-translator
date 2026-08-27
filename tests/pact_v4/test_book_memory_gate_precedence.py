@@ -61,12 +61,11 @@ def test_quarantined_evidence_rejects():
     assert not ok and code == "quarantined_evidence"
 
 def test_duplicate_rejects():
-    # Duplicate across chapters is merged via promotion, gate does not reject duplicate (handled via merge). Test conflict instead.
     policy = {}
     source_map = {"p00001": "Blake Thorburn appears"}
     rec = make_record(entity="Blake Thorburn")
-    ok, code = evaluate_gate(rec, policy=policy, source_map=source_map, current_chapter="0001", source_pids={"p00001"}, conflicts={"blake thorburn"})
-    assert not ok and code == "conflict"
+    ok, code = evaluate_gate(rec, policy=policy, source_map=source_map, current_chapter="0001", source_pids={"p00001"}, duplicate_names={"blake thorburn"})
+    assert not ok and code == "duplicate"
 
 def test_conflict_rejects():
     policy = {}

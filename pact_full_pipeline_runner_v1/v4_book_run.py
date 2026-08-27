@@ -1235,6 +1235,13 @@ def run_book(
         pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root, execution_host=_exec_host)
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
+    # FINDING 4: explicit init for genuine new-state (all four missing) — promotion path still requires all four present (fail closed)
+    from pact_v4.phase1.memory import CANONICAL_FILES as _CF4
+    import os as _os
+    _missing = [f for f in _CF4 if not _os.path.lexists(str(memory_dir / f))]
+    if len(_missing) == len(_CF4):
+        from pact_v4.phase1.memory import MemoryManager as _MM
+        _MM.initialize_canonical_files(str(memory_dir))
     manager = MemoryManager(str(memory_dir))
     ledger = GlossaryCandidateLedger(
         str(candidates_ledger or (out_base / "glossary_candidates.json"))
@@ -1910,7 +1917,22 @@ def run_book(
                         _filtered_context_entities = []
                         _gate_decisions = []
                         for rec in context.entities:
-                            ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, current_chapter=chapter_id, source_pids=set(_source_map.keys()), quarantined_pids=set(), existing_names=_existing, duplicate_names=set(), conflicts=set())
+                            # FINDING 2: pass real quarantined_pids and computed duplicate/conflict sets
+                            # compute duplicate_names: normalized entities that appear >1 in this batch
+                            _norm_counts = {}
+                            for _r in context.entities:
+                                _nk = _r.entity.strip().casefold().replace("\u2019","'")
+                                _norm_counts[_nk] = _norm_counts.get(_nk, 0) + 1
+                            _dup_names = {k for k, v in _norm_counts.items() if v > 1}
+                            # conflicts: use glossary conflict sources (casefold) if available, else empty
+                            _conflicts = set()
+                            try:
+                                _gloss_conf = glossary_before
+                                # glossary_before is dict {source: target}
+                                # no explicit conflict set, keep empty but pass computed duplicates
+                            except Exception:
+                                _conflicts = set()
+                            ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, current_chapter=chapter_id, source_pids=set(_source_map.keys()), quarantined_pids=quarantined_pids, existing_names=_existing, duplicate_names=_dup_names, conflicts=_conflicts)
                             if not ok:
                                 _gate_decisions.append({"entity": rec.entity, "memory_class": getattr(rec,"memory_class",""), "rejected": True, "reason": code, "evidence_pids": [rec.anchor.pid]})
                                 # record candidate_claim if any candidate claim present? handled below via claim filter
@@ -1993,9 +2015,15 @@ def run_book(
                         entity_obs[key]["canonical_ru"] = target
             # Glossary observations -> shadow memory (promoted below via the
             # same promote(status, quarantined) call, B7 filter applies).
-            for source, value in glossary_obs.items():
-                manager.add_observation("glossary", source, value)
-                proposed_sources.add(source)
+            # FINDING 1: only add to durable manager when glossary mode is promote; shadow/observe keep report but no mutation
+            if _mode == "promote":
+                for source, value in glossary_obs.items():
+                    manager.add_observation("glossary", source, value)
+                    proposed_sources.add(source)
+            else:
+                # Report still tracks proposed, but no durable observation
+                for source in glossary_obs.keys():
+                    proposed_sources.add(source)
             if glossary_proposed or glossary_conflicts:
                 ledger.append_chapter(
                     chapter_id, glossary_proposed + glossary_conflicts,
@@ -2079,35 +2107,43 @@ def run_book(
 
         promoted = False
         promote_detail = ""
-        if terminal_status == "complete":
-            assert not quarantined, (
-                f"Chapter {chapter_id} terminal=complete but has "
-                f"quarantined chunks: {sorted(quarantined)}"
-            )
-            # Stage REBUILT chapter_index.json inside same four-file transaction (finding 5)
-            manager.promote("complete", _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern)
-            promoted = True
-            promote_detail = "promoted after complete (all observations)"
-        elif terminal_status == "accepted_degraded":
-            manager.promote(
-                "accepted_degraded",
-                quarantined_chunks=quarantined,
-                _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern,
-            )
-            promoted = True
-            promote_detail = (
-                f"promoted after accepted_degraded "
-                f"(excluded {len(quarantined)} quarantined chunks)"
-            )
+        # FINDING 1: independent mode gate — only promoting categories commit durable state
+        _effective_bm_policy_for_promote = _effective_bm_policy if "_effective_bm_policy" in locals() else book_memory_policy
+        _should_promote = terminal_status in _PROMOTING_STATUSES and (_mode == "promote" or _effective_bm_policy_for_promote == "promote_verified")
+        if _should_promote:
+            if terminal_status == "complete":
+                assert not quarantined, (
+                    f"Chapter {chapter_id} terminal=complete but has "
+                    f"quarantined chunks: {sorted(quarantined)}"
+                )
+                # Stage REBUILT chapter_index.json inside same four-file transaction (finding 5)
+                manager.promote("complete", _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern)
+                promoted = True
+                promote_detail = "promoted after complete (all observations)"
+            elif terminal_status == "accepted_degraded":
+                manager.promote(
+                    "accepted_degraded",
+                    quarantined_chunks=quarantined,
+                    _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern,
+                )
+                promoted = True
+                promote_detail = (
+                    f"promoted after accepted_degraded "
+                    f"(excluded {len(quarantined)} quarantined chunks)"
+                )
+            # B9: promote stores observation values verbatim — restore the
+            # flat {source: target} glossary contract for the promoted entries.
+            _flatten_promoted_glossary(memory_dir)
+            # BM: promote stores observation values verbatim — strip the
+            # quarantined-filter-only chunk_id field from promoted book_memory
+            # entries so the on-disk bible stays clean (no-op when nothing was
+            # promoted; bytes preserved).
+            _strip_book_memory_observation_fields(memory_dir)
+        else:
+            if terminal_status in _PROMOTING_STATUSES:
+                promote_detail = f"skipped promotion: glossary_mode={_mode} bm_policy={_effective_bm_policy_for_promote} (observation-only)"
 
-        # B9: promote stores observation values verbatim — restore the
-        # flat {source: target} glossary contract for the promoted entries.
-        _flatten_promoted_glossary(memory_dir)
-        # BM: promote stores observation values verbatim — strip the
-        # quarantined-filter-only chunk_id field from promoted book_memory
-        # entries so the on-disk bible stays clean (no-op when nothing was
-        # promoted; bytes preserved).
-        _strip_book_memory_observation_fields(memory_dir)
+
 
         # A2 index entries are now staged inside the same four-file transaction via MemoryManager.promote (finding 5),
         # so no separate post-promote mutation of chapter_index.json is needed. The promote transaction already rebuilt

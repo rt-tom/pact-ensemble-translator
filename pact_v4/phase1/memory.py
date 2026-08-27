@@ -152,8 +152,16 @@ class MemoryManager:
         self.observations_path = os.path.join(base_dir, 'observations.json')
         self._marker_path = os.path.join(base_dir, MARKER_NAME)
         os.makedirs(base_dir, exist_ok=True)
-        # Ensure all four canonical files exist for strict validation (create empty JSON if missing)
-        for fpath in [self.glossary_path, self.book_memory_path, self.chapter_index_path, self.observations_path]:
+        # FINDING 4: do NOT silently auto-create canonical files — promotion path must require all four present (fail closed).
+        # Use initialize_canonical_files() for genuine new-state creation.
+        self._recover_if_needed()
+
+    @staticmethod
+    def initialize_canonical_files(base_dir: str) -> None:
+        """Explicit helper for genuine new-state creation: create missing canonical files."""
+        os.makedirs(base_dir, exist_ok=True)
+        for fname in CANONICAL_FILES:
+            fpath = os.path.join(base_dir, fname)
             if not os.path.lexists(fpath):
                 try:
                     with open(fpath, "w", encoding="utf-8") as f:
@@ -161,7 +169,6 @@ class MemoryManager:
                         f.write("\n")
                 except OSError:
                     pass
-        self._recover_if_needed()
 
     def _recover_if_needed(self):
         if not os.path.exists(self._marker_path):

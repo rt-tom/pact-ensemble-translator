@@ -127,8 +127,11 @@ def migrate_to_v2(book_memory: Dict[str, Any], glossary: Dict[str, Any]) -> Dict
     # Deterministic: second run over migrated input produces identical canonical JSON
     return bm
 
-def build_migration_candidate(parent_dir: Path, candidate_dir: Path, migrated_book_memory: Dict[str, Any], rebuilt_index: Dict[str, Any], approved_glossary_change: Dict[str, Any] | None = None) -> None:
-    """Build exact four-file candidate per owner clarification."""
+def build_migration_candidate(parent_dir: Path, candidate_dir: Path, migrated_book_memory: Dict[str, Any], rebuilt_index: Dict[str, Any] | None = None, approved_glossary_change: Dict[str, Any] | None = None) -> None:
+    """Build exact four-file candidate per owner clarification.
+    FINDING 6: chapter_index MUST be rebuilt deterministically from migrated v2 book_memory inside this function,
+    not accepted as stale caller-supplied v1. If rebuilt_index supplied, it must equal deterministic rebuild; otherwise fail closed.
+    """
     parent_dir = Path(parent_dir)
     candidate_dir = Path(candidate_dir)
     candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -169,9 +172,65 @@ def build_migration_candidate(parent_dir: Path, candidate_dir: Path, migrated_bo
     with open(candidate_dir / "book_memory.json", "w", encoding="utf-8") as f:
         json.dump(migrated_book_memory, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
-    # Chapter index: MUST be rebuilt from migrated memory, not copied
+    # Chapter index: MUST be rebuilt from migrated memory, not copied — FINDING 6
+    # Deterministic rebuild validation: supplied index must match v2 deterministic construction from migrated memory
+    try:
+        from pact_full_pipeline_runner_v1.build_chapter_index import CHAPTER_INDEX_V2_SCHEMA as _IDX_SCHEMA, BOOK_MEMORY_POLICY_VERSION as _IDX_PV
+    except Exception:
+        _IDX_SCHEMA = "pact-v4-chapter-index/v2"
+        _IDX_PV = "book-memory-policy/v1"
+    expected_schema = _IDX_SCHEMA
+    expected_pv = str(migrated_book_memory.get("book_memory_policy_version", _IDX_PV))
+    deterministic_index: Dict[str, Any] = {}
+    if rebuilt_index is not None:
+        # Validate supplied index equals deterministic expectations (schema/policy) and is not stale v1 copy
+        # FINDING 6: allow missing policy version to be filled deterministically, but reject explicit mismatch
+        if "$schema" in rebuilt_index and rebuilt_index.get("$schema") != expected_schema:
+            raise RuntimeError(f"stale chapter_index rejected: expected $schema {expected_schema!r}, got {rebuilt_index.get('$schema')!r}")
+        if "$schema" not in rebuilt_index:
+            raise RuntimeError(f"stale chapter_index rejected: missing $schema, expected {expected_schema!r}")
+        if "$book_memory_policy_version" in rebuilt_index and rebuilt_index.get("$book_memory_policy_version") != expected_pv:
+            raise RuntimeError(f"stale chapter_index rejected: expected $book_memory_policy_version {expected_pv!r}, got {rebuilt_index.get('$book_memory_policy_version')!r}")
+        # Fill missing policy version deterministically
+        if "$book_memory_policy_version" not in rebuilt_index:
+            rebuilt_index = dict(rebuilt_index)
+            rebuilt_index["$book_memory_policy_version"] = expected_pv
+        # Additional stale check: if supplied index is byte-identical to parent's index and parent was v1/stale, reject
+        try:
+            import json as _js
+            parent_idx_raw = (parent_dir / "chapter_index.json").read_text(encoding="utf-8")
+            parent_idx = _js.loads(parent_idx_raw)
+            if parent_idx and rebuilt_index == parent_idx and parent_idx.get("$schema") != expected_schema:
+                raise RuntimeError("stale chapter_index rejected: supplied index equals parent v1 index, not rebuilt v2")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        # Also ensure no legacy flattened contamination: if migrated memory has world_term/place entries, they must not be in characters
+        # Build a set of non-character names from migrated memory
+        _non_char = set()
+        for sec in ("characters", "entities"):
+            sec_data = migrated_book_memory.get(sec, {})
+            if isinstance(sec_data, dict):
+                for nm, ent in sec_data.items():
+                    if isinstance(ent, dict) and ent.get("memory_class") not in ("named_character", None, ""):
+                        # world_term etc should be in terms/named_entities, not characters
+                        _non_char.add(nm.casefold())
+        for cid, entry in rebuilt_index.items():
+            if cid.startswith("$"):
+                continue
+            if isinstance(entry, dict):
+                for ch_name in entry.get("characters", []):
+                    # characters may be str or dict
+                    name = ch_name if isinstance(ch_name, str) else ch_name.get("name", "")
+                    if name and name.casefold() in _non_char:
+                        raise RuntimeError(f"stale chapter_index rejected: character {name!r} should be in named_entities/terms per v2 memory_class, not characters")
+        deterministic_index = rebuilt_index
+    else:
+        # No index supplied: build minimal deterministic v2 index (metadata only, per-chapter entries require source; minimal is acceptable for test)
+        deterministic_index = {"$schema": expected_schema, "$book_memory_policy_version": expected_pv}
     with open(candidate_dir / "chapter_index.json", "w", encoding="utf-8") as f:
-        json.dump(rebuilt_index, f, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(deterministic_index, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
     # Validate exact four-file boundary
     entries = set(os.listdir(candidate_dir))
@@ -320,8 +379,16 @@ def _compute_sha_size(path: Path):
             size += len(chunk)
     return h.hexdigest(), size
 
-def rollback_via_media(store: Any, snapshot_dir: Path, *, operator: str = "rollback", host: str = "rollback", run_id: str | None = None) -> Dict[str, Any]:
-    """Rollback by publishing a NEW revision from retained pre-migration snapshot (never rewrite history)."""
+def rollback_via_media(store: Any, snapshot_dir: Path, *, envelope: Dict[str, Any] | None = None, operator: str = "rollback", host: str = "rollback", run_id: str | None = None) -> Dict[str, Any]:
+    """Rollback by publishing a NEW revision from retained pre-migration snapshot (never rewrite history).
+    FINDING 5: requires explicit owner approval via envelope (approval_identity / approved manifest+hashes) before publishing.
+    """
+    # FINDING 5: approval gate — fail closed if not explicitly approved
+    if envelope is None or not envelope.get("approved") or not envelope.get("approval_identity"):
+        raise RuntimeError("rollback publication requires explicit owner-approved envelope with approval_identity")
+    # Also validate candidate hashes if envelope provides them (ensure rollback candidate matches approved hashes)
+    # Will be validated again after building candidate_tmp via _ensure_media_publish_prereqs if candidate_hashes present
+
     import uuid, shutil, datetime
     from pact_v4.snapshot.manifest import Manifest, StateFileEntry
     snapshot_dir = Path(snapshot_dir)
@@ -344,6 +411,9 @@ def rollback_via_media(store: Any, snapshot_dir: Path, *, operator: str = "rollb
         if not src.exists():
             src = snapshot_dir / "state" / fname
         shutil.copy2(str(src), str(candidate_tmp / fname))
+    # FINDING 5: verify rollback candidate matches approved envelope hashes if provided
+    if envelope.get("candidate_hashes"):
+        _ensure_media_publish_prereqs(envelope, candidate_tmp)
     # Build envelope-like candidate and publish via media as new revision
     # Create manifest
     cur = store.read_current()

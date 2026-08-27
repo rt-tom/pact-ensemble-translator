@@ -288,39 +288,30 @@ def build_chapter_index(
     for one chapter — the value stored under ``chapter_id`` in
     ``chapter_index.json``.
     """
-    # Fail-soft to narrator+seed when schema/policy unknown (spec requirement)
+    # Fail-soft to narrator+seed when schema/policy missing or unknown (spec requirement) — FINDING 3
+    def _fail_soft(reason: str):
+        import logging as _log
+        _log.getLogger(__name__).warning("chapter_index fail-soft %s for %s — rendering narrator+seed only", reason, chapter_id)
+        narrator_name_fs = ""
+        pov_fs = book_memory.get("pov") if isinstance(book_memory, Mapping) else None
+        if isinstance(pov_fs, Mapping):
+            narrator_name_fs = str(pov_fs.get("source_name") or "")
+        chars_fs = [narrator_name_fs] if narrator_name_fs else []
+        raw_facts_fs = book_memory.get("facts") if isinstance(book_memory, Mapping) else None
+        facts_fs = []
+        if isinstance(raw_facts_fs, list):
+            for fact in raw_facts_fs:
+                if isinstance(fact, Mapping) and fact.get("seed") is True:
+                    t2 = str(fact.get("fact") or fact.get("text") or "")
+                    if t2:
+                        facts_fs.append(t2)
+        return {"characters": sorted(set(chars_fs), key=str.casefold), "named_entities": [], "terms": [], "facts": sorted(set(facts_fs), key=str.casefold), "address": [], "_fail_soft_reason": reason}
     bm_schema = book_memory.get("schema") if isinstance(book_memory, Mapping) else None
     bm_policy_ver = book_memory.get("book_memory_policy_version") if isinstance(book_memory, Mapping) else None
-    if isinstance(bm_schema, str) and bm_schema not in ("", "pact-v4-book-memory/v2"):
-        narrator_name_fs = ""
-        pov_fs = book_memory.get("pov") if isinstance(book_memory, Mapping) else None
-        if isinstance(pov_fs, Mapping):
-            narrator_name_fs = str(pov_fs.get("source_name") or "")
-        chars_fs = [narrator_name_fs] if narrator_name_fs else []
-        raw_facts_fs = book_memory.get("facts") if isinstance(book_memory, Mapping) else None
-        facts_fs = []
-        if isinstance(raw_facts_fs, list):
-            for fact in raw_facts_fs:
-                if isinstance(fact, Mapping) and fact.get("seed") is True:
-                    t2 = str(fact.get("fact") or fact.get("text") or "")
-                    if t2:
-                        facts_fs.append(t2)
-        return {"characters": sorted(set(chars_fs), key=str.casefold), "named_entities": [], "terms": [], "facts": sorted(set(facts_fs), key=str.casefold), "address": []}
-    if isinstance(bm_policy_ver, str) and bm_policy_ver not in ("", "book-memory-policy/v1"):
-        narrator_name_fs = ""
-        pov_fs = book_memory.get("pov") if isinstance(book_memory, Mapping) else None
-        if isinstance(pov_fs, Mapping):
-            narrator_name_fs = str(pov_fs.get("source_name") or "")
-        chars_fs = [narrator_name_fs] if narrator_name_fs else []
-        raw_facts_fs = book_memory.get("facts") if isinstance(book_memory, Mapping) else None
-        facts_fs = []
-        if isinstance(raw_facts_fs, list):
-            for fact in raw_facts_fs:
-                if isinstance(fact, Mapping) and fact.get("seed") is True:
-                    t2 = str(fact.get("fact") or fact.get("text") or "")
-                    if t2:
-                        facts_fs.append(t2)
-        return {"characters": sorted(set(chars_fs), key=str.casefold), "named_entities": [], "terms": [], "facts": sorted(set(facts_fs), key=str.casefold), "address": []}
+    if bm_schema != "pact-v4-book-memory/v2":
+        return _fail_soft(f"unsupported schema {bm_schema!r}")
+    if bm_policy_ver != "book-memory-policy/v1":
+        return _fail_soft(f"unsupported policy version {bm_policy_ver!r}")
     character_names = _iter_names(book_memory, "characters")
     entity_names = _iter_names(book_memory, "entities")
 

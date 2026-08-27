@@ -23,6 +23,12 @@ FAUL_POINTS = [
     "before_verify",
     "before_verify_glossary.json",
     "before_verify_book_memory.json",
+    "before_verify_chapter_index.json",
+    "before_verify_observations.json",
+    "after_verify_glossary.json",
+    "after_verify_book_memory.json",
+    "after_verify_chapter_index.json",
+    "after_verify_observations.json",
     "after_verify",
 ]
 

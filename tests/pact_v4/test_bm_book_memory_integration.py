@@ -75,6 +75,7 @@ def _setup_memory(tmp_path: Path, book_memory: dict | None = None) -> Path:
     (memory / "book_memory.json").write_text(
         json.dumps(book_memory, ensure_ascii=False), encoding="utf-8",
     )
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
     return memory
 
@@ -859,7 +860,8 @@ class TestBookMemoryAccumulation:
             "p00005": "The pact held firm against time.",
             "p00006": "The others watched from afar.",
         }
-        cache = _entity_cache_entry("0001", source_text)
+        # FINDING 2 quarantine: anchor must not be in quarantined chunk (chunk0001 covers p00001-p00003), so pick anchor in accepted chunk
+        cache = _entity_cache_entry("0001", source_text, anchor_pid="p00004", anchor_span="Blake saw Rose smile, and Rose waved once more.")
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (html, "accepted_degraded", ["chunk0001"], translations, cache),
         })
@@ -1200,7 +1202,7 @@ class TestStripBookMemoryAtomicWrite:
         # No leftover temp files in the memory dir.
         leftovers = [p for p in memory.iterdir()
                      if p.name not in ("book_memory.json", "glossary.json",
-                                       "observations.json")]
+                                       "observations.json", "chapter_index.json")]
         assert leftovers == []
 
     def test_strip_noop_preserves_bytes(self, tmp_path):

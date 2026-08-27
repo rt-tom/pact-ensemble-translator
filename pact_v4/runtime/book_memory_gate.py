@@ -25,7 +25,7 @@ def evaluate_gate(record: Any, *, policy: Mapping[str, Any], source_map: Mapping
     if existing_names is None:
         existing_names = set()
     if duplicate_names is None:
-        duplicate_names = set(existing_names) if existing_names else set()
+        duplicate_names = set()
     if conflicts is None:
         conflicts = set()
     if source_pids is None:
@@ -98,10 +98,10 @@ def evaluate_gate(record: Any, *, policy: Mapping[str, Any], source_map: Mapping
     if is_allowed:
         # no model_veto/class-check when allowed; proceed directly to duplicate/conflict/quarantine
         pass
-    # (f) duplicate/conflict/quarantine checks
+    # (f) duplicate/conflict/quarantine checks — FINDING 2: explicit duplicate before conflict/quarantine
     norm_ent = _norm(record.entity)
-    # Duplicate across chapters is merged, not rejected - only reject if marked as conflict
-    # Keep conflict rejection, but duplicate is handled via merge in promotion layer
+    if norm_ent in duplicate_names:
+        return False, "duplicate"
     if norm_ent in conflicts:
         return False, "conflict"
     quarantined_set = set(quarantined_pids) if quarantined_pids else set()
