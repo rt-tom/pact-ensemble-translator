@@ -129,6 +129,22 @@ from pact_v4.audit.russian_editor import (
     RussianEditorOutcome,
 )
 from pact_v4.phase1.models import SourceArtifact, canonical_json_hash
+from pact_v4.pipeline.glossary_resolver import (
+    RESOLVER_VERSION as GLOSSARY_RESOLVER_VERSION,
+    PROMPT_VERSION as GLOSSARY_PROMPT_VERSION,
+    RESPONSE_SCHEMA as GLOSSARY_RESPONSE_SCHEMA,
+    GLOSSARY_PROPOSAL_SCHEMA,
+    compute_allowed_evidence_pids,
+    candidate_input_hash as glossary_candidate_input_hash,
+    translation_hash as glossary_translation_hash,
+    semantic_translation_hash,
+    sidecar_path as glossary_sidecar_path,
+    atomic_write_sidecar,
+    load_and_validate_sidecar,
+    validate_sidecar_payload,
+    GlossaryResolver,
+    build_sidecar_payload,
+)
 from pact_v4.repair.selective_repair import (
     DEFAULT_REAUDIT_BASE_DELAY_SECONDS,
     DEFAULT_REAUDIT_MAX_INPUT_TOKENS,
@@ -479,6 +495,7 @@ def glossary_observations_from_entity_context(
     book_memory: Mapping[str, Any],
     consensus_ratio: float = 0.8,
     pid_to_chunk: Optional[Mapping[str, str]] = None,
+    _allow_proper_name_align: bool = False,
 ) -> Dict[str, Any]:
     """GLOSSARY-FROM-ENTITY (variant B): verified entities -> glossary targets.
 
@@ -527,6 +544,9 @@ def glossary_observations_from_entity_context(
     candidate records (proposed vs blocked) for the book-run
     ``candidates`` block / ledger. Deterministic; zero model calls.
     """
+    # Deprecated: proper_name production path disabled; term only library (task 4.1)
+    if not _allow_proper_name_align:
+        return {"glossary": {}, "canonical_ru": {}, "proposed": [], "conflicts": []}
     from pact_v4.phase1.glossary_candidates import align_candidates
 
     observations: Dict[str, Any] = {}
@@ -786,6 +806,8 @@ class B3AuditRepairConfig:
     russian_editor_max_edits_per_pid: int = MAX_EDITS_PER_PID
     russian_editor_retry_max_retries: int = DEFAULT_RETRY_MAX_RETRIES
     russian_editor_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
+    glossary_resolver_mode: str = "off"
+    glossary_resolver_cache_miss_policy: str = "recompute"
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -844,6 +866,10 @@ class B3AuditRepairConfig:
                     "max_retries": self.russian_editor_retry_max_retries,
                     "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
                 },
+            },
+            "glossary_resolver": {
+                "mode": self.glossary_resolver_mode,
+                "cache_miss_policy": self.glossary_resolver_cache_miss_policy,
             },
         }
 
@@ -3322,6 +3348,7 @@ class B3AuditRepair:
         out_dir: Path,
         config_identity: str,
         backend_identity_hash: str,
+        quarantined_pids: Optional[set] = None,
     ) -> B3AuditRepairResult:
         cfg = self._config
         cache_path = _audit_cache_path(out_dir)
@@ -3339,6 +3366,7 @@ class B3AuditRepair:
                 backend_identity_hash=backend_identity_hash,
                 cache_path=cache_path,
                 journal=journal,
+                quarantined_pids=quarantined_pids,
             )
         finally:
             journal.close()
@@ -3600,6 +3628,7 @@ class B3AuditRepair:
         backend_identity_hash: str,
         cache_path: Path,
         journal: AuditJournal,
+        quarantined_pids: Optional[set] = None,
     ) -> B3AuditRepairResult:
         cfg = self._config
         source_map = dict(source.source)
@@ -3803,6 +3832,22 @@ class B3AuditRepair:
                 released_as_audited=cache_repair_complete,
                 repair_complete=cache_repair_complete,
                 from_cache=True,
+            )
+            # Glossary resolver unified post-processing on cache hit (0 calls when valid sidecar)
+            _translations_for_glossary = repaired if repaired is not None else dict(translation_map)
+            self._handle_glossary_resolver(
+                chapter_id=chapter_id,
+                source=source,
+                snapshot_hash=snapshot_hash,
+                config_identity=config_identity,
+                backend_identity_hash=backend_identity_hash,
+                translations_repaired=_translations_for_glossary,
+                out_dir=out_dir,
+                journal=journal,
+                is_cache_hit=True,
+                entity_context_payload=entity_payload,
+                quarantined_pids=quarantined_pids,
+                glossary=glossary,
             )
             return B3AuditRepairResult(
                 step6=step6,
@@ -4481,6 +4526,21 @@ class B3AuditRepair:
             else {}
         )
         translations_repaired = {**translation_map, **committed}
+        # Glossary resolver unified post-processing (fresh path)
+        self._handle_glossary_resolver(
+            chapter_id=chapter_id,
+            source=source,
+            snapshot_hash=snapshot_hash,
+            config_identity=config_identity,
+            backend_identity_hash=backend_identity_hash,
+            translations_repaired=translations_repaired,
+            out_dir=out_dir,
+            journal=journal,
+            is_cache_hit=False,
+            entity_context_payload=entity_payload,
+            quarantined_pids=quarantined_pids,
+            glossary=glossary,
+        )
         repair_complete = (
             repair_outcome.repair_complete if repair_outcome is not None else False
         )
@@ -4599,6 +4659,251 @@ class B3AuditRepair:
             journal_path=journal.path,
             r_editor=r_editor_report,
         )
+
+    def _handle_glossary_resolver(
+        self,
+        *,
+        chapter_id: str,
+        source: Any,
+        snapshot_hash: str,
+        config_identity: str,
+        backend_identity_hash: str,
+        translations_repaired: Any,
+        out_dir: Any,
+        journal: Any,
+        is_cache_hit: bool = False,
+        entity_context_payload: Any = None,
+        quarantined_pids: Any = None,
+        glossary: Any = (),
+    ) -> None:
+        cfg = self._config
+        mode = getattr(cfg, "glossary_resolver_mode", "off")
+        policy = getattr(cfg, "glossary_resolver_cache_miss_policy", "recompute")
+        if mode == "off":
+            LOG.info("glossary_resolver: mode off for %s", chapter_id)
+            journal.emit("glossary_resolver", mode="off", status="skipped", reason="mode_off")
+            self._emit_progress("glossary_resolver", mode="off", status="skipped")
+            return
+        # Load entity records
+        entity_records = []
+        source_map = dict(source.source) if hasattr(source, "source") else {}
+        if entity_context_payload and isinstance(entity_context_payload, dict):
+            try:
+                from pact_v4.audit.entity_extractor import ChapterEntityContext, is_entity_glossary_candidate
+                ctx = ChapterEntityContext.from_payload(entity_context_payload)
+                for rec in ctx.entities:
+                    if rec.anchor.status != "verified":
+                        continue
+                    if is_entity_glossary_candidate(rec, source_map):
+                        entity_records.append(rec)
+            except Exception as exc:
+                LOG.warning("glossary_resolver: entity payload parse failed %s: %s", chapter_id, exc)
+                entity_records = []
+        else:
+            try:
+                from pact_v4.audit.entity_extractor import ChapterEntityContext, EntityContextCache, is_entity_glossary_candidate, entity_context_cache_key
+                import json as _js
+                cache_path = out_dir / "entity_context_cache.json"
+                if cache_path.exists():
+                    payload = _js.loads(cache_path.read_text(encoding="utf-8"))
+                    cache = EntityContextCache.from_payload(payload)
+                    key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=cfg.extractor_version)
+                    ctx = cache.get(key)
+                    if ctx and ctx.chapter_id == chapter_id and ctx.source_hash == source.source_hash:
+                        for rec in ctx.entities:
+                            if rec.anchor.status == "verified" and is_entity_glossary_candidate(rec, source_map):
+                                entity_records.append(rec)
+            except Exception as exc:
+                LOG.warning("glossary_resolver: fallback cache load failed %s: %s", chapter_id, exc)
+        if not entity_records:
+            LOG.info("glossary_resolver: no candidates for %s", chapter_id)
+            journal.emit("glossary_resolver", mode=mode, status="skipped", reason="no_candidates", entity_count=0)
+            self._emit_progress("glossary_resolver", mode=mode, status="skipped", reason="no_candidates")
+            return
+        allowed = compute_allowed_evidence_pids(source_map, entity_records)
+        quarantined_set = set(quarantined_pids or ())
+        if quarantined_set:
+            for ent in list(allowed.keys()):
+                allowed[ent] = allowed[ent] - quarantined_set
+        cand_hash = glossary_candidate_input_hash(entity_records)
+        trans_hash = glossary_translation_hash(translations_repaired)
+        try:
+            from pact_v4.pipeline.glossary_resolver import _model_ref_for_resolver as _mrfr
+            model_ref = _mrfr(self._audit_backend) or "unknown"
+        except Exception:
+            model_ref = "unknown"
+        backend_identity = backend_identity_hash or "unknown"
+        payload_existing, err = load_and_validate_sidecar(
+            out_dir,
+            expected_chapter_id=chapter_id,
+            expected_snapshot_hash=snapshot_hash,
+            expected_config_identity=config_identity,
+            expected_candidate_input_hash=cand_hash,
+            expected_translation_hash=trans_hash,
+            expected_model_ref=model_ref if model_ref != "unknown" else None,
+            expected_backend_identity=backend_identity if backend_identity != "unknown" else None,
+            allowed_pids=allowed,
+            translation_map=translations_repaired,
+            quarantined_pids=quarantined_set,
+        )
+        if payload_existing is not None:
+            LOG.info("glossary_resolver: valid sidecar for %s, 0 calls", chapter_id)
+            journal.emit("glossary_resolver", mode=mode, status="cache_hit_valid", entity_count=len(entity_records), candidate_hash=cand_hash[:12])
+            self._emit_progress("glossary_resolver", mode=mode, status="cache_hit_valid", entity_count=len(entity_records))
+            return
+        if is_cache_hit and policy == "fail_closed":
+            LOG.warning("glossary_resolver: cache hit stale %s for %s, fail_closed", err, chapter_id)
+            journal.emit("glossary_resolver", mode=mode, status="cache_hit_stale_fail_closed", error=err, policy=policy)
+            self._emit_progress("glossary_resolver", mode=mode, status="cache_hit_stale_fail_closed", error=err)
+            return
+        if is_cache_hit:
+            LOG.info("glossary_resolver: cache hit stale for %s, recompute", chapter_id)
+        else:
+            LOG.info("glossary_resolver: no valid sidecar for %s (%s), running", chapter_id, err)
+        from pact_v4.pipeline.glossary_resolver import _model_ref_for_resolver
+        if not _model_ref_for_resolver(self._audit_backend):
+            LOG.warning("glossary_resolver: no reviewer binding for %s", chapter_id)
+            journal.emit("glossary_resolver", mode=mode, status="fail_closed", reason="no_reviewer_binding")
+            self._emit_progress("glossary_resolver", mode=mode, status="fail_closed", reason="no_reviewer_binding")
+            return
+        existing_keys = {}
+        try:
+            if isinstance(glossary, dict):
+                for k in glossary.keys():
+                    existing_keys[str(k).casefold()] = str(k)
+            elif isinstance(glossary, (list, tuple)):
+                for entry in glossary:
+                    if isinstance(entry, dict) and "source" in entry:
+                        existing_keys[str(entry["source"]).casefold()] = str(entry["source"])
+                    elif isinstance(entry, str):
+                        existing_keys[entry.casefold()] = entry
+        except Exception:
+            pass
+        resolver = GlossaryResolver(self._audit_backend, progress=self._progress)
+        result = resolver.resolve(
+            chapter_id=chapter_id,
+            entity_records=entity_records,
+            source_map=source_map,
+            translations=translations_repaired,
+            allowed_pids=allowed,
+            out_dir=out_dir,
+        )
+        if result is None:
+            LOG.warning("glossary_resolver: resolver failed for %s", chapter_id)
+            journal.emit("glossary_resolver", mode=mode, status="failed", entity_count=len(entity_records))
+            self._emit_progress("glossary_resolver", mode=mode, status="failed", entity_count=len(entity_records))
+            return
+        raw_proposals = result.get("raw_proposals", [])
+        canonical_proposals = []
+        global_ru_map = {}
+        seen_entities = set()
+        for prop in raw_proposals:
+            entity = str(prop.get("entity") or "")
+            if not entity or entity in seen_entities:
+                continue
+            seen_entities.add(entity)
+            rec_match = next((r for r in entity_records if str(r.entity) == entity), None)
+            if rec_match is None:
+                continue
+            proposed_ru = str(prop.get("proposed_ru") or "")
+            surface_forms = prop.get("surface_forms") or []
+            evidence_pid = str(prop.get("evidence_pid") or "")
+            ptype = str(prop.get("type") or "person")
+            confidence = prop.get("confidence", 0.9)
+            decision = str(prop.get("decision") or "accept")
+            if decision != "accept":
+                continue
+            # Deterministic canonical English key selection per spec:
+            # 1) existing glossary key among entity/aliases (casefold match),
+            # 2) validated B1.2 canonical surface / min-PID (EntityRecord.entity is B1.2 canonical),
+            # 3) EntityRecord.entity fallback. Ordered priority, no set iteration.
+            ordered_surfaces: List[str] = [entity]
+            # Aliases sorted by pid then surface for determinism (min-PID canonical)
+            for alias in sorted(rec_match.aliases, key=lambda x: (str(getattr(x, "pid", "")), str(getattr(x, "surface", "")).casefold())):
+                surf = str(getattr(alias, "surface", "") or "")
+                if surf and surf not in ordered_surfaces:
+                    ordered_surfaces.append(surf)
+            canonical = None
+            for surf in ordered_surfaces:
+                cf = surf.casefold()
+                if cf in existing_keys:
+                    canonical = existing_keys[cf]
+                    break
+            if canonical is None:
+                # B1.2 canonical is EntityRecord.entity (validated min-PID surface)
+                canonical = entity
+            ru_cf = proposed_ru.casefold()
+            if ru_cf in global_ru_map and global_ru_map[ru_cf] != canonical:
+                LOG.warning("glossary_resolver: duplicate ru %r between %r and %r", proposed_ru, global_ru_map[ru_cf], canonical)
+                journal.emit("glossary_resolver", mode=mode, status="conflict_duplicate_ru", entity=entity, proposed_ru=proposed_ru)
+                continue
+            allowed_for = allowed.get(entity, set())
+            if evidence_pid not in allowed_for:
+                LOG.warning("glossary_resolver: evidence not allowed %r for %r", evidence_pid, entity)
+                continue
+            if quarantined_set and evidence_pid in quarantined_set:
+                continue
+            ev_text = translations_repaired.get(evidence_pid, "")
+            if not all(sf in ev_text for sf in surface_forms):
+                continue
+            from pact_v4.pipeline.glossary_resolver import lemma_v1_match, is_cyrillic, RU_STOP_WORDS, _GLOSSARY_BLOCKLIST
+            if not lemma_v1_match(surface_forms, proposed_ru):
+                continue
+            if not is_cyrillic(proposed_ru):
+                continue
+            if proposed_ru.casefold() in RU_STOP_WORDS or proposed_ru.casefold() in _GLOSSARY_BLOCKLIST:
+                continue
+            canonical_proposals.append({
+                "entity": canonical,
+                "proposed_ru": proposed_ru,
+                "surface_forms": surface_forms,
+                "evidence_pid": evidence_pid,
+                "type": ptype if ptype in ("person","place","group","nickname") else "person",
+                "confidence": float(confidence) if isinstance(confidence, (int,float)) else 0.9,
+                "decision": "accept",
+            })
+            global_ru_map[ru_cf] = canonical
+        canonical_proposals.sort(key=lambda x: x["entity"])
+        payload = build_sidecar_payload(
+            chapter_id=chapter_id,
+            snapshot_hash=snapshot_hash,
+            config_identity=config_identity,
+            candidate_input_hash=cand_hash,
+            translation_hash_val=trans_hash,
+            model_ref=model_ref or "unknown",
+            backend_identity=backend_identity,
+            proposals=canonical_proposals,
+        )
+        err = validate_sidecar_payload(
+            payload,
+            expected_chapter_id=chapter_id,
+            expected_snapshot_hash=snapshot_hash,
+            expected_config_identity=config_identity,
+            expected_candidate_input_hash=cand_hash,
+            expected_translation_hash=trans_hash,
+            allowed_pids=allowed,
+            translation_map=translations_repaired,
+            quarantined_pids=quarantined_set,
+        )
+        if err:
+            LOG.warning("glossary_resolver: sidecar validation failed for %s: %s", chapter_id, err)
+            journal.emit("glossary_resolver", mode=mode, status="validation_failed", error=err)
+            self._emit_progress("glossary_resolver", mode=mode, status="validation_failed", error=err)
+            return
+        try:
+            target = glossary_sidecar_path(out_dir)
+            if target.exists() and target.is_symlink():
+                LOG.warning("glossary_resolver: sidecar symlink for %s", chapter_id)
+                journal.emit("glossary_resolver", mode=mode, status="fail_symlink")
+                return
+            atomic_write_sidecar(out_dir, payload)
+            LOG.info("glossary_resolver: sidecar written for %s with %d", chapter_id, len(canonical_proposals))
+            journal.emit("glossary_resolver", mode=mode, status="written", proposal_count=len(canonical_proposals), candidate_hash=cand_hash[:12])
+            self._emit_progress("glossary_resolver", mode=mode, status="written", proposal_count=len(canonical_proposals))
+        except Exception as exc:
+            LOG.warning("glossary_resolver: write failed for %s: %s", chapter_id, exc)
+            journal.emit("glossary_resolver", mode=mode, status="write_failed", error=str(exc))
+            self._emit_progress("glossary_resolver", mode=mode, status="write_failed", error=str(exc))
 
     def _emit_progress(self, event: str, **fields: Any) -> None:
         progress = self._progress

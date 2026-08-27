@@ -66,11 +66,11 @@ LOG = logging.getLogger(__name__)
 
 # Identity of the validated artifact and of the extractor model call.
 ENTITY_CONTEXT_SCHEMA = "pact-v4-chapter-entity-context/v1"
-EXTRACTOR_VERSION = "pact-v4-entity-extractor/v1"
+EXTRACTOR_VERSION = "pact-v4-entity-extractor/v2"
 # Identity of the validation report written alongside the artifact so a
 # drop/downgrade is visible, never silent.
 VALIDATION_REPORT_SCHEMA = "pact-v4-entity-extractor-validation/v1"
-CACHE_SCHEMA = "pact-v4-entity-context-cache/v1"
+CACHE_SCHEMA = "pact-v4-entity-context-cache/v2"
 
 CLAIM_KINDS = ("gender", "alias_relation", "object_identity")
 STATUS_VERIFIED = "verified"
@@ -88,6 +88,91 @@ _FEMALE_PRONOUNS = re.compile(r"\b(she|her|hers|herself)\b", re.IGNORECASE)
 # English); such a span must be rejected (point 4 of §8.3).
 _CYRILLIC = re.compile(r"[\u0400-\u04FF]")
 
+# EN_STOP for glossary_worthy code gate (English stop words, not RU_STOP)
+EN_STOP_WORDS: frozenset[str] = frozenset("""
+a about above after again against all am an and any are aren't as at be
+because been before being below between both but by can can't cannot could
+couldn't did didn't do does doesn't doing don't down during each few for
+from further had hadn't has hasn't have haven't having he he'd he'll he's
+her here here's hers herself him himself his how how's i i'd i'll i'm i've
+if in into is isn't it it's its itself let's me more most mustn't my myself
+no nor not of off on once only or other ought our ours ourselves out over
+own same shan't she she'd she'll she's should shouldn't so some such than
+that that's the their theirs them themselves then there there's these they
+they'd they'll they're they've this those through to too under until up very
+was wasn't we we'd we'll we're we've were weren't what what's when when's
+where where's which while who who's whom why why's with won't would wouldn't
+you you'd you'll you're you've your yours yourself yourselves
+""".split())
+
+_SOURCE_BOUNDARY = r"A-Za-z0-9_"
+
+def _escaped_term(term: str) -> str:
+    """Word-boundary-safe, apostrophe-tolerant escaped regex for term."""
+    escaped = re.escape(term)
+    escaped = escaped.replace(r"\ ", r"\s+")
+    escaped = escaped.replace("\\ ", "\\s+")
+    # Apostrophe-tolerant: straight ' and curly ’ match either
+    escaped = escaped.replace("'", "['\u2019]").replace("\u2019", "['\u2019]")
+    escaped = escaped.replace("['\\u2019]", f"['{chr(8217)}]")
+    escaped = escaped.replace("['\u2019]", f"['{chr(39)}{chr(8217)}]")
+    return escaped
+
+def _term_in_source_word_boundary(text: str, term: str) -> bool:
+    """Case-insensitive word-boundary presence of term in text."""
+    if not term:
+        return False
+    escaped = _escaped_term(term)
+    return bool(re.search(rf"(?<![{_SOURCE_BOUNDARY}]){escaped}(?![{_SOURCE_BOUNDARY}])", text or "", flags=re.I))
+
+def _is_title_case_name(name: str) -> bool:
+    """Glossary-worthiness code gate: title-case (multi-word allows small words like of/the)."""
+    words = [w for w in name.split() if w]
+    if not words:
+        return False
+    # Single-word: must be Title
+    if len(words) == 1:
+        return words[0][0].isupper()
+    # Multi-word (e.g. Knights of the Basement): require first and last words title-case,
+    # allow interior small words (of/the/and etc) to be lower. This keeps Shotgun and Leonard Harlan
+    # passing while not promoting generic phrases.
+    small = {"of", "the", "and", "in", "on", "at", "for", "with", "a", "an", "to", "by", "from"}
+    # Check first and last are title-case, and any non-small interior word is title-case
+    if not words[0][0].isupper() or not words[-1][0].isupper():
+        return False
+    for w in words[1:-1]:
+        if w.lower() in small:
+            continue
+        if not w[0].isupper():
+            return False
+    return True
+
+def _is_glossary_code_gate_pass(record: "EntityRecord", source_map: Mapping[str, str]) -> bool:
+    """Code gate for glossary candidacy: title-case, not EN_STOP, word-boundary in source."""
+    name = str(record.entity or "")
+    if not _is_title_case_name(name):
+        return False
+    if name.casefold() in EN_STOP_WORDS:
+        return False
+    # entity surface must appear word-boundary in source (any pid)
+    joined_source = " ".join(source_map.values())
+    if not _term_in_source_word_boundary(joined_source, name):
+        # Also try each pid separately (handles multi-pid boundaries)
+        found = any(_term_in_source_word_boundary(text, name) for text in source_map.values())
+        if not found:
+            return False
+    # alias surfaces word-boundary in their own pid already checked by validation,
+    # but also need word-boundary presence; validation already ensures lower containment,
+    # so we consider it passed if validation passed.
+    return True
+
+def is_entity_glossary_candidate(record: "EntityRecord", source_map: Mapping[str, str]) -> bool:
+    """Combined gate: model glossary_worthy true AND code gate pass."""
+    if not getattr(record, "glossary_worthy", False):
+        return False
+    return _is_glossary_code_gate_pass(record, source_map)
+
+
 
 # ---------------------------------------------------------------------------
 # Model output schema (per-claim, §8.3)
@@ -96,7 +181,7 @@ _CYRILLIC = re.compile(r"[\u0400-\u04FF]")
 
 ENTITY_EXTRACTION_V1 = ReviewerPrompt(
     role="entity_extractor",
-    version="pact-v4-entity-extractor-prompt/v1",
+    version="pact-v4-entity-extractor-prompt/v2",
     instructions=(
         "You are a source-only entity extractor for an English fiction "
         "chapter. You are given the FULL SOURCE of one chapter as an ordered "
@@ -137,6 +222,10 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "quoted spans that support the claim\n"
         "      evidence_windows: array of inclusive PID ranges [[a,b], ...] "
         "that contain the supporting context\n"
+        "    glossary_worthy: bool — true if this entity is a proper-name "
+        "person/place/group/nickname that deserves a glossary entry "
+        "(title-case, not a common noun or stop word, appears word-boundary "
+        "in source); false veto even when code checks pass\n"
         "Rules:\n"
         "1. SOURCE ONLY: every span must be a verbatim quote from the "
         "source PID it is attached to. Never quote or invent text that is "
@@ -158,7 +247,11 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "in the VALID PIDS section below. Every pid you reference (anchor, "
         "alias, evidence, evidence_windows) must come from that list — a "
         "PID that is not in the list does not exist and the claim will be "
-        "discarded."
+        "discarded.\n"
+        "8. glossary_worthy: set true only for proper-name entities that "
+        "deserve a glossary entry (person/place/group/nickname, title-case, "
+        "not a stop word, surface appears word-boundary in source); false "
+        "otherwise. This is a model gate — false veto even if code checks pass."
     ),
 )
 
@@ -244,6 +337,7 @@ class EntityRecord:
     anchor: AnchorRef
     aliases: Tuple[AliasRef, ...] = ()
     claims: Tuple[EntityClaim, ...] = ()
+    glossary_worthy: bool = False
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -252,6 +346,7 @@ class EntityRecord:
             "anchor": self.anchor.to_payload(),
             "aliases": [a.to_payload() for a in self.aliases],
             "claims": [c.to_payload() for c in self.claims],
+            "glossary_worthy": bool(self.glossary_worthy),
         }
 
 
@@ -519,6 +614,15 @@ def _entity_from_payload(item: Any) -> EntityRecord:
         )
         for c in item.get("claims", [])
     )
+    gw = item.get("glossary_worthy")
+    if gw is None:
+        # Old payloads without glossary_worthy: treat as False (veto) but allow migration;
+        # new version requires explicit bool, so we default to False and let code gate handle.
+        glossary_worthy = False
+    elif isinstance(gw, bool):
+        glossary_worthy = gw
+    else:
+        raise ValueError(f"glossary_worthy must be bool, got {gw!r}")
     return EntityRecord(
         entity=str(item["entity"]),
         canonical_type=str(item["canonical_type"]),
@@ -528,6 +632,7 @@ def _entity_from_payload(item: Any) -> EntityRecord:
         ),
         aliases=aliases,
         claims=claims,
+        glossary_worthy=glossary_worthy,
     )
 
 
@@ -1259,4 +1364,6 @@ __all__ = [
     "validate_entity_context",
     "cached_context_source_valid",
     "with_entity_context_metadata",
+    "EN_STOP_WORDS",
+    "is_entity_glossary_candidate",
 ]

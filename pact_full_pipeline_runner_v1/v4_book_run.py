@@ -248,6 +248,23 @@ def _quarantined_chunks_from_record(out_dir: Path) -> set:
     return quarantined
 
 
+def _quarantined_pids_for_book_run(out_dir: Path, quarantined_chunks: set) -> set:
+    """Map quarantined chunk IDs → PID set via pid_to_chunk (evidence PID exclusion).
+
+    Evidence PIDs are quarantined when their owning chunk is quarantined.
+    Uses _pid_to_chunk (chunk_plan.json) for authoritative mapping; if the
+    plan is missing/ambiguous (None), returns empty set (fail-closed at
+    call site: no authoritative exclusion, but promotion still validated
+    via allowed_evidence_pids and in-memory B3 filtering).
+    """
+    if not quarantined_chunks:
+        return set()
+    pid_to_chunk = _pid_to_chunk(out_dir)
+    if pid_to_chunk is None:
+        return set()
+    return {pid for pid, chunk in pid_to_chunk.items() if chunk in quarantined_chunks}
+
+
 # ---------------------------------------------------------------------------
 # B9-I2: glossary-candidate generation / alignment / ledger / auto-promotion
 # ---------------------------------------------------------------------------
@@ -1207,6 +1224,8 @@ def run_book(
     formatting_cfg: Optional[Mapping[str, Any]] = None,
     formatting_client: Optional[Any] = None,
     max_formatting_incidents: int = _DEFAULT_MAX_FORMATTING_INCIDENTS,
+    glossary_resolver_mode: str = "off",
+    glossary_resolver_cache_miss_policy: str = "recompute",
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
@@ -1274,6 +1293,7 @@ def run_book(
             error_msg = result.get("error")
 
         quarantined = _quarantined_chunks_from_record(out_dir)
+        quarantined_pids = _quarantined_pids_for_book_run(out_dir, quarantined)
 
         # v41 italics: formatting restoration (per-chapter B7/B9). After
         # finalization (post-repair/edit) the plain Russian translation is
@@ -1534,6 +1554,169 @@ def run_book(
             "conflicts": 0,
         }
         proposed_sources: set = set()
+        # Glossary resolver mode handling (identity-bearing)
+        _mode = glossary_resolver_mode
+        for _i, _v in enumerate(extra_args):
+            if _v == "--glossary-resolver-mode" and _i + 1 < len(extra_args):
+                _mode = str(extra_args[_i+1])
+            elif isinstance(_v, str) and _v.startswith("--glossary-resolver-mode="):
+                _mode = _v.split("=",1)[1]
+        _policy = glossary_resolver_cache_miss_policy
+        for _i, _v in enumerate(extra_args):
+            if _v == "--glossary-resolver-cache-miss-policy" and _i + 1 < len(extra_args):
+                _policy = str(extra_args[_i+1])
+            elif isinstance(_v, str) and _v.startswith("--glossary-resolver-cache-miss-policy="):
+                _policy = _v.split("=",1)[1]
+        glossary_sidecar_handled = False
+        if _mode == "off":
+            LOG.info("glossary_resolver: mode off for %s, new glossary observations forbidden (fail-closed, no legacy deterministic promotion)", chapter_id)
+            # Spec glossary-model-resolver: off forbids ANY new glossary observations, even legacy deterministic.
+            # Fail-closed: block sidecar handling AND deterministic fallback.
+            glossary_sidecar_handled = True
+            candidates_block = {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0}
+        elif _mode in ("shadow", "promote") and terminal_status in _PROMOTING_STATUSES:
+            # Handle sidecar for shadow/promote
+            from pact_v4.pipeline.glossary_resolver import (
+                load_and_validate_sidecar as _lavs,
+                sidecar_path as glossary_sidecar_path,
+                semantic_translation_hash as _sth,
+                candidate_input_hash as _cih,
+                translation_hash as _th,
+            )
+            import json as _json
+            import re as _re
+            try:
+                _translations = _load_json(out_dir / "translations.json", {})
+                _translations_repaired = _load_json(out_dir / "translations_repaired.json", {})
+                if not _translations_repaired or not isinstance(_translations_repaired, dict):
+                    _translations_repaired = _translations
+                _tag_re = _re.compile(r"<[^>]+>")
+                def _strip_tags(m):
+                    res = {}
+                    for k, v in m.items():
+                        nv = _tag_re.sub("", v or "")
+                        nv = " ".join(nv.split())
+                        res[k] = nv
+                    return res
+                _snapshot_hash = str((run_record.get("identities") or {}).get("snapshot_hash") or "")
+                _config_identity = str((run_record.get("identities") or {}).get("config_identity") or "")
+                _allowed = None
+                _filtered_recs = []
+                try:
+                    from pact_v4.audit.entity_extractor import ChapterEntityContext, EntityContextCache, entity_context_cache_key, is_entity_glossary_candidate
+                    _ec_path = out_dir / "entity_context_cache.json"
+                    if _ec_path.exists():
+                        _ec_payload = _json.loads(_ec_path.read_text(encoding="utf-8"))
+                        _ec_cache = EntityContextCache.from_payload(_ec_payload)
+                        _src_map = _source_by_pid(chapter_html)
+                        _key = entity_context_cache_key(source_hash=str((run_record.get("identities") or {}).get("source_hash") or ""), extractor_version=str(((run_record.get("operational_policy") or {}).get("audit") or {}).get("extractor_version") or ""))
+                        _ctx = _ec_cache.get(_key)
+                        if _ctx and _ctx.chapter_id == chapter_id:
+                            _filtered_recs = [r for r in _ctx.entities if is_entity_glossary_candidate(r, _src_map)]
+                            from pact_v4.pipeline.glossary_resolver import compute_allowed_evidence_pids
+                            _allowed = compute_allowed_evidence_pids(_src_map, _filtered_recs)
+                except Exception:
+                    _allowed = None
+                _expected_cand_hash = None
+                try:
+                    if _allowed is not None and _filtered_recs:
+                        _expected_cand_hash = _cih(_filtered_recs)
+                except Exception:
+                    _expected_cand_hash = None
+                _trans_for_val = _translations_repaired if _translations_repaired else _translations
+                _expected_model_ref = None
+                _expected_backend_identity = None
+                try:
+                    _be = run_record.get("backend") or {}
+                    _bindings = _be.get("model_bindings") or {}
+                    for _role in ("russian_selector", "fidelity_reviewer", "qwen_audit", "qwen_fidelity", "default"):
+                        if _bindings.get(_role):
+                            _expected_model_ref = str(_bindings[_role])
+                            break
+                    _expected_backend_identity = _be.get("config_identity_hash") or _be.get("identity_hash") or _be.get("backend_identity_hash")
+                    if _expected_backend_identity:
+                        _expected_backend_identity = str(_expected_backend_identity)
+                except Exception:
+                    pass
+                # Compute expected translation hash BEFORE validation (semantic hash of repaired translation, formatting-aware).
+                _expected_translation_hash = None
+                try:
+                    if _translations_repaired and isinstance(_translations_repaired, dict) and _translations_repaired:
+                        _expected_translation_hash = _sth(_strip_tags(_translations_repaired))
+                    elif _translations and isinstance(_translations, dict) and _translations:
+                        _expected_translation_hash = _sth(_strip_tags(_translations))
+                except Exception:
+                    _expected_translation_hash = None
+                _payload, _err = _lavs(
+                    out_dir,
+                    expected_chapter_id=chapter_id,
+                    expected_snapshot_hash=_snapshot_hash if _snapshot_hash else None,
+                    expected_config_identity=_config_identity if _config_identity else None,
+                    expected_candidate_input_hash=_expected_cand_hash,
+                    expected_translation_hash=_expected_translation_hash,
+                    expected_model_ref=_expected_model_ref,
+                    expected_backend_identity=_expected_backend_identity,
+                    allowed_pids=_allowed,
+                    translation_map=_trans_for_val,
+                    quarantined_pids=quarantined_pids,
+                )
+                # stale translation_hash now fails-closed via load_and_validate; no unreachable fallback branch
+                if _err is not None:
+                    if _err == "missing":
+                        LOG.info("glossary no sidecar for %s, fail-closed", chapter_id)
+                    else:
+                        LOG.warning("glossary sidecar validation failed for %s: %s", chapter_id, _err)
+                    candidates_block["generated"] = 0
+                    candidates_block["proposed"] = 0
+                    candidates_block["conflicts"] = 0
+                    glossary_sidecar_handled = True
+                else:
+                    _proposals = _payload.get("proposals", [])
+                    _valid = []
+                    for _prop in _proposals:
+                        _ev = _prop.get("evidence_pid")
+                        if quarantined_pids and _ev in quarantined_pids:
+                            LOG.warning("glossary proposal %r quarantined %r for %s, skip", _prop.get("entity"), _ev, chapter_id)
+                            continue
+                        _ent = _prop.get("entity")
+                        _ru = _prop.get("proposed_ru")
+                        _existing = glossary_before.get(_ent)
+                        _flat = _existing if isinstance(_existing, str) else (_existing.get("target") if isinstance(_existing, dict) else None)
+                        if _flat is not None and _flat != _ru:
+                            LOG.info("glossary conflict %r existing %r vs %r, skip", _ent, _flat, _ru)
+                            continue
+                        if _flat == _ru:
+                            continue
+                        _valid.append(_prop)
+                    if _mode == "shadow":
+                        LOG.info("glossary shadow for %s: %d proposals logged", chapter_id, len(_valid))
+                        candidates_block["generated"] = len(_proposals)
+                        candidates_block["proposed"] = len(_valid)
+                        candidates_block["conflicts"] = len(_proposals) - len(_valid)
+                    elif _mode == "promote":
+                        LOG.info("glossary promote for %s: %d proposals", chapter_id, len(_valid))
+                        for _prop in _valid:
+                            _ent = _prop.get("entity")
+                            _ru = _prop.get("proposed_ru")
+                            _ptype = _prop.get("type") or "proper_name"
+                            _chunk_id = ""
+                            try:
+                                _pm = _pid_to_chunk(out_dir)
+                                if _pm and _prop.get("evidence_pid") in _pm:
+                                    _chunk_id = _pm[_prop.get("evidence_pid")]
+                            except Exception:
+                                _chunk_id = ""
+                            manager.add_observation("glossary", _ent, {"target": _ru, "type": _ptype, "chunk_id": _chunk_id})
+                            proposed_sources.add(_ent)
+                        candidates_block["generated"] = len(_proposals)
+                        candidates_block["proposed"] = len(_valid)
+                        candidates_block["conflicts"] = len(_proposals) - len(_valid)
+                    glossary_sidecar_handled = True
+            except Exception as exc:
+                LOG.warning("glossary sidecar handling failed for %s: %s", chapter_id, exc)
+                glossary_sidecar_handled = True
+        else:
+            glossary_sidecar_handled = False
 
         # SAFE-MEMORY (P0 owner decision 2026-08-14, B7 → entity_extractor):
         # the deterministic book_memory_candidates script (B7) is OFF —
@@ -1636,7 +1819,7 @@ def run_book(
         canonical_ru_map: Dict[str, str] = {}
         glossary_proposed: List[Dict[str, Any]] = []
         glossary_conflicts: List[Dict[str, Any]] = []
-        if terminal_status in _PROMOTING_STATUSES:
+        if not glossary_sidecar_handled and terminal_status in _PROMOTING_STATUSES:
             entity_payload = _load_json(out_dir / "entity_context_cache.json", None)
             if isinstance(entity_payload, dict) and entity_payload.get("entries"):
                 from pact_v4.audit.entity_extractor import (
@@ -1722,6 +1905,7 @@ def run_book(
                                     book_memory=book_memory_before,
                                     consensus_ratio=consensus_ratio,
                                     pid_to_chunk=pid_to_chunk,
+                                    _allow_proper_name_align=True,
                                 )
                                 glossary_obs.update(g["glossary"])
                                 canonical_ru_map.update(g["canonical_ru"])
@@ -2066,6 +2250,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-formatting-incidents", type=int, default=_DEFAULT_MAX_FORMATTING_INCIDENTS, help="v41 italics: max formatting incidents before blocking (lenient debt default 999)")
     parser.add_argument("--formatting-enabled", action="store_true", default=True, help="Enable v41 italics formatting (default: enabled)")
     parser.add_argument("--no-formatting", dest="formatting_enabled", action="store_false", help="Disable v41 italics formatting")
+    parser.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="off", help="Glossary resolver mode (identity-bearing, default off): off/shadow/promote")
+    parser.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute", help="Glossary resolver cache-miss policy (identity-bearing, default recompute)")
     return parser
 
 
@@ -2104,6 +2290,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         formatting_cfg=_fmt_cfg,
         formatting_client=None,
         max_formatting_incidents=int(args.max_formatting_incidents),
+        glossary_resolver_mode=args.glossary_resolver_mode,
+        glossary_resolver_cache_miss_policy=args.glossary_resolver_cache_miss_policy,
     )
     failed = 0
     for rec in result["chapters"]:

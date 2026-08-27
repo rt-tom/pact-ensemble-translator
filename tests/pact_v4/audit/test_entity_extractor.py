@@ -436,7 +436,7 @@ def test_cache_identity_ignores_prompt_version_change():
     )
     # The prompt version field exists and is /v1 — but it must NOT affect
     # the cache key. Changing it (hypothetically) would not change the key.
-    assert ENTITY_EXTRACTION_V1.version.endswith("/v1")
+    assert ENTITY_EXTRACTION_V1.version.endswith("/v2")
     # Cache identity is deterministic and depends only on source_hash + version.
     key2 = entity_context_cache_key(
         source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
@@ -997,7 +997,7 @@ def test_cache_from_payload_rejects_tampered_entry():
         source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
     )
     payload = {
-        "schema": "pact-v4-entity-context-cache/v1",
+        "schema": "pact-v4-entity-context-cache/v2",
         "entries": [{"key": key, "context": context.to_payload()}],
     }
     # Tamper: swap the stored context for a foreign one under the SAME key.
@@ -1080,7 +1080,7 @@ def test_cache_payload_round_trip_does_not_bypass_tamper_check():
         source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
     )
     cache_payload = {
-        "schema": "pact-v4-entity-context-cache/v1",
+        "schema": "pact-v4-entity-context-cache/v2",
         "entries": [{"key": key, "context": tampered_ctx.to_payload()}],
     }
     # Key identity is computed from the context's own (intact) metadata, so
@@ -1129,7 +1129,7 @@ def test_cache_from_payload_rejects_malformed_entry():
     """A structurally malformed cache entry (not an object {key, context})
     is rejected loudly — never silently accepted."""
     payload = {
-        "schema": "pact-v4-entity-context-cache/v1",
+        "schema": "pact-v4-entity-context-cache/v2",
         "entries": [["not", "an", "object"]],
     }
     with pytest.raises(ValueError, match="cache payload entry"):

@@ -567,6 +567,8 @@ def _pick_display_form(stem: str, forms: Dict[str, int]) -> str:
 
 
 def align_candidates(
+    # Deprecated for proper_name in production (glossary-model-resolver, task 4.1): proper_name now via glossary resolver sidecar;
+    # this function remains as library/diagnostic API for term telemetry (kind=term) and offline use.
     candidates: Sequence[Mapping[str, Any]],
     source_by_pid: Mapping[str, str],
     translations: Mapping[str, str],
