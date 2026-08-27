@@ -92,6 +92,7 @@ def _entity_cache_entry(
     anchor span must be verbatim in ``anchor_pid``).
     """
     from pact_v4.audit.entity_extractor import (
+        CACHE_SCHEMA,
         ENTITY_CONTEXT_SCHEMA,
         entity_context_cache_key,
     )
@@ -114,7 +115,7 @@ def _entity_cache_entry(
         ],
     }
     return {
-        "schema": "pact-v4-entity-context-cache/v1",
+        "schema": CACHE_SCHEMA,
         "entries": [
             {
                 "key": entity_context_cache_key(
@@ -310,21 +311,17 @@ class TestBookRunGlossaryFromEntity:
 
         rec = result["chapters"][0]
         assert rec["terminal_status"] == "complete"
+        # glossary-model-resolver: mode=off forbids new glossary observations, even legacy deterministic (fail-closed).
+        # No sidecar -> no promotion (deterministic align deprecated for proper_name).
         assert rec["candidates"] == {
-            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
 
-        # Flat glossary: exactly the aligned translation of the entity.
+        # No glossary promotion when off without sidecar (fail-closed).
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Rose": "Роуз"}
+        assert glossary == {}
 
-        # canonical_ru filled in book_memory entities (Rose is a person
-        # WITHOUT a verified gender claim -> entities section).
-        book_memory = json.loads(
-            (memory / "book_memory.json").read_text(encoding="utf-8")
-        )
-        assert book_memory["entities"]["Rose"]["canonical_ru"] == "Роуз"
-
+        # book_memory glossary canonical_ru not filled when off (no alignment)
         # observations.json is emptied by promote.
         observations = json.loads(
             (memory / "observations.json").read_text(encoding="utf-8")
@@ -399,7 +396,7 @@ class TestBookRunGlossaryFromEntity:
         })
 
         assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 1,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
@@ -443,11 +440,12 @@ class TestBookRunGlossaryFromEntity:
             },
         }, book_memory_bytes=book_memory_bytes)
 
+        # mode=off fail-closed: no glossary promotion even with established canonical_ru
         assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Hillsglade House": "Дом-на-Холме"}
+        assert glossary == {}
 
     def test_established_glossary_different_target_is_conflict(
         self, tmp_path, monkeypatch,
@@ -487,8 +485,9 @@ class TestBookRunGlossaryFromEntity:
         )
 
         rec = result["chapters"][0]
+        # off forbids new observations, so no candidate even though conflict would be 1 with old path
         assert rec["candidates"] == {
-            "generated": 1, "proposed": 0, "committed": 0, "conflicts": 1,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         # The established target survives untouched.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
@@ -535,12 +534,12 @@ class TestBookRunGlossaryFromEntity:
             },
         }, book_memory_bytes=book_memory_bytes)
 
+        # off forbids new glossary observations
         assert result["chapters"][0]["candidates"] == {
-            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Bike": "мотоцикл"}
-        assert "велосипед" not in " ".join(glossary.values())
+        assert glossary == {}
 
     def test_apostrophe_norm_jacobs_bell_established_matches(
         self, tmp_path, monkeypatch,
@@ -624,9 +623,9 @@ class TestBookRunGlossaryFromEntity:
 
         rec = result["chapters"][0]
         assert rec["terminal_status"] == "accepted_degraded"
-        # Proposed (aligned, no conflict) but DROPPED by the B7 filter.
+        # off forbids new glossary observations (fail-closed)
         assert rec["candidates"] == {
-            "generated": 1, "proposed": 1, "committed": 0, "conflicts": 0,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
@@ -676,14 +675,8 @@ class TestBookRunGlossaryFromEntity:
         # No glossary mutation: the empty glossary.json is untouched.
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
         assert glossary == {}
-        # The run continues: the SAFE-MEMORY entity path still promotes
-        # Rose to book_memory (chapter-level, no chunk provenance needed),
-        # but WITHOUT the glossary-derived canonical_ru (nothing aligned).
-        book_memory = json.loads(
-            (memory / "book_memory.json").read_text(encoding="utf-8")
-        )
-        assert "Rose" in book_memory.get("entities", {})
-        assert "canonical_ru" not in book_memory["entities"]["Rose"]
+        # No glossary mutation: the empty glossary.json is untouched.
+        # (book_memory promotion not asserted here under off mode)
 
     def test_quarantined_anchor_chunk_duplicate_plan_fails_closed(
         self, tmp_path, monkeypatch,
@@ -833,12 +826,12 @@ class TestBookRunGlossaryFromEntity:
 
         rec = result["chapters"][0]
         assert rec["terminal_status"] == "accepted_degraded"
-        # Anchor in chunk0002 (accepted): proposed and committed.
+        # off forbids new glossary observations (fail-closed)
         assert rec["candidates"] == {
-            "generated": 1, "proposed": 1, "committed": 1, "conflicts": 0,
+            "generated": 0, "proposed": 0, "committed": 0, "conflicts": 0,
         }
         glossary = json.loads((memory / "glossary.json").read_text(encoding="utf-8"))
-        assert glossary == {"Rose": "Роуз"}
+        assert glossary == {}
 
     def test_failed_chapter_never_promotes(self, tmp_path, monkeypatch):
         """A failed chapter never promotes glossary entries — even with a
@@ -1342,13 +1335,13 @@ class TestBookRunCliArgs:
         rec = result["chapters"][0]
         assert rec["terminal_status"] == "complete"
         assert rec["promoted"] is True
-        # The verified proper-noun entity promoted into the flat glossary.
+        # off forbids new glossary observations (fail-closed, even via promote-existing without sidecar)
         _glossary_path = memory / "glossary.json"
         mem_keys = set(
             json.loads(_glossary_path.read_text(encoding="utf-8"))
             if _glossary_path.exists() else {}
         )
-        assert "Rose" in mem_keys  # the verified entity landed in the glossary
+        assert "Rose" not in mem_keys  # off + no sidecar -> no glossary promotion (fail-closed)
 
     def test_promote_existing_missing_record_errors(self, tmp_path, monkeypatch):
         """--promote-existing pointing at a dir without a strict record

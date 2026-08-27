@@ -479,6 +479,9 @@ class StrictRunConfig:
     russian_editor_max_edits_per_pid: int = RUSSIAN_EDITOR_MAX_EDITS_PER_PID
     russian_editor_retry_max_retries: int = RUSSIAN_EDITOR_RETRY_MAX_RETRIES
     russian_editor_retry_base_delay_seconds: float = RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS
+    # Glossary resolver mode and cache-miss policy (identity-bearing, default off/recompute)
+    glossary_resolver_mode: str = "off"
+    glossary_resolver_cache_miss_policy: str = "recompute"
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
         return build_config_artifact(
@@ -627,6 +630,10 @@ class StrictRunConfig:
                         "max_retries": self.russian_editor_retry_max_retries,
                         "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
                     },
+                },
+                "glossary_resolver": {
+                    "mode": self.glossary_resolver_mode,
+                    "cache_miss_policy": self.glossary_resolver_cache_miss_policy,
                 },
             },
         )
@@ -4718,6 +4725,31 @@ def _run_whole_chapter_strict_impl(
         except Exception:
             pass
         try:
+            # Quarantined plumbing (rev6): derive from actual in-memory merged
+            # selection state, not a synthetic whole-chapter-only view.
+            # whole_chapter selected => no quarantined PIDs (whole_chapter chunk_id
+            # is not in chunk_plan pid→chunk map); quarantined chunks from a prior
+            # journal (e.g., chunked session) map via live chunk_plan.
+            _merged_selection_view: list[dict] = []
+            _seen_chunk_ids: set[str] = set()
+            for _e in prior_entries:
+                _cid = str(_e.get("chunk_id"))
+                if _cid in _seen_chunk_ids:
+                    continue
+                _seen_chunk_ids.add(_cid)
+                _merged_selection_view.append({"chunk_id": _cid, "status": str(_e.get("outcome") or "")})
+            if WHOLE_CHAPTER_CHUNK_ID not in _seen_chunk_ids:
+                _merged_selection_view.append({"chunk_id": WHOLE_CHAPTER_CHUNK_ID, "status": "selected" if raw_final_text_by_pid else "incomplete_generation"})
+            _quarantined_chunk_ids: set[str] = {
+                str(r.get("chunk_id"))
+                for r in _merged_selection_view
+                if r.get("status") == "quarantined" and str(r.get("chunk_id")) != WHOLE_CHAPTER_CHUNK_ID
+            }
+            _pid_to_chunk: dict[str, str] = {}
+            for _ch in chunk_plan.chunks:  # type: ignore[attr-defined]
+                for _pid in getattr(_ch, "pids", ()):
+                    _pid_to_chunk[str(_pid)] = str(_ch.chunk_id)
+            _quarantined_for_b3: set[str] = {pid for pid, cid in _pid_to_chunk.items() if cid in _quarantined_chunk_ids}
             b3_audit_result = b3_audit_repair.run(
                 chapter_id=cfg.chapter_id,
                 source=source,
@@ -4728,6 +4760,7 @@ def _run_whole_chapter_strict_impl(
                 out_dir=cfg.out_dir,
                 config_identity=config.config_identity,
                 backend_identity_hash=cfg.backend.identity_hash,
+                quarantined_pids=_quarantined_for_b3,
             )
         except Exception as exc:  # noqa: BLE001 — a B3 failure is a record, not a crash
             LOG.exception("B3 audit/repair failed for %s", cfg.chapter_id)

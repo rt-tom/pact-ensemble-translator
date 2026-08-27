@@ -992,7 +992,7 @@ def test_b3_entity_validation_report_records_drop_and_downgrade(
 
     # The validated context still carries the surviving entities.
     cache = _read_json(cfg.out_dir / "entity_context_cache.json")
-    assert cache["schema"] == "pact-v4-entity-context-cache/v1"
+    assert cache["schema"] == "pact-v4-entity-context-cache/v2"
 
 
 def test_b3_entity_extractor_failure_fails_closed_before_generation(
@@ -1156,7 +1156,7 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         "repair_microbatch_target": 4,
         "repair_context_window": 3,
         "repair_context_window_by_category": {
-            "invented_gender": 10, "referent": 10, "omission": 10,
+            "invented_gender": 10, "referent": 10, "omission": 10, "voice_continuity": 10, "seam": 10, "dialogue_translationese": 3, "ambiguity_flattening": 3,
         },
         "repair_reaudit_neighbour_window": 2,
         "repair_reaudit_chunk": {
@@ -1172,9 +1172,9 @@ def test_b3_flags_part_of_config_identity(tmp_path: Path) -> None:
         # is identity-bearing (F5) — flipping it invalidates cache/resume.
         "repair_reasoning": 1,
         "repair_reaudit_retry": {"max_retries": 2, "base_delay_seconds": 1.0},
-        "prompt_version": "pact-v4-reviewer-qwen-audit/v4.1",
+        "prompt_version": "pact-v4-reviewer-qwen-audit/v4.3-lenses",
         "harness_version": "4.1",
-        "extractor_version": "pact-v4-entity-extractor/v1",
+        "extractor_version": "pact-v4-entity-extractor/v2",
         # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding): the REPAIR prompt
         # version participates in the identity — a cache written under a
         # different repair prompt must never replay the repaired map.
@@ -1446,8 +1446,8 @@ def test_b3_per_category_windows_wired_from_run_config(
         _whole_chapter_cfg(tmp_path), None, None,
     )
     assert default_bundle._config.repair_context_window_by_category == {
-        "invented_gender": 10, "referent": 10, "omission": 10,
-    }
+            "invented_gender": 10, "referent": 10, "omission": 10, "voice_continuity": 10, "seam": 10, "dialogue_translationese": 3, "ambiguity_flattening": 3,
+        }
 
 
 def test_b3_reaudit_request_carries_configured_budget_and_retry(tmp_path: Path) -> None:
@@ -1561,12 +1561,12 @@ def test_b3_config_payload_carries_per_category_windows() -> None:
         DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY,
     )
     assert DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY == {
-        "invented_gender": 10, "referent": 10, "omission": 10,
-    }
+            "invented_gender": 10, "referent": 10, "omission": 10, "voice_continuity": 10, "seam": 10, "dialogue_translationese": 3, "ambiguity_flattening": 3,
+        }
     payload = B3AuditRepairConfig().to_payload()
     assert payload["repair_context_window_by_category"] == {
-        "invented_gender": 10, "referent": 10, "omission": 10,
-    }
+            "invented_gender": 10, "referent": 10, "omission": 10, "voice_continuity": 10, "seam": 10, "dialogue_translationese": 3, "ambiguity_flattening": 3,
+        }
     custom = B3AuditRepairConfig(
         repair_context_window_by_category={"referent": 25}
     ).to_payload()
@@ -2036,7 +2036,7 @@ def test_b6_malformed_entity_cache_missing_key_is_miss_not_abort(tmp_path: Path)
     # Object with an entry missing the 'context' key — KeyError path.
     (cfg.out_dir / "entity_context_cache.json").write_text(
         json.dumps({
-            "schema": "pact-v4-entity-context-cache/v1",
+            "schema": "pact-v4-entity-context-cache/v2",
             "entries": [{"key": "abc"}],
         }),
         encoding="utf-8",
@@ -2053,7 +2053,7 @@ def test_b6_malformed_entity_cache_type_error_is_miss_not_abort(tmp_path: Path) 
     # 'entries' is a string, not a list — TypeError path in from_payload.
     (cfg.out_dir / "entity_context_cache.json").write_text(
         json.dumps({
-            "schema": "pact-v4-entity-context-cache/v1",
+            "schema": "pact-v4-entity-context-cache/v2",
             "entries": "not-a-list",
         }),
         encoding="utf-8",

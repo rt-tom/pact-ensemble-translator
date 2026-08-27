@@ -283,6 +283,12 @@ def build_argparser() -> argparse.ArgumentParser:
                         "directly). Part of the config identity — use a "
                         "NEW --out-dir when flipping it against an existing "
                         "run.")
+    p.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="off",
+                   help="Glossary resolver mode (identity-bearing): off (no resolver, no new observations), "
+                        "shadow (sidecar written and logged, no promotion), promote (full path). Default off.")
+    p.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute",
+                   help="Glossary resolver cache-miss policy (identity-bearing, default recompute): recompute allows "
+                        "acquire/restart on cache hit with missing/stale sidecar, fail_closed forbids calls and promotion.")
     p.add_argument("--translator", default=None, metavar="PROVIDER/ALIAS",
                    help="PROVIDERS-REGISTRY (owner decision 2026-08-14): model "
                         "for the Translator role from configs/providers.yaml, "
@@ -674,6 +680,8 @@ def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Opti
             if args.lazy_balanced is not None
             else _env_flag("PACT_EFFICIENCY_LAZY_BALANCED", default=True)
         ),
+        glossary_resolver_mode=getattr(args, "glossary_resolver_mode", "off"),
+        glossary_resolver_cache_miss_policy=getattr(args, "glossary_resolver_cache_miss_policy", "recompute"),
     )
 
 
@@ -801,6 +809,8 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
             russian_editor_max_edits_per_pid=cfg.russian_editor_max_edits_per_pid,
             russian_editor_retry_max_retries=cfg.russian_editor_retry_max_retries,
             russian_editor_retry_base_delay_seconds=cfg.russian_editor_retry_base_delay_seconds,
+            glossary_resolver_mode=cfg.glossary_resolver_mode,
+            glossary_resolver_cache_miss_policy=cfg.glossary_resolver_cache_miss_policy,
         ),
     )
 

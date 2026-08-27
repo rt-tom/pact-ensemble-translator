@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from pact_v4.audit.entity_extractor import EXTRACTOR_VERSION
+from pact_v4.audit.entity_extractor import CACHE_SCHEMA, EXTRACTOR_VERSION
 from pact_v4.phase1.book_memory_candidates import BookMemoryCandidateLedger
 
 _PLAN = {
@@ -174,7 +174,7 @@ def _entity_cache_entry(
     ``EXTRACTOR_VERSION``; a caller exercising RV2 finding 1 (stale
     extractor-version entries in one cache) passes an older value.
     """
-    from pact_v4.audit.entity_extractor import (
+    from pact_v4.audit.entity_extractor import (CACHE_SCHEMA,
         ENTITY_CONTEXT_SCHEMA,
         entity_context_cache_key,
     )
@@ -201,7 +201,7 @@ def _entity_cache_entry(
         ],
     }
     return {
-        "schema": "pact-v4-entity-context-cache/v1",
+        "schema": CACHE_SCHEMA,
         "entries": [
             {
                 "key": entity_context_cache_key(
@@ -412,7 +412,7 @@ class TestBookMemoryAccumulation:
             }],
         )
         payload = {
-            "schema": "pact-v4-entity-context-cache/v1",
+            "schema": CACHE_SCHEMA,
             "entries": current["entries"] + foreign["entries"],
         }
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
@@ -502,7 +502,7 @@ class TestBookMemoryAccumulation:
             }],
         )
         payload = {
-            "schema": "pact-v4-entity-context-cache/v1",
+            "schema": CACHE_SCHEMA,
             "entries": stale["entries"] + current["entries"],
         }
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
