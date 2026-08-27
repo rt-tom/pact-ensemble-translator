@@ -252,7 +252,12 @@ class OpenCodeServerProcess:
         stderr_path: Optional[Path] = None
         if self._log_dir is not None:
             self._log_dir.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y%m%d_%H%M%S")
+            # Collision-proof stamp: second + microsecond + pid + random suffix so
+            # strict server and immediately following formatting server on the same
+            # second never collide and overwrite each other's log (round 4 fix).
+            base = time.strftime("%Y%m%d_%H%M%S")
+            micros = int(time.time() * 1_000_000) % 1_000_000
+            stamp = f"{base}_{micros:06d}_{os.getpid()}_{secrets.token_hex(2)}"
             stdout_path = self._log_dir / f"opencode_serve_{stamp}_stdout.log"
             stderr_path = self._log_dir / f"opencode_serve_{stamp}_stderr.log"
 

@@ -142,13 +142,16 @@ def test_run_book_without_client_graceful_debt(tmp_path, monkeypatch):
 
 
 def test_cli_wires_formatting_client_when_runtime_config(tmp_path, monkeypatch):
-    # Verify that main builds a formatting_client when --runtime-config is supplied.
-    # We monkeypatch _build_formatting_client to record call.
+    # Verify per-chapter formatting lifecycle (book-formatting-remote-server):
+    # main NO LONGER builds a global formatting_client before loop — it is built
+    # per-chapter inside run_book at formatting stage with out_dir/server_logs.
+    # So _build_formatting_client should NOT be called at CLI entry, and
+    # run_book receives formatting_client=None (per-chapter build handles it).
     from pact_full_pipeline_runner_v1 import v4_book_run
     calls = []
     orig = v4_book_run._build_formatting_client
-    def fake_build(args, extra, fmt_cfg):
-        calls.append((args, extra, fmt_cfg))
+    def fake_build(args, extra, fmt_cfg, out_dir=None):
+        calls.append((args, extra, fmt_cfg, out_dir))
         if not fmt_cfg.get("enabled", True):
             return None
         class _Fake:
@@ -175,11 +178,11 @@ def test_cli_wires_formatting_client_when_runtime_config(tmp_path, monkeypatch):
     # Provide dummy runtime-config file so _build would be called (we patched it)
     rc = tmp_path / "rc.yaml"
     rc.write_text("kind: local_llama\n", encoding="utf-8")
-    # Call main with extra runtime-config
+    # Call main with extra runtime-config — should NOT build global client
     v4_book_run.main(["--memory-dir", str(memory), "--chapters", "0001", "--chapter-html-pattern", str(src_dir / "{chapter_id}.html"), "--out-base", str(out_base), "--runtime-config", str(rc)])
-    assert len(calls) == 1
-    assert captured.get("formatting_client") is not None
-    # When --no-formatting, client should be None
+    assert len(calls) == 0, "per-chapter lifecycle: main must not build global formatting client"
+    assert captured.get("formatting_client") is None
+    # When --no-formatting, client should be None as well
     calls.clear()
     captured.clear()
     v4_book_run.main(["--memory-dir", str(memory), "--chapters", "0001", "--chapter-html-pattern", str(src_dir / "{chapter_id}.html"), "--out-base", str(out_base), "--no-formatting"])
