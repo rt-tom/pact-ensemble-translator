@@ -158,13 +158,15 @@ powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pi
 ```bash
 # media (Linux), из корня репозитория (всегда с cd!):
 cd ~/projects/pact-ensemble-translator
-python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665
+# ВАЖНО: для book-прогона --out-dir указывает на ПОДКАТАЛОГ ГЛАВЫ book_*/chapter_*, а НЕ на корень book_*
+# (phase_progress.ndjson и server_logs лежат внутри chapter_*-подкаталога, иначе будет 'Unknown / no chunk_plan.json').
+python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665/chapter_0001_bonds-1-1
 
-# цикл обновления раз в SEC секунд:
+# цикл обновления раз в SEC секунд (авто-поиск свежего chapter_*-подкаталога):
 cd ~/projects/pact-ensemble-translator
-python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665 --watch 5
+python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir "$(ls -dt /home/rt/pact_runs/outputs/book_0001*/chapter_* | head -1)" --watch 5
 ```
-Параметры: `--out-dir` (каталог прогона), `--out-base` (book-уровень, сводка по главам), `--watch SEC` (цикл обновления). Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>` (имя берётся из `ls -dt /home/rt/pact_runs/outputs/book_*` — самый свежий).
+Параметры: `--out-dir` (каталог прогона), `--out-base` (book-уровень, сводка по главам), `--watch SEC` (цикл обновления). Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`, а артефакты прогона — внутри `book_*/chapter_<NNNN>_*/` (его и передавать в `--out-dir`). Свежий chapter-каталог: `ls -dt /home/rt/pact_runs/outputs/book_0001*/chapter_* | head -1`.
 
 ### Деплой на RT через ssh rt + powershell (2026-08-27)
 - Хост RT доступен по ssh-алиасу `rt` (ключ `~/.ssh/id_rt`, `IdentitiesOnly yes`). Дефолтный удалённый шелл — `cmd`, но `powershell`/`pwsh` вызываются явно и работают: `ssh rt 'powershell -NoProfile -Command "Write-Host OK"'`.
