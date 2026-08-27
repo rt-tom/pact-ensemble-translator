@@ -136,6 +136,24 @@ ssh rt 'powershell -NoProfile -Command "cd D:/pact/pact_translator_v4_1; python 
 - Обязательные env-переменные (берутся из окружения интерактивной сессии владельца, НЕ из репозитория): `OPENCODE_SERVER_USERNAME`, `OPENCODE_SERVER_PASSWORD` (см. `configs/runtime_remote.example.yaml`, `auth.basic_env`). Агентская неинтерактивная оболочка их обычно не наследует — префлайт в ней покажет «missing env», хотя у владельца PASS.
 - Сам пайплайн запускает владелец вручную (manual-only); агент только готовит команды и валидирует префлайтом.
 
+#### Монитор прогона (v42-monitor-compact)
+Скрипт: `pact_full_pipeline_runner_v1/monitor_pipeline.ps1` (компактный `run-progress-monitor`; читает `phase_progress.ndjson` из каталога прогона). Запуск из корня репозитория на RT (`D:\pact\pact_translator_v4_1`):
+```powershell
+# Надёжный вариант — явный путь к каталогу прогона. v4_run пишет вывод в
+# D:\pact\gate_bench_runs\book_<range>_<local|remote>_<timestamp>:
+powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pipeline.ps1 -RunRoot D:\pact\gate_bench_runs\book_0001-0001_remote_2026xxxx_xxxxxx
+
+# Последний прогон под ProjectRoot\pipeline_runs (дефолтный авто-резолв):
+powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pipeline.ps1 -ProjectRoot D:\pact\pact_translator_v4_1
+
+# Конкретная глава/диапазон (→ ProjectRoot\pipeline_runs\chapter_N_to_M):
+powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pipeline.ps1 -ProjectRoot D:\pact\pact_translator_v4_1 -Start 1 -End 1
+
+# Однократный снимок без цикла обновления (интервал -RefreshSeconds, по умолч. 5):
+powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pipeline.ps1 -ProjectRoot D:\pact\pact_translator_v4_1 -Once
+```
+Параметры: `-RunRoot` (явный каталог прогона — самый надёжный), `-ProjectRoot` (дефолт устаревший `D:\pact\pact_translator_v3` → переопределять на `D:\pact\pact_translator_v4_1`), `-Start`/`-End` (→ `pipeline_runs\chapter_N_to_M`), `-RefreshSeconds` (по умолч. 5), `-Once`, `-NoClear`. Для v4_run-прогонов (вывод в `gate_bench_runs\book_*`) рекомендуется `-RunRoot` с явным путём к `book_*`-каталогу; авто-резолв через `pipeline_runs` рассчитан на старую раскладку.
+
 ### Деплой на RT через ssh rt + powershell (2026-08-27)
 - Хост RT доступен по ssh-алиасу `rt` (ключ `~/.ssh/id_rt`, `IdentitiesOnly yes`). Дефолтный удалённый шелл — `cmd`, но `powershell`/`pwsh` вызываются явно и работают: `ssh rt 'powershell -NoProfile -Command "Write-Host OK"'`.
 - Деплой-синхронизация продакшн-чекаута (per AGENTS.md: после каждого деплоя `git pull --ff-only` на RT). Проверенный вариант:
