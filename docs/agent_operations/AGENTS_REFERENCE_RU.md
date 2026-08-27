@@ -183,9 +183,9 @@ python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$(ls -dt /
   Glossary                 : 12 proposals
   Formatting               : spans 102/102 · incidents 0
 usage: 42 calls in=1.2k out=800 reas=500 $1.23
-Glossary promoted: 153 → glossary.json · 7 → memory
+Promoted this run: glossary committed 0 · memory committed 0 · memory promotions 0 (1 chapters)
 ```
-Формат заголовка — `[<id>] run <elapsed> · quiet <age>` (без `mode=fine`, без дублирующих `status:`/`phase:`); каждая фаза — одна строка, активная помечена `>`; `Glossary`/`Formatting` появляются только когда есть `glossary_proposals.json`/`formatting_report.json`; `Glossary promoted: … → glossary.json · … → memory` — book-уровень (`--out-base` + `--memory-dir`, по умолчанию state-root).
+Формат заголовка — `[<id>] run <elapsed> · quiet <age>` (без `mode=fine`, без дублирующих `status:`/`phase:`); каждая фаза — одна строка, активная помечена `>`; `Glossary`/`Formatting` появляются только когда есть `glossary_proposals.json`/`formatting_report.json`; `Promoted this run: glossary committed … · memory committed … · memory promotions … (N chapters)` / `Promoted this run: none (0 glossary / 0 memory)` / `State glossary/memory: N / M (input+promoted; book_run.json pending)` — book-уровень (`--out-base` + `--memory-dir`, по умолчанию state-root).
 
 Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`; артефакты прогона (`phase_progress.ndjson`, `server_logs`) лежат внутри `book_*/chapter_<NNNN>_*/`, НО для book-режима указывается сама папка книги (`--out-base`), а не подкаталог главы. Свежий book-каталог: `ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1`.
 
