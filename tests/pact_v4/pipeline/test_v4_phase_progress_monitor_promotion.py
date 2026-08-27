@@ -114,6 +114,24 @@ def test_book_promotion_none_committed(tmp_path: Path):
     assert "Promoted this run: none (0 glossary / 0 memory)" in report
 
 
+def test_book_promotion_empty_chapters(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _make_chapter(base, "chapter_0001_bonds-1-1")
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    # present book_run.json with empty chapters must NOT fall back to state totals
+    _write(base / "book_run.json", {
+        "schema": "pact-v4-book-run/v1",
+        "chapters": [],
+    })
+    _write(mem / "glossary.json", {f"k{i}": i for i in range(5)})
+    _write(mem / "book_memory.json", {f"k{i}": i for i in range(2)})
+    report = tracker.render_book_report(base, memory_dir=mem)
+    assert "Promoted this run: none (0 glossary / 0 memory)" in report
+    assert "State glossary/memory" not in report
+
+
 def test_book_promotion_pending_no_book_run_json(tmp_path: Path):
     base = tmp_path / "book"
     base.mkdir()

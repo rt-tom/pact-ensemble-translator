@@ -2846,7 +2846,7 @@ def _book_promotion_summary(out_base: Path, memory_dir: Optional[Path] = None) -
     data = _read_json(Path(out_base) / "book_run.json")
     if isinstance(data, dict):
         chapters = data.get("chapters")
-        if isinstance(chapters, list) and chapters:
+        if isinstance(chapters, list):
             g = 0
             m = 0
             p = 0
