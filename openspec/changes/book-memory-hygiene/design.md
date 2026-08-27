@@ -148,7 +148,11 @@ This local protocol protects the worker directory. It does not itself confer pro
 Migration never edits a historical snapshot or production state in place. It:
 
 1. reads/freeze-hashes current accepted four-file revision;
-2. builds a publishable candidate directory containing exactly migrated `book_memory`, rebuilt v2 index, unchanged-or-intentionally-updated glossary, and clean observations—no metadata or extra file is allowed inside this directory;
+2. builds a publishable candidate directory containing exactly the four canonical files — no metadata or extra file is allowed inside this directory — per owner clarification (2026-08-27):
+   - `glossary.json` is copied byte-for-byte from the accepted parent unless a separately approved glossary change is explicitly part of the same candidate; `book_memory.json` `canonical_ru` is reconciled *to* that parent glossary, never vice versa;
+   - `book_memory.json` is the migrated v2 memory (policy block, per-field/per-alias provenance or conservative omission, deterministic duplicate handling);
+   - `chapter_index.json` MUST be rebuilt from the migrated v2 book_memory/policy (not copied from rev-0011), because copying retains contaminated v1 flattened-character prompt content and stale hashes;
+   - `observations.json` is preserved byte-for-byte from the accepted parent; if it is nonempty/pending/incompatible with the migrated state, migration fails closed and requires explicit owner-approved reconciliation — it is not silently cleared or regenerated;
 3. emits a separate non-publishable transaction envelope containing the complete decision manifest, expected parent revision, approval identity, and candidate hashes;
 4. waits for explicit owner approval of that exact manifest/hash set;
 5. acquires lease and publishes through existing parent/CAS/exact-file boundary as one new Media revision;

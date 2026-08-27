@@ -95,6 +95,8 @@ def _gold_payload_0001(source: SourceArtifact) -> Dict:
                 "aliases": [
                     {"surface": "bike", "pid": "p00097", "span": "bike"},
                 ],
+                "memory_class": "chapter_local",
+                "memory_worthy": False,
                 "claims": [
                     {
                         "kind": "object_identity",
@@ -118,6 +120,8 @@ def _gold_payload_0001(source: SourceArtifact) -> Dict:
                     {"surface": "Rich", "pid": "p00285",
                      "span": "Nurse Rich"},
                 ],
+                "memory_class": "named_character",
+                "memory_worthy": True,
                 "claims": [
                     {
                         "kind": "gender",
@@ -436,7 +440,7 @@ def test_cache_identity_ignores_prompt_version_change():
     )
     # The prompt version field exists and is /v1 — but it must NOT affect
     # the cache key. Changing it (hypothetically) would not change the key.
-    assert ENTITY_EXTRACTION_V1.version.endswith("/v2")
+    assert ENTITY_EXTRACTION_V1.version.endswith("/v3")
     # Cache identity is deterministic and depends only on source_hash + version.
     key2 = entity_context_cache_key(
         source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
@@ -997,7 +1001,7 @@ def test_cache_from_payload_rejects_tampered_entry():
         source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
     )
     payload = {
-        "schema": "pact-v4-entity-context-cache/v2",
+        "schema": "pact-v4-entity-context-cache/v3",
         "entries": [{"key": key, "context": context.to_payload()}],
     }
     # Tamper: swap the stored context for a foreign one under the SAME key.
@@ -1080,7 +1084,7 @@ def test_cache_payload_round_trip_does_not_bypass_tamper_check():
         source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION
     )
     cache_payload = {
-        "schema": "pact-v4-entity-context-cache/v2",
+        "schema": "pact-v4-entity-context-cache/v3",
         "entries": [{"key": key, "context": tampered_ctx.to_payload()}],
     }
     # Key identity is computed from the context's own (intact) metadata, so
@@ -1129,7 +1133,7 @@ def test_cache_from_payload_rejects_malformed_entry():
     """A structurally malformed cache entry (not an object {key, context})
     is rejected loudly — never silently accepted."""
     payload = {
-        "schema": "pact-v4-entity-context-cache/v2",
+        "schema": "pact-v4-entity-context-cache/v3",
         "entries": [["not", "an", "object"]],
     }
     with pytest.raises(ValueError, match="cache payload entry"):
@@ -1226,6 +1230,8 @@ def test_canonical_type_checked_in_anchor_span_not_whole_pid():
             {
                 "entity": "Blake's vehicle",
                 "canonical_type": "vehicle",
+                "memory_class": "chapter_local",
+                "memory_worthy": False,
                 "anchor": {"pid": "p00007", "span": "motorcycle"},
                 "aliases": [],
                 "claims": [],
@@ -1257,6 +1263,8 @@ def test_canonical_type_in_anchor_span_passes():
                 "canonical_type": "motorcycle",
                 "anchor": {"pid": "p00007", "span": "motorcycle"},
                 "aliases": [],
+                "memory_class": "named_character",
+                "memory_worthy": True,
                 "claims": [],
             },
         ],

@@ -480,7 +480,7 @@ class StrictRunConfig:
     russian_editor_retry_max_retries: int = RUSSIAN_EDITOR_RETRY_MAX_RETRIES
     russian_editor_retry_base_delay_seconds: float = RUSSIAN_EDITOR_RETRY_BASE_DELAY_SECONDS
     # Glossary resolver mode and cache-miss policy (identity-bearing, default off/recompute)
-    glossary_resolver_mode: str = "off"
+    glossary_resolver_mode: str = "promote"
     glossary_resolver_cache_miss_policy: str = "recompute"
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:

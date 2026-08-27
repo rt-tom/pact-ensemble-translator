@@ -104,6 +104,8 @@ Any runtime promotion or migration that can change canonical state SHALL stage a
 ### Requirement: Authoritative Media migration
 Production migration SHALL construct all four canonical files in an isolated candidate directory, validate exact file set/types/JSON/hashes and parent revision, and publish through the existing Media lease/parent/CAS gate as one new revision. Historical snapshots SHALL remain immutable. Rollback SHALL publish a new revision built from the retained pre-migration snapshot; it SHALL NOT directly restore tracked live files or rewrite history.
 
+For a migration candidate built from the accepted parent revision (owner clarification 2026-08-27): `glossary.json` is copied byte-for-byte from the accepted parent unless a separately approved glossary change is explicitly part of the same candidate (`book_memory` `canonical_ru` reconciled *to* that parent glossary, never vice versa); `chapter_index.json` MUST be rebuilt from the migrated v2 book_memory/policy (copying retains contaminated v1 flattened-character content and stale hashes); `observations.json` is preserved byte-for-byte from the accepted parent — if nonempty/pending/incompatible with migrated state, migration fails closed and requires explicit owner-approved reconciliation, not silent clearing; the four files remain the exact publishable bundle.
+
 #### Scenario: Owner has not approved migration manifest
 - **WHEN** the complete retain/merge/move/reject manifest lacks explicit owner approval
 - **THEN** no production candidate revision SHALL be published

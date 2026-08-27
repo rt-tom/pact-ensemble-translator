@@ -166,7 +166,20 @@ def build_snapshot(
     selected_chapter_index = None
     if isinstance(memory.chapter_index, Mapping):
         selected_chapter_index = memory.chapter_index.get(chapter_id)
-    chapter_index_hash = _hash_canonical_json(selected_chapter_index)
+        # v2: bind to policy version and schema as well per spec 1.4/6.4, but keep v1 backward compatible
+        _is_v2 = memory.chapter_index.get("$schema") == "pact-v4-chapter-index/v2" or memory.chapter_index.get("schema") == "pact-v4-chapter-index/v2"
+        if _is_v2:
+            selected_policy_version = memory.chapter_index.get("$book_memory_policy_version") or memory.chapter_index.get("book_memory_policy_version")
+            selected_schema = memory.chapter_index.get("$schema") or memory.chapter_index.get("schema")
+            chapter_index_hash = _hash_canonical_json({
+                "selected": selected_chapter_index,
+                "policy_version": selected_policy_version,
+                "schema": selected_schema,
+            })
+        else:
+            chapter_index_hash = _hash_canonical_json(selected_chapter_index)
+    else:
+        chapter_index_hash = _hash_canonical_json(selected_chapter_index)
     return Snapshot(
         chapter_id=chapter_id,
         pids=pids,

@@ -161,6 +161,13 @@ def _entity_cache_entry(
     source_hash: str = "test-hash",
     extractor_version: str = EXTRACTOR_VERSION,
 ) -> dict:
+    # Auto-pick anchor pid where entity appears if default not in source or span mismatch
+    if anchor_pid not in source_text or anchor_span not in source_text.get(anchor_pid, ""):
+        for pid, txt in source_text.items():
+            if entity in txt:
+                anchor_pid = pid
+                anchor_span = txt
+                break
     """Build a valid single-entry ``entity_context_cache.json`` payload.
 
     The cache schema is ``pact-v4-entity-context-cache/v1``; every context
@@ -185,6 +192,9 @@ def _entity_cache_entry(
             "evidence": [{"pid": anchor_pid, "span": "She was running late"}],
             "evidence_windows": [[anchor_pid, anchor_pid]],
         }]
+    # memory_class heuristic for tests: use named_character for person names, else chapter_local
+    _mc = "named_character" if entity and entity[0].isupper() else "chapter_local"
+    _mw = True if _mc != "chapter_local" else False
     context = {
         "schema": ENTITY_CONTEXT_SCHEMA,
         "extractor_version": extractor_version,
@@ -197,6 +207,8 @@ def _entity_cache_entry(
                 "anchor": {"pid": anchor_pid, "span": anchor_span},
                 "aliases": [],
                 "claims": claims,
+                "memory_class": _mc,
+                "memory_worthy": _mw,
             },
         ],
     }

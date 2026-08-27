@@ -806,7 +806,7 @@ class B3AuditRepairConfig:
     russian_editor_max_edits_per_pid: int = MAX_EDITS_PER_PID
     russian_editor_retry_max_retries: int = DEFAULT_RETRY_MAX_RETRIES
     russian_editor_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
-    glossary_resolver_mode: str = "off"
+    glossary_resolver_mode: str = "promote"
     glossary_resolver_cache_miss_policy: str = "recompute"
 
     def to_payload(self) -> Dict[str, Any]:

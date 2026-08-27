@@ -37,6 +37,9 @@ from pact_v4.phase0b.source_html import load_source
 from pact_v4.phase1.memory import MemoryManager, atomic_write, load_json
 from pact_v4.phase2.risk import GlossaryEntry, _term_present
 
+CHAPTER_INDEX_V2_SCHEMA = "pact-v4-chapter-index/v2"
+BOOK_MEMORY_POLICY_VERSION = "book-memory-policy/v1"
+
 
 def _iter_names(book_memory: Mapping, section: str) -> List[str]:
     """Character/entity names from the ``characters``/``entities`` sections.
@@ -59,6 +62,45 @@ def _iter_names(book_memory: Mapping, section: str) -> List[str]:
                 names.append(str(name))
     return names
 
+
+def _variants_with_provenance(book_memory: Mapping, section: str, name: str, chapter_id: str | None = None) -> List[str]:
+    """Surface forms filtered by provenance: only aliases with chapter < target.""" 
+    data = book_memory.get(section)
+    forms = [name]
+    if isinstance(data, Mapping):
+        attrs = data.get(name)
+        if isinstance(attrs, Mapping):
+            variants = attrs.get("variants")
+            if isinstance(variants, Mapping):
+                for var, prov in variants.items():
+                    # If chapter_id given, filter by provenance strictly earlier
+                    if chapter_id is not None and isinstance(prov, Mapping):
+                        v_ch = str(prov.get("chapter") or "")
+                        if v_ch and not _chapter_before(v_ch, chapter_id):
+                            continue
+                    forms.append(str(var))
+    elif isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("name") or entry.get("source") or entry.get("english")) != name:
+                continue
+            variants = entry.get("variants")
+            if isinstance(variants, Mapping):
+                for var, prov in variants.items():
+                    if chapter_id is not None and isinstance(prov, Mapping):
+                        v_ch = str(prov.get("chapter") or "")
+                        if v_ch and not _chapter_before(v_ch, chapter_id):
+                            continue
+                    forms.append(str(var))
+    seen = set()
+    out: List[str] = []
+    for form in forms:
+        key = form.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(form)
+    return out
 
 def _variants_for(book_memory: Mapping, section: str, name: str) -> List[str]:
     """The surface forms to scan for: the canonical name plus its variants."""
@@ -223,6 +265,16 @@ def pre_chapter_book_memory(
     return out
 
 
+def _field_provenance_before(entry: Mapping, field: str, chapter_id: str) -> bool:
+    fp = entry.get("field_provenance", {})
+    if not isinstance(fp, Mapping):
+        return False
+    prov = fp.get(field)
+    if not isinstance(prov, Mapping):
+        return False
+    ch = str(prov.get("chapter") or "")
+    return bool(ch) and _chapter_before(ch, chapter_id)
+
 def build_chapter_index(
     *,
     chapter_id: str,
@@ -246,28 +298,55 @@ def build_chapter_index(
 
     conflict_sources = _glossary_conflict_sources(glossary)
 
-    # --- characters/entities: present in the chapter, or always (narrator) ---
-    characters: List[str] = []
+    # --- characters/entities: present in the chapter, or always (narrator) --- causal v2 split
+    characters: List[Any] = []
+    named_entities: List[str] = []
     for section in ("characters", "entities"):
         for name in _iter_names(book_memory, section):
-            present = _name_present(source_text, book_memory, section, name)
+            # Determine memory_class for split
+            entry = book_memory.get(section, {}).get(name) if isinstance(book_memory.get(section), dict) else None
+            mc = ""
+            if isinstance(entry, Mapping):
+                mc = str(entry.get("memory_class") or "")
+            # Use provenance-filtered variants for presence
+            present = any(
+                _term_present(source_text, form)
+                for form in _variants_with_provenance(book_memory, section, name, chapter_id)
+            )
             locked = bool(
                 narrator_name
                 and (
                     name.casefold() == narrator_name.casefold()
                     or any(
                         form.casefold() == narrator_name.casefold()
-                        for form in _variants_for(book_memory, section, name)
+                        for form in _variants_with_provenance(book_memory, section, name, chapter_id)
                     )
                 )
                 or name.casefold() in conflict_sources
             )
             if present or locked:
-                characters.append(name)
-    # The narrator is ALWAYS present, even when never named in the chapter.
-    if narrator_name and narrator_name not in characters:
+                # Split per memory_class: named_character -> characters, others -> named_entities
+                # v2 split: only when memory_class is explicitly v2, otherwise flatten for backward compat (v1)
+                if mc in ("named_character", "") or section == "characters":
+                    # For v1 (mc == ""), keep flattened into characters to preserve existing tests
+                    # For v2 named_character, also characters
+                    # If v2 and non-character, go to named_entities
+                    if mc == "" or mc == "named_character":
+                        characters.append(name)
+                    else:
+                        named_entities.append(name)
+                else:
+                    named_entities.append(name)
+    if narrator_name and narrator_name not in [str(c) if isinstance(c, str) else c.get("name") for c in characters]:
         characters.append(narrator_name)
-    characters = sorted(set(characters), key=str.casefold)
+    # Deduplicate: dicts by name, strs by value
+    seen_chars = {}
+    for item in characters:
+        key = (item if isinstance(item, str) else item.get("name","")).casefold()
+        if key not in seen_chars:
+            seen_chars[key] = item
+    characters = sorted(seen_chars.values(), key=lambda x: (x if isinstance(x, str) else x.get("name","")).casefold())
+    named_entities = sorted(set(named_entities), key=str.casefold)
 
     # --- facts: at least one key present in the chapter, or locked ---
     all_names = sorted(set(character_names) | set(entity_names), key=str.casefold)
@@ -336,8 +415,23 @@ def build_chapter_index(
                 address.append(text)
     address = sorted(set(address), key=str.casefold)
 
+    # v2: split characters into characters vs named_entities based on book_memory type
+    # For now, named_entities and terms are empty unless book_memory provides them; preserve compatibility
+    named_entities = []
+    terms = []
+    # terms from approved world terms if present in source
+    approved_terms = []
+    if isinstance(book_memory, dict):
+        policy_terms = book_memory.get("policy", {}).get("approved_terms", []) if isinstance(book_memory.get("policy"), dict) else []
+        approved_terms = [str(t) for t in policy_terms]
+    for term in approved_terms:
+        if _term_present(source_text, term):
+            terms.append(term)
+    terms = sorted(set(terms), key=str.casefold)
     return {
         "characters": characters,
+        "named_entities": named_entities,
+        "terms": terms,
         "facts": facts,
         "address": address,
     }
@@ -437,6 +531,9 @@ def build_index_file(
     existing = load_json(index_path, {})
     if not isinstance(existing, dict):
         existing = {}
+    # ensure v2 metadata
+    existing["$schema"] = CHAPTER_INDEX_V2_SCHEMA
+    existing["$book_memory_policy_version"] = BOOK_MEMORY_POLICY_VERSION
     existing[chapter_id] = entry
     atomic_write(str(index_path), existing)
     return entry

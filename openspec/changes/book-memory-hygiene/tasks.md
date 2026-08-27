@@ -1,7 +1,7 @@
 ## 1. Contracts and fixtures
 
 - [ ] 1.1 Freeze representative four-file state fixtures from accepted `rev-0011`, record exact hashes/file types, and verify historical snapshots remain untouched
-- [ ] 1.2 Add B1.2 `memory_class` enum and required `memory_worthy` field to prompt/schema/validator; bump extractor, cache, validation-report, and identity versions and verify old/missing/unknown fields force recompute
+- [x] 1.2 Add B1.2 `memory_class` enum and required `memory_worthy` field to prompt/schema/validator; bump extractor, cache, validation-report, and identity versions and verify old/missing/unknown fields force recompute
 - [ ] 1.3 Define `pact-v4-book-memory/v2`, policy block, per-field/per-alias provenance, stable rejection codes, and tolerant legacy reader behavior; verify schema fixtures and glossary authority conflicts
 - [ ] 1.4 Define `pact-v4-chapter-index/v2` reserved metadata and exact per-chapter scopes; inventory every reader/hash consumer and verify unsupported schema fails soft only to narrator+seed
 
@@ -29,7 +29,7 @@
 ## 5. Independent modes and defaults
 
 - [ ] 5.1 Add independent book-memory policies `promote_verified` (default), `observe`, and `off`, removing `glossary_sidecar_handled` as a memory gate; verify each policy controls only book-memory mutation
-- [ ] 5.2 Change glossary resolver default to `promote` while preserving explicit `shadow` and `off`; verify D6 supersession, CLI/config precedence, requested/effective provenance, and unchanged reviewer transport/budgets
+- [x] 5.2 Change glossary resolver default to `promote` while preserving explicit `shadow` and `off`; verify D6 supersession, CLI/config precedence, requested/effective provenance, and unchanged reviewer transport/budgets
 - [ ] 5.3 Implement glossary `off` status-only behavior (zero calls, no proposal sidecar) and `shadow` proposal-without-mutation behavior; verify artifacts and glossary hashes
 - [ ] 5.4 Add the full 3×3 glossary/book-memory mode matrix, including glossary-promote+memory-off and glossary-off+memory-promote; verify only the policy-owned resource mutates and both observation-only modes preserve all four canonical hashes
 - [ ] 5.5 Preserve all existing resolver identity/hash/model/backend/evidence/quarantine/duplicate/conflict gates under default promote; verify stale, tampered, missing, quarantined, and mixed valid/invalid proposal cases

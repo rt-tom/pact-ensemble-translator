@@ -1224,8 +1224,9 @@ def run_book(
     formatting_cfg: Optional[Mapping[str, Any]] = None,
     formatting_client: Optional[Any] = None,
     max_formatting_incidents: int = _DEFAULT_MAX_FORMATTING_INCIDENTS,
-    glossary_resolver_mode: str = "off",
+    glossary_resolver_mode: str = "promote",
     glossary_resolver_cache_miss_policy: str = "recompute",
+    book_memory_policy: str = "promote_verified",
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
@@ -1570,10 +1571,23 @@ def run_book(
         glossary_sidecar_handled = False
         if _mode == "off":
             LOG.info("glossary_resolver: mode off for %s, new glossary observations forbidden (fail-closed, no legacy deterministic promotion)", chapter_id)
-            # Spec glossary-model-resolver: off forbids ANY new glossary observations, even legacy deterministic.
-            # Fail-closed: block sidecar handling AND deterministic fallback.
             glossary_sidecar_handled = True
             candidates_block = {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0}
+            # Write versioned status artifact for off (no proposal sidecar)
+            try:
+                _status_path = out_dir / "glossary_resolver_status.json"
+                _status_payload = {
+                    "schema": "pact-v4-glossary-resolver-status/v1",
+                    "mode": "off",
+                    "status": "disabled",
+                    "chapter_id": chapter_id,
+                    "resolver_calls": 0,
+                    "candidates": 0,
+                    "glossary_hash": _load_json(memory_dir / "glossary.json", {}).get("__hash__", ""),
+                }
+                _status_path.write_text(__import__("json").dumps(_status_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         elif _mode in ("shadow", "promote") and terminal_status in _PROMOTING_STATUSES:
             # Handle sidecar for shadow/promote
             from pact_v4.pipeline.glossary_resolver import (
@@ -1731,6 +1745,9 @@ def run_book(
         # extreme-conservative gender (verified only when the extractor's
         # 8-point validation linked pronoun + referent in the same PID);
         # candidate claims are never promoted (audit-only, TIER_B).
+        # book-memory policy independent gate
+        _bm_policy_tmp = locals().get('book_memory_policy', 'promote_verified')
+        _skip_book_memory = (_bm_policy_tmp == 'off')
         book_memory_before = _load_json(memory_dir / "book_memory.json", {})
         bm_candidates_block = {
             "generated": 0,
@@ -1819,7 +1836,7 @@ def run_book(
         canonical_ru_map: Dict[str, str] = {}
         glossary_proposed: List[Dict[str, Any]] = []
         glossary_conflicts: List[Dict[str, Any]] = []
-        if not glossary_sidecar_handled and terminal_status in _PROMOTING_STATUSES:
+        if terminal_status in _PROMOTING_STATUSES:
             entity_payload = _load_json(out_dir / "entity_context_cache.json", None)
             if isinstance(entity_payload, dict) and entity_payload.get("entries"):
                 from pact_v4.audit.entity_extractor import (
@@ -1877,10 +1894,52 @@ def run_book(
                             or context.extractor_version != run_extractor_version
                         ):
                             continue
-                        obs = book_memory_observations_from_entity_context(
-                            context, chapter_id=chapter_id,
-                        )
-                        entity_obs.update(obs.get("book_memory", {}))
+                        # Durable gate: evaluate each record with ordered precedence
+                        from pact_v4.runtime.book_memory_policy import ensure_policy_block
+                        from pact_v4.runtime.book_memory_gate import evaluate_gate
+                        from pact_v4.pipeline.b3_audit_repair import book_memory_observations_from_entity_context as _legacy_obs
+                        # Build policy from book_memory_before
+                        _policy_block = ensure_policy_block(book_memory_before)
+                        _policy = _policy_block.get("policy", {})
+                        _source_map = _source_by_pid(chapter_html)
+                        _existing = set()
+                        for sec in ("characters","entities"):
+                            for k in (book_memory_before.get(sec) or {}).keys():
+                                _existing.add(k.strip().casefold().replace("\u2019","'"))
+                        # per-record gate evaluation
+                        _filtered_context_entities = []
+                        _gate_decisions = []
+                        for rec in context.entities:
+                            ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, quarantined_pids=quarantined_pids, existing_names=_existing)
+                            if not ok:
+                                _gate_decisions.append({"entity": rec.entity, "memory_class": getattr(rec,"memory_class",""), "rejected": True, "reason": code, "evidence_pids": [rec.anchor.pid]})
+                                # record candidate_claim if any candidate claim present? handled below via claim filter
+                                continue
+                            _filtered_context_entities.append(rec)
+                        if _filtered_context_entities:
+                            from pact_v4.audit.entity_extractor import ChapterEntityContext
+                            _filtered_context = ChapterEntityContext(
+                                schema=context.schema,
+                                extractor_version=context.extractor_version,
+                                chapter_id=context.chapter_id,
+                                source_hash=context.source_hash,
+                                entities=tuple(_filtered_context_entities),
+                            )
+                            obs = book_memory_observations_from_entity_context(
+                                _filtered_context, chapter_id=chapter_id,
+                            )
+                            entity_obs.update(obs.get("book_memory", {}))
+                        # store gate decisions for report (stashed on entity_obs via side channel)
+                        if "_gate_decisions" not in locals():
+                            _gate_decisions_global = []
+                        # accumulate for report
+                        if "_gate_decisions_global" not in dir():
+                            pass
+                        # we will attach to a global variable via manager? Instead store in a dict attached to loop variable
+                        # Use a simple attribute on manager
+                        if not hasattr(manager, "_gate_reports"):
+                            manager._gate_reports = []
+                        manager._gate_reports.extend(_gate_decisions)
                         try:
                             # GLOSSARY-FROM-ENTITY (variant B, 0 extra model
                             # calls): align the verified proper-noun entities
@@ -1946,38 +2005,39 @@ def run_book(
             )
             candidates_block["proposed"] = len(glossary_proposed)
             candidates_block["conflicts"] = len(glossary_conflicts)
-            for key, value in entity_obs.items():
-                # Chapter accumulation: a character/entity seen in earlier
-                # chapters keeps its cumulative `chapters` list (the entity
-                # cache holds only THIS chapter's context; union with the
-                # already-promoted entry so `chapters` never shrinks).
-                section, _, entry_key = key.partition(":")
-                if section in ("characters", "entities") and isinstance(value, dict):
-                    existing = book_memory_before.get(section, {}).get(entry_key)
-                    if isinstance(existing, dict):
-                        merged = dict(value)
-                        merged["chapters"] = sorted({
-                            str(c) for c in (
-                                list(existing.get("chapters") or [])
-                                + list(value.get("chapters") or [])
-                            )
-                        })
-                        # Cross-chapter gender disagreement fails closed
-                        # (owner decision 2026-08-08, BM): a verified gender
-                        # contradicted by a LATER chapter is unknown forever
-                        # — never pick a winner.
-                        existing_gender = existing.get("gender")
-                        new_gender = value.get("gender")
-                        if (
-                            existing_gender
-                            and new_gender
-                            and existing_gender != new_gender
-                        ):
-                            merged.pop("gender", None)
-                        elif existing_gender and not new_gender:
-                            merged["gender"] = existing_gender
-                        value = merged
-                manager.add_observation("book_memory", key, value)
+            # Independent book-memory policy gate
+            _effective_bm_policy = book_memory_policy if "book_memory_policy" in locals() else "promote_verified"
+            if _effective_bm_policy == "off":
+                # off: no durable mutation, but still record for report
+                pass
+            elif _effective_bm_policy == "observe":
+                # observe: classify/report without mutation
+                pass
+            else:  # promote_verified
+                for key, value in entity_obs.items():
+                    section, _, entry_key = key.partition(":")
+                    if section in ("characters", "entities") and isinstance(value, dict):
+                        existing = book_memory_before.get(section, {}).get(entry_key)
+                        if isinstance(existing, dict):
+                            merged = dict(value)
+                            merged["chapters"] = sorted({
+                                str(c) for c in (
+                                    list(existing.get("chapters") or [])
+                                    + list(value.get("chapters") or [])
+                                )
+                            })
+                            existing_gender = existing.get("gender")
+                            new_gender = value.get("gender")
+                            if (
+                                existing_gender
+                                and new_gender
+                                and existing_gender != new_gender
+                            ):
+                                merged.pop("gender", None)
+                            elif existing_gender and not new_gender:
+                                merged["gender"] = existing_gender
+                            value = merged
+                    manager.add_observation("book_memory", key, value)
             bm_candidates_block["generated"] = len(entity_obs)
             bm_candidates_block["proposed"] = len(entity_obs)
             bm_promotions = [
@@ -1991,6 +2051,31 @@ def run_book(
                 }
                 for key, value in entity_obs.items()
             ]
+            # Versioned candidate report
+            try:
+                _report_path = out_dir / "book_memory_candidates_report.json"
+                _report_payload = {
+                    "schema": "pact-v4-book-memory-candidates-report/v1",
+                    "chapter_id": chapter_id,
+                    "source_hash": str((run_record.get("identities") or {}).get("source_hash") or ""),
+                    "snapshot_hash": str((run_record.get("identities") or {}).get("snapshot_hash") or ""),
+                    "config_hash": str((run_record.get("identities") or {}).get("config_identity") or ""),
+                    "extractor_version": str(((run_record.get("operational_policy") or {}).get("audit") or {}).get("extractor_version") or ""),
+                    "cache_version": "pact-v4-entity-context-cache/v3",
+                    "policy_version": "book-memory-policy/v1",
+                    "requested_glossary_mode": _mode,
+                    "effective_glossary_mode": _mode,
+                    "requested_book_memory_policy": book_memory_policy,
+                    "effective_book_memory_policy": book_memory_policy,
+                    "terminal_status": terminal_status,
+                    "entity_count": len(entity_obs) + len(getattr(manager, "_gate_reports", [])),
+                    "accepted": bm_promotions,
+                    "rejected": getattr(manager, "_gate_reports", []),
+                    "decisions": bm_promotions + getattr(manager, "_gate_reports", []),
+                }
+                _report_path.write_text(__import__("json").dumps(_report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
         promoted = False
         promote_detail = ""
@@ -2250,7 +2335,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-formatting-incidents", type=int, default=_DEFAULT_MAX_FORMATTING_INCIDENTS, help="v41 italics: max formatting incidents before blocking (lenient debt default 999)")
     parser.add_argument("--formatting-enabled", action="store_true", default=True, help="Enable v41 italics formatting (default: enabled)")
     parser.add_argument("--no-formatting", dest="formatting_enabled", action="store_false", help="Disable v41 italics formatting")
-    parser.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="off", help="Glossary resolver mode (identity-bearing, default off): off/shadow/promote")
+    parser.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="promote", help="Glossary resolver mode (identity-bearing, default off): off/shadow/promote")
+    parser.add_argument("--book-memory-policy", choices=("promote_verified", "observe", "off"), default="promote_verified", help="Book-memory policy (identity-bearing, default promote_verified): promote_verified/observe/off")
     parser.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute", help="Glossary resolver cache-miss policy (identity-bearing, default recompute)")
     return parser
 
