@@ -1,8 +1,9 @@
-## Purpose
+# v4-run-monitor Specification
 
+## Purpose
 Read-only progress monitor for v4 chapter and book runs that surfaces per-phase progress from run artifacts without altering them.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Single source of truth
 The monitor SHALL derive each phase's status and metrics from one structured source and SHALL NOT emit duplicated or contradictory phase information for the same phase.
