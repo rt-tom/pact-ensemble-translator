@@ -34,8 +34,8 @@
 - **WHEN** `B3` `cache hit`, но sidecar `missing/stale/tampered`
 - **THEN** система либо `acquire/restart` `reviewer` модели для одного рекомпъюта, либо `fail-closed` без промоута (конфигурируемо, default — `recompute`)
 
-### Requirement: Evidence PID bound to candidate source
-Система SHALL детерминированно вычислять `allowed_evidence_pids` для каждого кандидата как множество `source` PID, содержащих `entity` (word-boundary) или любую `VERIFIED alias` surface, и разрешать `evidence_pid` резолвера только из этого множества. Для `accepted_degraded` quarantined PIDs исключаются из `allowed` до резолвера и отклоняются при consumption в `v4_book_run`.
+### Requirement: Evidence PID bound to candidate source with quarantine plumbing
+Система SHALL детерминированно вычислять `allowed_evidence_pids` как множество `source` PID, содержащих `entity` (word-boundary) или любую `VERIFIED alias` surface. `strict runner` SHALL передавать `quarantined_pids` (из `selection`) в `B3` пост-процессинг; `B3` SHALL исключить их из `allowed` до резолвера. Если plumbing отсутствует — резолвер работает по полному `allowed`, а quarantine применяется только `fail-closed` в `v4_book_run`. Только `evidence_pid` из финального `allowed` разрешён.
 
 #### Scenario: Evidence bound prevents Babula
 - **WHEN** резолвер предлагает `Roxanne→Бабуль` с `evidence_pid` где `Бабуль` есть, но `Roxanne`/`aliases` в source этого pid отсутствуют (вне `allowed`)
@@ -45,8 +45,8 @@
 - **WHEN** глава `accepted_degraded` и `evidence_pid` входит в quarantined множество
 - **THEN** proposal с этим PID исключается до резолвера и отклоняется при чтении sidecar, даже если `proposed_ru` кириллица
 
-### Requirement: Resolver returns canonical nominative
-Резолвер SHALL для каждой сущности вернуть `proposed_ru` в именительном падеже (лемма), `surface_forms[]` как в переводе, `evidence_pid` из `allowed`, `type` (`person/place/group/nickname`), `confidence`, `decision accept/reject`.
+### Requirement: Resolver returns canonical nominative via versioned surface→lemma
+Резолвер SHALL для каждой сущности вернуть `proposed_ru` в именительном падеже (лемма, версия `lemma_v1` — token-wise `ru_stem` с `_RU_ENDINGS`, входит в `resolver_version`), `surface_forms[]` как в переводе, `evidence_pid` из `allowed`, `type` (`person/place/group/nickname`), `confidence`, `decision accept/reject`. Связь `surface_forms[]→proposed_ru` SHALL проверяться стем-эквивалентностью токен-по-токену, не точным вхождением `proposed_ru`.
 
 #### Scenario: Case canonicalization
 - **WHEN** в `evidence_pid` встречается `Диониса`, `Сандре`, `Завоевателю`
@@ -110,6 +110,17 @@
 #### Scenario: Off forbids observations
 - **WHEN** `mode=off`
 - **THEN** `glossary_proposals.json` не читается и любые новые `glossary` observations от `B3` отклоняются
+
+### Requirement: Cache-miss policy for glossary resolver is identity-bearing
+Система SHALL поддерживать `glossary_resolver_cache_miss_policy = recompute | fail_closed` (в `config_identity`, default `recompute`). При `B3 cache hit` + `missing/stale/tampered` sidecar — `recompute` разрешает один `reviewer` `acquire/restart`, `fail_closed` — `0` вызовов и без промоута.
+
+#### Scenario: Recompute on missing sidecar
+- **WHEN** `cache hit` и sidecar `missing`, `policy=recompute`
+- **THEN** система выполняет один батчевый `reviewer` вызов
+
+#### Scenario: Fail-closed on missing sidecar
+- **WHEN** `cache hit` и sidecar `missing`, `policy=fail_closed`
+- **THEN** система не вызывает модель и не промоутит
 
 ### Requirement: Model binding and failure semantics
 Система SHALL переиспользовать `reviewer` транспорт без новой роли: primary `russian_selector`, fallback `fidelity_reviewer`, далее `qwen_audit` для `local`; если ни одного `reviewer` binding нет — резолвер не вызывается (`fail-closed`, sidecar не пишется, глава не падает). Наследует `temperature 0`, `seed` детерм., `reasoning` как у `reviewer` (low), `structured_output mode prompt_only`, `bounded output budget ~3072` (достаточно для батча `~1k` content, effectively unlimited для этой роли). `response_schema=glossary_proposal/v1` (strict). `1 logical batch` = `≤3` transport attempts (bounded JSON retry). При `failure` — `LOG warning`, sidecar не пишется (не кэшируемый `failed`), глава не падает, `promotion fail-closed`; `≤1` logical batch/главу при непустом candidate set (`off`/нет кандидатов/валидный sidecar → `0` вызовов). Каждый `attempt` — в `usage.ndjson` (label `glossary_resolver`), `backend events`, `phase_progress`.

@@ -5,14 +5,14 @@
 ## Goals / Non-Goals
 
 **Goals:**
-* Канонический `Именительный` для имён (`Дионис` не `Диониса`, `Роксанна` не `Бабуль`)
+* Канонический `Именительный` для имён (`Дионис` не `Диониса`, `Роксанна` не `Бабуль`) через `surface_forms[]→proposed_ru` лемматизацию
 * Поддержка многословных (`Knights of the Basement`) с фразой целиком
 * Фильтр ложных `Locket/Driver` на источнике
-* `evidence_pid` детерм. привязан к source-кандидату, quarantined исключён
-* Полный `sidecar` identity + resume (включая `B3 cache hit`, атомарность, TOCTOU)
-* Один батч-вызов/главу, без нового старта `local` сервера, без трогания `whole-chapter` контракта
+* `evidence_pid` детерм. привязан к source-кандидату; `surface_forms[]` обязаны быть в `evidence` тексте, `proposed_ru` — лемма `surface_forms`
+* Полный `sidecar` identity + resume (включая `B3 cache hit` с `0` вызовов при валидном sidecar, иначе `acquire/restart` или `fail-closed`)
+* Один батч-вызов/главу на `reviewer` транспорте (fresh path без `switch`, cache-hit 0 при валидном sidecar)
 * Модель ничего не пишет в память — только предлагает, код валидирует `provenance`/коллизии
-* Identity-bearing `off|shadow|promote` без отката к небезопасному `align`
+* Identity-bearing `off|shadow|promote` + `cache_miss_policy` без отката к `align`
 
 **Non-Goals:**
 * Авто-промоут generic terms (`door→дверь`) — телеметрия
@@ -22,13 +22,13 @@
 
 ## Decisions
 
-**D1. Источник — B1.2 записи, прошедшие `validate_entity_context`, не `EntityRecord.status`.** У `EntityRecord` нет `status`; статусы у `anchor/aliases/claims`. Кандидат берётся из записи, где `anchor` `verified`, `canonical_type` в `anchor.span`, все `aliases` с `verified` и surface в своём `pid`; поверхность `entity`/`aliases` проверяется word-boundary в `source`. `glossary_worthy` — модельный `advisory bool` в промпте, но финальный гейт — код: `title-case`, не `EN_STOP` (проверка English, а не `RU_STOP`), поверхность есть в source. `advisory false` + код `true` → кандидат исключается (advisory не переопределяет код-отказ), `advisory true` + код `false` → также исключается. Отдельное поле `source_aliases[]` не вводится — используется существующее `aliases[]`. Бамп `EXTRACTOR_VERSION`, `prompt_version`, `CACHE_SCHEMA` — старый кэш несовместим. Альтернатива — оставить `freq` скан — отклонена (шум `said/looked`).
+**D1. Источник — B1.2 записи, прошедшие `validate_entity_context`, не `EntityRecord.status`.** У `EntityRecord` нет `status`; статусы у `anchor/aliases/claims`. Кандидат берётся из записи, где `anchor` `verified`, `canonical_type` в `anchor.span`, все `aliases` с `verified` и surface в своём `pid`; поверхность `entity`/`aliases` проверяется word-boundary в `source`. `glossary_worthy` — **model gate** (не advisory): модельный `bool` в промпте, `false` — финальный `veto` даже при проходе кодовой проверки (`title-case`, не `EN_STOP`, поверхность есть в source). Код-гейт также обязателен; оба должны пройти. Отдельное поле `source_aliases[]` не вводится — используется `aliases[]`. Бамп `EXTRACTOR_VERSION`, `prompt_version`, `CACHE_SCHEMA` — старый кэш несовместим. Risk-тезис «не повышает порог» снят: `glossary_worthy=false` повышает строгость (вето).
 
 **D2. Резолвер — отдельный батчевый LLM после `repair/re-audit` по единому пост-процессингу пути.** Точка — сразу после формирования `translations_repaired` (in-memory), до `_write_translations` и до `release()`. Fresh path: резолвер использует уже резидентную `reviewer` модель без дополнительного `switch`. При `B3` раннем `cache hit` (`b3_audit_repair.py:3769`) пост-процессинг тоже выполняется: если sidecar валиден — `0` вызовов; если `missing/stale/tampered` — разрешён `acquire/restart` `reviewer` модели для рекомпъюта **либо** `promotion fail-closed` (конфигурируемо, default — `recompute`). Честная формулировка: `0` вызовов только при валидном sidecar, иначе допускается старт. Альтернативы `whole-chapter generation` и `v4_book_run` — отклонены.
 
-**D3. Evidence привязка.** Для каждой сущности `allowed_evidence_pids = {pids where source contains entity (word-boundary) or VERIFIED alias surface}`. `evidence_pid` обязан быть в этом множестве. Проверка лемматизации: `surface_forms[]` обязаны точным вхождением содержаться в русском тексте `evidence_pid`; `proposed_ru` (лемма, именительный) НЕ обязан дословно содержаться — его связь с `surface_forms` проверяется отдельной `surface→lemma` валидацией (стем/морфология), а не `proposed_ru ∈ evidence_text`. Для `accepted_degraded` quarantined PIDs исключаются из `allowed` до резолвера; при consumption любой `evidence` с quarantined pid → `conflict`. `chunk_id` гейт недостаточен — используется `pid`-точный.
+**D3. Evidence привязка и лемматизация (versioned).** Для каждой сущности `allowed_evidence_pids = {pids where source contains entity (word-boundary) or VERIFIED alias surface}`. `evidence_pid` обязан быть в этом множестве. Plumbing: `strict runner` передаёт `quarantined_pids` (из `selection`/`book_run` quarantine) в `B3` пост-процессинг; если plumbing отсутствует — резолвер работает по полному `allowed`, а quarantine применяется только `fail-closed` в `v4_book_run` (fallback). Проверка: `surface_forms[]` обязаны точным вхождением быть в русском тексте `evidence_pid`; `proposed_ru` НЕ обязан дословно — связь `surface→lemma` — versioned token-wise `stem equivalence` (`ru_stem` с тем же `_RU_ENDINGS` что в `glossary_candidates.py`, токен-по-токену, многословные — каждый токен стеммируется, порядок сохранён; fallback — точный `casefold` при `len<3`). Версия алгоритма `lemma_v1` входит в `resolver_version`/`candidate_input_hash`; матрица тестов покрывает `Сандре→Сандра`, `Завоевателю→Завоеватель`, `дробовика→Дробовик`, `Рыцари Подвала` склонённые.
 
-**D4. Sidecar identity и resume.** `glossary_proposals.json` атомарно `tmp+rename`, пишется только как `regular non-symlink`. Identity поля: `schema=glossary-proposal/v1`, `chapter_id`, `snapshot_hash`, `config_identity`, `resolver_version`, `prompt_version`, `response_schema`, `model_ref`+`backend identity`, `candidate_input_hash` (hash упорядоченного входа `[{source, aliases, anchor_pid}]`), `translation_hash` (hash `translations_repaired` in-memory, см. D6). Валидация при чтении: тип файла, точная схема/ключи, размеры, отсутствие `duplicate entries`/`duplicate ru`, повторная `provenance` проверка перед промоутом. При `cache hit` + `missing/stale/tampered` sidecar → детерм. рекомпъют (один `resolver` вызов) по тому же пути; `stale` = любой hash mismatch.
+**D4. Sidecar identity и resume + cache-miss policy.** `glossary_proposals.json` атомарно `tmp+rename`, только `regular non-symlink`. Identity: `schema=glossary-proposal/v1`, `chapter_id`, `snapshot_hash`, `config_identity`, `resolver_version` (включает `lemma_v1`), `prompt_version`, `response_schema`, `model_ref`+`backend identity`, `candidate_input_hash`, `translation_hash` (in-memory `translations_repaired`). Валидация: тип, точная схема/ключи, размеры, отсутствие `duplicate entries`/`duplicate ru`, `surface_forms` в `evidence`, `provenance` повторно перед промоутом. `B3 cache hit` + `missing/stale/tampered` → по `glossary_resolver_cache_miss_policy` (`recompute | fail_closed`, identity-bearing, default `recompute`): `recompute` — один `reviewer` `acquire/restart` разрешён, `fail_closed` — `0` вызовов, без промоута. `stale` = любой hash mismatch. Политика входит в `config_identity`.
 
 **D5. Финальный текст — in-memory `translations_repaired`.** `B3` не имеет окончательного `translations.json` на диске (его пишет `v4_phase12_strict_runner` после `B3`). Источник истины для резолвера и `sidecar` — in-memory `translations_repaired`. `book_run` валидирует семантический `translation_hash` (нормализованный `pid→text` без `formatting` тегов) с учётом последующего `formatting` — `formatting` может добавить `<i>` но не менять `proposed_ru`.
 
@@ -44,7 +44,7 @@
 
 ## Risks / Trade-offs
 
-* [Галлюцинация `proposed_ru` с валидным `evidence pid` другого персонажа] → `allowed_evidence_pids` + проверка `proposed_ru` содержится в `evidence pid` русском тексте.
+* [Галлюцинация `proposed_ru` с валидным `evidence pid` другого персонажа] → `allowed_evidence_pids` + проверка `surface_forms[]` в `evidence` тексте + `surface→lemma`.
 * [Падеж проскочит] → промпт `номинатив`, `surface_forms[]` проверка, `lint` по паре, не по суффиксу.
 * [Многословные — разнобой] → модель возвращает фразу целиком, `evidence_windows` + `phrase` проверка.
 * [Крэш между `B3 cache` и `sidecar`] → единый пост-процессинг, атомарная запись, при следующем `resume` — рекомпъют.
