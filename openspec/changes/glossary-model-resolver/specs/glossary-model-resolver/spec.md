@@ -23,8 +23,8 @@
 Система SHALL вызывать **не более одного** `glossary_resolver` LLM-батча на главу после `B3 repair/re-audit` по единому пост-процессингу пути (включая ранний `B3 cache hit`), когда in-memory `translations_repaired` готов, до `release()` рантайма, и сохранять результат в `glossary_proposals.json`; при `mode=off`, пустом `candidate set` или валидном sidecar — `0` вызовов.
 
 #### Scenario: Resolver after repair
-- **WHEN** `B3AuditRepair.run` сформировал in-memory `translations_repaired` (включая случай полного `cache hit`)
-- **THEN** система выполняет один батчевый вызов резолвера и атомарно пишет `glossary_proposals.json` в `out_dir`
+- **WHEN** `B3AuditRepair.run` сформировал in-memory `translations_repaired`, `mode != off`, `candidate set` непуст, нет валидного sidecar и `policy` допускает `recompute`
+- **THEN** система выполняет **не более одного** батчевого вызова резолвера и атомарно пишет `glossary_proposals.json` в `out_dir`; при `off`/пустом сете/валидном sidecar — `0` вызовов
 
 #### Scenario: Cache hit still runs resolver
 - **WHEN** `B3` вернул `cache hit` и на диске уже есть валидный `entity_context_cache` и валидный sidecar
@@ -136,13 +136,13 @@
 - **WHEN** `glossary_resolver_mode=promote`
 - **THEN** `generation` валидация принимает только `{pid: translation}` без дополнительных ключей
 
-### Requirement: Fidelity lint is pair-based on proposals
-Система SHALL предоставлять `pact-fidelity-lint` проверку пары `proposed_ru + evidence surface_forms[]` по `glossary_proposals.json` / `resolver fixtures` / `validation report` (не по плоскому `glossary.json` `{en:ru}` без `evidence`); суффикс `а/я/у/ю/ом` и транслит `H→Х` SHALL NOT быть hard rule, `Бабуль`-блоклист — только временный incident regression test на proposals.
+### Requirement: Fidelity lint is pair-based on proposals (link only)
+Система SHALL предоставлять `pact-fidelity-lint` проверку пары `proposed_ru + evidence surface_forms[]` по `glossary_proposals.json` / `resolver fixtures` / `validation report` (не по плоскому `glossary.json` без `evidence`): проверяет `surface_forms[]∈evidence`, `lemma_v1` связь и `blocklist`; суффикс `а/я/у/ю/ом` и транслит `H→Х` SHALL NOT быть hard rule, `Бабуль`-блоклист — только временный incident regression test на proposals. Падежные `Кристоффа/Диониса` deterministic lint **не** отклоняет (стем-равны лемме); такие ошибки — `shadow` quality evaluation, не `fail-closed` перед промоутом (или будущий обязательный морфовалидатор).
 
 #### Scenario: Pair-based lint
 - **WHEN** `glossary_proposals.json` содержит `Roxanne→Роксанна` с `surface_forms [Роксанна]`
-- **THEN** lint проходит, а `Roxanne→Бабуль` с `surface_forms [Бабуль]` падает только по blocklist, не по суффиксу `а`
+- **THEN** deterministic lint проходит, а `Roxanne→Бабуль` с `surface_forms [Бабуль]` падает только по blocklist, не по суффиксу `а`
 
 #### Scenario: Suffix not hard
 - **WHEN** proposals содержат `Sandra→Сандра` и `Roxanne→Роксанна`
-- **THEN** lint не падает на окончании `а`
+- **THEN** deterministic lint не падает на окончании `а`; `Кристоффа` также не падает deterministic (стем-равно `Кристофф`) — ловится shadow-метрикой

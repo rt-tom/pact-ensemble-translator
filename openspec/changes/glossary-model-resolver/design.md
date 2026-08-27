@@ -40,7 +40,7 @@
 
 **D9. Term — отключить в production.** Production `book-run` НЕ запускает частотный `generic term` скан; существующая `term` ветка остаётся только как `library/diagnostic API` (`glossary_candidates.py` доступен для offline телеметрии), не вызывается из `B3`/`v4_book_run` и не резолвится/не промоутится.
 
-**D10. Lint.** Убрать suffix `а/я/у/ю/ом/ем` и транслит `H→Х` из hard lint. `Бабуль`-блоклист — только `incident regression` на `glossary_proposals.json` / `resolver fixtures` (временно), не на `glossary.json` (`{en:ru}` без `evidence`). Основная проверка — пара `proposed_ru + evidence surface_forms[]` (из `glossary_proposals.json` или `validation report`) с fixture-набором (`Роксанна/Херб/Дионис` pass, `Кристоффа/Диониса/Бабуль` fail); по одному `glossary.json` проверить пару невозможно.
+**D10. Lint и nominative.** Убрать suffix `а/я/у/ю/ом/ем` и транслит `H→Х` из hard lint. `Бабуль`-блоклист — только `incident regression` на `glossary_proposals.json` / `resolver fixtures` (временно). Deterministic lint проверяет только `evidence/link` (`surface_forms[]∈evidence`, `surface→lemma` `lemma_v1`, `blocklist`, `provenance`); `Кристоффа/Диониса` стем-равны `Кристофф/Дионис` и пройдут deterministic проверку — такие падежные ошибки ловятся `shadow` quality evaluation (post-factum метрика по набору, не `fail-closed` перед промоутом), либо будущим обязательным морфовалидатором (отдельная задача с алгоритмом/тестами). По одному `glossary.json` без `evidence` пару проверить невозможно.
 
 ## Risks / Trade-offs
 
@@ -49,7 +49,7 @@
 * [Многословные — разнобой] → модель возвращает фразу целиком, `evidence_windows` + `phrase` проверка.
 * [Крэш между `B3 cache` и `sidecar`] → единый пост-процессинг, атомарная запись, при следующем `resume` — рекомпъют.
 * [Лишний вызов] → батч `5-15` сущ., `~400` tok, `local` без рестарта.
-* [B1.2 пропустит редкое имя] → `≥1` вхождение, `glossary_worthy` не повышает порог.
+* [B1.2 пропустит редкое имя / `glossary_worthy=false` veto снизит recall] → `≥1` вхождение, `veto` отслеживается shadow-метрикой `proposed vs link` , не порогом вхождения.
 
 ## Migration Plan
 

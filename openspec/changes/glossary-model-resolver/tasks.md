@@ -18,7 +18,7 @@
 ## 4. Депрекейт и линт
 
 - [ ] 4.1 Депрекейт `align_candidates` для `proper_name` в `glossary_observations_from_entity_context` (term-ветка остаётся только `library/diagnostic API`, production `book-run` её не запускает) — верификация: `Shotgun→Дробовик` резолвится, `door→дверь` не промоутится и скан не вызывается
-- [ ] 4.2 Заменить `pact-fidelity-lint` suffix/translit hard checks на проверку пары `proposed_ru + evidence surface forms` с fixture (`Роксанна/Херб/Дионис` pass, `Кристоффа/Диониса/Бабуль` fail), `Бабуль`-блоклист — только regression — верификация: `Sandra→Сандра` и `Roxanne→Роксанна` не падают на `а`
+- [ ] 4.2 Заменить `pact-fidelity-lint` suffix/translit hard checks на проверку пары `proposed_ru + surface_forms[]` по `glossary_proposals.json` (deterministic `surface∈evidence` + `lemma_v1` + `blocklist`), `Кристоффа/Диониса` deterministic **не** падают (стем-равны), ловятся `shadow` quality evaluation; `Бабуль` — только regression — верификация: `Sandra→Сандра` и `Роксанна` не падают на `а`, `Кристоффа` не падает deterministic
 
 ## 5. Модель и наблюдаемость
 
