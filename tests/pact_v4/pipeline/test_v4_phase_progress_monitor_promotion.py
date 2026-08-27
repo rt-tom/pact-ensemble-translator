@@ -69,23 +69,64 @@ def test_phase_formatting_absent(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# _book_promotion_summary / render_book_report
+# _book_promotion_summary / render_book_report (book_run.json per-run)
 # ---------------------------------------------------------------------------
 
-def test_book_promotion_present(tmp_path: Path):
+def test_book_promotion_from_book_run_json(tmp_path: Path):
     base = tmp_path / "book"
     base.mkdir()
-    ch = _make_chapter(base, "chapter_0001_bonds-1-1")
-    # ensure chapter discovered
+    _make_chapter(base, "chapter_0001_bonds-1-1")
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    _write(base / "book_run.json", {
+        "schema": "pact-v4-book-run/v1",
+        "memory_dir": str(mem),
+        "chapters": [{
+            "chapter_id": "0001_bonds-1-1",
+            "promoted": True,
+            "candidates": {"generated": 2, "proposed": 2, "committed": 2, "conflicts": 0},
+            "book_memory_candidates": {"generated": 1, "proposed": 1, "committed": 1, "conflicts": 0},
+            "book_memory_promotions": [{"name": "Alice"}],
+        }],
+    })
+    report = tracker.render_book_report(base, memory_dir=mem)
+    assert "Promoted this run: glossary committed 2 \u00b7 memory committed 1 \u00b7 memory promotions 1 (1 chapters)" in report
+
+
+def test_book_promotion_none_committed(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _make_chapter(base, "chapter_0001_bonds-1-1")
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    _write(base / "book_run.json", {
+        "schema": "pact-v4-book-run/v1",
+        "memory_dir": str(mem),
+        "chapters": [{
+            "chapter_id": "0001_bonds-1-1",
+            "promoted": True,
+            "candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_candidates": {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0},
+            "book_memory_promotions": [],
+        }],
+    })
+    report = tracker.render_book_report(base, memory_dir=mem)
+    assert "Promoted this run: none (0 glossary / 0 memory)" in report
+
+
+def test_book_promotion_pending_no_book_run_json(tmp_path: Path):
+    base = tmp_path / "book"
+    base.mkdir()
+    _make_chapter(base, "chapter_0001_bonds-1-1")
     mem = tmp_path / "mem"
     mem.mkdir()
     _write(mem / "glossary.json", {"a": 1, "b": 2, "c": 3})
     _write(mem / "book_memory.json", {"k1": 1, "k2": 2})
     report = tracker.render_book_report(base, memory_dir=mem)
-    assert "Glossary promoted: 3 \u2192 glossary.json \u00b7 2 \u2192 memory" in report
+    assert "State glossary/memory: 3 / 2 (input+promoted; book_run.json pending)" in report
 
 
-def test_book_promotion_absent(tmp_path: Path):
+def test_book_promotion_no_data(tmp_path: Path):
     base = tmp_path / "book"
     base.mkdir()
     _make_chapter(base, "chapter_0001_bonds-1-1")
@@ -93,14 +134,13 @@ def test_book_promotion_absent(tmp_path: Path):
     mem.mkdir()
     report = tracker.render_book_report(base, memory_dir=mem)
     assert "Glossary promoted" not in report
-
-
-def test_book_promotion_absent_none_dir(tmp_path: Path):
-    base = tmp_path / "book2"
-    base.mkdir()
-    _make_chapter(base, "chapter_0001_bonds-1-1")
-    report = tracker.render_book_report(base, memory_dir=None)
-    assert "Glossary promoted" not in report
+    assert "Promoted this run" not in report
+    assert "State glossary/memory" not in report
+    # also with memory_dir=None
+    report2 = tracker.render_book_report(base, memory_dir=None)
+    assert "Glossary promoted" not in report2
+    assert "Promoted this run" not in report2
+    assert "State glossary/memory" not in report2
 
 
 # ---------------------------------------------------------------------------

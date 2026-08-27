@@ -2834,21 +2834,63 @@ def _resolve_state_root() -> Path:
     return Path("/home/rt/pact_runs/workers/media/book-1/state")
 
 
-def _book_promotion_summary(memory_dir: Optional[Path]) -> Optional[str]:
-    """Count promoted glossary/memory entries for a book run.
+def _book_promotion_summary(out_base: Path, memory_dir: Optional[Path] = None) -> Optional[str]:
+    """Book-level promotion summary from ``book_run.json`` (per-run) with fallback.
 
-    Promotion writes ``glossary.json`` / ``book_memory.json`` to the state
-    (memory) directory, not the book output directory.
+    Reads ``<out_base>/book_run.json`` (``pact-v4-book-run/v1``) when present
+    and reports per-run committed/promotions counts. When the book run has
+    not yet written ``book_run.json`` (in-progress) the fallback reads the
+    cumulative state files ``glossary.json`` / ``book_memory.json`` from
+    ``memory_dir`` and labels them honestly as input+promoted.
     """
+    data = _read_json(Path(out_base) / "book_run.json")
+    if isinstance(data, dict):
+        chapters = data.get("chapters")
+        if isinstance(chapters, list) and chapters:
+            g = 0
+            m = 0
+            p = 0
+            k = 0
+            for ch in chapters:
+                if not isinstance(ch, dict):
+                    continue
+                if ch.get("promoted") is True:
+                    k += 1
+                cand = ch.get("candidates")
+                if isinstance(cand, dict):
+                    g += _as_int(cand.get("committed"))
+                bmc = ch.get("book_memory_candidates")
+                if isinstance(bmc, dict):
+                    m += _as_int(bmc.get("committed"))
+                promo = ch.get("book_memory_promotions")
+                if isinstance(promo, list):
+                    p += len(promo)
+            if g > 0 or m > 0 or p > 0:
+                return f"Promoted this run: glossary committed {g} \u00b7 memory committed {m} \u00b7 memory promotions {p} ({k} chapters)"
+            return "Promoted this run: none (0 glossary / 0 memory)"
     if memory_dir is None:
         return None
-    glossary = _read_json(Path(memory_dir) / "glossary.json") or {}
-    memory = _read_json(Path(memory_dir) / "book_memory.json") or {}
-    g = len(glossary) if isinstance(glossary, (dict, list)) else 0
-    m = len(memory) if isinstance(memory, (dict, list)) else 0
-    if g == 0 and m == 0:
+    glossary = _read_json(Path(memory_dir) / "glossary.json")
+    memory = _read_json(Path(memory_dir) / "book_memory.json")
+    g_len: Optional[int] = None
+    m_len: Optional[int] = None
+    if isinstance(glossary, dict):
+        g_len = len(glossary)
+    elif isinstance(glossary, list):
+        g_len = len(glossary)
+    if isinstance(memory, dict):
+        m_len = len(memory)
+    elif isinstance(memory, list):
+        m_len = len(memory)
+    g_val = g_len if g_len is not None else 0
+    m_val = m_len if m_len is not None else 0
+    if g_val == 0 and m_val == 0:
         return None
-    return f"Glossary promoted: {g} → glossary.json · {m} → memory"
+    # Only render fallback when the state dir actually had data; if both
+    # files missing/corrupt we return None (no line).
+    if g_len is None and m_len is None:
+        return None
+    return f"State glossary/memory: {g_val} / {m_val} (input+promoted; book_run.json pending)"
 
 
 def render_book_report(out_base: Path, incremental: bool = False, memory_dir: Optional[Path] = None) -> str:
@@ -2877,7 +2919,7 @@ def render_book_report(out_base: Path, incremental: bool = False, memory_dir: Op
         if active_snap is None:
             active_snap = _read_snapshot(active, incremental=incremental)
         lines.append(render_report(active, active_snap))
-    promotion = _book_promotion_summary(memory_dir)
+    promotion = _book_promotion_summary(out_base, memory_dir)
     if promotion:
         lines.append("")
         lines.append(promotion)
