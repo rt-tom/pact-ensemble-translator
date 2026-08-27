@@ -166,9 +166,13 @@ cd ~/projects/pact-ensemble-translator
 # book-прогон: --out-base на ПАПКУ КНИГИ (скрипт сам обходит chapter_* и показывает активную главу)
 python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665
 
-# цикл обновления раз в SEC секунд (авто-поиск свежего book_*-каталога):
-cd ~/projects/pact-ensemble-translator
-python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$(ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1)" --watch 5
+# УПРОЩЁННЫЙ запуск: авто-поиск САМОГО СВЕЖЕГО book_*-каталога (любая книга), цикл раз в 5с.
+# Тот же приём через переменную (можно переиспользовать для resume и других команд):
+latest=$(ls -dt /home/rt/pact_runs/outputs/book_*/ 2>/dev/null | head -1 | sed 's#/$##') && echo "Monitoring: $latest" && python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$latest" --watch 5
+
+# Ещё короче — алиас pactmon (см. ~/.bash_aliases на media): просто `pactmon` или `pactmon 10` (10с)
+pactmon
+# RT-вариант монитора — см. выше («Monitor прогона (v42-monitor-compact)»): -ProjectRoot мониторит все прогоны сразу.
 ```
 Пример вывода (per-phase, без 6-line cap, `--out-base` добавляет book-таблицу + промошен):
 ```
@@ -187,7 +191,7 @@ Promoted this run: glossary committed 0 · memory committed 0 · memory promotio
 ```
 Формат заголовка — `[<id>] run <elapsed> · quiet <age>` (без `mode=fine`, без дублирующих `status:`/`phase:`); каждая фаза — одна строка, активная помечена `>`; `Glossary`/`Formatting` появляются только когда есть `glossary_proposals.json`/`formatting_report.json`; `Promoted this run: glossary committed … · memory committed … · memory promotions … (N chapters)` / `Promoted this run: none (0 glossary / 0 memory)` / `State glossary/memory: N / M (input+promoted; book_run.json pending)` — book-уровень (`--out-base` + `--memory-dir`, по умолчанию state-root).
 
-Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`; артефакты прогона (`phase_progress.ndjson`, `server_logs`) лежат внутри `book_*/chapter_<NNNN>_*/`, НО для book-режима указывается сама папка книги (`--out-base`), а не подкаталог главы. Свежий book-каталог: `ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1`.
+Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`; артефакты прогона (`phase_progress.ndjson`, `server_logs`) лежат внутри `book_*/chapter_<NNNN>_*/`, НО для book-режима указывается сама папка книги (`--out-base`), а не подкаталог главы. Свежий book-каталог (любая книга): `ls -dt /home/rt/pact_runs/outputs/book_*/ | head -1` (слэш отсекает book_html_report.json).
 
 **Ландшафт мониторов (чтобы не путаться):** `monitor_pipeline_v31.ps1` — устаревший v3.1-монитор (только в старых handoff-доках, к v4 не относится); `monitor_pipeline.ps1` — новый компактный v42-монитор (PowerShell/RT); `v4_phase_progress.py` — Python-ядро монитора (book/chapter режимы, работает на media). Изменение **v42-monitor-compact (PR #220, `aa08858`)** добавило/переработало новые мониторы; старый `v31` оставлен как legacy и v4-пайплайном не используется.
 
