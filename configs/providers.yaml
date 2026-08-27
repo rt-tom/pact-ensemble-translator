@@ -15,9 +15,12 @@
 #   --translator -> generator + repair (repair falls back to generator)
 #   --reviewer   -> qwen_audit + fidelity_reviewer + russian_selector
 #                   + entity_extractor (all audit roles)
-# Defaults are NOT changed: when the flags are absent the runtime config's
-# model_bindings are used verbatim (deepseek-v4-flash + qwen3.7-plus via
-# opencode-go). Switching a flag changes the backend identity (new cache).
+# Defaults come from the SELECTED runtime profile's model_bindings (see
+# configs/runtime_*.example.yaml), NOT from this file. For the canonical
+# remote profile (--remote / configs/runtime_remote.example.yaml) the defaults
+# are musefree (generator + repair) + luna (all audit roles), reasoning 3;
+# the composite example profile still defaults to deepseek4flash + qwen37.
+# Switching a --translator/--reviewer flag changes the backend identity (new cache).
 #
 # reasoning_contract.variants: the reasoningEffort values the model declares
 # in the opencode provider catalog (checked 2026-08-14 against `opencode
@@ -78,15 +81,27 @@ providers:
   openai:
     kind: opencode_server
     models:
+      # GPT-5.6 Luna (verified 2026-08-26 via `opencode models openai --verbose`,
+      # serve 1.18.21 on media: variants none/low/medium/high/xhigh/max).
       luna:
         ref: openai/gpt-5.6-luna
+        # variants verified 2026-08-26 via `opencode models openai --verbose`:
+        # none, low, medium, high, xhigh, max
         reasoning_contract:
           variants: [none, low, medium, high, xhigh, max]
+      # GPT-5.6 Sol (verified 2026-08-26 via `opencode models openai --verbose`:
+      # variants none/low/medium/high/xhigh/max; providerID openai).
       sol:
         ref: openai/gpt-5.6-sol
+        # variants verified 2026-08-26 via `opencode models openai --verbose`:
+        # none, low, medium, high, xhigh, max
         reasoning_contract:
           variants: [none, low, medium, high, xhigh, max]
+      # GPT-5.6 Terra (verified 2026-08-26 via `opencode models openai --verbose`:
+      # variants none/low/medium/high/xhigh/max; providerID openai).
       terra:
         ref: openai/gpt-5.6-terra
+        # variants verified 2026-08-26 via `opencode models openai --verbose`:
+        # none, low, medium, high, xhigh, max
         reasoning_contract:
           variants: [none, low, medium, high, xhigh, max]
