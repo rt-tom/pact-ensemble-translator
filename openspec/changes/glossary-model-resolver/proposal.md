@@ -15,7 +15,7 @@
 * Отключить авто-промоут `kind=term` (generic terms только телеметрия), оставить только `proper_name` через новый путь.
 * Заменить suffix/translit hard lint на `blocklist` как incident regression + проверку пары `proposed_ru + evidence surface forms` с fixture-набором.
 * Ввести `glossary_resolver_mode = off | shadow | promote` и `glossary_resolver_cache_miss_policy = recompute | fail_closed` (оба identity-bearing); `off` запрещает новые observations, отката к небезопасному `align` нет; `recompute` разрешает `acquire/restart` при `cache hit` с `missing/stale` sidecar.
-* Переиспользовать существующие параметры `reviewer` роли (`russian_selector` primary, fallback `fidelity_reviewer` → `local Qwen / remote Luna`) для резолвера с bounded `3072` output budget и `prompt_only` режимом — `1 logical batch = N transport attempts` (bounded JSON retry), `failure → fail-closed promotion, глава не падает`, запись в `usage.ndjson`/`backend events`/`phase_progress`.
+* Переиспользовать существующие параметры `reviewer` роли (`russian_selector` primary, fallback `fidelity_reviewer` → `local Qwen / remote Luna`, его `max_output_tokens`/`reasoning`/`temperature`/`prompt_only` как есть, без отдельного `3072` — его `content`-оценка `~1k` без учёта `reasoning 8192` привела бы к `truncated`) для резолвера — `1 logical batch = N transport attempts` (bounded JSON retry), `failure → fail-closed promotion, глава не падает`, запись в `usage.ndjson`/`backend events`/`phase_progress`.
 
 ## Capabilities
 
@@ -28,5 +28,5 @@
 ## Impact
 
 * Код: `pact_v4/audit/entity_extractor.py` (промпт, версия), `pact_v4/pipeline/b3_audit_repair.py` (резолвер на `reviewer` параметрах, sidecar, post-processing), `pact_full_pipeline_runner_v1/v4_book_run.py` (чтение sidecar), `pact_v4/phase1/glossary_candidates.py` (депрекейт `align` для имён), `tools/pact_fidelity_lint`.
-* Рантайм: +1 батчевый вызов/главу на `reviewer` транспорте (батч 5-15 сущностей, bounded `3072`), `local Qwen` остаётся резидентным на fresh path / `acquire/restart` на cache-miss, `remote` — no-op `release()`.
+* Рантайм: +1 батчевый вызов/главу на `reviewer` транспорте (батч 5-15 сущностей) с его существующим бюджетом (`reasoning+content` уже покрывает аудит `~3.6k` входа), `local Qwen` остаётся резидентным на fresh path / `acquire/restart` на cache-miss, `remote` — no-op `release()`.
 * Данные: формат `glossary.json` без изменений; новый артефакт `glossary_proposals.json` в `out_dir` (persistent-data boundary).
