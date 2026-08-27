@@ -157,6 +157,7 @@ Classify work before editing:
   input, intended output location, and irreversible effects.
 - After every deploy, sync production checkout `D:\pact\pact_translator_v4_1` with `main` (`git pull --ff-only` on `RT`); deployment is not complete until `RT` reports `Already up to date` or the deployed commit.
 - Run-launch commands (RT / media; `--remote "sol/terra"` translator/reviewer aliases; `--chapters`; `--preflight`; monitor `monitor_pipeline.ps1`; required env vars) are catalogued in `docs/agent_operations/AGENTS_REFERENCE_RU.md` (section «Команды запуска прогона»). When asked to produce a launch or monitor command, consult that section first.
+- When providing shell commands to the owner, ALWAYS prepend the correct `cd` to the repo root so the command runs from the right directory without manual editing: media → `cd ~/projects/pact-ensemble-translator` (agent shell uses `python3`), RT → `cd D:\pact\pact_translator_v4_1` (PowerShell, `python`). Never hand over a bare command that assumes the caller is already in the repo root.
 
 ## Data and external boundaries
 

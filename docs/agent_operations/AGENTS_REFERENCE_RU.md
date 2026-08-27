@@ -156,10 +156,12 @@ powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pi
 
 **Media (Linux) — отдельный монитор:** `monitor_pipeline.ps1` — это PowerShell/RT, на media не запускается. Для media-прогонов используйте Python-монитор `v4_phase_progress` (читает `phase_progress.ndjson` read-only, пайплайн не трогает):
 ```bash
-# однократный снимок (в интерактивном shell владельца — python, в агентской сессии — python3):
+# media (Linux), из корня репозитория (всегда с cd!):
+cd ~/projects/pact-ensemble-translator
 python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665
 
 # цикл обновления раз в SEC секунд:
+cd ~/projects/pact-ensemble-translator
 python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665 --watch 5
 ```
 Параметры: `--out-dir` (каталог прогона), `--out-base` (book-уровень, сводка по главам), `--watch SEC` (цикл обновления). Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>` (имя берётся из `ls -dt /home/rt/pact_runs/outputs/book_*` — самый свежий).
