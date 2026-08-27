@@ -2540,7 +2540,7 @@ def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> s
         chapter_label = (identity.get('chapter_id') or out_dir.name).replace('chapter_', '')
         lines_out: List[str] = []
         lines_out.append(f"== V4 run progress: {out_dir} ==")
-        lines_out.append(f"[{chapter_label}] {elapsed_txt} · {alive_txt}")
+        lines_out.append(f"[{chapter_label}] run {elapsed_txt} · {alive_txt}")
         # Single source of truth: one line per pipeline phase (no duplication,
         # no forced line cap). Glossary + Formatting phases come from
         # _phase_block_lines (which also drops the legacy extra_parts block).
@@ -2569,29 +2569,43 @@ def render_report(out_dir: Path, snapshot: Optional[Dict[str, Any]] = None) -> s
         else:
             lines_out.append(usage_line)
         return "\n".join(lines_out)
-    # Coarse mode (no phase_progress) - keep legacy detailed but hide server_logs age when not fresh (finding 3)
-    # Minimal coarse output: header + phase + chunk info + usage hint
-    # To keep tests that check coarse substrings, include basic info
+    # Coarse mode (no phase_progress.ndjson): same single-source per-phase layout
+    # as fine mode (run/quiet header, one line per phase) — no status:/phase:/mode= duplication.
     elapsed_txt = f"{identity['elapsed_seconds']:.0f}s" if identity['elapsed_seconds'] is not None else "?"
-    alive_txt = "alive" if identity['alive'] else "stalled"
+    alive_age = identity.get('last_usage_age')
+    if alive_age is None:
+        alive_age = _recent_event_age(events) if events else None
+        if alive_age is not None and alive_age == float('inf'):
+            alive_age = None
+    alive_txt = f"quiet {alive_age:.0f}s" if alive_age is not None and alive_age <= FRESHNESS_WINDOW_SECONDS else ("quiet stalled" if identity['alive'] else "quiet ?")
     chapter_label = (identity.get('chapter_id') or out_dir.name).replace('chapter_', '')
-    header_phase = _PHASE_DISPLAY.get(phase, phase)
     lines: List[str] = []
     lines.append(f"== V4 run progress: {out_dir} ==")
-    lines.append(f"[{chapter_label}] {elapsed_txt} | {header_phase} | {alive_txt} | mode=coarse")
-    lines.append(f"status: {_status_line(out_dir, events, phase, snapshot)}")
-    lines.append(f"phase: {header_phase} -- {phase_basis}")
-    phase_lines_raw = _phase_block_lines(out_dir, events, snapshot)
-    lines.extend(phase_lines_raw)
-    # Usage block still shown in coarse (not compact) but without detailed table? Keep simple hint
+    lines.append(f"[{chapter_label}] run {elapsed_txt} · {alive_txt}")
+    phase_block = _phase_block_lines(out_dir, events, snapshot)
+    bodies = [l.strip() for l in phase_block[1:] if l.strip() and "нет Phase" not in l]
+    if bodies:
+        lines.extend(_align_phase_lines(bodies, phase))
+    else:
+        lines.append("(нет Phase-артефактов)")
+    # Usage summary (speed merged when local + fresh) — informational, not phase duplication
     usage_rows = snapshot.get("usage") or []
     if usage_rows:
         total_in = sum(_as_int(r.get("input_tokens")) for r in usage_rows)
         total_out = sum(_as_int(r.get("output_tokens")) for r in usage_rows)
-        lines.append(f"usage: {len(usage_rows)} calls in={_fmt_tokens(total_in)} out={_fmt_tokens(total_out)}")
+        total_reas = sum(_as_int(r.get("reasoning_tokens")) for r in usage_rows)
+        cost_vals = [_as_float(r.get("reported_cost")) for r in usage_rows if r.get("reported_cost") is not None]
+        total_cost = sum(cost_vals)
+        cost_txt = f" ${total_cost:.2f}" if any(c != 0 for c in cost_vals) else ""
+        usage_line = f"usage: {len(usage_rows)} calls in={_fmt_tokens(total_in)} out={_fmt_tokens(total_out)} reas={_fmt_tokens(total_reas)}{cost_txt}"
     else:
-        lines.append("usage: 0 calls")
-    # Server logs: gate age
+        usage_line = "usage: 0 calls"
+    if is_local_fresh and speed_lines:
+        speed_compact = speed_lines[1].strip() if len(speed_lines) > 1 else speed_lines[0].strip()
+        speed_compact = speed_compact.replace("gemma:", "speed gemma:").replace("qwen:", "speed qwen:")
+        lines.append(f"{usage_line} | {speed_compact}")
+    else:
+        lines.append(usage_line)
     log_count, newest_age = _server_log_freshness(out_dir)
     if is_local_fresh and newest_age is not None:
         lines.append(f"server_logs: {log_count} file(s), age since server start {newest_age:.0f}s")

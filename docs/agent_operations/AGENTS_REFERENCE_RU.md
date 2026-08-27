@@ -173,7 +173,7 @@ python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$(ls -dt /
 Пример вывода (per-phase, без 6-line cap, `--out-base` добавляет book-таблицу + промошен):
 ```
 == V4 run progress: /home/rt/pact_runs/outputs/book_0001-0001_remote_.../chapter_0001_... ==
-[0001] 123s · quiet 2s
+[0001_bonds-1-1] run 1322s · quiet ?
   Entity extraction        : сущностей: 12 | claims: verified 4 / candidate 2
 > Whole-chapter translation: attempt 1/3 | source 286 слов → перевод 1200 слов · PID ok
   R-editor                 : chunks done=2/2 | safe (применено)=5 | review (предложено)=1
