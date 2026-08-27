@@ -102,6 +102,9 @@ from pact_v4.phase1.memory import MemoryManager, atomic_write
 from pact_v4.runtime.bible_renderer import render_bible_section
 
 # v41 italics: formatting model-call defaults (mirror V3 Defaults["formatting"])
+# v41 fix: dynamic max_tokens via resolve_format_mappings (40*spans+500, min 800 cap 8192)
+# _DEFAULT_FORMATTING_CFG max_tokens is None sentinel (dynamic) — effective budget
+# computed per-batch in resolve_format_mappings. Explicit int overrides dynamic.
 _DEFAULT_FORMATTING_CFG: dict = {
     "enabled": True,
     "required": False,
@@ -109,7 +112,7 @@ _DEFAULT_FORMATTING_CFG: dict = {
     "top_p": 0.9,
     "top_k": 32,
     "enable_thinking": False,
-    "max_tokens": 1600,
+    "max_tokens": None,
     "generation_retries": 2,
     "tags": ["em", "strong", "i", "b", "a"],
     "required_tags": ["em", "strong", "i", "b", "a"],
@@ -117,6 +120,7 @@ _DEFAULT_FORMATTING_CFG: dict = {
     "max_blocks_per_call": 12,
     "retry_unresolved_spans": True,
     "on_failure": "omit_tag",
+    "formatting_single_call_whole_chapter": True,
 }
 # lenient default: do not block chapter on unresolved italics (debt)
 _DEFAULT_MAX_FORMATTING_INCIDENTS = 999
@@ -978,6 +982,7 @@ class _FormattingBackendClient:
                 model_ref = bindings.get("generator") or bindings.get("default") or "default"
             except Exception:
                 model_ref = "default"
+        # v41: formatting reasoning 0 — never pass reasoning in request_options
         req = CompletionRequest(
             model_ref=model_ref,
             messages=msgs,
@@ -987,10 +992,43 @@ class _FormattingBackendClient:
             label=label or "formatting",
         )
         resp = self._backend.complete(req)
+        # Propagate reasoning/finish_reason/usage for diagnostics (v41 3.3)
+        # CompletionResponse has finish_reason/usage; reasoning may be in raw_metadata
+        reasoning = ""
+        try:
+            raw_md = getattr(resp, "raw_metadata", {}) or {}
+            if isinstance(raw_md, dict):
+                reasoning = str(raw_md.get("reasoning") or raw_md.get("reasoning_content") or "")
+        except Exception:
+            reasoning = ""
+        finish_reason = str(getattr(resp, "finish_reason", "") or "")
+        usage = dict(getattr(resp, "usage", {}) or {})
+        text = resp.text if hasattr(resp, "text") else str(resp)
+        # v41 round2 fix: propagate backend's actual record, not request intent.
+        # raw_metadata["response_format_attempted"] is False when ApiClient fell back
+        # after grammar rejection; using req.response_schema would incorrectly report True.
+        try:
+            _raw_md2 = getattr(resp, "raw_metadata", None) or {}
+            if isinstance(_raw_md2, dict) and "response_format_attempted" in _raw_md2:
+                _val = _raw_md2["response_format_attempted"]
+                if _val is None:
+                    response_format_attempted = bool(getattr(req, "response_schema", None))
+                else:
+                    response_format_attempted = bool(_val)
+            else:
+                response_format_attempted = bool(getattr(req, "response_schema", None))
+        except Exception:
+            response_format_attempted = bool(getattr(req, "response_schema", None))
         class _Gen:
-            def __init__(self, text):
-                self.content = text
-        return _Gen(resp.text if hasattr(resp, "text") else str(resp))
+            def __init__(self, content, finish_reason, usage, reasoning, response_format_attempted):
+                self.content = content
+                self.text = content
+                self.finish_reason = finish_reason
+                self.usage = usage
+                self.reasoning = reasoning
+                self.reasoning_content = reasoning
+                self.response_format_attempted = response_format_attempted
+        return _Gen(text, finish_reason, usage, reasoning, response_format_attempted)
     def close(self):
         if self._runtime is not None:
             try:
@@ -1029,6 +1067,29 @@ def _build_formatting_client(args, extra, fmt_cfg):
                 tmp.reviewer = reviewer
                 tmp.providers_config = Path(providers_cfg) if providers_cfg else None
                 backend = _apf(tmp, backend)
+            # v41 fix: formatting must run with reasoning 0 even when runtime
+            # config carries a Gemma reasoning budget (2000). Override server
+            # args so formatting is not starved by reasoning tokens.
+            try:
+                from dataclasses import replace as _replace
+                from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _gemma_server_args_for_reasoning as _gemma_args0
+                from pact_v4.runtime.runtime_config import CompositeBackendConfig as _Composite, LocalLlamaBackendConfig as _Local
+                if isinstance(backend, _Local):
+                    new_sa = dict(backend.server_args)
+                    new_sa["gemma"] = _gemma_args0(0)
+                    backend = _replace(backend, server_args=new_sa)
+                elif isinstance(backend, _Composite):
+                    new_backends = {}
+                    for _name, _sub in backend.backends.items():
+                        if isinstance(_sub, _Local):
+                            _nsa = dict(_sub.server_args)
+                            _nsa["gemma"] = _gemma_args0(0)
+                            new_backends[_name] = _replace(_sub, server_args=_nsa)
+                        else:
+                            new_backends[_name] = _sub
+                    backend = _replace(backend, backends=new_backends)
+            except Exception:
+                pass
         else:
             # Historical local default — same backend as strict-runner run_local_default
             # (required so the ordinary CLI path without --runtime-config still resolves
@@ -1197,7 +1258,7 @@ def run_book(
                             # Resolve target_text via model (only PIDs with spans)
                             _mappings: dict = {}
                             if formatting_client is not None:
-                                _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations)
+                                _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
                             else:
                                 # No client injected (e.g. real run without explicit client):
                                 # produce empty mappings -> spans become lenient debt, report still written.
