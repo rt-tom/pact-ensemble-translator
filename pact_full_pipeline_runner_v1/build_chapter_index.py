@@ -288,6 +288,39 @@ def build_chapter_index(
     for one chapter — the value stored under ``chapter_id`` in
     ``chapter_index.json``.
     """
+    # Fail-soft to narrator+seed when schema/policy unknown (spec requirement)
+    bm_schema = book_memory.get("schema") if isinstance(book_memory, Mapping) else None
+    bm_policy_ver = book_memory.get("book_memory_policy_version") if isinstance(book_memory, Mapping) else None
+    if isinstance(bm_schema, str) and bm_schema not in ("", "pact-v4-book-memory/v2"):
+        narrator_name_fs = ""
+        pov_fs = book_memory.get("pov") if isinstance(book_memory, Mapping) else None
+        if isinstance(pov_fs, Mapping):
+            narrator_name_fs = str(pov_fs.get("source_name") or "")
+        chars_fs = [narrator_name_fs] if narrator_name_fs else []
+        raw_facts_fs = book_memory.get("facts") if isinstance(book_memory, Mapping) else None
+        facts_fs = []
+        if isinstance(raw_facts_fs, list):
+            for fact in raw_facts_fs:
+                if isinstance(fact, Mapping) and fact.get("seed") is True:
+                    t2 = str(fact.get("fact") or fact.get("text") or "")
+                    if t2:
+                        facts_fs.append(t2)
+        return {"characters": sorted(set(chars_fs), key=str.casefold), "named_entities": [], "terms": [], "facts": sorted(set(facts_fs), key=str.casefold), "address": []}
+    if isinstance(bm_policy_ver, str) and bm_policy_ver not in ("", "book-memory-policy/v1"):
+        narrator_name_fs = ""
+        pov_fs = book_memory.get("pov") if isinstance(book_memory, Mapping) else None
+        if isinstance(pov_fs, Mapping):
+            narrator_name_fs = str(pov_fs.get("source_name") or "")
+        chars_fs = [narrator_name_fs] if narrator_name_fs else []
+        raw_facts_fs = book_memory.get("facts") if isinstance(book_memory, Mapping) else None
+        facts_fs = []
+        if isinstance(raw_facts_fs, list):
+            for fact in raw_facts_fs:
+                if isinstance(fact, Mapping) and fact.get("seed") is True:
+                    t2 = str(fact.get("fact") or fact.get("text") or "")
+                    if t2:
+                        facts_fs.append(t2)
+        return {"characters": sorted(set(chars_fs), key=str.casefold), "named_entities": [], "terms": [], "facts": sorted(set(facts_fs), key=str.casefold), "address": []}
     character_names = _iter_names(book_memory, "characters")
     entity_names = _iter_names(book_memory, "entities")
 
@@ -415,19 +448,35 @@ def build_chapter_index(
                 address.append(text)
     address = sorted(set(address), key=str.casefold)
 
-    # v2: split characters into characters vs named_entities based on book_memory type
-    # For now, named_entities and terms are empty unless book_memory provides them; preserve compatibility
-    named_entities = []
-    terms = []
-    # terms from approved world terms if present in source
+    # v2 type-aware terms: world_term memory_class entities that are approved terms and present in source, causal filtered
+    terms: List[str] = []
+    # First collect world_term entities that are present
+    for section in ("characters", "entities"):
+        for name in _iter_names(book_memory, section):
+            entry = book_memory.get(section, {}).get(name) if isinstance(book_memory.get(section), dict) else None
+            mc = str(entry.get("memory_class") or "") if isinstance(entry, Mapping) else ""
+            if mc == "world_term":
+                # Causal: must be learned strictly before target chapter
+                chs = _entry_chapters(entry) if isinstance(entry, Mapping) else []
+                if chs and not any(_chapter_before(ch, chapter_id) for ch in chs):
+                    continue
+                if any(_term_present(source_text, form) for form in _variants_with_provenance(book_memory, section, name, chapter_id)):
+                    terms.append(name)
+    # Also include approved_terms from policy that may not be stored as entities (legacy)
     approved_terms = []
     if isinstance(book_memory, dict):
         policy_terms = book_memory.get("policy", {}).get("approved_terms", []) if isinstance(book_memory.get("policy"), dict) else []
         approved_terms = [str(t) for t in policy_terms]
     for term in approved_terms:
+        # Avoid duplicate if already added via world_term entity
+        if term.casefold() in {t.casefold() for t in terms}:
+            continue
         if _term_present(source_text, term):
+            # If term is not yet in world_term entities but approved, still expose as term when present (conservative)
             terms.append(term)
     terms = sorted(set(terms), key=str.casefold)
+    # Facts already filtered via pre_chapter_book_memory (chapter < N) and variant-aware presence above which uses provenance-filtered forms
+    # Ensure per-field provenance strictly earlier is enforced for fact keys that are aliases (already via _variants_with_provenance)
     return {
         "characters": characters,
         "named_entities": named_entities,

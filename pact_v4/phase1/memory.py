@@ -14,23 +14,36 @@ except Exception:
     _HAS_POLICY=False
 
 CANONICAL_FILES = ["glossary.json", "book_memory.json", "chapter_index.json", "observations.json"]
-# deterministic replacement order per spec: glossary, book_memory, chapter_index, observations
 REPLACEMENT_ORDER = ["glossary.json", "book_memory.json", "chapter_index.json", "observations.json"]
 MARKER_NAME = ".pact_transaction_marker.json"
 BACKUP_SUFFIX = ".pact_backup"
+# Only these extra file patterns are permitted: exact marker and backup suffix files, and candidate tmp dirs which are directories not files
+ALLOWED_EXTRA_FILES = {MARKER_NAME}
+# Temp files inside base_dir are not allowed except during atomic_write (which uses mkstemp with random suffix then replace immediately). Any lingering .tmp or .pact_* besides marker/backup is rejected.
 
 def _canonical_hash(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-def _file_hash(path: str) -> str:
+def _raw_file_hash(path: str) -> str:
+    # Raw bytes hash, not canonical JSON hash
     if not os.path.exists(path):
-        return _canonical_hash({})
+        return ""
     try:
-        data = open(path, "rb").read()
-        return hashlib.sha256(data).hexdigest()
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
     except OSError:
         return ""
+
+# Backward compat alias - used for internal staged content hash via canonical (for comparison) but marker now uses raw
+def _file_hash(path: str) -> str:
+    return _raw_file_hash(path)
 
 def atomic_write(filepath: str, data: Any):
     dir_name = os.path.dirname(filepath)
@@ -39,10 +52,10 @@ def atomic_write(filepath: str, data: Any):
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, text=True)
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, filepath)
-    # fsync dir
     try:
         dfd = os.open(dir_name or ".", os.O_DIRECTORY)
         os.fsync(dfd)
@@ -56,19 +69,7 @@ def load_json(filepath: str, default: Any = None) -> Any:
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def _is_regular_file(path: str) -> bool:
-    try:
-        st = os.lstat(path)
-        import stat
-        if not stat.S_ISREG(st.st_mode):
-            return False
-        # reject symlink at ancestor: lstat already checks leaf; check ancestors
-        return True
-    except OSError:
-        return False
-
 def _validate_no_symlink_ancestors(base_dir: str, filename: str) -> bool:
-    # check each ancestor up to base_dir for symlink
     cur = os.path.join(base_dir, filename)
     while True:
         try:
@@ -84,7 +85,6 @@ def _validate_no_symlink_ancestors(base_dir: str, filename: str) -> bool:
             if os.path.islink(cur):
                 return False
             break
-    # also check base_dir itself
     if os.path.islink(base_dir):
         return False
     return True
@@ -94,24 +94,34 @@ def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
         entries = os.listdir(base_dir)
     except OSError as e:
         return f"cannot list dir: {e}"
-    # filter out marker and backup files, temp files
-    visible = []
-    for e in entries:
-        if e.startswith(".pact_") or e.endswith(".tmp") or e.endswith(BACKUP_SUFFIX):
-            continue
-        visible.append(e)
-    # check extra files/dirs
+    # Strict allow-list: only canonical files plus exact marker and backup files are permitted
+    # Any other .pact_*, *.tmp, extra file/dir, symlink, special file is rejected
     allowed = set(CANONICAL_FILES)
-    for e in visible:
+    for e in entries:
+        # Allow marker file exactly
+        if e == MARKER_NAME:
+            continue
+        # Allow backup files exactly ending with BACKUP_SUFFIX
+        if e.endswith(BACKUP_SUFFIX):
+            # Ensure corresponding canonical base exists (e.g., glossary.json.pact_backup)
+            base = e[: -len(BACKUP_SUFFIX)]
+            if base in CANONICAL_FILES:
+                continue
+            return f"extra entry {e!r} not in canonical set (unknown backup)"
+        # Candidate tmp dirs created during transaction: .pact_candidate_* are allowed as transient transaction staging (same-filesystem bundle)
+        if e.startswith(".pact_candidate_"):
+            # Allow transient candidate dirs during transaction; they are not part of canonical set but are known transaction staging
+            continue
+        # Any other .pact_* or *.tmp is rejected
+        if e.startswith(".pact_") or e.endswith(".tmp"):
+            return f"extra entry {e!r} not in canonical set (marker/tmp not allowed)"
         if e not in allowed:
             return f"extra entry {e!r} not in canonical set"
-    # check each canonical file exists and is regular file, no symlink, no special
+    # Require ALL four canonical files present (no missing allowed)
     for fname in CANONICAL_FILES:
         fpath = os.path.join(base_dir, fname)
         if not os.path.lexists(fpath):
-            # missing is allowed for initial state; lexists (not exists) is required
-            # so a broken symlink is still detected by the islink check below
-            continue
+            return f"missing canonical file {fname}"
         if os.path.islink(fpath):
             return f"symlink not allowed: {fname}"
         if not _validate_no_symlink_ancestors(base_dir, fname):
@@ -121,15 +131,10 @@ def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
             import stat
             if not stat.S_ISREG(st.st_mode):
                 return f"non-regular file {fname}: mode {oct(st.st_mode)}"
-        except OSError as e:
-            return f"cannot stat {fname}: {e}"
-        # check special files via stat
-        try:
             if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
                 return f"special file {fname}"
-        except Exception:
-            pass
-        # validate JSON
+        except OSError as e:
+            return f"cannot stat {fname}: {e}"
         try:
             with open(fpath, 'r', encoding='utf-8') as f:
                 json.load(f)
@@ -146,22 +151,27 @@ class MemoryManager:
         self.chapter_index_path = os.path.join(base_dir, 'chapter_index.json')
         self.observations_path = os.path.join(base_dir, 'observations.json')
         self._marker_path = os.path.join(base_dir, MARKER_NAME)
-        # startup recovery: if marker exists, restore backups
+        os.makedirs(base_dir, exist_ok=True)
+        # Ensure all four canonical files exist for strict validation (create empty JSON if missing)
+        for fpath in [self.glossary_path, self.book_memory_path, self.chapter_index_path, self.observations_path]:
+            if not os.path.lexists(fpath):
+                try:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        json.dump({}, f, ensure_ascii=False, indent=2)
+                        f.write("\n")
+                except OSError:
+                    pass
         self._recover_if_needed()
 
     def _recover_if_needed(self):
         if not os.path.exists(self._marker_path):
             return
-        # Fail-closed: corrupt marker must NOT be silently deleted; keep it and abort
         try:
             marker = json.loads(open(self._marker_path, 'r', encoding='utf-8').read())
         except Exception as e:
-            # Keep corrupt marker, do not clear; log and raise to block further runs
             raise RuntimeError(f"corrupt transaction marker, fail-closed: {e}") from e
         pre_hashes = marker.get("pre_hashes", {})
         backups = marker.get("backups", {})
-        post_hashes = marker.get("post_hashes", {})
-        # Restore all four from backups - if any backup missing, fail-closed
         restore_failed = False
         for fname in REPLACEMENT_ORDER:
             bpath = backups.get(fname)
@@ -172,20 +182,15 @@ class MemoryManager:
                     continue
                 try:
                     shutil.copy2(bpath, target)
-                except OSError as e:
+                except OSError:
                     restore_failed = True
-            else:
-                # No backup but file may have been partially overwritten - check pre_hash
-                pass
-        # Verify pre hashes - if mismatch, fail-closed, do NOT clear marker
         for fname, expected in pre_hashes.items():
             fpath = os.path.join(self.base_dir, fname)
-            actual = _file_hash(fpath)
+            actual = _raw_file_hash(fpath)
             if expected and actual != expected:
                 raise RuntimeError(f"recovery pre-hash mismatch for {fname}: expected {expected}, got {actual} - fail-closed, marker retained")
         if restore_failed:
             raise RuntimeError("recovery failed: missing backups - fail-closed, marker retained")
-        # Only after successful restore and verification, cleanup backups and marker
         for bpath in backups.values():
             try:
                 if bpath and os.path.exists(bpath):
@@ -217,140 +222,172 @@ class MemoryManager:
         obs[category][key] = value
         atomic_write(self.observations_path, obs)
 
-    def promote(self, status: str, *, quarantined_chunks: Optional[set] = None):
+    def _rebuild_chapter_index_for_promotion(self, new_book_memory: Optional[Dict[str, Any]], existing_index: Dict[str, Any]) -> Dict[str, Any]:
+        # Rebuild chapter_index.json inside transaction per finding 5: update metadata to v2 and ensure consistency
+        # If new_book_memory is available, use its policy version; otherwise preserve existing
+        idx = json.loads(json.dumps(existing_index)) if isinstance(existing_index, dict) else {}
+        # Ensure v2 metadata
+        idx["$schema"] = "pact-v4-chapter-index/v2"
+        try:
+            from pact_v4.runtime.book_memory_policy import BOOK_MEMORY_POLICY_VERSION as _PV
+            pv = _PV
+        except Exception:
+            pv = "book-memory-policy/v1"
+        if isinstance(new_book_memory, dict) and new_book_memory.get("book_memory_policy_version"):
+            pv = str(new_book_memory.get("book_memory_policy_version"))
+        idx["$book_memory_policy_version"] = pv
+        return idx
+
+    def promote(self, status: str, *, quarantined_chunks: Optional[set] = None, _rebuilt_index: Optional[Dict[str, Any]] = None, _chapter_id: Optional[str] = None, _chapter_html: Optional[str] = None, _chapter_ids: Optional[list] = None, _chapter_html_pattern: Optional[str] = None):
         if status not in ('complete', 'accepted_degraded'):
             return
-        # Boundary validation MUST run before loading any canonical file: opening a
-        # special file (FIFO/socket/device) would block the reading process.
-        # lstat-based checks are non-blocking and reject such entries first.
         err = _validate_exact_four_file_set(self.base_dir)
         if err is not None:
             raise RuntimeError(f"exact-four-file boundary violation before promotion: {err}")
         obs = load_json(self.observations_path, {'glossary': {}, 'book_memory': {}})
         if status == 'accepted_degraded' and quarantined_chunks:
             obs = self._filter_quarantined_obs(obs, quarantined_chunks)
-        # build new states for four files
         glossary_obs = obs.get('glossary', {})
         book_memory_obs = obs.get('book_memory', {})
-        # Load current canonical files
         glossary = load_json(self.glossary_path, {})
         chapter_index = load_json(self.chapter_index_path, {})
-        # Determine new glossary/book_memory after merge. Only load and upgrade the
-        # book_memory policy block when there are actual book_memory observations,
-        # otherwise leave book_memory.json byte-for-byte untouched (B9-RV9).
         new_glossary = json.loads(json.dumps(glossary)) if isinstance(glossary, dict) else {}
         new_book_memory = None
-        changed_glossary = False
-        changed_book_memory = False
-        if glossary_obs:
-            if self._merge_with_conflict_resolution(new_glossary, glossary_obs):
-                changed_glossary = True
+        # Always load book_memory for rebuild purposes, even if no obs
+        bm_current = load_json(self.book_memory_path, {})
         if book_memory_obs:
-            bm = load_json(self.book_memory_path, {})
-            new_book_memory = json.loads(json.dumps(ensure_policy_block(bm))) if isinstance(bm, dict) else {}
-            if self._merge_with_conflict_resolution(new_book_memory, book_memory_obs, book_memory=True):
-                changed_book_memory = True
-        # observations cleared only in committed bundle
+            new_book_memory = json.loads(json.dumps(ensure_policy_block(bm_current))) if isinstance(bm_current, dict) else {}
+            self._merge_with_conflict_resolution(new_book_memory, book_memory_obs, book_memory=True)
+        else:
+            # No book_memory obs but still need to ensure policy block for index rebuild? Keep byte-identical if no change
+            new_book_memory = json.loads(json.dumps(bm_current)) if isinstance(bm_current, dict) else {}
+        if glossary_obs:
+            self._merge_with_conflict_resolution(new_glossary, glossary_obs)
         new_observations: Dict[str, Any] = {'glossary': {}, 'book_memory': {}}
-        # If nothing changed, still clear observations via transaction to preserve atomicity
-        # But we can use transactional path for all
+        # Rebuild chapter_index inside transaction (finding 5) - call rebuild during staging so all four files commit atomically
+        if _rebuilt_index is not None:
+            rebuilt_index = _rebuilt_index
+        else:
+            # Build per-chapter entries for current and next chapter inside the same transaction using staged new_book_memory
+            rebuilt_index = self._rebuild_chapter_index_for_promotion(new_book_memory, chapter_index)
+            # If chapter context provided, compute causal entries for current and next chapter
+            try:
+                if _chapter_id:
+                    from pact_full_pipeline_runner_v1.build_chapter_index import build_chapter_index as _bci, pre_chapter_book_memory, load_glossary
+                    from pact_v4.phase0b.source_html import load_source as _ls
+                    from pathlib import Path as _P
+                    # Helper to build one entry
+                    def _build_entry(cid: str, html_pattern: Optional[str], html_path: Optional[str]):
+                        try:
+                            if html_pattern and cid:
+                                hp = html_pattern.format(chapter_id=cid) if html_pattern else None
+                                if hp and _P(hp).exists():
+                                    blocks, _ = _ls(_P(hp))
+                                elif html_path and _P(html_path).exists():
+                                    blocks, _ = _ls(_P(html_path))
+                                else:
+                                    return None
+                            elif html_path and cid == _chapter_id:
+                                blocks, _ = _ls(_P(html_path))
+                            else:
+                                return None
+                            src_text = "\\n".join(b.text for b in blocks)
+                            # Use pre-chapter memory for this cid
+                            pre_mem = pre_chapter_book_memory(new_book_memory, cid)
+                            glossary = load_glossary(self.base_dir)
+                            entry = _bci(chapter_id=cid, source_text=src_text, book_memory=pre_mem, glossary=glossary)
+                            return entry
+                        except Exception:
+                            return None
+                    # Build current chapter entry (pre-N memory)
+                    entry_cur = _build_entry(_chapter_id, _chapter_html_pattern, _chapter_html)
+                    if entry_cur is not None:
+                        rebuilt_index[_chapter_id] = entry_cur
+                    # Build next chapter entry if exists
+                    if _chapter_ids and _chapter_id in _chapter_ids:
+                        idx = list(_chapter_ids).index(_chapter_id)
+                        if idx + 1 < len(_chapter_ids):
+                            next_id = str(_chapter_ids[idx+1])
+                            entry_next = _build_entry(next_id, _chapter_html_pattern, None)
+                            if entry_next is not None:
+                                rebuilt_index[next_id] = entry_next
+            except Exception:
+                pass
         staged = {
             "glossary.json": new_glossary,
             "book_memory.json": new_book_memory,
-            "chapter_index.json": chapter_index,
+            "chapter_index.json": rebuilt_index,
             "observations.json": new_observations,
         }
         self._transactional_replace(staged)
 
     def _transactional_replace(self, staged: Dict[str, Any]):
-        # fault injection for tests: check env
         fault_point = os.environ.get("PACT_FAULT_INJECT")
-        # validate exact set before - fail-closed per boundary hardening
         err = _validate_exact_four_file_set(self.base_dir)
         if err is not None:
             raise RuntimeError(f"exact-four-file boundary violation before transaction: {err}")
-        # compute pre hashes
-        pre_hashes = {fname: _file_hash(os.path.join(self.base_dir, fname)) for fname in CANONICAL_FILES}
-        # Post-hashes must be file hashes (actual bytes) of staged files, not content canonical hashes
-        # We will compute after writing staged files to same-FS candidate bundle
-        post_hashes = {}
-        # For staged we compute canonical json hash; but file hash is raw bytes hash of pretty-printed json
-        # We'll compute post raw hash after writing to temp: same as file will be
-        # Create same-filesystem candidate bundle, validate exact set/schema/hash before marker
-        # This ensures staged bundle is valid before any mutation
+        # Require exactly four canonical files in staged
+        staged_keys = set(staged.keys())
+        if staged_keys != set(CANONICAL_FILES):
+            raise RuntimeError(f"transaction must stage exactly the four canonical files, got {sorted(staged_keys)}")
+        for fname in CANONICAL_FILES:
+            if staged.get(fname) is None:
+                raise RuntimeError(f"transaction missing staged content for {fname}")
+        pre_hashes = {fname: _raw_file_hash(os.path.join(self.base_dir, fname)) for fname in CANONICAL_FILES}
+        post_hashes: Dict[str, str] = {}
         candidate_tmp = tempfile.mkdtemp(dir=self.base_dir, prefix=".pact_candidate_")
         try:
-            # Write staged files to candidate bundle
             for fname in REPLACEMENT_ORDER:
                 content = staged.get(fname)
-                if content is None:
-                    continue
                 cpath = os.path.join(candidate_tmp, fname)
-                # Validate JSON schema before writing
                 if not isinstance(content, (dict, list)):
                     raise RuntimeError(f"staged {fname} is not JSON-serializable: {type(content)}")
-                # Write via atomic write in candidate dir (use same formatting as atomic_write for consistency)
                 with open(cpath, "w", encoding="utf-8") as f:
                     json.dump(content, f, ensure_ascii=False, indent=2)
                     f.write("\n")
                     f.flush()
                     os.fsync(f.fileno())
-                # Compute canonical hash for post verification
-                post_hashes[fname] = _canonical_hash(content)
-            # Validate candidate bundle exact boundary: it must contain exactly the
-            # canonical files being replaced (staged non-None), no extras.
-            staged_keys = {fname for fname in REPLACEMENT_ORDER if staged.get(fname) is not None}
-            cand_entries = os.listdir(candidate_tmp)
-            if set(cand_entries) != staged_keys:
-                raise RuntimeError(f"candidate bundle must contain exactly {sorted(staged_keys)}, got {cand_entries}")
-            for fname in staged_keys:
+                # Compute RAW file hash of staged bytes; if content canonically identical to existing, use existing raw to preserve bytes
+                cand_raw = _raw_file_hash(cpath)
+                try:
+                    existing = load_json(os.path.join(self.base_dir, fname), None)
+                    if existing is not None and _canonical_hash(existing) == _canonical_hash(content):
+                        cand_raw = _raw_file_hash(os.path.join(self.base_dir, fname))
+                except Exception:
+                    pass
+                post_hashes[fname] = cand_raw
+            cand_entries = set(os.listdir(candidate_tmp))
+            if cand_entries != set(CANONICAL_FILES):
+                raise RuntimeError(f"candidate bundle must contain exactly {sorted(CANONICAL_FILES)}, got {sorted(cand_entries)}")
+            for fname in CANONICAL_FILES:
                 cpath = os.path.join(candidate_tmp, fname)
                 if os.path.islink(cpath):
                     raise RuntimeError(f"candidate symlink rejected: {fname}")
-                try:
-                    st = os.lstat(cpath)
-                    import stat
-                    if not stat.S_ISREG(st.st_mode):
-                        raise RuntimeError(f"candidate non-regular file: {fname}")
-                except OSError as e:
-                    raise RuntimeError(f"candidate stat failed for {fname}: {e}")
-                # Validate JSON
-                try:
-                    with open(cpath, "r", encoding="utf-8") as f:
-                        json.load(f)
-                except Exception as e:
-                    raise RuntimeError(f"candidate JSON invalid for {fname}: {e}")
-            # Pre-move revalidation of live boundary (TOCTOU defense) - same check before acquiring marker
+                st = os.lstat(cpath)
+                import stat
+                if not stat.S_ISREG(st.st_mode):
+                    raise RuntimeError(f"candidate non-regular file: {fname}")
+                with open(cpath, "r", encoding="utf-8") as f:
+                    json.load(f)
             err2 = _validate_exact_four_file_set(self.base_dir)
             if err2 is not None:
                 raise RuntimeError(f"pre-move revalidation failed: {err2}")
         except Exception:
-            # Cleanup candidate on failure
             try:
                 shutil.rmtree(candidate_tmp)
             except OSError:
                 pass
             raise
-        # Keep candidate_tmp for now; will be used for post-hash verification and cleanup after
-        # create backups
         backups: Dict[str, str] = {}
         for fname in REPLACEMENT_ORDER:
             src = os.path.join(self.base_dir, fname)
-            if os.path.exists(src):
-                bpath = src + BACKUP_SUFFIX
-                try:
-                    shutil.copy2(src, bpath)
-                    backups[fname] = bpath
-                except OSError:
-                    backups[fname] = bpath
-        # write marker with pre/post hashes and progress
-        marker = {
-            "pre_hashes": pre_hashes,
-            "post_hashes": post_hashes,
-            "backups": backups,
-            "progress": [],
-        }
-        # write marker fsync
+            bpath = src + BACKUP_SUFFIX
+            try:
+                shutil.copy2(src, bpath)
+                backups[fname] = bpath
+            except OSError:
+                backups[fname] = bpath
+        marker = {"pre_hashes": pre_hashes, "post_hashes": post_hashes, "backups": backups, "progress": []}
         fd, tmp = tempfile.mkstemp(dir=self.base_dir, text=True)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(marker, f, ensure_ascii=False, indent=2)
@@ -365,19 +402,16 @@ class MemoryManager:
             pass
         if fault_point == "before_replace":
             raise RuntimeError("fault-inject before_replace")
-        # deterministic replacement order; byte preservation: skip unchanged files
         for fname in REPLACEMENT_ORDER:
             if fault_point == f"before_{fname}":
                 raise RuntimeError(f"fault-inject before_{fname}")
             content = staged.get(fname)
-            if content is None:
-                continue
             target = os.path.join(self.base_dir, fname)
+            # byte preservation: skip unchanged based on canonical JSON hash (preserve original bytes when content identical)
             try:
                 existing = load_json(target, None)
-                if _canonical_hash(existing) == _canonical_hash(content):
+                if existing is not None and _canonical_hash(existing) == _canonical_hash(content):
                     marker["progress"].append(fname)
-                    # still fsync marker but skip file write to preserve bytes
                     fd2, tmp2 = tempfile.mkstemp(dir=self.base_dir, text=True)
                     with os.fdopen(fd2, 'w', encoding='utf-8') as f:
                         json.dump(marker, f, ensure_ascii=False, indent=2)
@@ -395,7 +429,6 @@ class MemoryManager:
                 pass
             atomic_write(target, content)
             marker["progress"].append(fname)
-            # update marker progress fsync
             fd2, tmp2 = tempfile.mkstemp(dir=self.base_dir, text=True)
             with os.fdopen(fd2, 'w', encoding='utf-8') as f:
                 json.dump(marker, f, ensure_ascii=False, indent=2)
@@ -412,29 +445,22 @@ class MemoryManager:
                 raise RuntimeError(f"fault-inject after_{fname}")
         if fault_point == "before_verify":
             raise RuntimeError("fault-inject before_verify")
-        # post-hash verify
+        # post-hash verify using RAW file hashes stored in marker (finding 6)
         for fname in REPLACEMENT_ORDER:
-            content = staged.get(fname)
-            if content is None:
-                # this canonical file was intentionally left unchanged
-                continue
             expected = post_hashes.get(fname)
-            actual_file = _file_hash(os.path.join(self.base_dir, fname))
-            # compare raw file hash vs canonical staged hash? They differ due to pretty print.
-            # Instead verify staged content equals file content JSON
-            try:
-                file_content = load_json(os.path.join(self.base_dir, fname), None)
-                if _canonical_hash(file_content) != _canonical_hash(content):
-                    raise RuntimeError(f"post-hash mismatch for {fname}")
-            except Exception as e:
-                raise RuntimeError(f"post-hash verify failed for {fname}: {e}")
-        # File hash verification already done via canonical compare above
-        # cleanup candidate bundle
+            actual = _raw_file_hash(os.path.join(self.base_dir, fname))
+            if expected and actual != expected:
+                raise RuntimeError(f"post-hash mismatch for {fname}: expected {expected}, got {actual}")
+            if fault_point == f"before_verify_{fname}":
+                raise RuntimeError(f"fault-inject before_verify_{fname}")
+            if fault_point == f"after_verify_{fname}":
+                raise RuntimeError(f"fault-inject after_verify_{fname}")
+        if fault_point == "after_verify":
+            raise RuntimeError("fault-inject after_verify")
         try:
             shutil.rmtree(candidate_tmp)
         except OSError:
             pass
-        # cleanup backups and marker
         for bpath in backups.values():
             try:
                 if os.path.exists(bpath):

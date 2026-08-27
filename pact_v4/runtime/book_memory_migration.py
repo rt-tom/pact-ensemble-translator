@@ -216,3 +216,170 @@ def create_envelope(candidate_dir: Path, envelope_dir: Path, parent_revision: st
 def requires_approval(envelope: Dict[str, Any]) -> bool:
     return not envelope.get("approved", False)
 
+# --- Media publication path (finding 7) ---
+
+def _ensure_media_publish_prereqs(envelope: Dict[str, Any], candidate_dir: Path) -> None:
+    """Fail closed if envelope not approved or candidate hashes mismatch envelope."""
+    if not envelope.get("approved"):
+        raise RuntimeError("migration publication requires explicit owner approval of exact manifest/hash set")
+    expected = envelope.get("candidate_hashes", {})
+    for fname in CANONICAL_FILES:
+        cpath = candidate_dir / fname
+        if not cpath.is_file() or cpath.is_symlink():
+            raise RuntimeError(f"candidate missing or symlink: {fname}")
+        actual = _file_hash(cpath)
+        exp = expected.get(fname)
+        if exp != actual:
+            raise RuntimeError(f"candidate hash mismatch for {fname}: expected {exp}, got {actual}")
+
+def publish_via_media(
+    store: Any,
+    candidate_dir: Path,
+    envelope: Dict[str, Any],
+    *,
+    operator: str = "migration",
+    host: str = "migration",
+    run_id: str | None = None,
+) -> Dict[str, Any]:
+    """Publish a migrated candidate through existing Media lease/parent/CAS.
+
+    Validates exact manifest + candidate hashes at publication (fail closed if mismatch),
+    publishes via Media promote, then verifies post-publication current revision == candidate hashes.
+    """
+    from pact_v4.snapshot.manifest import Manifest, StateFileEntry
+    from pact_v4.snapshot.store import BookStore
+    import datetime
+    candidate_dir = Path(candidate_dir)
+    _ensure_media_publish_prereqs(envelope, candidate_dir)
+    # Create Media incoming candidate bundle from plain four-file candidate
+    import uuid, os, json as _json
+    candidate_id = f"migration-{uuid.uuid4().hex[:8]}"
+    # Build manifest for media
+    parent_rev = envelope.get("parent_revision")
+    # Read current store current to validate parent
+    cur = store.read_current()
+    if cur is None or cur.get("revision_id") != parent_rev:
+        raise RuntimeError(f"stale parent: envelope expects {parent_rev}, current is {cur.get('revision_id') if cur else None}")
+    # Compute state file entries
+    state_entries = []
+    for fname in CANONICAL_FILES:
+        cpath = candidate_dir / fname
+        sha, size = Manifest_state_hash(cpath) if False else _compute_sha_size(cpath)
+        state_entries.append(StateFileEntry(rel_path=f"state/{fname}", sha256=sha, size=size))
+    manifest = Manifest(
+        schema_version="v1",
+        book_id=store.book_id,
+        revision_id="rev-0000",  # placeholder, media assigns real id
+        parent_revision_id=parent_rev,
+        created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        published_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        terminal_status="complete",
+        tool_version="book-memory-migration/v1",
+        source={"path_on_rt": str(candidate_dir), "operator": operator, "host": host, "run_id": run_id},
+        state_files=state_entries,
+        excludes=[],
+        code_commit="",
+    )
+    # Prepare incoming candidate dir
+    incoming = store.incoming_candidate_path(candidate_id)
+    incoming.mkdir(parents=True, exist_ok=True)
+    state_dir = incoming / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for fname in CANONICAL_FILES:
+        import shutil
+        shutil.copy2(str(candidate_dir / fname), str(state_dir / fname))
+    # Write manifest
+    manifest.write(incoming / "manifest.json")
+    # Publish via existing Media promote gate
+    from pact_v4.snapshot.promote import promote as _media_promote
+    result = _media_promote(store, candidate_id, operator=operator, host=host, run_id=run_id)
+    # Post-publication verification: current revision hashes == candidate hashes
+    cur_after = store.read_current()
+    if cur_after is None or cur_after.get("revision_id") != result.get("revision_id"):
+        raise RuntimeError(f"post-publication verification failed: current {cur_after} != result {result}")
+    # Verify each file hash matches candidate (via snapshot)
+    snap_dir = store.snapshot_dir(result["revision_id"])
+    for fname in CANONICAL_FILES:
+        snap_file = snap_dir / "state" / fname
+        if not snap_file.is_file():
+            raise RuntimeError(f"post-publication missing {fname} in snapshot")
+        if _file_hash(snap_file) != _file_hash(candidate_dir / fname):
+            raise RuntimeError(f"post-publication hash mismatch for {fname}")
+    return result
+
+def _compute_sha_size(path: Path):
+    import hashlib
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+def rollback_via_media(store: Any, snapshot_dir: Path, *, operator: str = "rollback", host: str = "rollback", run_id: str | None = None) -> Dict[str, Any]:
+    """Rollback by publishing a NEW revision from retained pre-migration snapshot (never rewrite history)."""
+    import uuid, shutil, datetime
+    from pact_v4.snapshot.manifest import Manifest, StateFileEntry
+    snapshot_dir = Path(snapshot_dir)
+    # snapshot_dir is expected to contain exactly four canonical files (state files) as retained snapshot
+    # Validate it has four files
+    for fname in CANONICAL_FILES:
+        p = snapshot_dir / fname
+        # also allow snapshot_dir/state/* layout - handle both
+        if not p.exists():
+            alt = snapshot_dir / "state" / fname
+            if alt.exists():
+                p = alt
+            else:
+                raise RuntimeError(f"rollback snapshot missing {fname}")
+    # Use the snapshot files as candidate
+    import tempfile as _tmp; candidate_tmp = Path(_tmp.mkdtemp()) / "rollback_candidate"
+    candidate_tmp.mkdir(parents=True, exist_ok=True)
+    for fname in CANONICAL_FILES:
+        src = snapshot_dir / fname
+        if not src.exists():
+            src = snapshot_dir / "state" / fname
+        shutil.copy2(str(src), str(candidate_tmp / fname))
+    # Build envelope-like candidate and publish via media as new revision
+    # Create manifest
+    cur = store.read_current()
+    parent_rev = cur.get("revision_id") if cur else None
+    state_entries = []
+    for fname in CANONICAL_FILES:
+        sha, size = _compute_sha_size(candidate_tmp / fname)
+        state_entries.append(StateFileEntry(rel_path=f"state/{fname}", sha256=sha, size=size))
+    manifest = Manifest(
+        schema_version="v1",
+        book_id=store.book_id,
+        revision_id="rev-0000",
+        parent_revision_id=parent_rev,
+        created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        published_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        terminal_status="complete",
+        tool_version="book-memory-rollback/v1",
+        source={"path_on_rt": str(snapshot_dir), "operator": operator, "host": host, "run_id": run_id},
+        state_files=state_entries,
+        excludes=[],
+        code_commit="",
+    )
+    candidate_id = f"rollback-{uuid.uuid4().hex[:8]}"
+    incoming = store.incoming_candidate_path(candidate_id)
+    incoming.mkdir(parents=True, exist_ok=True)
+    (incoming / "state").mkdir(parents=True, exist_ok=True)
+    for fname in CANONICAL_FILES:
+        shutil.copy2(str(candidate_tmp / fname), str(incoming / "state" / fname))
+    manifest.write(incoming / "manifest.json")
+    from pact_v4.snapshot.promote import promote as _media_promote
+    result = _media_promote(store, candidate_id, operator=operator, host=host, run_id=run_id)
+    # Verify as new revision, not rewriting history
+    if result.get("revision_id") == parent_rev:
+        raise RuntimeError("rollback must publish as new revision, not overwrite")
+    return result
+
+def Manifest_state_hash(path):  # helper alias for tests
+    return _compute_sha_size(path)
+

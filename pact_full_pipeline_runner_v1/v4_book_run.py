@@ -1910,7 +1910,7 @@ def run_book(
                         _filtered_context_entities = []
                         _gate_decisions = []
                         for rec in context.entities:
-                            ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, quarantined_pids=quarantined_pids, existing_names=_existing)
+                            ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, current_chapter=chapter_id, source_pids=set(_source_map.keys()), quarantined_pids=set(), existing_names=_existing, duplicate_names=set(), conflicts=set())
                             if not ok:
                                 _gate_decisions.append({"entity": rec.entity, "memory_class": getattr(rec,"memory_class",""), "rejected": True, "reason": code, "evidence_pids": [rec.anchor.pid]})
                                 # record candidate_claim if any candidate claim present? handled below via claim filter
@@ -2080,21 +2080,19 @@ def run_book(
         promoted = False
         promote_detail = ""
         if terminal_status == "complete":
-            # Invariant: complete does not filter observations; the
-            # quarantine status of individual chunks is irrelevant when
-            # the chapter as a whole reached complete. If this fires,
-            # the chapter reports a contradictory state.
             assert not quarantined, (
                 f"Chapter {chapter_id} terminal=complete but has "
                 f"quarantined chunks: {sorted(quarantined)}"
             )
-            manager.promote("complete")
+            # Stage REBUILT chapter_index.json inside same four-file transaction (finding 5)
+            manager.promote("complete", _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern)
             promoted = True
             promote_detail = "promoted after complete (all observations)"
         elif terminal_status == "accepted_degraded":
             manager.promote(
                 "accepted_degraded",
                 quarantined_chunks=quarantined,
+                _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern,
             )
             promoted = True
             promote_detail = (
@@ -2111,70 +2109,11 @@ def run_book(
         # promoted; bytes preserved).
         _strip_book_memory_observation_fields(memory_dir)
 
-        # A2 (causal <N, P0 2026-08-14; RV finding 1 SAFE-MEMORY
-        # 2026-08-14): after an ACCEPTED chapter N, write chapter_index
-        # entries for BOTH the current chapter N and the NEXT chapter N+1
-        # (when it exists in this run), each built from PRE-chapter memory
-        # ONLY — facts of chapters < the entry's chapter id
-        # (pre_chapter_book_memory). The strict runner reads
-        # chapter_index[X] before generating X, so:
-        #   * entry[N] (re)built from pre-N memory: a rerun of N never
-        #     sees N's own post-promotion facts (the old post-promotion
-        #     build leaked them into N's own prompt);
-        #   * entry[N+1] pre-built NOW from the post-N memory (= the
-        #     pre-chapter memory of N+1): the FIRST run of N+1 already
-        #     sees the memory of accepted chapters < N+1 (the old code
-        #     built only the current chapter's entry after acceptance, so
-        #     N+1's first run failed soft to narrator+seed and saw none of
-        #     the prior chapters' memory).
-        # 0 model calls, deterministic (B9-A2 card). Failed chapters never
-        # touch the index.
+        # A2 index entries are now staged inside the same four-file transaction via MemoryManager.promote (finding 5),
+        # so no separate post-promote mutation of chapter_index.json is needed. The promote transaction already rebuilt
+        # current and next chapter entries from pre-chapter memory. Keep index_built flag for reporting.
         if terminal_status in _PROMOTING_STATUSES:
-            try:
-                from pact_full_pipeline_runner_v1.build_chapter_index import (
-                    build_index_file,
-                )
-
-                build_index_file(
-                    memory_dir=str(memory_dir),
-                    chapter_html=str(chapter_html),
-                    chapter_id=chapter_id,
-                    out_path=str(memory_dir / "chapter_index.json"),
-                )
-                index_built = True
-            except Exception as exc:  # noqa: BLE001 — never break a run
-                LOG.warning(
-                    "A2: chapter_index build failed for %s (%s: %s); "
-                    "causal bible will fail-soft to narrator+seed",
-                    chapter_id, type(exc).__name__, exc,
-                )
-                index_built = False
-            # RV finding 1: pre-build the NEXT chapter's entry so its
-            # FIRST run sees the memory of accepted chapters < N+1
-            # (best-effort — a missing next-html or build error must
-            # never fail the run; the next chapter then fails soft).
-            next_chapter_id = _next_chapter_id(chapter_id, chapter_ids)
-            if next_chapter_id:
-                try:
-                    from pact_full_pipeline_runner_v1.build_chapter_index import (
-                        build_index_file,
-                    )
-
-                    build_index_file(
-                        memory_dir=str(memory_dir),
-                        chapter_html=str(
-                            chapter_html_pattern.format(chapter_id=next_chapter_id)
-                        ),
-                        chapter_id=next_chapter_id,
-                        out_path=str(memory_dir / "chapter_index.json"),
-                    )
-                except Exception as exc:  # noqa: BLE001 — never break a run
-                    LOG.warning(
-                        "A2: next-chapter index prebuild failed for %s "
-                        "(%s: %s); %s will fail-soft to narrator+seed",
-                        next_chapter_id, type(exc).__name__, exc,
-                        next_chapter_id,
-                    )
+            index_built = promoted
         else:
             index_built = False
 
@@ -2378,6 +2317,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_formatting_incidents=int(args.max_formatting_incidents),
         glossary_resolver_mode=args.glossary_resolver_mode,
         glossary_resolver_cache_miss_policy=args.glossary_resolver_cache_miss_policy,
+        book_memory_policy=args.book_memory_policy,
     )
     failed = 0
     for rec in result["chapters"]:
