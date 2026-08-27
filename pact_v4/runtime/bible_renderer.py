@@ -13,7 +13,15 @@ from __future__ import annotations
 
 from typing import Any, List, Mapping, Optional
 
+try:
+    from pact_v4.runtime.book_memory_policy import BOOK_MEMORY_POLICY_VERSION
+
+except Exception:
+    BOOK_MEMORY_POLICY_VERSION = "book-memory-policy/v1"
+
 __all__ = ["render_bible_section", "extract_narrator_gender"]
+CHAPTER_INDEX_V2_SCHEMA = "pact-v4-chapter-index/v2"
+BOOK_MEMORY_V2_SCHEMA = "pact-v4-book-memory/v2"
 
 
 def _norm_str(value: Any) -> str:
@@ -153,15 +161,18 @@ def render_bible_section(
             book_memory = chapter_id
         return _render_seed_bible(book_memory)
 
+    # v2 metadata check: BOTH $schema and $book_memory_policy_version must be present and exact (finding 2 refinement)
+    # No alias fallback ("schema" / "policy_version" etc.) — aliases fail soft. Missing/unknown of EITHER fails soft.
+    if isinstance(chapter_index, Mapping):
+        schema = chapter_index.get("$schema")
+        policy_ver = chapter_index.get("$book_memory_policy_version")
+        if schema != CHAPTER_INDEX_V2_SCHEMA or policy_ver != BOOK_MEMORY_POLICY_VERSION:
+            return _render_seed_bible(book_memory)
     entry = None
     if isinstance(chapter_index, Mapping):
         entry = chapter_index.get(chapter_id)
     if entry is None or not isinstance(entry, Mapping):
-        # No per-chapter index for this chapter: fail-soft to the MINIMUM
-        # (narrator + seed facts). A full book_memory dump here was the
-        # P0 future-leakage bug — never restored.
         return _render_seed_bible(book_memory)
-
     return _render_chapter_entry(entry, book_memory)
 
 
@@ -190,6 +201,8 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
     narrator = extract_narrator_gender(book_memory)
 
     characters = entry.get("characters") or []
+    named_entities = entry.get("named_entities") or []
+    terms = entry.get("terms") or []
     facts = list(entry.get("facts") or [])
     address = entry.get("address") or []
 
@@ -206,7 +219,7 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
         if seed_text not in facts:
             facts.append(seed_text)
 
-    if not narrator and not characters and not facts and not address:
+    if not narrator and not characters and not named_entities and not terms and not facts and not address:
         return ""
 
     parts: List[str] = ["BIBLE:"]
@@ -218,6 +231,18 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
             line = _render_character_line(item)
             if line:
                 parts.append(line)
+    if named_entities:
+        parts.append("  - Named entities:")
+        for item in named_entities:
+            line = _render_character_line(item) if isinstance(item, Mapping) else f"  * {_norm_str(item)}" if _norm_str(item) else ""
+            if line:
+                parts.append(line)
+    if terms:
+        parts.append("  - Terms:")
+        for term in terms:
+            t = _norm_str(term)
+            if t:
+                parts.append(f"  * {t}")
     if facts:
         parts.append("  - Facts:")
         for fact in facts:

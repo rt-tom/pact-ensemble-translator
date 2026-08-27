@@ -356,6 +356,7 @@ def book_memory_observations_from_entity_context(
         if not record.entity:
             continue
         verified_gender = ""
+        gender_evidence_pids: List[str] = []
         facts: List[Dict[str, Any]] = []
         for claim in record.claims:
             if claim.status != STATUS_VERIFIED:
@@ -363,6 +364,7 @@ def book_memory_observations_from_entity_context(
             evidence_pids = sorted({ev.pid for ev in claim.evidence})
             if claim.kind == "gender":
                 verified_gender = str(claim.value)
+                gender_evidence_pids = evidence_pids
                 continue
             facts.append({
                 "fact": (
@@ -371,16 +373,30 @@ def book_memory_observations_from_entity_context(
                 ),
                 "source_pids": evidence_pids,
                 "chapter": chapter_id,
+                "keys": [record.entity],
+                "status": "verified",
             })
+        # Build per-alias provenance (variants as provenance objects)
+        variants: Dict[str, Any] = {}
+        for alias in record.aliases:
+            # Only include alias surfaces that are verified (status verified is code-derived)
+            if alias.surface and alias.surface != record.entity:
+                variants[alias.surface] = {"chapter": chapter_id, "source_pids": [alias.pid]}
+        mc = getattr(record, "memory_class", "chapter_local")
+        section = "characters" if verified_gender else "entities"
         identity: Dict[str, Any] = {
             "type": record.canonical_type or "object",
+            "memory_class": mc,
+            "first_seen_chapter": chapter_id,
             "chapters": [chapter_id],
-            "variants": {},
+            "variants": variants,
+            "field_provenance": {},
             "forbidden_targets": [],
         }
         if verified_gender:
             identity["gender"] = verified_gender
-        section = "characters" if verified_gender else "entities"
+            identity["field_provenance"]["gender"] = {"chapter": chapter_id, "source_pids": gender_evidence_pids}
+        # Ensure field_provenance is present even if empty for v2 readers
         observations[f"{section}:{record.entity}"] = identity
         if facts:
             for idx, fact in enumerate(facts):
@@ -806,7 +822,7 @@ class B3AuditRepairConfig:
     russian_editor_max_edits_per_pid: int = MAX_EDITS_PER_PID
     russian_editor_retry_max_retries: int = DEFAULT_RETRY_MAX_RETRIES
     russian_editor_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
-    glossary_resolver_mode: str = "off"
+    glossary_resolver_mode: str = "promote"
     glossary_resolver_cache_miss_policy: str = "recompute"
 
     def to_payload(self) -> Dict[str, Any]:

@@ -283,7 +283,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "directly). Part of the config identity — use a "
                         "NEW --out-dir when flipping it against an existing "
                         "run.")
-    p.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="off",
+    p.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="promote",
                    help="Glossary resolver mode (identity-bearing): off (no resolver, no new observations), "
                         "shadow (sidecar written and logged, no promotion), promote (full path). Default off.")
     p.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute",

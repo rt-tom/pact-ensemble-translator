@@ -116,27 +116,29 @@ def test_build_snapshot_identity_binds_selected_chapter_index_record():
     # A2 RV fix (HIGH): chapter_index.json changes render_bible_section/the
     # bible prompt — the snapshot identity must change with the SELECTED
     # record so resume cannot reuse a translation against a different prompt.
+    # Finding 2: missing/unknown schema or policy version fails soft to seed (empty index).
     blocks = [_block("p00001", "Only.", index=0)]
     source = build_source_artifact(chapter_id="ch046", blocks=blocks)
     base_memory = ChapterMemory(glossary={}, book_memory={})
     snap_no_index = build_snapshot(
         chapter_id="ch046", source=source, memory=base_memory,
     )
+    # v2 index with proper schema/policy must change identity
     snap_with_index = build_snapshot(
         chapter_id="ch046", source=source,
         memory=ChapterMemory(
             glossary={}, book_memory={},
-            chapter_index={"ch046": {"characters": ["Blake"], "facts": [], "address": []}},
+            chapter_index={"$schema": "pact-v4-chapter-index/v2", "$book_memory_policy_version": "book-memory-policy/v1", "ch046": {"characters": ["Blake"], "facts": [], "address": []}},
         ),
     )
     assert snap_no_index.snapshot_hash != snap_with_index.snapshot_hash
     # Only the SELECTED record matters: another chapter's record must not
-    # invalidate this chapter's snapshot identity.
+    # invalidate this chapter's snapshot identity (still v2).
     snap_other_chapter = build_snapshot(
         chapter_id="ch046", source=source,
         memory=ChapterMemory(
             glossary={}, book_memory={},
-            chapter_index={"ch999": {"characters": ["Other"], "facts": [], "address": []}},
+            chapter_index={"$schema": "pact-v4-chapter-index/v2", "$book_memory_policy_version": "book-memory-policy/v1", "ch999": {"characters": ["Other"], "facts": [], "address": []}},
         ),
     )
     assert snap_other_chapter.snapshot_hash == snap_no_index.snapshot_hash
@@ -145,10 +147,21 @@ def test_build_snapshot_identity_binds_selected_chapter_index_record():
         chapter_id="ch046", source=source,
         memory=ChapterMemory(
             glossary={}, book_memory={},
-            chapter_index={"ch046": {"characters": ["Blake", "Duncan"], "facts": [], "address": []}},
+            chapter_index={"$schema": "pact-v4-chapter-index/v2", "$book_memory_policy_version": "book-memory-policy/v1", "ch046": {"characters": ["Blake", "Duncan"], "facts": [], "address": []}},
         ),
     )
     assert snap_changed.snapshot_hash != snap_with_index.snapshot_hash
+    # Missing schema or unknown policy_version must fail soft to seed (same as no index)
+    snap_missing_schema = build_snapshot(
+        chapter_id="ch046", source=source,
+        memory=ChapterMemory(glossary={}, book_memory={}, chapter_index={"ch046": {"characters": ["Blake"], "facts": [], "address": []}}),
+    )
+    assert snap_missing_schema.snapshot_hash == snap_no_index.snapshot_hash
+    snap_unknown_policy = build_snapshot(
+        chapter_id="ch046", source=source,
+        memory=ChapterMemory(glossary={}, book_memory={}, chapter_index={"$schema": "pact-v4-chapter-index/v2", "$book_memory_policy_version": "unknown/v9", "ch046": {"characters": ["Blake"], "facts": [], "address": []}}),
+    )
+    assert snap_unknown_policy.snapshot_hash == snap_no_index.snapshot_hash
 
 
 def test_build_config_artifact_records_runtime_values():

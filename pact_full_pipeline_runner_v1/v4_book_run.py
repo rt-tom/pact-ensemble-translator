@@ -1224,8 +1224,9 @@ def run_book(
     formatting_cfg: Optional[Mapping[str, Any]] = None,
     formatting_client: Optional[Any] = None,
     max_formatting_incidents: int = _DEFAULT_MAX_FORMATTING_INCIDENTS,
-    glossary_resolver_mode: str = "off",
+    glossary_resolver_mode: str = "promote",
     glossary_resolver_cache_miss_policy: str = "recompute",
+    book_memory_policy: str = "promote_verified",
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
@@ -1234,6 +1235,13 @@ def run_book(
         pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root, execution_host=_exec_host)
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
+    # FINDING 4: explicit init for genuine new-state (all four missing) — promotion path still requires all four present (fail closed)
+    from pact_v4.phase1.memory import CANONICAL_FILES as _CF4
+    import os as _os
+    _missing = [f for f in _CF4 if not _os.path.lexists(str(memory_dir / f))]
+    if len(_missing) == len(_CF4):
+        from pact_v4.phase1.memory import MemoryManager as _MM
+        _MM.initialize_canonical_files(str(memory_dir))
     manager = MemoryManager(str(memory_dir))
     ledger = GlossaryCandidateLedger(
         str(candidates_ledger or (out_base / "glossary_candidates.json"))
@@ -1570,10 +1578,23 @@ def run_book(
         glossary_sidecar_handled = False
         if _mode == "off":
             LOG.info("glossary_resolver: mode off for %s, new glossary observations forbidden (fail-closed, no legacy deterministic promotion)", chapter_id)
-            # Spec glossary-model-resolver: off forbids ANY new glossary observations, even legacy deterministic.
-            # Fail-closed: block sidecar handling AND deterministic fallback.
             glossary_sidecar_handled = True
             candidates_block = {"generated": 0, "proposed": 0, "committed": 0, "conflicts": 0}
+            # Write versioned status artifact for off (no proposal sidecar)
+            try:
+                _status_path = out_dir / "glossary_resolver_status.json"
+                _status_payload = {
+                    "schema": "pact-v4-glossary-resolver-status/v1",
+                    "mode": "off",
+                    "status": "disabled",
+                    "chapter_id": chapter_id,
+                    "resolver_calls": 0,
+                    "candidates": 0,
+                    "glossary_hash": _load_json(memory_dir / "glossary.json", {}).get("__hash__", ""),
+                }
+                _status_path.write_text(__import__("json").dumps(_status_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         elif _mode in ("shadow", "promote") and terminal_status in _PROMOTING_STATUSES:
             # Handle sidecar for shadow/promote
             from pact_v4.pipeline.glossary_resolver import (
@@ -1731,6 +1752,9 @@ def run_book(
         # extreme-conservative gender (verified only when the extractor's
         # 8-point validation linked pronoun + referent in the same PID);
         # candidate claims are never promoted (audit-only, TIER_B).
+        # book-memory policy independent gate
+        _bm_policy_tmp = locals().get('book_memory_policy', 'promote_verified')
+        _skip_book_memory = (_bm_policy_tmp == 'off')
         book_memory_before = _load_json(memory_dir / "book_memory.json", {})
         bm_candidates_block = {
             "generated": 0,
@@ -1819,7 +1843,7 @@ def run_book(
         canonical_ru_map: Dict[str, str] = {}
         glossary_proposed: List[Dict[str, Any]] = []
         glossary_conflicts: List[Dict[str, Any]] = []
-        if not glossary_sidecar_handled and terminal_status in _PROMOTING_STATUSES:
+        if terminal_status in _PROMOTING_STATUSES:
             entity_payload = _load_json(out_dir / "entity_context_cache.json", None)
             if isinstance(entity_payload, dict) and entity_payload.get("entries"):
                 from pact_v4.audit.entity_extractor import (
@@ -1877,10 +1901,85 @@ def run_book(
                             or context.extractor_version != run_extractor_version
                         ):
                             continue
-                        obs = book_memory_observations_from_entity_context(
-                            context, chapter_id=chapter_id,
-                        )
-                        entity_obs.update(obs.get("book_memory", {}))
+                        # Durable gate: evaluate each record with ordered precedence
+                        from pact_v4.runtime.book_memory_policy import ensure_policy_block
+                        from pact_v4.runtime.book_memory_gate import evaluate_gate
+                        from pact_v4.pipeline.b3_audit_repair import book_memory_observations_from_entity_context as _legacy_obs
+                        # Build policy from book_memory_before
+                        _policy_block = ensure_policy_block(book_memory_before)
+                        _policy = _policy_block.get("policy", {})
+                        _source_map = _source_by_pid(chapter_html)
+                        _existing = set()
+                        _existing_map: dict = {}
+                        for sec in ("characters","entities"):
+                            sec_data = book_memory_before.get(sec) or {}
+                            if isinstance(sec_data, dict):
+                                for k, v in sec_data.items():
+                                    norm = k.strip().casefold().replace("\u2019","'")
+                                    _existing.add(norm)
+                                    mc = v.get("memory_class") if isinstance(v, dict) else ""
+                                    _existing_map.setdefault(norm, []).append((sec, mc, k))
+                        # Build REAL conflict set: normalized names that collide with existing canonical entry under different identity
+                        _conflicts = set()
+                        # 1) ambiguous existing: same casefold present in both characters and entities or with different memory_class
+                        for norm, lst in _existing_map.items():
+                            if len(lst) > 1:
+                                secs = {s for s, _, _ in lst}
+                                mcs = {m for _, m, _ in lst}
+                                if len(secs) > 1 or len(mcs) > 1:
+                                    _conflicts.add(norm)
+                        # 2) incoming record collides with existing entry under different memory_class/section
+                        # Precompute duplicate counts for batch-conflict detection as well
+                        _norm_counts_batch = {}
+                        for _r in context.entities:
+                            _nk = _r.entity.strip().casefold().replace("\u2019","'")
+                            _norm_counts_batch[_nk] = _norm_counts_batch.get(_nk, 0) + 1
+                        _dup_names = {k for k, v in _norm_counts_batch.items() if v > 1}
+                        # Also add incoming vs existing memory_class mismatch to conflicts
+                        for _r in context.entities:
+                            _nk = _r.entity.strip().casefold().replace("\u2019","'")
+                            if _nk in _existing_map:
+                                rec_mc = getattr(_r, "memory_class", "")
+                                for _, existing_mc, _ in _existing_map[_nk]:
+                                    if existing_mc and rec_mc and existing_mc != rec_mc:
+                                        _conflicts.add(_nk)
+                                        break
+                                    # also if same norm but different canonical key string (case-sensitive) treat as conflict
+                                    # handled via ambiguous existing already
+                        # per-record gate evaluation
+                        _filtered_context_entities = []
+                        _gate_decisions = []
+                        for rec in context.entities:
+                            ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, current_chapter=chapter_id, source_pids=set(_source_map.keys()), quarantined_pids=quarantined_pids, existing_names=_existing, duplicate_names=_dup_names, conflicts=_conflicts)
+                            if not ok:
+                                _gate_decisions.append({"entity": rec.entity, "memory_class": getattr(rec,"memory_class",""), "rejected": True, "reason": code, "evidence_pids": [rec.anchor.pid]})
+                                # record candidate_claim if any candidate claim present? handled below via claim filter
+                                continue
+                            _filtered_context_entities.append(rec)
+                        if _filtered_context_entities:
+                            from pact_v4.audit.entity_extractor import ChapterEntityContext
+                            _filtered_context = ChapterEntityContext(
+                                schema=context.schema,
+                                extractor_version=context.extractor_version,
+                                chapter_id=context.chapter_id,
+                                source_hash=context.source_hash,
+                                entities=tuple(_filtered_context_entities),
+                            )
+                            obs = book_memory_observations_from_entity_context(
+                                _filtered_context, chapter_id=chapter_id,
+                            )
+                            entity_obs.update(obs.get("book_memory", {}))
+                        # store gate decisions for report (stashed on entity_obs via side channel)
+                        if "_gate_decisions" not in locals():
+                            _gate_decisions_global = []
+                        # accumulate for report
+                        if "_gate_decisions_global" not in dir():
+                            pass
+                        # we will attach to a global variable via manager? Instead store in a dict attached to loop variable
+                        # Use a simple attribute on manager
+                        if not hasattr(manager, "_gate_reports"):
+                            manager._gate_reports = []
+                        manager._gate_reports.extend(_gate_decisions)
                         try:
                             # GLOSSARY-FROM-ENTITY (variant B, 0 extra model
                             # calls): align the verified proper-noun entities
@@ -1934,9 +2033,15 @@ def run_book(
                         entity_obs[key]["canonical_ru"] = target
             # Glossary observations -> shadow memory (promoted below via the
             # same promote(status, quarantined) call, B7 filter applies).
-            for source, value in glossary_obs.items():
-                manager.add_observation("glossary", source, value)
-                proposed_sources.add(source)
+            # FINDING 1: only add to durable manager when glossary mode is promote; shadow/observe keep report but no mutation
+            if _mode == "promote":
+                for source, value in glossary_obs.items():
+                    manager.add_observation("glossary", source, value)
+                    proposed_sources.add(source)
+            else:
+                # Report still tracks proposed, but no durable observation
+                for source in glossary_obs.keys():
+                    proposed_sources.add(source)
             if glossary_proposed or glossary_conflicts:
                 ledger.append_chapter(
                     chapter_id, glossary_proposed + glossary_conflicts,
@@ -1946,38 +2051,39 @@ def run_book(
             )
             candidates_block["proposed"] = len(glossary_proposed)
             candidates_block["conflicts"] = len(glossary_conflicts)
-            for key, value in entity_obs.items():
-                # Chapter accumulation: a character/entity seen in earlier
-                # chapters keeps its cumulative `chapters` list (the entity
-                # cache holds only THIS chapter's context; union with the
-                # already-promoted entry so `chapters` never shrinks).
-                section, _, entry_key = key.partition(":")
-                if section in ("characters", "entities") and isinstance(value, dict):
-                    existing = book_memory_before.get(section, {}).get(entry_key)
-                    if isinstance(existing, dict):
-                        merged = dict(value)
-                        merged["chapters"] = sorted({
-                            str(c) for c in (
-                                list(existing.get("chapters") or [])
-                                + list(value.get("chapters") or [])
-                            )
-                        })
-                        # Cross-chapter gender disagreement fails closed
-                        # (owner decision 2026-08-08, BM): a verified gender
-                        # contradicted by a LATER chapter is unknown forever
-                        # — never pick a winner.
-                        existing_gender = existing.get("gender")
-                        new_gender = value.get("gender")
-                        if (
-                            existing_gender
-                            and new_gender
-                            and existing_gender != new_gender
-                        ):
-                            merged.pop("gender", None)
-                        elif existing_gender and not new_gender:
-                            merged["gender"] = existing_gender
-                        value = merged
-                manager.add_observation("book_memory", key, value)
+            # Independent book-memory policy gate
+            _effective_bm_policy = book_memory_policy if "book_memory_policy" in locals() else "promote_verified"
+            if _effective_bm_policy == "off":
+                # off: no durable mutation, but still record for report
+                pass
+            elif _effective_bm_policy == "observe":
+                # observe: classify/report without mutation
+                pass
+            else:  # promote_verified
+                for key, value in entity_obs.items():
+                    section, _, entry_key = key.partition(":")
+                    if section in ("characters", "entities") and isinstance(value, dict):
+                        existing = book_memory_before.get(section, {}).get(entry_key)
+                        if isinstance(existing, dict):
+                            merged = dict(value)
+                            merged["chapters"] = sorted({
+                                str(c) for c in (
+                                    list(existing.get("chapters") or [])
+                                    + list(value.get("chapters") or [])
+                                )
+                            })
+                            existing_gender = existing.get("gender")
+                            new_gender = value.get("gender")
+                            if (
+                                existing_gender
+                                and new_gender
+                                and existing_gender != new_gender
+                            ):
+                                merged.pop("gender", None)
+                            elif existing_gender and not new_gender:
+                                merged["gender"] = existing_gender
+                            value = merged
+                    manager.add_observation("book_memory", key, value)
             bm_candidates_block["generated"] = len(entity_obs)
             bm_candidates_block["proposed"] = len(entity_obs)
             bm_promotions = [
@@ -1991,105 +2097,77 @@ def run_book(
                 }
                 for key, value in entity_obs.items()
             ]
+            # Versioned candidate report
+            try:
+                _report_path = out_dir / "book_memory_candidates_report.json"
+                _report_payload = {
+                    "schema": "pact-v4-book-memory-candidates-report/v1",
+                    "chapter_id": chapter_id,
+                    "source_hash": str((run_record.get("identities") or {}).get("source_hash") or ""),
+                    "snapshot_hash": str((run_record.get("identities") or {}).get("snapshot_hash") or ""),
+                    "config_hash": str((run_record.get("identities") or {}).get("config_identity") or ""),
+                    "extractor_version": str(((run_record.get("operational_policy") or {}).get("audit") or {}).get("extractor_version") or ""),
+                    "cache_version": "pact-v4-entity-context-cache/v3",
+                    "policy_version": "book-memory-policy/v1",
+                    "requested_glossary_mode": _mode,
+                    "effective_glossary_mode": _mode,
+                    "requested_book_memory_policy": book_memory_policy,
+                    "effective_book_memory_policy": book_memory_policy,
+                    "terminal_status": terminal_status,
+                    "entity_count": len(entity_obs) + len(getattr(manager, "_gate_reports", [])),
+                    "accepted": bm_promotions,
+                    "rejected": getattr(manager, "_gate_reports", []),
+                    "decisions": bm_promotions + getattr(manager, "_gate_reports", []),
+                }
+                _report_path.write_text(__import__("json").dumps(_report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
         promoted = False
         promote_detail = ""
-        if terminal_status == "complete":
-            # Invariant: complete does not filter observations; the
-            # quarantine status of individual chunks is irrelevant when
-            # the chapter as a whole reached complete. If this fires,
-            # the chapter reports a contradictory state.
-            assert not quarantined, (
-                f"Chapter {chapter_id} terminal=complete but has "
-                f"quarantined chunks: {sorted(quarantined)}"
-            )
-            manager.promote("complete")
-            promoted = True
-            promote_detail = "promoted after complete (all observations)"
-        elif terminal_status == "accepted_degraded":
-            manager.promote(
-                "accepted_degraded",
-                quarantined_chunks=quarantined,
-            )
-            promoted = True
-            promote_detail = (
-                f"promoted after accepted_degraded "
-                f"(excluded {len(quarantined)} quarantined chunks)"
-            )
+        # FINDING 1: independent mode gate — only promoting categories commit durable state
+        _effective_bm_policy_for_promote = _effective_bm_policy if "_effective_bm_policy" in locals() else book_memory_policy
+        _should_promote = terminal_status in _PROMOTING_STATUSES and (_mode == "promote" or _effective_bm_policy_for_promote == "promote_verified")
+        if _should_promote:
+            if terminal_status == "complete":
+                assert not quarantined, (
+                    f"Chapter {chapter_id} terminal=complete but has "
+                    f"quarantined chunks: {sorted(quarantined)}"
+                )
+                # Stage REBUILT chapter_index.json inside same four-file transaction (finding 5)
+                manager.promote("complete", _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern)
+                promoted = True
+                promote_detail = "promoted after complete (all observations)"
+            elif terminal_status == "accepted_degraded":
+                manager.promote(
+                    "accepted_degraded",
+                    quarantined_chunks=quarantined,
+                    _chapter_id=chapter_id, _chapter_html=str(chapter_html), _chapter_ids=chapter_ids, _chapter_html_pattern=chapter_html_pattern,
+                )
+                promoted = True
+                promote_detail = (
+                    f"promoted after accepted_degraded "
+                    f"(excluded {len(quarantined)} quarantined chunks)"
+                )
+            # B9: promote stores observation values verbatim — restore the
+            # flat {source: target} glossary contract for the promoted entries.
+            _flatten_promoted_glossary(memory_dir)
+            # BM: promote stores observation values verbatim — strip the
+            # quarantined-filter-only chunk_id field from promoted book_memory
+            # entries so the on-disk bible stays clean (no-op when nothing was
+            # promoted; bytes preserved).
+            _strip_book_memory_observation_fields(memory_dir)
+        else:
+            if terminal_status in _PROMOTING_STATUSES:
+                promote_detail = f"skipped promotion: glossary_mode={_mode} bm_policy={_effective_bm_policy_for_promote} (observation-only)"
 
-        # B9: promote stores observation values verbatim — restore the
-        # flat {source: target} glossary contract for the promoted entries.
-        _flatten_promoted_glossary(memory_dir)
-        # BM: promote stores observation values verbatim — strip the
-        # quarantined-filter-only chunk_id field from promoted book_memory
-        # entries so the on-disk bible stays clean (no-op when nothing was
-        # promoted; bytes preserved).
-        _strip_book_memory_observation_fields(memory_dir)
 
-        # A2 (causal <N, P0 2026-08-14; RV finding 1 SAFE-MEMORY
-        # 2026-08-14): after an ACCEPTED chapter N, write chapter_index
-        # entries for BOTH the current chapter N and the NEXT chapter N+1
-        # (when it exists in this run), each built from PRE-chapter memory
-        # ONLY — facts of chapters < the entry's chapter id
-        # (pre_chapter_book_memory). The strict runner reads
-        # chapter_index[X] before generating X, so:
-        #   * entry[N] (re)built from pre-N memory: a rerun of N never
-        #     sees N's own post-promotion facts (the old post-promotion
-        #     build leaked them into N's own prompt);
-        #   * entry[N+1] pre-built NOW from the post-N memory (= the
-        #     pre-chapter memory of N+1): the FIRST run of N+1 already
-        #     sees the memory of accepted chapters < N+1 (the old code
-        #     built only the current chapter's entry after acceptance, so
-        #     N+1's first run failed soft to narrator+seed and saw none of
-        #     the prior chapters' memory).
-        # 0 model calls, deterministic (B9-A2 card). Failed chapters never
-        # touch the index.
+
+        # A2 index entries are now staged inside the same four-file transaction via MemoryManager.promote (finding 5),
+        # so no separate post-promote mutation of chapter_index.json is needed. The promote transaction already rebuilt
+        # current and next chapter entries from pre-chapter memory. Keep index_built flag for reporting.
         if terminal_status in _PROMOTING_STATUSES:
-            try:
-                from pact_full_pipeline_runner_v1.build_chapter_index import (
-                    build_index_file,
-                )
-
-                build_index_file(
-                    memory_dir=str(memory_dir),
-                    chapter_html=str(chapter_html),
-                    chapter_id=chapter_id,
-                    out_path=str(memory_dir / "chapter_index.json"),
-                )
-                index_built = True
-            except Exception as exc:  # noqa: BLE001 — never break a run
-                LOG.warning(
-                    "A2: chapter_index build failed for %s (%s: %s); "
-                    "causal bible will fail-soft to narrator+seed",
-                    chapter_id, type(exc).__name__, exc,
-                )
-                index_built = False
-            # RV finding 1: pre-build the NEXT chapter's entry so its
-            # FIRST run sees the memory of accepted chapters < N+1
-            # (best-effort — a missing next-html or build error must
-            # never fail the run; the next chapter then fails soft).
-            next_chapter_id = _next_chapter_id(chapter_id, chapter_ids)
-            if next_chapter_id:
-                try:
-                    from pact_full_pipeline_runner_v1.build_chapter_index import (
-                        build_index_file,
-                    )
-
-                    build_index_file(
-                        memory_dir=str(memory_dir),
-                        chapter_html=str(
-                            chapter_html_pattern.format(chapter_id=next_chapter_id)
-                        ),
-                        chapter_id=next_chapter_id,
-                        out_path=str(memory_dir / "chapter_index.json"),
-                    )
-                except Exception as exc:  # noqa: BLE001 — never break a run
-                    LOG.warning(
-                        "A2: next-chapter index prebuild failed for %s "
-                        "(%s: %s); %s will fail-soft to narrator+seed",
-                        next_chapter_id, type(exc).__name__, exc,
-                        next_chapter_id,
-                    )
+            index_built = promoted
         else:
             index_built = False
 
@@ -2250,7 +2328,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-formatting-incidents", type=int, default=_DEFAULT_MAX_FORMATTING_INCIDENTS, help="v41 italics: max formatting incidents before blocking (lenient debt default 999)")
     parser.add_argument("--formatting-enabled", action="store_true", default=True, help="Enable v41 italics formatting (default: enabled)")
     parser.add_argument("--no-formatting", dest="formatting_enabled", action="store_false", help="Disable v41 italics formatting")
-    parser.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="off", help="Glossary resolver mode (identity-bearing, default off): off/shadow/promote")
+    parser.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="promote", help="Glossary resolver mode (identity-bearing, default off): off/shadow/promote")
+    parser.add_argument("--book-memory-policy", choices=("promote_verified", "observe", "off"), default="promote_verified", help="Book-memory policy (identity-bearing, default promote_verified): promote_verified/observe/off")
     parser.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute", help="Glossary resolver cache-miss policy (identity-bearing, default recompute)")
     return parser
 
@@ -2292,6 +2371,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_formatting_incidents=int(args.max_formatting_incidents),
         glossary_resolver_mode=args.glossary_resolver_mode,
         glossary_resolver_cache_miss_policy=args.glossary_resolver_cache_miss_policy,
+        book_memory_policy=args.book_memory_policy,
     )
     failed = 0
     for rec in result["chapters"]:

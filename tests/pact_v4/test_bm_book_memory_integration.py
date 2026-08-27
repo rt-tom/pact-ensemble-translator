@@ -75,6 +75,7 @@ def _setup_memory(tmp_path: Path, book_memory: dict | None = None) -> Path:
     (memory / "book_memory.json").write_text(
         json.dumps(book_memory, ensure_ascii=False), encoding="utf-8",
     )
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
     return memory
 
@@ -161,6 +162,13 @@ def _entity_cache_entry(
     source_hash: str = "test-hash",
     extractor_version: str = EXTRACTOR_VERSION,
 ) -> dict:
+    # Auto-pick anchor pid where entity appears if default not in source or span mismatch
+    if anchor_pid not in source_text or anchor_span not in source_text.get(anchor_pid, ""):
+        for pid, txt in source_text.items():
+            if entity in txt:
+                anchor_pid = pid
+                anchor_span = txt
+                break
     """Build a valid single-entry ``entity_context_cache.json`` payload.
 
     The cache schema is ``pact-v4-entity-context-cache/v1``; every context
@@ -185,6 +193,9 @@ def _entity_cache_entry(
             "evidence": [{"pid": anchor_pid, "span": "She was running late"}],
             "evidence_windows": [[anchor_pid, anchor_pid]],
         }]
+    # memory_class heuristic for tests: use named_character for person names, else chapter_local
+    _mc = "named_character" if entity and entity[0].isupper() else "chapter_local"
+    _mw = True if _mc != "chapter_local" else False
     context = {
         "schema": ENTITY_CONTEXT_SCHEMA,
         "extractor_version": extractor_version,
@@ -197,6 +208,8 @@ def _entity_cache_entry(
                 "anchor": {"pid": anchor_pid, "span": anchor_span},
                 "aliases": [],
                 "claims": claims,
+                "memory_class": _mc,
+                "memory_worthy": _mw,
             },
         ],
     }
@@ -847,7 +860,8 @@ class TestBookMemoryAccumulation:
             "p00005": "The pact held firm against time.",
             "p00006": "The others watched from afar.",
         }
-        cache = _entity_cache_entry("0001", source_text)
+        # FINDING 2 quarantine: anchor must not be in quarantined chunk (chunk0001 covers p00001-p00003), so pick anchor in accepted chunk
+        cache = _entity_cache_entry("0001", source_text, anchor_pid="p00004", anchor_span="Blake saw Rose smile, and Rose waved once more.")
         memory, out_base, result = self._run(tmp_path, monkeypatch, {
             "0001": (html, "accepted_degraded", ["chunk0001"], translations, cache),
         })
@@ -1188,7 +1202,7 @@ class TestStripBookMemoryAtomicWrite:
         # No leftover temp files in the memory dir.
         leftovers = [p for p in memory.iterdir()
                      if p.name not in ("book_memory.json", "glossary.json",
-                                       "observations.json")]
+                                       "observations.json", "chapter_index.json")]
         assert leftovers == []
 
     def test_strip_noop_preserves_bytes(self, tmp_path):

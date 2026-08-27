@@ -65,14 +65,24 @@ from pact_v4.runtime.reasoning_writer import append_error_marker, open_reasoning
 LOG = logging.getLogger(__name__)
 
 # Identity of the validated artifact and of the extractor model call.
-ENTITY_CONTEXT_SCHEMA = "pact-v4-chapter-entity-context/v1"
-EXTRACTOR_VERSION = "pact-v4-entity-extractor/v2"
+ENTITY_CONTEXT_SCHEMA = "pact-v4-chapter-entity-context/v2"
+EXTRACTOR_VERSION = "pact-v4-entity-extractor/v3"
 # Identity of the validation report written alongside the artifact so a
 # drop/downgrade is visible, never silent.
-VALIDATION_REPORT_SCHEMA = "pact-v4-entity-extractor-validation/v1"
-CACHE_SCHEMA = "pact-v4-entity-context-cache/v2"
+VALIDATION_REPORT_SCHEMA = "pact-v4-entity-extractor-validation/v2"
+CACHE_SCHEMA = "pact-v4-entity-context-cache/v3"
 
 CLAIM_KINDS = ("gender", "alias_relation", "object_identity")
+MEMORY_CLASSES = (
+    "named_character",
+    "named_place",
+    "named_group",
+    "named_artifact",
+    "named_creature",
+    "world_term",
+    "chapter_local",
+)
+MEMORY_CLASS_SET = frozenset(MEMORY_CLASSES)
 STATUS_VERIFIED = "verified"
 STATUS_CANDIDATE = "candidate"
 STATUSES = (STATUS_VERIFIED, STATUS_CANDIDATE)
@@ -181,7 +191,7 @@ def is_entity_glossary_candidate(record: "EntityRecord", source_map: Mapping[str
 
 ENTITY_EXTRACTION_V1 = ReviewerPrompt(
     role="entity_extractor",
-    version="pact-v4-entity-extractor-prompt/v2",
+    version="pact-v4-entity-extractor-prompt/v3",
     instructions=(
         "You are a source-only entity extractor for an English fiction "
         "chapter. You are given the FULL SOURCE of one chapter as an ordered "
@@ -226,6 +236,8 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "person/place/group/nickname that deserves a glossary entry "
         "(title-case, not a common noun or stop word, appears word-boundary "
         "in source); false veto even when code checks pass\n"
+        "    memory_class: string — exactly one of named_character|named_place|named_group|named_artifact|named_creature|world_term|chapter_local\n"
+        "    memory_worthy: bool — true if this entity deserves durable memory (independent of glossary); false is a veto for durable promotion\n"
         "Rules:\n"
         "1. SOURCE ONLY: every span must be a verbatim quote from the "
         "source PID it is attached to. Never quote or invent text that is "
@@ -251,7 +263,10 @@ ENTITY_EXTRACTION_V1 = ReviewerPrompt(
         "8. glossary_worthy: set true only for proper-name entities that "
         "deserve a glossary entry (person/place/group/nickname, title-case, "
         "not a stop word, surface appears word-boundary in source); false "
-        "otherwise. This is a model gate — false veto even if code checks pass."
+        "otherwise. This is a model gate — false veto even if code checks pass.\n"
+        "9. memory_class: set exactly one of named_character|named_place|named_group|named_artifact|named_creature|world_term|chapter_local — named_* for durable named identities, world_term for recurring world vocabulary, chapter_local for scene objects/generic roles that must not persist.\n"
+        "10. memory_worthy: true only if this specific entity deserves durable memory; false veto even when class and evidence pass.\n"
+        "11. memory_class and memory_worthy are REQUIRED — missing, null, or unknown values are invalid."
     ),
 )
 
@@ -338,6 +353,8 @@ class EntityRecord:
     aliases: Tuple[AliasRef, ...] = ()
     claims: Tuple[EntityClaim, ...] = ()
     glossary_worthy: bool = False
+    memory_class: str = "chapter_local"
+    memory_worthy: bool = False
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -347,6 +364,8 @@ class EntityRecord:
             "aliases": [a.to_payload() for a in self.aliases],
             "claims": [c.to_payload() for c in self.claims],
             "glossary_worthy": bool(self.glossary_worthy),
+            "memory_class": str(self.memory_class),
+            "memory_worthy": bool(self.memory_worthy),
         }
 
 
@@ -616,13 +635,17 @@ def _entity_from_payload(item: Any) -> EntityRecord:
     )
     gw = item.get("glossary_worthy")
     if gw is None:
-        # Old payloads without glossary_worthy: treat as False (veto) but allow migration;
-        # new version requires explicit bool, so we default to False and let code gate handle.
         glossary_worthy = False
     elif isinstance(gw, bool):
         glossary_worthy = gw
     else:
         raise ValueError(f"glossary_worthy must be bool, got {gw!r}")
+    mc = item.get("memory_class")
+    if not isinstance(mc, str) or mc not in MEMORY_CLASS_SET:
+        raise ValueError(f"memory_class must be one of {MEMORY_CLASSES}, got {mc!r}")
+    mw = item.get("memory_worthy")
+    if not isinstance(mw, bool):
+        raise ValueError(f"memory_worthy must be bool, got {mw!r}")
     return EntityRecord(
         entity=str(item["entity"]),
         canonical_type=str(item["canonical_type"]),
@@ -633,6 +656,8 @@ def _entity_from_payload(item: Any) -> EntityRecord:
         aliases=aliases,
         claims=claims,
         glossary_worthy=glossary_worthy,
+        memory_class=mc,
+        memory_worthy=mw,
     )
 
 
@@ -897,6 +922,9 @@ def validate_entity_context(
                 for a in kept_aliases
             ),
             claims=tuple(kept_claims),
+            glossary_worthy=record.glossary_worthy,
+            memory_class=record.memory_class,
+            memory_worthy=record.memory_worthy,
         ))
 
     context = ChapterEntityContext(

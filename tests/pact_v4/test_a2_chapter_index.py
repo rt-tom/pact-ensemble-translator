@@ -23,6 +23,9 @@ from pact_v4.runtime.bible_renderer import render_bible_section
 
 def _book_memory() -> dict:
     return {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "policy": {"explicit_deny": [], "explicit_allow": {}, "aliases": {}, "approved_terms": [], "generic_patterns_version": "generic-memory-reject/v1"},
         "pov": {"gender": "male", "source_name": "Blake Thorburn"},
         "characters": {
             "Blake Thorburn": {
@@ -177,7 +180,10 @@ def test_build_index_file_writes_chapter_index_json(tmp_path):
 
 
 def _chapter_index() -> dict:
+    # Finding 2: chapter_index must carry v2 schema/policy or renderer fails soft to seed
     return {
+        "$schema": "pact-v4-chapter-index/v2",
+        "$book_memory_policy_version": "book-memory-policy/v1",
         "0001": build_chapter_index(
             chapter_id="0001", source_text=_source_text(),
             book_memory=_book_memory(),
@@ -369,6 +375,7 @@ def test_book_run_builds_chapter_index_after_accepted_chapter(tmp_path, monkeypa
     )
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
 
     out_base = tmp_path / "out"
     src_dir = tmp_path / "src"
@@ -438,6 +445,7 @@ def test_book_run_skips_chapter_index_for_failed_chapter(tmp_path, monkeypatch):
     )
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
 
     out_base = tmp_path / "out"
     src_dir = tmp_path / "src"
@@ -475,7 +483,11 @@ def test_book_run_skips_chapter_index_for_failed_chapter(tmp_path, monkeypatch):
 
     assert result["chapters"][0]["terminal_status"] == "failed"
     assert result["chapters"][0]["index_built"] is False
-    assert not (memory / "chapter_index.json").exists()
+    # Strict boundary (finding 6) ensures file always exists after init (empty), but entry must not be built for failed chapter
+    assert (memory / "chapter_index.json").exists()
+    import json as _j
+    idx = _j.loads((memory / "chapter_index.json").read_text())
+    assert "0001" not in idx
 
 
 def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
@@ -500,6 +512,9 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
     memory = tmp_path / "memory"
     memory.mkdir()
     book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "policy": {"explicit_deny": [], "explicit_allow": {}, "aliases": {}, "approved_terms": [], "generic_patterns_version": "generic-memory-reject/v1"},
         "pov": {"gender": "male", "source_name": "Blake Thorburn"},
         "characters": {
             "Blake Thorburn": {
@@ -525,6 +540,7 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
     )
     (memory / "glossary.json").write_text("{}", encoding="utf-8")
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
 
     out_base = tmp_path / "out"
     src_dir = tmp_path / "src"

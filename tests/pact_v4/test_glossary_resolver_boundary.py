@@ -136,7 +136,7 @@ def test_glossary_worthy_model_gate_and_code_gate():
     assert is_entity_glossary_candidate(rec_single, dict(source.source)) is True
 
 def test_extractor_version_bump():
-    assert EXTRACTOR_VERSION == "pact-v4-entity-extractor/v2"
+    assert EXTRACTOR_VERSION == "pact-v4-entity-extractor/v3"
 
 def test_lemma_v1():
     assert lemma_v1_match(["Сандре"], "Сандра") is True
@@ -628,7 +628,7 @@ def test_b3_strict_runner_quarantine_plumbing_via_b3_cache_hit(tmp_path: Path, m
     import json as _js
     from pact_v4.audit.entity_extractor import entity_context_cache_key
     key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION)
-    payload_ec = {"schema": "pact-v4-entity-context-cache/v2", "entries": [{"key": key, "context": ctx.to_payload()}]}
+    payload_ec = {"schema": "pact-v4-entity-context-cache/v3", "entries": [{"key": key, "context": ctx.to_payload()}]}
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик"}
     class _ResolverBackend(CompletionBackend):
@@ -840,7 +840,7 @@ def test_b3_cache_hit_valid_via_public_run(tmp_path: Path, monkeypatch):
     import json as _js
     from pact_v4.audit.entity_extractor import entity_context_cache_key
     key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION)
-    payload_ec = {"schema": "pact-v4-entity-context-cache/v2", "entries": [{"key": key, "context": ctx.to_payload()}]}
+    payload_ec = {"schema": "pact-v4-entity-context-cache/v3", "entries": [{"key": key, "context": ctx.to_payload()}]}
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик", "p00002": "text"}
     class _ResolverBackend(CompletionBackend):
@@ -912,7 +912,7 @@ def test_b3_cache_hit_missing_recompute_and_fail_closed_via_public_run(tmp_path:
     import json as _js
     from pact_v4.audit.entity_extractor import entity_context_cache_key
     key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION)
-    payload_ec = {"schema": "pact-v4-entity-context-cache/v2", "entries": [{"key": key, "context": ctx.to_payload()}]}
+    payload_ec = {"schema": "pact-v4-entity-context-cache/v3", "entries": [{"key": key, "context": ctx.to_payload()}]}
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик"}
     class _ResolverBackend(CompletionBackend):
@@ -1005,7 +1005,7 @@ def test_b3_cache_hit_stale_and_tampered_fail_closed_via_public_run(tmp_path: Pa
     import json as _js
     from pact_v4.audit.entity_extractor import entity_context_cache_key
     key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION)
-    payload_ec = {"schema": "pact-v4-entity-context-cache/v2", "entries": [{"key": key, "context": ctx.to_payload()}]}
+    payload_ec = {"schema": "pact-v4-entity-context-cache/v3", "entries": [{"key": key, "context": ctx.to_payload()}]}
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик"}
     # First fresh run to populate audit cache (creates valid sidecar)
@@ -1186,7 +1186,7 @@ def test_b3_run_end_to_end_promotion_via_real_run(tmp_path: Path, monkeypatch):
     # Write entity cache so B3 finds it
     from pact_v4.audit.entity_extractor import EntityContextCache, entity_context_cache_key
     key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=EXTRACTOR_VERSION)
-    payload_ec = {"schema": "pact-v4-entity-context-cache/v2", "entries": [{"key": key, "context": ctx.to_payload()}]}
+    payload_ec = {"schema": "pact-v4-entity-context-cache/v3", "entries": [{"key": key, "context": ctx.to_payload()}]}
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик", "p00002": "text"}
     class _ResolverBackend(CompletionBackend):
@@ -1257,7 +1257,7 @@ def test_book_run_end_to_end_promotion_stale_quarantine(tmp_path: Path):
     from pact_v4.audit.entity_extractor import entity_context_cache_key
     key = entity_context_cache_key(source_hash="src", extractor_version=EXTRACTOR_VERSION)
     ctx = ChapterEntityContext(schema=ENTITY_CONTEXT_SCHEMA, chapter_id="0001", source_hash="src", extractor_version=EXTRACTOR_VERSION, entities=(_make_entity("Shotgun"),))
-    (out_dir / "entity_context_cache.json").write_text(_js.dumps({"schema": "pact-v4-entity-context-cache/v1", "entries": [{"key": key, "context": ctx.to_payload()}]}), encoding="utf-8")
+    (out_dir / "entity_context_cache.json").write_text(_js.dumps({"schema": "pact-v4-entity-context-cache/v3", "entries": [{"key": key, "context": ctx.to_payload()}]}), encoding="utf-8")
     # 1) Promotion via real run_book
     result = run_book(memory_dir=memory_dir, chapter_ids=["0001"], chapter_html_pattern=str(chapters_dir / "{chapter_id}.html"), out_base=out_base, glossary_resolver_mode="promote", promote_existing_dir=out_dir)
     assert result is not None
