@@ -180,7 +180,10 @@ def test_build_index_file_writes_chapter_index_json(tmp_path):
 
 
 def _chapter_index() -> dict:
+    # Finding 2: chapter_index must carry v2 schema/policy or renderer fails soft to seed
     return {
+        "$schema": "pact-v4-chapter-index/v2",
+        "$book_memory_policy_version": "book-memory-policy/v1",
         "0001": build_chapter_index(
             chapter_id="0001", source_text=_source_text(),
             book_memory=_book_memory(),

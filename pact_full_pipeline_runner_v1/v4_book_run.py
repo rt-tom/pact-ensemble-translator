@@ -1910,28 +1910,46 @@ def run_book(
                         _policy = _policy_block.get("policy", {})
                         _source_map = _source_by_pid(chapter_html)
                         _existing = set()
+                        _existing_map: dict = {}
                         for sec in ("characters","entities"):
-                            for k in (book_memory_before.get(sec) or {}).keys():
-                                _existing.add(k.strip().casefold().replace("\u2019","'"))
+                            sec_data = book_memory_before.get(sec) or {}
+                            if isinstance(sec_data, dict):
+                                for k, v in sec_data.items():
+                                    norm = k.strip().casefold().replace("\u2019","'")
+                                    _existing.add(norm)
+                                    mc = v.get("memory_class") if isinstance(v, dict) else ""
+                                    _existing_map.setdefault(norm, []).append((sec, mc, k))
+                        # Build REAL conflict set: normalized names that collide with existing canonical entry under different identity
+                        _conflicts = set()
+                        # 1) ambiguous existing: same casefold present in both characters and entities or with different memory_class
+                        for norm, lst in _existing_map.items():
+                            if len(lst) > 1:
+                                secs = {s for s, _, _ in lst}
+                                mcs = {m for _, m, _ in lst}
+                                if len(secs) > 1 or len(mcs) > 1:
+                                    _conflicts.add(norm)
+                        # 2) incoming record collides with existing entry under different memory_class/section
+                        # Precompute duplicate counts for batch-conflict detection as well
+                        _norm_counts_batch = {}
+                        for _r in context.entities:
+                            _nk = _r.entity.strip().casefold().replace("\u2019","'")
+                            _norm_counts_batch[_nk] = _norm_counts_batch.get(_nk, 0) + 1
+                        _dup_names = {k for k, v in _norm_counts_batch.items() if v > 1}
+                        # Also add incoming vs existing memory_class mismatch to conflicts
+                        for _r in context.entities:
+                            _nk = _r.entity.strip().casefold().replace("\u2019","'")
+                            if _nk in _existing_map:
+                                rec_mc = getattr(_r, "memory_class", "")
+                                for _, existing_mc, _ in _existing_map[_nk]:
+                                    if existing_mc and rec_mc and existing_mc != rec_mc:
+                                        _conflicts.add(_nk)
+                                        break
+                                    # also if same norm but different canonical key string (case-sensitive) treat as conflict
+                                    # handled via ambiguous existing already
                         # per-record gate evaluation
                         _filtered_context_entities = []
                         _gate_decisions = []
                         for rec in context.entities:
-                            # FINDING 2: pass real quarantined_pids and computed duplicate/conflict sets
-                            # compute duplicate_names: normalized entities that appear >1 in this batch
-                            _norm_counts = {}
-                            for _r in context.entities:
-                                _nk = _r.entity.strip().casefold().replace("\u2019","'")
-                                _norm_counts[_nk] = _norm_counts.get(_nk, 0) + 1
-                            _dup_names = {k for k, v in _norm_counts.items() if v > 1}
-                            # conflicts: use glossary conflict sources (casefold) if available, else empty
-                            _conflicts = set()
-                            try:
-                                _gloss_conf = glossary_before
-                                # glossary_before is dict {source: target}
-                                # no explicit conflict set, keep empty but pass computed duplicates
-                            except Exception:
-                                _conflicts = set()
                             ok, code = evaluate_gate(rec, policy=_policy, source_map=_source_map, current_chapter=chapter_id, source_pids=set(_source_map.keys()), quarantined_pids=quarantined_pids, existing_names=_existing, duplicate_names=_dup_names, conflicts=_conflicts)
                             if not ok:
                                 _gate_decisions.append({"entity": rec.entity, "memory_class": getattr(rec,"memory_class",""), "rejected": True, "reason": code, "evidence_pids": [rec.anchor.pid]})

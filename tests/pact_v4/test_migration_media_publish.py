@@ -26,7 +26,8 @@ def test_publish_via_media_success(tmp_path):
     parent.mkdir()
     _setup_parent(parent)
     migrated = migrate_to_v2(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
-    rebuilt = {"$schema": "pact-v4-chapter-index/v2", "$book_memory_policy_version": "book-memory-policy/v1", "0001": {"characters": [], "named_entities": [], "terms": [], "facts": [], "address": []}}
+    from pact_v4.runtime.book_memory_migration import build_index_from_memory as _det
+    rebuilt = _det(migrated)
     cand = tmp_path / "cand"
     build_migration_candidate(parent, cand, migrated, rebuilt)
     manifest = dry_run_manifest(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
@@ -45,7 +46,8 @@ def test_publish_fails_without_approval(tmp_path):
     parent.mkdir()
     _setup_parent(parent)
     migrated = migrate_to_v2(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
-    rebuilt = {"$schema": "pact-v4-chapter-index/v2", "$book_memory_policy_version": "book-memory-policy/v1"}
+    from pact_v4.runtime.book_memory_migration import build_index_from_memory as _det
+    rebuilt = _det(migrated)
     cand = tmp_path / "cand"
     build_migration_candidate(parent, cand, migrated, rebuilt)
     manifest = dry_run_manifest(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
@@ -65,7 +67,8 @@ def test_publish_fails_hash_mismatch(tmp_path):
     parent.mkdir()
     _setup_parent(parent)
     migrated = migrate_to_v2(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
-    rebuilt = {"$schema": "pact-v4-chapter-index/v2"}
+    from pact_v4.runtime.book_memory_migration import build_index_from_memory as _det
+    rebuilt = _det(migrated)
     cand = tmp_path / "cand"
     build_migration_candidate(parent, cand, migrated, rebuilt)
     manifest = dry_run_manifest(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
@@ -87,7 +90,8 @@ def test_rollback_publishes_new_revision(tmp_path):
     parent.mkdir()
     _setup_parent(parent)
     migrated = migrate_to_v2(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))
-    rebuilt = {"$schema": "pact-v4-chapter-index/v2"}
+    from pact_v4.runtime.book_memory_migration import build_index_from_memory as _det
+    rebuilt = _det(migrated)
     cand = tmp_path / "cand"
     build_migration_candidate(parent, cand, migrated, rebuilt)
     manifest = dry_run_manifest(json.loads((parent / "book_memory.json").read_text()), json.loads((parent / "glossary.json").read_text()))

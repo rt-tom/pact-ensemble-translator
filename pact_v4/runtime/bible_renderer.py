@@ -13,6 +13,12 @@ from __future__ import annotations
 
 from typing import Any, List, Mapping, Optional
 
+try:
+    from pact_v4.runtime.book_memory_policy import BOOK_MEMORY_POLICY_VERSION
+
+except Exception:
+    BOOK_MEMORY_POLICY_VERSION = "book-memory-policy/v1"
+
 __all__ = ["render_bible_section", "extract_narrator_gender"]
 CHAPTER_INDEX_V2_SCHEMA = "pact-v4-chapter-index/v2"
 BOOK_MEMORY_V2_SCHEMA = "pact-v4-book-memory/v2"
@@ -155,10 +161,14 @@ def render_bible_section(
             book_memory = chapter_id
         return _render_seed_bible(book_memory)
 
-    # v2 schema check: missing or foreign schema fails soft to narrator+seed
+    # v2 schema check: missing or foreign schema fails soft to narrator+seed (finding 2)
     if isinstance(chapter_index, Mapping):
         schema = chapter_index.get("$schema") or chapter_index.get("schema")
-        if schema is not None and schema != CHAPTER_INDEX_V2_SCHEMA:
+        if schema != CHAPTER_INDEX_V2_SCHEMA:
+            return _render_seed_bible(book_memory)
+        # Also validate policy version if present; unknown version fails soft
+        policy_ver = chapter_index.get("$book_memory_policy_version") or chapter_index.get("book_memory_policy_version")
+        if policy_ver is not None and policy_ver != BOOK_MEMORY_POLICY_VERSION:
             return _render_seed_bible(book_memory)
     entry = None
     if isinstance(chapter_index, Mapping):

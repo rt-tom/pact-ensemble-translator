@@ -12,6 +12,129 @@ from .book_memory_policy import BOOK_MEMORY_SCHEMA, BOOK_MEMORY_POLICY_VERSION, 
 
 CANONICAL_FILES = ["glossary.json", "book_memory.json", "chapter_index.json", "observations.json"]
 
+def build_index_from_memory(migrated_book_memory: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic v2 chapter_index built SOLELY from migrated memory (no source needed).
+    For each entry in characters/entities/terms/facts/address, use its chapters list and memory_class
+    to place the name into the correct per-chapter bucket with causal provenance.
+    """
+    try:
+        from pact_full_pipeline_runner_v1.build_chapter_index import CHAPTER_INDEX_V2_SCHEMA as _SCHEMA, BOOK_MEMORY_POLICY_VERSION as _PV_DEFAULT
+    except Exception:
+        _SCHEMA = "pact-v4-chapter-index/v2"
+        _PV_DEFAULT = "book-memory-policy/v1"
+    schema = _SCHEMA
+    policy_ver = str(migrated_book_memory.get("book_memory_policy_version", _PV_DEFAULT))
+    # Accumulate per-chapter buckets
+    per_chapter: Dict[str, Dict[str, List[str]]] = {}
+    def _ensure(ch: str):
+        if ch not in per_chapter:
+            per_chapter[ch] = {"characters": [], "named_entities": [], "terms": [], "facts": [], "address": []}
+        return per_chapter[ch]
+    # characters / entities with memory_class
+    for section in ("characters", "entities"):
+        sec = migrated_book_memory.get(section, {})
+        if not isinstance(sec, dict):
+            continue
+        for name, entry in sec.items():
+            if not isinstance(entry, dict):
+                continue
+            mc = str(entry.get("memory_class") or "")
+            if mc == "chapter_local":
+                continue
+            # Determine bucket
+            if mc == "named_character":
+                bucket = "characters"
+            elif mc in ("named_place", "named_group", "named_artifact", "named_creature", "named_entity"):
+                bucket = "named_entities"
+            elif mc == "world_term":
+                bucket = "terms"
+            else:
+                # Default based on section for backward compat: characters -> characters, entities -> named_entities
+                if section == "characters":
+                    bucket = "characters"
+                else:
+                    bucket = "named_entities"
+                # If world_term without explicit class but in approved terms, put in terms
+                # Check policy approved_terms
+                approved = []
+                try:
+                    approved = migrated_book_memory.get("policy", {}).get("approved_terms", [])
+                except Exception:
+                    approved = []
+                if any(name.casefold() == str(t).casefold() for t in approved):
+                    bucket = "terms"
+            chs = entry.get("chapters")
+            if not isinstance(chs, (list, tuple)) or not chs:
+                chs = [entry.get("first_seen_chapter")] if entry.get("first_seen_chapter") else []
+            for ch in chs:
+                if not isinstance(ch, str) or not ch:
+                    continue
+                bucket_list = _ensure(str(ch))[bucket]
+                if name not in bucket_list:
+                    bucket_list.append(name)
+    # terms section if present (explicit)
+    terms_sec = migrated_book_memory.get("terms")
+    if isinstance(terms_sec, dict):
+        for name, entry in terms_sec.items():
+            chs = []
+            if isinstance(entry, dict):
+                chs = entry.get("chapters") or [entry.get("first_seen_chapter")] if entry.get("first_seen_chapter") else []
+            else:
+                chs = []
+            for ch in chs or []:
+                if isinstance(ch, str) and ch:
+                    _ensure(ch)["terms"].append(name)
+    elif isinstance(terms_sec, list):
+        for entry in terms_sec:
+            if isinstance(entry, dict):
+                name = str(entry.get("name") or entry.get("term") or "")
+                ch = str(entry.get("chapter") or "")
+                if name and ch:
+                    _ensure(ch)["terms"].append(name)
+    # facts
+    facts = migrated_book_memory.get("facts")
+    if isinstance(facts, list):
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            text = str(fact.get("fact") or fact.get("text") or "")
+            if not text:
+                continue
+            ch = str(fact.get("chapter") or "")
+            if not ch:
+                # Try keys/chapters?
+                continue
+            _ensure(ch)["facts"].append(text)
+    # address_register
+    addr = migrated_book_memory.get("address_register")
+    if isinstance(addr, list):
+        for entry in addr:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "")
+            if not text:
+                continue
+            ch = str(entry.get("chapter") or entry.get("first_seen_chapter") or "")
+            if ch:
+                _ensure(ch)["address"].append(text)
+            else:
+                # If no chapter provenance, assign to first chapter bucket if any, else skip
+                if per_chapter:
+                    first = sorted(per_chapter.keys())[0]
+                    _ensure(first)["address"].append(text)
+    # Build final deterministic index with sorted buckets
+    out: Dict[str, Any] = {"$schema": schema, "$book_memory_policy_version": policy_ver}
+    for ch in sorted(per_chapter.keys()):
+        buckets = per_chapter[ch]
+        out[ch] = {
+            "characters": sorted(set(buckets["characters"]), key=lambda x: x.casefold()),
+            "named_entities": sorted(set(buckets["named_entities"]), key=lambda x: x.casefold()),
+            "terms": sorted(set(buckets["terms"]), key=lambda x: x.casefold()),
+            "facts": sorted(set(buckets["facts"]), key=lambda x: x.casefold()),
+            "address": sorted(set(buckets["address"]), key=lambda x: x.casefold()),
+        }
+    return out
+
 def _canonical_hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -172,63 +295,24 @@ def build_migration_candidate(parent_dir: Path, candidate_dir: Path, migrated_bo
     with open(candidate_dir / "book_memory.json", "w", encoding="utf-8") as f:
         json.dump(migrated_book_memory, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
-    # Chapter index: MUST be rebuilt from migrated memory, not copied — FINDING 6
-    # Deterministic rebuild validation: supplied index must match v2 deterministic construction from migrated memory
-    try:
-        from pact_full_pipeline_runner_v1.build_chapter_index import CHAPTER_INDEX_V2_SCHEMA as _IDX_SCHEMA, BOOK_MEMORY_POLICY_VERSION as _IDX_PV
-    except Exception:
-        _IDX_SCHEMA = "pact-v4-chapter-index/v2"
-        _IDX_PV = "book-memory-policy/v1"
-    expected_schema = _IDX_SCHEMA
-    expected_pv = str(migrated_book_memory.get("book_memory_policy_version", _IDX_PV))
-    deterministic_index: Dict[str, Any] = {}
+    # Chapter index: MUST be rebuilt deterministically from migrated v2 memory (finding 4)
+    # Always compute deterministic_index = build_index_from_memory(migrated_book_memory)
+    deterministic_index = build_index_from_memory(migrated_book_memory)
+    expected_schema = deterministic_index.get("$schema")
+    expected_pv = deterministic_index.get("$book_memory_policy_version")
     if rebuilt_index is not None:
-        # Validate supplied index equals deterministic expectations (schema/policy) and is not stale v1 copy
-        # FINDING 6: allow missing policy version to be filled deterministically, but reject explicit mismatch
-        if "$schema" in rebuilt_index and rebuilt_index.get("$schema") != expected_schema:
+        # Require supplied index to equal deterministic rebuild exactly (canonical JSON equality)
+        # Normalize both to canonical JSON for comparison
+        def _canon(v):
+            return json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if _canon(rebuilt_index) != _canon(deterministic_index):
+            raise RuntimeError(f"stale chapter_index rejected: supplied rebuilt_index diverges from deterministic rebuild (expected {_canon(deterministic_index)[:200]!r} got {_canon(rebuilt_index)[:200]!r})")
+        # Also ensure not stale v1 (redundant with above, but explicit)
+        if rebuilt_index.get("$schema") != expected_schema:
             raise RuntimeError(f"stale chapter_index rejected: expected $schema {expected_schema!r}, got {rebuilt_index.get('$schema')!r}")
-        if "$schema" not in rebuilt_index:
-            raise RuntimeError(f"stale chapter_index rejected: missing $schema, expected {expected_schema!r}")
-        if "$book_memory_policy_version" in rebuilt_index and rebuilt_index.get("$book_memory_policy_version") != expected_pv:
-            raise RuntimeError(f"stale chapter_index rejected: expected $book_memory_policy_version {expected_pv!r}, got {rebuilt_index.get('$book_memory_policy_version')!r}")
-        # Fill missing policy version deterministically
-        if "$book_memory_policy_version" not in rebuilt_index:
-            rebuilt_index = dict(rebuilt_index)
-            rebuilt_index["$book_memory_policy_version"] = expected_pv
-        # Additional stale check: if supplied index is byte-identical to parent's index and parent was v1/stale, reject
-        try:
-            import json as _js
-            parent_idx_raw = (parent_dir / "chapter_index.json").read_text(encoding="utf-8")
-            parent_idx = _js.loads(parent_idx_raw)
-            if parent_idx and rebuilt_index == parent_idx and parent_idx.get("$schema") != expected_schema:
-                raise RuntimeError("stale chapter_index rejected: supplied index equals parent v1 index, not rebuilt v2")
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-        # Also ensure no legacy flattened contamination: if migrated memory has world_term/place entries, they must not be in characters
-        # Build a set of non-character names from migrated memory
-        _non_char = set()
-        for sec in ("characters", "entities"):
-            sec_data = migrated_book_memory.get(sec, {})
-            if isinstance(sec_data, dict):
-                for nm, ent in sec_data.items():
-                    if isinstance(ent, dict) and ent.get("memory_class") not in ("named_character", None, ""):
-                        # world_term etc should be in terms/named_entities, not characters
-                        _non_char.add(nm.casefold())
-        for cid, entry in rebuilt_index.items():
-            if cid.startswith("$"):
-                continue
-            if isinstance(entry, dict):
-                for ch_name in entry.get("characters", []):
-                    # characters may be str or dict
-                    name = ch_name if isinstance(ch_name, str) else ch_name.get("name", "")
-                    if name and name.casefold() in _non_char:
-                        raise RuntimeError(f"stale chapter_index rejected: character {name!r} should be in named_entities/terms per v2 memory_class, not characters")
-        deterministic_index = rebuilt_index
-    else:
-        # No index supplied: build minimal deterministic v2 index (metadata only, per-chapter entries require source; minimal is acceptable for test)
-        deterministic_index = {"$schema": expected_schema, "$book_memory_policy_version": expected_pv}
+    # Use deterministic_index unconditionally
+    # Validate no stale v1 contamination: if parent was v1 and supplied equals parent, already rejected above
+    # No additional handling needed
     with open(candidate_dir / "chapter_index.json", "w", encoding="utf-8") as f:
         json.dump(deterministic_index, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
@@ -278,16 +362,26 @@ def requires_approval(envelope: Dict[str, Any]) -> bool:
 # --- Media publication path (finding 7) ---
 
 def _ensure_media_publish_prereqs(envelope: Dict[str, Any], candidate_dir: Path) -> None:
-    """Fail closed if envelope not approved or candidate hashes mismatch envelope."""
+    """Fail closed if envelope not approved or candidate hashes mismatch envelope.
+    Requires candidate_hashes to be present and contain exact hash for EACH of the four canonical files; verify each unconditionally before publishing. Fail closed if any hash missing or mismatched. Keeps approved/approval_identity gate.
+    """
     if not envelope.get("approved"):
         raise RuntimeError("migration publication requires explicit owner approval of exact manifest/hash set")
-    expected = envelope.get("candidate_hashes", {})
+    candidate_hashes = envelope.get("candidate_hashes")
+    if not isinstance(candidate_hashes, dict):
+        raise RuntimeError("rollback/migration requires candidate_hashes to be present with exact hashes for all four canonical files")
+    for fname in CANONICAL_FILES:
+        if fname not in candidate_hashes:
+            raise RuntimeError(f"candidate_hashes missing required hash for {fname} — fail closed")
+        exp = candidate_hashes.get(fname)
+        if not isinstance(exp, str) or not exp:
+            raise RuntimeError(f"candidate_hashes invalid hash for {fname} — fail closed")
     for fname in CANONICAL_FILES:
         cpath = candidate_dir / fname
         if not cpath.is_file() or cpath.is_symlink():
             raise RuntimeError(f"candidate missing or symlink: {fname}")
         actual = _file_hash(cpath)
-        exp = expected.get(fname)
+        exp = candidate_hashes.get(fname)
         if exp != actual:
             raise RuntimeError(f"candidate hash mismatch for {fname}: expected {exp}, got {actual}")
 
@@ -411,9 +505,8 @@ def rollback_via_media(store: Any, snapshot_dir: Path, *, envelope: Dict[str, An
         if not src.exists():
             src = snapshot_dir / "state" / fname
         shutil.copy2(str(src), str(candidate_tmp / fname))
-    # FINDING 5: verify rollback candidate matches approved envelope hashes if provided
-    if envelope.get("candidate_hashes"):
-        _ensure_media_publish_prereqs(envelope, candidate_tmp)
+    # Finding 3: rollback requires exact hashes for all four canonical files, unconditionally — verify each before publishing, fail closed if missing/mismatched
+    _ensure_media_publish_prereqs(envelope, candidate_tmp)
     # Build envelope-like candidate and publish via media as new revision
     # Create manifest
     cur = store.read_current()

@@ -163,21 +163,38 @@ def build_snapshot(
     # book_memory) -> chapter_index[chapter_id]); the selected record is the
     # canonical identity input for this chapter, so changes to another
     # chapter's record do not invalidate this chapter's snapshot.
+    # Fail-soft for missing/unknown v2 schema or unknown policy_version: treat as empty index (seed-only)
+    try:
+        from pact_v4.runtime.book_memory_policy import BOOK_MEMORY_POLICY_VERSION as _BM_PV
+    except Exception:
+        _BM_PV = "book-memory-policy/v1"
+    try:
+        from pact_v4.runtime.bible_renderer import CHAPTER_INDEX_V2_SCHEMA as _IDX_SCHEMA
+    except Exception:
+        _IDX_SCHEMA = "pact-v4-chapter-index/v2"
     selected_chapter_index = None
     if isinstance(memory.chapter_index, Mapping):
-        selected_chapter_index = memory.chapter_index.get(chapter_id)
-        # v2: bind to policy version and schema as well per spec 1.4/6.4, but keep v1 backward compatible
-        _is_v2 = memory.chapter_index.get("$schema") == "pact-v4-chapter-index/v2" or memory.chapter_index.get("schema") == "pact-v4-chapter-index/v2"
-        if _is_v2:
-            selected_policy_version = memory.chapter_index.get("$book_memory_policy_version") or memory.chapter_index.get("book_memory_policy_version")
-            selected_schema = memory.chapter_index.get("$schema") or memory.chapter_index.get("schema")
-            chapter_index_hash = _hash_canonical_json({
-                "selected": selected_chapter_index,
-                "policy_version": selected_policy_version,
-                "schema": selected_schema,
-            })
-        else:
+        _schema = memory.chapter_index.get("$schema") or memory.chapter_index.get("schema")
+        _policy = memory.chapter_index.get("$book_memory_policy_version") or memory.chapter_index.get("book_memory_policy_version")
+        _schema_ok = (_schema == _IDX_SCHEMA)
+        _policy_ok = (_policy is None or _policy == _BM_PV)
+        if not _schema_ok or not _policy_ok:
+            selected_chapter_index = None
             chapter_index_hash = _hash_canonical_json(selected_chapter_index)
+        else:
+            selected_chapter_index = memory.chapter_index.get(chapter_id)
+            if selected_chapter_index is None:
+                # No entry for this chapter: hash is seed state, same as no index (other chapter's record doesn't affect this chapter)
+                chapter_index_hash = _hash_canonical_json(selected_chapter_index)
+            else:
+                # v2: bind to policy version and schema as well per spec 1.4/6.4 when entry exists
+                selected_policy_version = memory.chapter_index.get("$book_memory_policy_version") or memory.chapter_index.get("book_memory_policy_version")
+                selected_schema = memory.chapter_index.get("$schema") or memory.chapter_index.get("schema")
+                chapter_index_hash = _hash_canonical_json({
+                    "selected": selected_chapter_index,
+                    "policy_version": selected_policy_version,
+                    "schema": selected_schema,
+                })
     else:
         chapter_index_hash = _hash_canonical_json(selected_chapter_index)
     return Snapshot(
