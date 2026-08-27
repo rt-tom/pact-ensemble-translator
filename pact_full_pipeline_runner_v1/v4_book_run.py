@@ -1037,7 +1037,63 @@ class _FormattingBackendClient:
                 pass
 
 
-def _build_formatting_client(args, extra, fmt_cfg):
+def _formatting_backend_with_overrides(backend):
+    """Apply formatting-specific overrides: reasoning 0 and external->managed for opencode.
+
+    For Local: force gemma reasoning 0. For OpenCode: force reasoning 0 and when
+    server_mode is external, promote to managed (ManagedServerProcess / OpenCodeServerProcess)
+    on port from base_url (e.g. 4097) so formatting can start its own server per-chapter (proposal D2).
+    For Composite: apply recursively to each sub-backend.
+    """
+    try:
+        from dataclasses import replace as _replace
+        from pact_v4.runtime.runtime_config import CompositeBackendConfig as _Composite, LocalLlamaBackendConfig as _Local, OpenCodeBackendConfig as _OpenCode
+        from pact_v4.runtime.opencode_server_lifecycle import ManagedServerSpec as _Spec
+        from pact_v4.runtime.runtime_config import _parse_url_port as _port_of
+        from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _gemma_server_args_for_reasoning as _gemma_args0
+        if isinstance(backend, _Local):
+            new_sa = dict(backend.server_args)
+            new_sa["gemma"] = _gemma_args0(0)
+            return _replace(backend, server_args=new_sa)
+        if isinstance(backend, _OpenCode):
+            new_server = backend.server
+            # reasoning 0 override
+            if getattr(new_server, "reasoning", None) not in (None, 0):
+                new_server = _replace(new_server, reasoning=0)
+            if backend.server_mode == "external":
+                port = _port_of(new_server.base_url) or 4096
+                # Use ManagedServerSpec with port from base_url (handles 4097 for remote)
+                spec = _Spec(port=port, hostname="127.0.0.1")
+                # Also handle explicit managed spec if backend already has one
+                try:
+                    if backend.managed is not None:
+                        spec = _replace(backend.managed, port=port)
+                except Exception:
+                    pass
+                # ManagedServerProcess will be started by build_runtime;
+                # Need to ensure server_mode managed and managed spec set.
+                return _replace(backend, server=new_server, server_mode="managed", managed=spec)
+            if new_server is not backend.server:
+                return _replace(backend, server=new_server)
+            return backend
+        if isinstance(backend, _Composite):
+            new_backends = {}
+            for _name, _sub in backend.backends.items():
+                if isinstance(_sub, _Local):
+                    _nsa = dict(_sub.server_args)
+                    _nsa["gemma"] = _gemma_args0(0)
+                    new_backends[_name] = _replace(_sub, server_args=_nsa)
+                elif isinstance(_sub, _OpenCode):
+                    new_backends[_name] = _formatting_backend_with_overrides(_sub)
+                else:
+                    new_backends[_name] = _sub
+            return _replace(backend, backends=new_backends)
+    except Exception:
+        pass
+    return backend
+
+
+def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
     if not fmt_cfg.get("enabled", True):
         return None
     rc_path = _flag_value(extra, "--runtime-config")
@@ -1067,29 +1123,7 @@ def _build_formatting_client(args, extra, fmt_cfg):
                 tmp.reviewer = reviewer
                 tmp.providers_config = Path(providers_cfg) if providers_cfg else None
                 backend = _apf(tmp, backend)
-            # v41 fix: formatting must run with reasoning 0 even when runtime
-            # config carries a Gemma reasoning budget (2000). Override server
-            # args so formatting is not starved by reasoning tokens.
-            try:
-                from dataclasses import replace as _replace
-                from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _gemma_server_args_for_reasoning as _gemma_args0
-                from pact_v4.runtime.runtime_config import CompositeBackendConfig as _Composite, LocalLlamaBackendConfig as _Local
-                if isinstance(backend, _Local):
-                    new_sa = dict(backend.server_args)
-                    new_sa["gemma"] = _gemma_args0(0)
-                    backend = _replace(backend, server_args=new_sa)
-                elif isinstance(backend, _Composite):
-                    new_backends = {}
-                    for _name, _sub in backend.backends.items():
-                        if isinstance(_sub, _Local):
-                            _nsa = dict(_sub.server_args)
-                            _nsa["gemma"] = _gemma_args0(0)
-                            new_backends[_name] = _replace(_sub, server_args=_nsa)
-                        else:
-                            new_backends[_name] = _sub
-                    backend = _replace(backend, backends=new_backends)
-            except Exception:
-                pass
+            backend = _formatting_backend_with_overrides(backend)
         else:
             # Historical local default — same backend as strict-runner run_local_default
             # (required so the ordinary CLI path without --runtime-config still resolves
@@ -1117,17 +1151,31 @@ def _build_formatting_client(args, extra, fmt_cfg):
                     backend = _apf2(tmp2, backend)
                 except Exception:
                     pass
+            backend = _formatting_backend_with_overrides(backend)
         if backend is None:
             return None
-        log_dir = Path(getattr(args, "memory_dir", Path("/tmp"))) / "server_logs_fmt" if hasattr(args, "memory_dir") else Path("/tmp")
+        if out_dir is not None:
+            log_dir = Path(out_dir) / "server_logs"
+        else:
+            log_dir = Path(getattr(args, "memory_dir", Path("/tmp"))) / "server_logs_fmt" if hasattr(args, "memory_dir") else Path("/tmp")
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        runtime = backend.build_runtime(log_dir=log_dir)
-        from pact_v4.runtime.runtime_config import build_role_backend
-        fmt_backend = build_role_backend(backend, runtime)
-        return _FormattingBackendClient(fmt_backend, runtime)
+        runtime = None
+        try:
+            runtime = backend.build_runtime(log_dir=log_dir)
+            from pact_v4.runtime.runtime_config import build_role_backend
+            fmt_backend = build_role_backend(backend, runtime)
+            return _FormattingBackendClient(fmt_backend, runtime)
+        except Exception as exc:
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception:
+                    pass
+            LOG.warning("formatting client build failed (%s) — falling back to debt", exc)
+            return None
     except Exception as exc:
         LOG.warning("formatting client build failed (%s) — falling back to debt", exc)
         return None
@@ -1256,14 +1304,170 @@ def run_book(
                         has_spans = any(b.inline_spans for b in _blocks)
                         if has_spans:
                             # Resolve target_text via model (only PIDs with spans)
+                            # Per-chapter formatting lifecycle (book-formatting-remote-server):
+                            # build backend per chapter when has_spans, health-wait, then close in finally.
+                            # Injected formatting_client (tests) takes precedence; otherwise build from extra_args/out_dir.
                             _mappings: dict = {}
+                            _per_chapter_fmt_client = None
+                            _fmt_health_error: Optional[str] = None
                             if formatting_client is not None:
-                                _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
+                                try:
+                                    _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
+                                except Exception as _fmt_exc:
+                                    _fmt_health_error = str(_fmt_exc)
+                                    LOG.warning("v41 formatting resolve failed for %s (injected client): %s", chapter_id, _fmt_exc)
+                                    _mappings = {}
                             else:
-                                # No client injected (e.g. real run without explicit client):
-                                # produce empty mappings -> spans become lenient debt, report still written.
-                                # Caller can inject formatting_client for actual model-call.
-                                _mappings = {}
+                                # Snapshot pre-existing logs to isolate strict-run logs from formatting lifecycle.
+                                # Collision-proof: snapshot identity (mtime/size/inode), not just filename, so
+                                # a formatting log that overwrites a strict log with same second-resolution name
+                                # is still detected as new and strict content is not silently lost (unique stamp
+                                # in lifecycle prevents overwrite, metadata check is safety net).
+                                _log_dir_fmt = out_dir / "server_logs"
+                                try:
+                                    _log_dir_fmt.mkdir(parents=True, exist_ok=True)
+                                except Exception:
+                                    pass
+                                try:
+                                    _pre_existing_log_meta: dict[str, tuple] = {}
+                                    for _p in _log_dir_fmt.glob("opencode_serve_*.log"):
+                                        try:
+                                            _st = _p.stat()
+                                            _pre_existing_log_meta[_p.name] = (_st.st_mtime_ns, _st.st_size, getattr(_st, "st_ino", None))
+                                        except Exception:
+                                            _pre_existing_log_meta[_p.name] = None  # type: ignore
+                                except Exception:
+                                    _pre_existing_log_meta = {}
+                                _per_chapter_fmt_client = None
+                                try:
+                                    # Build per-chapter formatting backend (remote -> managed on same port)
+                                    # ManagedServerProcess / OpenCodeServerProcess health-wait on GET /global/health (port from base_url -> 4097)
+                                    _ns = type("FmtArgs", (), {"memory_dir": memory_dir, "runtime_config": None, "translator": None, "reviewer": None, "providers_config": None})()
+                                    _per_chapter_fmt_client = _build_formatting_client(_ns, list(extra_args), fmt_cfg, out_dir=out_dir)
+                                    if _per_chapter_fmt_client is not None:
+                                        _mappings = resolve_format_mappings(_per_chapter_fmt_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
+                                    else:
+                                        _fmt_health_error = "formatting backend unavailable: GET /global/health failed (port 4097)"
+                                        LOG.warning("formatting backend unavailable for %s — falling back to lenient debt (GET /global/health failed)", chapter_id)
+                                        _mappings = {}
+                                except Exception as _fmt_exc:
+                                    # Health failure / connection refused -> lenient debt without crashing
+                                    _fmt_health_error = str(_fmt_exc)
+                                    LOG.warning("formatting server health failed for %s (GET /global/health, error: %s) — falling back to lenient debt", chapter_id, _fmt_exc)
+                                    _mappings = {}
+                                finally:
+                                    # Preserve only logs created by formatting lifecycle (snapshot isolation)
+                                    try:
+                                        if _per_chapter_fmt_client is not None:
+                                            try:
+                                                _per_chapter_fmt_client.close()
+                                            except Exception:
+                                                pass
+                                        # Only consider new logs created during formatting lifecycle
+                                        try:
+                                            import shutil
+                                            _all_logs = list(_log_dir_fmt.glob("opencode_serve_*.log"))
+                                            _new_logs = []
+                                            for _p in _all_logs:
+                                                if "opencode_serve_fmt_" in _p.name:
+                                                    continue
+                                                if _p.name not in _pre_existing_log_meta:
+                                                    _new_logs.append(_p)
+                                                else:
+                                                    _prev = _pre_existing_log_meta.get(_p.name)
+                                                    if _prev is None:
+                                                        # Prior stat unavailable -> conservatively not new (avoid strict leak)
+                                                        continue
+                                                    try:
+                                                        _cur_st = _p.stat()
+                                                        _cur = (_cur_st.st_mtime_ns, _cur_st.st_size, getattr(_cur_st, "st_ino", None))
+                                                        if _cur != _prev:
+                                                            _new_logs.append(_p)
+                                                    except Exception:
+                                                        _new_logs.append(_p)
+                                            for _p in _new_logs:
+                                                _target = _p.parent / _p.name.replace("opencode_serve_", "opencode_serve_fmt_", 1)
+                                                if not _target.exists():
+                                                    try:
+                                                        shutil.copy(str(_p), str(_target))
+                                                    except Exception:
+                                                        try:
+                                                            _target.write_text(_p.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+                                                        except Exception:
+                                                            pass
+                                            # Startup failure before logs exist (e.g., port-occupancy preflight):
+                                            # ensure diagnostic fmt log exists with real error, not synthetic empty placeholder.
+                                            if _fmt_health_error is not None:
+                                                _fmt_existing = list(_log_dir_fmt.glob("opencode_serve_fmt_*.log"))
+                                                if not _fmt_existing:
+                                                    try:
+                                                        _err_text_for_log = _fmt_health_error
+                                                        if "/global/health" not in _err_text_for_log:
+                                                            _err_text_for_log = f"GET /global/health failed: {_err_text_for_log}"
+                                                        _diag_log = _log_dir_fmt / f"opencode_serve_fmt_{chapter_id}_health.log"
+                                                        _diag_log.write_text(
+                                                            f"formatting startup failed for {chapter_id}: {_err_text_for_log}\n",
+                                                            encoding="utf-8",
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
+                                        # Write required per-chapter failure metadata before lenient fallback (finding 2)
+                                        if _fmt_health_error is not None:
+                                            _meta_path = out_dir / "formatting_batch1_meta.json"
+                                            if not _meta_path.exists():
+                                                try:
+                                                    from pact_v4.phase5.formatting import _effective_max_tokens
+                                                    _span_count = sum(len(b.inline_spans) for b in _blocks)
+                                                    _cfg_max_raw = fmt_cfg.get("max_tokens")
+                                                    try:
+                                                        _cfg_max_int = int(_cfg_max_raw) if _cfg_max_raw is not None else None
+                                                    except Exception:
+                                                        _cfg_max_int = None
+                                                    _effective = _effective_max_tokens(_span_count, _cfg_max_int)
+                                                    _err_text = _fmt_health_error
+                                                    if "/global/health" not in _err_text:
+                                                        _err_text = f"GET /global/health failed: {_err_text}"
+                                                    _meta = {
+                                                        "batch": 1,
+                                                        "attempt": 1,
+                                                        "span_count": _span_count,
+                                                        "effective_max_tokens": _effective,
+                                                        "finish_reason": None,
+                                                        "usage": None,
+                                                        "response_format_attempted": None,
+                                                        "error": _err_text,
+                                                    }
+                                                    _meta_path.write_text(json.dumps(_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                                                    _attempt_meta = out_dir / "formatting_batch1_attempt1_meta.json"
+                                                    if not _attempt_meta.exists():
+                                                        _attempt_meta.write_text(json.dumps(_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                                                except Exception:
+                                                    pass
+                                    except Exception:
+                                        pass
+                            # Injected-client health failure also needs diagnostic meta (finding 2)
+                            if _fmt_health_error is not None and not (out_dir / "formatting_batch1_meta.json").exists():
+                                try:
+                                    from pact_v4.phase5.formatting import _effective_max_tokens as _eff2
+                                    _sc2 = sum(len(b.inline_spans) for b in _blocks)
+                                    _cfg2 = fmt_cfg.get("max_tokens")
+                                    try:
+                                        _cfg2_i = int(_cfg2) if _cfg2 is not None else None
+                                    except Exception:
+                                        _cfg2_i = None
+                                    _eff_val2 = _eff2(_sc2, _cfg2_i)
+                                    _err2 = _fmt_health_error
+                                    if "/global/health" not in _err2:
+                                        _err2 = f"GET /global/health failed: {_err2}"
+                                    _meta2 = {"batch": 1, "attempt": 1, "span_count": _sc2, "effective_max_tokens": _eff_val2, "finish_reason": None, "usage": None, "response_format_attempted": None, "error": _err2}
+                                    (out_dir / "formatting_batch1_meta.json").write_text(json.dumps(_meta2, ensure_ascii=False, indent=2), encoding="utf-8")
+                                    _am2 = out_dir / "formatting_batch1_attempt1_meta.json"
+                                    if not _am2.exists():
+                                        _am2.write_text(json.dumps(_meta2, ensure_ascii=False, indent=2), encoding="utf-8")
+                                except Exception:
+                                    pass
                             # Determine backend hash for report (from run_record lifecycle if available)
                             _backend_hash = ""
                             try:
@@ -1875,9 +2079,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         extra += ["--mixed-script-allow", str(entry)]
     _fmt_cfg: dict = dict(_DEFAULT_FORMATTING_CFG)
     _fmt_cfg["enabled"] = bool(args.formatting_enabled)
-    _formatting_client = _build_formatting_client(args, extra, _fmt_cfg)
-    try:
-        result = run_book(
+    # Per-chapter formatting lifecycle (book-formatting-remote-server): no global
+    # formatting_client — built inside run_book at formatting stage per out_dir/server_logs.
+    result = run_book(
         memory_dir=args.memory_dir,
         chapter_ids=args.chapters,
         chapter_html_pattern=args.chapter_html_pattern,
@@ -1898,15 +2102,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         media_target=args.media_target,
         media_exec_host=args.media_exec_host,
         formatting_cfg=_fmt_cfg,
-        formatting_client=_formatting_client,
+        formatting_client=None,
         max_formatting_incidents=int(args.max_formatting_incidents),
     )
-    finally:
-        if _formatting_client is not None and hasattr(_formatting_client, "close"):
-            try:
-                _formatting_client.close()
-            except Exception:
-                pass
     failed = 0
     for rec in result["chapters"]:
         status = rec["terminal_status"]
