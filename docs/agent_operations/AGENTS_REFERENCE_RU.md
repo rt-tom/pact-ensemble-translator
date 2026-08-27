@@ -154,19 +154,25 @@ powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pi
 ```
 Параметры: `-RunRoot` (явный каталог прогона — самый надёжный), `-ProjectRoot` (дефолт устаревший `D:\pact\pact_translator_v3` → переопределять на `D:\pact\pact_translator_v4_1`), `-Start`/`-End` (→ `pipeline_runs\chapter_N_to_M`), `-RefreshSeconds` (по умолч. 5), `-Once`, `-NoClear`. Для v4_run-прогонов (вывод в `gate_bench_runs\book_*`) рекомендуется `-RunRoot` с явным путём к `book_*`-каталогу; авто-резолв через `pipeline_runs` рассчитан на старую раскладку.
 
-**Media (Linux) — отдельный монитор:** `monitor_pipeline.ps1` — это PowerShell/RT, на media не запускается. Для media-прогонов используйте Python-монитор `v4_phase_progress` (читает `phase_progress.ndjson` read-only, пайплайн не трогает):
+**Media (Linux) — Python-монитор `v4_phase_progress` (canonical для book-прогонов):** `monitor_pipeline.ps1` — это PowerShell/RT, на media не запускается. Для media-прогонов используйте Python-монитор (читает `phase_progress.ndjson` read-only, пайплайн не трогает).
+
+Два режима (`--out-dir` / `--out-base` — взаимоисключающие):
+- `--out-base <папка_книги>` — **book-режим**: передаётся сама папка `book_*`, скрипт сам ходит по `chapter_*`-подкаталогам и показывает активную главу. **Именно это нужно для book-прогона.**
+- `--out-dir <chapter_*`-подкаталог>` — single-chapter режим: один конкретный каталог главы.
+
 ```bash
 # media (Linux), из корня репозитория (всегда с cd!):
 cd ~/projects/pact-ensemble-translator
-# ВАЖНО: для book-прогона --out-dir указывает на ПОДКАТАЛОГ ГЛАВЫ book_*/chapter_*, а НЕ на корень book_*
-# (phase_progress.ndjson и server_logs лежат внутри chapter_*-подкаталога, иначе будет 'Unknown / no chunk_plan.json').
-python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665/chapter_0001_bonds-1-1
+# book-прогон: --out-base на ПАПКУ КНИГИ (скрипт сам обходит chapter_* и показывает активную главу)
+python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665
 
-# цикл обновления раз в SEC секунд (авто-поиск свежего chapter_*-подкаталога):
+# цикл обновления раз в SEC секунд (авто-поиск свежего book_*-каталога):
 cd ~/projects/pact-ensemble-translator
-python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir "$(ls -dt /home/rt/pact_runs/outputs/book_0001*/chapter_* | head -1)" --watch 5
+python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-base "$(ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1)" --watch 5
 ```
-Параметры: `--out-dir` (каталог прогона), `--out-base` (book-уровень, сводка по главам), `--watch SEC` (цикл обновления). Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`, а артефакты прогона — внутри `book_*/chapter_<NNNN>_*/` (его и передавать в `--out-dir`). Свежий chapter-каталог: `ls -dt /home/rt/pact_runs/outputs/book_0001*/chapter_* | head -1`.
+Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>`; артефакты прогона (`phase_progress.ndjson`, `server_logs`) лежат внутри `book_*/chapter_<NNNN>_*/`, НО для book-режима указывается сама папка книги (`--out-base`), а не подкаталог главы. Свежий book-каталог: `ls -dt /home/rt/pact_runs/outputs/book_0001* | head -1`.
+
+**Ландшафт мониторов (чтобы не путаться):** `monitor_pipeline_v31.ps1` — устаревший v3.1-монитор (только в старых handoff-доках, к v4 не относится); `monitor_pipeline.ps1` — новый компактный v42-монитор (PowerShell/RT); `v4_phase_progress.py` — Python-ядро монитора (book/chapter режимы, работает на media). Изменение **v42-monitor-compact (PR #220, `aa08858`)** добавило/переработало новые мониторы; старый `v31` оставлен как legacy и v4-пайплайном не используется.
 
 ### Деплой на RT через ssh rt + powershell (2026-08-27)
 - Хост RT доступен по ssh-алиасу `rt` (ключ `~/.ssh/id_rt`, `IdentitiesOnly yes`). Дефолтный удалённый шелл — `cmd`, но `powershell`/`pwsh` вызываются явно и работают: `ssh rt 'powershell -NoProfile -Command "Write-Host OK"'`.
