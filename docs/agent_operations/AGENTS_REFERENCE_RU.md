@@ -154,6 +154,16 @@ powershell -ExecutionPolicy Bypass -File pact_full_pipeline_runner_v1\monitor_pi
 ```
 Параметры: `-RunRoot` (явный каталог прогона — самый надёжный), `-ProjectRoot` (дефолт устаревший `D:\pact\pact_translator_v3` → переопределять на `D:\pact\pact_translator_v4_1`), `-Start`/`-End` (→ `pipeline_runs\chapter_N_to_M`), `-RefreshSeconds` (по умолч. 5), `-Once`, `-NoClear`. Для v4_run-прогонов (вывод в `gate_bench_runs\book_*`) рекомендуется `-RunRoot` с явным путём к `book_*`-каталогу; авто-резолв через `pipeline_runs` рассчитан на старую раскладку.
 
+**Media (Linux) — отдельный монитор:** `monitor_pipeline.ps1` — это PowerShell/RT, на media не запускается. Для media-прогонов используйте Python-монитор `v4_phase_progress` (читает `phase_progress.ndjson` read-only, пайплайн не трогает):
+```bash
+# однократный снимок (в интерактивном shell владельца — python, в агентской сессии — python3):
+python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665
+
+# цикл обновления раз в SEC секунд:
+python3 -m pact_full_pipeline_runner_v1.v4_phase_progress --out-dir /home/rt/pact_runs/outputs/book_0001-0001_remote_20260827_063641_998665 --watch 5
+```
+Параметры: `--out-dir` (каталог прогона), `--out-base` (book-уровень, сводка по главам), `--watch SEC` (цикл обновления). Вывод run-каталога на media: `/home/rt/pact_runs/outputs/book_<range>_<local|remote>_<timestamp>` (имя берётся из `ls -dt /home/rt/pact_runs/outputs/book_*` — самый свежий).
+
 ### Деплой на RT через ssh rt + powershell (2026-08-27)
 - Хост RT доступен по ssh-алиасу `rt` (ключ `~/.ssh/id_rt`, `IdentitiesOnly yes`). Дефолтный удалённый шелл — `cmd`, но `powershell`/`pwsh` вызываются явно и работают: `ssh rt 'powershell -NoProfile -Command "Write-Host OK"'`.
 - Деплой-синхронизация продакшн-чекаута (per AGENTS.md: после каждого деплоя `git pull --ff-only` на RT). Проверенный вариант:
