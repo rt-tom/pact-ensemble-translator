@@ -1,51 +1,62 @@
 ## Context
 
-См. `proposal.md — Why`. Сейчас `glossary.json` — единственный `locked` источник (всё в промпт как обязательно). `B1.2` (`pact_v4/audit/entity_extractor.py`, `Qwen`, source-only, `source_hash+extractor_version` кэш) даёт `ChapterEntityContext` с `VERIFIED` сущностями до перевода. После `whole-chapter` + `R-audit/repair/re-audit` (`B3AuditRepair`) текст финальный (`translations_repaired`). Текущий `glossary_observations_from_entity_context` (`b3_audit_repair.py:472`) для однословных имён зовёт детерминированный `align_candidates` (счёт заглавных кириллических слов, `lowercase_stems` фильтр, `most frequent surface`). Он ломается на прозвищах-нарицательных и падежах.
+См. `proposal.md — Why`. `glossary.json` — единственный `locked` источник (всё в промпт как обязательно). `B1.2` (`pact_v4/audit/entity_extractor.py`, `Qwen`, source-only, `source_hash+extractor_version` кэш) даёт `ChapterEntityContext` с сущностями до перевода. После `whole-chapter` + `R-audit/repair/re-audit` (`B3AuditRepair`) финальный in-memory `translations_repaired` готов. Текущий `glossary_observations_from_entity_context` для однословных имён зовёт детерминированный `align_candidates` (счёт заглавных, `lowercase_stems`, `most frequent surface`). Он ломается на прозвищах-нарицательных и падежах. Ревью 26.08 выявил дыры в `evidence` привязке, `sidecar` identity/resume, контракте `EntityRecord`, версии финального текста, `shadow` флаге, lint, алиасах, модели.
 
 ## Goals / Non-Goals
 
 **Goals:**
-* Каноническая форма `Именительный падеж` для имён ( `Дионис` не `Диониса`, `Роксанна` не `Бабуль` )
-* Поддержка многословных имён (`Knights of the Basement`, `Leonard Harlan`)
-* Фильтр ложных `proper_name` (`Locket`, `Driver`) на источнике
-* Один батч-вызов/главу, без нового старта `local` сервера, без вмешательства в `whole-chapter` JSON-контракт
-* Модель ничего не пишет в память — только предлагает, код валидирует `provenance` и коллизии
+* Канонический `Именительный` для имён (`Дионис` не `Диониса`, `Роксанна` не `Бабуль`)
+* Поддержка многословных (`Knights of the Basement`) с фразой целиком
+* Фильтр ложных `Locket/Driver` на источнике
+* `evidence_pid` детерм. привязан к source-кандидату, quarantined исключён
+* Полный `sidecar` identity + resume (включая `B3 cache hit`, атомарность, TOCTOU)
+* Один батч-вызов/главу, без нового старта `local` сервера, без трогания `whole-chapter` контракта
+* Модель ничего не пишет в память — только предлагает, код валидирует `provenance`/коллизии
+* Identity-bearing `off|shadow|promote` без отката к небезопасному `align`
 
 **Non-Goals:**
-* Авто-промоут generic terms (`door→дверь`) — остаётся телеметрией
+* Авто-промоут generic terms (`door→дверь`) — телеметрия
 * Переписывание `glossary.json` формата или `MemoryManager` контракта
-* Отдельный сервис/очередь предложений вне пайплайна
+* Отдельный сервис/очередь вне пайплайна
+* Hard suffix-lint `а/я/у/ю` как детектор падежа
 
 ## Decisions
 
-**D1. Источник кандидатов — B1.2 VERIFIED entities, не частотный скан.** Причина: LLM уже отличает `Shotgun-человек` vs `shotgun-ружьё` и находит `Knights/Teddy` с `1` вхождением. Альтернатива — оставить `generate_candidates` (freq) — отклонена: шум `said/looked` и пропуск редких имён.
+**D1. Источник — B1.2 записи, прошедшие `validate_entity_context`, не `EntityRecord.status`.** У `EntityRecord` нет `status`; статусы у `anchor/aliases/claims`. Кандидат берётся из записи, где `anchor` `verified`, `canonical_type` в `anchor.span`, все `aliases` с `verified` и surface в своём PID. `glossary_worthy` — модельный `advisory bool` в промпте, код валидирует: `title-case`, не `RU_STOP`, поверхность есть в source; mismatch → `conflict`. Бамп `EXTRACTOR_VERSION`, `prompt_version`, `CACHE_SCHEMA` — старый кэш несовместим. Альтернатива — оставить `freq` скан — отклонена (шум `said/looked`).
 
-**D2. Резолвер — отдельный батчевый LLM после `repair/re-audit` внутри `B3AuditRepair.run`.** Причина: есть финальный русский текст, `VERIFIED` контекст, `local Qwen` ещё резидент (`R → audit → repair`), `remote` — `release()` no-op (`runtime_coordinator.py:448`), teardown только в `v4_phase12_strict_runner.py:4120`. Альтернативы: `whole-chapter generation` (риск сломать `{pid:tr}`) и `v4_book_run` после возврата (локальный сервер уже закрыт → рестарт) — отклонены.
+**D2. Резолвер — отдельный батчевый LLM после `repair/re-audit` по единому пост-процессингу пути.** Точка — сразу после формирования `translations_repaired` (in-memory), до `_write_translations` и до `release()`. `local Qwen` ещё резидент, `remote` no-op. Путь выполняется и при `B3` раннем `cache hit` (`b3_audit_repair.py:3769`): `_run_impl` возвращает кэш, пост-процессинг всё равно запускает резолвер/sidecar логику. Альтернативы `whole-chapter generation` (ломает `{pid:tr}`) и `v4_book_run` (сервер уже закрыт) — отклонены.
 
-**D3. Промпт B1.2 расширить `glossary_worthy: bool` + `source_aliases[]`.** Причина: `Locket/Driver` отсекаются на источнике без русского текста, `Knights of the Basement` попадает целиком. Альтернатива — фильтровать постфактум — оставляет шум в резолвере.
+**D3. Evidence привязка.** Для каждой сущности `allowed_evidence_pids = {pids where source contains entity (word-boundary) or VERIFIED alias surface}`. `evidence_pid` из резолвера обязан быть в этом множестве. Для `accepted_degraded` quarantined PIDs исключаются из `allowed` до резолвера; при consumption в `v4_book_run` любой `evidence` с quarantined pid → `conflict`. `chunk_id` гейт недостаточен при `multiple evidence` — используется `pid`-точный.
 
-**D4. Sidecar `glossary_proposals.json` (identity = `source_hash+entity_context_hash+translation_hash`).** Причина: не трогает `journal`/`translations` артефакты, `v4_book_run` читает его только после `terminal_status complete/accepted_degraded` и уже применяет существующий `quarantine/promotion` gate (идемпотентно). Альтернатива — прямая запись в `glossary_candidates.json` из `B3` — нарушает слойность (B3 не владелец ledger).
+**D4. Sidecar identity и resume.** `glossary_proposals.json` атомарно `tmp+rename`, пишется только как `regular non-symlink`. Identity поля: `schema=glossary-proposal/v1`, `chapter_id`, `snapshot_hash`, `config_identity`, `resolver_version`, `prompt_version`, `response_schema`, `model_ref`+`backend identity`, `candidate_input_hash` (hash упорядоченного входа `[{source, aliases, anchor_pid}]`), `translation_hash` (hash `translations_repaired` in-memory, см. D6). Валидация при чтении: тип файла, точная схема/ключи, размеры, отсутствие `duplicate entries`/`duplicate ru`, повторная `provenance` проверка перед промоутом. При `cache hit` + `missing/stale/tampered` sidecar → детерм. рекомпъют (один `resolver` вызов) по тому же пути; `stale` = любой hash mismatch.
 
-**D5. Код-валидация до промоута.** Проверки: `source` есть в `VERIFIED` контексте, `evidence pid` существует, `proposed_ru` кириллица и не `RU_STOP`, не `Бабуль`-блоклист, не `VALUE` другого ключа, транслит `H→Х` sanity, коллизия `Дубль ru←[en]` → `conflict`. Только после — `MemoryManager.add_observation("glossary")`.
+**D5. Финальный текст — in-memory `translations_repaired`.** `B3` не имеет окончательного `translations.json` на диске (его пишет `v4_phase12_strict_runner` после `B3`). Источник истины для резолвера и `sidecar` — in-memory `translations_repaired`. `book_run` валидирует семантический `translation_hash` (нормализованный `pid→text` без `formatting` тегов) с учётом последующего `formatting` — `formatting` может добавить `<i>` но не менять `proposed_ru`.
 
-**D6. Term-кандидаты — отключить промоут.** Причина: частота ≠ термин (см. `HANDOFF_GLOSSARY 1.5` — `545` кандид. на 3 главы). Альтернатива — оставить `align` для `term` — сохраняет `50%` ошибок.
+**D6. Mode.** `glossary_resolver_mode = off | shadow | promote` (identity-bearing, в `config_identity`). `off` — резолвер не вызывается, новые `glossary` observations запрещены. `shadow` — sidecar пишется и логируется, `v4_book_run` не вызывает `add_observation`. `promote` — полный путь. Отката к `align_candidates` как `automatic rollback` нет (небезопасен). `default` `off` → `shadow` (5 глав) → `promote`.
+
+**D7. Алиасы.** Только один `canonical English key` становится `glossary` ключом; `source_aliases[]`/`aliases[]` (`Craig Dowght`, `C. Dowght`, `Dowght`) — не отдельные ключи, а `evidence` для одного `Dowght→Даут`. Дубликат `ru` внутри одной `alias-group` разрешён и не считается конфликтом; между разными `entity` записями `ru←[en]` остаётся `conflict`.
+
+**D8. Модель/ретрай/фейл.** Отдельная роль `glossary_resolver` (`runtime_config.py`, `ROLE_GLOSSARY_RESOLVER`), `local` → `qwen_audit`, `remote` → `russian_selector` (Luna), `composite` — fallback как у остальных роles. `max_tokens 1536`, `temperature 0`, `reasoning 0`, `response_schema glossary_proposal/v1` (strict). `1 logical batch` = `≤3` transport attempts (bounded JSON retry, exponential backoff). `Failure` → `LOG warning`, `sidecar` не пишется/помечается `failed`, глава не падает, `promotion fail-closed` (0 наблюдений). Каждый `attempt` пишется в `usage.ndjson` (label `glossary_resolver`), `backend events`, `phase_progress`.
+
+**D9. Term — отключить.** `generic term` (`door→дверь`) остаётся телеметрией в `glossary_candidates.json`, не резолвится.
+
+**D10. Lint.** Убрать suffix `а/я/у/ю/ом/ем` и транслит `H→Х` из hard lint. `Бабуль`-блоклист — только `incident regression test` (временный fixture). Основная проверка — пара `proposed_ru + evidence surface forms` с `fixture-набором` (`Роксанна/Херб/Дионис` pass, `Кристоффа/Диониса/Бабуль` fail).
 
 ## Risks / Trade-offs
 
-* [LLM галлюцинация имени в `proposed_ru`] → Mitigation: `evidence pid` обязан содержать `proposed_ru` поверхность, `source` provenance, `quarantine` gate.
-* [Падежная форма проскочит] → Mitigation: промпт требует `номинатив`, `pact-fidelity-lint` ловит `а/у/ом` хвост + стемминг-валидация, `share` не нужен — LLM даёт лемму.
-* [Лишний вызов/главу] → Mitigation: батч `5-15` сущностей, `~300` токенов, `local` без рестарта.
-* [Многословные — разнобой перевода] → Mitigation: модель возвращает фразу целиком, `evidence_windows` проверяет, `target` — фраза, не слово.
-* [B1.2 пропустит редкое имя] → Mitigation: `B1.2` уже `≥1` вхождение, `glossary_worthy` не повышает порог, а фильтрует ложные.
+* [Галлюцинация `proposed_ru` с валидным `evidence pid` другого персонажа] → `allowed_evidence_pids` + проверка `proposed_ru` содержится в `evidence pid` русском тексте.
+* [Падеж проскочит] → промпт `номинатив`, `surface_forms[]` проверка, `lint` по паре, не по суффиксу.
+* [Многословные — разнобой] → модель возвращает фразу целиком, `evidence_windows` + `phrase` проверка.
+* [Крэш между `B3 cache` и `sidecar`] → единый пост-процессинг, атомарная запись, при следующем `resume` — рекомпъют.
+* [Лишний вызов] → батч `5-15` сущ., `~400` tok, `local` без рестарта.
+* [B1.2 пропустит редкое имя] → `≥1` вхождение, `glossary_worthy` не повышает порог.
 
 ## Migration Plan
 
-1. Деплой кода без изменения `glossary.json` — новый `sidecar` пишется, но `v4_book_run` пока логирует `proposed` без промоута (shadow mode, 5-10 глав).
-2. Включить промоут за флагом `glossary_model_resolver_enabled` (default `false` → `true` после ревью `50%` → `>90%`).
-3. Депрекейт `align_candidates` ветки для `proper_name` (оставить для `term` телеметрии).
-4. Rollback: флаг `false` — поведение как до изменения (детерм. `align`).
+1. Shadow (`mode=shadow`) на 5-10 глав: `sidecar` пишется, `v4_book_run` логирует без промоута, метрика `precision` (`50%→>90%`).
+2. Включить `promote` за флагом (identity-bearing). Депрекейт `align` ветки для `proper_name`.
+3. Rollback: `mode=off` (no-op), не `align`.
 
 ## Open Questions
 
-* Точный `response_schema` резолвера (`glossary_proposal/v1`) — `max_tokens` `1024` vs `2048` — подобрать на 3-5 главах.
-* `model_bindings` для `glossary_resolver` — reuse `russian_selector` (`Luna`) vs `entity_extractor` (`Qwen`) — сравнить `translit` качество.
+* Точный `max_tokens` резолвера (`1536` vs `2048`) — подобрать на 3 главах без truncation.
