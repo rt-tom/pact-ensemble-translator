@@ -833,7 +833,7 @@ class RussianEditorEvaluator:
         # (stage_progress.r_editor), so a kill preserves every GOOD R chunk.
         self._on_progress = on_progress
         # v4.2 book-memory role views: an OPTIONAL bounded russian_editor card
-        # from the frozen pre-chapter canonical state. Disabled (None) keeps the
+        # from the frozen canonical state. Disabled (None) keeps the
         # v4.1 R prompt byte-identical.
         self._book_memory_role_card = book_memory_role_card
 

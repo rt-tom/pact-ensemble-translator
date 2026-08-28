@@ -259,8 +259,7 @@ def render_entity_context_block(
     block).
 
     ``role_view_card`` (v4.2 book-memory role views): an OPTIONAL bounded
-    ``audit_repair`` consistency card from the frozen pre-chapter canonical
-    state. When provided it is appended after the source-derived block. It is
+    ``audit_repair`` consistency card from the frozen canonical state. When provided it is appended after the source-derived block. It is
     disabled by default (``None``) so the v4.1 B3 prompt is byte-identical.
 
     ``verified_only=True`` (generation-prompt variant, owner decision

@@ -195,14 +195,13 @@ def test_render_bible_section_chapter_id_renders_entry():
     rendered = render_bible_section("0001", _chapter_index(), _book_memory())
     assert "BIBLE:" in rendered
     assert "Narrator: male" in rendered
-    # Causal-memory contract (RV finding 1, 2026-08-14): the chapter index
-    # entry carries only the NAMES visible in this chapter. The renderer
-    # NEVER enriches them with gender/role from the full accumulated
-    # book_memory — an attribute learned in a LATER chapter must not leak
-    # into an early prompt. The name renders as-is (or with attrs the
-    # chapter-scoped entry itself snapshots, never from book_memory).
+    # Index-only invariant: the chapter index entry carries only the NAMES
+    # present in this chapter's source (Rule 1). The renderer renders those
+    # names as-is (or with attrs the entry itself snapshots) and never
+    # enriches them with gender/role read from the full accumulated
+    # book_memory beyond the entry.
     assert "Blake Thorburn" in rendered
-    # No gender/role enrichment in the character lines (causal contract).
+    # No gender/role enrichment in the character lines (index-only).
     char_lines = rendered.split("Characters:")[1].split("Facts:")[0]
     assert "Blake Thorburn, male" not in char_lines
     assert "Protagonist" not in char_lines
@@ -359,9 +358,10 @@ def test_build_index_file_includes_locked_terms_from_flat_glossary(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# A2 causal <N: v4_book_run builds chapter_index.json after accepted chapters
-# (P0 2026-08-14: the causal bible renderer needs a fresh per-chapter entry;
-# a failed chapter never touches the index).
+# v4_book_run builds chapter_index.json after accepted chapters
+# (presence-based full-memory selection: the renderer needs a fresh
+# per-chapter entry built from the full accumulated book_memory;
+# a failed chapter never creates an entry).
 # ---------------------------------------------------------------------------
 
 
@@ -490,22 +490,18 @@ def test_book_run_skips_chapter_index_for_failed_chapter(tmp_path, monkeypatch):
     assert "0001" not in idx
 
 
-def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
+def test_book_run_two_accepted_chapters_full_memory_presence_based(
     tmp_path, monkeypatch,
 ):
-    """RV finding 1 HIGH regression (SAFE-MEMORY, 2026-08-14): with two
-    ACCEPTED chapters, chapter 0002's prompt must be built from PRE-chapter
-    memory — the memory of chapter 0001 only — and a rerun of 0002 must
-    NEVER show 0002 its own facts.
+    """Presence-based selection (remove-pre-chapter-filter): with two
+    ACCEPTED chapters, each chapter's prompt is built from the full
+    accumulated book_memory filtered only by Rule 1 source presence.
 
-    The book_memory.json below already carries facts for BOTH chapters
-    (post-promotion state, exactly what a rerun would see): fact A is
-    attributed to chapter 0001, fact B to chapter 0002. ``build_index_file``
-    filters book_memory through ``pre_chapter_book_memory(memory, "0002")``
-    (facts with ``chapter < "0002"`` only), so chapter_index["0002"] keeps
-    fact A and drops fact B. The old code built the entry from POST-
-    promotion memory under the current chapter's key, so 0002's first run
-    saw nothing and a rerun saw 0002's own facts.
+    The book_memory.json below carries facts for BOTH chapters (full
+    accumulated state). ``build_index_file`` now uses a non-filtering
+    shallow copy, so chapter_index["0002"] includes both facts when their
+    keys are present in the chapter source, and the same source-absent
+    exclusion still applies.
     """
     from pact_full_pipeline_runner_v1 import v4_book_run
 
@@ -579,10 +575,9 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
             encoding="utf-8",
         )
 
-    # 0002's source names BOTH Blake and Rose: without the pre-chapter
-    # filter BOTH facts would be present in the 0002 entry (both keys occur
-    # in the chapter source) — the causal <N filter is the only thing that
-    # keeps fact B out.
+    # 0002's source names BOTH Blake and Rose: with full-memory presence-based
+    # selection BOTH facts are present in the 0002 entry (both keys occur
+    # in the chapter source).
     _write_chapter("0001", "<html><body><p id='p1'>Blake walked.</p></body></html>")
     _write_chapter(
         "0002",
@@ -609,15 +604,13 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
         index = json.loads(index_path.read_text(encoding="utf-8"))
         assert "0002" in index
         entry_0002 = index["0002"]
-        # 0001's fact survived (chapter 0001 < 0002)...
+        # Both facts are present when their keys are in the chapter source (full memory, Rule 1).
         assert "Blake is the narrator." in entry_0002["facts"]
-        # ...0002's OWN fact is NOT in 0002's entry (chapter 0002 not < 0002)
-        assert "Rose is Blake's sister." not in entry_0002["facts"]
-        # 0002's own character is not in 0002's entry either.
-        assert "Rose" not in entry_0002["characters"]
+        assert "Rose is Blake's sister." in entry_0002["facts"]
+        # Both characters are present when named in the source.
+        assert "Rose" in entry_0002["characters"]
         assert "Blake Thorburn" in entry_0002["characters"]
-        # The PROMPT for 0002 (what render_bible_section produces) carries
-        # 0001's memory and never 0002's own facts — the acceptance proof.
+        # The PROMPT for 0002 carries both facts when source-present.
         from pact_v4.runtime.bible_renderer import render_bible_section
 
         prompt_0002 = render_bible_section(
@@ -626,13 +619,12 @@ def test_book_run_two_accepted_chapters_0002_prompt_only_0001_memory(
             )
         )
         assert "Blake is the narrator." in prompt_0002
-        assert "Rose is Blake's sister." not in prompt_0002
-        # 0001's own entry reflects its PRE-chapter state: 0001's fact is
-        # NOT in 0001's entry either (chapter 0001 not < 0001).
-        assert "Blake is the narrator." not in index["0001"]["facts"]
+        assert "Rose is Blake's sister." in prompt_0002
+        # 0001's own entry reflects presence-based selection: its fact IS
+        # in 0001's entry because its key is in 0001's source.
+        assert "Blake is the narrator." in index["0001"]["facts"]
 
     # First run (both chapters accepted) and a RERUN: the authoritative
-    # chapter_index must be identical — 0002's prompt never sees its own
-    # facts, on either run.
+    # chapter_index must be identical — full-memory presence-based.
     _run_and_check()
     _run_and_check()

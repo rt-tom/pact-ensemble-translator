@@ -1,15 +1,15 @@
-"""Book-memory role views — bounded, causal, role-specific book-memory contexts.
+"""Book-memory role views — bounded, role-specific book-memory contexts.
 
 Part of the ``book-memory-role-views`` capability (v4.2 dev). This module is
 PURE and STATELESS (no model calls, no disk I/O): it turns the single
-authoritative pre-chapter ``book_memory`` + glossary into a per-role prompt
+canonical ``book_memory`` + glossary into a per-role prompt
 block used by the real default whole-chapter consumers (generation, R-stage
 Russian editor, B3 audit, selective repair/re-audit, glossary resolver).
 
 Two public pure functions:
 
 * ``select_relevant(authoritative_state, source_map)`` — computed ONCE per
-  chapter, reusing the existing causal source-relevance logic in
+  chapter, reusing the existing source-relevance logic in
   ``build_chapter_index``. Every role view is a projection of the single
   ``RelevanceResult`` so consumers cannot drift apart.
 * ``render_book_context(role, relevance, authoritative_glossary,
@@ -28,7 +28,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-# Reuse the existing causal source-relevance logic (build_chapter_index) and
+# Reuse the existing source-relevance logic (build_chapter_index) and
 # the frozen-authoritative-glossary entry type. Imported lazily inside helper
 # functions to keep this module importable in isolation (unit tests).
 try:  # pragma: no cover - import path differs between package layouts
@@ -74,7 +74,7 @@ ROLE_VIEW_ROLES: Tuple[str, ...] = (
 )
 
 # Concrete per-role token budgets (deterministic char/~4 estimate). The
-# translator budget covers the causal durable BIBLE only; the current-chapter
+# translator budget covers the durable BIBLE only; the current-chapter
 # verified B1.2 block is a SEPARATE labelled section (see render_book_context
 # 'translator') and is not counted here.
 ROLE_TOKEN_BUDGET: Dict[str, int] = {
@@ -137,18 +137,19 @@ def _norm(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Authoritative state (frozen, pre-chapter) + source map
+# Authoritative state (frozen, canonical) + source map
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class AuthoritativeState:
-    """Frozen pre-chapter authoritative state for role-view rendering.
+    """Frozen canonical authoritative state for role-view rendering.
 
-    ``book_memory`` MUST already be pre-chapter (provenance strictly earlier
-    than the target chapter). ``glossary`` is the FROZEN authoritative
-    glossary (glossary > ``book_memory.canonical_ru``). The caller is
-    responsible for providing regular, non-symlink, validated inputs.
+    ``book_memory`` is the full accumulated durable ``book_memory``;
+    provenance is audit metadata and does not gate eligibility. Selection
+    is presence-based (Rule 1) over the complete state. ``glossary`` is
+    the FROZEN authoritative glossary (glossary > ``book_memory.canonical_ru``).
+    The caller is responsible for providing regular, non-symlink, validated inputs.
     """
 
     book_memory: Mapping[str, Any]
@@ -161,7 +162,7 @@ class AuthoritativeState:
 
 @dataclass(frozen=True)
 class CanonicalRecord:
-    """A source-relevant canonical record projected from the pre-chapter state.
+    """A source-relevant canonical record projected from the canonical state.
 
     Carries only the stable, consistency-relevant attributes (name, kind,
     gender, the raw ``canonical_ru`` carrier, address/register, memory_class,
@@ -187,7 +188,7 @@ class CanonicalRecord:
 
 @dataclass(frozen=True)
 class RelevanceResult:
-    """The single causal source-relevance decision for one chapter.
+    """The single source-relevance decision for one chapter.
 
     Every role view is a projection of this object; the glossary view
     additionally intersects it with the resolver's candidate set. The
@@ -205,7 +206,7 @@ class RelevanceResult:
     # included independent of source presence (Decision 2 / task 3.9).
     exceptions: Tuple[str, ...]
     # The projected, source-relevant canonical records (with attributes) pulled
-    # from the pre-chapter book_memory. render_book_context stays pure over
+    # from the full book_memory. render_book_context stays pure over
     # (relevance, authoritative_glossary, current_b1_2, glossary_candidates).
     selected_records: Tuple[CanonicalRecord, ...]
     index_entry: Mapping[str, Any]
@@ -229,42 +230,42 @@ def _record_for(bm: Mapping[str, Any], section: str, name: str) -> Optional[Mapp
     return None
 
 
-def _is_excluded(pre_bm: Mapping[str, Any], name: str) -> bool:
+def _is_excluded(full_bm: Mapping[str, Any], name: str) -> bool:
     """Durable conflict exclusion: a record still in an ambiguous conflict state
     is excluded from every role view until an explicitly approved resolution."""
-    if not isinstance(pre_bm, Mapping):
+    if not isinstance(full_bm, Mapping):
         return False
-    conflicts = pre_bm.get("_conflicts")
+    conflicts = full_bm.get("_conflicts")
     if isinstance(conflicts, Mapping) and _norm(name) in {_norm(str(k)) for k in conflicts.keys()}:
         return True
     # Also check per-record _excluded_conflict flag
     for section in ("characters", "entities", "terms"):
-        rec = _record_for(pre_bm, section, name)
+        rec = _record_for(full_bm, section, name)
         if isinstance(rec, Mapping) and rec.get("_excluded_conflict"):
             return True
     return False
 
 
 def _project_records(
-    pre_bm: Mapping[str, Any],
+    full_bm: Mapping[str, Any],
     entry: Mapping[str, Any],
     exceptions: Sequence[str],
 ) -> Tuple[CanonicalRecord, ...]:
     """Project source-relevant canonical records (with attributes) from the
-    pre-chapter book_memory, plus the explicit exception records.
+    full book_memory, plus the explicit exception records.
     Records in a durable conflict state are excluded (finding 6)."""
     records: List[CanonicalRecord] = []
     seen: set = set()
 
     def _collect(section: str, kind: str, names: Sequence[str]) -> None:
         for name in names:
-            if _is_excluded(pre_bm, name):
+            if _is_excluded(full_bm, name):
                 continue
             key = (kind, _norm(name))
             if key in seen:
                 continue
             seen.add(key)
-            rec = _record_for(pre_bm, section, name) or {}
+            rec = _record_for(full_bm, section, name) or {}
             # Skip if the underlying record is durably excluded
             if isinstance(rec, Mapping) and rec.get("_excluded_conflict"):
                 continue
@@ -309,9 +310,9 @@ def select_relevant(
     authoritative_state: AuthoritativeState,
     source_map: Mapping[str, str],
 ) -> RelevanceResult:
-    """Compute the single causal source-relevance decision for one chapter.
+    """Compute the single source-relevance decision for one chapter.
 
-    Reuses the existing causal source-relevance logic in ``build_chapter_index``
+    Reuses the existing source-relevance logic in ``build_chapter_index``
     (presence of a canonical name or a verified lexical variant in the chapter
     source). The result is computed ONCE per chapter and reused by every role
     view projection.
@@ -327,7 +328,7 @@ def select_relevant(
     chapter_id = authoritative_state.chapter_id
     source_text = "\n".join(str(v) for v in source_map.values())
 
-    pre_bm = pre_chapter_book_memory(bm, chapter_id) if pre_chapter_book_memory else dict(bm)
+    full_bm = pre_chapter_book_memory(bm, chapter_id) if pre_chapter_book_memory else dict(bm)
     glossary = authoritative_state.glossary
 
     entry: Mapping[str, Any]
@@ -335,7 +336,7 @@ def select_relevant(
         entry = build_chapter_index(
             chapter_id=chapter_id,
             source_text=source_text,
-            book_memory=pre_bm,
+            book_memory=full_bm,
             glossary=list(glossary),
         )
     else:  # pragma: no cover - defensive fallback
@@ -381,7 +382,7 @@ def select_relevant(
         selected_facts=tuple(sorted({str(f) for f in entry.get("facts", [])}, key=str.casefold)),
         selected_address=tuple(sorted({str(a) for a in entry.get("address", [])}, key=str.casefold)),
         exceptions=tuple(sorted(set(exceptions), key=str.casefold)),
-        selected_records=_project_records(pre_bm, entry, exceptions),
+        selected_records=_project_records(full_bm, entry, exceptions),
         index_entry=entry,
         relevance_hash=rel_hash,
         source_hash=_source_hash(source_map),
@@ -451,7 +452,7 @@ class RenderedContext:
     text: str
     included_canonical_ids: Tuple[str, ...]
     resolved_term_map: Dict[str, str]  # EN name -> resolved RU form ("" if excluded/unknown)
-    canonical_hash: str  # hash of (role, schema, selected causal entry, resolved glossary slice)
+    canonical_hash: str  # hash of (role, schema, selected entry, resolved glossary slice)
     conflicts: Tuple[Dict[str, str], ...]  # glossary/memory conflict diagnostics
     empty_reason: str = ""  # "" when non-empty; "no_relevant"/"disabled"/"invalid" otherwise
 
@@ -605,7 +606,7 @@ def render_book_context(
     identity. ``glossary_candidates`` limits the ``glossary`` role to the
     resolver's current candidate set.
 
-    The rendered hash includes the role schema/version, the selected causal
+    The rendered hash includes the role schema/version, the selected
     entry, and the resolved glossary slice, so a glossary change (or a
     relevance change) invalidates replay.
     """
@@ -624,14 +625,14 @@ def render_book_context(
     )
 
     if role == "translator":
-        # Causal durable BIBLE (pre-chapter facts only) — bounded.
+        # Durable BIBLE — bounded, presence-based over full book_memory.
         cards = _build_cards(
             relevance, glossary,
             include_kinds=("character", "entity", "term", "narrator", "seed_fact", "global_voice"),
             include_facts=True, include_address=True,
         )
         kept, conflicts = _trim_to_budget(cards, role, ("name", "canonical_ru", "gender", "address", "fact"))
-        lines: List[str] = ["BOOK MEMORY (established, pre-chapter):"]
+        lines: List[str] = ["BOOK MEMORY (established):"]
         for exc in relevance.exceptions:
             lines.append(f"- {exc}")
         for card in kept:
@@ -826,7 +827,7 @@ def compute_role_views(
     state_hash: str = "",
     glossary_hash: str = "",
 ) -> Dict[str, Any]:
-    """Compute the single causal relevance result ONCE and project every role view.
+    """Compute the single relevance result ONCE and project every role view.
 
     Returns ``{"relevance": RelevanceResult, "views": {role: RenderedContext},
     "provenance": {role: dict}}``. The whole-chapter runner calls this once per

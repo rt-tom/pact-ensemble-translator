@@ -99,14 +99,42 @@ def test_select_relevant_computed_once_reused_by_all_roles():
     assert views["translator"].text == again.text
 
 
-def test_later_chapter_fact_excluded_from_earlier_view():
-    # A fact attributed to chapter 0005 must not appear in the chapter 0003 view.
+def test_later_chapter_fact_included_when_source_present():
+    # A fact attributed to chapter 0005 is eligible for chapter 0003 when its Rule 1 keys are present.
     bm = _v2_bm(
         characters={"Callan": {"gender": "male", "canonical_ru": "Каллан", "memory_class": "named_character"}},
-        facts=[{"fact": "Callan becomes a detective", "chapter": "0005"}],
+        facts=[{"fact": "Callan becomes a detective", "keys": ["Callan"], "chapter": "0005"}],
     )
     rel = select_relevant(_state(bm, _glossary([]), chapter_id="0003"), {"p1": "Callan walked."})
-    assert "Callan becomes a detective" not in rel.selected_facts
+    assert "Callan becomes a detective" in rel.selected_facts
+    # Absent key remains excluded
+    rel_absent = select_relevant(_state(bm, _glossary([]), chapter_id="0003"), {"p1": "Nothing relevant."})
+    assert "Callan becomes a detective" not in rel_absent.selected_facts
+
+def test_select_relevant_full_memory_multiple_and_excludes_conflict():
+    bm = _v2_bm(
+        characters={
+            "Callan": {"gender": "male", "canonical_ru": "Каллан", "memory_class": "named_character", "chapters": ["0005"]},
+            "Paige": {"gender": "female", "canonical_ru": "Пейдж", "memory_class": "named_character", "chapters": ["0006"], "_excluded_conflict": True},
+        },
+        entities={
+            "Riverbend": {"memory_class": "named_place", "canonical_ru": "Ривербенд", "chapters": ["0004"]},
+        },
+    )
+    # Insert _conflicts marker for Paige via top-level _conflicts
+    bm["_conflicts"] = {"Paige": {"reason": "conflict_incompatible"}}
+    rel = select_relevant(_state(bm, _glossary([]), chapter_id="0001"), {"p1": "Callan and Paige met at Riverbend."})
+    # Full memory: later records are included when source present
+    assert "Callan" in rel.selected_characters
+    assert "Riverbend" in rel.selected_entities
+    # Conflict exclusion: Paige is omitted from projected records and rendered views
+    assert not any(r.name == "Paige" for r in rel.selected_records)
+    assert any(r.name == "Callan" for r in rel.selected_records)
+    # Rendered view must not contain the conflicted record
+    rc = render_book_context("translator", rel, _glossary([]))
+    assert "Paige" not in rc.text
+    assert "Callan" in rc.text
+    assert "Riverbend" in rc.text
 
 
 # ---------------------------------------------------------------------------

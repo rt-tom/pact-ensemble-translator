@@ -549,7 +549,7 @@ class MemoryManager:
         else:
             # Build per-chapter entries for current and next chapter inside the same transaction using staged new_book_memory
             rebuilt_index = self._rebuild_chapter_index_for_promotion(new_book_memory, chapter_index)
-            # If chapter context provided, compute causal entries for current and next chapter
+            # If chapter context provided, compute entries for current and next chapter (presence-based, full memory)
             try:
                 if _chapter_id:
                     from pact_full_pipeline_runner_v1.build_chapter_index import build_chapter_index as _bci, pre_chapter_book_memory, load_glossary
@@ -571,14 +571,14 @@ class MemoryManager:
                             else:
                                 return None
                             src_text = "\\n".join(b.text for b in blocks)
-                            # Use pre-chapter memory for this cid
-                            pre_mem = pre_chapter_book_memory(new_book_memory, cid)
+                            # Use full accumulated memory for this cid (no provenance gate)
+                            full_mem = pre_chapter_book_memory(new_book_memory, cid)
                             glossary = load_glossary(self.base_dir)
-                            entry = _bci(chapter_id=cid, source_text=src_text, book_memory=pre_mem, glossary=glossary)
+                            entry = _bci(chapter_id=cid, source_text=src_text, book_memory=full_mem, glossary=glossary)
                             return entry
                         except Exception:
                             return None
-                    # Build current chapter entry (pre-N memory)
+                    # Build current chapter entry (full memory)
                     entry_cur = _build_entry(_chapter_id, _chapter_html_pattern, _chapter_html)
                     if entry_cur is not None:
                         rebuilt_index[_chapter_id] = entry_cur

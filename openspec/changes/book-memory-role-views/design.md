@@ -61,7 +61,7 @@ This is deliberately not semantic merge. Exact normalized identity and policy-ap
 
 ### 2. Role-aware rendering is an ephemeral compiler
 
-Add one deterministic, pure renderer pipeline. Relevance is computed exactly once per chapter by reusing the existing causal source-relevance logic in `build_chapter_index` as a single pure function over the frozen pre-chapter state plus the current source map:
+Add one deterministic, pure renderer pipeline. Relevance is computed exactly once per chapter by reusing the existing causal source-relevance logic in `build_chapter_index` as a single pure function over the canonical book_memory state plus the current source map:
 
 ```text
 select_relevant(authoritative_state, source_map) -> RelevanceResult   # once per chapter
@@ -75,7 +75,7 @@ Every role view is a projection of the single `RelevanceResult`; the glossary vi
 
 `RenderedContext` contains text, schema/version, included canonical IDs, resolved term-map, and canonical hash. Each role has a deterministic token/card budget. When the selected relevant records exceed the budget, the renderer applies a fixed field/record priority and overflow policy (retain the source-prevails instruction and highest-priority canonical constraints; drop lowest-priority extras) instead of growing unbounded. The audit/repair card is included in the existing audit input-budget accounting, so it cannot silently increase audit chunks or retries; an over-budget card is trimmed, not used to add model calls.
 
-The translator prompt composes two clearly labelled sections: the causal durable role view (pre-chapter facts only) and a separate current-chapter verified B1.2 block (permitted only for generation). The B1.2 block is not a durable role view and carries its own identity. The other role cards are small projections:
+The translator prompt composes two clearly labelled sections: the causal durable role view (drawn from the full accumulated book_memory, selected by presence in the chapter source) and a separate current-chapter verified B1.2 block (permitted only for generation). The B1.2 block is not a durable role view and carries its own identity. The other role cards are small projections:
 
 | Role | Contents | Consumers |
 |---|---|---|
