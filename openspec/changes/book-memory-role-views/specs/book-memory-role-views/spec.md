@@ -5,13 +5,13 @@ Provide each real consumer in the default whole-chapter book run only the causal
 ## ADDED Requirements
 
 ### Requirement: Default whole-chapter role routing
-For the public simple `book --chapters … --local|--remote` whole-chapter path, the system SHALL derive model context from the same pre-chapter canonical state and SHALL route it as follows: the generator receives the Translator BIBLE; the enabled R-stage Russian editor receives a Russian editorial view; B3 audit and selective repair (including their re-audit) receive an audit/repair consistency view; and the enabled glossary resolver receives an established-term view. The entity prepass SHALL remain source-only, inline-formatting resolution SHALL remain memory-free, and shared-state promotion SHALL remain deterministic.
+For the public simple `book --chapters … --local|--remote` whole-chapter path, the system SHALL derive model context from the same canonical book_memory state and SHALL route it as follows: the generator receives the Translator BIBLE; the enabled R-stage Russian editor receives a Russian editorial view; B3 audit and selective repair (including their re-audit) receive an audit/repair consistency view; and the enabled glossary resolver receives an established-term view. The entity prepass SHALL remain source-only, inline-formatting resolution SHALL remain memory-free, and shared-state promotion SHALL remain deterministic.
 
 A disabled optional stage SHALL make no call and require no view. The implementation SHALL NOT add a new standalone model stage: role cards are attached to the existing generation, R-editor, B3 audit, selective repair/re-audit, and glossary-resolver calls.
 
 #### Scenario: Default book chapter uses all enabled consistency views
 - **WHEN** a simple whole-chapter book run processes a chapter with generation, R-editor, B3, repair, and glossary resolver enabled
-- **THEN** each enabled consumer receives only its declared role view derived from the causal pre-chapter state
+- **THEN** each enabled consumer receives only its declared role view derived from the canonical book_memory state
 
 #### Scenario: No new model stage is introduced
 - **WHEN** the whole-chapter book run executes with all enabled consumers
@@ -22,11 +22,11 @@ A disabled optional stage SHALL make no call and require no view. The implementa
 - **THEN** neither model receives book-memory-derived prompt text
 
 ### Requirement: Bounded role views, authoritative glossary, and source precedence
-The Translator BIBLE SHALL compose two labelled sections: the causal durable role view (only facts whose provenance is strictly earlier than the target chapter) and a separate current-chapter verified B1.2 entity block permitted only for generation. The B1.2 block SHALL NOT be treated as a durable role view and SHALL carry its own identity.
+The Translator BIBLE SHALL compose two labelled sections: the causal durable role view (drawn from the full accumulated book_memory, selected by presence in the chapter source) and a separate current-chapter verified B1.2 entity block permitted only for generation. The B1.2 block SHALL NOT be treated as a durable role view and SHALL carry its own identity.
 
 The audit/repair view, Russian editorial view, and glossary view SHALL contain only canonical, source-relevant consistency constraints resolved from the authoritative glossary. Each established Russian form SHALL be resolved from the frozen authoritative glossary; when a glossary entry exists it SHALL override `book_memory.canonical_ru`; when the two disagree, the conflict SHALL be excluded from the prompt view and recorded as a diagnostic, and SHALL NOT be silently resolved in favor of either source. The rendered-view hash SHALL include the resolved glossary slice.
 
-Every view SHALL exclude chapter-local observations, generic descriptions, unverified/candidate relations, and facts whose provenance is not strictly earlier than the target chapter. Prompts using audit/repair/glossary views SHALL state that current source evidence prevails over memory; a disagreement is a consistency issue to verify, not proof that the current source is wrong.
+Every view SHALL exclude chapter-local observations, generic descriptions, and unverified/candidate relations. Prompts using audit/repair/glossary views SHALL state that current source evidence prevails over memory; a disagreement is a consistency issue to verify, not proof that the current source is wrong.
 
 Each role view SHALL be bounded by a deterministic per-role token/card budget. When selected relevant records exceed the budget, the renderer SHALL apply a fixed field/record priority and overflow policy (retain the source-prevails instruction and highest-priority canonical constraints; drop lowest-priority extras) rather than growing unbounded. The audit/repair card SHALL be included in the existing audit input-budget accounting so it cannot silently increase audit chunks or retries; an over-budget card SHALL be trimmed, not used to add model calls.
 
@@ -44,7 +44,7 @@ Each role view SHALL be bounded by a deterministic per-role token/card budget. W
 
 #### Scenario: Causal durable view excludes current-chapter B1.2
 - **WHEN** the generation prompt is built
-- **THEN** the causal durable view contains only pre-chapter facts and the current B1.2 block is a separate labelled section with its own identity
+- **THEN** the causal durable view contains the chapter-relevant book_memory facts and the current B1.2 block is a separate labelled section with its own identity
 
 #### Scenario: Over-budget card is trimmed not expanded
 - **WHEN** selected relevant records exceed the role budget
@@ -55,13 +55,9 @@ Each role view SHALL be bounded by a deterministic per-role token/card budget. W
 - **THEN** its editorial view contains that name/form/gender information but no unrelated plot facts or chapter-local entity claims
 
 ### Requirement: Single relevance selector and identity-bound rendering
-A single pure relevance selector SHALL be computed once per chapter from the frozen pre-chapter state and the current source map, reusing the existing causal source-relevance logic. Role views SHALL be projections of that selector result; the glossary view SHALL additionally intersect the selector result with the resolver's current entity candidates. The implementation SHALL NOT recompute relevance independently per consumer.
+A single pure relevance selector SHALL be computed once per chapter from the canonical book_memory state and the current source map, reusing the existing causal source-relevance logic. Role views SHALL be projections of that selector result; the glossary view SHALL additionally intersect the selector result with the resolver's current entity candidates. The implementation SHALL NOT recompute relevance independently per consumer.
 
 The role, view schema/version, selected causal entry, resolved glossary slice, and rendered-view hash SHALL participate in the identity of every prompt cache or resumable model artifact that consumes the view. A stale, unsupported, or mismatched view SHALL be recomputed from validated state or fail according to the existing consumer's safe policy; it SHALL not replay a model output made with different constraints.
-
-#### Scenario: Later fact cannot leak into an earlier chapter view
-- **WHEN** an alias or attribute is first verified in chapter M
-- **THEN** no role view for chapter N where N is less than or equal to M contains that alias or attribute
 
 #### Scenario: View change invalidates consumer replay
 - **WHEN** the rendered repair view differs from the view bound to a cached repair artifact
