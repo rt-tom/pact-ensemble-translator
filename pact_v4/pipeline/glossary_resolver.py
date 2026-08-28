@@ -219,6 +219,7 @@ def render_resolver_prompt(
     allowed_pids: Mapping[str, set],
     translations: Mapping[str, str],
     source_map: Mapping[str, str],
+    role_view_card: Optional[str] = None,
 ) -> str:
     """Render resolver prompt with candidates and translations."""
     lines = [GLOSSARY_RESOLVER_PROMPT.instructions, "", "ENTITIES:"]
@@ -234,6 +235,13 @@ def render_resolver_prompt(
     lines.append("SOURCE (for allowed check, English):")
     for pid in sorted(source_map):
         lines.append(f"  {pid}: {source_map[pid]}")
+    if role_view_card:
+        lines.append("")
+        lines.append(
+            "ESTABLISHED EN→RU FORMS (authoritative glossary; source prevails "
+            "on disagreement):"
+        )
+        lines.append(str(role_view_card))
     return "\n".join(lines)
 
 # Sidecar paths
@@ -289,6 +297,8 @@ def validate_sidecar_payload(
     expected_translation_hash: Optional[str] = None,
     expected_model_ref: Optional[str] = None,
     expected_backend_identity: Optional[str] = None,
+    expected_glossary_view_hash: Optional[str] = None,
+    expected_glossary_view_version: Optional[str] = None,
     allowed_pids: Optional[Mapping[str, set]] = None,
     translation_map: Optional[Mapping[str, str]] = None,
     quarantined_pids: Optional[set] = None,
@@ -296,8 +306,10 @@ def validate_sidecar_payload(
     """Strict validation of sidecar payload. Returns None if valid, else reason string."""
     if not isinstance(payload, dict):
         return "payload must be object"
-    # Exact schema/keys check
-    expected_keys = {"schema", "chapter_id", "snapshot_hash", "config_identity", "resolver_version", "prompt_version", "response_schema", "model_ref", "backend_identity", "candidate_input_hash", "translation_hash", "proposals"}
+    # Exact schema/keys check — v4.2 adds rendered glossary-card identity so a
+    # changed established-term card cannot reuse a sidecar built under different
+    # prompt constraints (blocker finding 2).
+    expected_keys = {"schema", "chapter_id", "snapshot_hash", "config_identity", "resolver_version", "prompt_version", "response_schema", "model_ref", "backend_identity", "candidate_input_hash", "translation_hash", "proposals", "glossary_view_hash", "glossary_view_version"}
     extra = set(payload.keys()) - expected_keys
     if extra:
         return f"extra fields {sorted(extra)}"
@@ -326,6 +338,10 @@ def validate_sidecar_payload(
         return f"model_ref mismatch {payload.get('model_ref')!r} != {expected_model_ref!r}"
     if expected_backend_identity and payload.get("backend_identity") != expected_backend_identity:
         return f"backend_identity mismatch {payload.get('backend_identity')!r} != {expected_backend_identity!r}"
+    if expected_glossary_view_hash is not None and payload.get("glossary_view_hash") != expected_glossary_view_hash:
+        return f"glossary_view_hash mismatch {payload.get('glossary_view_hash')!r} != {expected_glossary_view_hash!r}"
+    if expected_glossary_view_version is not None and payload.get("glossary_view_version") != expected_glossary_view_version:
+        return f"glossary_view_version mismatch {payload.get('glossary_view_version')!r} != {expected_glossary_view_version!r}"
     proposals = payload.get("proposals")
     if not isinstance(proposals, list):
         return "proposals must be list"
@@ -417,6 +433,8 @@ def load_and_validate_sidecar(
     expected_translation_hash: Optional[str] = None,
     expected_model_ref: Optional[str] = None,
     expected_backend_identity: Optional[str] = None,
+    expected_glossary_view_hash: Optional[str] = None,
+    expected_glossary_view_version: Optional[str] = None,
     allowed_pids: Optional[Mapping[str, set]] = None,
     translation_map: Optional[Mapping[str, str]] = None,
     quarantined_pids: Optional[set] = None,
@@ -448,6 +466,8 @@ def load_and_validate_sidecar(
         expected_translation_hash=expected_translation_hash,
         expected_model_ref=expected_model_ref,
         expected_backend_identity=expected_backend_identity,
+        expected_glossary_view_hash=expected_glossary_view_hash,
+        expected_glossary_view_version=expected_glossary_view_version,
         allowed_pids=allowed_pids,
         translation_map=translation_map,
         quarantined_pids=quarantined_pids,
@@ -473,6 +493,7 @@ class GlossaryResolver:
         translations: Mapping[str, str],
         allowed_pids: Mapping[str, set],
         out_dir: Optional[Path] = None,
+        role_view_card: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Run one logical batch (≤3 attempts) to produce proposals. Returns sidecar payload or None on failure."""
         if not entity_records:
@@ -481,7 +502,7 @@ class GlossaryResolver:
         if not model_ref:
             LOG.warning("glossary_resolver: no reviewer binding, fail-closed")
             return None
-        prompt = render_resolver_prompt(entity_records, allowed_pids, translations, source_map)
+        prompt = render_resolver_prompt(entity_records, allowed_pids, translations, source_map, role_view_card=role_view_card)
         # Reuse reviewer role's configured max_output_tokens unchanged (no hard-code, no clamp)
         # Spec D8: inherit reviewer max_output_tokens as is; do not introduce separate 4096/16384 budget
         _reviewer_max_tokens = None
@@ -592,6 +613,8 @@ def build_sidecar_payload(
     model_ref: str,
     backend_identity: str,
     proposals: List[Dict[str, Any]],
+    glossary_view_hash: str = "",
+    glossary_view_version: str = "",
 ) -> Dict[str, Any]:
     return {
         "schema": GLOSSARY_PROPOSAL_SCHEMA,
@@ -605,6 +628,8 @@ def build_sidecar_payload(
         "backend_identity": backend_identity,
         "candidate_input_hash": candidate_input_hash,
         "translation_hash": translation_hash_val,
+        "glossary_view_hash": glossary_view_hash,
+        "glossary_view_version": glossary_view_version,
         "proposals": proposals,
     }
 
