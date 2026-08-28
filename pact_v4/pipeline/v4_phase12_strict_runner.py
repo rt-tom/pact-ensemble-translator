@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -482,162 +483,186 @@ class StrictRunConfig:
     # Glossary resolver mode and cache-miss policy (identity-bearing, default off/recompute)
     glossary_resolver_mode: str = "promote"
     glossary_resolver_cache_miss_policy: str = "recompute"
+    # v4.2 book-memory role views (owner decision: ship as separate dev profile
+    # v4.2 alongside unchanged v4.1). When False (default) the v4.1 prompt path
+    # is byte-identical — no role cards are computed or rendered. When True, the
+    # runner computes select_relevant ONCE per chapter and projects bounded
+    # role views (translator / audit_repair / russian_editor / glossary) into
+    # the real whole-chapter consumers.
+    book_memory_role_views_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        # v4.2 enablement hook: the owner runs v4.2 via a separate runtime
+        # profile + the env var PACT_V4_2_ROLE_VIEWS=1, so the default v4.1
+        # path is byte-identical (flag stays False) and 4.1 on main is never
+        # disturbed. Frozen dataclass -> use object.__setattr__.
+        if not self.book_memory_role_views_enabled and os.environ.get("PACT_V4_2_ROLE_VIEWS"):
+            object.__setattr__(self, "book_memory_role_views_enabled", True)
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
-        return build_config_artifact(
-            version=self.config_version,
-            values={
-                "chapter_id": self.chapter_id,
-                "model_profile": model_profile,
-                "chunk_min_words": self.min_chunk_words,
-                "chunk_target_words": self.target_chunk_words,
-                "chunk_max_words": self.max_chunk_words,
-                "right_context_pids": self.right_context_pids,
-                "generation": {
-                    "temperature": self.temperature,
-                    "seed": self.seed,
-                    "max_tokens": self.max_tokens,
-                    "reasoning": self.reasoning,
+        values = {
+            "chapter_id": self.chapter_id,
+            "model_profile": model_profile,
+            "chunk_min_words": self.min_chunk_words,
+            "chunk_target_words": self.target_chunk_words,
+            "chunk_max_words": self.max_chunk_words,
+            "right_context_pids": self.right_context_pids,
+            "generation": {
+                "temperature": self.temperature,
+                "seed": self.seed,
+                "max_tokens": self.max_tokens,
+                "reasoning": self.reasoning,
+            },
+            "stop_after": self.stop_after,
+            "whole_chapter": self.whole_chapter,
+            "formatting": {
+                "required": self.formatting_required,
+                "max_incidents": self.max_formatting_incidents,
+                "policy_version": self.formatting_policy_version,
+            },
+            # B5 mixed_script-политика: the manual allowlist is a gate-policy
+            # input, so it is part of the run's config identity — changing it
+            # invalidates cache/resume exactly like a memory/source change.
+            "deterministic_mixed_script_allow": list(self.deterministic_mixed_script_allow),
+            # P1 АРКИ (owner decision 2026-08-14): the deterministic arc
+            # mapping renders an "АРКИ:" block into the generation prompt,
+            # so it is part of the config identity — a changed mapping
+            # invalidates cache/resume exactly like a glossary change.
+            "deterministic_arc_names": [
+                list(pair) for pair in self.deterministic_arc_names
+            ],
+            # V4 Efficiency A1.1 (review fix, HIGH): the glossary budgeter
+            # changes the actual generation prompts, so the policy version
+            # MUST be part of the config identity. Without it, a journal
+            # written before the policy (full-glossary prompts) passes the
+            # resume identity check and its chunks are silently replayed
+            # alongside post-policy filtered candidates, mixing two
+            # different prompt regimes in one run. Versioning the identity
+            # makes any pre-policy journal a foreign identity -> resume
+            # refuses instead of silently reusing.
+            "glossary_budget_policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
+            # V4 Efficiency A2: the lazy balanced-only generation scheme is
+            # part of the run's config identity — flipping it changes which
+            # candidates are generated (balanced-only vs A/B pair), so a
+            # journal written under the other scheme must be refused on
+            # resume (same reasoning as glossary_budget_policy_version).
+            "efficiency": {"lazy_balanced": self.lazy_balanced},
+            # V4.1 B3: the production audit/repair stage is part of the
+            # run's config identity — flipping run_audit /
+            # entity_context_enabled / audit budget invalidates
+            # cache/resume exactly like any other generation setting.
+            # F5: every repair-policy knob and prompt/extractor/harness
+            # version is included, so changing the repair policy can
+            # never silently reuse a stale cached repaired map.
+            "audit": {
+                "run": self.run_audit,
+                "entity_context_enabled": self.entity_context_enabled,
+                "max_input_tokens": self.audit_max_input_tokens,
+                "max_tokens": self.audit_max_tokens,
+                "overlap_tokens": self.audit_overlap_tokens,
+                "reasoning_budget": self.audit_reasoning_budget,
+                "audit_transport_retry": {
+                    "max_retries": self.audit_transport_max_retries,
+                    "base_delay_seconds": self.audit_transport_base_delay_seconds,
                 },
-                "stop_after": self.stop_after,
-                "whole_chapter": self.whole_chapter,
-                "formatting": {
-                    "required": self.formatting_required,
-                    "max_incidents": self.max_formatting_incidents,
-                    "policy_version": self.formatting_policy_version,
+                "repair_findings_cap": self.audit_repair_findings_cap,
+                "repair_microbatch_trigger": self.audit_repair_microbatch_trigger,
+                "repair_microbatch_target": self.audit_repair_microbatch_target,
+                # REPAIR-CTX (t_97b31f81): the local-context window is
+                # identity-bearing — a change invalidates cache/resume
+                # (F5: an old full-chapter repaired map must never replay
+                # under a local-context prompt).
+                "repair_context_window": self.audit_repair_context_window,
+                # REPAIR-2 (t_768537b9): the per-category window
+                # overrides are identity-bearing — a change invalidates
+                # cache/resume (F5: a stale repaired map written under a
+                # narrow gender window must never replay under a
+                # wide-gender-window prompt).
+                "repair_context_window_by_category": dict(
+                    self.audit_repair_context_window_by_category
+                ),
+                "repair_reaudit_neighbour_window": self.audit_repair_reaudit_neighbour_window,
+                # REPAIR-CTX (t_97b31f81): the re-audit chunk/overlap
+                # settings and the REPAIRED CHANGES delta format are
+                # identity-bearing — a change invalidates cache/resume
+                # (F5: an old full-chapter re-audit must never replay
+                # under the chunked local-context prompt).
+                "repair_reaudit_chunk": {
+                    "max_input_tokens": self.audit_repair_reaudit_max_input_tokens,
+                    "overlap_tokens": self.audit_repair_reaudit_overlap_tokens,
+                    "min_overlap_pairs": self.audit_repair_reaudit_min_overlap_pairs,
+                    "max_overlap_pairs": self.audit_repair_reaudit_max_overlap_pairs,
+                    "delta_format": self.audit_repair_reaudit_delta_format,
                 },
-                # B5 mixed_script-политика: the manual allowlist is a gate-policy
-                # input, so it is part of the run's config identity — changing it
-                # invalidates cache/resume exactly like a memory/source change.
-                "deterministic_mixed_script_allow": list(self.deterministic_mixed_script_allow),
-                # P1 АРКИ (owner decision 2026-08-14): the deterministic arc
-                # mapping renders an "АРКИ:" block into the generation prompt,
-                # so it is part of the config identity — a changed mapping
-                # invalidates cache/resume exactly like a glossary change.
-                "deterministic_arc_names": [
-                    list(pair) for pair in self.deterministic_arc_names
-                ],
-                # V4 Efficiency A1.1 (review fix, HIGH): the glossary budgeter
-                # changes the actual generation prompts, so the policy version
-                # MUST be part of the config identity. Without it, a journal
-                # written before the policy (full-glossary prompts) passes the
-                # resume identity check and its chunks are silently replayed
-                # alongside post-policy filtered candidates, mixing two
-                # different prompt regimes in one run. Versioning the identity
-                # makes any pre-policy journal a foreign identity -> resume
-                # refuses instead of silently reusing.
-                "glossary_budget_policy_version": GLOSSARY_BUDGET_POLICY_VERSION,
-                # V4 Efficiency A2: the lazy balanced-only generation scheme is
-                # part of the run's config identity — flipping it changes which
-                # candidates are generated (balanced-only vs A/B pair), so a
-                # journal written under the other scheme must be refused on
-                # resume (same reasoning as glossary_budget_policy_version).
-                "efficiency": {"lazy_balanced": self.lazy_balanced},
-                # V4.1 B3: the production audit/repair stage is part of the
-                # run's config identity — flipping run_audit /
-                # entity_context_enabled / audit budget invalidates
-                # cache/resume exactly like any other generation setting.
-                # F5: every repair-policy knob and prompt/extractor/harness
-                # version is included, so changing the repair policy can
-                # never silently reuse a stale cached repaired map.
-                "audit": {
-                    "run": self.run_audit,
-                    "entity_context_enabled": self.entity_context_enabled,
-                    "max_input_tokens": self.audit_max_input_tokens,
-                    "max_tokens": self.audit_max_tokens,
-                    "overlap_tokens": self.audit_overlap_tokens,
-                    "reasoning_budget": self.audit_reasoning_budget,
-                    "audit_transport_retry": {
-                        "max_retries": self.audit_transport_max_retries,
-                        "base_delay_seconds": self.audit_transport_base_delay_seconds,
-                    },
-                    "repair_findings_cap": self.audit_repair_findings_cap,
-                    "repair_microbatch_trigger": self.audit_repair_microbatch_trigger,
-                    "repair_microbatch_target": self.audit_repair_microbatch_target,
-                    # REPAIR-CTX (t_97b31f81): the local-context window is
-                    # identity-bearing — a change invalidates cache/resume
-                    # (F5: an old full-chapter repaired map must never replay
-                    # under a local-context prompt).
-                    "repair_context_window": self.audit_repair_context_window,
-                    # REPAIR-2 (t_768537b9): the per-category window
-                    # overrides are identity-bearing — a change invalidates
-                    # cache/resume (F5: a stale repaired map written under a
-                    # narrow gender window must never replay under a
-                    # wide-gender-window prompt).
-                    "repair_context_window_by_category": dict(
-                        self.audit_repair_context_window_by_category
-                    ),
-                    "repair_reaudit_neighbour_window": self.audit_repair_reaudit_neighbour_window,
-                    # REPAIR-CTX (t_97b31f81): the re-audit chunk/overlap
-                    # settings and the REPAIRED CHANGES delta format are
-                    # identity-bearing — a change invalidates cache/resume
-                    # (F5: an old full-chapter re-audit must never replay
-                    # under the chunked local-context prompt).
-                    "repair_reaudit_chunk": {
-                        "max_input_tokens": self.audit_repair_reaudit_max_input_tokens,
-                        "overlap_tokens": self.audit_repair_reaudit_overlap_tokens,
-                        "min_overlap_pairs": self.audit_repair_reaudit_min_overlap_pairs,
-                        "max_overlap_pairs": self.audit_repair_reaudit_max_overlap_pairs,
-                        "delta_format": self.audit_repair_reaudit_delta_format,
-                    },
-                    # F5: the re-audit output budget and bounded retry policy
-                    # are identity-bearing — a cache written under the old
-                    # 12000-token re-audit must never replay under the
-                    # 20000-token policy (RV 71b7cbc finding).
-                    "repair_reaudit_max_tokens": self.audit_repair_reaudit_max_tokens,
-                    # REPAIR-MAX-TOKENS (owner decision 2026-08-15): the
-                    # per-batch repair OUTPUT budget is identity-bearing —
-                    # a cache written under 4000 (empty deepseek repair
-                    # responses, run_0004-0005) must never replay under
-                    # 16000. F5: budget change invalidates cache/resume.
-                    "repair_max_tokens": self.audit_repair_max_tokens,
-                    # REPAIR-ROBUST (t_b6fd6cbd, F5): the repair reasoning
-                    # effort is identity-bearing — a change invalidates a
-                    # stale cached repaired map (old high-reasoning repairs
-                    # must never replay under low).
-                    "repair_reasoning": self.audit_repair_reasoning,
-                    "repair_reaudit_retry": {
-                        "max_retries": self.audit_repair_reaudit_max_retries,
-                        "base_delay_seconds": self.audit_repair_reaudit_base_delay_seconds,
-                    },
-                    "prompt_version": self.audit_prompt_version,
-                    "harness_version": self.audit_harness_version,
-                    "extractor_version": self.audit_extractor_version,
-                    # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
-                    # REPAIR prompt version participates in the identity —
-                    # a cache written under a different repair prompt must
-                    # never replay the repaired map.
-                    "repair_prompt_version": self.audit_repair_prompt_version,
-                    "repair_harness_version": self.audit_repair_harness_version,
+                # F5: the re-audit output budget and bounded retry policy
+                # are identity-bearing — a cache written under the old
+                # 12000-token re-audit must never replay under the
+                # 20000-token policy (RV 71b7cbc finding).
+                "repair_reaudit_max_tokens": self.audit_repair_reaudit_max_tokens,
+                # REPAIR-MAX-TOKENS (owner decision 2026-08-15): the
+                # per-batch repair OUTPUT budget is identity-bearing —
+                # a cache written under 4000 (empty deepseek repair
+                # responses, run_0004-0005) must never replay under
+                # 16000. F5: budget change invalidates cache/resume.
+                "repair_max_tokens": self.audit_repair_max_tokens,
+                # REPAIR-ROBUST (t_b6fd6cbd, F5): the repair reasoning
+                # effort is identity-bearing — a change invalidates a
+                # stale cached repaired map (old high-reasoning repairs
+                # must never replay under low).
+                "repair_reasoning": self.audit_repair_reasoning,
+                "repair_reaudit_retry": {
+                    "max_retries": self.audit_repair_reaudit_max_retries,
+                    "base_delay_seconds": self.audit_repair_reaudit_base_delay_seconds,
                 },
-                # V4.2 R (card t_4707e6e5, F5 lesson): the Russian-only
-                # editor stage is part of the run's config identity — its
-                # version, chunk settings and class threshold are included,
-                # so a cache written under a different R policy can never
-                # replay the repaired map (same reasoning as the audit
-                # block). ``--no-russian-editor`` flips ``enabled`` and thus
-                # invalidates cache/resume (scheme 4.1 is a different run).
-                "russian_editor": {
-                    "enabled": self.russian_editor_enabled,
-                    "version": self.russian_editor_version,
-                    "harness_version": self.russian_editor_harness_version,
-                    "chunk_size": self.russian_editor_chunk_size,
-                    "overlap_pairs": self.russian_editor_overlap_pairs,
-                    "max_tokens": self.russian_editor_max_tokens,
-                    "safe_classes": list(self.russian_editor_safe_classes),
-                    "max_edits_per_pid": self.russian_editor_max_edits_per_pid,
-                    "r_editor_retry": {
-                        "max_retries": self.russian_editor_retry_max_retries,
-                        "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
-                    },
-                },
-                "glossary_resolver": {
-                    "mode": self.glossary_resolver_mode,
-                    "cache_miss_policy": self.glossary_resolver_cache_miss_policy,
+                "prompt_version": self.audit_prompt_version,
+                "harness_version": self.audit_harness_version,
+                "extractor_version": self.audit_extractor_version,
+                # CANDIDATE-MERGE (t_0ffe56e1, RV2 HIGH finding, F5): the
+                # REPAIR prompt version participates in the identity —
+                # a cache written under a different repair prompt must
+                # never replay the repaired map.
+                "repair_prompt_version": self.audit_repair_prompt_version,
+                "repair_harness_version": self.audit_repair_harness_version,
+            },
+            # V4.2 R (card t_4707e6e5, F5 lesson): the Russian-only
+            # editor stage is part of the run's config identity — its
+            # version, chunk settings and class threshold are included,
+            # so a cache written under a different R policy can never
+            # replay the repaired map (same reasoning as the audit
+            # block). ``--no-russian-editor`` flips ``enabled`` and thus
+            # invalidates cache/resume (scheme 4.1 is a different run).
+            "russian_editor": {
+                "enabled": self.russian_editor_enabled,
+                "version": self.russian_editor_version,
+                "harness_version": self.russian_editor_harness_version,
+                "chunk_size": self.russian_editor_chunk_size,
+                "overlap_pairs": self.russian_editor_overlap_pairs,
+                "max_tokens": self.russian_editor_max_tokens,
+                "safe_classes": list(self.russian_editor_safe_classes),
+                "max_edits_per_pid": self.russian_editor_max_edits_per_pid,
+                "r_editor_retry": {
+                    "max_retries": self.russian_editor_retry_max_retries,
+                    "base_delay_seconds": self.russian_editor_retry_base_delay_seconds,
                 },
             },
+            "glossary_resolver": {
+                "mode": self.glossary_resolver_mode,
+                "cache_miss_policy": self.glossary_resolver_cache_miss_policy,
+            },
+        }
+        # v4.2 book-memory role views: included in config identity ONLY when
+        # enabled, so the default v4.1 config identity is byte-identical
+        # (no new key) and a v4.1 run never replays under a v4.2 identity.
+        if self.book_memory_role_views_enabled:
+            from pact_v4.runtime.book_memory_role_views import ROLE_VIEW_SCHEMA_VERSION
+            values["book_memory_role_views"] = {
+                "enabled": True,
+                "schema_version": ROLE_VIEW_SCHEMA_VERSION,
+            }
+        return build_config_artifact(
+            version=self.config_version,
+            values=values,
         )
-
 
 def build_strict_lifecycle(
     backend: StrictBackendConfig, *, log_dir: Path, bible_text: str = "",
@@ -4234,6 +4259,51 @@ def _run_whole_chapter_strict_impl(
         resumed_from_index=resumed_from_index,
     )
 
+    # v4.2 book-memory role views (gated; v4.1 path unchanged when disabled).
+    # Single-computation contract: compute select_relevant ONCE per chapter
+    # and reuse the same RelevanceResult for every role view. The translator
+    # view is re-rendered after B1.2 becomes available using the same
+    # relevance; glossary candidates are derived from the resolver's entity
+    # candidates and passed to render_book_context.
+    from pact_v4.runtime.book_memory_role_views import (
+        AuthoritativeState,
+        render_book_context,
+        select_relevant,
+    )
+    entity_gen_block = ""
+    role_views: Optional[Dict[str, Any]] = None
+    role_relevance = None  # RelevanceResult, computed once when enabled
+    role_provenance: Optional[Dict[str, Any]] = None
+    if cfg.book_memory_role_views_enabled:
+        _state = AuthoritativeState(
+            book_memory=memory.book_memory,
+            glossary=list(glossary),
+            chapter_id=cfg.chapter_id,
+        )
+        role_relevance = select_relevant(_state, dict(source.source))
+        # Render audit/repair and russian_editor eagerly (no B1.2, no glossary filter yet)
+        _audit_rc = render_book_context("audit_repair", role_relevance, list(glossary))
+        _russian_rc = render_book_context("russian_editor", role_relevance, list(glossary))
+        # Translator without B1.2 yet (will be re-rendered after prepass with same relevance)
+        _translator_rc = render_book_context("translator", role_relevance, list(glossary), current_b1_2=None)
+        # Glossary card is candidate-limited: derive candidates from B1.2 extraction below;
+        # for now render a placeholder that will be replaced after extraction with real candidates.
+        _glossary_rc = render_book_context("glossary", role_relevance, list(glossary), glossary_candidates=[])
+        # Account for audit card BEFORE chunk planning: its tokens reduce the per-chunk pair budget.
+        # The audit evaluator's validate_input_budget already counts entity_tokens including the card
+        # when we pass the combined entity_context, but we also store the card hash for cache identity.
+        from pact_v4.runtime.book_memory_role_views import build_role_provenance
+        role_views = {
+            "translator": _translator_rc,
+            "audit_repair": _audit_rc,
+            "russian_editor": _russian_rc,
+            "glossary": _glossary_rc,
+        }
+        role_provenance = {
+            k: build_role_provenance(k, v, role_relevance).to_payload()
+            for k, v in role_views.items()
+        }
+
     if resumed_from_index > 0:
         # Whole-chapter resume journal contract: exactly ONE whole_chapter
         # entry. A duplicate or malformed journal is a data-integrity failure
@@ -4491,6 +4561,45 @@ def _run_whole_chapter_strict_impl(
                 f"{bible_text}\nCHAPTER ENTITY FACTS - SOURCE-DERIVED\n"
                 f"{entity_gen_block}"
             )
+        # v4.2 book-memory role views: re-render translator view with the SAME
+        # relevance (no recomputation) once the current-chapter B1.2 block is
+        # known, and refine the glossary card to be candidate-limited.
+        if cfg.book_memory_role_views_enabled and role_views is not None and role_relevance is not None:
+            from pact_v4.runtime.book_memory_role_views import build_role_provenance as _brp2
+            _translator_rc2 = render_book_context(
+                "translator", role_relevance, list(glossary),
+                current_b1_2=entity_gen_block or None,
+            )
+            role_views["translator"] = _translator_rc2
+            # Glossary candidates: derive from the resolver's current entity candidates
+            # (verified anchors that are glossary candidates per source_map). This
+            # makes the glossary view candidate-only, not all-relevant.
+            _gloss_cands: list = []
+            try:
+                if extraction is not None:
+                    from pact_v4.audit.entity_extractor import is_entity_glossary_candidate as _is_gc
+                    for _rec in extraction.context.entities:
+                        if _rec.anchor.status == "verified" and _is_gc(_rec, dict(source.source)):
+                            _gloss_cands.append(str(_rec.entity))
+            except Exception:
+                _gloss_cands = []
+            _glossary_rc2 = render_book_context(
+                "glossary", role_relevance, list(glossary),
+                glossary_candidates=_gloss_cands,
+            )
+            role_views["glossary"] = _glossary_rc2
+            # Refresh provenance for the re-rendered roles
+            role_provenance["translator"] = _brp2("translator", _translator_rc2, role_relevance).to_payload()
+            role_provenance["glossary"] = _brp2("glossary", _glossary_rc2, role_relevance).to_payload()
+            gen_bible_text = _translator_rc2.text
+            # Persist role provenance/diagnostics (task 5.1) alongside the generation prompt
+            try:
+                import json as _js_pv
+                (cfg.out_dir / "role_view_provenance.json").write_text(
+                    _js_pv.dumps(role_provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except Exception:
+                pass
         # P1 АРКИ (owner decision 2026-08-14): deterministic arc-name block
         # from arc_names.json so chapter headings translate consistently
         # (Bonds = Узы in every chapter). Part of the bundle identity via
@@ -4694,6 +4803,49 @@ def _run_whole_chapter_strict_impl(
     # A B3 failure is recorded (step6/7/8 status "failed"), never a
     # crash of the completed generation run.
     # ------------------------------------------------------------------
+    # v4.2 High — resumed chapters: finalize role views for resumed runs
+    # too (translator with current B1.2 block; glossary with candidates from
+    # cached B1.2 context). Without this, a resumed run would use a
+    # translator view lacking the B1.2 block and a glossary card with an
+    # empty placeholder candidate list, giving B3 an incorrectly
+    # unrestricted glossary card.
+    if resumed_from_index > 0 and cfg.book_memory_role_views_enabled and role_views is not None and role_relevance is not None:
+        try:
+            _cached_block = ""
+            _cached_cands: list = []
+            try:
+                from pathlib import Path as _P2
+                from pact_v4.audit.entity_extractor import EntityContextCache, entity_context_cache_key, is_entity_glossary_candidate
+                from pact_v4.pipeline.b3_audit_repair import render_entity_context_block as _recb2
+                import json as _js3
+                _cache_path = cfg.out_dir / "entity_context_cache.json"
+                if _cache_path.exists():
+                    _payload = _js3.loads(_cache_path.read_text(encoding="utf-8"))
+                    _cache = EntityContextCache.from_payload(_payload)
+                    _key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=cfg.audit_extractor_version)
+                    _ctx = _cache.get(_key)
+                    if _ctx is not None and _ctx.chapter_id == cfg.chapter_id:
+                        _cached_block = _recb2(_ctx, verified_only=True)
+                        for _rec in _ctx.entities:
+                            if _rec.anchor.status == "verified" and is_entity_glossary_candidate(_rec, dict(source.source)):
+                                _cached_cands.append(str(_rec.entity))
+            except Exception:
+                _cached_block = ""
+                _cached_cands = []
+            from pact_v4.runtime.book_memory_role_views import render_book_context as _rbc_resume, build_role_provenance as _brp_resume
+            _translator_resume = _rbc_resume("translator", role_relevance, list(glossary), current_b1_2=_cached_block or None)
+            role_views["translator"] = _translator_resume
+            role_provenance["translator"] = _brp_resume("translator", _translator_resume, role_relevance).to_payload()  # type: ignore[index]
+            _glossary_resume = _rbc_resume("glossary", role_relevance, list(glossary), glossary_candidates=_cached_cands)
+            role_views["glossary"] = _glossary_resume
+            role_provenance["glossary"] = _brp_resume("glossary", _glossary_resume, role_relevance).to_payload()  # type: ignore[index]
+            try:
+                import json as _js_pv2
+                (cfg.out_dir / "role_view_provenance.json").write_text(_js_pv2.dumps(role_provenance, ensure_ascii=False, indent=2), encoding="utf-8")  # type: ignore[arg-type]
+            except Exception:
+                pass
+        except Exception:
+            pass
     raw_final_text_by_pid = dict(final_text_by_pid)
     b3_audit_result: Optional[Any] = None
     b3_failed: Optional[str] = None
@@ -4750,6 +4902,11 @@ def _run_whole_chapter_strict_impl(
                 for _pid in getattr(_ch, "pids", ()):
                     _pid_to_chunk[str(_pid)] = str(_ch.chunk_id)
             _quarantined_for_b3: set[str] = {pid for pid, cid in _pid_to_chunk.items() if cid in _quarantined_chunk_ids}
+            # v4.2: pass rendered .text for prompt consumers (blocker #2)
+            # and keep rendered hashes/provenance for cache identity (high #5)
+            _b3_views = None
+            if role_views is not None:
+                _b3_views = role_views  # RenderedContext objects: b3 extracts .text via _card_text
             b3_audit_result = b3_audit_repair.run(
                 chapter_id=cfg.chapter_id,
                 source=source,
@@ -4761,6 +4918,7 @@ def _run_whole_chapter_strict_impl(
                 config_identity=config.config_identity,
                 backend_identity_hash=cfg.backend.identity_hash,
                 quarantined_pids=_quarantined_for_b3,
+                book_memory_role_views=_b3_views,
             )
         except Exception as exc:  # noqa: BLE001 — a B3 failure is a record, not a crash
             LOG.exception("B3 audit/repair failed for %s", cfg.chapter_id)

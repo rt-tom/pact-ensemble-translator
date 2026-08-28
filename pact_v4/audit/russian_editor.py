@@ -818,6 +818,7 @@ class RussianEditorEvaluator:
         config: Optional[RussianEditorConfig] = None,
         on_chunk_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        book_memory_role_card: Optional[str] = None,
     ) -> None:
         self._backend = backend
         self._config = config or RussianEditorConfig()
@@ -831,6 +832,10 @@ class RussianEditorEvaluator:
         # orchestrator uses it to rewrite audit_cache_b3.json incrementally
         # (stage_progress.r_editor), so a kill preserves every GOOD R chunk.
         self._on_progress = on_progress
+        # v4.2 book-memory role views: an OPTIONAL bounded russian_editor card
+        # from the frozen pre-chapter canonical state. Disabled (None) keeps the
+        # v4.1 R prompt byte-identical.
+        self._book_memory_role_card = book_memory_role_card
 
     @property
     def backend(self) -> CompletionBackend:
@@ -1006,6 +1011,7 @@ class RussianEditorEvaluator:
                 chunk_index=chunk_index,
                 chunk_total=len(chunks),
                 template=cfg.template,
+                book_memory_role_card=self._book_memory_role_card,
             )
             # REASONING-STREAM: the reasoning file is created BEFORE the call
             # and grows live via on_reasoning_chunk (gemma_rewrite_v4 pattern);

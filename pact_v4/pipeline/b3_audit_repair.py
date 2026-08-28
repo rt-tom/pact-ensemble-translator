@@ -248,6 +248,7 @@ def render_entity_context_block(
     context: ChapterEntityContext,
     *,
     verified_only: bool = False,
+    role_view_card: Optional[str] = None,
 ) -> str:
     """Render a validated ``ChapterEntityContext`` into the audit prompt's
     ``CHAPTER ENTITY FACTS - SOURCE-DERIVED`` block.
@@ -256,6 +257,11 @@ def render_entity_context_block(
     auditor (evidence level 3: source > adjacent > chapter facts), never
     an instruction. Empty context -> empty string (caller omits the
     block).
+
+    ``role_view_card`` (v4.2 book-memory role views): an OPTIONAL bounded
+    ``audit_repair`` consistency card from the frozen pre-chapter canonical
+    state. When provided it is appended after the source-derived block. It is
+    disabled by default (``None``) so the v4.1 B3 prompt is byte-identical.
 
     ``verified_only=True`` (generation-prompt variant, owner decision
     2026-08-14): only claims whose status is ``verified`` are rendered —
@@ -268,44 +274,56 @@ def render_entity_context_block(
     other alias stays in the full audit block.
     """
     if not context.entities:
-        return ""
-    lines: list = []
-    for record in sorted(context.entities, key=lambda r: r.entity):
-        claims = (
-            [c for c in record.claims if c.status == STATUS_VERIFIED]
-            if verified_only
-            else list(record.claims)
-        )
-        aliases = record.aliases
-        if verified_only:
-            aliases = tuple(
-                a for a in record.aliases if _alias_is_source_apposed(record, a)
+        block = ""
+    else:
+        lines: list = []
+        for record in sorted(context.entities, key=lambda r: r.entity):
+            claims = (
+                [c for c in record.claims if c.status == STATUS_VERIFIED]
+                if verified_only
+                else list(record.claims)
             )
-        lines.append(f"- entity: {record.entity}")
-        lines.append(f"  established_type: {record.canonical_type}")
-        anchor = record.anchor
-        lines.append(
-            f"  anchor: \"{anchor.span}\" (pid {anchor.pid}, {anchor.status})"
-        )
-        for alias in aliases:
+            aliases = record.aliases
+            if verified_only:
+                aliases = tuple(
+                    a for a in record.aliases if _alias_is_source_apposed(record, a)
+                )
+            lines.append(f"- entity: {record.entity}")
+            lines.append(f"  established_type: {record.canonical_type}")
+            anchor = record.anchor
             lines.append(
-                f"  alias: \"{alias.surface}\" (pid {alias.pid}, {alias.status})"
+                f"  anchor: \"{anchor.span}\" (pid {anchor.pid}, {anchor.status})"
             )
-        for claim in claims:
-            evidence = ", ".join(
-                f"{ev.pid} \"{ev.span}\"" for ev in claim.evidence
-            )
-            windows = ", ".join(
-                f"[{a}-{b}]" for a, b in claim.evidence_windows
-            )
-            detail = f"evidence: {evidence}" if evidence else ""
-            if windows:
-                detail += f" windows: {windows}"
-            lines.append(
-                f"  claim: {claim.kind}={claim.value!r} ({claim.status})"
-                + (f" {detail}" if detail else "")
-            )
-    return "\n".join(lines) + "\n"
+            for alias in aliases:
+                lines.append(
+                    f"  alias: \"{alias.surface}\" (pid {alias.pid}, {alias.status})"
+                )
+            for claim in claims:
+                evidence = ", ".join(
+                    f"{ev.pid} \"{ev.span}\"" for ev in claim.evidence
+                )
+                windows = ", ".join(
+                    f"[{a}-{b}]" for a, b in claim.evidence_windows
+                )
+                detail = f"evidence: {evidence}" if evidence else ""
+                if windows:
+                    detail += f" windows: {windows}"
+                lines.append(
+                    f"  claim: {claim.kind}={claim.value!r} ({claim.status})"
+                    + (f" {detail}" if detail else "")
+                )
+    if context.entities:
+        block = "\n".join(lines) + "\n"
+    return _append_role_view_card(block, role_view_card)
+
+
+def _append_role_view_card(block: str, role_view_card: Optional[str]) -> str:
+    """Append an OPTIONAL bounded role-view card to a prompt block (no-op when
+    ``None``). Keeps the v4.1 path byte-identical when no card is supplied."""
+    if not role_view_card:
+        return block
+    sep = "" if block.endswith("\n") else "\n"
+    return f"{block}{sep}\n{role_view_card}"
 
 
 def render_entity_context_to_hard_filters(
@@ -3365,6 +3383,7 @@ class B3AuditRepair:
         config_identity: str,
         backend_identity_hash: str,
         quarantined_pids: Optional[set] = None,
+        book_memory_role_views: Optional[Mapping[str, Any]] = None,
     ) -> B3AuditRepairResult:
         cfg = self._config
         cache_path = _audit_cache_path(out_dir)
@@ -3383,6 +3402,7 @@ class B3AuditRepair:
                 cache_path=cache_path,
                 journal=journal,
                 quarantined_pids=quarantined_pids,
+                book_memory_role_views=book_memory_role_views,
             )
         finally:
             journal.close()
@@ -3460,6 +3480,7 @@ class B3AuditRepair:
         out_dir: Optional[Path],
         cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
         on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        book_memory_role_card: Optional[str] = None,
     ) -> Tuple[Dict[str, str], Tuple[ReviewCandidate, ...], Optional[RussianEditorOutcome]]:
         """V4.2 R stage: run the Russian-only editor over the raw map.
 
@@ -3548,6 +3569,7 @@ class B3AuditRepair:
             ),
             on_chunk_event=_journal_r_editor_chunk_event,
             on_progress=on_progress,
+            book_memory_role_card=book_memory_role_card,
         )
         journal.emit(
             "r_editor_started",
@@ -3645,10 +3667,21 @@ class B3AuditRepair:
         cache_path: Path,
         journal: AuditJournal,
         quarantined_pids: Optional[set] = None,
+        book_memory_role_views: Optional[Mapping[str, Any]] = None,
     ) -> B3AuditRepairResult:
         cfg = self._config
         source_map = dict(source.source)
         translation_map = dict(translation)
+        # v4.2 helper: extract role card as plain text (RenderedContext.text when present)
+        def _card_text(key: str) -> Optional[str]:
+            if not book_memory_role_views:
+                return None
+            val = book_memory_role_views.get(key)
+            if val is None:
+                return None
+            if hasattr(val, "text"):
+                return val.text  # type: ignore[attr-defined]
+            return str(val)
         # The audit outcome is a function of BOTH the source and the
         # translation being audited, so the audit cache identity binds to
         # the exact translation content too — a regenerated/tampered raw
@@ -3680,8 +3713,29 @@ class B3AuditRepair:
             )
             entity_from_cache = extraction.from_cache
             entity_payload = extraction.context.to_payload()
+            _audit_card = _card_text("audit_repair")
             entity_hash = canonical_json_hash(entity_payload)
-            entity_context = render_entity_context_block(extraction.context)
+            # When a role card is present, combine its hash into the entity
+            # hash so a card change invalidates replay (finding 5). Keep the
+            # source-only hash separately for provenance.
+            _source_entity_hash = entity_hash
+            if _audit_card:
+                import hashlib, json as _js2
+                _audit_card_hash = hashlib.sha256(_audit_card.encode("utf-8")).hexdigest()
+                entity_hash = canonical_json_hash({"source": entity_payload, "role_card_hash": _audit_card_hash})
+            entity_context = render_entity_context_block(
+                extraction.context,
+                role_view_card=_audit_card,
+            )
+            # Persist role provenance/diagnostics and bind hashes to artifacts.
+            if _audit_card and book_memory_role_views is not None:
+                _prov = {}
+                for _k, _v in book_memory_role_views.items():
+                    if hasattr(_v, "canonical_hash"):
+                        _prov[_k] = {"hash": _v.canonical_hash, "schema": getattr(_v, "schema_version", "")}
+                    elif isinstance(_v, str):
+                        _prov[_k] = {"hash": hashlib.sha256(_v.encode("utf-8")).hexdigest()}
+                journal.emit("role_view_provenance", provenance=_prov, source_entity_hash=_source_entity_hash, combined_entity_hash=entity_hash)
             journal.emit(
                 "entity_context",
                 enabled=True,
@@ -3864,6 +3918,7 @@ class B3AuditRepair:
                 entity_context_payload=entity_payload,
                 quarantined_pids=quarantined_pids,
                 glossary=glossary,
+                book_memory_role_views=book_memory_role_views,
             )
             return B3AuditRepairResult(
                 step6=step6,
@@ -3981,6 +4036,7 @@ class B3AuditRepair:
             }
             _save_stage_progress()
 
+        _r_editor_card = _card_text("russian_editor")
         if cfg.russian_editor_enabled:
             edited_map, review_candidates, r_editor_outcome = (
                 self._run_russian_editor(
@@ -3990,6 +4046,7 @@ class B3AuditRepair:
                     out_dir=out_dir,
                     cached_chunks=r_editor_resume or None,
                     on_progress=_on_r_editor_progress,
+                    book_memory_role_card=_r_editor_card,
                 )
             )
             # The audit/repair consume the R-EDITED map (raw + SAFE edits).
@@ -4556,6 +4613,7 @@ class B3AuditRepair:
             entity_context_payload=entity_payload,
             quarantined_pids=quarantined_pids,
             glossary=glossary,
+            book_memory_role_views=book_memory_role_views,
         )
         repair_complete = (
             repair_outcome.repair_complete if repair_outcome is not None else False
@@ -4691,6 +4749,7 @@ class B3AuditRepair:
         entity_context_payload: Any = None,
         quarantined_pids: Any = None,
         glossary: Any = (),
+        book_memory_role_views: Optional[Mapping[str, Any]] = None,
     ) -> None:
         cfg = self._config
         mode = getattr(cfg, "glossary_resolver_mode", "off")
@@ -4749,6 +4808,23 @@ class B3AuditRepair:
         except Exception:
             model_ref = "unknown"
         backend_identity = backend_identity_hash or "unknown"
+        # v4.2: bind rendered glossary view identity (hash/version/selection/
+        # glossary slice) so a changed established-term card invalidates replay.
+        _gv_hash = ""
+        _gv_version = ""
+        try:
+            _gview = (book_memory_role_views or {}).get("glossary") if isinstance(book_memory_role_views, Mapping) else None
+            if _gview is not None:
+                _gv_hash = str(getattr(_gview, "canonical_hash", "") or _gview.get("canonical_hash", "") if isinstance(_gview, Mapping) else getattr(_gview, "canonical_hash", ""))
+                _gv_version = str(getattr(_gview, "schema_version", "") or _gview.get("schema_version", "") if isinstance(_gview, Mapping) else getattr(_gview, "schema_version", ""))
+                if not _gv_hash and isinstance(_gview, Mapping) and "text" in _gview:
+                    import hashlib, json as _js2
+                    _gv_hash = hashlib.sha256(_js2.dumps(str(_gview.get("text", "")), ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                if not _gv_version and isinstance(_gview, Mapping):
+                    _gv_version = str(_gview.get("schema_version", ""))
+        except Exception:
+            _gv_hash = ""
+            _gv_version = ""
         payload_existing, err = load_and_validate_sidecar(
             out_dir,
             expected_chapter_id=chapter_id,
@@ -4758,6 +4834,8 @@ class B3AuditRepair:
             expected_translation_hash=trans_hash,
             expected_model_ref=model_ref if model_ref != "unknown" else None,
             expected_backend_identity=backend_identity if backend_identity != "unknown" else None,
+            expected_glossary_view_hash=_gv_hash or None,
+            expected_glossary_view_version=_gv_version or None,
             allowed_pids=allowed,
             translation_map=translations_repaired,
             quarantined_pids=quarantined_set,
@@ -4796,6 +4874,13 @@ class B3AuditRepair:
         except Exception:
             pass
         resolver = GlossaryResolver(self._audit_backend, progress=self._progress)
+        _glossary_card = None
+        if book_memory_role_views is not None:
+            _glossary_card = book_memory_role_views.get("glossary")
+            if _glossary_card is not None and hasattr(_glossary_card, "text"):
+                _glossary_card = _glossary_card.text  # type: ignore[attr-defined]
+            elif _glossary_card is not None:
+                _glossary_card = str(_glossary_card)
         result = resolver.resolve(
             chapter_id=chapter_id,
             entity_records=entity_records,
@@ -4803,6 +4888,7 @@ class B3AuditRepair:
             translations=translations_repaired,
             allowed_pids=allowed,
             out_dir=out_dir,
+            role_view_card=_glossary_card,
         )
         if result is None:
             LOG.warning("glossary_resolver: resolver failed for %s", chapter_id)
@@ -4889,6 +4975,8 @@ class B3AuditRepair:
             model_ref=model_ref or "unknown",
             backend_identity=backend_identity,
             proposals=canonical_proposals,
+            glossary_view_hash=_gv_hash,
+            glossary_view_version=_gv_version,
         )
         err = validate_sidecar_payload(
             payload,
@@ -4897,6 +4985,8 @@ class B3AuditRepair:
             expected_config_identity=config_identity,
             expected_candidate_input_hash=cand_hash,
             expected_translation_hash=trans_hash,
+            expected_glossary_view_hash=_gv_hash or None,
+            expected_glossary_view_version=_gv_version or None,
             allowed_pids=allowed,
             translation_map=translations_repaired,
             quarantined_pids=quarantined_set,

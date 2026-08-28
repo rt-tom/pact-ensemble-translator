@@ -10,7 +10,7 @@ provenance rather than silently changing review behaviour.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -918,6 +918,7 @@ def render_russian_editor_prompt(
     chunk_index: int = 0,
     chunk_total: int = 1,
     template: ReviewerPrompt = RUSSIAN_EDITOR_V4_2_R1,
+    book_memory_role_card: Optional[str] = None,
 ) -> str:
     """Render the v4.2-R1 Russian-editor request for one chunk.
 
@@ -947,11 +948,18 @@ def render_russian_editor_prompt(
         if chunk_total > 1 else "EDIT_PAIRS:"
     )
     rendered_edits = "\n".join(f"  {p.pid}: {p.text}" for p in edit_pairs)
-    return (
+    prompt = (
         f"{template.instructions}"
         f"{ctx_block}\n\n"
         f"{header}\n{rendered_edits}"
     )
+    if book_memory_role_card:
+        prompt = (
+            f"{prompt}\n\nBOOK MEMORY ESTABLISHED RUSSIAN FORMS "
+            "(constrain realization only; no source text):\n"
+            f"{book_memory_role_card}"
+        )
+    return prompt
 
 
 def render_qwen_review_prompt(
