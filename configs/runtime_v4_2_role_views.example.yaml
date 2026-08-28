@@ -45,7 +45,3 @@ reasoning_effort_map:
   1: low
   2: medium
   3: high
-# v4.2 marker: the runner reads PACT_V4_2_ROLE_VIEWS to enable this profile's
-# role views. Kept here as documentation of intent; the authoritative switch is
-# the env var above (so the v4.1 config identity is unchanged when it is unset).
-book_memory_role_views: true
