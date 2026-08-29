@@ -19,8 +19,18 @@ Worktrees: /home/rt/projects/pact-worktrees/<change-name>
 Production/execution host: Windows `RT`.
 
 ```text
-Production checkout: D:\\pact\\pact_translator_v4_1
+Production checkout (running 4.1): D:\pact\pact_translator_v4_1
+v4.2 dev/test copy (where v4.2 branches are synced and tested): D:\pact\pact_translator_v4_2
 ```
+
+- The two RT checkouts are DIFFERENT folders. `v4_1` is the live production 4.1
+  tree; `v4_2` is the v4.2 dev/test copy used for the `dev/v4.2-*` branches.
+- For any v4.2 work, the owner syncs `D:\pact\pact_translator_v4_2` (NOT `v4_1`).
+  Confirmed RT sync workflow (PowerShell):
+  `cd D:\pact\pact_translator_v4_2` →
+  `git fetch origin <dev-branch>` →
+  `git switch <dev-branch>` (first time: creates local tracking branch) →
+  `git pull --ff-only`. `Already up to date` after `git switch` is expected.
 
 - Commands executed by agents on `media` use Bash/Linux syntax.
 - Commands prepared for the owner to run on `RT` use PowerShell/Windows syntax.
