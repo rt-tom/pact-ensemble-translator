@@ -95,6 +95,23 @@ def _collect_claim_evidence_pids(obs: Mapping[str, Any]) -> List[str]:
 def _file_hash(path: str) -> str:
     return _raw_file_hash(path)
 
+def _fsync_dir(dir_path: str) -> None:
+    """Durably flush a directory entry after a rename (POSIX only).
+
+    On platforms without ``os.O_DIRECTORY`` (e.g. Windows, where
+    ``os.replace`` is already atomic on NTFS) this is a no-op. The attribute
+    access is guarded so the durability fsync never raises ``AttributeError``
+    off-POSIX; any ``OSError`` from the underlying ``os.open``/``os.fsync`` is
+    left to the ``try/except OSError`` that already wraps each call site.
+    """
+    o_directory = getattr(os, "O_DIRECTORY", None)
+    if o_directory is None:
+        return
+    dfd = os.open(dir_path, o_directory)
+    os.fsync(dfd)
+    os.close(dfd)
+
+
 def atomic_write(filepath: str, data: Any):
     dir_name = os.path.dirname(filepath)
     if dir_name:
@@ -107,9 +124,8 @@ def atomic_write(filepath: str, data: Any):
         os.fsync(f.fileno())
     os.replace(tmp_path, filepath)
     try:
-        dfd = os.open(dir_name or ".", os.O_DIRECTORY)
-        os.fsync(dfd)
-        os.close(dfd)
+        _fsync_dir(dir_name or ".")
+
     except OSError:
         pass
 
@@ -283,9 +299,8 @@ class MemoryManager:
         except OSError as e:
             raise RuntimeError(f"failed to clear marker after recovery: {e}") from e
         try:
-            dfd = os.open(self.base_dir, os.O_DIRECTORY)
-            os.fsync(dfd)
-            os.close(dfd)
+            _fsync_dir(self.base_dir)
+
         except OSError:
             pass
 
@@ -674,9 +689,8 @@ class MemoryManager:
             os.fsync(f.fileno())
         os.replace(tmp, self._marker_path)
         try:
-            dfd = os.open(self.base_dir, os.O_DIRECTORY)
-            os.fsync(dfd)
-            os.close(dfd)
+            _fsync_dir(self.base_dir)
+
         except OSError:
             pass
         if fault_point == "before_replace":
@@ -698,9 +712,8 @@ class MemoryManager:
                         os.fsync(f.fileno())
                     os.replace(tmp2, self._marker_path)
                     try:
-                        dfd = os.open(self.base_dir, os.O_DIRECTORY)
-                        os.fsync(dfd)
-                        os.close(dfd)
+                        _fsync_dir(self.base_dir)
+
                     except OSError:
                         pass
                     continue
@@ -715,9 +728,8 @@ class MemoryManager:
                 os.fsync(f.fileno())
             os.replace(tmp2, self._marker_path)
             try:
-                dfd = os.open(self.base_dir, os.O_DIRECTORY)
-                os.fsync(dfd)
-                os.close(dfd)
+                _fsync_dir(self.base_dir)
+
             except OSError:
                 pass
             if fault_point == f"after_{fname}":
@@ -751,9 +763,8 @@ class MemoryManager:
         except OSError as e:
             raise RuntimeError(f"failed to clear marker: {e}") from e
         try:
-            dfd = os.open(self.base_dir, os.O_DIRECTORY)
-            os.fsync(dfd)
-            os.close(dfd)
+            _fsync_dir(self.base_dir)
+
         except OSError:
             pass
 
