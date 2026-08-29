@@ -689,21 +689,74 @@ def _referent_surfaces(record: EntityRecord) -> List[str]:
     return [s for s in surfaces if s]
 
 
+def _build_pid_int_map(source_map: Mapping[str, str]) -> Dict[int, str]:
+    """Reverse map int(value) -> canonical pNNNNN key."""
+    int_map: Dict[int, str] = {}
+    for pid in source_map:
+        s = str(pid)
+        if not re.fullmatch(r"p?\d+", s):
+            continue
+        # Strip optional leading 'p' before int conversion; fullmatch
+        # guarantees at least one digit remains.
+        digits = s[1:] if s.startswith("p") else s
+        try:
+            num = int(digits)
+        except ValueError:
+            continue
+        # First canonical key wins; source_map keys are unique canonical pids.
+        if num not in int_map:
+            int_map[num] = str(pid)
+    return int_map
+
+
+def _normalize_pid(pid: Any, int_map: Mapping[int, str]) -> str:
+    """Canonicalize a model-supplied PID reference.
+
+    The model may write p00086 / 00086 / p86 / 86 (or int 86); each
+    resolves to the chapter's canonical p00086 when the integer matches
+    a real source PID. Otherwise the reference is returned unchanged so
+    the dead-PID guard still rejects genuinely unknown PIDs.
+
+    Strict grammar: the ENTIRE string must be ``p?\\d+`` (optional
+    leading 'p' followed by digits, nothing else).  Malformed values
+    such as '-86', 'p-86', '86a', 'a86' contain a valid numeric
+    substring but are NOT accepted — they are returned unchanged and
+    fail the dead-PID existence check.
+    """
+    s = str(pid)
+    if not re.fullmatch(r"p?\d+", s):
+        return s
+    digits = s[1:] if s.startswith("p") else s
+    try:
+        num = int(digits)
+    except ValueError:
+        return s
+    canonical = int_map.get(num)
+    if canonical is not None:
+        return canonical
+    return s
+
+
 def _validate_claim(
     claim: EntityClaim,
     *,
     record: EntityRecord,
     source_map: Mapping[str, str],
     entries: List[ValidationEntry],
+    pid_int_map: Mapping[int, str] | None = None,
 ) -> Optional[EntityClaim]:
     """Validate one claim; return the accepted claim or None (dropped)."""
     label = f"{claim.kind} {claim.value!r}"
+    int_map: Mapping[int, str] = pid_int_map if pid_int_map is not None else {}
 
-    # Point 2: every PID exists.
-    claim_pids = [e.pid for e in claim.evidence]
-    claim_pids += [w[0] for w in claim.evidence_windows]
-    claim_pids += [w[1] for w in claim.evidence_windows]
-    for pid in claim_pids:
+    # Point 2: every PID exists (normalize before existence check).
+    normalized_pids: List[str] = []
+    for ev in claim.evidence:
+        normalized_pids.append(_normalize_pid(ev.pid, int_map))
+    for w in claim.evidence_windows:
+        normalized_pids.append(_normalize_pid(w[0], int_map))
+        normalized_pids.append(_normalize_pid(w[1], int_map))
+    for pid in normalized_pids:
         if pid not in source_map:
             entries.append(ValidationEntry(
                 entity=record.entity, claim=label,
@@ -720,11 +773,12 @@ def _validate_claim(
                 reason=f"translation-derived span {ev.span!r} (not source)",
             ))
             return None
-        if not _span_verbatim_in_pid(ev.span, source_map.get(ev.pid, "")):
+        norm_pid = _normalize_pid(ev.pid, int_map)
+        if not _span_verbatim_in_pid(ev.span, source_map.get(norm_pid, "")):
             entries.append(ValidationEntry(
                 entity=record.entity, claim=label,
                 action="dropped",
-                reason=f"span {ev.span!r} not verbatim in {ev.pid}",
+                reason=f"span {ev.span!r} not verbatim in {norm_pid}",
             ))
             return None
 
@@ -735,7 +789,8 @@ def _validate_claim(
         referents = _referent_surfaces(record)
         linked = False
         for ev in claim.evidence:
-            pid_text = source_map.get(ev.pid, "")
+            norm_pid = _normalize_pid(ev.pid, int_map)
+            pid_text = source_map.get(norm_pid, "")
             if not _gender_value_matches_pronouns(claim.value, pid_text):
                 continue
             if any(ref and ref.lower() in pid_text.lower() for ref in referents):
@@ -763,9 +818,18 @@ def _validate_claim(
             ))
         status = STATUS_CANDIDATE
 
+    # Stored PIDs are canonical so cached context stays consistent.
+    canonical_evidence = tuple(
+        EvidenceRef(pid=_normalize_pid(ev.pid, int_map), span=ev.span)
+        for ev in claim.evidence
+    )
+    canonical_windows = tuple(
+        (_normalize_pid(w[0], int_map), _normalize_pid(w[1], int_map))
+        for w in claim.evidence_windows
+    )
     return EntityClaim(
         kind=claim.kind, value=claim.value, status=status,
-        evidence=claim.evidence, evidence_windows=claim.evidence_windows,
+        evidence=canonical_evidence, evidence_windows=canonical_windows,
     )
 
 
@@ -801,6 +865,7 @@ def validate_entity_context(
     ))
 
     source_map = dict(source)
+    pid_int_map = _build_pid_int_map(source_map)
     entities_raw = payload.get("entities")
     if not isinstance(entities_raw, list):
         raise ValueError(
@@ -813,22 +878,23 @@ def validate_entity_context(
         record = _entity_from_payload(item)
         label = f"entity {record.entity!r}"
 
-        # Point 2 for the anchor: the anchor PID must exist.
-        if record.anchor.pid not in source_map:
+        # Point 2 for the anchor: the anchor PID must exist (normalize first).
+        anchor_pid = _normalize_pid(record.anchor.pid, pid_int_map)
+        if anchor_pid not in source_map:
             entries.append(ValidationEntry(
                 entity=record.entity, claim="anchor",
                 action="dropped",
-                reason=f"dead PID {record.anchor.pid}",
+                reason=f"dead PID {anchor_pid}",
             ))
             continue
-        anchor_text = source_map[record.anchor.pid]
+        anchor_text = source_map[anchor_pid]
         # Point 3 for the anchor span.
         if not _span_verbatim_in_pid(record.anchor.span, anchor_text):
             entries.append(ValidationEntry(
                 entity=record.entity, claim="anchor",
                 action="dropped",
                 reason=f"anchor span {record.anchor.span!r} not verbatim in "
-                       f"{record.anchor.pid}",
+                       f"{anchor_pid}",
             ))
             continue
         # Point 4 for the anchor span.
@@ -854,16 +920,17 @@ def validate_entity_context(
             ))
             continue
 
-        # Point 6: each alias surface in its own PID.
+        # Point 6: each alias surface in its own PID (normalize first).
         kept_aliases: List[AliasRef] = []
         for alias in record.aliases:
-            if alias.pid not in source_map:
+            alias_pid = _normalize_pid(alias.pid, pid_int_map)
+            if alias_pid not in source_map:
                 entries.append(ValidationEntry(
                     entity=record.entity, claim=f"alias {alias.surface!r}",
-                    action="dropped", reason=f"dead PID {alias.pid}",
+                    action="dropped", reason=f"dead PID {alias_pid}",
                 ))
                 continue
-            alias_text = source_map[alias.pid]
+            alias_text = source_map[alias_pid]
             if _is_translation_derived(alias.span) or not _span_verbatim_in_pid(
                 alias.span, alias_text
             ):
@@ -884,11 +951,14 @@ def validate_entity_context(
                     action="dropped",
                     reason=(
                         f"alias surface {alias.surface!r} not present in "
-                        f"its own PID {alias.pid}"
+                        f"its own PID {alias_pid}"
                     ),
                 ))
                 continue
-            kept_aliases.append(alias)
+            kept_aliases.append(AliasRef(
+                surface=alias.surface, pid=alias_pid, span=alias.span,
+                status=alias.status,
+            ))
 
         kept_claims: List[EntityClaim] = []
         for claim in record.claims:
@@ -899,7 +969,8 @@ def validate_entity_context(
                 ))
                 continue
             accepted = _validate_claim(
-                claim, record=record, source_map=source_map, entries=entries
+                claim, record=record, source_map=source_map, entries=entries,
+                pid_int_map=pid_int_map,
             )
             if accepted is not None:
                 kept_claims.append(accepted)
@@ -908,7 +979,7 @@ def validate_entity_context(
         # a status at all; a span that passed every §8.3 code check IS verified.
         # Any model-supplied status is overridden here (never stored verbatim).
         verified_anchor = AnchorRef(
-            pid=record.anchor.pid, span=record.anchor.span,
+            pid=anchor_pid, span=record.anchor.span,
             status=STATUS_VERIFIED,
         )
         records.append(EntityRecord(
