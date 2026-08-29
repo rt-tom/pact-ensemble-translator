@@ -1286,3 +1286,197 @@ def test_extractor_max_tokens_covers_reasoning_budget():
     assert cfg.max_tokens > 8192  # server --reasoning-budget
     assert cfg.max_tokens >= 8192 + 3000  # budget + content headroom
     assert cfg.max_tokens >= 8192 * 2  # extractor: whole-chapter input provokes full-budget reasoning
+
+
+# ---------------------------------------------------------------------------
+# entity-pid-normalization: PID format tolerance (pNNNNN / NNNNN / pN / N)
+# ---------------------------------------------------------------------------
+
+def _chapter_3_source():
+    """Minimal chapter-3 fixture: PIDs p00001..p00279 with texts that
+    satisfy the verbatim-span checks for the entity-pid-normalization
+    fixtures. Only the PIDs referenced in the tests need meaningful text."""
+    source = {f"p{i:05d}": f"filler {i}" for i in range(1, 280)}
+    # Anchor / alias / evidence texts must contain the quoted spans verbatim.
+    source["p00007"] = "Their eyes on my back, I pushed my motorcycle."
+    source["p00086"] = "The motorcycle stood near p86."
+    source["p00120"] = "The man in scrubs waited near the doorway."
+    source["p00236"] = "I settled with my back to the wall beside my bike."
+    # PID 279 is the last valid PID — used to bound dead-PID checks.
+    source["p00279"] = "The last valid paragraph of the chapter."
+    return source
+
+
+def test_normalize_pid_four_variants_and_unknown():
+    """Unit: _normalize_pid maps p00086/00086/p86/86 -> p00086 and
+    leaves 999 (outside 1..279) unchanged."""
+    from pact_v4.audit.entity_extractor import _build_pid_int_map, _normalize_pid
+
+    source = _chapter_3_source()
+    int_map = _build_pid_int_map(source)
+    assert int_map[86] == "p00086"
+    assert int_map[7] == "p00007"
+    assert 999 not in int_map
+    for variant in ("p00086", "00086", "p86", "86", 86):
+        assert _normalize_pid(variant, int_map) == "p00086", variant
+    # Unknown PID stays unresolved so the dead-PID guard still rejects it.
+    assert _normalize_pid("999", int_map) == "999"
+    assert _normalize_pid(999, int_map) == "999"
+    assert _normalize_pid("p999", int_map) == "p999"
+    # Other known boundary: p00007 variants.
+    for variant in ("p00007", "00007", "p7", "7", 7):
+        assert _normalize_pid(variant, int_map) == "p00007", variant
+
+
+def test_pid_normalization_canonicalizes_stored_pids_and_retains_valid_claim():
+    """End-to-end: chapter-3 style payload with bare-integer
+    evidence_windows [[86,86]] and mixed-format anchor/alias/evidence PIDs
+    is accepted and all stored PIDs are canonical pNNNNN."""
+    from pact_v4.audit.entity_extractor import ENTITY_CONTEXT_SCHEMA, EXTRACTOR_VERSION
+
+    source = _chapter_3_source()
+    src_hash = canonical_json_hash(source)
+    chapter_id = "0003"
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": chapter_id,
+        "source_hash": src_hash,
+        "entities": [
+            {
+                "entity": "Blake's vehicle",
+                "canonical_type": "motorcycle",
+                "anchor": {"pid": "86", "span": "motorcycle"},
+                "aliases": [
+                    {"surface": "bike", "pid": "00236", "span": "bike"},
+                ],
+                "memory_class": "chapter_local",
+                "memory_worthy": False,
+                "claims": [
+                    {
+                        "kind": "object_identity",
+                        "value": "bike = motorcycle",
+                        "status": "candidate",
+                        "evidence": [
+                            {"pid": "p86", "span": "motorcycle"},
+                            {"pid": "00236", "span": "bike"},
+                        ],
+                        "evidence_windows": [[86, 86], ["00007", "00007"]],
+                    },
+                ],
+            },
+        ],
+    }
+    context, report = validate_entity_context(
+        payload,
+        chapter_id=chapter_id,
+        source_hash=src_hash,
+        source=source,
+    )
+    assert report.is_clean(), [e.to_payload() for e in report.entries]
+    assert len(context.entities) == 1
+    rec = context.entities[0]
+    # Stored PIDs must be canonical pNNNNN.
+    assert rec.anchor.pid == "p00086"
+    assert rec.aliases[0].pid == "p00236"
+    claim = rec.claims[0]
+    assert [e.pid for e in claim.evidence] == ["p00086", "p00236"]
+    assert list(claim.evidence_windows) == [("p00086", "p00086"), ("p00007", "p00007")]
+
+
+def test_pid_normalization_drops_genuinely_unknown_pid():
+    """End-to-end: a reference whose integer is absent from the real PID
+    set (999 when PIDs end at 279) is still dropped as dead PID."""
+    from pact_v4.audit.entity_extractor import ENTITY_CONTEXT_SCHEMA, EXTRACTOR_VERSION
+
+    source = _chapter_3_source()
+    src_hash = canonical_json_hash(source)
+    chapter_id = "0003"
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": chapter_id,
+        "source_hash": src_hash,
+        "entities": [
+            {
+                "entity": "Blake's vehicle",
+                "canonical_type": "motorcycle",
+                "anchor": {"pid": "p00007", "span": "motorcycle"},
+                "aliases": [],
+                "memory_class": "chapter_local",
+                "memory_worthy": False,
+                "claims": [
+                    {
+                        "kind": "object_identity",
+                        "value": "mystery = motorcycle",
+                        "status": "candidate",
+                        "evidence": [
+                            {"pid": "999", "span": "motorcycle"},
+                        ],
+                        "evidence_windows": [["999", "999"]],
+                    },
+                ],
+            },
+        ],
+    }
+    context, report = validate_entity_context(
+        payload,
+        chapter_id=chapter_id,
+        source_hash=src_hash,
+        source=source,
+    )
+    assert any("dead PID 999" in e.reason for e in report.entries)
+    assert context.entities[0].claims == ()
+
+
+def test_pid_normalization_dead_window_drops_only_affected_claim():
+    """Regression: a dead-PID in evidence_windows drops that claim but
+    a sibling claim with valid bare-integer windows is retained."""
+    from pact_v4.audit.entity_extractor import ENTITY_CONTEXT_SCHEMA, EXTRACTOR_VERSION
+
+    source = _chapter_3_source()
+    src_hash = canonical_json_hash(source)
+    chapter_id = "0003"
+    payload = {
+        "schema": ENTITY_CONTEXT_SCHEMA,
+        "extractor_version": EXTRACTOR_VERSION,
+        "chapter_id": chapter_id,
+        "source_hash": src_hash,
+        "entities": [
+            {
+                "entity": "Blake's vehicle",
+                "canonical_type": "motorcycle",
+                "anchor": {"pid": "p00007", "span": "motorcycle"},
+                "aliases": [],
+                "memory_class": "chapter_local",
+                "memory_worthy": False,
+                "claims": [
+                    {
+                        "kind": "object_identity",
+                        "value": "valid claim",
+                        "status": "candidate",
+                        "evidence": [{"pid": "86", "span": "motorcycle"}],
+                        "evidence_windows": [[86, 86]],
+                    },
+                    {
+                        "kind": "object_identity",
+                        "value": "dead claim",
+                        "status": "candidate",
+                        "evidence": [{"pid": "p00007", "span": "motorcycle"}],
+                        "evidence_windows": [[999, 999]],
+                    },
+                ],
+            },
+        ],
+    }
+    context, report = validate_entity_context(
+        payload,
+        chapter_id=chapter_id,
+        source_hash=src_hash,
+        source=source,
+    )
+    assert len(context.entities[0].claims) == 1
+    assert context.entities[0].claims[0].value == "valid claim"
+    assert context.entities[0].claims[0].evidence[0].pid == "p00086"
+    assert context.entities[0].claims[0].evidence_windows[0] == ("p00086", "p00086")
+    assert any("dead PID 999" in e.reason for e in report.entries)
