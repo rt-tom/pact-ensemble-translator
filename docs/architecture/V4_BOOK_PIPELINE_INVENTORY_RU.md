@@ -54,7 +54,7 @@ python -m pact_full_pipeline_runner_v1.v4_run book --chapters 1-3 --local
 
 | Роль (model role) | Что делает | Дефолтная модель (remote) | Промпт (версия) |
 |---|---|---|---|
-| `generator` (`balanced_literary`) | Перевод целой главы одним вызовом | `opencode/muse-spark-1.2-contributor-free` | `pact-v4-prompt-balanced-literary/v5` (`pact_v4/phase2/prompts.py`) |
+| `generator` (`balanced_literary`) | Перевод целой главы одним вызовом | `opencode/muse-spark-1.2-contributor-free` | `pact-v4-prompt-balanced-literary/v6` (`pact_v4/phase2/prompts.py`) |
 | `entity_extractor` | Source entity prepass до перевода | `openai/gpt-5.6-luna` | `pact-v4-entity-extractor-prompt/v3` (`pact_v4/audit/entity_extractor.py`) |
 | `qwen_chapter_audit` | B3 chunked audit | `openai/gpt-5.6-luna` | `pact-v4-reviewer-qwen-audit/v4.3-lenses` (`pact_v4/runtime/prompts_runtime.py`, `QWEN_AUDIT_V4_1`) |
 | `russian_editor` | B3 Russian-only editor (V4.2 R) | на audit backend (`qwen_audit` → `openai/gpt-5.6-luna`) | `pact-v4.2-russian-editor/v4` (`pact_v4/runtime/prompts_runtime.py`, `RUSSIAN_EDITOR_V4_2_R1`) |
@@ -247,7 +247,7 @@ b3_audit_repair is not None`. В вашем дефолтном пути все �
 **Роль/модель.** `generator` (`balanced_literary`) →
 `opencode/muse-spark-1.2-contributor-free`. Промпт: `pact_v4/phase2/prompts.py`
 (`BALANCED_LITERARY_V4`, role `balanced_literary`,
-version `pact-v4-prompt-balanced-literary/v5`; рендер через `render_prompt`).
+version `pact-v4-prompt-balanced-literary/v6`; рендер через `render_prompt`).
 (Роль `fidelity_first`/`pact-v4-prompt-fidelity-first/v3` в whole-chapter пути
 не генерируется заранее — она reserve для lazy fallback; дефолтный whole-chapter
 путь выдаёт ровно одного candidate `balanced_literary`.)

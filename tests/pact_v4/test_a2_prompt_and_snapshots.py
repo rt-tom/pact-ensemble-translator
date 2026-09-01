@@ -16,7 +16,7 @@ from pact_v4.phase2.risk import GlossaryEntry
 
 
 def test_balanced_literary_v4_version_and_contract():
-    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v5"
+    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v6"
     assert FIDELITY_FIRST_V1.version == "pact-v4-prompt-fidelity-first/v3"
     for template in (BALANCED_LITERARY_V4, FIDELITY_FIRST_V1):
         instructions = template.instructions
@@ -64,10 +64,15 @@ def test_balanced_literary_v4_version_and_contract():
         # Illustrative example is present but marked non-copyable.
         assert "Shape example (illustrative only" in instructions
         assert "do not output these placeholder" in instructions
-        # No HTML/markup (only balanced_literary carries the full §4 text).
+        # HTML/markup is forbidden inside JSON string values, while JSON remains
+        # mandatory for the outer response.
         if template.role == "balanced_literary":
-            assert "Do not output any HTML or" in instructions
+            assert "Do not output any HTML or markup inside" in instructions
             assert "markup" in instructions
+            assert "The complete response must be valid JSON" in instructions
+            assert "plain Russian text only" not in instructions
+            assert "TRANSLATION VALUE RULE" in instructions
+            assert "OUTPUT CONTRACT — MANDATORY AND AUTHORITATIVE" in instructions
         # Legacy STRICT marker may still appear via ownership guard wording, but
         # the authoritative contract is the explicit object rule above.
         assert "OWNED_SOURCE" in instructions
@@ -190,9 +195,9 @@ def test_prompt_cache_identity_changes_with_version_and_instructions():
     bundle_reworded = PromptBundle(template=template_v3_reworded, **common)
     assert bundle_v2.bundle_hash != bundle_v3.bundle_hash
     assert bundle_v3.bundle_hash != bundle_reworded.bundle_hash
-    # Real templates also participate: their current versions are v3/v5.
+    # Real templates also participate: their current versions are v3/v6.
     assert FIDELITY_FIRST_V1.version == "pact-v4-prompt-fidelity-first/v3"
-    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v5"
+    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v6"
 
 # ---------------------------------------------------------------------------
 # Gemma server args per §3.4
