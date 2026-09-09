@@ -1312,10 +1312,7 @@ def build_role_adapters(
         shared = _load_shared_role_budgets_from_registry()
         def _synth_remote(role: str):
             budget = shared[role]
-            req = _sampling_for_remote_role(role)
-            if "temperature" not in req:
-                raise ValueError(f"remote role {role!r} sampling missing temperature")
-            req = dict(req)
+            req = dict(_sampling_for_remote_role(role))
             req["max_output_tokens"] = int(budget.max_output_tokens)
             return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "remote", "policy_hash": budget.budget_hash})()
         return (
@@ -1404,10 +1401,7 @@ def build_repair_adapters(
         shared = _load_shared_role_budgets_from_registry()
         def _synth_remote(role: str):
             budget = shared[role]
-            req = _sampling_for_remote_role(role)
-            if "temperature" not in req:
-                raise ValueError(f"remote role {role!r} sampling missing temperature")
-            req = dict(req)
+            req = dict(_sampling_for_remote_role(role))
             req["max_output_tokens"] = int(budget.max_output_tokens)
             return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "remote", "policy_hash": budget.budget_hash})()
         return (
@@ -1577,20 +1571,6 @@ class ProvidersRegistry:
         )
 
 
-def _default_role_budgets() -> Dict[str, RoleBudget]:
-    return {
-        "generator": RoleBudget(max_output_tokens=70000),
-        "repair": RoleBudget(max_output_tokens=16384, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=16384, per_item_tokens=128, ceiling=24576)),
-        "formatting": RoleBudget(max_output_tokens=8000, output_budget=OutputBudgetPolicy(mode="span_formula", base_tokens=8000, per_span_tokens=64, ceiling=24576)),
-        "gemma_audit": RoleBudget(max_output_tokens=4096),
-        "qwen_audit": RoleBudget(max_output_tokens=12000, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=12000, per_item_tokens=128, ceiling=24576)),
-        "fidelity_reviewer": RoleBudget(max_output_tokens=16384, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=16384, per_item_tokens=128, ceiling=24576)),
-        "russian_selector": RoleBudget(max_output_tokens=1024),
-        "entity_extractor": RoleBudget(max_output_tokens=12000),
-        "russian_editor": RoleBudget(max_output_tokens=12000),
-        "glossary_resolver": RoleBudget(max_output_tokens=4096),
-    }
-
 def _load_shared_role_budgets_from_registry() -> Dict[str, RoleBudget]:
     """Load shared role_budgets from providers.yaml as sole budget source (no synthesis, fail-closed)."""
     candidate = Path(__file__).resolve().parents[2] / "configs" / "providers.yaml"
@@ -1602,24 +1582,22 @@ def _load_shared_role_budgets_from_registry() -> Dict[str, RoleBudget]:
     return dict(reg.role_budgets)
 
 def _sampling_for_remote_role(role: str) -> Dict[str, Any]:
-    """Sampling for remote/no-pair roles from selected remote model registry (fail-closed, never local)."""
+    """Sampling for remote/no-pair roles from selected remote model registry (optional, never local)."""
     candidate = Path(__file__).resolve().parents[2] / "configs" / "providers.yaml"
     if not candidate.is_file():
         raise ValueError(f"sampling for remote role {role!r}: registry {candidate} missing — fail-closed")
     reg = load_providers_registry(candidate)
-    # Prefer any non-local provider's model request if present; otherwise use role_budgets budget hash as fallback signal to fail closed
+    # Prefer any non-local provider's model request if present; otherwise return empty sampling
+    # and let adapter proceed with just budget (remote sampling is OPTIONAL).
     for provider_id, models in reg.providers.items():
         if provider_id.lower() == "local":
             continue
         for alias, model in models.items():
-            # Remote ProviderModel does not carry request sampling in current registry schema;
-            # sampling for remote is therefore not available from local gemma/qwen — fail closed if no remote request.
-            # Check if model has a request-like attribute (future remote local models may carry it)
             req = getattr(model, "request", None)
             if isinstance(req, dict) and req:
                 return dict(req)
-    # No remote model carries sampling — do not fallback to local gemma/qwen. Fail closed.
-    raise ValueError(f"sampling for remote role {role!r} not found in remote registry (providers.yaml has no remote model request) — fail-closed, do not use local alias")
+    # No remote model carries sampling — optional for remote, return empty dict (no override).
+    return {}
 
 def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, RoleBudget]:
     rb_raw = payload.get("role_budgets")

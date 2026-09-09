@@ -987,13 +987,11 @@ class ChunkedAuditEvaluator:
         from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
         max_tok = int(_derive(policy, item_count=item_count))
         req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("ChunkedAuditEvaluator: role_policy missing temperature")
         return CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),

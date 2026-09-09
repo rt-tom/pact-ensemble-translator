@@ -282,9 +282,7 @@ class BackendModelCaller:
         _policy = getattr(self._config, "role_policy", None)
         if _policy is not None:
             _req = dict(_policy.request)
-            if "temperature" not in _req:
-                raise ValueError("BackendModelCaller: role_policy missing temperature")
-            _temperature = float(_req["temperature"])
+            _temperature = float(_req["temperature"]) if "temperature" in _req else None
             _top_p = _req.get("top_p")
             _top_k = _req.get("top_k")
             _min_p = _req.get("min_p")
@@ -293,9 +291,7 @@ class BackendModelCaller:
             # Fallback to registry shared budgets/sampling (no literal, no bundle default)
             _fallback = _shared_budget_for_role("generator")
             _req = dict(_fallback.request)
-            if "temperature" not in _req:
-                raise ValueError("BackendModelCaller: fallback policy missing temperature")
-            _temperature = float(_req["temperature"])
+            _temperature = float(_req["temperature"]) if "temperature" in _req else None
             _top_p = _req.get("top_p")
             _top_k = _req.get("top_k")
             _min_p = _req.get("min_p")
@@ -449,13 +445,11 @@ class BackendQwenEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendQwenEvaluator: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -561,13 +555,11 @@ class BackendGemmaSelector:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok = int(_derive(policy))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendGemmaSelector: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "russian_selector"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -690,13 +682,11 @@ class BackendQwenAuditEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendQwenAuditEvaluator: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "qwen_audit"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -795,13 +785,11 @@ class BackendGemmaAuditEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok = int(_derive(policy))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendGemmaAuditEvaluator: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "gemma_audit"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -919,13 +907,11 @@ class BackendRepairCaller:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendRepairCaller: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "repair"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -1040,13 +1026,11 @@ class BackendRegionFidelityGate:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok = int(_derive(policy))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendRegionFidelityGate: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -1122,13 +1106,11 @@ class BackendRegionFidelityGate:
                 from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
                 max_tokens = int(_derive(policy, item_count=len(chunk)))
                 req = dict(policy.request)
-                if "temperature" not in req:
-                    raise ValueError("BackendRegionFidelityGate.batch: role_policy missing temperature")
             request = CompletionRequest(
                 model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tokens,
-                temperature=float(req["temperature"]),
+                temperature=float(req["temperature"]) if "temperature" in req else None,
                 top_p=req.get("top_p"),
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),

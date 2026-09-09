@@ -1266,13 +1266,11 @@ class BackendEntityExtractor:
         from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
         max_tok = int(_derive(policy))
         req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendEntityExtractor: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "entity_extractor"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
