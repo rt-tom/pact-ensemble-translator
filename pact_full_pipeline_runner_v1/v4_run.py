@@ -870,6 +870,20 @@ def _handle_book(argv: Sequence[str]) -> int:
     try:
         cfg = _apply_overrides(cfg, translator_override, reviewer_override, reasoning_override, providers_config=args.providers_config)
         cfg = _apply_managed(cfg, effective_managed)
+        if local_alias_value is not None:
+            from pact_v4.runtime.runtime_config import apply_local_alias_to_config
+            # resolve alias via registry (fail-closed) and mutate cfg so label/preflight reflect alias fragments
+            prov_path = Path(args.providers_config) if args.providers_config else Path(__file__).resolve().parent.parent / "configs" / "providers.yaml"
+            if prov_path.is_file():
+                from pact_v4.runtime.runtime_config import load_providers_registry
+                reg = load_providers_registry(prov_path)
+                if "/" in local_alias_value:
+                    alias_entry = reg.resolve(local_alias_value)
+                else:
+                    alias_entry = reg.resolve_bare(local_alias_value)
+                # apply_local_alias_to_config expects LocalModelAlias; ensure we have it
+                # ProviderModel vs LocalModelAlias are stored together; runtime resolve_bare already returns LocalModelAlias for local aliases
+                cfg = apply_local_alias_to_config(cfg, alias_entry)
     except Exception as exc:
         _error_exit(str(exc))
 
@@ -1008,7 +1022,8 @@ def _handle_book(argv: Sequence[str]) -> int:
         label = _derive_label(cfg, local_alias=local_alias_value)
     except Exception as exc:
         _error_exit(f"cannot derive local/remote label from runtime descriptor: {exc}")
-    if label not in ("local", "remote"):
+    import re as _re_label
+    if label not in ("local", "remote") and not _re_label.match(r"^local(_[a-z0-9_]+)?$", label, flags=_re_label.IGNORECASE):
         _error_exit(f"unknown runtime descriptor label {label!r}; expected local or remote")
 
     # Re-validate final output before creation (covers custom --out-base bypass)
@@ -1039,6 +1054,11 @@ def _handle_book(argv: Sequence[str]) -> int:
     delegated += ["--chapter-html-pattern", chapter_html_pattern]
     delegated += ["--memory-dir", str(memory_dir)]
     delegated += ["--out-base", str(out_base)]
+    # When local alias is used, forward --local <alias> so delegated book run resolves alias with providers_config
+    if local_alias_value is not None:
+        delegated += ["--local", local_alias_value]
+        if args.providers_config:
+            delegated += ["--providers-config", str(args.providers_config)]
     delegated += ["--runtime-config", str(cfg_path)]
     # Translator/reviewer for simple remote
     if is_simple_remote:
@@ -1057,7 +1077,7 @@ def _handle_book(argv: Sequence[str]) -> int:
             delegated += ["--reasoning", str(args.reasoning)]
     if effective_managed:
         delegated += ["--managed-server"]
-    if args.providers_config:
+    if args.providers_config and "--providers-config" not in delegated:
         delegated += ["--providers-config", str(args.providers_config)]
     # Whole-chapter default for every book mode
     if "--whole-chapter" not in delegated and "--whole_chapter" not in delegated:

@@ -272,22 +272,30 @@ class BackendModelCaller:
         if bundle.params.reasoning and _reasoning_transported_via_request_options(
             self._backend, model_ref
         ):
-            # V4.1: Phase 2B generation reasoning budget (0=off, 1=low,
-            # 2=medium, 3=high). Transported via request_options so the
-            # opencode backend can map it to the top-level ``reasoningEffort``
-            # field; 0/absent keeps the historical B1 baseline (no field).
-            # Only the generation caller carries it — the Qwen audit / repair
-            # / formatting adapters never set request_options. V4.1 A2: local
-            # llama-server transports receive the reasoning budget from their
-            # server args (--reasoning-budget), so the request to them must
-            # NOT carry request_options reasoning (LocalOpenAIBackend rejects
-            # it — a library-level guard, plan §3.4/§0.1).
             request_options["reasoning"] = bundle.params.reasoning
+        # Policy-owned sampling (local-model-aliases): when role_policy present, use its request fields
+        _policy = getattr(self._config, "role_policy", None)
+        if _policy is not None:
+            _req = dict(_policy.request)
+            if "temperature" not in _req:
+                raise ValueError("BackendModelCaller: role_policy missing temperature")
+            _temperature = float(_req["temperature"])
+            _top_p = _req.get("top_p")
+            _top_k = _req.get("top_k")
+            _min_p = _req.get("min_p")
+            _seed = _req.get("seed")
+        else:
+            _temperature = float(bundle.params.temperature)
+            _top_p = _top_k = _min_p = _seed = None
         request = CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=user_text),),
             max_output_tokens=self._max_tokens,
-            temperature=bundle.params.temperature,
+            temperature=_temperature,
+            top_p=_top_p,
+            top_k=_top_k,
+            min_p=_min_p,
+            seed=_seed,
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,

@@ -168,6 +168,53 @@ def _validate_request_map(req: object, *, context: str) -> Dict[str, object]:
             out[k] = int(v)
     return out
 
+def _validate_request_fragment(req: object, *, context: str) -> Dict[str, object]:
+    if not isinstance(req, dict):
+        raise ValueError(f"{context}: request must be a mapping, got {type(req).__name__}")
+    unknown = set(req) - ALLOWED_REQUEST_FIELDS
+    if unknown:
+        raise ValueError(f"{context}: unknown request field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_REQUEST_FIELDS)}")
+    out: Dict[str, object] = {}
+    for k, v in req.items():
+        if k == "temperature":
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{context}: temperature must be number, got {v!r}")
+            fv = float(v)
+            if not (0 <= fv <= 2):
+                raise ValueError(f"{context}: temperature must be in [0,2], got {fv!r}")
+            out[k] = fv
+        elif k == "top_p":
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{context}: top_p must be number, got {v!r}")
+            fv = float(v)
+            if not (0 < fv <= 1):
+                raise ValueError(f"{context}: top_p must be in (0,1], got {fv!r}")
+            out[k] = fv
+        elif k == "top_k":
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"{context}: top_k must be int, got {v!r}")
+            if v <= 0:
+                raise ValueError(f"{context}: top_k must be >0, got {v!r}")
+            out[k] = int(v)
+        elif k == "min_p":
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{context}: min_p must be number, got {v!r}")
+            fv = float(v)
+            if not (0 <= fv <= 1):
+                raise ValueError(f"{context}: min_p must be in [0,1], got {fv!r}")
+            out[k] = fv
+        elif k == "seed":
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"{context}: seed must be int, got {v!r}")
+            out[k] = int(v)
+        elif k == "max_output_tokens":
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"{context}: max_output_tokens must be int, got {v!r}")
+            if v <= 0 or v > 200000:
+                raise ValueError(f"{context}: max_output_tokens must be in (0,200000], got {v!r}")
+            out[k] = int(v)
+    return out
+
 def _validate_output_budget(ob: object, *, context: str) -> "OutputBudgetPolicy":
     if not isinstance(ob, dict):
         raise ValueError(f"{context}: output_budget must be mapping, got {type(ob).__name__}")
@@ -217,7 +264,7 @@ class LocalModelAlias:
     model_name: str
     server_args: Tuple[str, ...]
     reasoning_budget: Optional[int] = None
-    role_policy_overrides: Mapping[str, RoleCallPolicy] = field(default_factory=dict)  # type: ignore
+    role_policy_overrides: Mapping[str, Any] = field(default_factory=dict)  # fragment dicts {request, output_budget, model_key}
 
 
 @dataclass(frozen=True)
@@ -1538,7 +1585,7 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                         raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} {exc}") from None
                 # Validate role_policy_overrides
                 overrides_raw = raw_model.get("role_policy_overrides")
-                overrides: Dict[str, RoleCallPolicy] = {}
+                overrides: Dict[str, Any] = {}
                 if overrides_raw is not None:
                     if not isinstance(overrides_raw, dict):
                         raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} role_policy_overrides must be mapping, got {type(overrides_raw).__name__}")
@@ -1553,16 +1600,15 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                         ov_model_key = ov.get("model_key", model_key)
                         if ov_model_key != model_key:
                             raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} override {role!r} incompatible: alias model_key {model_key!r} != override model_key {ov_model_key!r}")
-                        ov_req = ov.get("request") or {}
+                        ov_req_raw = ov.get("request") or {}
                         ov_ob_raw = ov.get("output_budget")
                         ov_ob = None
                         if ov_ob_raw is not None:
                             ov_ob = _validate_output_budget(ov_ob_raw, context=f"{path}: local model {provider_id!r}/{alias!r} override {role!r} output_budget")
-                        # validate request
-                        _validate_request_map(ov_req, context=f"{path}: local model {provider_id!r}/{alias!r} override {role!r} request")
-                        # Need base policy to merge later; store raw for now as RoleCallPolicy with validated request
-                        # Create a temporary RoleCallPolicy for validation
-                        overrides[role] = RoleCallPolicy(model_key=model_key, request=dict(ov_req), output_budget=ov_ob)
+                        # validate request fragment (allow subset, do NOT require max_output_tokens)
+                        ov_req = _validate_request_fragment(ov_req_raw, context=f"{path}: local model {provider_id!r}/{alias!r} override {role!r} request")
+                        # Store as fragment dict for later merge (do not construct RoleCallPolicy yet)
+                        overrides[role] = {"request": dict(ov_req), "output_budget": ov_ob, "model_key": model_key}
                     # Incompatible override check: overridden role's resolved model_key must equal alias model_key (checked above)
                 # Store as LocalModelAlias wrapped in ProviderModel-like slot via dict entry with extra attribute
                 # We store a LocalModelAlias instance in providers dict, but type is ProviderModel for backward compat via duck typing
@@ -1978,14 +2024,15 @@ def build_resolved_role_policies_from_registry(path: pathlib.Path, alias: str | 
             if policies[role].model_key != alias_key:
                 raise ValueError(f"build_resolved alias {alias!r} incompatible override for role {role!r}: alias key {alias_key!r} != base {policies[role].model_key!r}")
             base_req = dict(policies[role].request)
-            ov_req = dict((ov.get("request") or {}))
-            if ov_req:
-                _validate_request_map(ov_req, context=f"build_resolved alias {alias} override {role} request")
+            ov_req_raw = ov.get("request") or {}
+            if ov_req_raw:
+                ov_req = _validate_request_fragment(ov_req_raw, context=f"build_resolved alias {alias} override {role} request")
                 base_req.update(ov_req)
             ov_ob_raw = ov.get("output_budget")
             ov_ob = policies[role].output_budget
             if isinstance(ov_ob_raw, dict):
                 ov_ob = _validate_output_budget(ov_ob_raw, context=f"build_resolved alias {alias} override {role} output_budget")
+            # Only after merge construct final RoleCallPolicy and validate completeness (max_output_tokens via merged request or budget)
             policies[role] = RoleCallPolicy(model_key=policies[role].model_key, request=base_req, output_budget=ov_ob)
     return ResolvedRolePolicies(policies=policies)
 

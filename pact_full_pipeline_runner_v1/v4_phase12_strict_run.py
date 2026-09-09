@@ -665,10 +665,10 @@ def _resolve_local_alias_entry(alias: str, providers_config: Optional[Path] = No
             raise ValueError(f"--local alias must be a local provider alias; got remote {alias!r}")
         return resolved
 
-def _load_resolved_role_policies(alias: Optional[str] = None):
+def _load_resolved_role_policies(alias: Optional[str] = None, providers_config: Optional[Path] = None):
     from pact_v4.runtime.runtime_config import build_resolved_role_policies_from_registry, load_providers_registry
     import pathlib
-    prov_path = _default_providers_config()
+    prov_path = Path(providers_config) if providers_config else _default_providers_config()
     if not prov_path.is_file():
         return None
     # Canonical validation: load registry strictly and propagate ValueError for malformed policy
@@ -682,7 +682,7 @@ def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Opti
         _alias = None if getattr(args, "local", None) in (None, "__LOCAL_DEFAULT__") else (str(getattr(args, "local", "") or "").strip() or None)
     except Exception:
         _alias = None
-    _resolved = _load_resolved_role_policies(_alias)
+    _resolved = _load_resolved_role_policies(_alias, providers_config=getattr(args, "providers_config", None))
     return StrictRunConfig(
         resolved_role_policies=_resolved,
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
@@ -758,6 +758,7 @@ def _build_b3_audit_repair(cfg: StrictRunConfig, backend: Any, runtime: Any):
     return B3AuditRepair(
         audit_backend=completion_backend,
         repair_backend=completion_backend,
+        resolved_role_policies=getattr(cfg, "resolved_role_policies", None),
         config=B3AuditRepairConfig(
             entity_context_enabled=cfg.entity_context_enabled,
             max_input_tokens=cfg.audit_max_input_tokens,
@@ -1161,7 +1162,7 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # network/artifact side effects, no credential values.
     preflight_report = run_runtime_preflight(backend, reasoning=effective_reasoning)
     # Augment preflight with resolved role policies provenance (aggregate + per-role hashes)
-    _resolved_for_preflight = _load_resolved_role_policies(None)
+    _resolved_for_preflight = _load_resolved_role_policies(None, providers_config=args.providers_config)
     if _resolved_for_preflight is not None:
         extra = {"resolved_role_policies_hash": _resolved_for_preflight.aggregate_hash, "per_role_hashes": {k: v.policy_hash for k, v in _resolved_for_preflight.policies.items()}}
         # monkey-patch report dict for JSON output
@@ -1283,7 +1284,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     raise ValueError(f"--local alias {alias!r}: {exc}") from exc
             from pact_v4.runtime.runtime_config import run_runtime_preflight as _rp
             report = _rp(_backend, reasoning=eff)
-            _resolved_local = _load_resolved_role_policies(alias)
+            _resolved_local = _load_resolved_role_policies(alias, providers_config=args.providers_config)
             if _resolved_local is not None:
                 import json as _j
                 extra = {"resolved_role_policies_hash": _resolved_local.aggregate_hash, "per_role_hashes": {k: v.policy_hash for k, v in _resolved_local.policies.items()}}
