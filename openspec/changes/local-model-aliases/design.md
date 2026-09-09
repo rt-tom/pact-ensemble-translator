@@ -1,62 +1,96 @@
 ## Context
 
-`--remote` already has alias ergonomics: `book --remote musefree/luna` resolves via `configs/providers.yaml` (provider/model `ref` + `reasoning_contract.variants` → `model_bindings` + `reasoning_effort_map`) and via `_apply_overrides` → `BackendDescriptor` identity. `book --local` is static: `configs/runtime_local.example.yaml` (`LocalLlamaBackendConfig: exe/device/host/port + model_paths/model_names/server_args` for fixed keys `gemma`/`qwen`) + `StrictRunConfig.temperature/seed/max_tokens` (0.2/7/70000) → `GenerationParams` → `CompletionRequest.temperature/max_output_tokens`. Today **every** stage hardcodes its body temperature in code: generation `0.2` (`StrictRunConfig`), audit/repair/russian_editor/entity_extractor `0.0` (`backend_role_adapters`/`chunked_audit`/`entity_extractor`/`selective_repair`), formatting `0.1` (`phase5/formatting.py`). Local reasoning is deliberately **not** in `request_options`: `LocalOpenAIBackend` rejects `request_options`, `server_args --reasoning-budget` is the wire (see `runtime_config.py:830`), validated by `_local_generator_server_args`/`_reasoning_budget_from_server_args` and `validate_reasoning_backend`.
+Remote aliases are currently resolved from `configs/providers.yaml`; local runs use static `LocalLlamaBackendConfig` mappings for `gemma` and `qwen`. Sampling and output settings are scattered through `StrictRunConfig`, role-adapter defaults, B3 configuration, `selective_repair`, `entity_extractor`, `russian_editor`, `formatting`, and `glossary_resolver`. Several `CompletionRequest` producers hardcode `temperature=0.0`; generation has `0.2`; formatting has an independent `0.1` client configuration. Some output budgets are fixed, while others add a literal per-PID allowance and ceiling.
 
-The owner wants `book --local [alias]` like remote, where the alias brings model-specific **server_args** (`-c`/`--reasoning-budget`/`-ngl`/`-ctk`…) and **body** (`temperature/min_p/top_p/top_k/seed/max_tokens`) without a new `runtime_localN.yaml` per model. This change is alias plumbing only; no new model is added.
+The owner requires every model-call body policy to come from providers, at every stage. This is a policy-source change, not permission to send unsupported fields. Local reasoning is already correctly expressed by `llama-server` arguments (`--reasoning-budget`), not body `reasoning`.
 
 ## Goals / Non-Goals
 
-**Goals:**
-- `book --local` bare keeps today's defaults byte-identically (no behavior change, no cache break).
-- `book --local <alias>` (and `chapter --local <alias>` transport-neutrally) resolves a `local` alias through the unified `providers.yaml` and produces the effective `LocalLlamaBackendConfig` + generation body from that alias.
-- Server-args (`--reasoning-budget` etc.) stay `server_args`-based for local; body params stay `CompletionRequest.temperature` + `ALLOWED_REQUEST_OPTIONS` (`top_p/top_k/seed/reasoning`) — but local keeps `request_options` empty (reasoning not via body) to preserve the existing guard.
-- Alias choice is identity-bearing (`BackendDescriptor` + `StrictRunConfig.to_config_artifact`) and visible in `preflight` and `strict_chapter_trial_record.json`.
-- Keep `remote` path untouched.
+**Goals**
 
-**Non-Goals:**
-- No new model entry, no new `runtime_local*.yaml`, no `local2` flag in this change.
-- No `TRANSLATOR/REVIEWER` split for local in v1 (single alias selects the local backend fragment; a later split can layer `local:translator/reviewer` if needed).
-- No migration, no pipeline run, no server lifecycle change.
+- `book|chapter --local` preserves current behavior through explicit local provider defaults; no model-call sampling/output literal remains a production policy fallback.
+- `book|chapter --local <alias>` resolves an unambiguous alias through the unified registry and replaces only the declared local model key.
+- Every V4 strict/book producer has one enumerated role and receives an immutable resolved `RoleCallPolicy`.
+- Local and remote transports serialize exactly the body fields allowed for that transport; unknown/unsupported fields fail before a server is started or called.
+- The resolved policy is auditable and identity-bearing at the producer/cache boundary.
+
+**Non-Goals**
+
+- No real local model is added and no server/pipeline is run.
+- No per-role command-line knobs or new `runtime_localN.yaml` files.
+- No change to prompt, retry/backoff, parsing, safety gates, or model lifecycle semantics. Retry policy is not a model request-body/server-start parameter and remains outside this change.
 
 ## Decisions
 
-### 1. Unified registry, local block shape
+### 1. Registry schema and precedence
 
-Reuse `configs/providers.yaml` (owner-approved unified registry). Add top-level provider `local: kind: local_llama, models: { alias: { model_key: gemma|qwen, model_path, model_name, server_args: [..], generation: { temperature, top_p, top_k, min_p, seed, max_tokens }, reasoning_budget } }`. Bare-alias global uniqueness applies across all providers (existing `_build_global_alias_index` now includes `local` aliases; duplicate normalized alias → fail-closed at registry load, provider-qualified `local/alias` remains supported).
+`configs/providers.yaml` remains the single registry. It gains a `local` provider and every provider used by strict/book declares `role_policies`; policy is never inferred from a code literal.
 
-Alternative separate `local_models.yaml` rejected — second registry duplicates validation/identity/preflight and drifts from the remote contract. `runtime_localN.yaml` per model rejected — N files/N flags not scalable.
+```yaml
+providers:
+  local:
+    kind: local_llama
+    role_policies:
+      generator:
+        model_key: gemma
+        request: {temperature: 0.2, seed: 7, max_output_tokens: 70000}
+      qwen_audit:
+        model_key: qwen
+        request: {temperature: 0.0, max_output_tokens: 12000}
+        output_budget: {mode: floor_plus_per_item, per_item_tokens: <current value>, ceiling: <current value>}
+      # every required role appears; see the matrix below
+    models: {}                 # allowed only for local until a real alias exists
+```
 
-### 2. Body vs server-args split per transport
+A local alias has `model_key`, `model_path`, `model_name`, `server_args`, optional `reasoning_budget`, and optional `role_policy_overrides` keyed by the same role names. An override is allowed only for a role whose resolved `model_key` equals the alias `model_key`; this prevents a Gemma alias from silently changing Qwen audit policy. Merge precedence is: required local provider policy → matching alias role override. `models: {}` is valid for the local provider so this plumbing change can add explicit default policies without adding an executable-host model entry; other providers retain their non-empty model-catalog requirement.
 
-*Body for every role:* All hardcoded `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`max_tokens` (generation `0.2`, audit/repair/Editor `0.0`, formatting `0.1`) are removed as hardcoded defaults. When a local (and later remote) alias is selected, per-role `generation` blocks from the registry override the body params for **each** stage: `pact_v4/phase2/generation.py:GenerationParams` for generation, `pact_v4/audit/chunked_audit.py`/`entity_extractor.py`, `pact_v4/audit/russian_editor.py`, `pact_v4/repair/selective_repair.py`, `pact_v4/phase5/formatting.py`, `pact_v4/pipeline/glossary_resolver.py` for other roles. Without an alias the current values remain as registry-provided defaults (so bare `--local` is byte-identical). Each alias's `generation` is validated (`temperature` float, `top_p` in (0,1], etc.) and enters `to_config_artifact`/`BackendDescriptor` so a `0.0→0.7` change invalidates the correct cache (generation vs audit vs repair). Implementation: extend `GenerationParams` and the role-adapter call sites to take `temperature` from `StrictRunConfig`/provider per role instead of literal `0.0`/`0.2`; `top_p/top_k/min_p` travel as `CompletionRequest.request_options` for `remote` but for `local` the existing `LocalOpenAIBackend` guard must keep `request_options` empty — therefore for `local` in v1 only `temperature/seed/max_tokens` are body-overridable and `top_p/top_k/min_p` are either rejected or mapped to `server_args` in a follow-up after verifying the local binary's CLI flags. This still removes **all** hardcodes as source of truth (registry → code), while keeping the local transport guard.
+All role policies must be complete: omission of a required role, unknown role, unknown policy key, wrong type/range, duplicate normalized alias, or incompatible override fails closed during registry load. There is no production code fallback. Test-only direct constructors must pass a policy explicitly.
 
-*Reasoning:* For `local` keep the existing `server_args --reasoning-budget` path (identity-bearing, validated by `_reasoning_budget_from_server_args` + `validate_reasoning_backend`). The registry's `reasoning_budget` for local is a convenience that must equal the `server_args` entry; mismatch → fail-closed at load. For `remote` keep `request_options reasoningEffort` via `reasoning_effort_map`. Never send `request_options` on the local path.
+### 2. Required role/call-site matrix
 
-### 3. CLI contract
+The registry role namespace and implementation coverage are fixed by this matrix. The task implementation must update the cited producer and tests for each row; adding a new producer requires adding a role and registry default in the same change.
 
-`book`/`chapter` parsers: `--local` changes from `store_true` to `nargs="?" const="__DEFAULT__"` mirroring `--remote` (bare → `__DEFAULT__` → keep defaults). Parsing: `book --local` → keep canonical `runtime_local.example.yaml`; `book --local mygemma` → resolve `mygemma` via registry (bare or `local/mygemma`). `--local` and `--remote` stay mutually exclusive, both mutually exclusive with `--runtime-config`/`--profile`. The current guard `if is_simple_local and (translator/reviewer): error` stays (local alias suffices for v1). Output label: `local` for bare, `local_<alias>` sanitized for alias (used in auto `book_XXXX-YYYY_local_<alias>_<ts>` dir; `local` stays `book_..._local_...`). Help text updated to mirror remote alias form.
+| Registry role | Current producer(s) | Routing binding | Policy fields / dynamic rule |
+| --- | --- | --- | --- |
+| `generator` | `BackendModelCaller`, whole-chapter generation | `generator` | request fields; fixed output budget |
+| `fidelity_reviewer` | `BackendQwenEvaluator`, `BackendRegionFidelityGate` single and batch | `fidelity_reviewer` | request fields; batch headroom/ceiling from `output_budget` |
+| `russian_selector` | `BackendGemmaSelector` | `russian_selector` | request fields |
+| `qwen_audit` | `BackendQwenAuditEvaluator`, `ChunkedAuditEvaluator`, B3 audit and re-audit | `qwen_audit` | request fields; per-PID headroom/ceiling from policy |
+| `gemma_audit` | `BackendGemmaAuditEvaluator` | `gemma_audit` | request fields |
+| `repair` | `BackendRepairCaller`, `SelectiveRepair` and B3 repair | policy-declared binding (normally `repair`) | request fields; per-PID headroom/ceiling from policy |
+| `entity_extractor` | `BackendEntityExtractor` / B3 entity prepass | policy-declared binding (normally `entity_extractor`) | request fields |
+| `russian_editor` | `russian_editor` / B3 editor | policy-declared binding | request fields |
+| `formatting` | `phase5/formatting.py` adapter/client | policy-declared binding | request fields; span-based output-budget formula from policy |
+| `glossary_resolver` | `GlossaryResolver` | policy-declared binding | request fields; it does not introspect descriptor internals for hidden values |
 
-Alternative ` --local2` flag rejected — not generic.
+All `request` maps use the same validated vocabulary: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`. A role may omit a field only where the target transport's protocol documents it as not applicable; it may not obtain the omitted value from a literal. `output_budget` is explicit for dynamic calls and contains a mode plus all factors/ceilings necessary to derive the final `max_output_tokens` deterministically. Response schema and prompt contracts remain code-owned protocol, not sampling policy.
 
-### 4. Wiring and identity
+### 3. Transport split
 
-`_apply_overrides(cfg, local_alias, ...)` for `LocalLlamaBackendConfig`: replace `model_paths[model_key]`, `model_names[model_key]`, `server_args[model_key]` from the alias; for `CompositeBackendConfig` with a local sub-backend replace that sub-backend's fragment similarly. `StrictRunConfig` is re-wrapped with overridden `temperature/seed/max_tokens` when alias provides `generation`. Both enter `to_config_artifact`/`BackendDescriptor.public_record()` so an alias change → new `bundle_hash`/`config_identity` → cache/resume invalidated. `preflight` resolves the same alias and prints sanitized `server_args`/`generation`/`reasoning_budget` + identity hash. Delegation (`_delegate_*` helpers in `v4_run.py`/`v4_phase12_strict_run.py`) forwards `--local alias` to strict.
+`CompletionRequest` gets a typed, validated sampling map (or equivalent explicit fields) that includes `min_p`; `ALLOWED_REQUEST_OPTIONS` and payload serialization are updated accordingly.
 
-### 5. Validation and preflight
+- **Remote:** sampling body/options are serialized through the existing OpenCode mapping. `reasoning` continues to map through the remote reasoning contract.
+- **Local:** `LocalOpenAIBackend`/`ApiClient` serializes the declared sampling body fields, including `seed`, `top_p`, `top_k`, and `min_p`, rather than rejecting all request options. `reasoning` remains rejected for local. The registry validates `reasoning_budget` equals the `--reasoning-budget` server argument, and preflight validates the paired `--reasoning` switch where required.
 
-Registry load: validate `local` model entry shape (`model_key` in `SUPPORTED_LOCAL_MODEL_KEYS`, `model_path` non-empty, `model_name` non-empty, `server_args` list-of-strings, `generation` fields typed, `reasoning_budget` integer and equal to `server_args --reasoning-budget` when both present). Alias global uniqueness as above. Runtime load: fail-closed on unknown/duplicate alias. Preflight: existing `run_runtime_preflight` already checks `exe`/`model_paths` existence and port; add alias-resolved `LocalLlamaBackendConfig` to the same checks + `validate_reasoning_backend` (`--reasoning-budget` agrees with `--reasoning`).
+The implementation must add serialization tests for each local body field and a transport-contract test with a mock `llama-server` request. If the supported RT llama-server version rejects any named field, the change must not silently drop it: remove that field from the allowed local registry schema, retain its policy only as a documented server argument if available, and obtain owner approval for the changed capability.
 
-## Risks / Trade-offs
+### 4. CLI and alias resolution
 
-- [Alias shadows remote bare alias] → Global alias index already rejects duplicate normalized aliases; bare `luna` that exists in both `openai` and `local` → fail-closed, require `local/luna` vs `openai/luna`.
-- [User expects `top_p` for local body but local keeps `request_options` empty] → v1 documents that only `temperature/seed/max_tokens` are overridable for local; `top_p/top_k/min_p` are v2 after verifying server CLI. Fail-closed on alias that sets them for local.
-- [Output dir label `local_<alias>` breaks tooling that expects exactly `local`] → Auto-naming keeps `local` as prefix (`local_<alias>`), `remote` unchanged; explicit `--out-base/--out-dir` overrides still work.
-- [Cache blow-up: per-alias generation change invalidates all old generation caches] → By design (same as `--translator` for remote); documented to use new `--out-base`.
+`--local` becomes `nargs="?"`, with a bare sentinel matching `--remote`. Bare local uses the canonical runtime local transport plus `providers.local.role_policies`; `--local alias` applies the alias fragment. Local/remote/runtime-config remain mutually exclusive and simple mode cannot mix translator/reviewer overrides. Output labels are `local` and `local_<sanitized-alias>`.
 
-## Migration Plan
+### 5. Identity, artifacts, cache and preflight
 
-1. Extend `providers.yaml` schema/tests for `local` kind (no real model entry yet — use fixture aliases).
-2. Extend `runtime_config.py` registry + `StrictRunConfig`/`GenerationParams` alias overrides + identity.
-3. Update `v4_run.py` + `v4_phase12_strict_run.py` CLI/parse/delegate/label/help and `preflight` reporting.
-4. Update inventory/docs and help text; add alias-parsing/preflight/identity tests.
-5. `openspec validate --strict` + independent review; no pipeline run, no real model addition (next change adds a model entry).
+`ResolvedRolePolicies` is a canonical, immutable mapping and receives a hash. It is included in `BackendDescriptor.public_record`, `StrictRunConfig.to_config_artifact`, preflight output, and the strict trial record. Each producer additionally includes its own `role_policy_hash` and final derived output budget in the cache/request identity that it already uses:
+
+- generation: `PromptBundle.bundle_hash` and generation trial fields;
+- audit/re-audit: audit-cache unit hash/envelope and audit trial fields;
+- repair: repair-unit hash/cache envelope and repair trial fields;
+- formatting and glossary resolver: their call/cache/sidecar provenance fields.
+
+Changing an audit policy must not reuse old audit results; changing a repair policy must not reuse old repair results. A run-level identity change may invalidate broader resume reuse, which is safe; producer-level hashes are still required for correctness and auditability.
+
+`--preflight` performs registry validation/resolution and reports sanitized alias, routing, `server_args`, complete resolved role policies, per-role hashes, and aggregate identity without starting a server or making a network call.
+
+## Risks / Migration
+
+A malformed policy could otherwise change translation behavior silently. Completeness, type/range validation, transport-specific field validation, and identity tests are therefore fail-closed. Implementation sequence: add registry types/defaults and tests; add resolved policy to runtime identity; wire all matrix producers and serialization; add CLI/preflight; then run strict OpenSpec validation and focused tests. No pipeline execution is part of this change.

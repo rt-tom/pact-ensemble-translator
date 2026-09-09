@@ -1,84 +1,85 @@
 ## Purpose
-Alias-driven selection of local models where the alias determines server-start arguments and generation body params.
+
+Defines alias-driven local model selection and explicit provider-owned model-call policy for every V4 strict/book stage.
 
 ## ADDED Requirements
 
-### Requirement: Unified local registry
+### Requirement: Complete provider-owned role policy
 
-The system SHALL allow `local` models to be defined in the unified `configs/providers.yaml` registry alongside `opencode_server` models.
+The system SHALL obtain every V4 strict/book model-call body setting from a validated provider registry role policy, not from a code literal or descriptor-introspection fallback. Required roles SHALL be `generator`, `fidelity_reviewer`, `russian_selector`, `qwen_audit`, `gemma_audit`, `repair`, `entity_extractor`, `russian_editor`, `formatting`, and `glossary_resolver`.
 
-#### Scenario: Local provider in registry
+Each role policy SHALL declare its routing model key/binding and a `request` map whose allowed fields are `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`. A dynamically sized request SHALL additionally declare all deterministic budget inputs (mode, base/floor, per-item allowance, and ceiling) in `output_budget`.
 
-- **WHEN** `configs/providers.yaml` contains a provider `local` with `kind: local_llama`
-- **THEN** the registry loader SHALL accept it, validate each model entry's `model_key` (`gemma`/`qwen`), `model_path`, `model_name`, `server_args` (list-of-strings) and optional `generation` (`temperature`, `seed`, `max_tokens`) and `reasoning_budget`, and SHALL reject a duplicate normalized alias across all providers (including local) fail-closed.
+#### Scenario: Complete default local policy
 
-#### Scenario: Bare alias resolution for local
+- **WHEN** bare `book --local` is resolved
+- **THEN** the resolved local provider policy SHALL contain every required role and preserve each former generation/audit/repair/editor/formatting/resolver request setting without reading a sampling/output default from code.
 
-- **WHEN** the alias is given as bare `mygemma` (no slash) and is globally unique
-- **THEN** it SHALL resolve to the `local/mygemma` model; a duplicate bare alias across providers SHALL fail-closed and require provider-qualified `local/mygemma` vs `openai/luna`.
+#### Scenario: Missing or unknown role fails closed
 
-### Requirement: Alias-driven LocalLlamaBackendConfig
+- **WHEN** a provider policy omits a required role, names an unknown role, supplies an unknown request field, or has an invalid value/range
+- **THEN** registry loading SHALL fail before preflight, server start, or model call.
 
-The system SHALL build the effective `LocalLlamaBackendConfig` from the alias's model fragment when a local alias is given.
+#### Scenario: Dynamic audit budget is policy-owned
 
-#### Scenario: Local alias overrides server_args
+- **WHEN** a `qwen_audit` policy uses a per-PID output budget
+- **THEN** its base/floor, per-PID allowance, and ceiling SHALL be read from the role policy and the final derived `max_output_tokens` SHALL be recorded in the request identity.
 
-- **WHEN** `book --local mygemma` is given and `local/mygemma` defines `server_args` for `gemma`
-- **THEN** the effective `LocalLlamaBackendConfig.server_args[gemma]` SHALL equal the alias's `server_args` and the `BackendDescriptor`/`StrictRunConfig.to_config_artifact` identity SHALL change vs the no-alias run.
+### Requirement: Unified local alias registry
 
-#### Scenario: Bare local keeps defaults
+The system SHALL allow a `local` provider of `kind: local_llama` in `configs/providers.yaml`. Its explicit `role_policies` are required; its `models` mapping MAY be empty until a local alias is added. Each alias SHALL define `model_key`, `model_path`, `model_name`, `server_args`, optional `reasoning_budget`, and optional role-keyed policy overrides.
 
-- **WHEN** `book --local` is given with no alias
-- **THEN** the effective `LocalLlamaBackendConfig` SHALL be the canonical `configs/runtime_local.example.yaml` unchanged and byte-identical to the pre-change local run.
+#### Scenario: Compatible alias override
 
-### Requirement: All body params from registry (no hardcodes)
+- **WHEN** `local/mygemma` replaces model key `gemma` and overrides `generator.request.temperature`
+- **THEN** it SHALL replace only the Gemma server fragment and compatible role policies; a Qwen audit role SHALL retain the local provider default unless independently and compatibly overridden.
 
-The system SHALL have no hardcoded `temperature`/`top_p`/`top_k`/`min_p`/`seed`/`max_tokens` as source of truth for any stage; every stage's body params SHALL come from the provider registry's per-role `generation` block (code literals only as fallback when registry gives nothing).
+#### Scenario: Invalid local model entry fails closed
 
-#### Scenario: Temperature override for generation
+- **WHEN** a local alias has an unsupported model key, empty path/name, non-string server argument, incompatible role override, or `reasoning_budget` that differs from `--reasoning-budget`
+- **THEN** registry loading SHALL fail closed with the alias and field identified.
 
-- **WHEN** a local alias defines `generation.temperature: 0.7` for the generator role
-- **THEN** the generation `CompletionRequest.temperature` SHALL be `0.7` (vs registry default `0.2`), `GenerationParams`/`StrictRunConfig.to_config_artifact` SHALL reflect it.
+#### Scenario: Alias uniqueness and qualified selection
 
-#### Scenario: Temperature override for audit/repair
+- **WHEN** a bare alias is globally unique
+- **THEN** it SHALL resolve case-insensitively; a duplicate normalized alias across providers SHALL fail at registry load, while `local/alias` remains a supported qualified form.
 
-- **WHEN** a local (or remote) alias defines `generation.temperature: 0.3` for the `qwen_audit` / `selective_repair` / `russian_editor` / `entity_extractor` / `formatting` role
-- **THEN** that stage's `CompletionRequest.temperature` SHALL be `0.3` instead of the former hardcoded `0.0`/`0.1`, and its identity SHALL change.
+### Requirement: Local request body and reasoning transport
 
-#### Scenario: Unsupported top_p for local in v1
+The local OpenAI-compatible transport SHALL serialize every declared local sampling field that it supports: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`. Local reasoning SHALL remain exclusively a `llama-server` policy (`server_args --reasoning-budget`) and SHALL NOT be serialized as remote `reasoning` request options.
 
-- **WHEN** a local alias defines `generation.top_p` (or `top_k`/`min_p`) in this change
-- **THEN** the system SHALL fail-closed with a clear error (local v1 only supports `temperature`/`seed`/`max_tokens` via body; `top_p`/`top_k` for local are deferred to server_args mapping).
+#### Scenario: Local seed and sampling serialization
 
-### Requirement: Local reasoning via server_args only
+- **WHEN** a local role policy supplies `seed`, `top_p`, `top_k`, or `min_p`
+- **THEN** the local request body SHALL contain that exact value, the effective policy/identity SHALL contain it, and no value SHALL be silently ignored or replaced with a code default.
 
-The system SHALL keep local reasoning budget via `server_args --reasoning-budget` and SHALL NOT send `request_options` for local runs.
+#### Scenario: Unsupported local request option
 
-#### Scenario: Local alias reasoning
+- **WHEN** a local policy requests a field unsupported by the verified local transport contract
+- **THEN** registry validation or preflight SHALL fail with a clear error; the transport SHALL not silently drop the field.
 
-- **WHEN** a local alias defines `reasoning_budget` and `server_args` contains `--reasoning-budget`
-- **THEN** the two values SHALL agree or loading SHALL fail-closed; the `LocalOpenAIBackend` SHALL receive an empty `request_options` and `validate_reasoning_backend` SHALL pass when the budget agrees with `--reasoning`.
+#### Scenario: Local reasoning remains server-side
 
-#### Scenario: Remote unchanged
+- **WHEN** a local alias uses reasoning
+- **THEN** its `reasoning_budget` SHALL agree with `server_args --reasoning-budget`, local `CompletionRequest` SHALL have no `reasoning` request option, and the local server start/preflight validation SHALL enforce the required reasoning server flags.
 
-- **WHEN** a remote alias is used
-- **THEN** `request_options` (`reasoning`, `top_p`/`top_k`) SHALL continue to be used and `server_args` for remote SHALL not be affected.
+### Requirement: Alias CLI, provenance, and cache identity
 
-### Requirement: CLI alias ergonomics and identity
+The system SHALL accept `book|chapter --local [alias]`. Bare local SHALL use the canonical runtime transport and the explicit provider default role policies; alias local SHALL use the alias-resolved transport and policies. `--local`, `--remote`, and `--runtime-config` SHALL remain mutually exclusive.
 
-The system SHALL accept `book --local [alias]` and `chapter --local [alias]` like `book --remote [alias]` and SHALL make the alias identity-bearing.
+The complete resolved role-policy map SHALL have an aggregate identity hash. Every model-call producer SHALL include its own role-policy hash and final derived request budget in the cache/artifact identity that governs its output.
 
-#### Scenario: CLI parse
+#### Scenario: Audit-only policy change invalidates audit data
 
-- **WHEN** `book --chapters 28 --local mygemma` is given
-- **THEN** it SHALL resolve the alias, build the alias-specific backend, and auto-name the output `book_0028_local_mygemma_<ts>` (bare `book --local` stays `book_..._local_...`); `--local` and `--remote` remain mutually exclusive and both exclusive with `--runtime-config`.
+- **WHEN** only `qwen_audit.request.temperature` or its dynamic-budget inputs change
+- **THEN** audit/re-audit cache identity and audit provenance SHALL change, prior audit results SHALL not be replayed, and unrelated role policy hashes SHALL remain unchanged.
 
-#### Scenario: Cache invalidation
+#### Scenario: Generation policy change invalidates generation data
 
-- **WHEN** the alias or its `server_args`/`generation` changes
-- **THEN** the generation `bundle_hash`/`config_identity` SHALL change so prior cached `translations_raw.json`/`audit_cache_b3.json` are not replayed (new `--out-base` required).
+- **WHEN** `generator.request.temperature`, `seed`, or output-budget policy changes
+- **THEN** `PromptBundle.bundle_hash`, generation provenance, and run identity SHALL change before cached generation output can be reused.
 
-#### Scenario: Preflight
+#### Scenario: Preflight is side-effect free and complete
 
-- **WHEN** `book --local mygemma --preflight` is given
-- **THEN** `run_runtime_preflight` SHALL resolve the same alias, check `exe`/`model_path`/`port` of the alias-resolved `LocalLlamaBackendConfig`, and report the sanitized `server_args`/`generation`/`reasoning_budget` and identity without starting a server or making a network call.
+- **WHEN** `book --local mygemma --preflight` is invoked
+- **THEN** it SHALL resolve the same alias and complete role-policy map as execution, validate model path/server arguments and transport field support, print sanitized per-role policies and hashes, and neither start a server nor make a network call.
