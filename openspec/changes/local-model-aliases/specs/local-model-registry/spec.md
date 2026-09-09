@@ -8,15 +8,15 @@ Two-model local selection with model-owned sampling, shared role-owned budgets, 
 
 The system SHALL use exactly these groups for both local and remote runtime selection:
 
-- translator: `generator`, `repair`, `russian_selector`, `gemma_audit`, `formatting`;
-- reviewer: `qwen_audit`, `fidelity_reviewer`, `entity_extractor`, `russian_editor`, `glossary_resolver`.
+- translator: `generator`, `repair`, `formatting`, `gemma_audit`;
+- reviewer: `qwen_audit`, `fidelity_reviewer`, `russian_selector`, `entity_extractor`, `russian_editor`, `glossary_resolver`.
 
-No provider model entry SHALL alter group membership.
+No provider model entry SHALL alter group membership. Every role SHALL be bound explicitly to its group model; resolution SHALL fail closed when that exact role is absent and SHALL NOT fall back to another role or `default`.
 
 #### Scenario: Remote and local use identical groups
 
 - **WHEN** either `--remote translator/reviewer` or `--local translator/reviewer` is resolved
-- **THEN** the left model SHALL bind every translator role and the right model SHALL bind every reviewer role.
+- **THEN** the left model SHALL bind every translator role and the right model SHALL bind every reviewer role, with no fallback bindings consulted.
 
 ### Requirement: Model-owned sampling and shared role budgets
 

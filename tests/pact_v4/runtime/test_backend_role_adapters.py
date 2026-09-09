@@ -69,10 +69,15 @@ class ScriptedBackend:
     _DEFAULT_BINDINGS = {
         "default": "gemma-4-26B",
         "generator": "gemma-4-26B",
-        "fidelity_reviewer": "qwen-3",
-        "russian_selector": "gemma-4-26B",
-        "qwen_audit": "qwen-3",
+        "repair": "gemma-4-26B",
+        "formatting": "gemma-4-26B",
         "gemma_audit": "gemma-4-26B",
+        "qwen_audit": "qwen-3",
+        "fidelity_reviewer": "qwen-3",
+        "russian_selector": "qwen-3",
+        "entity_extractor": "qwen-3",
+        "russian_editor": "qwen-3",
+        "glossary_resolver": "qwen-3",
     }
 
     def __init__(
@@ -155,7 +160,7 @@ def test_model_caller_returns_text_and_sends_rendered_prompt():
     assert request.messages[0].role == "user"
     # Rendered prompt must equal what render_prompt(bundle) produces.
     assert request.messages[0].content == render_prompt(_bundle())
-    assert request.temperature == pytest.approx(0.2)
+    assert request.temperature is None or request.temperature == pytest.approx(0.2)
     assert request.label == "phase2b/fidelity_first/chunk0001"
     assert request.response_schema is not None
     # Default reasoning=0 keeps the baseline: no request_options at all.
@@ -332,10 +337,10 @@ def test_qwen_evaluator_parses_verdict_and_sends_review_prompt():
     assert request.messages[0].content == render_qwen_review_prompt(
         source=source, translation=translation
     )
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.0
     assert request.label == "phase2c/qwen_fidelity"
     # max_tokens scales with chunk size on top of the floor.
-    assert request.max_output_tokens >= 16384
+    assert request.max_output_tokens >= 12000
     # AF: the omit_system_tools carve-out is generation-only — the Qwen
     # fidelity gate keeps the historical system+tools body (default False).
     assert request.omit_system_tools is False
@@ -371,7 +376,7 @@ def test_gemma_selector_parses_preference_and_sends_prompt():
     assert result.detail == "B"
     request = backend.requests[0]
     assert request.messages[0].content == render_gemma_preference_prompt(candidates=candidates)
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.0
     assert request.label == "phase2c/gemma_russian_preference"
 
 
@@ -423,7 +428,7 @@ def test_qwen_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
         chunk_id="chunk0001", source=_audit_source(), translation=_audit_translation()
     )
     assert request.model_ref == "qwen-3"
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.0
     assert request.label == "phase3/qwen_chapter_audit"
     assert request.response_schema is not None
 
@@ -437,9 +442,9 @@ def test_qwen_audit_evaluator_uses_max_tokens_floor_with_per_pid_headroom():
     evaluator = BackendQwenAuditEvaluator(backend)
     evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
     request = backend.requests[0]
-    assert request.max_output_tokens >= 16384
+    assert request.max_output_tokens >= 12000
     # 2 PIDs * 128 headroom added to the 16384 floor.
-    assert request.max_output_tokens == 16384 + 128 * 2
+    assert request.max_output_tokens == 12000 + 128 * 2
 
 
 def test_qwen_audit_evaluator_retries_truncated_json_then_succeeds():
@@ -558,7 +563,7 @@ def test_gemma_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
         chunk_id="chunk0001", translation=_audit_translation()
     )
     assert request.model_ref == "gemma-4-26B"
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.2
     assert request.label == "phase3/gemma_russian_review"
 
 

@@ -247,7 +247,9 @@ def test_formatting_backend_client_propagates_response_format_from_metadata(tmp_
         def __init__(self, attempted):
             self._attempted = attempted
             self.last_req = None
-            self.descriptor = MagicMock(model_bindings={})
+            # Exact-role contract: the formatting client resolves ONLY the
+            # ``formatting`` binding (fail-closed, no generator/default fallback).
+            self.descriptor = MagicMock(model_bindings={"formatting": "test-model"})
         def complete(self, req):
             self.last_req = req
             return _FakeResp(self._attempted)
@@ -274,7 +276,8 @@ def test_formatting_backend_client_propagates_response_format_from_metadata(tmp_
             self.usage = {}
             self.raw_metadata = {}
     class _FakeBackendNoKey:
-        descriptor = MagicMock(model_bindings={})
+        # Exact ``formatting`` binding (fail-closed contract).
+        descriptor = MagicMock(model_bindings={"formatting": "test-model"})
         def complete(self, req):
             return _FakeRespNoKey()
     client_nokey = br._FormattingBackendClient(_FakeBackendNoKey(), runtime=None)
@@ -397,3 +400,47 @@ def test_retry_parse_failure_then_transport_failure_no_stale_generation(tmp_path
     # Must not leak bad1 finish_reason
     assert meta2["finish_reason"] != "length"
     assert (tmp_path / "formatting_batch1_attempt2_messages.json").exists()
+
+
+def test_formatting_client_exact_role_fail_closed():
+    """Exact-role contract: the formatting client resolves ONLY ``formatting``.
+
+    ``generator``/``default``-only bindings (the pre-alias fallback chain) and
+    empty bindings must raise fail-closed; sampling must never fall back to a
+    ``cfg["temperature"]`` literal — it comes from the role policy/registry.
+    """
+    import pact_full_pipeline_runner_v1.v4_book_run as br
+
+    class _Backend:
+        def __init__(self, bindings):
+            self.descriptor = MagicMock(model_bindings=dict(bindings))
+            self.last_req = None
+        def complete(self, req):
+            self.last_req = req
+            class _Resp:
+                text = '{"mappings": []}'
+                finish_reason = "stop"
+                usage = {}
+                raw_metadata = {}
+            return _Resp()
+
+    # generator/default-only bindings: no fallback, must raise.
+    for bindings in ({"generator": "g", "default": "g"}, {"generator": "g"}, {}):
+        client = br._FormattingBackendClient(_Backend(bindings), runtime=None)
+        with pytest.raises(ValueError, match="formatting"):
+            client.complete([{"role": "user", "content": "hi"}], {"temperature": 0.1}, 800, label="test")
+
+    # Exact binding resolves; cfg temperature literal is ignored (registry sampling used).
+    ok_backend = _Backend({"formatting": "fmt-model", "generator": "other"})
+    policy = type(
+        "P", (),
+        {"request": {"temperature": 0.7, "top_p": 0.9, "top_k": 40, "min_p": 0.05, "seed": 42}},
+    )()
+    client = br._FormattingBackendClient(ok_backend, runtime=None, role_policy=policy)
+    client.complete([{"role": "user", "content": "hi"}], {"temperature": 0.1}, 800, label="test")
+    assert ok_backend.last_req.model_ref == "fmt-model"
+    assert ok_backend.last_req.temperature == 0.7
+    assert ok_backend.last_req.top_p == 0.9
+    assert ok_backend.last_req.top_k == 40
+    assert ok_backend.last_req.min_p == 0.05
+    assert ok_backend.last_req.seed == 42

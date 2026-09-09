@@ -141,10 +141,10 @@ def test_russian_editor_identity():
     pol1=RoleCallPolicy(model_key="qwen", request={"temperature":0.0, "max_output_tokens":12000})
     pol2=RoleCallPolicy(model_key="qwen", request={"temperature":0.6, "max_output_tokens":12000})
     b1=FakeBackend({"russian_editor":"m"})
-    # russian_editor resolves via qwen_audit binding; ensure binding maps
-    b1.descriptor=BackendDescriptor(kind="local_llama", transport_version="v1", endpoint_family="openai", public_endpoint="http://a", model_bindings={"qwen_audit":"m"}, effective_options={})
+    # russian_editor resolves ONLY its exact binding (fail-closed, no qwen_audit fallback)
+    b1.descriptor=BackendDescriptor(kind="local_llama", transport_version="v1", endpoint_family="openai", public_endpoint="http://a", model_bindings={"russian_editor":"m"}, effective_options={})
     b2=FakeBackend({"russian_editor":"m"})
-    b2.descriptor=BackendDescriptor(kind="local_llama", transport_version="v1", endpoint_family="openai", public_endpoint="http://a", model_bindings={"qwen_audit":"m"}, effective_options={})
+    b2.descriptor=BackendDescriptor(kind="local_llama", transport_version="v1", endpoint_family="openai", public_endpoint="http://a", model_bindings={"russian_editor":"m"}, effective_options={})
     ev1=RussianEditorEvaluator(b1, config=RussianEditorConfig(role_policy=pol1))
     ev2=RussianEditorEvaluator(b2, config=RussianEditorConfig(role_policy=pol2))
     ev1(chapter_id="ch", translation={"p1":"privet"})

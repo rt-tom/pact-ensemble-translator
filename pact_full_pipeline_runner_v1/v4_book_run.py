@@ -1015,29 +1015,49 @@ def _flag_value(extra, flag):
 
 
 class _FormattingBackendClient:
-    """Adapter wrapping a CompletionBackend for resolve_format_mappings."""
-    def __init__(self, backend, runtime=None):
+    """Adapter wrapping a CompletionBackend for resolve_format_mappings.
+
+    Exact-role contract (local-model-aliases): the model ref resolves ONLY
+    the ``formatting`` binding (fail-closed, no ``generator``/``default``
+    fallback), and sampling (temperature/top_p/top_k/min_p/seed) comes ONLY
+    from the formatting role policy — ``role_policy`` passed at construction
+    (synthesized from the run's ``ResolvedModelPair`` translator model) or,
+    when absent, from the shared registry (``_shared_budget_for_role``).
+    The ``cfg`` mapping is never a sampling source: its legacy
+    ``temperature`` default must not leak into the request.
+    """
+    def __init__(self, backend, runtime=None, role_policy=None):
         self._backend = backend
         self._runtime = runtime
+        self._role_policy = role_policy
     def complete(self, messages, cfg, max_tokens, label=None):
         from pact_v4.runtime.backend_protocol import CompletionRequest, Message
+        from pact_v4.runtime.backend_role_adapters import (
+            _model_ref_for,
+            _shared_budget_for_role,
+        )
         msgs = tuple(Message(role=str(m.get("role", "user")), content=str(m.get("content", ""))) for m in messages)
-        model_ref = "default"
-        try:
-            from pact_v4.runtime.backend_role_adapters import _model_ref_for
-            model_ref = _model_ref_for(self._backend, ("generator", "default"))
-        except Exception:
-            try:
-                bindings = getattr(getattr(self._backend, "descriptor", None), "model_bindings", {}) or {}
-                model_ref = bindings.get("generator") or bindings.get("default") or "default"
-            except Exception:
-                model_ref = "default"
+        # Exact ``formatting`` role only — fail-closed when unbound (no fallback).
+        model_ref = _model_ref_for(self._backend, "formatting")
+        # Model-owned sampling only: explicit role policy first (ResolvedModelPair
+        # translator model via cfg thread-through), else the shared registry.
+        # Never a code literal and never cfg["temperature"].
+        policy = self._role_policy
+        if policy is None and isinstance(cfg, Mapping):
+            policy = cfg.get("role_policy")
+        if policy is None:
+            policy = _shared_budget_for_role("formatting")
+        sampling = dict(policy.request)
         # v41: formatting reasoning 0 — never pass reasoning in request_options
         req = CompletionRequest(
             model_ref=model_ref,
             messages=msgs,
             max_output_tokens=int(max_tokens),
-            temperature=float(cfg.get("temperature", 0.1)),
+            temperature=float(sampling["temperature"]) if "temperature" in sampling else None,
+            top_p=sampling.get("top_p"),
+            top_k=sampling.get("top_k"),
+            min_p=sampling.get("min_p"),
+            seed=sampling.get("seed"),
             response_schema={"type": "json_object"},
             label=label or "formatting",
         )
@@ -1143,6 +1163,51 @@ def _formatting_backend_with_overrides(backend):
     return backend
 
 
+def _formatting_role_policy_from_config(backend_cfg):
+    """Synthesize the formatting role policy from the backend config's pair.
+
+    Local-model-aliases: sampling comes from the run's ``ResolvedModelPair``
+    (translator model serves the translator-group ``formatting`` role) and
+    the output budget from ``role_budgets["formatting"]`` — mirroring the
+    ``_synth`` path in ``build_role_adapters``. Returns ``None`` when the
+    config carries no pair; the client then resolves sampling from the
+    shared registry (remote path). Never a code literal.
+    """
+    try:
+        pair = getattr(backend_cfg, "resolved_pair", None) or getattr(
+            backend_cfg, "resolved_role_policies", None
+        )
+    except Exception:
+        return None
+    if pair is None:
+        return None
+    try:
+        # Legacy ResolvedRolePolicies shape (remote tests): direct policy map.
+        policies = getattr(pair, "policies", None)
+        if isinstance(policies, dict) and "formatting" in policies:
+            return policies["formatting"]
+        if hasattr(pair, "sampling_for_role") and hasattr(pair, "budget_for_role"):
+            from pact_v4.runtime.runtime_config import TRANSLATOR_ROLES
+            budget = pair.budget_for_role("formatting")
+            sampling = dict(pair.sampling_for_role("formatting"))
+            is_translator = "formatting" in TRANSLATOR_ROLES
+            model = pair.translator_model if is_translator else pair.reviewer_model
+            req = dict(sampling)
+            if "max_output_tokens" not in req:
+                req["max_output_tokens"] = int(budget.max_output_tokens)
+            return type(
+                "SynthPolicy", (), {
+                    "request": req,
+                    "output_budget": budget.output_budget,
+                    "model_key": model.model_key,
+                    "policy_hash": pair.per_role_hash("formatting"),
+                }
+            )()
+    except Exception:
+        return None
+    return None
+
+
 def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
     if not fmt_cfg.get("enabled", True):
         return None
@@ -1177,7 +1242,7 @@ def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
         else:
             # Historical local default — same backend as strict-runner run_local_default
             # (required so the ordinary CLI path without --runtime-config still resolves
-            # formatting via the generator role instead of falling back to debt).
+            # formatting via the exact formatting role instead of falling back to debt).
             from pact_full_pipeline_runner_v1.v4_phase12_strict_run import GEMMA_PATH, QWEN_PATH, QWEN_SERVER_ARGS, _gemma_server_args_for_reasoning
             from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig
             backend = LocalLlamaBackendConfig(
@@ -1217,7 +1282,10 @@ def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
             runtime = backend.build_runtime(log_dir=log_dir)
             from pact_v4.runtime.runtime_config import build_role_backend
             fmt_backend = build_role_backend(backend, runtime)
-            return _FormattingBackendClient(fmt_backend, runtime)
+            return _FormattingBackendClient(
+                fmt_backend, runtime,
+                role_policy=_formatting_role_policy_from_config(backend),
+            )
         except Exception as exc:
             if runtime is not None:
                 try:

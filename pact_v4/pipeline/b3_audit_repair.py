@@ -189,6 +189,41 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _policy_for_role(pair: Any, role: str) -> Any:
+    """Derive synthetic policy for role from ResolvedModelPair (model-centric) or legacy ResolvedRolePolicies."""
+    if pair is None:
+        return None
+    # Model-centric ResolvedModelPair: sampling from group model + budget from role_budgets
+    if hasattr(pair, "role_budgets") and hasattr(pair, "translator_model"):
+        # fail-closed if role not in pair
+        budget = pair.budget_for_role(role)  # may raise ValueError if missing (no fallback)
+        sampling = pair.sampling_for_role(role)
+        from pact_v4.runtime.runtime_config import TRANSLATOR_ROLES
+        is_translator = role in TRANSLATOR_ROLES
+        model = pair.translator_model if is_translator else pair.reviewer_model
+        req = dict(sampling)
+        if "max_output_tokens" not in req:
+            req["max_output_tokens"] = int(budget.max_output_tokens)
+        return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": model.model_key, "policy_hash": pair.per_role_hash(role)})()
+    if hasattr(pair, "policies"):
+        return pair.policies.get(role)
+    return None
+
+def _synth_policy_from_registry(role: str, *, max_override: int | None = None) -> Any:
+    """Synthesize policy from registry shared budgets + model sampling (no literals)."""
+    from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role, TRANSLATOR_ROLES, RoleBudget
+    shared = _load_shared_role_budgets_from_registry()
+    budget = shared[role]
+    if max_override is not None:
+        # Override as fixed budget (no dynamic output_budget) so derive returns exact max_override
+        budget = RoleBudget(max_output_tokens=int(max_override), output_budget=None)
+    sampling = _sampling_for_remote_role(role)
+    req = dict(sampling)
+    if "max_output_tokens" not in req:
+        req["max_output_tokens"] = int(budget.max_output_tokens)
+    return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "registry", "policy_hash": budget.budget_hash})()
+
+
 def _atomic_write_json(path: Path, payload: Any) -> None:
     """Atomic write (write temp, fsync, replace) with a UTF-8 JSON payload.
 
@@ -3438,17 +3473,14 @@ class B3AuditRepair:
             return None
         entity_cache = _load_entity_cache(out_dir)
         try:
-            _entity_policy = None
-            if getattr(self, "_resolved_role_policies", None) is not None:
-                try:
-                    _entity_policy = self._resolved_role_policies.policies.get("entity_extractor")
-                except Exception:
-                    _entity_policy = None
+            _entity_policy = _policy_for_role(getattr(self, "_resolved_role_policies", None), "entity_extractor")
+            if _entity_policy is None:
+                _entity_policy = _synth_policy_from_registry("entity_extractor")
             extraction = extract_entity_context(
                 source_artifact=source,
                 extractor=BackendEntityExtractor(
                     self._entity_backend,
-                    config=BackendEntityExtractorConfig(role_policy=_entity_policy) if _entity_policy is not None else BackendEntityExtractorConfig(),
+                    config=BackendEntityExtractorConfig(role_policy=_entity_policy),
                 ),
                 cache=entity_cache,
                 extractor_version=cfg.extractor_version,
@@ -3561,12 +3593,9 @@ class B3AuditRepair:
                 )
                 self._emit_progress("r_editor_chunk_done", chunk=fields.get("chunk"), total=fields.get("total"), status=fields.get("status"), edit_count=fields.get("edit_count", 0), warning_count=fields.get("warning_count", 0), error=fields.get("error"), reused=fields.get("reused"))
 
-        _russian_policy = None
-        if getattr(self, "_resolved_role_policies", None) is not None:
-            try:
-                _russian_policy = self._resolved_role_policies.policies.get("russian_editor")
-            except Exception:
-                _russian_policy = None
+        _russian_policy = _policy_for_role(getattr(self, "_resolved_role_policies", None), "russian_editor")
+        if _russian_policy is None:
+            _russian_policy = _synth_policy_from_registry("russian_editor", max_override=cfg.russian_editor_max_tokens)
         evaluator = RussianEditorEvaluator(
             self._audit_backend,
             config=RussianEditorConfig(
@@ -4229,12 +4258,9 @@ class B3AuditRepair:
                 }
                 _save_stage_progress()
 
-            _audit_policy = None
-            if getattr(self, "_resolved_role_policies", None) is not None:
-                try:
-                    _audit_policy = self._resolved_role_policies.policies.get("qwen_audit")
-                except Exception:
-                    _audit_policy = None
+            _audit_policy = _policy_for_role(getattr(self, "_resolved_role_policies", None), "qwen_audit")
+            if _audit_policy is None:
+                _audit_policy = _synth_policy_from_registry("qwen_audit")
             evaluator = ChunkedAuditEvaluator(
                 self._audit_backend,
                 config=ChunkedAuditConfig(
@@ -4460,14 +4486,12 @@ class B3AuditRepair:
                     }
                     _save_stage_progress()
 
-            _repair_policy = None
-            _reaudit_policy = None
-            if getattr(self, "_resolved_role_policies", None) is not None:
-                try:
-                    _repair_policy = self._resolved_role_policies.policies.get("repair")
-                    _reaudit_policy = self._resolved_role_policies.policies.get("qwen_audit")
-                except Exception:
-                    _repair_policy = _reaudit_policy = None
+            _repair_policy = _policy_for_role(getattr(self, "_resolved_role_policies", None), "repair")
+            _reaudit_policy = _policy_for_role(getattr(self, "_resolved_role_policies", None), "qwen_audit")
+            if _repair_policy is None:
+                _repair_policy = _synth_policy_from_registry("repair", max_override=cfg.repair_max_tokens)
+            if _reaudit_policy is None:
+                _reaudit_policy = _synth_policy_from_registry("qwen_audit", max_override=cfg.repair_reaudit_max_tokens)
             repair_evaluator = SelectiveRepairEvaluator(
                 self._repair_backend,
                 reaudit_backend=self._audit_backend,
@@ -4902,11 +4926,9 @@ class B3AuditRepair:
         except Exception:
             pass
         _glossary_policy = None
-        if getattr(self, "_resolved_role_policies", None) is not None:
-            try:
-                _glossary_policy = self._resolved_role_policies.policies.get("glossary_resolver")
-            except Exception:
-                _glossary_policy = None
+        _glossary_policy = _policy_for_role(getattr(self, "_resolved_role_policies", None), "glossary_resolver")
+        if _glossary_policy is None:
+            _glossary_policy = _synth_policy_from_registry("glossary_resolver")
         resolver = GlossaryResolver(self._audit_backend, progress=self._progress, role_policy=_glossary_policy)
         _glossary_card = None
         if book_memory_role_views is not None:

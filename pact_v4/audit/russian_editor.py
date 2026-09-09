@@ -71,8 +71,9 @@ harmful):
 
 Transport: the evaluator is backend-neutral over ``CompletionBackend`` (the
 same boundary the B1 chunked audit uses); it resolves the model ref via
-``audit_model_ref`` (Qwen — the editor is the audit model, owner decision).
-The lifecycle wrapper supplies the local ``llama-server`` backend; the
+the exact ``russian_editor`` binding (reviewer group — the reviewer model
+serves the editor, fail-closed, no ``qwen_audit`` fallback). The lifecycle
+wrapper supplies the local ``llama-server`` backend; the
 evaluator itself never imports ``model_lifecycle*``.
 
 This module is pure and deterministic except for the injected model calls.
@@ -86,7 +87,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from pact_v4.audit.chunked_audit import audit_model_ref
 from pact_v4.runtime.backend_protocol import (
     JSON_OBJECT_SCHEMA,
     CompletionBackend,
@@ -797,6 +797,26 @@ def detect_dialogue_format_candidates(
 # ---------------------------------------------------------------------------
 
 
+def russian_editor_model_ref(backend: CompletionBackend) -> str:
+    """Resolve the model reference for the exact ``russian_editor`` role.
+
+    Fail-closed: raises when the backend binds no ``russian_editor`` role —
+    falling back to ``qwen_audit`` (or any other role) is forbidden, even
+    though the same reviewer model usually serves both. The reviewer-group
+    contract is honoured through the binding itself (the config binds the
+    reviewer model under ``russian_editor``), never through role-to-role
+    resolution.
+    """
+    bindings = backend.descriptor.model_bindings
+    ref = bindings.get("russian_editor")
+    if ref:
+        return str(ref)
+    raise ValueError(
+        f"no model binding for editor role 'russian_editor'; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
+    )
+
+
 class RussianEditorEvaluator:
     """V4.2 R Russian-only editor over ``CompletionBackend`` (transport-neutral).
 
@@ -810,8 +830,10 @@ class RussianEditorEvaluator:
 
     One ``CompletionRequest`` per chunk (``max_output_tokens`` from policy
     via ``derive_max_output_tokens``, temperature from policy, ``json_object`` schema — never ``request_options``; the
-    reasoning budget is a server arg). The model ref resolves to the audit
-    (Qwen) role — the editor is the audit model (owner decision, 0 restarts).
+    reasoning budget is a server arg). The model ref resolves to the exact
+    ``russian_editor`` binding (reviewer group — the reviewer model serves
+    the editor via its own binding, fail-closed, no ``qwen_audit``
+    fallback).
     """
 
     def __init__(
@@ -913,7 +935,7 @@ class RussianEditorEvaluator:
         cached_chunks: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> RussianEditorOutcome:
         cfg = self._config
-        model_ref = audit_model_ref(self._backend)
+        model_ref = russian_editor_model_ref(self._backend)
 
         if not translation:
             # Fail-closed: an empty input is rejected before any model call.
@@ -1024,17 +1046,20 @@ class RussianEditorEvaluator:
                 reason_path = out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt"
             policy = getattr(cfg, "role_policy", None)
             if policy is None:
-                raise ValueError("RussianEditor: role_policy is required")
+                from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role
+                _b = _load_shared_role_budgets_from_registry()["russian_editor"]
+                _s = _sampling_for_remote_role("russian_editor")
+                _req = dict(_s)
+                _req["max_output_tokens"] = int(_b.max_output_tokens)
+                policy = type("SynthPolicy", (), {"request": _req, "output_budget": _b.output_budget, "model_key": "registry", "policy_hash": _b.budget_hash})()
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok = int(_derive(policy))
             req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("RussianEditor: role_policy missing temperature")
             request = CompletionRequest(
                 model_ref=model_ref,
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tok,
-                temperature=float(req["temperature"]),
+                temperature=float(req["temperature"]) if "temperature" in req else None,
                 top_p=req.get("top_p"),
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),

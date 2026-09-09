@@ -681,7 +681,7 @@ def _handle_book(argv: Sequence[str]) -> int:
     parser.add_argument("--chapters", required=False, default=None)
     parser.add_argument("--runtime-config", dest="runtime_config", required=False, default=None)
     parser.add_argument("--profile", dest="profile", required=False, default=None)
-    parser.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="ALIAS", help="Select canonical local profile; optional local alias from providers.yaml (e.g. --local mygemma); bare --local preserves current behavior")
+    parser.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="ALIAS", help="Select canonical local pair gemma/qwen; --local a/b selects translator a and reviewer b from providers.local.models (case-insensitive, no provider slash); single alias fails with pair required")
     parser.add_argument("--remote", nargs="?", const="__DEFAULT__", default=None, help="Select canonical remote profile; optional translator/reviewer alias")
     parser.add_argument("--chapter-html-pattern", dest="chapter_html_pattern", required=False, default=None)
     parser.add_argument("--memory-dir", dest="memory_dir", required=False, default=None)
@@ -724,14 +724,24 @@ def _handle_book(argv: Sequence[str]) -> int:
     # Determine mode: simple (--local or --remote) vs advanced (--runtime-config)
     is_simple_local = args.local is not None
     is_simple_remote = args.remote is not None
-    local_alias_value: Optional[str] = None
+    local_pair: Optional[tuple[str, str]] = None
+    local_alias_value: Optional[str] = None  # for label derivation (sanitized pair)
     if is_simple_local:
-        if args.local == "__LOCAL_DEFAULT__":
-            local_alias_value = None
+        raw_local = args.local
+        if raw_local == "__LOCAL_DEFAULT__":
+            raw_local = None
+        try:
+            from pact_v4.runtime.runtime_config import parse_local_pair_arg
+            parsed = parse_local_pair_arg(raw_local)
+        except Exception as exc:
+            _error_exit(str(exc))
+        if parsed is not None:
+            local_pair = parsed  # type: ignore
+            # for label: use translator/reviewer aliases
+            local_alias_value = f"{parsed[0]}_{parsed[1]}" if parsed != ("gemma", "qwen") else None
         else:
-            local_alias_value = str(args.local).strip() if str(args.local).strip() else None
-            if local_alias_value == "__LOCAL_DEFAULT__":
-                local_alias_value = None
+            local_pair = ("gemma", "qwen")
+            local_alias_value = None
     is_advanced = bool(args.runtime_config or args.profile)
     # Mutual exclusivity
     if is_simple_local and is_simple_remote:
@@ -742,17 +752,16 @@ def _handle_book(argv: Sequence[str]) -> int:
         _error_exit("book mode requires --local or --remote [translator/reviewer] (simple) or --runtime-config FILE (advanced)")
     if not args.chapters:
         _error_exit("--chapters N or N-M is required for book mode (e.g. --chapters 28 or --chapters 27-32)")
-    # Validate local alias via registry if provided (fail-closed)
-    if local_alias_value:
+    # Validate local pair via registry (fail-closed, local-only, case-insensitive)
+    if is_simple_local and local_pair is not None:
         try:
-            from pact_v4.runtime.runtime_config import load_providers_registry
+            from pact_v4.runtime.runtime_config import load_providers_registry, _lookup_local_alias
             prov_path = Path(args.providers_config) if args.providers_config else Path(__file__).resolve().parent.parent / "configs" / "providers.yaml"
             if prov_path.is_file():
                 reg = load_providers_registry(prov_path)
-                if "/" in local_alias_value:
-                    reg.resolve(local_alias_value)
-                else:
-                    reg.resolve_bare(local_alias_value)
+                # trigger case-insensitive local-only lookup for both
+                _lookup_local_alias(reg, local_pair[0])
+                _lookup_local_alias(reg, local_pair[1])
         except Exception as exc:
             _error_exit(str(exc))
     # Simple mode: --translator/--reviewer must not be combined with --remote alias pair (avoid ambiguity)
@@ -870,20 +879,13 @@ def _handle_book(argv: Sequence[str]) -> int:
     try:
         cfg = _apply_overrides(cfg, translator_override, reviewer_override, reasoning_override, providers_config=args.providers_config)
         cfg = _apply_managed(cfg, effective_managed)
-        if local_alias_value is not None:
-            from pact_v4.runtime.runtime_config import apply_local_alias_to_config
-            # resolve alias via registry (fail-closed) and mutate cfg so label/preflight reflect alias fragments
+        if is_simple_local and local_pair is not None:
+            from pact_v4.runtime.runtime_config import load_providers_registry, build_resolved_pair_from_registry, apply_resolved_pair_to_config
             prov_path = Path(args.providers_config) if args.providers_config else Path(__file__).resolve().parent.parent / "configs" / "providers.yaml"
             if prov_path.is_file():
-                from pact_v4.runtime.runtime_config import load_providers_registry
                 reg = load_providers_registry(prov_path)
-                if "/" in local_alias_value:
-                    alias_entry = reg.resolve(local_alias_value)
-                else:
-                    alias_entry = reg.resolve_bare(local_alias_value)
-                # apply_local_alias_to_config expects LocalModelAlias; ensure we have it
-                # ProviderModel vs LocalModelAlias are stored together; runtime resolve_bare already returns LocalModelAlias for local aliases
-                cfg = apply_local_alias_to_config(cfg, alias_entry)
+                pair = build_resolved_pair_from_registry(reg, local_pair[0], local_pair[1])
+                cfg = apply_resolved_pair_to_config(cfg, pair)
     except Exception as exc:
         _error_exit(str(exc))
 
@@ -1054,11 +1056,11 @@ def _handle_book(argv: Sequence[str]) -> int:
     delegated += ["--chapter-html-pattern", chapter_html_pattern]
     delegated += ["--memory-dir", str(memory_dir)]
     delegated += ["--out-base", str(out_base)]
-    # Local simple mode: forward --local (bare or alias) so delegated book run resolves via providers registry.
+    # Local simple mode: forward --local pair (bare => gemma/qwen, else translator/reviewer) so delegated book run resolves via providers registry.
     # It must NOT also forward --runtime-config, which strict explicitly rejects for --local (mutual exclusion).
     if is_simple_local:
-        if local_alias_value is not None:
-            delegated += ["--local", local_alias_value]
+        if local_pair is not None and local_pair != ("gemma", "qwen"):
+            delegated += ["--local", f"{local_pair[0]}/{local_pair[1]}"]
         else:
             delegated += ["--local"]
         if args.providers_config and "--providers-config" not in delegated:
@@ -1122,7 +1124,7 @@ def _handle_chapter(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="v4_run chapter", add_help=False)
     parser.add_argument("--runtime-config", dest="runtime_config", required=False, default=None)
     parser.add_argument("--profile", dest="profile", required=False, default=None)
-    parser.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="ALIAS", help="Select canonical local profile; optional alias")
+    parser.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="PAIR", help="Select canonical local pair gemma/qwen; --local a/b selects translator a and reviewer b (local-only, case-insensitive); single alias fails with pair required")
     parser.add_argument("--translator", required=False, default=None)
     parser.add_argument("--reviewer", required=False, default=None)
     parser.add_argument("--reasoning", type=int, required=False, default=None)
@@ -1147,31 +1149,36 @@ def _handle_chapter(argv: Sequence[str]) -> int:
     _validate_markup(args.markup)
     if args.json and not args.preflight and not args.preflight_json:
         _error_exit("--json requires --preflight (use --preflight --json or --preflight-json)")
-    # --local handling in chapter dispatch
+    # --local handling in chapter dispatch (model-centric pair)
     is_local_chapter = args.local is not None
     if is_local_chapter:
         if args.runtime_config or args.profile:
             _error_exit("--local and --runtime-config are mutually exclusive")
         if args.translator or args.reviewer:
             _error_exit("--translator/--reviewer cannot be combined with --local")
-        local_alias = None if args.local == "__LOCAL_DEFAULT__" else (str(args.local).strip() or None)
-        # Validate alias via registry if provided
-        if local_alias:
-            try:
-                from pact_v4.runtime.runtime_config import load_providers_registry
+        raw = args.local
+        if raw == "__LOCAL_DEFAULT__":
+            raw = None
+        try:
+            from pact_v4.runtime.runtime_config import parse_local_pair_arg, load_providers_registry, _lookup_local_alias
+            parsed = parse_local_pair_arg(raw)
+            # validate both aliases are local-only case-insensitive
+            if parsed is not None and parsed != ("gemma", "qwen"):
+                # bare None already default; otherwise validate pair exists
                 prov_path = Path(args.providers_config) if args.providers_config else Path(__file__).resolve().parent.parent / "configs" / "providers.yaml"
                 if prov_path.is_file():
                     reg = load_providers_registry(prov_path)
-                    if "/" in local_alias:
-                        reg.resolve(local_alias)
-                    else:
-                        reg.resolve_bare(local_alias)
-            except Exception as exc:
-                _error_exit(str(exc))
+                    _lookup_local_alias(reg, parsed[0])
+                    _lookup_local_alias(reg, parsed[1])
+            local_pair = parsed
+        except Exception as exc:
+            _error_exit(str(exc))
         # Handle preflight for --local chapter
         if args.preflight or args.preflight_json:
-            # Use strict run preflight path via delegation with --local
-            delegated = ["--local", local_alias] if local_alias else ["--local"]
+            if local_pair is None or local_pair == ("gemma", "qwen"):
+                delegated = ["--local"]
+            else:
+                delegated = ["--local", f"{local_pair[0]}/{local_pair[1]}"]
             if args.preflight:
                 delegated.append("--preflight")
             if args.preflight_json:
@@ -1181,8 +1188,11 @@ def _handle_chapter(argv: Sequence[str]) -> int:
             delegated += list(remaining)
             from pact_full_pipeline_runner_v1.v4_phase12_strict_run import main as strict_main
             return int(strict_main(delegated))
-        # Default delegation for --local chapter (no preflight): forward to strict with --local
-        delegated = ["--local", local_alias] if local_alias else ["--local"]
+        # Default delegation for --local chapter (no preflight): forward to strict with --local pair
+        if local_pair is None or local_pair == ("gemma", "qwen"):
+            delegated = ["--local"]
+        else:
+            delegated = ["--local", f"{local_pair[0]}/{local_pair[1]}"]
         if args.providers_config:
             delegated += ["--providers-config", str(args.providers_config)]
         delegated += list(remaining)

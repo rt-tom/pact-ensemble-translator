@@ -1,96 +1,61 @@
 # Provider registry for remote model roles (PROVIDERS-REGISTRY card, 2026-08-14).
+# Plus model-centric local registry (local-model-aliases, 2026-09): top-level role_budgets
+# shared by local & remote, and per-model sampling in providers.local.models.<alias>.request.
 #
-# A NEW file — deliberately separate from the runtime transport profiles
-# (configs/runtime_*.example.yaml): the runtime config describes HOW to talk
-# to a server (endpoint, auth env names, budgets, structured output), while
-# this registry is the model SPRAVOCHNIK (aliases -> full provider/model refs)
-# plus the per-model reasoning contract, so a run command can say
-# `--translator opencode-go/deepseek4flash` instead of the full model id.
+# CLI usage:
+#   Remote: --translator <provider>/<alias> e.g. opencode-go/musefree  --reviewer openai/luna
+#   Local:  --local (gemma/qwen) | --local translator/reviewer  e.g. --local glm/glimmer
+#           where both components are local aliases (case-insensitive, no provider slash).
 #
-# CLI usage (v4_phase12_strict_run.py):
-#   --translator <provider>/<alias>   e.g. opencode-go/deepseek4flash
-#   --reviewer   <provider>/<alias>   e.g. openai/luna
+# Fixed shared role groups (local & remote):
+#   translator = generator, repair, formatting, gemma_audit
+#   reviewer   = qwen_audit, fidelity_reviewer, russian_selector, entity_extractor, russian_editor, glossary_resolver
+# Every role is bound explicitly to its group model; no role->role or default fallback.
 #
-# Role mapping (owner decision 2026-08-14):
-#   --translator -> generator + repair (repair falls back to generator)
-#   --reviewer   -> qwen_audit + fidelity_reviewer + russian_selector
-#                   + entity_extractor (all audit roles)
-# Defaults come from the SELECTED runtime profile's model_bindings (see
-# configs/runtime_*.example.yaml), NOT from this file. For the canonical
-# remote profile (--remote / configs/runtime_remote.example.yaml) the defaults
-# are musefree (generator + repair) + luna (all audit roles), reasoning 3;
-# the composite example profile still defaults to deepseek4flash + qwen37.
-# Switching a --translator/--reviewer flag changes the backend identity (new cache).
-#
-# reasoning_contract.variants: the reasoningEffort values the model declares
-# in the opencode provider catalog (checked 2026-08-14 against `opencode
-# models <provider> --verbose`, serve 1.18.18). The serve relay does NOT
-# validate reasoningEffort (any string is accepted and proxied), so this
-# contract is the authoritative mapping guide: --reasoning N is mapped to the
-# nearest declared variant when the canonical value is not declared
-# (e.g. deepseek-v4-flash: 2 -> high). Adding a model REQUIRES verifying its
-# variants from the catalog and fixing them here (acceptance criterion).
+# Local model owns: model_key, model_path, model_name, server_args, reasoning_budget, request{temperature,top_p,top_k,min_p,seed}
+# Role budgets own only max_output_tokens / output_budget. Request must NOT contain max_output_tokens.
+# Sampling is excluded from run identity (same output dir) but INCLUDED in each request cache key/provenance.
+role_budgets:
+  generator: {max_output_tokens: 70000}
+  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  formatting: {max_output_tokens: 8000, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
+  gemma_audit: {max_output_tokens: 4096}
+  qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}}
+  fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  russian_selector: {max_output_tokens: 1024}
+  entity_extractor: {max_output_tokens: 12000}
+  russian_editor: {max_output_tokens: 12000}
+  glossary_resolver: {max_output_tokens: 4096}
 providers:
   opencode-go:
     kind: opencode_server
     models:
-      # Default Translator (alias deepseek4flash).
       deepseek4flash:
         ref: opencode-go/deepseek-v4-flash
         reasoning_contract:
           variants: [low, high, max]
-      # Default Reviewer (alias qwen37). Catalog variants are
-      # thinking-budget based (high/max); reasoningEffort wire behavior for
-      # qwen is to be verified at the first live run (the serve relay still
-      # accepts any reasoningEffort string).
       qwen37:
         ref: opencode-go/qwen3.7-plus
         reasoning_contract:
           variants: [high, max]
-      # Muse Spark 1.2 (added 2026-08-18). Catalog id opencode-go/muse-spark-1.2,
-      # display "Muse Spark 1.2", family muse, context up to ~1M tokens.
-      # reasoningEffort variants verified 2026-08-18 via `opencode models
-      # opencode-go --verbose`.
       muse:
         ref: opencode-go/muse-spark-1.2-contributor
         reasoning_contract:
           variants: [minimal, low, medium, high, xhigh]
-      # Muse Spark 1.2 Contributor Free (added 2026-08-20, owner). CLI alias
-      # musefree. Same muse family/reasoning variants as muse. Provider is
-      # "opencode" (NOT opencode-go) per owner-specified exact ref
-      # opencode/muse-spark-1.2-contributor-free.
       musefree:
         ref: opencode/muse-spark-1.2-contributor-free
         reasoning_contract:
           variants: [minimal, low, medium, high, xhigh]
-      # Hy3 Free (added 2026-08-21, owner). CLI alias hy3free. Provider is
-      # "opencode" (NOT opencode-go) per owner-specified exact ref
-      # opencode/hy3-free. Catalog: limit.output 64000, reasoning true,
-      # variants [low, medium, high].
       hy3free:
         ref: opencode/hy3-free
         reasoning_contract:
           variants: [low, medium, high]
-      # Ox Alpha Free (added 2026-08-21, owner). CLI alias oxfree.
-      # Exact ref opencode-go/ox-alpha-free. Catalog: limit.output 131072,
-      # reasoning true, variants [low, high, max].
       oxfree:
         ref: opencode-go/ox-alpha-free
         reasoning_contract:
           variants: [low, high, max]
   local:
     kind: local_llama
-    role_policies:
-      generator: {model_key: gemma, request: {temperature: 0.2, seed: 7, max_output_tokens: 70000}}
-      fidelity_reviewer: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 16384}, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
-      russian_selector: {model_key: gemma, request: {temperature: 0.0, max_output_tokens: 1024}}
-      qwen_audit: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}}
-      gemma_audit: {model_key: gemma, request: {temperature: 0.0, max_output_tokens: 4096}}
-      repair: {model_key: gemma, request: {temperature: 0.0, max_output_tokens: 16384}, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
-      entity_extractor: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}}
-      russian_editor: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}}
-      formatting: {model_key: gemma, request: {temperature: 0.1, max_output_tokens: 8000}, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
-      glossary_resolver: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 4096}}
     models:
       gemma:
         model_key: gemma
@@ -98,36 +63,26 @@ providers:
         model_name: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
         server_args: [-ngl, "99", -ncmoe, "18", --load-mode, mmap, --reasoning-budget, "2048", -np, "1", -c, "49152", -fa, "on", --jinja, -ctk, q8_0, -ctv, q4_0, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 2048
+        request: {temperature: 0.2, seed: 7}
       qwen:
         model_key: qwen
         model_path: C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
         model_name: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
         server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "3", --device, SYCL0, -fit, "on", -fitt, "1280", -b, "2048", -ub, "512", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --reasoning-budget, "8192", -np, "1", -c, "49152", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 8192
+        request: {temperature: 0.0}
   openai:
     kind: opencode_server
     models:
-      # GPT-5.6 Luna (verified 2026-08-26 via `opencode models openai --verbose`,
-      # serve 1.18.21 on media: variants none/low/medium/high/xhigh/max).
       luna:
         ref: openai/gpt-5.6-luna
-        # variants verified 2026-08-26 via `opencode models openai --verbose`:
-        # none, low, medium, high, xhigh, max
         reasoning_contract:
           variants: [none, low, medium, high, xhigh, max]
-      # GPT-5.6 Sol (verified 2026-08-26 via `opencode models openai --verbose`:
-      # variants none/low/medium/high/xhigh/max; providerID openai).
       sol:
         ref: openai/gpt-5.6-sol
-        # variants verified 2026-08-26 via `opencode models openai --verbose`:
-        # none, low, medium, high, xhigh, max
         reasoning_contract:
           variants: [none, low, medium, high, xhigh, max]
-      # GPT-5.6 Terra (verified 2026-08-26 via `opencode models openai --verbose`:
-      # variants none/low/medium/high/xhigh/max; providerID openai).
       terra:
         ref: openai/gpt-5.6-terra
-        # variants verified 2026-08-26 via `opencode models openai --verbose`:
-        # none, low, medium, high, xhigh, max
         reasoning_contract:
           variants: [none, low, medium, high, xhigh, max]

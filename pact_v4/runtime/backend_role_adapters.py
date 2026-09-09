@@ -64,6 +64,18 @@ from pact_v4.runtime.qwen_evaluator import (
 
 LOG = logging.getLogger(__name__)
 
+def _shared_budget_for_role(role: str):
+    """Shared top-level role_budgets as sole budget source from registry (no literals)."""
+    from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role
+    budgets = _load_shared_role_budgets_from_registry()
+    b = budgets.get(role)
+    if b is None:
+        raise ValueError(f"shared role_budgets missing role {role!r}")
+    sampling = _sampling_for_remote_role(role)
+    req = dict(sampling)
+    req["max_output_tokens"] = int(b.max_output_tokens)
+    return type("SynthPolicy", (), {"request": req, "output_budget": b.output_budget, "model_key": "registry", "policy_hash": b.budget_hash})()
+
 
 # Phase 2B generation calls produce JSON-object output. The output budget is
 # 70000 tokens (V4.1 A1, owner decision 2026-08-08; raised 2026-08-19 from
@@ -77,24 +89,15 @@ LOG = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 70000
 
 
-def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
-    """Resolve the role → model binding from the backend descriptor.
-
-    Falls back to a ``default`` binding. Raises a role-aware ``ValueError``
-    when no binding exists so a role without an assigned model fails loudly
-    instead of silently using whatever model the transport is serving.
-    """
+def _model_ref_for(backend: CompletionBackend, role: str) -> str:
+    """Resolve exact role → model binding, fail-closed if absent (no fallback)."""
     bindings = backend.descriptor.model_bindings
-    for role in roles:
-        ref = bindings.get(role)
-        if ref:
-            return ref
-    ref = bindings.get("default")
+    ref = bindings.get(role)
     if ref:
         return ref
     raise ValueError(
-        f"no model binding for role(s) {list(roles)!r}; "
-        f"backend model_bindings={dict(bindings)!r}"
+        f"no model binding for role {role!r}; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
     )
 
 
@@ -187,12 +190,14 @@ class BackendModelCaller:
     ) -> None:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
-        # Policy-owned budget when role_policy present; otherwise legacy field
+        # Policy-owned budget when role_policy present; otherwise shared role_budgets (no literals)
         if getattr(self._config, "role_policy", None) is not None:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("generator")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
         # V4.1 GEN-REASONING: the reasoning text of the most recent backend
         # completion (raw_metadata['reasoning'], '' when the transport or
         # provider reported none). Exposed for the whole-chapter generation
@@ -267,7 +272,7 @@ class BackendModelCaller:
         # "fidelity_first"/"balanced_literary" to a different model than
         # "generator", this lookup honours the bundle role first and the
         # alias only as a fallback.
-        model_ref = _model_ref_for(self._backend, (bundle.role, "generator"))
+        model_ref = _model_ref_for(self._backend, "generator")
         request_options: Dict[str, Any] = {}
         if bundle.params.reasoning and _reasoning_transported_via_request_options(
             self._backend, model_ref
@@ -277,16 +282,20 @@ class BackendModelCaller:
         _policy = getattr(self._config, "role_policy", None)
         if _policy is not None:
             _req = dict(_policy.request)
-            if "temperature" not in _req:
-                raise ValueError("BackendModelCaller: role_policy missing temperature")
-            _temperature = float(_req["temperature"])
+            _temperature = float(_req["temperature"]) if "temperature" in _req else None
             _top_p = _req.get("top_p")
             _top_k = _req.get("top_k")
             _min_p = _req.get("min_p")
             _seed = _req.get("seed")
         else:
-            _temperature = float(bundle.params.temperature)
-            _top_p = _top_k = _min_p = _seed = None
+            # Fallback to registry shared budgets/sampling (no literal, no bundle default)
+            _fallback = _shared_budget_for_role("generator")
+            _req = dict(_fallback.request)
+            _temperature = float(_req["temperature"]) if "temperature" in _req else None
+            _top_p = _req.get("top_p")
+            _top_k = _req.get("top_k")
+            _min_p = _req.get("min_p")
+            _seed = _req.get("seed")
         request = CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=user_text),),
@@ -403,13 +412,15 @@ class BackendQwenEvaluator:
     ) -> None:
         self._backend = backend
         self._config = config or BackendQwenEvaluatorConfig()
-        # Policy-owned budget when role_policy present; otherwise legacy field
+        # Policy-owned budget when role_policy present; otherwise shared role_budgets (no literals)
         if getattr(self._config, "role_policy", None) is not None:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             # derive with dummy count; actual per-call derived in __call__
             self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b, item_count=0))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -426,19 +437,19 @@ class BackendQwenEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("BackendQwenEvaluator: role_policy is required (no literal fallback)")
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-        dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
-        req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendQwenEvaluator: role_policy missing temperature")
+            policy = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+            req = dict(policy.request)
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+            req = dict(policy.request)
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("fidelity_reviewer", "qwen_fidelity")
-            ),
+            model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -512,7 +523,9 @@ class BackendGemmaSelector:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("russian_selector")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -534,19 +547,19 @@ class BackendGemmaSelector:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("BackendGemmaSelector: role_policy is required")
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-        max_tok = int(_derive(policy))
-        req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendGemmaSelector: role_policy missing temperature")
+            policy = _shared_budget_for_role("russian_selector")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("russian_selector", "gemma_russian_preference")
-            ),
+            model_ref=_model_ref_for(self._backend, "russian_selector"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -641,7 +654,9 @@ class BackendQwenAuditEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("qwen_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b, item_count=0))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -659,19 +674,19 @@ class BackendQwenAuditEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("BackendQwenAuditEvaluator: role_policy is required")
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-        dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
-        req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendQwenAuditEvaluator: role_policy missing temperature")
+            policy = _shared_budget_for_role("qwen_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+            req = dict(policy.request)
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+            req = dict(policy.request)
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("qwen_audit", "fidelity_reviewer", "qwen_fidelity")
-            ),
+            model_ref=_model_ref_for(self._backend, "qwen_audit"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -745,7 +760,9 @@ class BackendGemmaAuditEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("gemma_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -760,19 +777,19 @@ class BackendGemmaAuditEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("BackendGemmaAuditEvaluator: role_policy is required")
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-        max_tok = int(_derive(policy))
-        req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendGemmaAuditEvaluator: role_policy missing temperature")
+            policy = _shared_budget_for_role("gemma_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("gemma_audit", "russian_selector", "gemma_russian_preference")
-            ),
+            model_ref=_model_ref_for(self._backend, "gemma_audit"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -855,7 +872,9 @@ class BackendRepairCaller:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("repair")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b, item_count=0))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -880,17 +899,19 @@ class BackendRepairCaller:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("BackendRepairCaller: role_policy is required")
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-        dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
-        req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendRepairCaller: role_policy missing temperature")
+            policy = _shared_budget_for_role("repair")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+            req = dict(policy.request)
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+            req = dict(policy.request)
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, ("repair", "generator")),
+            model_ref=_model_ref_for(self._backend, "repair"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -978,7 +999,9 @@ class BackendRegionFidelityGate:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -995,19 +1018,19 @@ class BackendRegionFidelityGate:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("BackendRegionFidelityGate: role_policy is required")
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-        max_tok = int(_derive(policy))
-        req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("BackendRegionFidelityGate: role_policy missing temperature")
+            policy = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("fidelity_reviewer", "qwen_fidelity")
-            ),
+            model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
@@ -1075,19 +1098,19 @@ class BackendRegionFidelityGate:
             )
             policy = getattr(self._config, "role_policy", None)
             if policy is None:
-                raise ValueError("BackendRegionFidelityGate.batch: role_policy is required")
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tokens = int(_derive(policy, item_count=len(chunk)))
-            req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendRegionFidelityGate.batch: role_policy missing temperature")
+                policy = _shared_budget_for_role("fidelity_reviewer")
+                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+                max_tokens = int(_derive(policy, item_count=len(chunk)))
+                req = dict(policy.request)
+            else:
+                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+                max_tokens = int(_derive(policy, item_count=len(chunk)))
+                req = dict(policy.request)
             request = CompletionRequest(
-                model_ref=_model_ref_for(
-                    self._backend, ("fidelity_reviewer", "qwen_fidelity")
-                ),
+                model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tokens,
-                temperature=float(req["temperature"]),
+                temperature=float(req["temperature"]) if "temperature" in req else None,
                 top_p=req.get("top_p"),
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),

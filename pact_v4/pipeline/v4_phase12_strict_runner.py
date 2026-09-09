@@ -504,11 +504,37 @@ class StrictRunConfig:
         _resolved_hash = None
         _per_role = {}
         try:
-            if self.resolved_role_policies is not None:
-                _resolved_hash = self.resolved_role_policies.aggregate_hash  # type: ignore[attr-defined]
-                _per_role = {k: v.policy_hash for k, v in self.resolved_role_policies.policies.items()}  # type: ignore[attr-defined]
+            pair = self.resolved_role_policies
+            if pair is not None:
+                if hasattr(pair, "role_budgets"):
+                    _resolved_hash = pair.aggregate_hash  # type: ignore[attr-defined]
+                    # Sampling excluded from global identity: per_role keeps budget hash only,
+                    # sampling lives in per-request cache/provenance (per_role_hash = sampling+budget)
+                    _per_role = {k: pair.role_budgets[k].budget_hash for k in pair.role_budgets}  # type: ignore[attr-defined]
+                elif hasattr(pair, "policies"):
+                    _resolved_hash = pair.aggregate_hash  # type: ignore[attr-defined]
+                    _per_role = {}
+                    for k, v in pair.policies.items():  # type: ignore[attr-defined]
+                        try:
+                            ob = getattr(v, "output_budget", None)
+                            if ob is not None and hasattr(ob, "budget_hash"):
+                                _per_role[k] = ob.budget_hash
+                            else:
+                                _per_role[k] = v.policy_hash
+                        except Exception:
+                            _per_role[k] = v.policy_hash
         except Exception:
             _resolved_hash = None
+        # Sampling excluded from global identity: generation temperature/seed are per-role
+        # (translator/reviewer models), not global. Global keeps only budgets/routing/server_args.
+        try:
+            _pair_present = self.resolved_role_policies is not None  # type: ignore[attr-defined]
+        except Exception:
+            _pair_present = False
+        if _pair_present:
+            _gen_block = {"max_tokens": self.max_tokens, "reasoning": self.reasoning, "per_role_sampling": "delegated"}
+        else:
+            _gen_block = {"temperature": self.temperature, "seed": self.seed, "max_tokens": self.max_tokens, "reasoning": self.reasoning}
         values = {
             "chapter_id": self.chapter_id,
             "model_profile": model_profile,
@@ -518,12 +544,7 @@ class StrictRunConfig:
             "chunk_target_words": self.target_chunk_words,
             "chunk_max_words": self.max_chunk_words,
             "right_context_pids": self.right_context_pids,
-            "generation": {
-                "temperature": self.temperature,
-                "seed": self.seed,
-                "max_tokens": self.max_tokens,
-                "reasoning": self.reasoning,
-            },
+            "generation": _gen_block,
             "stop_after": self.stop_after,
             "whole_chapter": self.whole_chapter,
             "formatting": {
@@ -2956,6 +2977,13 @@ def run_chapter_strict(
                     "dropped_count": len(dropped_glossary),
                 }
 
+                _gen_rph = None
+                try:
+                    _pair = getattr(cfg, "resolved_pair", None) or getattr(cfg, "resolved_role_policies", None)
+                    if _pair is not None and hasattr(_pair, "per_role_hash"):
+                        _gen_rph = _pair.per_role_hash("generator")  # sampling in per-request cache identity
+                except Exception:
+                    _gen_rph = None
                 outcome = generate_for_chunk(
                     chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
                     chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
@@ -2963,6 +2991,7 @@ def run_chapter_strict(
                     config=config, params=generation_params,
                     model_caller=model_caller, cache=gen_cache,
                     lazy_balanced=cfg.lazy_balanced,
+                    role_policy_hash=_gen_rph,
                 )
                 generation_records.append(_serialize_generation_outcome(outcome))
 
@@ -3093,6 +3122,13 @@ def run_chapter_strict(
                 # 2-candidate + Gemma behavior, full rollback).
                 if cfg.lazy_balanced and result.quarantine:
                     primary_quarantine_reason = result.quarantine_reason
+                    _lazy_rph = None
+                    try:
+                        _pair2 = getattr(cfg, "resolved_pair", None) or getattr(cfg, "resolved_role_policies", None)
+                        if _pair2 is not None and hasattr(_pair2, "per_role_hash"):
+                            _lazy_rph = _pair2.per_role_hash("generator")
+                    except Exception:
+                        _lazy_rph = None
                     lazy_outcome = generate_for_chunk(
                         chunk_id=plan_chunk.chunk_id, risk=risk, source=source, snapshot=snapshot,
                         chunk_plan=chunk_plan, left_context=left_context, right_context=right_context,
@@ -3100,6 +3136,7 @@ def run_chapter_strict(
                         config=config, params=generation_params,
                         model_caller=model_caller, cache=gen_cache,
                         roles=("fidelity_first",),
+                        role_policy_hash=_lazy_rph,
                     )
                     # RV A2 fix: the lazy fidelity outcome must join the
                     # chunk's PRIMARY generation record instead of being

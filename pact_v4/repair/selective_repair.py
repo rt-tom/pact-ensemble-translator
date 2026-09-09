@@ -550,22 +550,15 @@ class SelectiveRepairOutcome:
         }
 
 
-# Roles that may serve the repair call, in priority order (generator first —
-# the repair model is the generator by owner decision, Kocmi-safe).
-_REPAIR_ROLES = ("generator", "default")
-
-
 def repair_model_ref(backend: CompletionBackend) -> str:
-    """Resolve the model reference for the repair role (generator, else
-    ``default``); raises when unbound so a misconfigured role fails loudly."""
+    """Resolve the model reference for the exact ``repair`` role; raises when unbound (no fallback)."""
     bindings = backend.descriptor.model_bindings
-    for role in _REPAIR_ROLES:
-        ref = bindings.get(role)
-        if ref:
-            return str(ref)
+    ref = bindings.get("repair")
+    if ref:
+        return str(ref)
     raise ValueError(
-        f"no model binding for repair role(s) {list(_REPAIR_ROLES)!r}; "
-        f"backend model_bindings={dict(bindings)!r}"
+        f"no model binding for repair role 'repair'; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
     )
 
 
@@ -1735,26 +1728,30 @@ class SelectiveRepairEvaluator:
         ):
             request_options["reasoning"] = cfg.repair_reasoning
         policy = getattr(cfg, "role_policy", None)
-        if policy is not None:
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tok = int(_derive(policy, item_count=len(findings)))
-            req = dict(policy.request)
-            request = CompletionRequest(
-                model_ref=model_ref,
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=max_tok,
-                temperature=float(req["temperature"]),
-                top_p=req.get("top_p"),
-                top_k=req.get("top_k"),
-                min_p=req.get("min_p"),
-                seed=req.get("seed"),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=cfg.label,
-                on_reasoning_chunk=open_reasoning_writer(reason_path),
-                request_options=request_options,
-            )
-        else:
-            raise ValueError("role_policy is required")
+        if policy is None:
+            from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role
+            _b = _load_shared_role_budgets_from_registry()["repair"]
+            _s = _sampling_for_remote_role("repair")
+            _req = dict(_s)
+            _req["max_output_tokens"] = int(_b.max_output_tokens)
+            policy = type("SynthPolicy", (), {"request": _req, "output_budget": _b.output_budget, "model_key": "registry", "policy_hash": _b.budget_hash})()
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy, item_count=len(findings)))
+        req = dict(policy.request)
+        request = CompletionRequest(
+            model_ref=model_ref,
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]) if "temperature" in req else None,
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=cfg.label,
+            on_reasoning_chunk=open_reasoning_writer(reason_path),
+            request_options=request_options,
+        )
         try:
             response = self._repair_backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
@@ -1996,26 +1993,25 @@ class SelectiveRepairEvaluator:
                 reason_path = out_dir / (
                     f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
                 )
-            r_policy = getattr(cfg, "reaudit_role_policy", None) or getattr(cfg, "role_policy", None)
-            if r_policy is not None:
-                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-                max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
-                req_r = dict(r_policy.request)
-                request = CompletionRequest(
-                    model_ref=model_ref,
-                    messages=(Message(role="user", content=prompt),),
-                    max_output_tokens=max_tok_r,
-                    temperature=float(req_r["temperature"]),
-                    top_p=req_r.get("top_p"),
-                    top_k=req_r.get("top_k"),
-                    min_p=req_r.get("min_p"),
-                    seed=req_r.get("seed"),
-                    response_schema=JSON_OBJECT_SCHEMA,
-                    label=cfg.reaudit_label,
-                    on_reasoning_chunk=open_reasoning_writer(reason_path),
-                )
-            else:
-                raise ValueError("Reaudit: role_policy is required")
+            r_policy = getattr(cfg, "reaudit_role_policy", None)
+            if r_policy is None:
+                raise ValueError("repair re-audit requires explicit reaudit_role_policy (qwen_audit) — fallback to repair policy is forbidden; fail-closed")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
+            req_r = dict(r_policy.request)
+            request = CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok_r,
+                temperature=float(req_r["temperature"]) if "temperature" in req_r else None,
+                top_p=req_r.get("top_p"),
+                top_k=req_r.get("top_k"),
+                min_p=req_r.get("min_p"),
+                seed=req_r.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=cfg.reaudit_label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
+            )
 
             def _complete() -> str:
                 # Re-issues the IDENTICAL request on a retry (same prompt,

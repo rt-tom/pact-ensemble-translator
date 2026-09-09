@@ -33,6 +33,17 @@ from pact_v4.runtime.runtime_config import (
 )
 
 REGISTRY_YAML = """\
+role_budgets:
+  generator: {max_output_tokens: 1000}
+  repair: {max_output_tokens: 1000}
+  formatting: {max_output_tokens: 1000}
+  gemma_audit: {max_output_tokens: 1000}
+  qwen_audit: {max_output_tokens: 1000}
+  fidelity_reviewer: {max_output_tokens: 1000}
+  russian_selector: {max_output_tokens: 1000}
+  entity_extractor: {max_output_tokens: 1000}
+  russian_editor: {max_output_tokens: 1000}
+  glossary_resolver: {max_output_tokens: 1000}
 providers:
   opencode-go:
     kind: opencode_server
@@ -118,6 +129,17 @@ def test_load_registry_rejects_flat_model_entry(registry_path: Path):
     # Every model must carry its reasoning contract (acceptance: adding a
     # model REQUIRES variants verification + reasoning_contract fixation).
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
@@ -131,6 +153,17 @@ def test_load_registry_rejects_flat_model_entry(registry_path: Path):
 
 def test_load_registry_requires_reasoning_variants(registry_path: Path):
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
@@ -145,6 +178,17 @@ def test_load_registry_requires_reasoning_variants(registry_path: Path):
 
 def test_load_registry_rejects_unknown_variant(registry_path: Path):
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
@@ -161,6 +205,17 @@ def test_load_registry_rejects_unknown_variant(registry_path: Path):
 
 def test_load_registry_rejects_unsupported_kind(registry_path: Path):
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: codex_cli\n"
@@ -327,17 +382,19 @@ def _composite_cfg(
         LocalLlamaBackendConfig,
     )
 
+    # Fixed new groups: translator = generator, repair, formatting, gemma_audit ; reviewer = qwen_audit, fidelity_reviewer, russian_selector, entity_extractor, russian_editor, glossary_resolver
     bindings = {
         "generator": "opencode-go/deepseek-v4-flash",
+        "repair": "opencode-go/deepseek-v4-flash",
+        "formatting": "opencode-go/deepseek-v4-flash",
+        "gemma_audit": "opencode-go/deepseek-v4-flash",
         "fidelity_reviewer": "opencode-go/qwen3.7-plus",
         "russian_selector": "opencode-go/qwen3.7-plus",
         "qwen_audit": "opencode-go/qwen3.7-plus",
-        "gemma_audit": "opencode-go/deepseek-v4-flash",
+        "entity_extractor": "opencode-go/qwen3.7-plus",
+        "russian_editor": "opencode-go/qwen3.7-plus",
+        "glossary_resolver": "opencode-go/qwen3.7-plus",
     }
-    if include_repair:
-        bindings["repair"] = "opencode-go/deepseek-v4-flash"
-    if include_entity_extractor:
-        bindings["entity_extractor"] = "opencode-go/qwen3.7-plus"
     remote = OpenCodeBackendConfig(
         server=OpenCodeServerBackendConfig(
             base_url="http://127.0.0.1:4096",
@@ -355,15 +412,16 @@ def _composite_cfg(
     )
     role_backend_map = {
         "generator": "opencode",
+        "repair": "opencode",
+        "formatting": "opencode",
+        "gemma_audit": "opencode",
         "fidelity_reviewer": "opencode",
         "russian_selector": "opencode",
         "qwen_audit": "opencode",
-        "gemma_audit": "local",
+        "entity_extractor": "opencode",
+        "russian_editor": "opencode",
+        "glossary_resolver": "opencode",
     }
-    if include_repair:
-        role_backend_map["repair"] = "opencode"
-    if include_entity_extractor:
-        role_backend_map["entity_extractor"] = "opencode"
     return CompositeBackendConfig(
         backends={"opencode": remote, "local": local},
         role_backend_map=role_backend_map,
@@ -530,51 +588,88 @@ def _dual_generator_composite() -> Any:
 
     a = _opencode("a", {
         "generator": "opencode-go/deepseek-v4-flash",
-        "qwen_audit": "opencode-go/qwen3.7-plus",
-    })
-    b = _opencode("b", {
-        "generator": "opencode-go/qwen3.7-plus",
+        "repair": "opencode-go/deepseek-v4-flash",
+        "formatting": "opencode-go/deepseek-v4-flash",
+        "gemma_audit": "opencode-go/deepseek-v4-flash",
         "qwen_audit": "opencode-go/qwen3.7-plus",
         "fidelity_reviewer": "opencode-go/qwen3.7-plus",
         "russian_selector": "opencode-go/qwen3.7-plus",
+        "entity_extractor": "opencode-go/qwen3.7-plus",
+        "russian_editor": "opencode-go/qwen3.7-plus",
+        "glossary_resolver": "opencode-go/qwen3.7-plus",
+    })
+    b = _opencode("b", {
+        "generator": "opencode-go/qwen3.7-plus",
+        "repair": "opencode-go/qwen3.7-plus",
+        "formatting": "opencode-go/qwen3.7-plus",
+        "gemma_audit": "opencode-go/qwen3.7-plus",
+        "qwen_audit": "opencode-go/qwen3.7-plus",
+        "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+        "russian_selector": "opencode-go/qwen3.7-plus",
+        "entity_extractor": "opencode-go/qwen3.7-plus",
+        "russian_editor": "opencode-go/qwen3.7-plus",
+        "glossary_resolver": "opencode-go/qwen3.7-plus",
     })
     return CompositeBackendConfig(
         backends={"a": a, "b": b},
         role_backend_map={
             "generator": "b",
             "repair": "b",
+            "formatting": "b",
+            "gemma_audit": "b",
             "qwen_audit": "b",
             "fidelity_reviewer": "b",
             "russian_selector": "b",
+            "entity_extractor": "b",
+            "russian_editor": "b",
+            "glossary_resolver": "b",
         },
     )
 
 
 def _dual_audit_composite() -> Any:
     """A valid composite where TWO sub-backends declare the qwen_audit role
-    with DIFFERENT refs and the role map routes the audit roles to ``b``;
-    entity_extractor is declared by NOBODY (the documented fallback to
-    qwen_audit must resolve it to the same concrete backend).
+    with DIFFERENT refs and the role map routes the audit roles to ``b``.
     """
     from pact_v4.runtime.runtime_config import CompositeBackendConfig
 
     a = _opencode("a", {
         "generator": "opencode-go/deepseek-v4-flash",
+        "repair": "opencode-go/deepseek-v4-flash",
+        "formatting": "opencode-go/deepseek-v4-flash",
+        "gemma_audit": "opencode-go/deepseek-v4-flash",
         "qwen_audit": "opencode-go/qwen3.7-plus",
+        "fidelity_reviewer": "opencode-go/qwen3.7-plus",
+        "russian_selector": "opencode-go/qwen3.7-plus",
+        "entity_extractor": "opencode-go/qwen3.7-plus",
+        "russian_editor": "opencode-go/qwen3.7-plus",
+        "glossary_resolver": "opencode-go/qwen3.7-plus",
     })
     b = _opencode("b", {
         "generator": "opencode-go/deepseek-v4-flash",
+        "repair": "opencode-go/deepseek-v4-flash",
+        "formatting": "opencode-go/deepseek-v4-flash",
+        "gemma_audit": "opencode-go/deepseek-v4-flash",
         "qwen_audit": "opencode-go/deepseek-v4-flash",
         "fidelity_reviewer": "opencode-go/qwen3.7-plus",
         "russian_selector": "opencode-go/qwen3.7-plus",
+        "entity_extractor": "opencode-go/qwen3.7-plus",
+        "russian_editor": "opencode-go/qwen3.7-plus",
+        "glossary_resolver": "opencode-go/qwen3.7-plus",
     })
     return CompositeBackendConfig(
         backends={"a": a, "b": b},
         role_backend_map={
             "generator": "b",
+            "repair": "b",
+            "formatting": "b",
+            "gemma_audit": "b",
             "qwen_audit": "b",
             "fidelity_reviewer": "b",
             "russian_selector": "b",
+            "entity_extractor": "b",
+            "russian_editor": "b",
+            "glossary_resolver": "b",
         },
     )
 
@@ -643,16 +738,15 @@ def test_reviewer_entity_extractor_fallback_on_duplicate_audit_routes_to_mapped_
 
 
 def test_composite_descriptor_keeps_fallback_roles_unbound_when_undeclared():
-    # repair/entity_extractor undeclared by every sub-backend stay ABSENT
-    # from the descriptor: no synthetic bindings are introduced, so the
-    # identity of existing composites does not change (no cache/resume
-    # regression). The runtime resolves them via the generator / qwen_audit
-    # refs at request time (_EntityRoleView / repair -> generator fallback).
+    # After model-centric fixed groups (2026-09), every role is bound explicitly.
+    # The composite with all 10 roles now has repair/entity_extractor present.
     cfg = _composite_cfg()
     bindings = cfg.build_descriptor().model_bindings
-    assert "repair" not in bindings
-    assert "entity_extractor" not in bindings
+    assert "repair" in bindings
+    assert "entity_extractor" in bindings
     assert bindings["generator"] == "opencode-go/deepseek-v4-flash"
+    assert bindings["repair"] == "opencode-go/deepseek-v4-flash"
+    assert bindings["entity_extractor"] == "opencode-go/qwen3.7-plus"
 
 
 def test_provider_model_validation():

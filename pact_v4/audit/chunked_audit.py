@@ -155,28 +155,15 @@ def pairs_from_maps(
     )
 
 
-# Roles that may serve the audit call, in priority order (same fallback
-# contract as the runtime role adapters: any role binding, else ``default``).
-_AUDIT_ROLES = ("qwen_audit", "fidelity_reviewer", "qwen_fidelity")
-
-
 def audit_model_ref(backend: CompletionBackend) -> str:
-    """Resolve the model reference for the audit role from the backend
-    descriptor (role binding, else ``default``). Raises when unbound so a
-    role without an assigned model fails loudly instead of silently using
-    whatever model the transport serves.
-    """
+    """Resolve exact qwen_audit binding, fail-closed (no fallback)."""
     bindings = backend.descriptor.model_bindings
-    for role in _AUDIT_ROLES:
-        ref = bindings.get(role)
-        if ref:
-            return str(ref)
-    ref = bindings.get("default")
+    ref = bindings.get("qwen_audit")
     if ref:
         return str(ref)
     raise ValueError(
-        f"no model binding for audit role(s) {list(_AUDIT_ROLES)!r}; "
-        f"backend model_bindings={dict(bindings)!r}"
+        f"no model binding for role 'qwen_audit'; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
     )
 
 
@@ -991,17 +978,20 @@ class ChunkedAuditEvaluator:
     ) -> CompletionRequest:
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("ChunkedAuditEvaluator: role_policy is required")
+            from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role, RoleBudget
+            _b = _load_shared_role_budgets_from_registry()["qwen_audit"]
+            _s = _sampling_for_remote_role("qwen_audit")
+            _req = dict(_s)
+            _req["max_output_tokens"] = int(_b.max_output_tokens)
+            policy = type("SynthPolicy", (), {"request": _req, "output_budget": _b.output_budget, "model_key": "registry", "policy_hash": _b.budget_hash})()
         from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
         max_tok = int(_derive(policy, item_count=item_count))
         req = dict(policy.request)
-        if "temperature" not in req:
-            raise ValueError("ChunkedAuditEvaluator: role_policy missing temperature")
         return CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
-            temperature=float(req["temperature"]),
+            temperature=float(req["temperature"]) if "temperature" in req else None,
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),

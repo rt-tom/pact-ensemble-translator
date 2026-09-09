@@ -138,8 +138,9 @@ class HttpGemmaSelector:
         )
         from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 
+        from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig
         self._impl = BackendGemmaSelector(
-            LocalOpenAIBackend(api=api),
+            LocalOpenAIBackend(api=api, config=LocalOpenAIBackendConfig(api=api.config, name=api.name, model_bindings={"russian_selector": api.config.model})),
             config=BackendGemmaSelectorConfig(
                 max_tokens=self._max_tokens,
                 template=self._config.template,

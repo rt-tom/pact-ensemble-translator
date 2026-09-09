@@ -260,8 +260,9 @@ class HttpQwenEvaluator:
         )
         from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 
+        from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig
         self._impl = BackendQwenEvaluator(
-            LocalOpenAIBackend(api=api),
+            LocalOpenAIBackend(api=api, config=LocalOpenAIBackendConfig(api=api.config, name=api.name, model_bindings={"fidelity_reviewer": api.config.model})),
             config=BackendQwenEvaluatorConfig(
                 max_tokens=self._max_tokens,
                 template=self._config.template,

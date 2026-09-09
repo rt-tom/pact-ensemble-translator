@@ -1,12 +1,12 @@
 ## 1. Registry and fixed role map
 
-- [ ] 1.1 Define one fixed role mapping, used by local and remote: translator (`generator/repair/russian_selector/gemma_audit/formatting`) and reviewer (`qwen_audit/fidelity_reviewer/entity_extractor/russian_editor/glossary_resolver`). Update remote `TRANSLATOR_ROLES`/`REVIEWER_ROLES`, runtime profiles, defaults, and binding tests to this map.
+- [ ] 1.1 Define one fixed role mapping, used by local and remote: translator (`generator/repair/formatting/gemma_audit`) and reviewer (`qwen_audit/fidelity_reviewer/russian_selector/entity_extractor/russian_editor/glossary_resolver`). Update remote `TRANSLATOR_ROLES`/`REVIEWER_ROLES`, runtime profiles, defaults, and binding tests to this map. Bind every role explicitly; remove role-to-role and `default` resolution fallbacks.
 - [ ] 1.2 Replace local `role_policies` with top-level shared `role_budgets` (all ten roles, only `max_output_tokens/output_budget`) and model-owned `providers.local.models.<alias>.request` (`temperature/top_p/top_k/min_p/seed`). Validate all shapes/types/ranges and reject model request `max_output_tokens` fail-closed.
 - [ ] 1.3 Retain production `gemma`/`qwen` aliases from `runtime_local.example.yaml`; validate paths/names/string args/reasoning agreement. Define immutable `ResolvedModelPair` and case-insensitive local alias lookup.
 
 ## 2. Transport and producers
 
-- [ ] 2.1 Wire every V4 producer to `ResolvedModelPair`: translator roles take model request from left pair model, reviewer roles from right; final budget from `role_budgets[role]` through one `derive_max_output_tokens` helper. Remove sampling/budget code literals and glossary descriptor introspection.
+- [ ] 2.1 Wire every V4 producer to `ResolvedModelPair`: translator roles take model request from left pair model, reviewer roles from right; final budget from `role_budgets[role]` through one `derive_max_output_tokens` helper. Each producer resolves only its exact role and fails closed when it is absent. Remove sampling/budget code literals and glossary descriptor introspection.
 - [ ] 2.2 Serialize local `temperature/top_p/top_k/min_p/seed` from selected model and `max_output_tokens` from role budget; local `reasoning` rejected, server args only. Apply to generation/repair/selector/Gemma audit/formatting/Qwen audit/fidelity/re-gate/entity/Russian editor/glossary/B3.
 - [ ] 2.3 Thread resolved pair through strict config, B3, role adapters, formatting and glossary; code must fail closed if normal simple local execution has no pair.
 

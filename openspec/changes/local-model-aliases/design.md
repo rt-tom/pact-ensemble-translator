@@ -1,6 +1,6 @@
 ## Context
 
-Current remote CLI overrides bind only a subset of roles (`TRANSLATOR_ROLES = generator, repair`; `REVIEWER_ROLES = qwen_audit, fidelity_reviewer, russian_selector, entity_extractor`). Current local aliases are role-policy-centric. Neither matches the owner's required model-centric design: two models in every run, fixed groups identical across transports, sampling on models, budgets on roles.
+Current remote CLI overrides bind only a subset of roles (`TRANSLATOR_ROLES = generator, repair`; `REVIEWER_ROLES = qwen_audit, fidelity_reviewer, russian_selector, entity_extractor`) and use fallback chains for the remaining roles. Current local aliases are role-policy-centric. Neither matches the owner's required model-centric design: two models in every run, fixed groups identical across transports, explicit binding for every role with no fallback, sampling on models, budgets on roles.
 
 ## Goals / Non-Goals
 
@@ -23,12 +23,12 @@ Current remote CLI overrides bind only a subset of roles (`TRANSLATOR_ROLES = ge
 This is the sole role map for local **and remote**, including alias overrides and runtime profile bindings:
 
 ```text
-translator = generator, repair, russian_selector, gemma_audit, formatting
-reviewer   = qwen_audit, fidelity_reviewer, entity_extractor,
-             russian_editor, glossary_resolver
+translator = generator, repair, formatting, gemma_audit
+reviewer   = qwen_audit, fidelity_reviewer, russian_selector,
+             entity_extractor, russian_editor, glossary_resolver
 ```
 
-Implementation changes existing `TRANSLATOR_ROLES`/`REVIEWER_ROLES` and adds explicit bindings/fallbacks for all ten roles in remote profiles. No `models.<alias>` field controls role membership. A formatter/auditor model change is therefore always selected by its group position, never by an ad hoc role setting.
+Implementation changes existing `TRANSLATOR_ROLES`/`REVIEWER_ROLES` and adds explicit bindings for all ten roles in local and remote profiles. Every producer resolves its exact role only: no role-to-role or `default` fallback is permitted. No `models.<alias>` field controls role membership. A formatter/auditor model change is therefore always selected by its group position, never by an ad hoc role setting.
 
 ### 2. Registry shape
 
@@ -71,7 +71,7 @@ Top-level `role_budgets` requires all ten role keys, only output-budget fields, 
 - final `max_output_tokens` only from `derive_max_output_tokens(role_budgets[role], item_count/span_count)`;
 - local reasoning only from the selected model's `server_args`.
 
-All ten producers (generation, repair, selector, Gemma audit, formatting, Qwen audit, fidelity/re-gate, entity extractor, Russian editor, glossary resolver) receive that resolved pair. `ApiClient` only serializes sampling explicitly in that model request and limit explicitly derived from role budget.
+All ten producers (generation, repair, formatting, Gemma audit, Qwen audit, fidelity/re-gate, selector, entity extractor, Russian editor, glossary resolver) receive that resolved pair and fail closed if their exact role is not bound. `ApiClient` only serializes sampling explicitly in that model request and limit explicitly derived from role budget.
 
 ### 5. Cache and provenance
 
