@@ -1054,12 +1054,17 @@ def _handle_book(argv: Sequence[str]) -> int:
     delegated += ["--chapter-html-pattern", chapter_html_pattern]
     delegated += ["--memory-dir", str(memory_dir)]
     delegated += ["--out-base", str(out_base)]
-    # When local alias is used, forward --local <alias> so delegated book run resolves alias with providers_config
-    if local_alias_value is not None:
-        delegated += ["--local", local_alias_value]
-        if args.providers_config:
+    # Local simple mode: forward --local (bare or alias) so delegated book run resolves via providers registry.
+    # It must NOT also forward --runtime-config, which strict explicitly rejects for --local (mutual exclusion).
+    if is_simple_local:
+        if local_alias_value is not None:
+            delegated += ["--local", local_alias_value]
+        else:
+            delegated += ["--local"]
+        if args.providers_config and "--providers-config" not in delegated:
             delegated += ["--providers-config", str(args.providers_config)]
-    delegated += ["--runtime-config", str(cfg_path)]
+    else:
+        delegated += ["--runtime-config", str(cfg_path)]
     # Translator/reviewer for simple remote
     if is_simple_remote:
         if remote_translator:
