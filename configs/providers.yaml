@@ -91,7 +91,19 @@ providers:
       russian_editor: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}}
       formatting: {model_key: gemma, request: {temperature: 0.1, max_output_tokens: 8000}, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
       glossary_resolver: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 4096}}
-    models: {}
+    models:
+      gemma:
+        model_key: gemma
+        model_path: C:/llama-cpp/models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+        model_name: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
+        server_args: [-ngl, "99", -ncmoe, "18", --load-mode, mmap, --reasoning-budget, "2048", -np, "1", -c, "49152", -fa, "on", --jinja, -ctk, q8_0, -ctv, q4_0, --cache-ram, "0", --ctx-checkpoints, "0"]
+        reasoning_budget: 2048
+      qwen:
+        model_key: qwen
+        model_path: C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+        model_name: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "3", --device, SYCL0, -fit, "on", -fitt, "1280", -b, "2048", -ub, "512", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --reasoning-budget, "8192", -np, "1", -c, "49152", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
+        reasoning_budget: 8192
   openai:
     kind: opencode_server
     models:
