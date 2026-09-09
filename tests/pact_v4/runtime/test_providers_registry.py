@@ -551,7 +551,7 @@ def test_composite_fallback_resolving_to_local_backend_fails_loudly():
         backends={"local": local},
         role_backend_map={"generator": "local"},
     )
-    with pytest.raises(ValueError, match="is not routed"):
+    with pytest.raises(ValueError, match="local backend"):
         apply_role_models(cfg, {"repair": "opencode-go/deepseek-v4-flash"})
 
 

@@ -1736,12 +1736,11 @@ class SelectiveRepairEvaluator:
             request_options["reasoning"] = cfg.repair_reasoning
         policy = getattr(cfg, "role_policy", None)
         if policy is None:
-            max_tok = int(cfg.max_tokens)
-            req = {"temperature": 0.0}
+            from pact_v4.runtime.runtime_config import _default_role_budgets, derive_max_output_tokens as _derive
+            _b = _default_role_budgets()["repair"]
+            policy = type("TmpPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": int(_b.max_output_tokens)}, "output_budget": _b.output_budget})()
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tok = int(_derive(policy, item_count=len(findings)))
-            req = dict(policy.request)
         max_tok = int(_derive(policy, item_count=len(findings)))
         req = dict(policy.request)
         request = CompletionRequest(
@@ -2001,12 +2000,11 @@ class SelectiveRepairEvaluator:
                 )
             r_policy = getattr(cfg, "reaudit_role_policy", None) or getattr(cfg, "role_policy", None)
             if r_policy is None:
-                max_tok_r = int(getattr(cfg, "reaudit_max_tokens", 12000))
-                req_r = {"temperature": 0.0}
+                from pact_v4.runtime.runtime_config import _default_role_budgets, derive_max_output_tokens as _derive
+                _b = _default_role_budgets()["qwen_audit"]
+                r_policy = type("TmpPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": int(_b.max_output_tokens)}, "output_budget": _b.output_budget})()
             else:
                 from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-                max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
-                req_r = dict(r_policy.request)
             max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
             req_r = dict(r_policy.request)
             request = CompletionRequest(

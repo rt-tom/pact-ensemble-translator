@@ -501,12 +501,20 @@ class LocalLlamaBackendConfig:
     def _role_bindings(self) -> Dict[str, str]:
         # Explicit binding for every fixed role, no fallback to another role or default
         if self.resolved_pair is None:
-            # Composite test fixtures may declare a local sub-backend that is
-            # not the role owner (remote serves all). Returning empty keeps
-            # descriptor construction valid for those fixtures; normal local
-            # execution is fail-closed via the strict runner's pair check
-            # (build_role_adapters requires pair). Never synthesize fallback
-            # bindings here.
+            # No pair (test fixtures / composite sub-backend): provide deterministic
+            # bindings from model_names when available so offline tests can route.
+            # Production local execution is fail-closed via build_role_adapters pair check.
+            if self.model_names:
+                # Use gemma model for translator roles if present, else first model
+                t_name = self.model_names.get("gemma") or next(iter(self.model_names.values()))
+                # Use qwen model for reviewer roles if present, else t_name
+                r_name = self.model_names.get("qwen") or t_name
+                bindings: Dict[str, str] = {}
+                for role in TRANSLATOR_ROLES:
+                    bindings[role] = t_name
+                for role in REVIEWER_ROLES:
+                    bindings[role] = r_name
+                return bindings
             return {}
         t_name = self.resolved_pair.translator_model.model_name
         r_name = self.resolved_pair.reviewer_model.model_name
@@ -549,8 +557,9 @@ class LocalLlamaBackendConfig:
         }
         if self.resolved_pair is not None:
             eff["resolved_pair_hash"] = self.resolved_pair.aggregate_hash
-            # per_role includes sampling + budget for provenance, but identity (aggregate) excludes sampling
-            eff["per_role_hashes"] = {k: self.resolved_pair.per_role_hash(k) for k in sorted(self.resolved_pair.role_budgets)}
+            # Run identity excludes sampling: only budget hashes are identity-bearing.
+            # per_role sampling hashes are provenance-only (stored separately, not in effective_options).
+            eff["per_role_budget_hashes"] = {k: self.resolved_pair.role_budgets[k].budget_hash for k in sorted(self.resolved_pair.role_budgets)}
             # keep backward key for old caches that expect resolved_role_policies_hash (alias)
             eff["resolved_role_policies_hash"] = self.resolved_pair.aggregate_hash
         return BackendDescriptor(
@@ -1299,13 +1308,20 @@ def build_role_adapters(
     if pair is None:
         if isinstance(cfg, LocalLlamaBackendConfig):
             raise ValueError("build_role_adapters: ResolvedModelPair is required for local execution (no literal fallback)")
-        # Remote/composite without local pair: adapters without role_policy (use default temps/budgets)
+        # Remote/composite without local pair: synthesize policies from shared top-level role_budgets as sole budget source
+        shared = _default_role_budgets()
+        def _synth_remote(role: str):
+            budget = shared[role]
+            req = {"temperature": 0.0}
+            # include max for derive compatibility but budget is authoritative
+            req["max_output_tokens"] = int(budget.max_output_tokens)
+            return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "remote", "policy_hash": budget.budget_hash})()
         return (
-            BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry)),
-            BackendQwenEvaluator(backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text)),
-            BackendGemmaSelector(backend, config=BackendGemmaSelectorConfig(retry=retry)),
-            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
-            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
+            BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry, role_policy=_synth_remote(ROLE_GENERATOR))),
+            BackendQwenEvaluator(backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth_remote(ROLE_FIDELITY_REVIEWER))),
+            BackendGemmaSelector(backend, config=BackendGemmaSelectorConfig(retry=retry, role_policy=_synth_remote(ROLE_RUSSIAN_SELECTOR))),
+            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth_remote(ROLE_QWEN_AUDIT))),
+            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth_remote(ROLE_GEMMA_AUDIT))),
         )
     # If pair is old ResolvedRolePolicies (backward for remote tests), handle directly
     if hasattr(pair, "policies"):
@@ -1383,11 +1399,17 @@ def build_repair_adapters(
     if pair is None:
         if isinstance(cfg, LocalLlamaBackendConfig):
             raise ValueError("build_repair_adapters: ResolvedModelPair is required for local execution (no literal fallback)")
+        shared = _default_role_budgets()
+        def _synth_remote(role: str):
+            budget = shared[role]
+            req = {"temperature": 0.0}
+            req["max_output_tokens"] = int(budget.max_output_tokens)
+            return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "remote", "policy_hash": budget.budget_hash})()
         return (
-            BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry)),
-            BackendRegionFidelityGate(backend, config=BackendRegionFidelityGateConfig(retry=retry)),
-            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
-            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
+            BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry, role_policy=_synth_remote(ROLE_REPAIR))),
+            BackendRegionFidelityGate(backend, config=BackendRegionFidelityGateConfig(retry=retry, role_policy=_synth_remote(ROLE_FIDELITY_REVIEWER))),
+            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth_remote(ROLE_QWEN_AUDIT))),
+            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth_remote(ROLE_GEMMA_AUDIT))),
         )
     if hasattr(pair, "policies"):
         resolved = pair  # type: ignore

@@ -69,10 +69,15 @@ class ScriptedBackend:
     _DEFAULT_BINDINGS = {
         "default": "gemma-4-26B",
         "generator": "gemma-4-26B",
-        "fidelity_reviewer": "qwen-3",
-        "russian_selector": "gemma-4-26B",
-        "qwen_audit": "qwen-3",
+        "repair": "gemma-4-26B",
+        "formatting": "gemma-4-26B",
         "gemma_audit": "gemma-4-26B",
+        "qwen_audit": "qwen-3",
+        "fidelity_reviewer": "qwen-3",
+        "russian_selector": "qwen-3",
+        "entity_extractor": "qwen-3",
+        "russian_editor": "qwen-3",
+        "glossary_resolver": "qwen-3",
     }
 
     def __init__(

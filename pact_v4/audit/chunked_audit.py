@@ -155,28 +155,15 @@ def pairs_from_maps(
     )
 
 
-# Roles that may serve the audit call, in priority order (same fallback
-# contract as the runtime role adapters: any role binding, else ``default``).
-_AUDIT_ROLES = ("qwen_audit", "fidelity_reviewer", "qwen_fidelity")
-
-
 def audit_model_ref(backend: CompletionBackend) -> str:
-    """Resolve the model reference for the audit role from the backend
-    descriptor (role binding, else ``default``). Raises when unbound so a
-    role without an assigned model fails loudly instead of silently using
-    whatever model the transport serves.
-    """
+    """Resolve exact qwen_audit binding, fail-closed (no fallback)."""
     bindings = backend.descriptor.model_bindings
-    for role in _AUDIT_ROLES:
-        ref = bindings.get(role)
-        if ref:
-            return str(ref)
-    ref = bindings.get("default")
+    ref = bindings.get("qwen_audit")
     if ref:
         return str(ref)
     raise ValueError(
-        f"no model binding for audit role(s) {list(_AUDIT_ROLES)!r}; "
-        f"backend model_bindings={dict(bindings)!r}"
+        f"no model binding for role 'qwen_audit'; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
     )
 
 
@@ -991,10 +978,9 @@ class ChunkedAuditEvaluator:
     ) -> CompletionRequest:
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            # Unit-test fallback: use config's max_tokens and default sampling
-            # Production local execution via B3 always provides a ResolvedModelPair-derived policy,
-            # so this path is only for tests/mocks without pair (fail-closed for local is enforced at B3/strict runner)
-            max_tok = int(self._config.max_tokens)
+            from pact_v4.runtime.runtime_config import _default_role_budgets, derive_max_output_tokens as _derive
+            b = _default_role_budgets()["qwen_audit"]
+            max_tok = int(_derive(b, item_count=item_count))
             req = {"temperature": 0.0}
             return CompletionRequest(
                 model_ref=model_ref,

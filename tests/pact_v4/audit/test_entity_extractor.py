@@ -490,7 +490,7 @@ def test_backend_extractor_sends_source_only_prompt_and_returns_raw():
     assert request.temperature == 0.0
     assert request.response_schema is not None
     assert request.label == "b1.2/entity_extractor"
-    assert request.model_ref == "gemma-4-26B"  # ScriptedBackend default binding
+    assert request.model_ref == "qwen-3"  # reviewer role -> qwen-3
 
 
 def test_backend_extractor_retries_empty_then_succeeds():

@@ -1024,8 +1024,9 @@ class RussianEditorEvaluator:
                 reason_path = out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt"
             policy = getattr(cfg, "role_policy", None)
             if policy is None:
-                max_tok = int(cfg.max_tokens)
-                req = {"temperature": 0.0}
+                from pact_v4.runtime.runtime_config import _default_role_budgets, derive_max_output_tokens as _derive
+                _b = _default_role_budgets()["russian_editor"]
+                policy = type("TmpPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": int(_b.max_output_tokens)}, "output_budget": _b.output_budget})()
             else:
                 from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok = int(_derive(policy))

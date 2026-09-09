@@ -1347,16 +1347,15 @@ class BackendEntityExtractor:
 
 
 def _model_ref_for(backend: CompletionBackend, role: str) -> str:
-    """Resolve the role->model binding from the backend descriptor."""
+    """Resolve exact role->model binding, fail-closed (no fallback)."""
     bindings = backend.descriptor.model_bindings
     ref = bindings.get(role)
-    if not ref:
-        ref = bindings.get("default")
-    if not ref:
-        raise ValueError(
-            f"no model binding for role {role!r}; "
-            f"backend model_bindings={dict(bindings)!r}"
-        )
+    if ref:
+        return str(ref)
+    raise ValueError(
+        f"no model binding for role {role!r}; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
+    )
     return ref
 
 

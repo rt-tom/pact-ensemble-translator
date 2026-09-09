@@ -149,12 +149,11 @@ GLOSSARY_RESOLVER_PROMPT = ReviewerPrompt(
 )
 
 def _model_ref_for_resolver(backend: CompletionBackend) -> Optional[str]:
-    """Resolve reviewer transport: russian_selector -> fidelity_reviewer -> qwen_audit -> default, else None."""
+    """Resolve exact glossary_resolver binding, fail-closed (no fallback)."""
     bindings = getattr(backend.descriptor, "model_bindings", {}) or {}
-    for role in ("russian_selector", "fidelity_reviewer", "qwen_audit", "qwen_fidelity", "default"):
-        ref = bindings.get(role)
-        if ref:
-            return ref
+    ref = bindings.get("glossary_resolver")
+    if ref:
+        return ref
     return None
 
 def compute_allowed_evidence_pids(

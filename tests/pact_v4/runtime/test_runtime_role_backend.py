@@ -387,7 +387,7 @@ def test_composite_backend_duplicate_role_routes_to_mapped_backend():
     )
     # _model_ref_for (what the role adapters consume) resolves generator to
     # the mapped backend's ref.
-    ref = _model_ref_for(composite, ("generator", "fidelity_first"))
+    ref = _model_ref_for(composite, "generator")
     assert ref == "m-b-gen"
     composite.complete(_req(ref))
     assert b.seen == ["m-b-gen"]
@@ -458,32 +458,35 @@ def test_composite_backend_cross_role_collision_fails_closed():
 
 
 def test_composite_backend_fallback_role_reaches_generator_backend():
-    # Documented fallbacks (repair -> generator, entity_extractor ->
-    # qwen_audit): a role declared by NO sub-backend resolves its model_ref
-    # through the fallback binding, and the request reaches the SAME
-    # concrete backend that serves the fallback role.
-    a = _FakeCompletionBackend("a", {"generator": "m-gen", "qwen_audit": "m-qa"})
+    # No fallback: repair and entity_extractor must be explicitly bound, not via generator/qwen_audit.
+    a = _FakeCompletionBackend("a", {"generator": "m-gen", "qwen_audit": "m-qa", "repair": "m-gen", "entity_extractor": "m-qa"})
     b = _FakeCompletionBackend("b", {"fidelity_reviewer": "m-fid"})
-    routing = {"generator": "a", "qwen_audit": "a", "fidelity_reviewer": "b"}
+    routing = {"generator": "a", "qwen_audit": "a", "fidelity_reviewer": "b", "repair": "a", "entity_extractor": "a"}
     composite = CompositeCompletionBackend(
         {"a": a, "b": b},
         _composite_descriptor(routing, {
-            "generator": "m-gen", "qwen_audit": "m-qa", "fidelity_reviewer": "m-fid",
+            "generator": "m-gen", "qwen_audit": "m-qa", "fidelity_reviewer": "m-fid", "repair": "m-gen", "entity_extractor": "m-qa",
         }),
     )
-    # Descriptor carries no synthetic repair binding.
-    assert "repair" not in composite.descriptor.model_bindings
-    repair_ref = _model_ref_for(composite, ("repair", "generator"))
+    assert composite.descriptor.model_bindings["repair"] == "m-gen"
+    repair_ref = _model_ref_for(composite, "repair")
     assert repair_ref == "m-gen"
     composite.complete(_req(repair_ref))
     assert a.seen == ["m-gen"]
     assert b.seen == []
-    # entity_extractor resolves via the qwen_audit binding on the same
-    # audit backend ("a" here) — B3 _EntityRoleView does the same.
-    entity_ref = _model_ref_for(composite, ("entity_extractor", "qwen_audit"))
+    entity_ref = _model_ref_for(composite, "entity_extractor")
     assert entity_ref == "m-qa"
     composite.complete(_req(entity_ref))
     assert a.seen == ["m-gen", "m-qa"]
+    # Without explicit binding, lookup fails closed
+    a2 = _FakeCompletionBackend("a2", {"generator": "m-gen"})
+    b2 = _FakeCompletionBackend("b2", {"fidelity_reviewer": "m-fid"})
+    composite2 = CompositeCompletionBackend(
+        {"a2": a2, "b2": b2},
+        _composite_descriptor({"generator": "a2", "fidelity_reviewer": "b2"}, {"generator": "m-gen", "fidelity_reviewer": "m-fid"}),
+    )
+    with pytest.raises(ValueError, match="no model binding"):
+        _model_ref_for(composite2, "repair")
 
 
 def test_composite_backend_non_ambiguous_routing_unchanged_with_map():

@@ -64,6 +64,15 @@ from pact_v4.runtime.qwen_evaluator import (
 
 LOG = logging.getLogger(__name__)
 
+def _shared_budget_for_role(role: str):
+    """Shared top-level role_budgets as sole budget source (no literals)."""
+    from pact_v4.runtime.runtime_config import _default_role_budgets, derive_max_output_tokens
+    budgets = _default_role_budgets()
+    b = budgets.get(role)
+    if b is None:
+        raise ValueError(f"shared role_budgets missing role {role!r}")
+    return b
+
 
 # Phase 2B generation calls produce JSON-object output. The output budget is
 # 70000 tokens (V4.1 A1, owner decision 2026-08-08; raised 2026-08-19 from
@@ -178,12 +187,14 @@ class BackendModelCaller:
     ) -> None:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
-        # Policy-owned budget when role_policy present; otherwise legacy field
+        # Policy-owned budget when role_policy present; otherwise shared role_budgets (no literals)
         if getattr(self._config, "role_policy", None) is not None:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("generator")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
         # V4.1 GEN-REASONING: the reasoning text of the most recent backend
         # completion (raw_metadata['reasoning'], '' when the transport or
         # provider reported none). Exposed for the whole-chapter generation
@@ -394,13 +405,15 @@ class BackendQwenEvaluator:
     ) -> None:
         self._backend = backend
         self._config = config or BackendQwenEvaluatorConfig()
-        # Policy-owned budget when role_policy present; otherwise legacy field
+        # Policy-owned budget when role_policy present; otherwise shared role_budgets (no literals)
         if getattr(self._config, "role_policy", None) is not None:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             # derive with dummy count; actual per-call derived in __call__
             self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b, item_count=0))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -417,9 +430,9 @@ class BackendQwenEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            # Fallback for unit tests / non-local execution: use config max_tokens and default sampling
-            # Production local via B3/strict runner always provides a ResolvedModelPair-derived policy
-            dynamic_max_tokens = min(24576, 16384 + 128 * int(len(translation)))
+            b = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(b, item_count=len(translation)))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -505,7 +518,9 @@ class BackendGemmaSelector:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("russian_selector")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -527,7 +542,9 @@ class BackendGemmaSelector:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            max_tok = int(self._max_tokens) if hasattr(self, "_max_tokens") else 1024
+            b = _shared_budget_for_role("russian_selector")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(b))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -634,7 +651,9 @@ class BackendQwenAuditEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("qwen_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b, item_count=0))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -652,7 +671,9 @@ class BackendQwenAuditEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            dynamic_max_tokens = min(24576, 16384 + 128 * int(len(translation)))
+            b = _shared_budget_for_role("qwen_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(b, item_count=len(translation)))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -738,7 +759,9 @@ class BackendGemmaAuditEvaluator:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("gemma_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -753,7 +776,9 @@ class BackendGemmaAuditEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            max_tok = int(self._max_tokens) if hasattr(self, "_max_tokens") else 4096
+            b = _shared_budget_for_role("gemma_audit")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(b))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -848,7 +873,9 @@ class BackendRepairCaller:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("repair")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b, item_count=0))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -873,7 +900,9 @@ class BackendRepairCaller:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            dynamic_max_tokens = min(24576, 16384 + 128 * int(len(translation)))
+            b = _shared_budget_for_role("repair")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            dynamic_max_tokens = int(_derive(b, item_count=len(translation)))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -973,7 +1002,9 @@ class BackendRegionFidelityGate:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             self._max_tokens = int(_derive(self._config.role_policy))
         else:
-            self._max_tokens = int(self._config.max_tokens)
+            b = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(b))
 
     @property
     def backend(self) -> CompletionBackend:
@@ -990,7 +1021,9 @@ class BackendRegionFidelityGate:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            max_tok = int(self._max_tokens) if hasattr(self, "_max_tokens") else 4096
+            b = _shared_budget_for_role("fidelity_reviewer")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(b))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -1070,7 +1103,9 @@ class BackendRegionFidelityGate:
             )
             policy = getattr(self._config, "role_policy", None)
             if policy is None:
-                max_tokens = min(24576, 4096 * int(len(chunk)))
+                b = _shared_budget_for_role("fidelity_reviewer")
+                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+                max_tokens = int(_derive(b, item_count=len(chunk)))
                 req = {"temperature": 0.0}
             else:
                 from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive

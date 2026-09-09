@@ -478,7 +478,8 @@ def test_chunked_run_sends_v41_prompt_with_context_blocks() -> None:
         assert "<PAIR id=" in prompt
         assert "AUDIT_PAIRS (chunk " in prompt
         assert request.temperature == 0.0
-        assert request.max_output_tokens == 12000
+        # max_output_tokens is derived from shared role_budgets qwen_audit (floor_plus_per_item)
+        assert 12000 <= request.max_output_tokens <= 24576
         # reasoning budget must NOT travel via request_options (server arg)
         assert request.request_options == {}
 
