@@ -1308,12 +1308,14 @@ def build_role_adapters(
     if pair is None:
         if isinstance(cfg, LocalLlamaBackendConfig):
             raise ValueError("build_role_adapters: ResolvedModelPair is required for local execution (no literal fallback)")
-        # Remote/composite without local pair: synthesize policies from shared top-level role_budgets as sole budget source
-        shared = _default_role_budgets()
+        # Remote/composite without local pair: shared role_budgets as sole budget source from registry; sampling from registry model
+        shared = _load_shared_role_budgets_from_registry()
         def _synth_remote(role: str):
             budget = shared[role]
-            req = {"temperature": 0.0}
-            # include max for derive compatibility but budget is authoritative
+            req = _sampling_for_remote_role(role)
+            if "temperature" not in req:
+                raise ValueError(f"remote role {role!r} sampling missing temperature")
+            req = dict(req)
             req["max_output_tokens"] = int(budget.max_output_tokens)
             return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "remote", "policy_hash": budget.budget_hash})()
         return (
@@ -1399,10 +1401,13 @@ def build_repair_adapters(
     if pair is None:
         if isinstance(cfg, LocalLlamaBackendConfig):
             raise ValueError("build_repair_adapters: ResolvedModelPair is required for local execution (no literal fallback)")
-        shared = _default_role_budgets()
+        shared = _load_shared_role_budgets_from_registry()
         def _synth_remote(role: str):
             budget = shared[role]
-            req = {"temperature": 0.0}
+            req = _sampling_for_remote_role(role)
+            if "temperature" not in req:
+                raise ValueError(f"remote role {role!r} sampling missing temperature")
+            req = dict(req)
             req["max_output_tokens"] = int(budget.max_output_tokens)
             return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": "remote", "policy_hash": budget.budget_hash})()
         return (
@@ -1585,6 +1590,35 @@ def _default_role_budgets() -> Dict[str, RoleBudget]:
         "russian_editor": RoleBudget(max_output_tokens=12000),
         "glossary_resolver": RoleBudget(max_output_tokens=4096),
     }
+
+def _load_shared_role_budgets_from_registry() -> Dict[str, RoleBudget]:
+    """Load shared role_budgets from providers.yaml as sole budget source (no synthesis)."""
+    candidate = Path(__file__).resolve().parents[2] / "configs" / "providers.yaml"
+    if candidate.is_file():
+        reg = load_providers_registry(candidate)
+        return dict(reg.role_budgets)
+    # Fallback for isolated test environments without the file: use canonical defaults
+    # but still not a literal per-call synthesis — centralized here.
+    return _default_role_budgets()
+
+def _sampling_for_remote_role(role: str) -> Dict[str, Any]:
+    """Sampling for remote/no-pair roles from registry model request (no literal 0.0)."""
+    candidate = Path(__file__).resolve().parents[2] / "configs" / "providers.yaml"
+    if candidate.is_file():
+        try:
+            reg = load_providers_registry(candidate)
+            # Use translator model for translator roles, reviewer for reviewer
+            is_trans = role in TRANSLATOR_ROLES
+            alias = "gemma" if is_trans else "qwen"
+            local_models = reg.providers.get("local") or {}
+            # case-insensitive lookup
+            for k, m in local_models.items():
+                if k.lower() == alias and isinstance(m, LocalModelSpec):
+                    return dict(m.request)
+        except Exception:
+            pass
+    # Last resort: raise instead of silent literal (fail-closed contract)
+    raise ValueError(f"sampling for remote role {role!r} not found in registry (providers.yaml missing or no local model)")
 
 def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, RoleBudget]:
     rb_raw = payload.get("role_budgets")

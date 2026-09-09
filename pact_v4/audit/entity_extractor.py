@@ -1257,29 +1257,18 @@ class BackendEntityExtractor:
             reasoning_path = out_dir / "b1.2_entity_reasoning.txt"
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            # Unit-test fallback: use config max_tokens and default sampling
-            max_tok = int(self._config.max_tokens)
-            req = {"temperature": 0.0}
-            request = CompletionRequest(
-                model_ref=_model_ref_for(self._backend, "entity_extractor"),
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=max_tok,
-                temperature=float(req["temperature"]),
-                top_p=req.get("top_p"),
-                top_k=req.get("top_k"),
-                min_p=req.get("min_p"),
-                seed=req.get("seed"),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=self._config.label,
-                on_reasoning_chunk=open_reasoning_writer(reasoning_path),
-            )
-        else:
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tok = int(_derive(policy))
-            req = dict(policy.request)
-            if "temperature" not in req:
-                raise ValueError("BackendEntityExtractor: role_policy missing temperature")
-            request = CompletionRequest(
+            from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role
+            _b = _load_shared_role_budgets_from_registry()["entity_extractor"]
+            _s = _sampling_for_remote_role("entity_extractor")
+            _req = dict(_s)
+            _req["max_output_tokens"] = int(_b.max_output_tokens)
+            policy = type("SynthPolicy", (), {"request": _req, "output_budget": _b.output_budget, "model_key": "registry", "policy_hash": _b.budget_hash})()
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendEntityExtractor: role_policy missing temperature")
+        request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, "entity_extractor"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,

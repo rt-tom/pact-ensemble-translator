@@ -924,6 +924,8 @@ ENTITY_PAYLOAD_MIXED = {
                     "evidence_windows": [["p00001", "p00002"]],
                 },
             ],
+            "memory_class": "named_character",
+            "memory_worthy": True,
         },
         {
             "entity": "the ghost",
@@ -939,6 +941,8 @@ ENTITY_PAYLOAD_MIXED = {
                     "evidence_windows": [["p00003", "p00004"]],
                 },
             ],
+            "memory_class": "named_character",
+            "memory_worthy": False,
         },
         {
             "entity": "the shadow",
@@ -957,6 +961,8 @@ ENTITY_PAYLOAD_MIXED = {
                     "evidence_windows": [["p00005", "p00006"]],
                 },
             ],
+            "memory_class": "world_term",
+            "memory_worthy": True,
         },
     ],
 }

@@ -514,6 +514,9 @@ class GlossaryResolver:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             tok = int(_derive(policy))
             req_vals = dict(policy.request)
+            if "temperature" not in req_vals:
+                LOG.warning("glossary_resolver: role_policy missing temperature, fail-closed")
+                return None
         except Exception as exc:
             LOG.warning("glossary_resolver: policy derive failed %r", exc)
             return None
@@ -528,7 +531,7 @@ class GlossaryResolver:
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=tok,
-            temperature=float(req_vals.get("temperature", 0)),
+            temperature=float(req_vals["temperature"]),
             top_p=req_vals.get("top_p"),
             top_k=req_vals.get("top_k"),
             min_p=req_vals.get("min_p"),

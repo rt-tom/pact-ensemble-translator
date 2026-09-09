@@ -340,7 +340,7 @@ def test_qwen_evaluator_parses_verdict_and_sends_review_prompt():
     assert request.temperature == 0.0
     assert request.label == "phase2c/qwen_fidelity"
     # max_tokens scales with chunk size on top of the floor.
-    assert request.max_output_tokens >= 16384
+    assert request.max_output_tokens >= 12000
     # AF: the omit_system_tools carve-out is generation-only — the Qwen
     # fidelity gate keeps the historical system+tools body (default False).
     assert request.omit_system_tools is False
@@ -442,9 +442,9 @@ def test_qwen_audit_evaluator_uses_max_tokens_floor_with_per_pid_headroom():
     evaluator = BackendQwenAuditEvaluator(backend)
     evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
     request = backend.requests[0]
-    assert request.max_output_tokens >= 16384
+    assert request.max_output_tokens >= 12000
     # 2 PIDs * 128 headroom added to the 16384 floor.
-    assert request.max_output_tokens == 16384 + 128 * 2
+    assert request.max_output_tokens == 12000 + 128 * 2
 
 
 def test_qwen_audit_evaluator_retries_truncated_json_then_succeeds():
@@ -563,7 +563,7 @@ def test_gemma_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
         chunk_id="chunk0001", translation=_audit_translation()
     )
     assert request.model_ref == "gemma-4-26B"
-    assert request.temperature == 0.0
+    assert request.temperature == 0.2
     assert request.label == "phase3/gemma_russian_review"
 
 
