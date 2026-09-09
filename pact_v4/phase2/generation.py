@@ -493,6 +493,7 @@ def _generate_one(
     params: GenerationParams,
     model_caller: ModelCaller,
     cache: GenerationCache,
+    role_policy_hash: Optional[str] = None,
 ) -> GenerationCandidateResult:
     chunk = chunk_plan.chunk(chunk_id)
     template = _TEMPLATES[role]
@@ -500,6 +501,18 @@ def _generate_one(
         sorted({feature.code for feature in risk.features} & REQUIRED_RISK_CATEGORIES)
     )
 
+    # Derive per-request role_policy_hash from caller or from config's per-role budget hash fallback
+    _rph = role_policy_hash
+    if _rph is None:
+        try:
+            vals = dict(config.values) if hasattr(config, "values") else {}
+            per_role = vals.get("resolved_role_policies_per_role") if isinstance(vals, dict) else None
+            if isinstance(per_role, dict) and role in per_role:
+                _rph = None  # budget-only per_role in global identity; no sampling here
+            # Fallback: extract from config's resolved_role_policies_per_role budget hash is not sampling,
+            # so leave _rph None when not supplied by caller (per-request sampling via dedicated param)
+        except Exception:
+            _rph = None
     bundle = PromptBundle(
         template=template,
         role=role,
@@ -518,6 +531,7 @@ def _generate_one(
         bible_text=bible_text,
         config_identity=config.config_identity,
         params=params,
+        role_policy_hash=_rph,
     )
 
     cached = cache.get(bundle.bundle_hash)
@@ -604,6 +618,7 @@ def generate_for_chunk(
     cache: Optional[GenerationCache] = None,
     lazy_balanced: bool = True,
     roles: Optional[Tuple[str, ...]] = None,
+    role_policy_hash: Optional[str] = None,
 ) -> GenerationOutcome:
     """Generate the risk-gated candidate set for one chunk.
 
@@ -668,6 +683,7 @@ def generate_for_chunk(
             params=params,
             model_caller=model_caller,
             cache=cache,
+            role_policy_hash=role_policy_hash,
         )
         if result.candidate is not None:
             candidates[role] = result.candidate

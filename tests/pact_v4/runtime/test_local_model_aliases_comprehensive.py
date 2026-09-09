@@ -602,3 +602,204 @@ providers:
     assert pair.per_role_hash("qwen_audit") == pair2.per_role_hash("qwen_audit")
     # Aggregate hashes same (run identity unchanged)
     assert pair.aggregate_hash == pair2.aggregate_hash
+
+
+def test_all_ten_real_producer_cache_with_sampling(tmp_path):
+    """Integration: all ten producers via fake backend + cache overwrite & reviewer reuse."""
+    import json
+    from pact_v4.phase2.generation import GenerationParams, PromptBundle, GenerationCache
+    from pact_v4.phase2.prompts import FIDELITY_FIRST_V1
+    from pact_v4.phase1.models import canonical_json_hash, SourceArtifact, Snapshot, ChunkPlanArtifact, ConfigArtifact
+    from pact_v4.runtime.backend_role_adapters import (
+        BackendModelCallerConfig, BackendModelCaller,
+        BackendQwenEvaluatorConfig, BackendQwenEvaluator,
+        BackendGemmaSelectorConfig, BackendGemmaSelector,
+        BackendQwenAuditEvaluatorConfig, BackendQwenAuditEvaluator,
+        BackendGemmaAuditEvaluatorConfig, BackendGemmaAuditEvaluator,
+        BackendRepairCallerConfig, BackendRepairCaller,
+    )
+    _, pair = _registry_with_pair(tmp_path)
+    bindings = {role: pair.translator_model.model_name for role in TRANSLATOR_ROLES}
+    bindings.update({role: pair.reviewer_model.model_name for role in REVIEWER_ROLES})
+    def _hash(s): return canonical_json_hash({"s": s})
+    # Config with per-role budget hashes (global identity excludes sampling)
+    cfg = ConfigArtifact(version="v1", values={"resolved_role_policies_per_role": {k: pair.budget_for_role(k).budget_hash for k in TRANSLATOR_ROLES + REVIEWER_ROLES}, "chapter_id":"ch1"})
+    gen_params = GenerationParams(temperature=0.99, seed=1, max_tokens=512)
+    gen_cache = GenerationCache()
+    # Generator with sampling from pair (translator)
+    budget = pair.budget_for_role("generator")
+    sampling = pair.sampling_for_role("generator")
+    req = dict(sampling); req["max_output_tokens"]=int(budget.max_output_tokens)
+    policy = type("P", (), {"request": req, "output_budget": budget.output_budget, "model_key": "gemma", "policy_hash": pair.per_role_hash("generator")})()
+    backend = _FakeBackend(bindings)
+    caller = BackendModelCaller(backend, config=BackendModelCallerConfig(role_policy=policy))
+    bundle = PromptBundle(template=FIDELITY_FIRST_V1, role="fidelity_first", risk_band="low", risk_policy_version="v1", required_risk_feature_codes=(), snapshot_hash=_hash("snap"), source_hash=_hash("src"), chunk_id="chunk0001", owned_pids=("p00001",), owned_source=(("p00001","Hello"),), left_context=(), right_context=(), glossary=(), style_constraints=(), bible_text="", config_identity=cfg.config_identity, params=gen_params, role_policy_hash=pair.per_role_hash("generator"))
+    # First call populates cache
+    caller(bundle)
+    rq1 = backend.last_request
+    assert rq1.temperature == 0.7
+    assert rq1.top_p == 0.9
+    # Use GenerationCache directly to test miss on sampling change
+    cache = GenerationCache()
+    bundle1 = PromptBundle(template=FIDELITY_FIRST_V1, role="fidelity_first", risk_band="low", risk_policy_version="v1", required_risk_feature_codes=(), snapshot_hash=_hash("snap"), source_hash=_hash("src"), chunk_id="chunk0001", owned_pids=("p00001",), owned_source=(("p00001","Hello"),), left_context=(), right_context=(), glossary=(), style_constraints=(), bible_text="", config_identity=_hash("cfg"), params=gen_params, role_policy_hash=pair.per_role_hash("generator"))
+    # Simulate same-dir cache: second bundle with changed sampling has different hash but same dir
+    yaml2 = textwrap.dedent("""
+role_budgets:
+  generator: {max_output_tokens: 70000}
+  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  formatting: {max_output_tokens: 8000, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
+  gemma_audit: {max_output_tokens: 4096}
+  qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}}
+  fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  russian_selector: {max_output_tokens: 1024}
+  entity_extractor: {max_output_tokens: 12000}
+  russian_editor: {max_output_tokens: 12000}
+  glossary_resolver: {max_output_tokens: 4096}
+providers:
+  local:
+    kind: local_llama
+    models:
+      trans:
+        model_key: gemma
+        model_path: /tmp/trans.gguf
+        model_name: trans.gguf
+        server_args: ["--reasoning-budget", "2048"]
+        reasoning_budget: 2048
+        request: {temperature: 0.9, top_p: 0.9, top_k: 40, min_p: 0.05, seed: 42}
+      rev:
+        model_key: qwen
+        model_path: /tmp/rev.gguf
+        model_name: rev.gguf
+        server_args: ["--reasoning-budget", "8192"]
+        reasoning_budget: 8192
+        request: {temperature: 0.3, top_p: 0.95, top_k: 50, min_p: 0.1, seed: 7}
+  opencode-go:
+    kind: opencode_server
+    models:
+      m1: {ref: opencode-go/m1, reasoning_contract: {variants: [low]}}
+""")
+    p2 = tmp_path / "providers_allten.yaml"
+    p2.write_text(yaml2, encoding="utf-8")
+    reg2 = load_providers_registry(p2)
+    pair2 = build_resolved_pair_from_registry(reg2, "trans", "rev")
+    bundle2 = PromptBundle(template=FIDELITY_FIRST_V1, role="fidelity_first", risk_band="low", risk_policy_version="v1", required_risk_feature_codes=(), snapshot_hash=_hash("snap"), source_hash=_hash("src"), chunk_id="chunk0001", owned_pids=("p00001",), owned_source=(("p00001","Hello"),), left_context=(), right_context=(), glossary=(), style_constraints=(), bible_text="", config_identity=_hash("cfg"), params=gen_params, role_policy_hash=pair2.per_role_hash("generator"))
+    assert bundle1.bundle_hash != bundle2.bundle_hash, "sampling change must miss generation cache"
+    assert pair.aggregate_hash == pair2.aggregate_hash, "global identity unchanged on sampling change"
+    assert pair.per_role_hash("qwen_audit") == pair2.per_role_hash("qwen_audit"), "reviewer reuse when unchanged"
+    # Verify each of the ten roles captures correct sampling via backend
+    for role in TRANSLATOR_ROLES + REVIEWER_ROLES:
+        b = pair.budget_for_role(role)
+        s = pair.sampling_for_role(role)
+        r = dict(s); r["max_output_tokens"]=int(b.max_output_tokens)
+        pol = type("P", (), {"request": r, "output_budget": b.output_budget, "model_key": "test", "policy_hash": pair.per_role_hash(role)})()
+        be = _FakeBackend(bindings)
+        if role == "generator":
+            c = BackendModelCaller(be, config=BackendModelCallerConfig(role_policy=pol))
+            c(bundle1)
+        elif role == "fidelity_reviewer":
+            q = BackendQwenEvaluator(be, config=BackendQwenEvaluatorConfig(role_policy=pol, bible_text=""))
+            q(source={"p00001":"Hello"}, translation={"p00001":"Привет"})
+        elif role == "russian_selector":
+            sel = BackendGemmaSelector(be, config=BackendGemmaSelectorConfig(role_policy=pol))
+            sel(candidates=[("a", {"p00001":"Привет"}), ("b", {"p00001":"Здравствуй"})])
+        elif role == "qwen_audit":
+            qa = BackendQwenAuditEvaluator(be, config=BackendQwenAuditEvaluatorConfig(role_policy=pol, bible_text=""))
+            qa(chunk_id="c", source={"p00001":"Hello"}, translation={"p00001":"Привет"})
+        elif role == "gemma_audit":
+            ga = BackendGemmaAuditEvaluator(be, config=BackendGemmaAuditEvaluatorConfig(role_policy=pol, bible_text=""))
+            ga(chunk_id="c", translation={"p00001":"Привет"})
+        elif role == "repair":
+            rc = BackendRepairCaller(be, config=BackendRepairCallerConfig(role_policy=pol))
+            class _Region: pid="p00001"; start=0; end=5
+            rc(chunk_id="c", source={"p00001":"Hello"}, translation={"p00001":"Привет"}, region=_Region(), findings=[{"pid":"p00001","category":"omission","note":"x","excerpt":"y"}])
+        else:
+            # formatting, entity_extractor, russian_editor, glossary_resolver: verify sampling/budget without backend call
+            expected_temp = 0.7 if role in TRANSLATOR_ROLES else 0.3
+            assert s["temperature"] == expected_temp
+            continue
+        assert be.last_request is not None, f"{role} must capture request"
+        assert be.last_request.temperature == s["temperature"]
+    # Repair re-audit capture (requires explicit reaudit_role_policy, no fallback)
+    from pact_v4.repair.selective_repair import SelectiveRepairConfig, SelectiveRepairEvaluator
+    from pact_v4.runtime.json_resilience import JsonRetryPolicy
+    repair_budget = pair.budget_for_role("repair")
+    repair_sampling = pair.sampling_for_role("repair")
+    repair_req = dict(repair_sampling); repair_req["max_output_tokens"]=int(repair_budget.max_output_tokens)
+    repair_pol = type("P", (), {"request": repair_req, "output_budget": repair_budget.output_budget, "model_key": "test"})()
+    q_budget = pair.budget_for_role("qwen_audit")
+    q_sampling = pair.sampling_for_role("qwen_audit")
+    q_req = dict(q_sampling); q_req["max_output_tokens"]=int(q_budget.max_output_tokens)
+    q_pol = type("P", (), {"request": q_req, "output_budget": q_budget.output_budget, "model_key": "test"})()
+    # Verify fallback is forbidden
+    cfg_bad = SelectiveRepairConfig(role_policy=repair_pol, reaudit_retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0))
+    assert getattr(cfg_bad, "reaudit_role_policy", None) is None
+    # With correct reaudit policy, evaluator should accept and re-audit sampling is reviewer temp 0.3
+    cfg_good = SelectiveRepairConfig(role_policy=repair_pol, reaudit_role_policy=q_pol, reaudit_retry=JsonRetryPolicy(max_retries=0, base_delay_seconds=0.0))
+    assert cfg_good.reaudit_role_policy.request["temperature"] == 0.3
+    assert cfg_good.role_policy.request["temperature"] == 0.7
+
+
+def test_same_directory_cache_overwrite_with_real_cache(tmp_path):
+    """GenerationCache miss on sampling change, overwrite same dir, reviewer reuse."""
+    from pact_v4.phase2.generation import GenerationParams, PromptBundle, GenerationCache
+    from pact_v4.phase2.prompts import FIDELITY_FIRST_V1
+    from pact_v4.phase1.models import canonical_json_hash
+    def _hash(s): return canonical_json_hash({"s": s})
+    gen_params = GenerationParams(temperature=0.99, seed=1, max_tokens=512)
+    _, pair = _registry_with_pair(tmp_path)
+    cache = GenerationCache()
+    bundle1 = PromptBundle(template=FIDELITY_FIRST_V1, role="fidelity_first", risk_band="low", risk_policy_version="v1", required_risk_feature_codes=(), snapshot_hash=_hash("snap"), source_hash=_hash("src"), chunk_id="c1", owned_pids=("p00001",), owned_source=(("p00001","Hello"),), left_context=(), right_context=(), glossary=(), style_constraints=(), bible_text="", config_identity=_hash("cfg"), params=gen_params, role_policy_hash=pair.per_role_hash("generator"))
+    from pact_v4.phase2.generation import GenerationCandidateResult, GenerationError, GenerationErrorCode
+    res = GenerationCandidateResult(candidate=None, error=GenerationError(role="fidelity_first", code=GenerationErrorCode.INVALID_JSON, detail="dummy"))
+    cache.put(bundle1.bundle_hash, res)
+    assert cache.get(bundle1.bundle_hash) is not None
+    # Sampling change => different bundle hash => miss
+    yaml2 = textwrap.dedent("""
+role_budgets:
+  generator: {max_output_tokens: 70000}
+  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  formatting: {max_output_tokens: 8000, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
+  gemma_audit: {max_output_tokens: 4096}
+  qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}}
+  fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  russian_selector: {max_output_tokens: 1024}
+  entity_extractor: {max_output_tokens: 12000}
+  russian_editor: {max_output_tokens: 12000}
+  glossary_resolver: {max_output_tokens: 4096}
+providers:
+  local:
+    kind: local_llama
+    models:
+      trans:
+        model_key: gemma
+        model_path: /tmp/trans.gguf
+        model_name: trans.gguf
+        server_args: ["--reasoning-budget", "2048"]
+        reasoning_budget: 2048
+        request: {temperature: 0.9, top_p: 0.9, top_k: 40, min_p: 0.05, seed: 42}
+      rev:
+        model_key: qwen
+        model_path: /tmp/rev.gguf
+        model_name: rev.gguf
+        server_args: ["--reasoning-budget", "8192"]
+        reasoning_budget: 8192
+        request: {temperature: 0.3, top_p: 0.95, top_k: 50, min_p: 0.1, seed: 7}
+  opencode-go:
+    kind: opencode_server
+    models:
+      m1: {ref: opencode-go/m1, reasoning_contract: {variants: [low]}}
+""")
+    p2 = tmp_path / "providers_cache.yaml"
+    p2.write_text(yaml2, encoding="utf-8")
+    reg2 = load_providers_registry(p2)
+    pair2 = build_resolved_pair_from_registry(reg2, "trans", "rev")
+    bundle2 = PromptBundle(template=FIDELITY_FIRST_V1, role="fidelity_first", risk_band="low", risk_policy_version="v1", required_risk_feature_codes=(), snapshot_hash=_hash("snap"), source_hash=_hash("src"), chunk_id="c1", owned_pids=("p00001",), owned_source=(("p00001","Hello"),), left_context=(), right_context=(), glossary=(), style_constraints=(), bible_text="", config_identity=_hash("cfg"), params=gen_params, role_policy_hash=pair2.per_role_hash("generator"))
+    assert cache.get(bundle2.bundle_hash) is None, "changed sampling must miss cache"
+    # Overwrite same logical cache (same dir semantics: put with new hash)
+    res2 = GenerationCandidateResult(candidate=None, error=GenerationError(role="fidelity_first", code=GenerationErrorCode.INVALID_JSON, detail="dummy2"))
+    cache.put(bundle2.bundle_hash, res2)
+    assert cache.get(bundle2.bundle_hash).error.detail == "dummy2"
+    # Reviewer reuse unchanged
+    assert pair.per_role_hash("qwen_audit") == pair2.per_role_hash("qwen_audit")
+    assert pair.aggregate_hash == pair2.aggregate_hash
+

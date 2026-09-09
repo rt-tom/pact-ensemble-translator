@@ -1592,33 +1592,34 @@ def _default_role_budgets() -> Dict[str, RoleBudget]:
     }
 
 def _load_shared_role_budgets_from_registry() -> Dict[str, RoleBudget]:
-    """Load shared role_budgets from providers.yaml as sole budget source (no synthesis)."""
+    """Load shared role_budgets from providers.yaml as sole budget source (no synthesis, fail-closed)."""
     candidate = Path(__file__).resolve().parents[2] / "configs" / "providers.yaml"
-    if candidate.is_file():
-        reg = load_providers_registry(candidate)
-        return dict(reg.role_budgets)
-    # Fallback for isolated test environments without the file: use canonical defaults
-    # but still not a literal per-call synthesis — centralized here.
-    return _default_role_budgets()
+    if not candidate.is_file():
+        raise ValueError(f"role_budgets registry missing: {candidate} not found — fail-closed, no default fallback")
+    reg = load_providers_registry(candidate)
+    if not reg.role_budgets:
+        raise ValueError(f"{candidate}: role_budgets missing — fail-closed, registry must declare all ten roles")
+    return dict(reg.role_budgets)
 
 def _sampling_for_remote_role(role: str) -> Dict[str, Any]:
-    """Sampling for remote/no-pair roles from registry model request (no literal 0.0)."""
+    """Sampling for remote/no-pair roles from selected remote model registry (fail-closed, never local)."""
     candidate = Path(__file__).resolve().parents[2] / "configs" / "providers.yaml"
-    if candidate.is_file():
-        try:
-            reg = load_providers_registry(candidate)
-            # Use translator model for translator roles, reviewer for reviewer
-            is_trans = role in TRANSLATOR_ROLES
-            alias = "gemma" if is_trans else "qwen"
-            local_models = reg.providers.get("local") or {}
-            # case-insensitive lookup
-            for k, m in local_models.items():
-                if k.lower() == alias and isinstance(m, LocalModelSpec):
-                    return dict(m.request)
-        except Exception:
-            pass
-    # Last resort: raise instead of silent literal (fail-closed contract)
-    raise ValueError(f"sampling for remote role {role!r} not found in registry (providers.yaml missing or no local model)")
+    if not candidate.is_file():
+        raise ValueError(f"sampling for remote role {role!r}: registry {candidate} missing — fail-closed")
+    reg = load_providers_registry(candidate)
+    # Prefer any non-local provider's model request if present; otherwise use role_budgets budget hash as fallback signal to fail closed
+    for provider_id, models in reg.providers.items():
+        if provider_id.lower() == "local":
+            continue
+        for alias, model in models.items():
+            # Remote ProviderModel does not carry request sampling in current registry schema;
+            # sampling for remote is therefore not available from local gemma/qwen — fail closed if no remote request.
+            # Check if model has a request-like attribute (future remote local models may carry it)
+            req = getattr(model, "request", None)
+            if isinstance(req, dict) and req:
+                return dict(req)
+    # No remote model carries sampling — do not fallback to local gemma/qwen. Fail closed.
+    raise ValueError(f"sampling for remote role {role!r} not found in remote registry (providers.yaml has no remote model request) — fail-closed, do not use local alias")
 
 def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, RoleBudget]:
     rb_raw = payload.get("role_budgets")

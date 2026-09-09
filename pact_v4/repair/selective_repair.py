@@ -2000,14 +2000,9 @@ class SelectiveRepairEvaluator:
                 reason_path = out_dir / (
                     f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
                 )
-            r_policy = getattr(cfg, "reaudit_role_policy", None) or getattr(cfg, "role_policy", None)
+            r_policy = getattr(cfg, "reaudit_role_policy", None)
             if r_policy is None:
-                from pact_v4.runtime.runtime_config import _load_shared_role_budgets_from_registry, _sampling_for_remote_role
-                _b = _load_shared_role_budgets_from_registry()["qwen_audit"]
-                _s = _sampling_for_remote_role("qwen_audit")
-                _req = dict(_s)
-                _req["max_output_tokens"] = int(_b.max_output_tokens)
-                r_policy = type("SynthPolicy", (), {"request": _req, "output_budget": _b.output_budget, "model_key": "registry", "policy_hash": _b.budget_hash})()
+                raise ValueError("repair re-audit requires explicit reaudit_role_policy (qwen_audit) — fallback to repair policy is forbidden; fail-closed")
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
             req_r = dict(r_policy.request)
