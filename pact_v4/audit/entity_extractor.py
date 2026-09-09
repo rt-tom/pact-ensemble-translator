@@ -1264,7 +1264,7 @@ class BackendEntityExtractor:
                 model_ref=_model_ref_for(self._backend, "entity_extractor"),
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tok,
-                temperature=float(req.get("temperature", 0)),
+                temperature=float(req["temperature"]),
                 top_p=req.get("top_p"),
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),
@@ -1274,15 +1274,7 @@ class BackendEntityExtractor:
                 on_reasoning_chunk=open_reasoning_writer(reasoning_path),
             )
         else:
-            request = CompletionRequest(
-                model_ref=_model_ref_for(self._backend, "entity_extractor"),
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=self._max_tokens,
-                temperature=float(0),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=self._config.label,
-                on_reasoning_chunk=open_reasoning_writer(reasoning_path),
-            )
+            raise ValueError("role_policy is required (no literal fallback)")
         attempts: List[Tuple[int, str, str]] = []  # (attempt_no, raw, reasoning)
 
         def _complete() -> str:

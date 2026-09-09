@@ -1023,33 +1023,26 @@ class RussianEditorEvaluator:
             if out_dir is not None:
                 reason_path = out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt"
             policy = getattr(cfg, "role_policy", None)
-            if policy is not None:
-                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-                max_tok = int(_derive(policy))
-                req = dict(policy.request)
-                request = CompletionRequest(
-                    model_ref=model_ref,
-                    messages=(Message(role="user", content=prompt),),
-                    max_output_tokens=max_tok,
-                    temperature=float(req.get("temperature", 0)),
-                    top_p=req.get("top_p"),
-                    top_k=req.get("top_k"),
-                    min_p=req.get("min_p"),
-                    seed=req.get("seed"),
-                    response_schema=JSON_OBJECT_SCHEMA,
-                    label=cfg.label,
-                    on_reasoning_chunk=open_reasoning_writer(reason_path),
-                )
-            else:
-                request = CompletionRequest(
-                    model_ref=model_ref,
-                    messages=(Message(role="user", content=prompt),),
-                    max_output_tokens=cfg.max_tokens,
-                    temperature=float(0),
-                    response_schema=JSON_OBJECT_SCHEMA,
-                    label=cfg.label,
-                    on_reasoning_chunk=open_reasoning_writer(reason_path),
-                )
+            if policy is None:
+                raise ValueError("RussianEditor: role_policy is required")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
+            if "temperature" not in req:
+                raise ValueError("RussianEditor: role_policy missing temperature")
+            request = CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok,
+                temperature=float(req["temperature"]),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=cfg.label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
+            )
             self._emit_chunk_event(
                 "started", chunk=chunk_index, total=len(chunks)
             )

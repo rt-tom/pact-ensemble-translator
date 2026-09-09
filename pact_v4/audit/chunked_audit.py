@@ -990,33 +990,25 @@ class ChunkedAuditEvaluator:
         item_count: int = 0,
     ) -> CompletionRequest:
         policy = getattr(self._config, "role_policy", None)
-        if policy is not None:
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tok = int(_derive(policy, item_count=item_count))
-            req = dict(policy.request)
-            return CompletionRequest(
-                model_ref=model_ref,
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=max_tok,
-                temperature=float(req.get("temperature", 0)),
-                top_p=req.get("top_p"),
-                top_k=req.get("top_k"),
-                min_p=req.get("min_p"),
-                seed=req.get("seed"),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=self._config.label,
-                on_reasoning_chunk=on_reasoning_chunk,
-            )
+        if policy is None:
+            raise ValueError("ChunkedAuditEvaluator: role_policy is required")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy, item_count=item_count))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("ChunkedAuditEvaluator: role_policy missing temperature")
         return CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._config.max_tokens,
-            temperature=float(0),
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
             on_reasoning_chunk=on_reasoning_chunk,
-            # NOTE: no request_options — the reasoning budget is a server
-            # arg (--reasoning-budget); LocalOpenAIBackend rejects options.
         )
 
     def _write_artifacts(

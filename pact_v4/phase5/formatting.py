@@ -147,25 +147,11 @@ _FORMATTING_SINGLE_CALL_PROMPT_LIMIT = 12000
 
 
 def _effective_max_tokens(span_count: int, cfg_max: Any, role_policy: Any = None) -> int:
-    """Policy-owned derivation; when role_policy is None the caller is test-only."""
-    """v41 dynamic budget: max(800, 40*span_count+500, cfg_max) capped at 8192.
-    When ``role_policy`` is provided, ``derive_max_output_tokens`` drives the
-    ceiling/span-formula, never a literal."""
+    """Policy-owned derivation: when role_policy is provided, derive via OutputBudgetPolicy; otherwise fail-closed."""
     if role_policy is not None:
-        try:
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            return int(_derive(role_policy, span_tokens=span_count))
-        except Exception:
-            pass
-    if cfg_max is None:
-        cfg_val = 0
-    else:
-        try:
-            cfg_val = int(cfg_max)
-        except Exception:
-            cfg_val = 0
-    needed = _FORMATTING_TOKENS_PER_SPAN * int(span_count) + _FORMATTING_TOKENS_OVERHEAD
-    return min(_FORMATTING_MAX_TOKENS_CAP, max(_FORMATTING_MIN_TOKENS, needed, cfg_val))
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        return int(_derive(role_policy, span_tokens=span_count))
+    raise ValueError("_effective_max_tokens: formatting role_policy is required (no literal fallback)")
 
 # Word-boundary charset matches ``_SOURCE_BOUNDARY`` in
 # ``pact_v4._integrity_checks`` (same convention as the glossary/number

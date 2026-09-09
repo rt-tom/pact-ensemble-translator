@@ -140,15 +140,11 @@ class ApiClient:
             "temperature": float(temperature),
             "stream": bool(stream),
         }
-        # Explicit sampling fields: when provided, use caller value; otherwise fall back to cfg defaults for top_p/top_k
+        # Policy-owned sampling fields: only send fields explicitly present in the resolved policy/request.
         if top_p is not None:
             payload["top_p"] = float(top_p)
-        else:
-            payload["top_p"] = float(self._cfg.top_p)
         if top_k is not None:
             payload["top_k"] = int(top_k)
-        else:
-            payload["top_k"] = int(self._cfg.top_k)
         if min_p is not None:
             payload["min_p"] = float(min_p)
         if seed is not None:

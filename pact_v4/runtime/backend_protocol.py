@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pact_v4.phase1.models import canonical_json_hash
@@ -396,17 +396,24 @@ class BackendDescriptor:
         the backend after preflight reads the health endpoint) — never part
         of ``identity_hash``, so it is safe to persist and does not affect
         cache/resume identity.
+        Includes resolved role-policy provenance when present in effective_options.
         """
-        return {
+        eff = _sanitize_secrets(dict(self.effective_options))
+        rec: Dict[str, Any] = {
             "kind": self.kind,
             "transport_version": self.transport_version,
             "endpoint_family": self.endpoint_family,
             "public_endpoint": _canonical_endpoint(self.public_endpoint, drop_port=False),
             "model_bindings": dict(sorted(self.model_bindings.items())),
-            "effective_options": _sanitize_secrets(dict(self.effective_options)),
+            "effective_options": eff,
             "observed_server_version": self.observed_server_version,
             "identity_hash": self.identity_hash,
         }
+        if "resolved_role_policies_hash" in eff:
+            rec["resolved_role_policies_hash"] = eff["resolved_role_policies_hash"]
+        if "per_role_hashes" in eff:
+            rec["per_role_hashes"] = eff["per_role_hashes"]
+        return rec
 
 
 class CompletionBackend(Protocol):

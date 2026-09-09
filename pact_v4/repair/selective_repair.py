@@ -1743,7 +1743,7 @@ class SelectiveRepairEvaluator:
                 model_ref=model_ref,
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tok,
-                temperature=float(req.get("temperature", 0)),
+                temperature=float(req["temperature"]),
                 top_p=req.get("top_p"),
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),
@@ -1754,16 +1754,7 @@ class SelectiveRepairEvaluator:
                 request_options=request_options,
             )
         else:
-            request = CompletionRequest(
-                model_ref=model_ref,
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=cfg.max_tokens,
-                temperature=float(0),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=cfg.label,
-                on_reasoning_chunk=open_reasoning_writer(reason_path),
-                request_options=request_options,
-            )
+            raise ValueError("role_policy is required")
         try:
             response = self._repair_backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
@@ -2014,7 +2005,7 @@ class SelectiveRepairEvaluator:
                     model_ref=model_ref,
                     messages=(Message(role="user", content=prompt),),
                     max_output_tokens=max_tok_r,
-                    temperature=float(req_r.get("temperature", 0)),
+                    temperature=float(req_r["temperature"]),
                     top_p=req_r.get("top_p"),
                     top_k=req_r.get("top_k"),
                     min_p=req_r.get("min_p"),
@@ -2024,15 +2015,7 @@ class SelectiveRepairEvaluator:
                     on_reasoning_chunk=open_reasoning_writer(reason_path),
                 )
             else:
-                request = CompletionRequest(
-                    model_ref=model_ref,
-                    messages=(Message(role="user", content=prompt),),
-                    max_output_tokens=cfg.reaudit_max_tokens,
-                    temperature=float(0),
-                    response_schema=JSON_OBJECT_SCHEMA,
-                    label=cfg.reaudit_label,
-                    on_reasoning_chunk=open_reasoning_writer(reason_path),
-                )
+                raise ValueError("Reaudit: role_policy is required")
 
             def _complete() -> str:
                 # Re-issues the IDENTICAL request on a retry (same prompt,
