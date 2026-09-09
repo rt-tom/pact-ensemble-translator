@@ -182,6 +182,14 @@ class CompletionRequest:
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     seed: Optional[int] = None
+    # Local-matrix-v2 follow-up (HIGH review finding): the four extended
+    # sampling fields. Registry-allowlisted values must reach the HTTP
+    # payload (llama-server chat-completions body); transports send them
+    # only when not None (policy-owned: absent stays absent).
+    repeat_penalty: Optional[float] = None
+    repeat_last_n: Optional[int] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
     # OpenCode transport body shape: when True, the neutral system prompt
     # and the all-disabled tools map are omitted from the message body
     # (serve 1.4.7 applied a default ~32k output budget to requests that
@@ -201,6 +209,14 @@ class CompletionRequest:
     on_reasoning_chunk: Optional[Callable[[str], None]] = field(
         default=None, compare=False, repr=False,
     )
+    # Local-matrix-v2: the fixed pipeline role this call serves
+    # (``generator``/``qwen_audit``/..., one of the ten REQUIRED_ROLES).
+    # Routing hint for the local single-resident router: the router must
+    # restart/relaunch the same model when the next role needs a different
+    # role-effective reasoning budget. Optional (None = legacy, residency
+    # by model only). Never sent on the wire, never part of backend
+    # identity or request-cache keys — transports read explicit fields.
+    role: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_ref, str) or not self.model_ref:
@@ -231,11 +247,38 @@ class CompletionRequest:
             raise ValueError(f"CompletionRequest: min_p must be in [0,1], got {self.min_p!r}")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError(f"CompletionRequest: seed must be int, got {self.seed!r}")
+        # Ranges mirror the registry allowlist (_validate_model_request).
+        if self.repeat_penalty is not None:
+            if isinstance(self.repeat_penalty, bool) or not isinstance(self.repeat_penalty, (int, float)):
+                raise ValueError(f"CompletionRequest: repeat_penalty must be number, got {self.repeat_penalty!r}")
+            if not (0 <= float(self.repeat_penalty) <= 5):
+                raise ValueError(f"CompletionRequest: repeat_penalty must be in [0,5], got {self.repeat_penalty!r}")
+        if self.repeat_last_n is not None:
+            if isinstance(self.repeat_last_n, bool) or not isinstance(self.repeat_last_n, int):
+                raise ValueError(f"CompletionRequest: repeat_last_n must be int, got {self.repeat_last_n!r}")
+            if not (-1 <= int(self.repeat_last_n) <= 65536):
+                raise ValueError(f"CompletionRequest: repeat_last_n must be in [-1,65536], got {self.repeat_last_n!r}")
+        if self.frequency_penalty is not None:
+            if isinstance(self.frequency_penalty, bool) or not isinstance(self.frequency_penalty, (int, float)):
+                raise ValueError(f"CompletionRequest: frequency_penalty must be number, got {self.frequency_penalty!r}")
+            if not (-2 <= float(self.frequency_penalty) <= 2):
+                raise ValueError(f"CompletionRequest: frequency_penalty must be in [-2,2], got {self.frequency_penalty!r}")
+        if self.presence_penalty is not None:
+            if isinstance(self.presence_penalty, bool) or not isinstance(self.presence_penalty, (int, float)):
+                raise ValueError(f"CompletionRequest: presence_penalty must be number, got {self.presence_penalty!r}")
+            if not (-2 <= float(self.presence_penalty) <= 2):
+                raise ValueError(f"CompletionRequest: presence_penalty must be in [-2,2], got {self.presence_penalty!r}")
         if self.on_reasoning_chunk is not None and not callable(
             self.on_reasoning_chunk
         ):
             raise ValueError(
                 "CompletionRequest: on_reasoning_chunk must be None or callable"
+            )
+        if self.role is not None and (
+            not isinstance(self.role, str) or not self.role.strip()
+        ):
+            raise ValueError(
+                f"CompletionRequest: role must be a non-empty role name or None, got {self.role!r}"
             )
         object.__setattr__(
             self,

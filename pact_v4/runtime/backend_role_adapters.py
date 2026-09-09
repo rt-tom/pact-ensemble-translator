@@ -287,6 +287,10 @@ class BackendModelCaller:
             _top_k = _req.get("top_k")
             _min_p = _req.get("min_p")
             _seed = _req.get("seed")
+            _repeat_penalty = _req.get("repeat_penalty")
+            _repeat_last_n = _req.get("repeat_last_n")
+            _frequency_penalty = _req.get("frequency_penalty")
+            _presence_penalty = _req.get("presence_penalty")
         else:
             # Fallback to registry shared budgets/sampling (no literal, no bundle default)
             _fallback = _shared_budget_for_role("generator")
@@ -296,6 +300,10 @@ class BackendModelCaller:
             _top_k = _req.get("top_k")
             _min_p = _req.get("min_p")
             _seed = _req.get("seed")
+            _repeat_penalty = _req.get("repeat_penalty")
+            _repeat_last_n = _req.get("repeat_last_n")
+            _frequency_penalty = _req.get("frequency_penalty")
+            _presence_penalty = _req.get("presence_penalty")
         request = CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=user_text),),
@@ -305,9 +313,14 @@ class BackendModelCaller:
             top_k=_top_k,
             min_p=_min_p,
             seed=_seed,
+            repeat_penalty=_repeat_penalty,
+            repeat_last_n=_repeat_last_n,
+            frequency_penalty=_frequency_penalty,
+            presence_penalty=_presence_penalty,
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,
+            role="generator",
             # AF (2026-08-10): serve 1.4.7 applied a default ~32k output
             # budget to message bodies that carry system/tools (agentic
             # mode), truncating whole-chapter reasoning at 32000 tokens
@@ -454,8 +467,13 @@ class BackendQwenEvaluator:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label="phase2c/qwen_fidelity",
+            role="fidelity_reviewer",
         )
 
         def _complete() -> str:
@@ -564,8 +582,13 @@ class BackendGemmaSelector:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label="phase2c/gemma_russian_preference",
+            role="russian_selector",
         )
 
         def _complete() -> str:
@@ -691,8 +714,13 @@ class BackendQwenAuditEvaluator:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
+            role="qwen_audit",
         )
 
         def _complete() -> str:
@@ -794,8 +822,13 @@ class BackendGemmaAuditEvaluator:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
+            role="gemma_audit",
         )
 
         def _complete() -> str:
@@ -916,8 +949,13 @@ class BackendRepairCaller:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
+            role="repair",
         )
 
         def _complete() -> str:
@@ -1035,8 +1073,13 @@ class BackendRegionFidelityGate:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
+            role="fidelity_reviewer",
         )
 
         def _complete() -> str:
@@ -1115,8 +1158,13 @@ class BackendRegionFidelityGate:
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),
                 seed=req.get("seed"),
+                repeat_penalty=req.get("repeat_penalty"),
+                repeat_last_n=req.get("repeat_last_n"),
+                frequency_penalty=req.get("frequency_penalty"),
+                presence_penalty=req.get("presence_penalty"),
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=self._config.label,
+                role="fidelity_reviewer",
             )
 
             def _complete(req: CompletionRequest = request) -> str:  # type: ignore[no-redef]

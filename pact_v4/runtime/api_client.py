@@ -132,6 +132,10 @@ class ApiClient:
         top_k: Optional[int] = None,
         min_p: Optional[float] = None,
         seed: Optional[int] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self._cfg.model,
@@ -149,6 +153,14 @@ class ApiClient:
             payload["min_p"] = float(min_p)
         if seed is not None:
             payload["seed"] = int(seed)
+        if repeat_penalty is not None:
+            payload["repeat_penalty"] = float(repeat_penalty)
+        if repeat_last_n is not None:
+            payload["repeat_last_n"] = int(repeat_last_n)
+        if frequency_penalty is not None:
+            payload["frequency_penalty"] = float(frequency_penalty)
+        if presence_penalty is not None:
+            payload["presence_penalty"] = float(presence_penalty)
         if response_format_json and self._json_response_format_supported:
             payload["response_format"] = {"type": "json_object"}
         return payload
@@ -170,6 +182,10 @@ class ApiClient:
         top_k: Optional[int] = None,
         min_p: Optional[float] = None,
         seed: Optional[int] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
     ) -> str:
         """Send a single chat-completions request, return the model text.
 
@@ -219,6 +235,10 @@ class ApiClient:
                         top_k=top_k,
                         min_p=min_p,
                         seed=seed,
+                        repeat_penalty=repeat_penalty,
+                        repeat_last_n=repeat_last_n,
+                        frequency_penalty=frequency_penalty,
+                        presence_penalty=presence_penalty,
                     )
                     streamed = True
                 except ApiClientError as exc:
@@ -235,6 +255,10 @@ class ApiClient:
                         top_k=top_k,
                         min_p=min_p,
                         seed=seed,
+                        repeat_penalty=repeat_penalty,
+                        repeat_last_n=repeat_last_n,
+                        frequency_penalty=frequency_penalty,
+                        presence_penalty=presence_penalty,
                     )
                     data, http_status, fmt_attempted, attempts = self._post_with_retry(
                         payload
@@ -271,6 +295,10 @@ class ApiClient:
                     top_k=top_k,
                     min_p=min_p,
                     seed=seed,
+                    repeat_penalty=repeat_penalty,
+                    repeat_last_n=repeat_last_n,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
                 )
                 data, http_status, fmt_attempted, attempts = self._post_with_retry(
                     payload
@@ -466,6 +494,10 @@ class ApiClient:
         top_k: Optional[int] = None,
         min_p: Optional[float] = None,
         seed: Optional[int] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
     ) -> tuple[str, Optional[str], Dict[str, Any], str, int, bool, int]:
         """POST with ``stream=True`` and SSE-iterate ``reasoning_content``.
 
@@ -492,6 +524,10 @@ class ApiClient:
             top_k=top_k,
             min_p=min_p,
             seed=seed,
+            repeat_penalty=repeat_penalty,
+            repeat_last_n=repeat_last_n,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
         )
         attempts = 0
         last_error: Optional[Exception] = None

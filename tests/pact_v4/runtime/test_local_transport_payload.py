@@ -21,7 +21,7 @@ def test_local_serializes_all_fields():
     cfg=ApiClientConfig(chat_url="http://127.0.0.1:8093/v1/chat/completions", model="test-model")
     api=ApiClient(cfg, session=sess)
     backend=LocalOpenAIBackend(api=api)
-    req=CompletionRequest(model_ref="test-model", messages=(Message(role="user", content="hi"),), max_output_tokens=123, temperature=0.7, response_schema=JSON_OBJECT_SCHEMA, label="test", top_p=0.9, top_k=32, min_p=0.05, seed=42)
+    req=CompletionRequest(model_ref="test-model", messages=(Message(role="user", content="hi"),), max_output_tokens=123, temperature=0.7, response_schema=JSON_OBJECT_SCHEMA, label="test", top_p=0.9, top_k=32, min_p=0.05, seed=42, repeat_penalty=1.0, repeat_last_n=64, frequency_penalty=0.5, presence_penalty=0.0)
     backend.complete(req)
     payload=sess.payloads[0]
     assert payload["temperature"]==0.7
@@ -30,6 +30,17 @@ def test_local_serializes_all_fields():
     assert payload["min_p"]==0.05
     assert payload["seed"]==42
     assert payload["max_tokens"]==123
+    # Local-matrix-v2 follow-up (HIGH finding): extended sampling reaches payload.
+    assert payload["repeat_penalty"]==1.0
+    assert payload["repeat_last_n"]==64
+    assert payload["frequency_penalty"]==0.5
+    assert payload["presence_penalty"]==0.0
+    # Absent stays absent (policy-owned).
+    req2=CompletionRequest(model_ref="test-model", messages=(Message(role="user", content="hi"),), max_output_tokens=123, temperature=0.7, response_schema=JSON_OBJECT_SCHEMA, label="test2")
+    backend.complete(req2)
+    payload2=sess.payloads[1]
+    for key in ("repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty"):
+        assert key not in payload2
 
 def test_local_rejects_reasoning():
     cfg=ApiClientConfig(chat_url="http://127.0.0.1:8093/v1/chat/completions", model="m")
@@ -80,9 +91,9 @@ def test_alias_application_body_check():
     from pact_v4.runtime.runtime_config import RoleCallPolicy
     from pathlib import Path
     base=LocalLlamaBackendConfig(exe=Path("/tmp/exe"), device="SYCL0", host="127.0.0.1", model_paths={"gemma": Path("/tmp/old.gguf"), "qwen": Path("/tmp/q.gguf")}, model_names={"gemma": "old", "qwen": "q"}, server_args={"gemma": ["--old"], "qwen": []})
-    alias=LocalModelAlias(model_key="gemma", model_path="/tmp/new.gguf", model_name="new-gemma", server_args=("--ctx-size","9999"))
+    alias=LocalModelAlias(model_key="gemma", model_path="/tmp/new.gguf", model_name="new-gemma", server_args=("--ctx-size","9999", "--reasoning-budget", "2000"), reasoning_budget=2000)
     new=apply_local_alias_to_config(base, alias)
-    assert new.server_args["gemma"]==["--ctx-size","9999"]
+    assert new.server_args["gemma"]==["--ctx-size","9999", "--reasoning-budget", "2000"]
     assert str(new.model_paths["gemma"])=="/tmp/new.gguf"
     assert new.model_names["gemma"]=="new-gemma"
     # Verify backend descriptor reflects alias (model_names contributes to bindings)

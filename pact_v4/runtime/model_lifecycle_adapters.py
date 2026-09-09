@@ -63,13 +63,40 @@ GEMMA_MODEL_KEY = "gemma"
 QWEN_MODEL_KEY = "qwen"
 
 
+def _ensure_role_resident(router: ModelRouter, model_key: str, *, role: str, pair: Any = None) -> None:
+    """Local-matrix-v2 residency: role-effective relaunch when a pair is given.
+
+    With a ``ResolvedModelPair`` the router restarts/relaunches the SAME
+    model with the role-effective ``--reasoning-budget`` when it differs
+    (no group-max substitute); without a pair, legacy residency by model.
+    """
+    if pair is not None:
+        # Fresh-call provenance (model base + role delta + effective +
+        # actual launch args) rides the SwitchRecord on launch/relaunch
+        # only; resident hits return None and rewrite nothing.
+        prov = pair.reasoning_provenance_for_role(role)
+        router.ensure_resident(
+            model_key,
+            reasoning_budget=int(prov["effective"]),
+            reasoning_provenance=prov,
+        )
+    else:
+        router.ensure_resident(model_key)
+
+
 class LifecycleModelCaller:
     """``ModelCaller`` that ensures Gemma is resident before every call."""
 
     def __init__(self, router: ModelRouter, *, model_name: str,
                  config: Optional[HttpModelCallerConfig] = None,
-                 json_retry_policy: Optional[JsonRetryPolicy] = None):
+                 json_retry_policy: Optional[JsonRetryPolicy] = None,
+                 model_key: str = GEMMA_MODEL_KEY,
+                 role: str = "generator",
+                 pair: Any = None):
         self._router = router
+        self._model_key = model_key
+        self._role = role
+        self._pair = pair
         api_config = (config.api if config else ApiClientConfig()).__class__(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
@@ -102,7 +129,7 @@ class LifecycleModelCaller:
         # completion and the whole-chapter reasoning sink would attribute
         # old text to the aborted attempt.
         self._caller.reset_attempt_state()
-        self._router.ensure_resident(GEMMA_MODEL_KEY)
+        _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
         return self._caller(bundle)
 
     @property
@@ -150,8 +177,14 @@ class LifecycleQwenEvaluator:
     """``QwenEvaluator`` that ensures Qwen is resident before every call."""
 
     def __init__(self, router: ModelRouter, *, model_name: str,
-                 config: Optional[HttpQwenEvaluatorConfig] = None):
+                 config: Optional[HttpQwenEvaluatorConfig] = None,
+                 model_key: str = QWEN_MODEL_KEY,
+                 role: str = "fidelity_reviewer",
+                 pair: Any = None):
         self._router = router
+        self._model_key = model_key
+        self._role = role
+        self._pair = pair
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
@@ -169,7 +202,7 @@ class LifecycleQwenEvaluator:
         self._evaluator = HttpQwenEvaluator(config=inner_config)
 
     def __call__(self, source: Mapping[str, str], translation: Mapping[str, str]) -> GateResult:
-        self._router.ensure_resident(QWEN_MODEL_KEY)
+        _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
         return self._evaluator(source, translation)
 
     def set_usage_sink(self, sink: Any) -> None:
@@ -187,8 +220,14 @@ class LifecycleGemmaSelector:
     """``GemmaSelector`` that ensures Gemma is resident before every call."""
 
     def __init__(self, router: ModelRouter, *, model_name: str,
-                 config: Optional[HttpGemmaSelectorConfig] = None):
+                 config: Optional[HttpGemmaSelectorConfig] = None,
+                 model_key: str = GEMMA_MODEL_KEY,
+                 role: str = "russian_selector",
+                 pair: Any = None):
         self._router = router
+        self._model_key = model_key
+        self._role = role
+        self._pair = pair
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
@@ -207,7 +246,7 @@ class LifecycleGemmaSelector:
     def __call__(
         self, candidates: Sequence[Tuple[str, Mapping[str, str]]],
     ) -> GateResult:
-        self._router.ensure_resident(GEMMA_MODEL_KEY)
+        _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
         return self._selector(candidates)
 
     def set_usage_sink(self, sink: Any) -> None:
@@ -245,8 +284,14 @@ class LifecycleQwenAuditEvaluator:
     """
 
     def __init__(self, router: ModelRouter, *, model_name: str,
-                 config: Optional[BackendQwenAuditEvaluatorConfig] = None):
+                 config: Optional[BackendQwenAuditEvaluatorConfig] = None,
+                 model_key: str = QWEN_MODEL_KEY,
+                 role: str = "qwen_audit",
+                 pair: Any = None):
         self._router = router
+        self._model_key = model_key
+        self._role = role
+        self._pair = pair
         cfg = config or BackendQwenAuditEvaluatorConfig()
         # temperature=float(0), not 0.2: the audit adapters always send
         # ``request.temperature == 0`` (same as the gate evaluations), so
@@ -295,7 +340,7 @@ class LifecycleQwenAuditEvaluator:
         chunked_audit``). ``out_dir``/``out_base`` persist per-chunk
         raw/reasoning artifacts (harness-compatible names).
         """
-        self._router.ensure_resident(QWEN_MODEL_KEY)
+        _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
         if pairs is not None:
             return self._chunked(
                 chapter_id=chunk_id,
@@ -329,8 +374,14 @@ class LifecycleGemmaAuditEvaluator:
     """
 
     def __init__(self, router: ModelRouter, *, model_name: str,
-                 config: Optional[BackendGemmaAuditEvaluatorConfig] = None):
+                 config: Optional[BackendGemmaAuditEvaluatorConfig] = None,
+                 model_key: str = GEMMA_MODEL_KEY,
+                 role: str = "gemma_audit",
+                 pair: Any = None):
         self._router = router
+        self._model_key = model_key
+        self._role = role
+        self._pair = pair
         cfg = config or BackendGemmaAuditEvaluatorConfig()
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
@@ -351,7 +402,7 @@ class LifecycleGemmaAuditEvaluator:
         )
 
     def __call__(self, *, chunk_id: str, translation: Mapping[str, str]) -> str:
-        self._router.ensure_resident(GEMMA_MODEL_KEY)
+        _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
         return self._evaluator(chunk_id=chunk_id, translation=translation)
 
     def set_usage_sink(self, sink: Any) -> None:
@@ -380,8 +431,14 @@ class LifecycleQwenEntityExtractor:
     """
 
     def __init__(self, router: ModelRouter, *, model_name: str,
-                 config: Optional[BackendEntityExtractorConfig] = None):
+                 config: Optional[BackendEntityExtractorConfig] = None,
+                 model_key: str = QWEN_MODEL_KEY,
+                 role: str = "entity_extractor",
+                 pair: Any = None):
         self._router = router
+        self._model_key = model_key
+        self._role = role
+        self._pair = pair
         cfg = config or BackendEntityExtractorConfig()
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
@@ -408,7 +465,7 @@ class LifecycleQwenEntityExtractor:
         source: Mapping[str, str],
         out_dir: Optional[Path] = None,
     ) -> str:
-        self._router.ensure_resident(QWEN_MODEL_KEY)
+        _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
         return self._extractor(
             chapter_id=chapter_id, source=source, out_dir=out_dir
         )
@@ -454,6 +511,9 @@ class LifecycleSelectiveRepairEvaluator:
         repair_model_name: str,
         reaudit_model_name: Optional[str] = None,
         config: Optional[SelectiveRepairConfig] = None,
+        repair_model_key: str = GEMMA_MODEL_KEY,
+        reaudit_model_key: str = QWEN_MODEL_KEY,
+        pair: Any = None,
     ):
         if not reaudit_model_name:
             raise ValueError(
@@ -463,6 +523,9 @@ class LifecycleSelectiveRepairEvaluator:
                 f"repair_model_name={repair_model_name!r}"
             )
         self._router = router
+        self._repair_model_key = repair_model_key
+        self._reaudit_model_key = reaudit_model_key
+        self._pair = pair
         repair_api = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=repair_model_name,
@@ -516,9 +579,9 @@ class LifecycleSelectiveRepairEvaluator:
 
     def _ensure_phase(self, phase: str) -> None:
         if phase == "reaudit":
-            self._router.ensure_resident(QWEN_MODEL_KEY)
+            _ensure_role_resident(self._router, self._reaudit_model_key, role="qwen_audit", pair=self._pair)
         else:
-            self._router.ensure_resident(GEMMA_MODEL_KEY)
+            _ensure_role_resident(self._router, self._repair_model_key, role="repair", pair=self._pair)
 
     def set_usage_sink(self, sink: Any) -> None:
         """MONITOR-V2 (2.4): forward the per-call usage sink to BOTH owned

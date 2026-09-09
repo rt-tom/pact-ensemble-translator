@@ -179,7 +179,15 @@ def switch_aggregates_by_model(switches: List[SwitchRecord]) -> dict:
 
 
 def switch_payload(sw: SwitchRecord) -> Mapping[str, Any]:
-    """``SwitchRecord`` in the same dict shape v1 records used."""
+    """``SwitchRecord`` in the same dict shape v1 records used.
+
+    Local-matrix-v2: fresh-call reasoning provenance rides along — the
+    role-effective ``reasoning_budget``, the ACTUAL ``launch_args``, and
+    (when the launch carried a pair) ``role``/``model_base``/``role_delta``
+    /``effective``. Legacy launches keep ``reasoning_budget`` None and an
+    empty ``launch_args``; resident hits produce no record at all, so
+    cache-hit provenance is never rewritten.
+    """
     return {
         "from_model": sw.from_model,
         "to_model": sw.to_model,
@@ -188,6 +196,12 @@ def switch_payload(sw: SwitchRecord) -> Mapping[str, Any]:
         "load_retries": sw.load_retries,
         "peak_vram_mb": sw.peak_vram_mb,
         "timestamp": sw.timestamp,
+        "reasoning_budget": sw.reasoning_budget,
+        "launch_args": list(sw.launch_args),
+        "role": sw.role,
+        "model_base": sw.model_base,
+        "role_delta": sw.role_delta,
+        "effective": sw.reasoning_budget,
     }
 
 

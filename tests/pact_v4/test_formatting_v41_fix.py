@@ -164,6 +164,10 @@ def test_diagnostics_on_parse_failure_logs_and_writes_meta(tmp_path: Path, caplo
 
 
 def test_build_formatting_client_overrides_reasoning_for_runtime_config(tmp_path: Path, monkeypatch):
+    # Local-matrix-v2: a local formatting backend is NOT forced to gemma
+    # reasoning 0 anymore — the per-chapter formatting server runs the
+    # reviewer model's resolved launch args. This test now asserts the
+    # local backend passes through unchanged (reviewer args preserved).
     import pact_full_pipeline_runner_v1.v4_book_run as br
     from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _gemma_server_args_for_reasoning
     from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig
@@ -193,9 +197,9 @@ def test_build_formatting_client_overrides_reasoning_for_runtime_config(tmp_path
         def close(self): pass
 
     def fake_build_runtime(self, log_dir=None):
-        # Verify gemma args have reasoning 0
-        assert self.server_args["gemma"] != _gemma_server_args_for_reasoning(2048)
-        assert self.server_args["gemma"] == _gemma_server_args_for_reasoning(0)
+        # Local-matrix-v2: local reviewer launch args pass through unchanged
+        # (no reasoning-0 override on gemma).
+        assert self.server_args["gemma"] == _gemma_server_args_for_reasoning(2048)
         captured["checked"] = True
         return DummyRuntime()
 

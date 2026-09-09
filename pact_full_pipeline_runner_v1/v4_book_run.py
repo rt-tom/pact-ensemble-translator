@@ -1017,11 +1017,11 @@ def _flag_value(extra, flag):
 class _FormattingBackendClient:
     """Adapter wrapping a CompletionBackend for resolve_format_mappings.
 
-    Exact-role contract (local-model-aliases): the model ref resolves ONLY
+    Exact-role contract (local-matrix-v2): the model ref resolves ONLY
     the ``formatting`` binding (fail-closed, no ``generator``/``default``
     fallback), and sampling (temperature/top_p/top_k/min_p/seed) comes ONLY
     from the formatting role policy — ``role_policy`` passed at construction
-    (synthesized from the run's ``ResolvedModelPair`` translator model) or,
+    (synthesized from the run's ``ResolvedModelPair`` REVIEWER model) or,
     when absent, from the shared registry (``_shared_budget_for_role``).
     The ``cfg`` mapping is never a sampling source: its legacy
     ``temperature`` default must not leak into the request.
@@ -1058,8 +1058,13 @@ class _FormattingBackendClient:
             top_k=sampling.get("top_k"),
             min_p=sampling.get("min_p"),
             seed=sampling.get("seed"),
+            repeat_penalty=sampling.get("repeat_penalty"),
+            repeat_last_n=sampling.get("repeat_last_n"),
+            frequency_penalty=sampling.get("frequency_penalty"),
+            presence_penalty=sampling.get("presence_penalty"),
             response_schema={"type": "json_object"},
             label=label or "formatting",
+            role="formatting",
         )
         resp = self._backend.complete(req)
         # Propagate reasoning/finish_reason/usage for diagnostics (v41 3.3)
@@ -1107,24 +1112,52 @@ class _FormattingBackendClient:
                 pass
 
 
+def _local_formatting_backend_for_pair(pair, *, port: int = 8094):
+    """Separate per-chapter local reviewer-model formatting server config.
+
+    Local-matrix-v2: ``book --local`` formatting starts its own server from
+    the REVIEWER model's resolved launch args for the ``formatting`` role
+    (role-effective ``--reasoning-budget`` replaced, reviewer sampling via
+    the formatting role policy) — never the translator, never reasoning 0.
+    This does NOT reuse an already-resident re-audit process; it reuses the
+    reviewer model/profile. Local-server log naming is preserved by the
+    lifecycle (``{profile}_{stamp}_*.log``); no ``opencode_serve_fmt_``
+    renaming applies to local logs.
+    """
+    from pathlib import Path as _Path
+    from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig as _Local
+    reviewer = pair.reviewer_model
+    key = reviewer.model_key
+    return _Local(
+        exe=_Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0",
+        host="127.0.0.1",
+        model_paths={key: _Path(reviewer.model_path)},
+        model_names={key: reviewer.model_name},
+        server_args={key: list(pair.launch_args_for_role("formatting"))},
+        port=int(port),
+        resolved_pair=pair,
+    )
+
+
 def _formatting_backend_with_overrides(backend):
     """Apply formatting-specific overrides: reasoning 0 and external->managed for opencode.
 
-    For Local: force gemma reasoning 0. For OpenCode: force reasoning 0 and when
+    For Local (local-matrix-v2): no override — the per-chapter formatting
+    server is built from the reviewer model's resolved launch args
+    (``_local_formatting_backend_for_pair``), already role-effective.
+    For OpenCode: force reasoning 0 and when
     server_mode is external, promote to managed (ManagedServerProcess / OpenCodeServerProcess)
     on port from base_url (e.g. 4097) so formatting can start its own server per-chapter (proposal D2).
-    For Composite: apply recursively to each sub-backend.
+    For Composite: apply recursively to each sub-backend (local sub-backends unchanged).
     """
     try:
         from dataclasses import replace as _replace
         from pact_v4.runtime.runtime_config import CompositeBackendConfig as _Composite, LocalLlamaBackendConfig as _Local, OpenCodeBackendConfig as _OpenCode
         from pact_v4.runtime.opencode_server_lifecycle import ManagedServerSpec as _Spec
         from pact_v4.runtime.runtime_config import _parse_url_port as _port_of
-        from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _gemma_server_args_for_reasoning as _gemma_args0
         if isinstance(backend, _Local):
-            new_sa = dict(backend.server_args)
-            new_sa["gemma"] = _gemma_args0(0)
-            return _replace(backend, server_args=new_sa)
+            return backend
         if isinstance(backend, _OpenCode):
             new_server = backend.server
             # reasoning 0 override
@@ -1150,9 +1183,9 @@ def _formatting_backend_with_overrides(backend):
             new_backends = {}
             for _name, _sub in backend.backends.items():
                 if isinstance(_sub, _Local):
-                    _nsa = dict(_sub.server_args)
-                    _nsa["gemma"] = _gemma_args0(0)
-                    new_backends[_name] = _replace(_sub, server_args=_nsa)
+                    # Local-matrix-v2: local sub-backends keep their resolved
+                    # reviewer launch args (no reasoning-0 override).
+                    new_backends[_name] = _sub
                 elif isinstance(_sub, _OpenCode):
                     new_backends[_name] = _formatting_backend_with_overrides(_sub)
                 else:
@@ -1166,8 +1199,8 @@ def _formatting_backend_with_overrides(backend):
 def _formatting_role_policy_from_config(backend_cfg):
     """Synthesize the formatting role policy from the backend config's pair.
 
-    Local-model-aliases: sampling comes from the run's ``ResolvedModelPair``
-    (translator model serves the translator-group ``formatting`` role) and
+    Local-matrix-v2: sampling comes from the run's ``ResolvedModelPair``
+    (reviewer model serves the reviewer-group ``formatting`` role) and
     the output budget from ``role_budgets["formatting"]`` — mirroring the
     ``_synth`` path in ``build_role_adapters``. Returns ``None`` when the
     config carries no pair; the client then resolves sampling from the
@@ -1240,32 +1273,39 @@ def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
                 backend = _apf(tmp, backend)
             backend = _formatting_backend_with_overrides(backend)
         else:
-            # Historical local default — same backend as strict-runner run_local_default
-            # (required so the ordinary CLI path without --runtime-config still resolves
-            # formatting via the exact formatting role instead of falling back to debt).
-            from pact_full_pipeline_runner_v1.v4_phase12_strict_run import GEMMA_PATH, QWEN_PATH, QWEN_SERVER_ARGS, _gemma_server_args_for_reasoning
-            from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig
-            backend = LocalLlamaBackendConfig(
-                exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
-                device="SYCL0",
-                host="127.0.0.1",
-                model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
-                model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
-                server_args={"gemma": _gemma_server_args_for_reasoning(0), "qwen": list(QWEN_SERVER_ARGS)},
-                port=8094,
-            )
-            if translator or reviewer:
-                try:
-                    from pact_full_pipeline_runner_v1.v4_phase12_strict_run import _apply_provider_flags as _apf2
-                    class _Tmp2:
-                        pass
-                    tmp2 = _Tmp2()
-                    tmp2.translator = translator
-                    tmp2.reviewer = reviewer
-                    tmp2.providers_config = Path(providers_cfg) if providers_cfg else None
-                    backend = _apf2(tmp2, backend)
-                except Exception:
-                    pass
+            # Local-matrix-v2: separate per-chapter local reviewer-model
+            # formatting server. The strict chapter run has already released
+            # its local lifecycle, so start the reviewer model's resolved
+            # launch args for the ``formatting`` role (health-wait, then
+            # close; deterministic fallback on failure). The pair comes from
+            # --local in extra_args (or the default gemma/qwen pair); a
+            # --runtime-config run never reaches this branch. Resolution
+            # failure returns None -> deterministic run_formatting_align.
+            try:
+                from pact_full_pipeline_runner_v1.v4_phase12_strict_run import (
+                    _default_providers_config as _def_prov,
+                    _resolve_local_pair as _resolve_pair,
+                )
+                _local_raw = _flag_value(extra, "--local")
+                # Bare --local (no pair value: next token is another flag or
+                # absent) means the default pair, not a pair literally named
+                # after the next flag.
+                if _local_raw is not None and str(_local_raw).startswith("--"):
+                    _local_raw = None
+                if _local_raw is None and hasattr(args, "local") and getattr(args, "local", None):
+                    _local_raw = str(getattr(args, "local"))
+                if _local_raw is not None and not str(_local_raw).strip():
+                    _local_raw = None
+                _prov = Path(providers_cfg) if providers_cfg else _def_prov()
+                # Bare --local (flag without value) resolves the default pair.
+                _pair_str = _local_raw
+                if _pair_str is not None and _pair_str == "__LOCAL_DEFAULT__":
+                    _pair_str = None
+                _pair = _resolve_pair(_pair_str, _prov)
+                backend = _local_formatting_backend_for_pair(_pair, port=8094)
+            except Exception as _pair_exc:
+                LOG.warning("local formatting pair resolution failed (%s) — falling back to debt", _pair_exc)
+                return None
             backend = _formatting_backend_with_overrides(backend)
         if backend is None:
             return None
@@ -1282,10 +1322,20 @@ def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
             runtime = backend.build_runtime(log_dir=log_dir)
             from pact_v4.runtime.runtime_config import build_role_backend
             fmt_backend = build_role_backend(backend, runtime)
-            return _FormattingBackendClient(
+            _client = _FormattingBackendClient(
                 fmt_backend, runtime,
                 role_policy=_formatting_role_policy_from_config(backend),
             )
+            # Local-matrix-v2: tag local reviewer formatting clients so the
+            # book run keeps local-server log naming (no opencode_serve_fmt_
+            # renaming) for local logs.
+            try:
+                from pact_v4.runtime.runtime_config import LocalLlamaBackendConfig as _LocalCfg
+                if isinstance(backend, _LocalCfg) and getattr(backend, "resolved_pair", None) is not None:
+                    _client._local_format_profile = str(backend.resolved_pair.reviewer_model.model_key)
+            except Exception:
+                pass
+            return _client
         except Exception as exc:
             if runtime is not None:
                 try:
@@ -1476,7 +1526,7 @@ def run_book(
                                     if _per_chapter_fmt_client is not None:
                                         _mappings = resolve_format_mappings(_per_chapter_fmt_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
                                     else:
-                                        _fmt_health_error = "formatting backend unavailable: GET /global/health failed (port 4097)"
+                                        _fmt_health_error = "formatting backend unavailable: GET /global/health failed"
                                         LOG.warning("formatting backend unavailable for %s — falling back to lenient debt (GET /global/health failed)", chapter_id)
                                         _mappings = {}
                                 except Exception as _fmt_exc:
@@ -1487,6 +1537,11 @@ def run_book(
                                 finally:
                                     # Preserve only logs created by formatting lifecycle (snapshot isolation)
                                     try:
+                                        # Local-matrix-v2: local formatting logs keep
+                                        # local-server naming ({profile}_{stamp}_*.log)
+                                        # — never renamed to opencode_serve_fmt_*.
+                                        _fmt_local_profile = getattr(_per_chapter_fmt_client, "_local_format_profile", None)
+                                        _fmt_is_local = _fmt_local_profile is not None
                                         if _per_chapter_fmt_client is not None:
                                             try:
                                                 _per_chapter_fmt_client.close()
@@ -1495,7 +1550,7 @@ def run_book(
                                         # Only consider new logs created during formatting lifecycle
                                         try:
                                             import shutil
-                                            _all_logs = list(_log_dir_fmt.glob("opencode_serve_*.log"))
+                                            _all_logs = [] if _fmt_is_local else list(_log_dir_fmt.glob("opencode_serve_*.log"))
                                             _new_logs = []
                                             for _p in _all_logs:
                                                 if "opencode_serve_fmt_" in _p.name:
@@ -1526,14 +1581,20 @@ def run_book(
                                                             pass
                                             # Startup failure before logs exist (e.g., port-occupancy preflight):
                                             # ensure diagnostic fmt log exists with real error, not synthetic empty placeholder.
+                                            # Local runs keep local-server naming ({profile}_fmt_{chapter}_health.log).
                                             if _fmt_health_error is not None:
-                                                _fmt_existing = list(_log_dir_fmt.glob("opencode_serve_fmt_*.log"))
+                                                if _fmt_is_local:
+                                                    _fmt_existing = list(_log_dir_fmt.glob(f"{_fmt_local_profile}_fmt_*.log"))
+                                                    _diag_name = f"{_fmt_local_profile}_fmt_{chapter_id}_health.log"
+                                                else:
+                                                    _fmt_existing = list(_log_dir_fmt.glob("opencode_serve_fmt_*.log"))
+                                                    _diag_name = f"opencode_serve_fmt_{chapter_id}_health.log"
                                                 if not _fmt_existing:
                                                     try:
                                                         _err_text_for_log = _fmt_health_error
                                                         if "/global/health" not in _err_text_for_log:
                                                             _err_text_for_log = f"GET /global/health failed: {_err_text_for_log}"
-                                                        _diag_log = _log_dir_fmt / f"opencode_serve_fmt_{chapter_id}_health.log"
+                                                        _diag_log = _log_dir_fmt / _diag_name
                                                         _diag_log.write_text(
                                                             f"formatting startup failed for {chapter_id}: {_err_text_for_log}\n",
                                                             encoding="utf-8",

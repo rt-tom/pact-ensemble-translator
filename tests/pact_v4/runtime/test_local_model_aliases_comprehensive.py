@@ -201,11 +201,12 @@ providers:
 def test_all_ten_producers_receive_correct_group_model_and_budget(tmp_path):
     _, pair = _registry_with_pair(tmp_path)
     # Every translator role must use trans model's sampling and its own budget
+    # (local-matrix-v2: formatting moved to reviewer, so 8000 lives there).
     for role in TRANSLATOR_ROLES:
         sampling = pair.sampling_for_role(role)
         assert sampling["temperature"] == 0.7, f"{role} should use translator sampling"
         budget = pair.budget_for_role(role)
-        assert budget.max_output_tokens in (70000, 16384, 8000, 4096), f"{role} budget unexpected"
+        assert budget.max_output_tokens in (70000, 16384, 4096), f"{role} budget unexpected"
         # derive must work
         derived = derive_max_output_tokens(budget, item_count=10)
         assert isinstance(derived, int) and derived > 0
@@ -213,7 +214,7 @@ def test_all_ten_producers_receive_correct_group_model_and_budget(tmp_path):
         sampling = pair.sampling_for_role(role)
         assert sampling["temperature"] == 0.3, f"{role} should use reviewer sampling"
         budget = pair.budget_for_role(role)
-        assert budget.max_output_tokens in (12000, 16384, 1024, 12000, 4096)
+        assert budget.max_output_tokens in (8000, 12000, 16384, 1024, 12000, 4096)
     # Check that B3 helper correctly wires all roles
     from pact_v4.pipeline.b3_audit_repair import _policy_for_role
     for role in TRANSLATOR_ROLES | REVIEWER_ROLES if isinstance(TRANSLATOR_ROLES, set) else (TRANSLATOR_ROLES + REVIEWER_ROLES):

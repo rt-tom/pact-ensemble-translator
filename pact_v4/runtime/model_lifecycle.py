@@ -283,6 +283,33 @@ class LifecycleAdapter:
 # from what is already resident.
 # --------------------------------------------------------------------------
 
+def with_reasoning_budget(args: list[str], budget: int) -> list[str]:
+    """Copy ``args`` with ``--reasoning-budget`` REPLACED by ``budget``.
+
+    Local-matrix-v2: the same model is relaunched (never appended) when
+    the next role needs a different role-effective budget. Fail-closed
+    when the profile carries no ``--reasoning-budget`` flag or carries it
+    ambiguously (duplicates) — silently reusing the wrong budget or
+    promoting to a group maximum is forbidden.
+    """
+    occurrences = [i for i, arg in enumerate(args) if arg == "--reasoning-budget"]
+    if not occurrences:
+        raise ValueError(
+            "with_reasoning_budget: server_args carry no --reasoning-budget flag; "
+            "cannot launch role-effective budget %r (refusing to silently reuse)" % (budget,)
+        )
+    if len(occurrences) > 1:
+        raise ValueError(
+            "with_reasoning_budget: --reasoning-budget appears %d times; refusing to guess" % len(occurrences)
+        )
+    index = occurrences[0]
+    if index + 1 >= len(args):
+        raise ValueError("with_reasoning_budget: --reasoning-budget has no value")
+    out = list(args)
+    out[index + 1] = str(int(budget))
+    return out
+
+
 @dataclass
 class SwitchRecord:
     from_model: Optional[str]
@@ -292,6 +319,18 @@ class SwitchRecord:
     load_retries: int
     peak_vram_mb: Optional[float]
     timestamp: str
+    # Local-matrix-v2 provenance: the role-effective budget this (re)launch
+    # serves and the ACTUAL launch args (None/empty for legacy residency
+    # calls that did not request an effective budget). Fresh-call records
+    # (created only on launch/relaunch, never on resident hits) also carry
+    # the role + model base + role delta so the switch payload reconstructs
+    # model_base / role_delta / effective / launch_args without touching
+    # cache-hit provenance elsewhere.
+    reasoning_budget: Optional[int] = None
+    launch_args: tuple = ()
+    role: Optional[str] = None
+    model_base: Optional[int] = None
+    role_delta: Optional[int] = None
 
 
 class ModelRouter:
@@ -300,6 +339,12 @@ class ModelRouter:
     This is what lets ``Gpref(N)`` and ``Ggen(N+1)`` share one Gemma
     lease: two consecutive ``ensure_resident("gemma")`` calls with no
     intervening ``ensure_resident("qwen")`` do not restart anything.
+
+    Local-matrix-v2: ``reasoning_budget`` is the role-effective budget the
+    next call needs. The SAME model is restarted/relaunched when the
+    effective budget differs from the resident launch (``--reasoning-budget``
+    replaced, never appended; never a group-maximum substitute). ``None``
+    means legacy residency-by-model (no restart for the same model).
     """
 
     def __init__(self, adapter: LifecycleAdapter, *,
@@ -309,26 +354,53 @@ class ModelRouter:
         self._role_profile_names = dict(role_profile_names)
         self._role_args = dict(role_args)
         self.current_model: Optional[str] = None
+        self.current_reasoning_budget: Optional[int] = None
         self.switches: list[SwitchRecord] = []
 
     @property
     def base_url(self) -> str:
         return self._adapter.base_url
 
-    def ensure_resident(self, model_key: str) -> Optional[SwitchRecord]:
+    def launch_args_for(self, model_key: str, reasoning_budget: Optional[int] = None) -> list[str]:
+        """Resolved launch args for ``model_key`` (effective budget replaced)."""
+        base = list(self._role_args.get(model_key, []))
+        if reasoning_budget is None:
+            return base
+        return with_reasoning_budget(base, int(reasoning_budget))
+
+    def ensure_resident(
+        self,
+        model_key: str,
+        *,
+        reasoning_budget: Optional[int] = None,
+        reasoning_provenance: Optional[Mapping[str, object]] = None,
+    ) -> Optional[SwitchRecord]:
+        want = None if reasoning_budget is None else int(reasoning_budget)
         if self.current_model == model_key:
-            return None
+            if want is None or want == self.current_reasoning_budget:
+                return None
+            # Same model, different effective budget -> relaunch (Q1: same-model
+            # restart with replaced --reasoning-budget, no group-max substitute).
         from_model = self.current_model
         unload_seconds: Optional[float] = None
         if self.current_model is not None:
             unload_seconds, _released, _final_bytes = self._adapter.stop()
+        launch_args = self.launch_args_for(model_key, want)
         cold_acquire_seconds, load_retries = self._adapter.start(
             model_key,
             self._role_profile_names.get(model_key, model_key),
-            self._role_args.get(model_key, []),
+            launch_args,
         )
         self.current_model = model_key
+        # Tracked budget is the budget of the CURRENT resident launch:
+        # a model switch replaces it (None = legacy static launch, unknown
+        # effective); a same-model call only reaches here on relaunch.
+        self.current_reasoning_budget = want
         peak_vram = self._adapter.sample_vram()
+        # Fresh-call reasoning provenance only: populated when the caller
+        # supplied it alongside a launch/relaunch. Resident hits return
+        # None above and write nothing (cache-hit provenance untouched).
+        _prov = reasoning_provenance if isinstance(reasoning_provenance, Mapping) else None
         record = SwitchRecord(
             from_model=from_model,
             to_model=model_key,
@@ -337,6 +409,11 @@ class ModelRouter:
             load_retries=load_retries,
             peak_vram_mb=(peak_vram / (1024 * 1024)) if peak_vram and peak_vram > 0 else None,
             timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            reasoning_budget=want,
+            launch_args=tuple(launch_args),
+            role=str(_prov.get("role")) if _prov is not None and _prov.get("role") is not None else None,
+            model_base=int(_prov.get("model_base")) if _prov is not None and _prov.get("model_base") is not None else None,
+            role_delta=int(_prov.get("role_delta")) if _prov is not None and _prov.get("role_delta") is not None else None,
         )
         self.switches.append(record)
         return record
@@ -347,4 +424,5 @@ class ModelRouter:
             return None
         unload_seconds, _released, _final_bytes = self._adapter.stop()
         self.current_model = None
+        self.current_reasoning_budget = None
         return unload_seconds

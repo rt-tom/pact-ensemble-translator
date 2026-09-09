@@ -1747,8 +1747,13 @@ class SelectiveRepairEvaluator:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=cfg.label,
+            role="repair",
             on_reasoning_chunk=open_reasoning_writer(reason_path),
             request_options=request_options,
         )
@@ -2008,8 +2013,13 @@ class SelectiveRepairEvaluator:
                 top_k=req_r.get("top_k"),
                 min_p=req_r.get("min_p"),
                 seed=req_r.get("seed"),
+                repeat_penalty=req_r.get("repeat_penalty"),
+                repeat_last_n=req_r.get("repeat_last_n"),
+                frequency_penalty=req_r.get("frequency_penalty"),
+                presence_penalty=req_r.get("presence_penalty"),
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=cfg.reaudit_label,
+                role="qwen_audit",
                 on_reasoning_chunk=open_reasoning_writer(reason_path),
             )
 

@@ -1064,8 +1064,13 @@ class RussianEditorEvaluator:
                 top_k=req.get("top_k"),
                 min_p=req.get("min_p"),
                 seed=req.get("seed"),
+                repeat_penalty=req.get("repeat_penalty"),
+                repeat_last_n=req.get("repeat_last_n"),
+                frequency_penalty=req.get("frequency_penalty"),
+                presence_penalty=req.get("presence_penalty"),
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=cfg.label,
+                role="russian_editor",
                 on_reasoning_chunk=open_reasoning_writer(reason_path),
             )
             self._emit_chunk_event(

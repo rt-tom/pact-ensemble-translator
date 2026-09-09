@@ -208,7 +208,7 @@ def build_argparser() -> argparse.ArgumentParser:
                         "--no-lazy-balanced restores the legacy 2-candidate A/B + Gemma "
                         "scheme (full rollback).")
     p.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="PAIR",
-                    help="Select canonical local pair gemma/qwen; --local a/b selects translator a reviewer b from providers.local.models (case-insensitive, no provider slash); single alias fails with pair required")
+                    help="Select canonical local pair gemma/qwen (or gemma31/qwen38); --local a/b selects translator a reviewer b from providers.local.models (case-insensitive, no provider slash); single alias fails with pair required. Hybrid effective reasoning = model base + role delta (generator/entity_extractor/qwen_audit +2000); the router relaunches the same model on budget change; effective reasoning never alters run identity/cache/resume" )
     p.add_argument("--runtime-config", type=Path, default=None, metavar="FILE",
                     help="YAML/JSON tagged runtime profile (kind local_llama | "
                          "opencode_server | composite). When absent the historical "
@@ -935,6 +935,15 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
 # name — a substring test would admit lookalikes (Qwen-non-MTP.gguf,
 # …/MTP-disabled/…, forged model_names.qwen=Qwen-MTP.gguf) as MTP.
 _B3_QWEN_MTP_VARIANT = "Qwen3.6-35B-A3B-MTP"
+# Round-2 HIGH (option B): the approved qwen38 reviewer profile carries its
+# MTP draft as an EXTERNAL draft file (-md) instead of an MTP-variant main
+# model directory, with a 44k context. B3 capability for qwen38 is assessed
+# against this exact approved contract — model-specific, never a broad
+# relaxation: exact draft-file stem, exact main-model stem, spec-type
+# draft-mtp, reasoning >= 8192, context floor 44000.
+_B3_QWEN38_MODEL_STEM = "Qwen3.8-27B-UD-Q4_K_XL"
+_B3_QWEN38_DRAFT_STEM = "mtp-Qwen3.8-27B-Q4_0"
+_B3_QWEN38_CONTEXT_FLOOR = 44000
 # A model NAME that explicitly negates MTP contradicts a valid MTP path —
 # name/path coherence guard (the name must never override the path verdict).
 _B3_QWEN_MTP_NEGATION_MARKERS = (
@@ -977,6 +986,98 @@ def _name_negates_b3_qwen_mtp(name: str) -> bool:
     return any(marker in lowered for marker in _B3_QWEN_MTP_NEGATION_MARKERS)
 
 
+def _normalized_path_stem(value: str):
+    """Normalized file stem (lowercased) or ``None`` when empty/malformed.
+
+    Same normalization discipline as ``_is_b3_qwen_mtp_identity``: identity
+    is judged on the effective path, and malformed values fail closed.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return Path(os.path.normpath(value)).stem.lower()
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_b3_qwen38_draft_identity(value: str) -> bool:
+    """Exact approved external MTP draft-file identity for the qwen38 reviewer.
+
+    The approved qwen38 profile declares ``--spec-type draft-mtp`` with the
+    draft carried by ``-md <.../MTP/mtp-Qwen3.8-27B-Q4_0.gguf>``. Only the
+    exact draft-file stem satisfies the B3 draft requirement — substring
+    lookalikes and forged names fail closed (mirrors the exactness of
+    ``_is_b3_qwen_mtp_identity`` for the legacy qwen profile).
+    """
+    stem = _normalized_path_stem(value)
+    return stem is not None and stem == _B3_QWEN38_DRAFT_STEM.lower()
+
+
+def _validate_b3_qwen38_reviewer(rev_args: list, rev_path: Any, rev_name: Any) -> None:
+    """B3 capability for the approved qwen38 reviewer profile (option B).
+
+    Accepts ONLY the approved qwen38 contract: ``--spec-type draft-mtp``
+    with the exact external draft file (``-md`` stem
+    ``mtp-Qwen3.8-27B-Q4_0``), the exact approved main-model build,
+    ``--reasoning-budget >= 8192`` (assessed on the ACTUAL qwen_audit
+    role-effective launch args, e.g. 10192), and context floor 44000.
+    Anything else — missing/lookalike draft, wrong main model, lowered
+    budget or context — fails closed. Never a broad relaxation: every
+    check is qwen38-model-specific.
+    """
+    def _arg_value(flag: str):
+        for index, arg in enumerate(rev_args):
+            if arg == flag and index + 1 < len(rev_args):
+                return rev_args[index + 1]
+        return None
+
+    spec_type = _arg_value("--spec-type")
+    draft = _arg_value("-md")
+    reasoning_budget = _arg_value("--reasoning-budget")
+    context = _arg_value("-c") or _arg_value("--ctx-size")
+    path_str = str(rev_path) if rev_path is not None else ""
+    name_str = str(rev_name) if rev_name is not None else ""
+    problems: list = []
+    if spec_type != "draft-mtp":
+        problems.append("--spec-type draft-mtp (MTP draft)")
+    if not draft or not _is_b3_qwen38_draft_identity(draft):
+        problems.append(
+            f"-md {_B3_QWEN38_DRAFT_STEM!r} (exact approved external MTP draft file; "
+            f"got {draft!r})"
+        )
+    main_stem = _normalized_path_stem(path_str)
+    if main_stem != _B3_QWEN38_MODEL_STEM.lower():
+        problems.append(
+            f"reviewer main model must be the approved {_B3_QWEN38_MODEL_STEM!r} build "
+            f"(got path={path_str!r})"
+        )
+    elif name_str and _name_negates_b3_qwen_mtp(name_str):
+        problems.append(
+            f"reviewer model_names contradicts the MTP draft declaration "
+            f"(got name={name_str!r}, path={path_str!r})"
+        )
+    try:
+        budget_ok = reasoning_budget is not None and int(reasoning_budget) >= 8192
+    except ValueError:
+        budget_ok = False
+    if not budget_ok:
+        problems.append("--reasoning-budget >= 8192")
+    try:
+        context_ok = context is not None and int(context) >= _B3_QWEN38_CONTEXT_FLOOR
+    except ValueError:
+        context_ok = False
+    if not context_ok:
+        problems.append(f"context -c >= {_B3_QWEN38_CONTEXT_FLOOR}")
+    if problems:
+        raise ValueError(
+            "B3 audit requires a qwen38 reviewer profile that is B3-capable "
+            "(missing: " + "; ".join(problems) + "). The qwen38 audit server "
+            "args and the B3 config identity must agree — only the approved "
+            "qwen38 profile (-md external draft, 44k context) is accepted "
+            "(or pass --skip-audit)."
+        )
+
+
 def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
     """Fail loudly when a local profile cannot serve the B3 Qwen audit.
 
@@ -1001,14 +1102,51 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
         # Remote/composite audit transport is provider-side; the remote
         # audit is a CONTRACT not tested yet (owner decision).
         return
-    qwen_args = list((backend.server_args or {}).get("qwen") or [])
+    # Round-2 HIGH: validate the RESOLVED reviewer (the model that will
+    # actually serve the audit), not the retained legacy "qwen" entries.
+    # apply_resolved_pair_to_config keeps legacy model_paths/model_names/
+    # server_args entries while the active reviewer routes to the pair's
+    # reviewer model (e.g. qwen38) — inspecting hardcoded "qwen" entries
+    # would bless qwen3.6/49k settings while launching qwen38/44k.
+    pair = getattr(backend, "resolved_pair", None) or getattr(backend, "resolved_role_policies", None)
+    reviewer = getattr(pair, "reviewer_model", None) if pair is not None else None
+    if reviewer is not None:
+        rev_key = reviewer.model_key
+        # Actual launch args: the backend's real arg list for the reviewer
+        # key with the qwen_audit role-effective budget applied (exactly
+        # what the router launches: static args never run as-is). Missing
+        # or ambiguous --reasoning-budget fails closed here (never silently
+        # validated against the wrong budget).
+        from pact_v4.runtime.model_lifecycle import with_reasoning_budget as _with_budget
+        rev_args = _with_budget(
+            list((backend.server_args or {}).get(rev_key) or []),
+            pair.effective_reasoning_budget("qwen_audit"),
+        )
+    else:
+        rev_key = "qwen"
+        rev_args = list((backend.server_args or {}).get("qwen") or [])
+    rev_path = (backend.model_paths or {}).get(rev_key)
+    rev_name = (backend.model_names or {}).get(rev_key)
 
     def _arg_value(flag: str) -> Optional[str]:
-        for index, arg in enumerate(qwen_args):
-            if arg == flag and index + 1 < len(qwen_args):
-                return qwen_args[index + 1]
+        for index, arg in enumerate(rev_args):
+            if arg == flag and index + 1 < len(rev_args):
+                return rev_args[index + 1]
         return None
 
+    if rev_key == "qwen38":
+        _validate_b3_qwen38_reviewer(rev_args, rev_path, rev_name)
+        return
+    if rev_key != "qwen":
+        # Model-specific fail-closed: B3 capability has only been assessed
+        # for the qwen (qwen3.6 MTP) and qwen38 (external-draft) reviewer
+        # profiles. Any other reviewer model cannot be proven B3-capable.
+        raise ValueError(
+            f"B3 audit requires a reviewer model with assessed B3 capability "
+            f"(qwen or qwen38); resolved reviewer model_key={rev_key!r} is "
+            f"unassessed — refusing to audit on an unvalidated profile "
+            f"(or pass --skip-audit)."
+        )
     spec_type = _arg_value("--spec-type")
     reasoning_budget = _arg_value("--reasoning-budget")
     context = _arg_value("-c") or _arg_value("--ctx-size")
@@ -1018,8 +1156,8 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
     # model path with MTP flags is an unsupported mismatch (the draft spec
     # is a property of the model build, not just the server args), so it
     # must fail loudly here instead of silently starting a non-MTP server.
-    qwen_path = (backend.model_paths or {}).get("qwen")
-    qwen_name = (backend.model_names or {}).get("qwen")
+    qwen_path = rev_path
+    qwen_name = rev_name
     path_str = str(qwen_path) if qwen_path is not None else ""
     name_str = str(qwen_name) if qwen_name is not None else ""
     problems: list = []
