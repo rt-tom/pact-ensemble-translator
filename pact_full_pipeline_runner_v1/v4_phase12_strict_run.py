@@ -642,44 +642,38 @@ def _with_reasoning_override(backend: Any, reasoning: int) -> Any:
     return backend
 
 
+def _resolve_local_alias_entry(alias: str, providers_config: Optional[Path] = None):
+    """Resolve alias via registry and validate it is a local provider alias."""
+    from pact_v4.runtime.runtime_config import LocalModelAlias, load_providers_registry
+    prov_path = providers_config or _default_providers_config()
+    registry = load_providers_registry(prov_path)
+    if "/" in alias:
+        provider = alias.split("/", 1)[0]
+        if provider.lower() != "local":
+            raise ValueError(f"--local alias must be a local provider alias; got remote {alias!r}")
+        resolved = registry.resolve(alias)
+        if not isinstance(resolved, LocalModelAlias):
+            raise ValueError(f"--local alias must be a local provider alias; got remote {alias!r}")
+        return resolved
+    else:
+        resolved = registry.resolve_bare(alias)
+        if not isinstance(resolved, LocalModelAlias):
+            raise ValueError(f"--local alias must be a local provider alias; got remote {alias!r}")
+        # Verify alias is from local provider (membership check)
+        local_models = registry.providers.get("local") or {}
+        if not any(k.lower() == alias.lower() for k in local_models):
+            raise ValueError(f"--local alias must be a local provider alias; got remote {alias!r}")
+        return resolved
+
 def _load_resolved_role_policies(alias: Optional[str] = None):
-    try:
-        from pact_v4.runtime.runtime_config import ResolvedRolePolicies, RoleCallPolicy, OutputBudgetPolicy
-        import yaml, pathlib
-        prov_path = _default_providers_config()
-        if not prov_path.is_file():
-            return None
-        raw = yaml.safe_load(prov_path.read_text(encoding="utf-8")) or {}
-        local = (raw.get("providers") or {}).get("local") or {}
-        rp = local.get("role_policies") or {}
-        if not rp:
-            return None
-        policies = {}
-        for role, cfg in rp.items():
-            req = dict((cfg.get("request") or {}))
-            ob = cfg.get("output_budget")
-            obp = None
-            if isinstance(ob, dict):
-                obp = OutputBudgetPolicy(mode=ob.get("mode", "fixed"), base_tokens=ob.get("base_tokens"), floor_tokens=ob.get("floor_tokens"), per_item_tokens=ob.get("per_item_tokens"), per_span_tokens=ob.get("per_span_tokens"), ceiling=ob.get("ceiling"))
-            policies[role] = RoleCallPolicy(model_key=str(cfg.get("model_key") or ""), request=req, output_budget=obp)
-        # alias overrides (compatible only) — simplified: if alias present and models[alias].role_policy_overrides exists, merge where model_key matches
-        if alias:
-            models = local.get("models") or {}
-            alias_cfg = models.get(alias) or {}
-            overrides = alias_cfg.get("role_policy_overrides") or {}
-            alias_key = alias_cfg.get("model_key")
-            for role, ov in overrides.items():
-                if role in policies and policies[role].model_key == alias_key:
-                    base_req = dict(policies[role].request)
-                    base_req.update(dict((ov.get("request") or {})))
-                    ob2 = ov.get("output_budget")
-                    obp2 = policies[role].output_budget
-                    if isinstance(ob2, dict):
-                        obp2 = OutputBudgetPolicy(mode=ob2.get("mode", obp2.mode if obp2 else "fixed"), base_tokens=ob2.get("base_tokens", obp2.base_tokens if obp2 else None), floor_tokens=ob2.get("floor_tokens", obp2.floor_tokens if obp2 else None), per_item_tokens=ob2.get("per_item_tokens", obp2.per_item_tokens if obp2 else None), per_span_tokens=ob2.get("per_span_tokens", obp2.per_span_tokens if obp2 else None), ceiling=ob2.get("ceiling", obp2.ceiling if obp2 else None))
-                    policies[role] = RoleCallPolicy(model_key=policies[role].model_key, request=base_req, output_budget=obp2)
-        return ResolvedRolePolicies(policies=policies)
-    except Exception:
+    from pact_v4.runtime.runtime_config import build_resolved_role_policies_from_registry, load_providers_registry
+    import pathlib
+    prov_path = _default_providers_config()
+    if not prov_path.is_file():
         return None
+    # Canonical validation: load registry strictly and propagate ValueError for malformed policy
+    load_providers_registry(prov_path)
+    return build_resolved_role_policies_from_registry(prov_path, alias=alias)
 
 def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Optional[int] = None) -> StrictRunConfig:
     effective_reasoning = reasoning if reasoning is not None else _resolve_effective_reasoning(args, backend)
@@ -1070,6 +1064,10 @@ def run_local_default(args: argparse.Namespace) -> int:
     and remote profiles run the identical Phase 4 algorithm.
     """
     effective_reasoning = int(args.reasoning) if args.reasoning is not None else 0
+    _local_alias = None if getattr(args, "local", None) in (None, "__LOCAL_DEFAULT__") else (str(getattr(args, "local", "") or "").strip() or None)
+    _alias_entry = None
+    if _local_alias:
+        _alias_entry = _resolve_local_alias_entry(_local_alias, args.providers_config)
     backend = StrictBackendConfig(
         # V4.1 §3.4: sycl-edge build (reasoning-budget 2048 works; MTP off).
         exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
@@ -1090,12 +1088,19 @@ def run_local_default(args: argparse.Namespace) -> int:
     # V4.1 A2: local no longer blocks --reasoning > 0 — the Gemma reasoning
     # budget is transported via the server args (--reasoning-budget 2048),
     # not request_options (validate_reasoning_backend accepts local now).
+    if _alias_entry is not None:
+        from pact_v4.runtime.runtime_config import apply_local_alias_to_config
+        backend = apply_local_alias_to_config(backend, _alias_entry)
     validate_reasoning_backend(effective_reasoning, backend)
     # F3 (B3 review): when the B3 audit will run, the local Qwen profile
     # must be B3-capable (MTP draft, reasoning 8192, context 49k) or the
     # run fails loudly — never silently audits with a non-B3 server.
     _validate_b3_qwen_profile(args, backend)
     cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
+    # Wire resolved policies onto backend for adapter construction (fail-closed)
+    if getattr(cfg, "resolved_role_policies", None) is not None and getattr(backend, "resolved_role_policies", None) is None:
+        from dataclasses import replace as _replace
+        backend = _replace(backend, resolved_role_policies=cfg.resolved_role_policies)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     # A2 review fix (whole-chapter retry ownership): in whole-chapter mode
@@ -1187,6 +1192,20 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # Preflight passed — log sanitized report for auditability before startup
     LOG.info("Offline preflight PASS:\n%s", preflight_report.format_human())
     _warn_remote_acknowledgement(backend)
+    # Build StrictRunConfig first to obtain resolved_role_policies, then wire onto backend for adapter construction
+    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
+    if getattr(cfg, "resolved_role_policies", None) is not None and getattr(backend, "resolved_role_policies", None) is None:
+        from dataclasses import replace as _replace2
+        if isinstance(backend, LocalLlamaBackendConfig):
+            backend = _replace2(backend, resolved_role_policies=cfg.resolved_role_policies)
+        elif isinstance(backend, CompositeBackendConfig):
+            new_backends = {}
+            for name, sub in backend.backends.items():
+                if isinstance(sub, LocalLlamaBackendConfig) and getattr(sub, "resolved_role_policies", None) is None:
+                    new_backends[name] = _replace2(sub, resolved_role_policies=cfg.resolved_role_policies)
+                else:
+                    new_backends[name] = sub
+            backend = _replace2(backend, backends=new_backends)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
@@ -1204,7 +1223,6 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
             backend, runtime, bible_text=bible_text, json_retry_policy=json_retry,
         )
     repair_adapters = build_repair_adapters(backend, runtime, bible_text=bible_text)
-    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
     b3_audit_repair = _build_b3_audit_repair(cfg, backend, runtime)
     progress = PhaseProgressWriter(cfg.out_dir)
     result = run_chapter_strict(
@@ -1246,28 +1264,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.local is not None:
         alias = None if args.local == "__LOCAL_DEFAULT__" else (str(args.local).strip() or None)
         if alias:
-            # Resolve alias via providers.yaml to validate existence and compatibility (fail-closed)
-            from pact_v4.runtime.runtime_config import load_providers_registry
-            prov_path = args.providers_config or _default_providers_config()
-            if prov_path.is_file():
-                registry = load_providers_registry(prov_path)
-                # Trigger validation that alias exists (bare or qualified)
-                try:
-                    if "/" in alias:
-                        registry.resolve(alias)
-                    else:
-                        registry.resolve_bare(alias)
-                except ValueError as exc:
-                    raise ValueError(f"--local alias {alias!r}: {exc}") from exc
+            # Validate alias exists and is a local provider alias (fail-closed)
+            try:
+                _resolve_local_alias_entry(alias, args.providers_config)
+            except ValueError as exc:
+                raise ValueError(f"--local alias {alias!r}: {exc}") from exc
         # Preflight for --local path
         if args.preflight or args.preflight_json:
-            # For local preflight, use run_local_default's backend construction but via offline check
-            # Minimal: construct backend as run_local_default would and run preflight
-            effective_reasoning = _resolve_effective_reasoning(args, StrictBackendConfig(exe=Path("dummy"), device="SYCL0", host="127.0.0.1", model_paths={"gemma": Path("/tmp/g"), "qwen": Path("/tmp/q")}, model_names={"gemma": "g", "qwen": "q"}, server_args={"gemma": [], "qwen": []})) if False else None
-            # Actual local backend for preflight check
             from pathlib import Path as _P
             eff = int(args.reasoning) if args.reasoning is not None else 0
             _backend = StrictBackendConfig(exe=_P(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"), device="SYCL0", host=args.host, model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH}, model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name}, server_args={"gemma": _gemma_server_args_for_reasoning(eff), "qwen": QWEN_SERVER_ARGS}, port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout)
+            if alias:
+                try:
+                    _ae = _resolve_local_alias_entry(alias, args.providers_config)
+                    from pact_v4.runtime.runtime_config import apply_local_alias_to_config as _apply
+                    _backend = _apply(_backend, _ae)
+                except ValueError as exc:
+                    raise ValueError(f"--local alias {alias!r}: {exc}") from exc
             from pact_v4.runtime.runtime_config import run_runtime_preflight as _rp
             report = _rp(_backend, reasoning=eff)
             _resolved_local = _load_resolved_role_policies(alias)

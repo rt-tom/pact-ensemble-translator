@@ -122,7 +122,7 @@ TIER_MODEL_TARGET = "model_target"
 DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "enabled": True,
     "required": False,
-    "temperature": float("0.1")  # test-only fallback; production must supply role_policy,
+    "temperature": float("0.1"),  # test-only fallback; production must supply role_policy,
     "top_p": 0.9,
     "top_k": 32,
     "enable_thinking": False,

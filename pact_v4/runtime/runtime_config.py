@@ -32,6 +32,7 @@ resolved at backend construction from the environment and never persisted
 """
 from __future__ import annotations
 
+import pathlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
@@ -1188,21 +1189,24 @@ def build_role_adapters(
 
     retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
+    resolved = getattr(cfg, "resolved_role_policies", None)
+    if resolved is None:
+        raise ValueError("build_role_adapters: resolved_role_policies is required (production must supply role_policy; no literal fallback)")
     return (
-        BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry)),
+        BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry, role_policy=resolved.policies["generator"])),
         BackendQwenEvaluator(
-            backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text),
+            backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["fidelity_reviewer"]),
         ),
         BackendGemmaSelector(
-            backend, config=BackendGemmaSelectorConfig(retry=retry),
+            backend, config=BackendGemmaSelectorConfig(retry=retry, role_policy=resolved.policies["russian_selector"]),
         ),
         BackendQwenAuditEvaluator(
             backend,
-            config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text),
+            config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["qwen_audit"]),
         ),
         BackendGemmaAuditEvaluator(
             backend,
-            config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text),
+            config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["gemma_audit"]),
         ),
     )
 
@@ -1247,19 +1251,22 @@ def build_repair_adapters(
 
     retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
+    resolved = getattr(cfg, "resolved_role_policies", None)
+    if resolved is None:
+        raise ValueError("build_repair_adapters: resolved_role_policies is required (no literal fallback)")
     return (
-        BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry)),
+        BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry, role_policy=resolved.policies["repair"])),
         BackendRegionFidelityGate(
-            backend, config=BackendRegionFidelityGateConfig(retry=retry),
+            backend, config=BackendRegionFidelityGateConfig(retry=retry, role_policy=resolved.policies["fidelity_reviewer"]),
         ),
         BackendQwenAuditEvaluator(
             backend, config=BackendQwenAuditEvaluatorConfig(
-                retry=retry, bible_text=bible_text,
+                retry=retry, bible_text=bible_text, role_policy=resolved.policies["qwen_audit"],
             ),
         ),
         BackendGemmaAuditEvaluator(
             backend, config=BackendGemmaAuditEvaluatorConfig(
-                retry=retry, bible_text=bible_text,
+                retry=retry, bible_text=bible_text, role_policy=resolved.policies["gemma_audit"],
             ),
         ),
     )
@@ -1991,7 +1998,7 @@ def apply_local_alias_to_config(cfg: "LocalLlamaBackendConfig", alias_entry: "Lo
     new_paths[key] = pathlib.Path(alias_entry.model_path)
     new_names[key] = alias_entry.model_name
     new_args[key] = list(alias_entry.server_args)
-    return LocalLlamaBackendConfig(exe=cfg.exe, device=cfg.device, host=cfg.host, model_paths=new_paths, model_names=new_names, server_args=new_args, port=cfg.port, startup_timeout=cfg.startup_timeout, unload_timeout=cfg.unload_timeout)
+    return LocalLlamaBackendConfig(exe=cfg.exe, device=cfg.device, host=cfg.host, model_paths=new_paths, model_names=new_names, server_args=new_args, port=cfg.port, startup_timeout=cfg.startup_timeout, unload_timeout=cfg.unload_timeout, resolved_role_policies=cfg.resolved_role_policies)
 
 def is_local_alias(provider_id: str, alias: str, registry: "ProvidersRegistry") -> bool:
     return provider_id.lower() == "local"
