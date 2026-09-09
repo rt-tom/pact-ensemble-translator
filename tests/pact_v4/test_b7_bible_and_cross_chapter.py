@@ -39,7 +39,7 @@ class TestRenderBibleSection:
         assert "Narrator: male" in result
 
     def test_positional_form_renders_only_narrator_and_seed(self):
-        # P0 causal-memory contract (2026-08-14): the positional/legacy form
+        # Index-only / fail-soft invariant: the positional/legacy form
         # must NEVER dump the full book_memory. Only the narrator + explicit
         # ``seed: true`` facts are safe for an unknown chapter.
         memory = {
@@ -77,6 +77,8 @@ class TestRenderBibleSection:
             },
         }
         index = {
+            "$schema": "pact-v4-chapter-index/v2",
+            "$book_memory_policy_version": "book-memory-policy/v1",
             "0001": {
                 "characters": ["John"],
                 "facts": ["The story takes place in London."],
@@ -93,11 +95,13 @@ class TestRenderBibleSection:
         assert "showing first" not in result
         assert "Mary" not in result
 
-    def test_future_chapter_fact_never_visible_earlier(self):
-        # P0 future-leakage regression: a fact belonging to chapter 0148
-        # must NEVER appear in the bible rendered for chapter 0001 — neither
-        # via the chapter entry (index is chapter-scoped) nor via the
-        # fail-soft path (only seed facts).
+    def test_index_only_fact_rendering_and_seed_fallback(self):
+        # Index-only / fail-soft invariant (presence-based full-memory
+        # selection): render_bible_section renders ONLY facts explicitly in
+        # the chapter's index entry plus explicit seed facts. A non-seed fact
+        # present in book_memory but absent from the entry must not appear
+        # via a full-memory fallback — neither for a known chapter nor for
+        # an unknown chapter (which renders narrator + seed only).
         memory = {
             "pov": {"gender": "male"},
             "facts": [
@@ -106,24 +110,24 @@ class TestRenderBibleSection:
             ],
         }
         index = {
+            "$schema": "pact-v4-chapter-index/v2",
+            "$book_memory_policy_version": "book-memory-policy/v1",
             "0001": {"characters": [], "facts": [], "address": []},
         }
         rendered = render_bible_section("0001", index, memory)
         assert "tattoo" not in rendered
         assert "motorcycle" in rendered
-        # And the unknown-chapter path also never dumps the future fact.
+        # Unknown chapter also renders only seed facts, never a full dump.
         fallback = render_bible_section("9999", index, memory)
         assert "tattoo" not in fallback
         assert "motorcycle" in fallback
 
-    def test_future_character_attrs_never_visible_earlier(self):
-        # P0 future-leakage regression (RV finding 1): chapter 0001's index
-        # entry lists the NAME "Future" (it appeared in the chapter source),
-        # but the character's gender/role attributes were only LEARNED in a
-        # later chapter (full book_memory carries role "future-only"). The
-        # renderer must NOT enrich the chapter-scoped name from the full
-        # accumulated book_memory — the future attribute would leak into the
-        # early prompt.
+    def test_index_only_character_attrs_not_enriched_from_memory(self):
+        # Index-only invariant: the renderer lists character NAMES from the
+        # chapter's index entry only. It must NOT enrich those names with
+        # gender/role attributes read from the full accumulated book_memory
+        # beyond what the entry itself carries. The entry dictates content;
+        # book_memory is not consulted for attribute enrichment.
         memory = {
             "pov": {"gender": "male"},
             "characters": {
@@ -131,6 +135,8 @@ class TestRenderBibleSection:
             },
         }
         index = {
+            "$schema": "pact-v4-chapter-index/v2",
+            "$book_memory_policy_version": "book-memory-policy/v1",
             "0001": {"characters": ["Future"], "facts": [], "address": []},
         }
         rendered = render_bible_section("0001", index, memory)
@@ -149,8 +155,8 @@ class TestRenderBibleSection:
         assert r1 == r2
 
     def test_fail_soft_missing_index_never_dumps(self):
-        # P0 causal contract: no chapter_index entry -> narrator + seed only,
-        # never a full book_memory dump (the pre-fix leak of chapters 46-148).
+        # Index-only / fail-soft invariant: no chapter_index entry -> narrator + seed only,
+        # never a full book_memory dump.
         memory = {
             "pov": {"gender": "male"},
             "characters": {f"c{i}": {"gender": "male"} for i in range(50)},

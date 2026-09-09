@@ -64,43 +64,10 @@ def _iter_names(book_memory: Mapping, section: str) -> List[str]:
 
 
 def _variants_with_provenance(book_memory: Mapping, section: str, name: str, chapter_id: str | None = None) -> List[str]:
-    """Surface forms filtered by provenance: only aliases with chapter < target.""" 
-    data = book_memory.get(section)
-    forms = [name]
-    if isinstance(data, Mapping):
-        attrs = data.get(name)
-        if isinstance(attrs, Mapping):
-            variants = attrs.get("variants")
-            if isinstance(variants, Mapping):
-                for var, prov in variants.items():
-                    # If chapter_id given, filter by provenance strictly earlier
-                    if chapter_id is not None and isinstance(prov, Mapping):
-                        v_ch = str(prov.get("chapter") or "")
-                        if v_ch and not _chapter_before(v_ch, chapter_id):
-                            continue
-                    forms.append(str(var))
-    elif isinstance(data, list):
-        for entry in data:
-            if not isinstance(entry, Mapping):
-                continue
-            if str(entry.get("name") or entry.get("source") or entry.get("english")) != name:
-                continue
-            variants = entry.get("variants")
-            if isinstance(variants, Mapping):
-                for var, prov in variants.items():
-                    if chapter_id is not None and isinstance(prov, Mapping):
-                        v_ch = str(prov.get("chapter") or "")
-                        if v_ch and not _chapter_before(v_ch, chapter_id):
-                            continue
-                    forms.append(str(var))
-    seen = set()
-    out: List[str] = []
-    for form in forms:
-        key = form.casefold()
-        if key not in seen:
-            seen.add(key)
-            out.append(form)
-    return out
+    """Surface forms including all verified aliases (provenance is audit metadata, no eligibility gate)."""
+    # Retains signature for compatibility; chapter_id is ignored — selection is
+    # presence-based over the full accumulated book_memory.
+    return _variants_for(book_memory, section, name)
 
 def _variants_for(book_memory: Mapping, section: str, name: str) -> List[str]:
     """The surface forms to scan for: the canonical name plus its variants."""
@@ -207,73 +174,16 @@ def pre_chapter_book_memory(
     book_memory: Mapping,
     chapter_id: str,
 ) -> Dict[str, Any]:
-    """Return the PRE-chapter view of ``book_memory`` for chapter ``N``.
+    """Return a non-filtering top-level shallow copy of ``book_memory``.
 
-    RV finding 1 (SAFE-MEMORY, 2026-08-14): the per-chapter index entry for
-    chapter N must be built from PRE-chapter memory — ONLY facts and
-    entities that were known before chapter N (provenance chapter < N) —
-    never from the post-promotion state of chapter N itself. A rerun of an
-    already-accepted chapter must not show that chapter its own promoted
-    facts (causal ``< N`` boundary).
-
-    Rules (fail-closed; global knowledge always survives):
-
-    * facts: kept when the entry is a global seed fact (``seed: true``), has
-      NO ``chapter`` provenance (manual/global), or its ``chapter`` is
-      strictly before ``chapter_id``; a fact attributed to chapter N or a
-      LATER chapter is dropped;
-    * characters/entities: kept when the entry has NO ``chapters``
-      provenance (seed/manual) or its FIRST chapter is strictly before
-      ``chapter_id``; an entity first seen in chapter N or later is dropped;
-    * ``pov`` (narrator) and ``address_register`` are kept verbatim — the
-      narrator is always known, and address forms are already
-      participant-presence-filtered by ``build_chapter_index``.
-
-    Returns a shallow copy; list sections are rebuilt, dict sections are
-    copied per-entry, everything else is shared.
+    Provenance (``chapter``/``chapters``/``variants[*].chapter``) is retained
+    as audit metadata but does not gate eligibility. Selection is
+    presence-based over the full accumulated ``book_memory`` (Rule 1).
+    The returned mapping is a distinct top-level dict; nested values are
+    shared (shallow copy). Signature is retained for compatibility.
     """
-    out: Dict[str, Any] = {}
-    for key, value in book_memory.items():
-        if key == "facts":
-            kept_facts: List[Any] = []
-            if isinstance(value, list):
-                for fact in value:
-                    if not isinstance(fact, Mapping):
-                        kept_facts.append(fact)
-                        continue
-                    if fact.get("seed") is True:
-                        kept_facts.append(fact)
-                        continue
-                    chapter = str(fact.get("chapter") or "")
-                    if not chapter or _chapter_before(chapter, chapter_id):
-                        kept_facts.append(fact)
-            out[key] = kept_facts
-        elif key in ("characters", "entities"):
-            if isinstance(value, Mapping):
-                kept_entries: Dict[str, Any] = {}
-                for name, entry in value.items():
-                    chapters = _entry_chapters(entry)
-                    if not chapters or any(
-                        _chapter_before(ch, chapter_id) for ch in chapters
-                    ):
-                        kept_entries[name] = entry
-                out[key] = kept_entries
-            else:
-                out[key] = value
-        else:
-            out[key] = value
-    return out
+    return dict(book_memory)
 
-
-def _field_provenance_before(entry: Mapping, field: str, chapter_id: str) -> bool:
-    fp = entry.get("field_provenance", {})
-    if not isinstance(fp, Mapping):
-        return False
-    prov = fp.get(field)
-    if not isinstance(prov, Mapping):
-        return False
-    ch = str(prov.get("chapter") or "")
-    return bool(ch) and _chapter_before(ch, chapter_id)
 
 def build_chapter_index(
     *,
@@ -322,7 +232,17 @@ def build_chapter_index(
 
     conflict_sources = _glossary_conflict_sources(glossary)
 
-    # --- characters/entities: present in the chapter, or always (narrator) --- causal v2 split
+    # Policy approval gate for world_term (must be approved to be eligible)
+    _approved_terms_pre: List[str] = []
+    if isinstance(book_memory, Mapping):
+        _policy_pre = book_memory.get("policy")
+        if isinstance(_policy_pre, Mapping):
+            _pt = _policy_pre.get("approved_terms", [])
+            if isinstance(_pt, (list, tuple)):
+                _approved_terms_pre = [str(t) for t in _pt if t]
+    _approved_set_pre = {t.casefold() for t in _approved_terms_pre}
+
+    # --- characters/entities: present in the chapter, or always (narrator) ---
     characters: List[Any] = []
     named_entities: List[str] = []
     for section in ("characters", "entities"):
@@ -332,7 +252,10 @@ def build_chapter_index(
             mc = ""
             if isinstance(entry, Mapping):
                 mc = str(entry.get("memory_class") or "")
-            # Use provenance-filtered variants for presence
+            # world_term is handled exclusively via the terms scope with policy approval; do not route to characters/named_entities
+            if mc == "world_term":
+                continue
+            # Use all verified variants for presence (no provenance gate)
             present = any(
                 _term_present(source_text, form)
                 for form in _variants_with_provenance(book_memory, section, name, chapter_id)
@@ -439,35 +362,40 @@ def build_chapter_index(
                 address.append(text)
     address = sorted(set(address), key=str.casefold)
 
-    # v2 type-aware terms: world_term memory_class entities that are approved terms and present in source, causal filtered
+    # v2 type-aware terms: world_term memory_class entities that are approved terms and present in source
     terms: List[str] = []
-    # First collect world_term entities that are present
+    # Policy approval gate: only terms in approved_terms are eligible.
+    approved_terms: List[str] = []
+    if isinstance(book_memory, Mapping):
+        policy = book_memory.get("policy")
+        if isinstance(policy, Mapping):
+            policy_terms = policy.get("approved_terms", [])
+            if isinstance(policy_terms, (list, tuple)):
+                approved_terms = [str(t) for t in policy_terms if t]
+    approved_set = {t.casefold() for t in approved_terms}
+    # Stored world_term entities: require policy approval and (source presence OR glossary-conflict lock).
+    # Existing glossary-conflict lock is preserved for approved world_terms even when the source surface is absent.
+    # Unapproved stored world_terms remain excluded even if conflicted (negative fixture).
     for section in ("characters", "entities"):
         for name in _iter_names(book_memory, section):
             entry = book_memory.get(section, {}).get(name) if isinstance(book_memory.get(section), dict) else None
             mc = str(entry.get("memory_class") or "") if isinstance(entry, Mapping) else ""
             if mc == "world_term":
-                # Causal: must be learned strictly before target chapter
-                chs = _entry_chapters(entry) if isinstance(entry, Mapping) else []
-                if chs and not any(_chapter_before(ch, chapter_id) for ch in chs):
+                if name.casefold() not in approved_set:
                     continue
-                if any(_term_present(source_text, form) for form in _variants_with_provenance(book_memory, section, name, chapter_id)):
+                present = any(_term_present(source_text, form) for form in _variants_with_provenance(book_memory, section, name, chapter_id))
+                locked = name.casefold() in conflict_sources
+                if present or locked:
                     terms.append(name)
-    # Also include approved_terms from policy that may not be stored as entities (legacy)
-    approved_terms = []
-    if isinstance(book_memory, dict):
-        policy_terms = book_memory.get("policy", {}).get("approved_terms", []) if isinstance(book_memory.get("policy"), dict) else []
-        approved_terms = [str(t) for t in policy_terms]
+    # Legacy path: approved_terms that are not stored as world_term entities but present in source.
     for term in approved_terms:
-        # Avoid duplicate if already added via world_term entity
         if term.casefold() in {t.casefold() for t in terms}:
             continue
         if _term_present(source_text, term):
-            # If term is not yet in world_term entities but approved, still expose as term when present (conservative)
             terms.append(term)
     terms = sorted(set(terms), key=str.casefold)
-    # Facts already filtered via pre_chapter_book_memory (chapter < N) and variant-aware presence above which uses provenance-filtered forms
-    # Ensure per-field provenance strictly earlier is enforced for fact keys that are aliases (already via _variants_with_provenance)
+    # Facts are presence-based over the full accumulated book_memory; provenance
+    # is audit metadata and does not gate eligibility.
     return {
         "characters": characters,
         "named_entities": named_entities,
@@ -539,15 +467,12 @@ def build_index_file(
 ) -> Dict[str, Any]:
     """Build one chapter's index entry and merge it into ``chapter_index.json``.
 
-    RV finding 1 (SAFE-MEMORY, 2026-08-14): the entry for chapter N is
-    ALWAYS built from PRE-chapter memory — ``pre_chapter_book_memory``
-    keeps only facts/entities with provenance ``chapter < N`` (plus
-    seeds/narrator). The strict runner reads ``chapter_index[N]`` before
-    generating N, so the entry under N must never contain N's own
-    post-promotion facts: a rerun of N would otherwise leak N's own
-    memory into its prompt. Pass ``book_memory`` to build from a caller
-    snapshot; default loads the on-disk ``book_memory.json`` (the filter
-    still applies to it).
+    The entry for chapter N is built from the full accumulated
+    ``book_memory`` (no provenance gate); selection is presence-based
+    (Rule 1). ``pre_chapter_book_memory`` returns a non-filtering
+    shallow copy and is retained for signature compatibility. Pass
+    ``book_memory`` to build from a caller snapshot; default loads the
+    on-disk ``book_memory.json``.
     """
     memory_dir_path = Path(memory_dir)
     memory_dir_path.mkdir(parents=True, exist_ok=True)

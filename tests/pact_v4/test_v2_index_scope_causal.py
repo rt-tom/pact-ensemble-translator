@@ -1,4 +1,4 @@
-"""v2 index scope + causal backward-leakage tests."""
+"""v2 index scope — presence-based full-memory selection (Rule 1) + fail-soft."""
 import json, tempfile
 from pathlib import Path
 from pact_full_pipeline_runner_v1.build_chapter_index import build_chapter_index, pre_chapter_book_memory
@@ -26,8 +26,9 @@ def test_named_entities_present_terms_split():
     # Ensure not flattened into characters
     assert "Hillsglade House" not in entry["characters"]
 
-def test_later_learned_alias_absent_from_earlier_chapters():
-    # Alias Steph learned in 0002 should not appear in index for 0001
+def test_later_learned_alias_included_when_source_present():
+    # Alias Steph verified in 0002 is eligible for any chapter whose source contains
+    # the alias surface, regardless of provenance ordering (Rule 1 presence-based).
     book_memory = {
         "schema": "pact-v4-book-memory/v2",
         "book_memory_policy_version": "book-memory-policy/v1",
@@ -38,16 +39,44 @@ def test_later_learned_alias_absent_from_earlier_chapters():
         "facts": [],
         "policy": {"approved_terms": []}
     }
-    # For chapter 0001, alias Steph not yet learned, so source containing "Steph" should NOT match
     source_text = "Steph visited."
+    # Even for chapter 0001 (before alias provenance), source containing "Steph" matches
     entry_early = build_chapter_index(chapter_id="0001_bonds-1-1", source_text=source_text, book_memory=book_memory, glossary=[])
-    assert "Stephanie" not in entry_early["characters"]
-    assert "Stephanie" not in entry_early["named_entities"]
-    # For chapter 0003, alias now known, should match
+    assert "Stephanie" in entry_early["characters"]
+    # For chapter 0003, alias also matches
     entry_late = build_chapter_index(chapter_id="0003_bonds-1-3", source_text=source_text, book_memory=book_memory, glossary=[])
     assert "Stephanie" in entry_late["characters"]
+    # Absent surface remains excluded (Rule 1)
+    entry_absent = build_chapter_index(chapter_id="0001_bonds-1-1", source_text="Blake visited.", book_memory=book_memory, glossary=[])
+    assert "Stephanie" not in entry_absent["characters"]
 
-def test_fact_causal_filter():
+def test_pre_chapter_book_memory_is_non_filtering_shallow_copy():
+    book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {
+            "Blake Thorburn": {"memory_class": "named_character", "chapters": ["0001"], "variants": {}, "field_provenance": {}},
+        },
+        "entities": {
+            "Hillsglade House": {"memory_class": "named_place", "chapters": ["0002"], "variants": {}, "field_provenance": {}},
+        },
+        "facts": [
+            {"fact": "Blake knows Joel", "keys": ["Blake Thorburn", "Joel"], "chapter": "0002_bonds-1-2"},
+        ],
+        "policy": {"approved_terms": []},
+        "pov": {"source_name": "Narrator"},
+    }
+    copy = pre_chapter_book_memory(book_memory, "0001_bonds-1-1")
+    # Distinct top-level mapping but same nested values (shallow)
+    assert copy is not book_memory
+    assert copy == book_memory
+    assert copy["characters"] is book_memory["characters"]
+    assert copy["facts"] is book_memory["facts"]
+    # All facts/entities remain, including those attributed to target or later chapter
+    assert any("Blake knows Joel" in str(f.get("fact", "")) for f in copy["facts"])
+    assert "Hillsglade House" in copy["entities"]
+
+def test_fact_presence_based_no_provenance_gate():
     book_memory = {
         "schema": "pact-v4-book-memory/v2",
         "book_memory_policy_version": "book-memory-policy/v1",
@@ -62,15 +91,109 @@ def test_fact_causal_filter():
         ],
         "policy": {"approved_terms": []}
     }
-    # For chapter 0002, fact from 0002 should NOT be included (pre-chapter memory)
-    pre_mem = pre_chapter_book_memory(book_memory, "0002_bonds-1-2")
-    entry = build_chapter_index(chapter_id="0002_bonds-1-2", source_text="Blake Thorburn and Joel were there", book_memory=pre_mem, glossary=[])
-    # Seed fact should be present, Joel fact should not (since its chapter == target)
+    # Fact attributed to N is eligible when its Rule 1 keys are present, regardless of chapter ordering
+    entry = build_chapter_index(chapter_id="0002_bonds-1-2", source_text="Blake Thorburn and Joel were there", book_memory=book_memory, glossary=[])
+    assert any("Blake knows Joel" in f for f in entry["facts"])
     assert any("Seed fact" in f for f in entry["facts"])
-    # For chapter 0003, fact from 0002 now visible
-    pre_mem2 = pre_chapter_book_memory(book_memory, "0003_bonds-1-3")
-    entry2 = build_chapter_index(chapter_id="0003_bonds-1-3", source_text="Blake Thorburn and Joel were there", book_memory=pre_mem2, glossary=[])
-    assert any("Blake knows Joel" in f for f in entry2["facts"])
+    # Absent keys remain excluded (neither key in source)
+    entry_absent = build_chapter_index(chapter_id="0002_bonds-1-2", source_text="Alice walked alone", book_memory=book_memory, glossary=[])
+    assert not any("Blake knows Joel" in f for f in entry_absent["facts"])
+
+def test_world_term_first_recorded_in_target_chapter_selected_when_present():
+    book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {},
+        "entities": {
+            "Demesnes": {"memory_class": "world_term", "chapters": ["0002_bonds-1-2"], "variants": {}, "field_provenance": {}}
+        },
+        "facts": [],
+        "policy": {"approved_terms": ["Demesnes"]},
+        "pov": {"source_name": "Narrator"}
+    }
+    entry = build_chapter_index(chapter_id="0002_bonds-1-2", source_text="They discussed Demesnes.", book_memory=book_memory, glossary=[])
+    assert "Demesnes" in entry["terms"]
+    entry_absent = build_chapter_index(chapter_id="0002_bonds-1-2", source_text="They discussed nothing.", book_memory=book_memory, glossary=[])
+    assert "Demesnes" not in entry_absent["terms"]
+
+def test_unapproved_stored_world_term_excluded_even_when_present():
+    # Policy boundary: a stored world_term not in policy.approved_terms
+    # must not enter terms or named_entities even when its surface is
+    # present in the chapter source. Only approved world_terms are eligible.
+    book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {},
+        "entities": {
+            "Demesnes": {"memory_class": "world_term", "chapters": ["0002"], "variants": {}, "field_provenance": {}},
+            "UnapprovedTerm": {"memory_class": "world_term", "chapters": ["0001"], "variants": {}, "field_provenance": {}},
+        },
+        "facts": [],
+        "policy": {"approved_terms": ["Demesnes"]},
+        "pov": {"source_name": "Narrator"}
+    }
+    source = "They discussed Demesnes and UnapprovedTerm."
+    entry = build_chapter_index(chapter_id="0002", source_text=source, book_memory=book_memory, glossary=[])
+    assert "Demesnes" in entry["terms"]
+    assert "UnapprovedTerm" not in entry["terms"]
+    assert "UnapprovedTerm" not in entry["named_entities"]
+    assert "UnapprovedTerm" not in entry["characters"]
+    # Approved-term legacy path still works when term is present but not stored as world_term
+    book_memory2 = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {},
+        "entities": {},
+        "facts": [],
+        "policy": {"approved_terms": ["Demesnes"]},
+        "pov": {"source_name": "Narrator"}
+    }
+    entry2 = build_chapter_index(chapter_id="0002", source_text="They discussed Demesnes.", book_memory=book_memory2, glossary=[])
+    assert "Demesnes" in entry2["terms"]
+
+def test_approved_stored_world_term_glossary_conflict_lock_without_source():
+    # Regression for remove-pre-chapter-filter review finding (high):
+    # an approved stored world_term whose glossary source has conflicting
+    # targets must remain locked (included) even when its surface is absent
+    # from the chapter source. Unapproved world_terms must remain excluded
+    # even if conflicted.
+    from pact_v4.phase2.risk import GlossaryEntry
+    glossary_conflict = [GlossaryEntry(source_term="Demesnes", target_terms=("Домены", "Владения"))]
+    book_memory = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {},
+        "entities": {
+            "Demesnes": {"memory_class": "world_term", "chapters": ["0002"], "variants": {}, "field_provenance": {}}
+        },
+        "facts": [],
+        "policy": {"approved_terms": ["Demesnes"]},
+        "pov": {"source_name": "Narrator"}
+    }
+    # No source surface for Demesnes, but glossary conflict -> locked
+    entry = build_chapter_index(chapter_id="0001", source_text="Blake walked alone.", book_memory=book_memory, glossary=glossary_conflict)
+    assert "Demesnes" in entry["terms"]
+    # Unapproved stored world_term with same conflict must remain excluded even when present
+    book_memory_unapproved = {
+        "schema": "pact-v4-book-memory/v2",
+        "book_memory_policy_version": "book-memory-policy/v1",
+        "characters": {},
+        "entities": {
+            "UnapprovedTerm": {"memory_class": "world_term", "chapters": ["0001"], "variants": {}, "field_provenance": {}}
+        },
+        "facts": [],
+        "policy": {"approved_terms": ["Demesnes"]},
+        "pov": {"source_name": "Narrator"}
+    }
+    glossary_conflict_unapproved = [GlossaryEntry(source_term="UnapprovedTerm", target_terms=("A", "B"))]
+    entry_unapproved = build_chapter_index(chapter_id="0001", source_text="UnapprovedTerm appears.", book_memory=book_memory_unapproved, glossary=glossary_conflict_unapproved)
+    assert "UnapprovedTerm" not in entry_unapproved["terms"]
+    assert "UnapprovedTerm" not in entry_unapproved["named_entities"]
+    assert "UnapprovedTerm" not in entry_unapproved["characters"]
+    # Approved non-conflict term absent must remain excluded (presence still required)
+    glossary_no_conflict = [GlossaryEntry(source_term="Demesnes", target_terms=("Домены",))]
+    entry_no_conflict = build_chapter_index(chapter_id="0001", source_text="Blake walked alone.", book_memory=book_memory, glossary=glossary_no_conflict)
+    assert "Demesnes" not in entry_no_conflict["terms"]
 
 def test_fail_soft_to_narrator_seed_on_unknown_schema():
     book_memory = {

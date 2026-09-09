@@ -2215,7 +2215,7 @@ def run_book(
 
         # A2 index entries are now staged inside the same four-file transaction via MemoryManager.promote (finding 5),
         # so no separate post-promote mutation of chapter_index.json is needed. The promote transaction already rebuilt
-        # current and next chapter entries from pre-chapter memory. Keep index_built flag for reporting.
+        # current and next chapter entries from the full accumulated memory (presence-based). Keep index_built flag for reporting.
         if terminal_status in _PROMOTING_STATUSES:
             index_built = promoted
         else:

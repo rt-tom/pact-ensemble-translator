@@ -74,7 +74,7 @@ def _seed_facts(book_memory: Mapping) -> List[Mapping]:
     minimal global facts with an explicit ``seed`` flag. These are the
     ONLY facts rendered when no per-chapter index entry exists: they are
     global world knowledge (e.g. ``Blake's vehicle is a motorcycle``) that
-    must not leak future chapters, but are safe for every chapter.
+    are safe for every chapter.
     """
     facts = book_memory.get("facts")
     if not isinstance(facts, list):
@@ -88,12 +88,9 @@ def _seed_facts(book_memory: Mapping) -> List[Mapping]:
 def _render_seed_bible(book_memory: Any) -> str:
     """Fail-soft minimum render: narrator + seed facts (NEVER a full dump).
 
-    Replaces the pre-2026-08-14 legacy full-memory fallback (owner decision
-    P0, future-leakage fix): when no deterministic per-chapter index entry
-    exists the bible must NOT render the whole book_memory (which, after a
-    long book run, contains facts from chapters far in the future). Only the
-    narrator (gender) and the explicit ``seed: true`` global facts are safe
-    to show for an unknown chapter.
+    When no deterministic per-chapter index entry exists the bible must NOT
+    render the whole book_memory. Only the narrator (gender) and the explicit
+    ``seed: true`` global facts are safe to show for an unknown chapter.
     """
     if not isinstance(book_memory, Mapping):
         return ""
@@ -128,19 +125,14 @@ def render_bible_section(
     ``render_bible_section(chapter_id, chapter_index, book_memory)``. The
     bible is rendered from the deterministic per-chapter entry
     (``chapter_index.json``: ``{characters, facts, address}``) instead of
-    the legacy full-memory dump with "first N" caps — the index is already
-    chapter-filtered, so no caps apply. The narrator (gender) is always
-    included (fail-closed).
+    the legacy full-memory dump with "first N" caps — the index is
+    presence-based over the full accumulated book_memory, so no caps apply.
+    The narrator (gender) is always included (fail-closed).
 
-    Causal-memory invariant (owner decision 2026-08-14, P0 future-leakage
-    fix): when the chapter has NO per-chapter index entry (missing
-    ``chapter_index.json`` or an unknown ``chapter_id``) the renderer fails
-    SOFT to the minimum — narrator + explicit ``seed: true`` global facts —
-    and NEVER falls back to a full book_memory dump. A full dump would
-    expose facts from chapters later in the book to an early chapter's
-    translation prompt (confirmed leakage: facts from chapters 46/60/100/112/
-    148 were rendered into the Bonds 1.1-1.3 prompts when ``chapter_index``
-    was not built).
+    Fail-soft invariant: when the chapter has NO per-chapter index entry
+    (missing ``chapter_index.json`` or an unknown ``chapter_id``) the renderer
+    fails SOFT to the minimum — narrator + explicit ``seed: true`` global facts —
+    and NEVER falls back to a full book_memory dump.
 
     ``render_bible_section(book_memory)`` (a Mapping first argument, or
     ``None``) keeps the same fail-soft seed render — the legacy full-memory
@@ -179,22 +171,18 @@ def render_bible_section(
 def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
     """Render a per-chapter index entry (narrator always; no caps).
 
-    Causal-memory invariant (P0 owner decision 2026-08-14, RV finding 1):
-    the character lines are rendered ONLY from data present in the
-    chapter-scoped entry — never enriched with gender/role attributes read
-    from the full accumulated ``book_memory``. The chapter index carries
-    the names that were visible in THIS chapter; attributes that were
-    learned in a LATER chapter (e.g. role ``future-only``) must not leak
-    into an early chapter's prompt. A chapter-scoped entry item may carry
-    an explicit attrs snapshot (``{name, gender, role}``) — those attrs
-    are rendered from the entry itself, still never from book_memory.
+    Index-only invariant: the character lines are rendered ONLY from data
+    present in the chapter-scoped entry — never enriched with attributes read
+    from the full accumulated ``book_memory`` beyond what the entry already
+    selected. A chapter-scoped entry item may carry an explicit attrs snapshot
+    (``{name, gender, role}``) — those attrs are rendered from the entry itself,
+    still never from book_memory directly.
 
     The explicit ``seed: true`` facts from book_memory are ALWAYS included
     in addition to the entry's own facts (deduplicated by text): they are
-    global immutable world knowledge (owner decision 2026-08-14) that must
-    reach every chapter's prompt even when the index entry was built before
-    the seed fact existed. The entry's facts are chapter-scoped; the seed
-    facts are the causal-memory floor — never a full dump.
+    global immutable world knowledge that must reach every chapter's prompt.
+    The entry's facts are presence-based; the seed facts are the
+    fail-soft floor — never a full dump.
     """
     if not isinstance(book_memory, Mapping):
         book_memory = {}
@@ -257,11 +245,9 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
 def _render_character_line(item: Any) -> str:
     """Render one character line from a chapter-scoped index entry item.
 
-    Causal-memory invariant (RV finding 1, 2026-08-14): the line is built
-    ONLY from the entry item itself — a plain name string, or an explicit
-    attrs snapshot ``{name, gender, role}`` carried by the entry. The full
-    ``book_memory`` is NEVER consulted here: an attribute learned in a
-    future chapter must not leak into an earlier chapter's prompt.
+    Index-only invariant: the line is built ONLY from the entry item itself —
+    a plain name string, or an explicit attrs snapshot ``{name, gender, role}``
+    carried by the entry. The full ``book_memory`` is NEVER consulted here.
     """
     if isinstance(item, Mapping):
         name = (
