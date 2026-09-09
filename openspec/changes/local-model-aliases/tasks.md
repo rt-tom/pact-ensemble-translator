@@ -1,27 +1,25 @@
-## 1. Registry contract and effective policy
+## 1. Registry and fixed role map
 
-- [ ] 1.1 Define immutable `RoleCallPolicy`, `OutputBudgetPolicy`, and `ResolvedRolePolicies` in `pact_v4/runtime/runtime_config.py`. Implement the complete role namespace: `generator`, `fidelity_reviewer`, `russian_selector`, `qwen_audit`, `gemma_audit`, `repair`, `entity_extractor`, `russian_editor`, `formatting`, `glossary_resolver`.
-- [ ] 1.2 Extend `configs/providers.yaml` schema/loader for provider `role_policies` and `local: kind: local_llama`. Require complete local defaults that reproduce existing V4 strict/book behavior. Allow an empty local `models` map for this plumbing-only change; validate non-empty remote catalogs as today.
-- [ ] 1.3 Add local alias validation/resolution: `model_key`, path/name, string-only `server_args`, reasoning-budget/server-arg agreement, global normalized alias uniqueness, and compatible role-keyed overrides only. Reject missing/unknown roles, unknown request keys, invalid value/range, incompatible overrides, and unsupported transport fields fail-closed.
-- [ ] 1.4 Define canonical role-policy merge precedence and hashes. Include aggregate resolved policies in backend/config identity and preserve the per-role hash plus final derived output budget for each producing artifact/cache.
+- [ ] 1.1 Define one fixed role mapping, used by local and remote: translator (`generator/repair/formatting/gemma_audit`) and reviewer (`qwen_audit/fidelity_reviewer/russian_selector/entity_extractor/russian_editor/glossary_resolver`). Update remote `TRANSLATOR_ROLES`/`REVIEWER_ROLES`, runtime profiles, defaults, and binding tests to this map. Bind every role explicitly; remove role-to-role and `default` resolution fallbacks.
+- [ ] 1.2 Replace local `role_policies` with top-level shared `role_budgets` (all ten roles, only `max_output_tokens/output_budget`) and model-owned `providers.local.models.<alias>.request` (`temperature/top_p/top_k/min_p/seed`). Validate all shapes/types/ranges and reject model request `max_output_tokens` fail-closed.
+- [ ] 1.3 Retain production `gemma`/`qwen` aliases from `runtime_local.example.yaml`; validate paths/names/string args/reasoning agreement. Define immutable `ResolvedModelPair` and case-insensitive local alias lookup.
 
-## 2. Request transport and all producer wiring
+## 2. Transport and producers
 
-- [ ] 2.1 Extend `CompletionRequest`/`ApiClient`/`LocalOpenAIBackend` to carry and serialize typed local sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`; add `min_p` validation. Keep local `reasoning` request options rejected and local reasoning solely in `server_args --reasoning-budget`.
-- [ ] 2.2 Replace all V4 strict/book code-owned sampling/output policy literals with `RoleCallPolicy`. Cover every matrix row: generator/whole-chapter; Qwen fidelity and region re-gate (single+batch); Gemma selector; Qwen/Gemma audit and B3 re-audit; repair/selective-repair/B3 repair; entity extractor; Russian editor; formatting; glossary resolver. Remove descriptor-private-field introspection in glossary resolution.
-- [ ] 2.3 Move all dynamic request-budget constants used by those producers (base/floor, per-PID/per-span allowance, ceiling) into `OutputBudgetPolicy`, implement one deterministic derivation helper, and record its final result with the call identity.
-- [ ] 2.4 Wire per-role policy through `StrictRunConfig`, B3 construction, role adapters, and formatting client without changing prompt, parser, retry/backoff, hard-filter, or lifecycle behavior.
+- [ ] 2.1 Wire every V4 producer to `ResolvedModelPair`: translator roles take model request from left pair model, reviewer roles from right; final budget from `role_budgets[role]` through one `derive_max_output_tokens` helper. Each producer resolves only its exact role and fails closed when it is absent. Remove sampling/budget code literals and glossary descriptor introspection.
+- [ ] 2.2 Serialize local `temperature/top_p/top_k/min_p/seed` from selected model and `max_output_tokens` from role budget; local `reasoning` rejected, server args only. Apply to generation/repair/selector/Gemma audit/formatting/Qwen audit/fidelity/re-gate/entity/Russian editor/glossary/B3.
+- [ ] 2.3 Thread resolved pair through strict config, B3, role adapters, formatting and glossary; code must fail closed if normal simple local execution has no pair.
 
-## 3. CLI, preflight, identity, and provenance
+## 3. CLI, cache, preflight
 
-- [ ] 3.1 Update `v4_run.py` and `v4_phase12_strict_run.py`: `--local` accepts optional alias, is mutually exclusive with remote/runtime config, delegates unchanged through book/chapter paths, and uses `local` / `local_<alias>` output labels.
-- [ ] 3.2 Resolve exactly the same local alias/policies in `run_runtime_preflight`; validate paths, server args/reasoning agreement, request-field transport support, and emit sanitized routing, policy map, per-role hashes, aggregate identity, and no network/server side effect.
-- [ ] 3.3 Update generation, audit/re-audit, repair, formatting, glossary resolver, and strict trial records/cache envelopes to preserve their role-policy hash and effective final output budget. Bump only the schemas/versions necessary to prevent replay under a different policy, with backward compatibility handled fail-closed.
+- [ ] 3.1 Implement `book|chapter --local` → `gemma/qwen`, `--local a/b` → left translator/right reviewer, single `a` fail-closed. Resolve components only under local registry; forward pair and providers config through delegation; labels `local` and `local_<a>_<b>`.
+- [ ] 3.2 Preflight resolves/validates same pair plus all shared budgets, paths/server args/reasoning agreement, reports sanitized pair/request/budget data, no network/server start.
+- [ ] 3.3 Routing/server args/budgets remain run identity-bearing. Sampling is excluded from run/output-dir identity but included in each request cache key/provenance: changed sampling must regenerate and overwrite in same directory, never replay stale sample. Update schemas and stale-cache tests accordingly.
 
-## 4. Tests, documentation, and verification
+## 4. Tests, docs, verification
 
-- [ ] 4.1 Add registry tests: complete defaults, empty local model catalog, alias resolution (bare/qualified), global collision, every malformed policy/override, and local server-args/reasoning consistency.
-- [ ] 4.2 Add transport tests with captured mock requests proving local and remote serialization/identity for every allowed field, including `seed` and `min_p`, and rejection/no-silent-drop of unsupported local fields.
-- [ ] 4.3 Add one focused producer test per matrix row. Mutate that role's temperature, seed where applicable, and dynamic budget inputs; prove the precise request body, policy hash, final budget, artifact/cache identity, and no stale reuse. Retain bare-local regression tests proving behavior is preserved from explicit registry defaults.
-- [ ] 4.4 Update `V4_BOOK_PIPELINE_INVENTORY_RU.md`, `AGENTS_REFERENCE_RU.md`, help, and `providers.yaml` comments with the role matrix, alias syntax, local-vs-remote reasoning transport, policy identity, and new-model preflight procedure.
-- [ ] 4.5 Run `openspec validate local-model-aliases --strict`, `pact-fidelity-lint`, focused runtime/adapter/strict/book tests, and `git diff --check`; no server lifecycle action or pipeline execution.
+- [ ] 4.1 Tests: bare `gemma/qwen`, explicit `glm/glimmer`, single-alias rejection, remote-under-local rejection, malformed model request/budget/reasoning input, remote fixed-group bindings, pair preflight.
+- [ ] 4.2 Payload-capture: model sampling + role budget for both group positions, all allowed fields, local reasoning rejection/no silent drop.
+- [ ] 4.3 Producer/cache matrix: every role receives correct group model and role budget; changing sampling regenerates only affected group in same output directory; budget/routing change has correct stale-resume behavior.
+- [ ] 4.4 Docs/help: pair syntax, fixed shared groups, model sampling vs role budgets, overwrite semantics, `runtime_local.example.yaml` reference-only status.
+- [ ] 4.5 Run `openspec validate local-model-aliases --strict`, focused runtime/adapter/strict/book tests, `git diff --check`; no server/pipeline execution.

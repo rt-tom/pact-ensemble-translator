@@ -1,28 +1,31 @@
 ## Why
 
-`book --local` uses a fixed local runtime profile, while remote models can be selected by alias from `configs/providers.yaml`. The owner needs `book --local [alias]` without creating `runtime_localN.yaml`/`localN` flags. An alias must select model path/name and exact `llama-server` arguments.
+The owner needs one model-centric registry for local execution: each model owns its llama-server arguments and body sampling (`temperature/top_p/top_k/min_p/seed`); fixed roles own only output budgets. Every run always has two models: a translator and a reviewer. Bare `--local` keeps the production pair `gemma/qwen`; `--local glm/glimmer` selects a different translator/reviewer pair.
 
-In addition, no model-call body setting may be an implicit code policy. At every V4 strict/book pipeline stage, the effective sampling/output policy (for example `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`) must come from the selected provider registry policy. This includes generation, all audits and re-gates, repair, entity extraction, Russian editing, formatting, and glossary resolution. Local reasoning remains an explicit server-start policy (`--reasoning-budget`), not a request body option.
+The current remote subset and local role policies do not form the owner's explicit fixed translator/reviewer mapping, so this change makes the role groups identical for both transports and removes role-resolution fallbacks. Sampling values must not be code literals or force a new output directory. If sampling changes, the affected model call must be regenerated and written over the old result in the same run directory; it must never replay a cache created with different sampling.
 
 ## What Changes
 
-- Extend the unified `configs/providers.yaml` registry with a `local` provider (`kind: local_llama`). It supplies two independent, validated concerns:
-  - `role_policies`: canonical policy for every V4 strict/book model-call role, including model-key routing and every request-body setting; these registry defaults preserve the current production behavior for bare `--local`.
-  - `models.<alias>`: an optional local model replacement (`model_key`, `model_path`, `model_name`, `server_args`, and per-role policy overrides). No real model is added by this change; test fixtures prove the contract.
-- Add `book --local [alias]` and `chapter --local [alias]`, analogous to remote aliases. Bare `--local` resolves the canonical local runtime plus the registry's local role policies. `--local alias` replaces only the declared `model_key` and applies only its compatible per-role policy overrides. It never silently changes unrelated roles.
-- Replace all V4 strict/book literal request-body sampling/output settings with a resolved immutable `RoleCallPolicy`. Each `CompletionRequest` producer receives its role's policy explicitly. Dynamic output-budget calculations are expressed by registry policy fields (base, per-item headroom, and ceiling), not literals in call sites.
-- Extend the local OpenAI-compatible request serialization to send declared sampling fields (`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_output_tokens`) in the request body. The existing prohibition is narrowed to the remote-only `reasoning` request option: local reasoning remains solely in alias `server_args` and is validated against `reasoning_budget`.
-- Make the fully resolved role-policy map, local alias/server arguments, and effective routing identity-bearing. Each cache/artifact records the policy hash relevant to the call that produced it; changing a role policy invalidates that role's cache/resume data and appears in preflight/trial provenance.
+- `configs/providers.yaml` becomes model-centric:
+  - top-level `role_budgets` is one shared fixed budget map for all local and remote roles; it owns `max_output_tokens` and `output_budget` only;
+  - `providers.local.models.<alias>` owns `model_key`, `model_path`, `model_name`, `server_args`, `reasoning_budget`, and `request` sampling only. Production `gemma`/`qwen` entries are ported unchanged from `runtime_local.example.yaml`.
+- Define one fixed role split and use it for **both** local and remote:
+  - translator: `generator`, `repair`, `formatting`, `gemma_audit`;
+  - reviewer: `qwen_audit`, `fidelity_reviewer`, `russian_selector`, `entity_extractor`, `russian_editor`, `glossary_resolver`.
+  No model entry may change this map, and every role is bound explicitly with no fallback to another role or `default`.
+- Local CLI: bare `book|chapter --local` selects `gemma/qwen`; explicit selection requires exactly `--local translator/reviewer`, for example `--local glm/glimmer`. A single alias fails closed. Pair components are local aliases (not cross-provider/global lookups); remote aliases fail closed. This is the same two-position CLI semantics as remote, without ambiguous provider-qualified slash syntax.
+- A translator model supplies sampling to every translator role; a reviewer model supplies sampling to every reviewer role. The shared role budget supplies the final output limit. Local reasoning remains server-start-only (`--reasoning-budget`).
+- Sampling is excluded from run/output-directory identity, so no new `--out-base` is needed. It remains in each call/cache request key and provenance, so a changed temperature causes regeneration/overwrite rather than stale cache replay. Routing, server args and role budgets remain run identity-bearing.
 
 ## Capabilities
 
 ### New Capabilities
-- `local-model-aliases`: scalable local alias selection with server-start configuration and per-role model-call policies from `providers.yaml`.
+- `local-model-aliases`: two-model local pair selection with model-owned sampling and shared fixed role budgets.
 
 ### Modified Capabilities
-- `runtime-profile-contract`: simple local and remote execution consume explicit provider policy rather than code sampling defaults.
+- `runtime-profile-contract`: remote and local share one fixed translator/reviewer role map and shared role budgets.
 
 ## Impact
 
-- `configs/providers.yaml`; provider-registry parsing and effective-policy resolution in `pact_v4/runtime/runtime_config.py`; the local request adapter/client and `CompletionRequest` sampling contract; strict/book CLI/preflight/identity plumbing; every V4 strict/book `CompletionRequest` producer and formatting adapter.
-- High risk: runtime contract, cache/resume identity, and all model-call paths change. The change adds no real model entry, starts no server, runs no pipeline, and does not migrate or delete persistent state.
+- `configs/providers.yaml`, `runtime_config.py`, local/remote role binding, local request serialization, strict/book CLI/preflight, all V4 producers, cache request identities and provenance.
+- High risk: role routing and cache behavior change. No pipeline/server action or new model beyond current `gemma/qwen` is included.

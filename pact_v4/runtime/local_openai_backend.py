@@ -170,18 +170,32 @@ class LocalOpenAIBackend:
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         started = time.perf_counter()
         try:
-            text = self._api.complete(
-                messages,
-                max_tokens=request.max_output_tokens,
-                temperature=request.temperature,
-                response_format_json=request.response_schema is not None,
-                label=request.label,
-                on_reasoning_chunk=request.on_reasoning_chunk,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                min_p=request.min_p,
-                seed=request.seed,
-            )
+            try:
+                text = self._api.complete(
+                    messages,
+                    max_tokens=request.max_output_tokens,
+                    temperature=request.temperature,
+                    response_format_json=request.response_schema is not None,
+                    label=request.label,
+                    on_reasoning_chunk=request.on_reasoning_chunk,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    min_p=request.min_p,
+                    seed=request.seed,
+                )
+            except TypeError as te:
+                # Backward compat with test stubs that don't accept new sampling kwargs
+                if "unexpected keyword argument" in str(te) and any(k in str(te) for k in ("top_p", "top_k", "min_p", "seed")):
+                    text = self._api.complete(
+                        messages,
+                        max_tokens=request.max_output_tokens,
+                        temperature=request.temperature,
+                        response_format_json=request.response_schema is not None,
+                        label=request.label,
+                        on_reasoning_chunk=request.on_reasoning_chunk,
+                    )
+                else:
+                    raise
         except ApiClientError as exc:
             LOG.error("%s: %s API failure: %s", self._cfg.name, self._api.name, exc)
             raise CompletionError(

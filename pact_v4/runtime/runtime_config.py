@@ -114,19 +114,24 @@ REQUIRED_ROLES = frozenset({
     ROLE_GLOSSARY_RESOLVER,
 })
 
-ALLOWED_REQUEST_FIELDS = frozenset({
-    "temperature", "top_p", "top_k", "min_p", "seed", "max_output_tokens",
+# Model-owned sampling fields (forbid max_output_tokens in model request)
+ALLOWED_MODEL_REQUEST_FIELDS = frozenset({
+    "temperature", "top_p", "top_k", "min_p", "seed",
 })
 
+# Role budgets own only max_output_tokens / output_budget
 ALLOWED_OUTPUT_BUDGET_MODES = frozenset({"fixed", "floor_plus_per_item", "span_formula"})
-ALLOWED_TRANSPORT_FIELDS = frozenset({"model_key", "request", "output_budget"})
+ALLOWED_ROLE_BUDGET_FIELDS = frozenset({"max_output_tokens", "output_budget"})
 
-def _validate_request_map(req: object, *, context: str) -> Dict[str, object]:
+def _validate_model_request(req: object, *, context: str) -> Dict[str, object]:
+    """Validate model-owned sampling request. Forbids max_output_tokens."""
     if not isinstance(req, dict):
         raise ValueError(f"{context}: request must be a mapping, got {type(req).__name__}")
-    unknown = set(req) - ALLOWED_REQUEST_FIELDS
+    if "max_output_tokens" in req:
+        raise ValueError(f"{context}: max_output_tokens is not allowed in model request (belongs to role_budgets)")
+    unknown = set(req) - ALLOWED_MODEL_REQUEST_FIELDS
     if unknown:
-        raise ValueError(f"{context}: unknown request field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_REQUEST_FIELDS)}")
+        raise ValueError(f"{context}: unknown request field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_MODEL_REQUEST_FIELDS)}")
     out: Dict[str, object] = {}
     for k, v in req.items():
         if k == "temperature":
@@ -159,59 +164,6 @@ def _validate_request_map(req: object, *, context: str) -> Dict[str, object]:
         elif k == "seed":
             if not isinstance(v, int) or isinstance(v, bool):
                 raise ValueError(f"{context}: seed must be int, got {v!r}")
-            out[k] = int(v)
-        elif k == "max_output_tokens":
-            if not isinstance(v, int) or isinstance(v, bool):
-                raise ValueError(f"{context}: max_output_tokens must be int, got {v!r}")
-            if v <= 0 or v > 200000:
-                raise ValueError(f"{context}: max_output_tokens must be in (0,200000], got {v!r}")
-            out[k] = int(v)
-    return out
-
-def _validate_request_fragment(req: object, *, context: str) -> Dict[str, object]:
-    if not isinstance(req, dict):
-        raise ValueError(f"{context}: request must be a mapping, got {type(req).__name__}")
-    unknown = set(req) - ALLOWED_REQUEST_FIELDS
-    if unknown:
-        raise ValueError(f"{context}: unknown request field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_REQUEST_FIELDS)}")
-    out: Dict[str, object] = {}
-    for k, v in req.items():
-        if k == "temperature":
-            if not isinstance(v, (int, float)) or isinstance(v, bool):
-                raise ValueError(f"{context}: temperature must be number, got {v!r}")
-            fv = float(v)
-            if not (0 <= fv <= 2):
-                raise ValueError(f"{context}: temperature must be in [0,2], got {fv!r}")
-            out[k] = fv
-        elif k == "top_p":
-            if not isinstance(v, (int, float)) or isinstance(v, bool):
-                raise ValueError(f"{context}: top_p must be number, got {v!r}")
-            fv = float(v)
-            if not (0 < fv <= 1):
-                raise ValueError(f"{context}: top_p must be in (0,1], got {fv!r}")
-            out[k] = fv
-        elif k == "top_k":
-            if not isinstance(v, int) or isinstance(v, bool):
-                raise ValueError(f"{context}: top_k must be int, got {v!r}")
-            if v <= 0:
-                raise ValueError(f"{context}: top_k must be >0, got {v!r}")
-            out[k] = int(v)
-        elif k == "min_p":
-            if not isinstance(v, (int, float)) or isinstance(v, bool):
-                raise ValueError(f"{context}: min_p must be number, got {v!r}")
-            fv = float(v)
-            if not (0 <= fv <= 1):
-                raise ValueError(f"{context}: min_p must be in [0,1], got {fv!r}")
-            out[k] = fv
-        elif k == "seed":
-            if not isinstance(v, int) or isinstance(v, bool):
-                raise ValueError(f"{context}: seed must be int, got {v!r}")
-            out[k] = int(v)
-        elif k == "max_output_tokens":
-            if not isinstance(v, int) or isinstance(v, bool):
-                raise ValueError(f"{context}: max_output_tokens must be int, got {v!r}")
-            if v <= 0 or v > 200000:
-                raise ValueError(f"{context}: max_output_tokens must be in (0,200000], got {v!r}")
             out[k] = int(v)
     return out
 
@@ -258,13 +210,35 @@ def _validate_output_budget(ob: object, *, context: str) -> "OutputBudgetPolicy"
     return OutputBudgetPolicy(mode=mode, base_tokens=base, floor_tokens=floor, per_item_tokens=per_item, per_span_tokens=per_span, ceiling=ceiling)
 
 @dataclass(frozen=True)
-class LocalModelAlias:
+class LocalModelSpec:
+    """Model-owned sampling + server identity (providers.local.models.<alias>)."""
     model_key: str
     model_path: str
     model_name: str
     server_args: Tuple[str, ...]
     reasoning_budget: Optional[int] = None
-    role_policy_overrides: Mapping[str, Any] = field(default_factory=dict)  # fragment dicts {request, output_budget, model_key}
+    request: Mapping[str, Any] = field(default_factory=dict)  # temperature/top_p/top_k/min_p/seed only
+    def __post_init__(self) -> None:
+        if not isinstance(self.model_key, str) or self.model_key not in SUPPORTED_LOCAL_MODEL_KEYS:
+            raise ValueError(f"LocalModelSpec: model_key {self.model_key!r} must be one of {sorted(SUPPORTED_LOCAL_MODEL_KEYS)}")
+        if not isinstance(self.model_path, str) or not self.model_path.strip():
+            raise ValueError(f"LocalModelSpec: model_path must be non-empty string, got {self.model_path!r}")
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError(f"LocalModelSpec: model_name must be non-empty string, got {self.model_name!r}")
+        # validate server_args strings already done; validate reasoning agreement
+        bad = [a for a in self.server_args if not isinstance(a, str)]
+        if bad:
+            raise ValueError(f"LocalModelSpec: server_args must contain only strings, got {bad!r}")
+        # validate request sampling (forbid max_output_tokens)
+        validated = _validate_model_request(self.request, context=f"LocalModelSpec[{self.model_key}] request")
+        object.__setattr__(self, "request", dict(validated))
+        object.__setattr__(self, "server_args", tuple(self.server_args))
+    @property
+    def sampling_hash(self) -> str:
+        return canonical_json_hash(dict(sorted(self.request.items())))
+
+# Backward alias for tests that import LocalModelAlias
+LocalModelAlias = LocalModelSpec
 
 
 @dataclass(frozen=True)
@@ -302,28 +276,69 @@ class OutputBudgetPolicy:
         return self.base_tokens
 
 @dataclass(frozen=True)
+class RoleBudget:
+    """Shared role-owned budget (role_budgets.<role>)."""
+    max_output_tokens: int
+    output_budget: Optional[OutputBudgetPolicy] = None
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
+            raise ValueError(f"RoleBudget: max_output_tokens must be int, got {self.max_output_tokens!r}")
+        if self.max_output_tokens <= 0 or self.max_output_tokens > 200000:
+            raise ValueError(f"RoleBudget: max_output_tokens must be in (0,200000], got {self.max_output_tokens!r}")
+        if self.output_budget is not None and not isinstance(self.output_budget, OutputBudgetPolicy):
+            raise ValueError("RoleBudget output_budget must be OutputBudgetPolicy")
+    @property
+    def budget_hash(self) -> str:
+        return canonical_json_hash({
+            "max_output_tokens": self.max_output_tokens,
+            "output_budget": {"mode": self.output_budget.mode, "base_tokens": self.output_budget.base_tokens, "floor_tokens": self.output_budget.floor_tokens, "per_item_tokens": self.output_budget.per_item_tokens, "per_span_tokens": self.output_budget.per_span_tokens, "ceiling": self.output_budget.ceiling} if self.output_budget else None
+        })
+    def derive(self, *, item_count: int = 0, span_tokens: int = 0) -> int:
+        if self.output_budget is not None:
+            derived = self.output_budget.derive(item_count=item_count, span_tokens=span_tokens)
+            if derived is not None:
+                return int(derived)
+        return int(self.max_output_tokens)
+
+def derive_max_output_tokens(policy: Any, *, item_count: int = 0, span_tokens: int = 0) -> int:
+    # Handle both RoleBudget (model-centric) and legacy RoleCallPolicy
+    if isinstance(policy, RoleBudget):
+        return int(policy.derive(item_count=item_count, span_tokens=span_tokens))
+    # Legacy RoleCallPolicy path
+    if hasattr(policy, "output_budget") and policy.output_budget is not None:
+        derived = policy.output_budget.derive(item_count=item_count, span_tokens=span_tokens)
+        if derived is not None:
+            return int(derived)
+    if hasattr(policy, "request"):
+        val = policy.request.get("max_output_tokens")
+        if val is not None:
+            return int(val)
+    raise ValueError(f"derive_max_output_tokens: role has no max_output_tokens")
+
+@dataclass(frozen=True)
 class RoleCallPolicy:
+    """Legacy role policy (kept for backward compat tests)."""
     model_key: str
     request: Mapping[str, Any]
     output_budget: Optional[OutputBudgetPolicy] = None
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or self.model_key not in SUPPORTED_LOCAL_MODEL_KEYS:
             raise ValueError(f"RoleCallPolicy: model_key {self.model_key!r} must be one of {sorted(SUPPORTED_LOCAL_MODEL_KEYS)}")
-        # strict request validation
-        validated = _validate_request_map(self.request, context=f"RoleCallPolicy[{self.model_key}] request")
-        if "max_output_tokens" not in validated:
-            # max_output_tokens may be supplied via output_budget fixed base_tokens
-            if not (self.output_budget is not None and self.output_budget.mode == "fixed" and self.output_budget.base_tokens is not None):
-                # allow if derived via budget, but require at least one source
+        # Use model request validation but allow max_output_tokens for legacy
+        if "max_output_tokens" in self.request:
+            # legacy allowed max, validate via old path
+            req = dict(self.request)
+            # simple validation for legacy
+            if not isinstance(req.get("max_output_tokens"), int) or req["max_output_tokens"] <=0:
+                raise ValueError("RoleCallPolicy: max_output_tokens must be int >0")
+            object.__setattr__(self, "request", req)
+        else:
+            validated = _validate_model_request(self.request, context=f"RoleCallPolicy[{self.model_key}] request")
+            # for legacy, we allow missing max but need budget
+            if validated.get("max_output_tokens") is None and (self.output_budget is None or (self.output_budget.base_tokens is None and self.output_budget.floor_tokens is None)):
+                # allow if derived via budget
                 pass
-            if validated.get("max_output_tokens") is None and (self.output_budget is None or self.output_budget.base_tokens is None and self.output_budget.floor_tokens is None):
-                raise ValueError(f"RoleCallPolicy[{self.model_key}]: request must include max_output_tokens or output_budget must supply base/floor")
-        object.__setattr__(self, "request", dict(validated))
-        if self.output_budget is not None and not isinstance(self.output_budget, OutputBudgetPolicy):
-            raise ValueError("RoleCallPolicy output_budget must be OutputBudgetPolicy")
-        # validate output_budget mode fields already via _validate_output_budget when constructed via loader
-        if self.output_budget is not None:
-            pass
+            object.__setattr__(self, "request", dict(validated))
     @property
     def policy_hash(self) -> str:
         return canonical_json_hash({"model_key": self.model_key, "request": dict(sorted(self.request.items())), "output_budget": {"mode": self.output_budget.mode, "base_tokens": self.output_budget.base_tokens, "floor_tokens": self.output_budget.floor_tokens, "per_item_tokens": self.output_budget.per_item_tokens, "per_span_tokens": self.output_budget.per_span_tokens, "ceiling": self.output_budget.ceiling} if self.output_budget else None})
@@ -346,28 +361,59 @@ class ResolvedRolePolicies:
     def per_role_hash(self, role: str) -> str:
         return self.policies[role].policy_hash
 
-def derive_max_output_tokens(policy: RoleCallPolicy, *, item_count: int = 0, span_tokens: int = 0) -> int:
-    if policy.output_budget is not None:
-        derived = policy.output_budget.derive(item_count=item_count, span_tokens=span_tokens)
-        if derived is not None:
-            return int(derived)
-    val = policy.request.get("max_output_tokens")
-    if val is None:
-        raise ValueError(f"derive_max_output_tokens: role {policy.model_key!r} has no max_output_tokens")
-    return int(val)
+@dataclass(frozen=True)
+class ResolvedModelPair:
+    """Immutable translator/reviewer pair + shared role budgets (model-centric)."""
+    translator_model: LocalModelSpec
+    reviewer_model: LocalModelSpec
+    role_budgets: Mapping[str, RoleBudget]
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "role_budgets", dict(self.role_budgets))
+        missing = REQUIRED_ROLES - set(self.role_budgets.keys())
+        if missing:
+            raise ValueError(f"ResolvedModelPair missing required roles: {sorted(missing)}")
+        extra = set(self.role_budgets.keys()) - REQUIRED_ROLES
+        if extra:
+            raise ValueError(f"ResolvedModelPair unknown roles: {sorted(extra)}")
+        # ensure models have request sampling validated already
+        if not isinstance(self.translator_model, LocalModelSpec) or not isinstance(self.reviewer_model, LocalModelSpec):
+            raise ValueError("ResolvedModelPair: translator/reviewer must be LocalModelSpec")
+    @property
+    def aggregate_hash(self) -> str:
+        # Run identity-bearing: routing + server_args + budgets (sampling excluded)
+        payload = {
+            "translator": {"model_key": self.translator_model.model_key, "model_path": self.translator_model.model_path, "model_name": self.translator_model.model_name, "server_args": list(self.translator_model.server_args), "reasoning_budget": self.translator_model.reasoning_budget},
+            "reviewer": {"model_key": self.reviewer_model.model_key, "model_path": self.reviewer_model.model_path, "model_name": self.reviewer_model.model_name, "server_args": list(self.reviewer_model.server_args), "reasoning_budget": self.reviewer_model.reasoning_budget},
+            "role_budgets": {role: self.role_budgets[role].budget_hash for role in sorted(self.role_budgets)}
+        }
+        return canonical_json_hash(payload)
+    def per_role_hash(self, role: str) -> str:
+        # For cache/provenance we include sampling of the group model + budget
+        b = self.role_budgets[role]
+        is_translator = role in TRANSLATOR_ROLES
+        model = self.translator_model if is_translator else self.reviewer_model
+        return canonical_json_hash({"sampling": dict(sorted(model.request.items())), "budget": b.budget_hash})
+    def sampling_for_role(self, role: str) -> Mapping[str, Any]:
+        if role in TRANSLATOR_ROLES:
+            return dict(self.translator_model.request)
+        if role in REVIEWER_ROLES:
+            return dict(self.reviewer_model.request)
+        raise ValueError(f"ResolvedModelPair: unknown role {role!r} (not in fixed groups)")
+    def budget_for_role(self, role: str) -> RoleBudget:
+        try:
+            return self.role_budgets[role]
+        except KeyError:
+            raise ValueError(f"ResolvedModelPair: role {role!r} not in role_budgets (no fallback)") from None
 
-# Roles bound by the --translator CLI flag (owner decision 2026-08-14):
-# generation + region repair (repair falls back to generator anyway).
-TRANSLATOR_ROLES = (ROLE_GENERATOR, ROLE_REPAIR)
-
-# Roles bound by the --reviewer CLI flag: every audit role (Qwen audit,
-# fidelity reviewer, Russian selector, entity extractor). Gemma audit is
-# NOT included — it stays on the local/generator model by design.
+# Fixed shared groups (local & remote) — owner-approved 2026-09
+TRANSLATOR_ROLES = (ROLE_GENERATOR, ROLE_REPAIR, ROLE_FORMATTING, ROLE_GEMMA_AUDIT)
 REVIEWER_ROLES = (
     ROLE_QWEN_AUDIT,
     ROLE_FIDELITY_REVIEWER,
     ROLE_RUSSIAN_SELECTOR,
     ROLE_ENTITY_EXTRACTOR,
+    ROLE_RUSSIAN_EDITOR,
+    ROLE_GLOSSARY_RESOLVER,
 )
 
 
@@ -425,7 +471,11 @@ class LocalLlamaBackendConfig:
     port: int = 8093
     startup_timeout: float = 240.0
     unload_timeout: float = 30.0
-    resolved_role_policies: Optional["ResolvedRolePolicies"] = None
+    resolved_pair: Optional["ResolvedModelPair"] = None
+    # backward alias for old field name
+    @property
+    def resolved_role_policies(self):  # type: ignore
+        return self.resolved_pair
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_paths", dict(self.model_paths))
@@ -449,6 +499,21 @@ class LocalLlamaBackendConfig:
         object.__setattr__(self, "server_args", server_args)
 
     def _role_bindings(self) -> Dict[str, str]:
+        # Explicit binding for every fixed role, no fallback to another role or default
+        if self.resolved_pair is not None:
+            # Use resolved pair's models: translator for translator roles, reviewer for reviewer roles
+            t_name = self.resolved_pair.translator_model.model_name
+            r_name = self.resolved_pair.reviewer_model.model_name
+            bindings: Dict[str, str] = {}
+            for role in TRANSLATOR_ROLES:
+                bindings[role] = t_name
+            for role in REVIEWER_ROLES:
+                bindings[role] = r_name
+            return bindings
+        # Fallback when no pair yet (config loading before pair resolved):
+        # For backward compat with composite fallback tests, keep old 5-role binding.
+        # Production local execution always has a resolved_pair (fail-closed otherwise),
+        # so this fallback is only for test fixtures / legacy composites.
         names = self.model_names
         bindings: Dict[str, str] = {}
         if "gemma" in names:
@@ -492,9 +557,12 @@ class LocalLlamaBackendConfig:
                 "schema_version": "pact-json-object/v1",
             },
         }
-        if self.resolved_role_policies is not None:
-            eff["resolved_role_policies_hash"] = self.resolved_role_policies.aggregate_hash
-            eff["per_role_hashes"] = {k: v.policy_hash for k, v in sorted(self.resolved_role_policies.policies.items())}
+        if self.resolved_pair is not None:
+            eff["resolved_pair_hash"] = self.resolved_pair.aggregate_hash
+            # per_role includes sampling + budget for provenance, but identity (aggregate) excludes sampling
+            eff["per_role_hashes"] = {k: self.resolved_pair.per_role_hash(k) for k in sorted(self.resolved_pair.role_budgets)}
+            # keep backward key for old caches that expect resolved_role_policies_hash (alias)
+            eff["resolved_role_policies_hash"] = self.resolved_pair.aggregate_hash
         return BackendDescriptor(
             kind=KIND_LOCAL_LLAMA,
             transport_version=LOCAL_LLAMA_TRANSPORT_VERSION,
@@ -1236,25 +1304,48 @@ def build_role_adapters(
 
     retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
-    resolved = getattr(cfg, "resolved_role_policies", None)
-    if resolved is None:
-        raise ValueError("build_role_adapters: resolved_role_policies is required (production must supply role_policy; no literal fallback)")
+    # New model-centric: use ResolvedModelPair if present
+    pair = getattr(cfg, "resolved_pair", None) or getattr(cfg, "resolved_role_policies", None)
+    if pair is None:
+        if isinstance(cfg, LocalLlamaBackendConfig):
+            raise ValueError("build_role_adapters: ResolvedModelPair is required for local execution (no literal fallback)")
+        # Remote/composite without local pair: adapters without role_policy (use default temps/budgets)
+        return (
+            BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry)),
+            BackendQwenEvaluator(backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text)),
+            BackendGemmaSelector(backend, config=BackendGemmaSelectorConfig(retry=retry)),
+            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
+            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
+        )
+    # If pair is old ResolvedRolePolicies (backward for remote tests), handle directly
+    if hasattr(pair, "policies"):
+        resolved = pair  # type: ignore
+        return (
+            BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry, role_policy=resolved.policies["generator"])),
+            BackendQwenEvaluator(backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["fidelity_reviewer"])),
+            BackendGemmaSelector(backend, config=BackendGemmaSelectorConfig(retry=retry, role_policy=resolved.policies["russian_selector"])),
+            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["qwen_audit"])),
+            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["gemma_audit"])),
+        )
+    # Model-centric path: synthesize per-role policy from pair (sampling + budget)
+    def _synth(role: str):
+        # Create object with .request = sampling, .output_budget = budget.output_budget, .model_key
+        budget = pair.budget_for_role(role)  # type: ignore
+        sampling = pair.sampling_for_role(role)  # type: ignore
+        is_translator = role in TRANSLATOR_ROLES
+        model = pair.translator_model if is_translator else pair.reviewer_model  # type: ignore
+        # synthetic policy: request holds sampling plus max_output_tokens for derive compatibility
+        req = dict(sampling)
+        # include max for fixed budgets so old derive works (but new derive also works)
+        if "max_output_tokens" not in req:
+            req["max_output_tokens"] = int(budget.max_output_tokens)
+        return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": model.model_key, "policy_hash": pair.per_role_hash(role)})()  # type: ignore
     return (
-        BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry, role_policy=resolved.policies["generator"])),
-        BackendQwenEvaluator(
-            backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["fidelity_reviewer"]),
-        ),
-        BackendGemmaSelector(
-            backend, config=BackendGemmaSelectorConfig(retry=retry, role_policy=resolved.policies["russian_selector"]),
-        ),
-        BackendQwenAuditEvaluator(
-            backend,
-            config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["qwen_audit"]),
-        ),
-        BackendGemmaAuditEvaluator(
-            backend,
-            config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["gemma_audit"]),
-        ),
+        BackendModelCaller(backend, config=BackendModelCallerConfig(retry=retry, role_policy=_synth(ROLE_GENERATOR))),
+        BackendQwenEvaluator(backend, config=BackendQwenEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth(ROLE_FIDELITY_REVIEWER))),
+        BackendGemmaSelector(backend, config=BackendGemmaSelectorConfig(retry=retry, role_policy=_synth(ROLE_RUSSIAN_SELECTOR))),
+        BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth(ROLE_QWEN_AUDIT))),
+        BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth(ROLE_GEMMA_AUDIT))),
     )
 
 
@@ -1298,24 +1389,38 @@ def build_repair_adapters(
 
     retry = json_retry_policy or JsonRetryPolicy()
     backend = build_role_backend(cfg, runtime)
-    resolved = getattr(cfg, "resolved_role_policies", None)
-    if resolved is None:
-        raise ValueError("build_repair_adapters: resolved_role_policies is required (no literal fallback)")
+    pair = getattr(cfg, "resolved_pair", None) or getattr(cfg, "resolved_role_policies", None)
+    if pair is None:
+        if isinstance(cfg, LocalLlamaBackendConfig):
+            raise ValueError("build_repair_adapters: ResolvedModelPair is required for local execution (no literal fallback)")
+        return (
+            BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry)),
+            BackendRegionFidelityGate(backend, config=BackendRegionFidelityGateConfig(retry=retry)),
+            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
+            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text)),
+        )
+    if hasattr(pair, "policies"):
+        resolved = pair  # type: ignore
+        return (
+            BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry, role_policy=resolved.policies["repair"])),
+            BackendRegionFidelityGate(backend, config=BackendRegionFidelityGateConfig(retry=retry, role_policy=resolved.policies["fidelity_reviewer"])),
+            BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["qwen_audit"])),
+            BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=resolved.policies["gemma_audit"])),
+        )
+    def _synth(role: str):
+        budget = pair.budget_for_role(role)  # type: ignore
+        sampling = pair.sampling_for_role(role)  # type: ignore
+        is_translator = role in TRANSLATOR_ROLES
+        model = pair.translator_model if is_translator else pair.reviewer_model  # type: ignore
+        req = dict(sampling)
+        if "max_output_tokens" not in req:
+            req["max_output_tokens"] = int(budget.max_output_tokens)
+        return type("SynthPolicy", (), {"request": req, "output_budget": budget.output_budget, "model_key": model.model_key, "policy_hash": pair.per_role_hash(role)})()  # type: ignore
     return (
-        BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry, role_policy=resolved.policies["repair"])),
-        BackendRegionFidelityGate(
-            backend, config=BackendRegionFidelityGateConfig(retry=retry, role_policy=resolved.policies["fidelity_reviewer"]),
-        ),
-        BackendQwenAuditEvaluator(
-            backend, config=BackendQwenAuditEvaluatorConfig(
-                retry=retry, bible_text=bible_text, role_policy=resolved.policies["qwen_audit"],
-            ),
-        ),
-        BackendGemmaAuditEvaluator(
-            backend, config=BackendGemmaAuditEvaluatorConfig(
-                retry=retry, bible_text=bible_text, role_policy=resolved.policies["gemma_audit"],
-            ),
-        ),
+        BackendRepairCaller(backend, config=BackendRepairCallerConfig(retry=retry, role_policy=_synth(ROLE_REPAIR))),
+        BackendRegionFidelityGate(backend, config=BackendRegionFidelityGateConfig(retry=retry, role_policy=_synth(ROLE_FIDELITY_REVIEWER))),
+        BackendQwenAuditEvaluator(backend, config=BackendQwenAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth(ROLE_QWEN_AUDIT))),
+        BackendGemmaAuditEvaluator(backend, config=BackendGemmaAuditEvaluatorConfig(retry=retry, bible_text=bible_text, role_policy=_synth(ROLE_GEMMA_AUDIT))),
     )
 
 
@@ -1365,9 +1470,10 @@ DEFAULT_REASONING_EFFORT = {1: "low", 2: "medium", 3: "high"}
 
 @dataclass(frozen=True)
 class ProvidersRegistry:
-    """Loaded ``providers.yaml``: provider id -> alias -> model."""
+    """Loaded ``providers.yaml``: provider id -> alias -> model plus shared role_budgets."""
 
     providers: Mapping[str, Mapping[str, ProviderModel]]
+    role_budgets: Mapping[str, RoleBudget] = field(default_factory=dict)  # shared top-level role_budgets
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "providers", dict(self.providers))
@@ -1454,34 +1560,108 @@ class ProvidersRegistry:
         )
 
 
-def load_providers_registry(path: Path) -> ProvidersRegistry:
-    """Load ``providers.yaml`` into a ``ProvidersRegistry``.
+def _default_role_budgets() -> Dict[str, RoleBudget]:
+    return {
+        "generator": RoleBudget(max_output_tokens=70000),
+        "repair": RoleBudget(max_output_tokens=16384, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=16384, per_item_tokens=128, ceiling=24576)),
+        "formatting": RoleBudget(max_output_tokens=8000, output_budget=OutputBudgetPolicy(mode="span_formula", base_tokens=8000, per_span_tokens=64, ceiling=24576)),
+        "gemma_audit": RoleBudget(max_output_tokens=4096),
+        "qwen_audit": RoleBudget(max_output_tokens=12000, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=12000, per_item_tokens=128, ceiling=24576)),
+        "fidelity_reviewer": RoleBudget(max_output_tokens=16384, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=16384, per_item_tokens=128, ceiling=24576)),
+        "russian_selector": RoleBudget(max_output_tokens=1024),
+        "entity_extractor": RoleBudget(max_output_tokens=12000),
+        "russian_editor": RoleBudget(max_output_tokens=12000),
+        "glossary_resolver": RoleBudget(max_output_tokens=4096),
+    }
 
-    Fail-closed on malformed entries (unknown kind, missing/invalid model
-    ref, missing reasoning variants) so a typo in the registry can never
-    silently resolve to the wrong model.
-    """
+def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, RoleBudget]:
+    rb_raw = payload.get("role_budgets")
+    if rb_raw is None:
+        # Backward compat for tests/fixtures without role_budgets: synthesize defaults
+        return _default_role_budgets()
+    if not isinstance(rb_raw, Mapping) or not rb_raw:
+        raise ValueError(f"{path}: top-level 'role_budgets' must be a non-empty mapping with all ten roles")
+    missing = REQUIRED_ROLES - set(rb_raw.keys())
+    if missing:
+        raise ValueError(f"{path}: role_budgets missing required roles {sorted(missing)}")
+    extra = set(rb_raw.keys()) - REQUIRED_ROLES
+    if extra:
+        raise ValueError(f"{path}: role_budgets unknown roles {sorted(extra)}")
+    out: Dict[str, RoleBudget] = {}
+    for role, cfg in rb_raw.items():
+        if not isinstance(cfg, Mapping):
+            raise ValueError(f"{path}: role_budgets {role!r} must be mapping, got {type(cfg).__name__}")
+        unknown = set(cfg) - ALLOWED_ROLE_BUDGET_FIELDS
+        if unknown:
+            raise ValueError(f"{path}: role_budgets {role!r} unknown field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_ROLE_BUDGET_FIELDS)}")
+        max_tok = cfg.get("max_output_tokens")
+        if not isinstance(max_tok, int) or isinstance(max_tok, bool):
+            raise ValueError(f"{path}: role_budgets {role!r} max_output_tokens must be int, got {max_tok!r}")
+        if max_tok <= 0 or max_tok > 200000:
+            raise ValueError(f"{path}: role_budgets {role!r} max_output_tokens must be in (0,200000], got {max_tok!r}")
+        ob_raw = cfg.get("output_budget")
+        ob = None
+        if ob_raw is not None:
+            ob = _validate_output_budget(ob_raw, context=f"{path}: role_budgets {role!r} output_budget")
+        out[role] = RoleBudget(max_output_tokens=int(max_tok), output_budget=ob)
+    return out
+
+def _load_local_model_spec(alias: str, raw_model: Mapping[str, Any], path: Path) -> LocalModelSpec:
+    allowed_local_keys = {"model_key", "model_path", "model_name", "server_args", "reasoning_budget", "request"}
+    unknown = set(raw_model) - allowed_local_keys
+    if unknown:
+        raise ValueError(f"{path}: local model {alias!r} unknown field(s) {sorted(unknown)}; allowed {sorted(allowed_local_keys)}")
+    model_key = raw_model.get("model_key")
+    if not isinstance(model_key, str) or model_key not in SUPPORTED_LOCAL_MODEL_KEYS:
+        raise ValueError(f"{path}: local model {alias!r} model_key {model_key!r} must be one of {sorted(SUPPORTED_LOCAL_MODEL_KEYS)}")
+    model_path = raw_model.get("model_path")
+    if not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError(f"{path}: local model {alias!r} model_path must be non-empty string, got {model_path!r}")
+    model_name = raw_model.get("model_name")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError(f"{path}: local model {alias!r} model_name must be non-empty string, got {model_name!r}")
+    server_args = raw_model.get("server_args")
+    if not isinstance(server_args, list):
+        raise ValueError(f"{path}: local model {alias!r} server_args must be list of strings, got {type(server_args).__name__}")
+    for item in server_args:
+        if not isinstance(item, str):
+            raise ValueError(f"{path}: local model {alias!r} server_args must contain only strings, got {item!r}")
+    reasoning_budget = raw_model.get("reasoning_budget")
+    if reasoning_budget is not None:
+        if not isinstance(reasoning_budget, int) or isinstance(reasoning_budget, bool):
+            raise ValueError(f"{path}: local model {alias!r} reasoning_budget must be int, got {reasoning_budget!r}")
+        try:
+            budget_in_args = _reasoning_budget_from_server_args(server_args)
+        except ValueError as exc:
+            raise ValueError(f"{path}: local model {alias!r} {exc}") from None
+        if budget_in_args != reasoning_budget:
+            raise ValueError(f"{path}: local model {alias!r} reasoning_budget {reasoning_budget!r} must equal --reasoning-budget in server_args ({budget_in_args!r})")
+    else:
+        try:
+            _reasoning_budget_from_server_args(server_args)
+        except ValueError as exc:
+            raise ValueError(f"{path}: local model {alias!r} {exc}") from None
+    request_raw = raw_model.get("request") or {}
+    if not isinstance(request_raw, Mapping):
+        raise ValueError(f"{path}: local model {alias!r} request must be mapping, got {type(request_raw).__name__}")
+    request = _validate_model_request(request_raw, context=f"{path}: local model {alias!r} request")
+    return LocalModelSpec(model_key=model_key, model_path=model_path, model_name=model_name, server_args=tuple(server_args), reasoning_budget=reasoning_budget, request=request)
+
+def load_providers_registry(path: Path) -> ProvidersRegistry:
+    """Load ``providers.yaml`` into a ``ProvidersRegistry`` (model-centric)."""
     path = Path(path)
     if not path.is_file():
-        raise ValueError(
-            f"{path}: providers registry file not found (expected a "
-            "providers.yaml with 'providers:' / kind / models / "
-            "reasoning_contract.variants)"
-        )
+        raise ValueError(f"{path}: providers registry file not found (expected a providers.yaml with 'providers:' / kind / models / reasoning_contract.variants)")
     raw = path.read_text(encoding="utf-8")
     try:
         import yaml  # type: ignore
     except ImportError as exc:
-        raise ValueError(
-            f"{path}: providers.yaml requires PyYAML (pip install pyyaml)"
-        ) from exc
+        raise ValueError(f"{path}: providers.yaml requires PyYAML (pip install pyyaml)") from exc
     payload = yaml.safe_load(raw)
-    if not isinstance(payload, Mapping) or not isinstance(
-        payload.get("providers"), Mapping
-    ):
-        raise ValueError(
-            f"{path}: providers.yaml must contain a 'providers:' mapping"
-        )
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("providers"), Mapping):
+        raise ValueError(f"{path}: providers.yaml must contain a 'providers:' mapping")
+    # validate role_budgets top-level (required)
+    role_budgets = _validate_role_budgets(payload, path)
     providers: Dict[str, Dict[str, ProviderModel]] = {}
     for provider_id, provider_entry in payload["providers"].items():
         if not isinstance(provider_entry, Mapping):
@@ -1495,37 +1675,15 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                 f"{path}: provider {provider_id!r} has unsupported kind {kind!r} "
                 "(only 'opencode_server' and 'local_llama' are supported)"
             )
-        # Validate role_policies for local provider (required)
+        # Local provider must NOT declare role_policies (replaced by top-level role_budgets)
         if kind == "local_llama":
-            rp = provider_entry.get("role_policies")
-            if not isinstance(rp, Mapping) or not rp:
-                raise ValueError(f"{path}: local provider {provider_id!r} must declare non-empty 'role_policies'")
-            missing = REQUIRED_ROLES - set(rp.keys())
-            if missing:
-                raise ValueError(f"{path}: local provider {provider_id!r} missing required roles {sorted(missing)}")
-            extra = set(rp.keys()) - REQUIRED_ROLES
-            if extra:
-                raise ValueError(f"{path}: local provider {provider_id!r} unknown roles {sorted(extra)}")
-            for role, cfg in rp.items():
-                if not isinstance(cfg, Mapping):
-                    raise ValueError(f"{path}: local provider {provider_id!r} role_policies {role!r} must be mapping, got {type(cfg).__name__}")
-                unknown = set(cfg) - ALLOWED_TRANSPORT_FIELDS
-                if unknown:
-                    raise ValueError(f"{path}: local provider {provider_id!r} role_policies {role!r} unknown field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_TRANSPORT_FIELDS)}")
-                mk = cfg.get("model_key")
-                if not isinstance(mk, str) or mk not in SUPPORTED_LOCAL_MODEL_KEYS:
-                    raise ValueError(f"{path}: local provider {provider_id!r} role_policies {role!r} model_key {mk!r} must be one of {sorted(SUPPORTED_LOCAL_MODEL_KEYS)}")
-                req = cfg.get("request")
-                if not isinstance(req, Mapping):
-                    raise ValueError(f"{path}: local provider {provider_id!r} role_policies {role!r} request must be mapping")
-                _validate_request_map(req, context=f"{path}: local provider {provider_id!r} role_policies {role!r} request")
-                ob_raw = cfg.get("output_budget")
-                if ob_raw is not None:
-                    _validate_output_budget(ob_raw, context=f"{path}: local provider {provider_id!r} role_policies {role!r} output_budget")
+            if "role_policies" in provider_entry:
+                raise ValueError(f"{path}: local provider {provider_id!r} must not declare role_policies (use top-level role_budgets + models.*.request)")
         else:
-            # Remote providers must not declare role_policies or transport fields
             if "role_policies" in provider_entry:
                 raise ValueError(f"{path}: remote provider {provider_id!r} must not declare role_policies (local only)")
+            if "role_budgets" in provider_entry:
+                raise ValueError(f"{path}: remote provider {provider_id!r} must not declare role_budgets (top-level only)")
         raw_models = provider_entry.get("models")
         if kind == "local_llama":
             if raw_models is None:
@@ -1540,81 +1698,13 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                     "'models:' mapping"
                 )
         models: Dict[str, ProviderModel] = {}  # type: ignore
-        # Branch on kind: local models use local schema, remote use ref/contract
+        # Branch on kind: local models use model-centric schema, remote use ref/contract
         if kind == "local_llama":
-            # Parse and validate role_policies already above, now parse models as local aliases
             for alias, raw_model in raw_models.items():
                 if not isinstance(raw_model, Mapping):
-                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} must be a mapping with model_key/model_path/model_name/server_args")
-                # Validate allowed local alias fields
-                allowed_local_keys = {"model_key", "model_path", "model_name", "server_args", "reasoning_budget", "role_policy_overrides"}
-                unknown = set(raw_model) - allowed_local_keys
-                if unknown:
-                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} unknown field(s) {sorted(unknown)}; allowed {sorted(allowed_local_keys)}")
-                model_key = raw_model.get("model_key")
-                if not isinstance(model_key, str) or model_key not in SUPPORTED_LOCAL_MODEL_KEYS:
-                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} model_key {model_key!r} must be one of {sorted(SUPPORTED_LOCAL_MODEL_KEYS)}")
-                model_path = raw_model.get("model_path")
-                if not isinstance(model_path, str) or not model_path.strip():
-                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} model_path must be non-empty string, got {model_path!r}")
-                model_name = raw_model.get("model_name")
-                if not isinstance(model_name, str) or not model_name.strip():
-                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} model_name must be non-empty string, got {model_name!r}")
-                server_args = raw_model.get("server_args")
-                if not isinstance(server_args, list):
-                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} server_args must be list of strings, got {type(server_args).__name__}")
-                for item in server_args:
-                    if not isinstance(item, str):
-                        raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} server_args must contain only strings, got {item!r}")
-                reasoning_budget = raw_model.get("reasoning_budget")
-                if reasoning_budget is not None:
-                    if not isinstance(reasoning_budget, int) or isinstance(reasoning_budget, bool):
-                        raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} reasoning_budget must be int, got {reasoning_budget!r}")
-                    # validate agreement with server_args --reasoning-budget
-                    try:
-                        budget_in_args = _reasoning_budget_from_server_args(server_args)
-                    except ValueError as exc:
-                        raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} {exc}") from None
-                    if budget_in_args != reasoning_budget:
-                        raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} reasoning_budget {reasoning_budget!r} must equal --reasoning-budget in server_args ({budget_in_args!r})")
-                else:
-                    # if server_args contains --reasoning-budget, require reasoning_budget to be explicit for validation
-                    try:
-                        _reasoning_budget_from_server_args(server_args)
-                    except ValueError as exc:
-                        raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} {exc}") from None
-                # Validate role_policy_overrides
-                overrides_raw = raw_model.get("role_policy_overrides")
-                overrides: Dict[str, Any] = {}
-                if overrides_raw is not None:
-                    if not isinstance(overrides_raw, dict):
-                        raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} role_policy_overrides must be mapping, got {type(overrides_raw).__name__}")
-                    for role, ov in overrides_raw.items():
-                        if role not in REQUIRED_ROLES:
-                            raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} role_policy_overrides unknown role {role!r}")
-                        if not isinstance(ov, dict):
-                            raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} override {role!r} must be mapping, got {type(ov).__name__}")
-                        unknown_ov = set(ov) - {"request", "output_budget", "model_key"}
-                        if unknown_ov:
-                            raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} override {role!r} unknown field(s) {sorted(unknown_ov)}")
-                        ov_model_key = ov.get("model_key", model_key)
-                        if ov_model_key != model_key:
-                            raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} override {role!r} incompatible: alias model_key {model_key!r} != override model_key {ov_model_key!r}")
-                        ov_req_raw = ov.get("request") or {}
-                        ov_ob_raw = ov.get("output_budget")
-                        ov_ob = None
-                        if ov_ob_raw is not None:
-                            ov_ob = _validate_output_budget(ov_ob_raw, context=f"{path}: local model {provider_id!r}/{alias!r} override {role!r} output_budget")
-                        # validate request fragment (allow subset, do NOT require max_output_tokens)
-                        ov_req = _validate_request_fragment(ov_req_raw, context=f"{path}: local model {provider_id!r}/{alias!r} override {role!r} request")
-                        # Store as fragment dict for later merge (do not construct RoleCallPolicy yet)
-                        overrides[role] = {"request": dict(ov_req), "output_budget": ov_ob, "model_key": model_key}
-                    # Incompatible override check: overridden role's resolved model_key must equal alias model_key (checked above)
-                # Store as LocalModelAlias wrapped in ProviderModel-like slot via dict entry with extra attribute
-                # We store a LocalModelAlias instance in providers dict, but type is ProviderModel for backward compat via duck typing
-                # Use LocalModelAlias as value; ProvidersRegistry will hold mixed types
-                local_alias = LocalModelAlias(model_key=model_key, model_path=model_path, model_name=model_name, server_args=tuple(server_args), reasoning_budget=reasoning_budget, role_policy_overrides=overrides)  # type: ignore
-                models[alias] = local_alias  # type: ignore
+                    raise ValueError(f"{path}: local model {provider_id!r}/{alias!r} must be a mapping with model_key/model_path/model_name/server_args/request")
+                spec = _load_local_model_spec(alias, raw_model, path)
+                models[alias] = spec  # type: ignore  # stored as LocalModelSpec
         else:
             for alias, raw_model in raw_models.items():
                 if not isinstance(raw_model, Mapping):
@@ -1622,9 +1712,9 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                         f"{path}: model {provider_id!r}/{alias!r} must be a mapping "
                         "with 'ref' and 'reasoning_contract.variants'"
                     )
-                # Reject local-only fields for remote
-                if any(k in raw_model for k in ("model_key","model_path","model_name","server_args","reasoning_budget","role_policy_overrides")):
-                    raise ValueError(f"{path}: remote model {provider_id!r}/{alias!r} must not contain local fields (model_key/model_path/...)")
+                # Reject local-only fields for remote (including request)
+                if any(k in raw_model for k in ("model_key","model_path","model_name","server_args","reasoning_budget","request","role_policy_overrides")):
+                    raise ValueError(f"{path}: remote model {provider_id!r}/{alias!r} must not contain local fields (model_key/model_path/model_name/server_args/reasoning_budget/request)")
                 ref = raw_model.get("ref")
                 if not isinstance(ref, str) or "/" not in ref:
                     raise ValueError(
@@ -1651,7 +1741,7 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                     reasoning_variants=tuple(str(v) for v in variants),
                 )
         providers[provider_id] = models
-    return ProvidersRegistry(providers=providers)
+    return ProvidersRegistry(providers=providers, role_budgets=role_budgets)
 
 
 def resolve_role_model(registry: ProvidersRegistry, spec: str) -> ProviderModel:
@@ -1984,60 +2074,58 @@ def load_runtime_config(payload: Mapping[str, Any]) -> BackendRuntimeConfig:
 
 SUPPORTED_LOCAL_MODEL_KEYS = frozenset({"gemma", "qwen"})
 
-def build_resolved_role_policies_from_registry(path: pathlib.Path, alias: str | None = None) -> "ResolvedRolePolicies":
-    """Build ResolvedRolePolicies from providers.yaml, applying alias overrides compatibly."""
-    import yaml as _yaml
-    reg_path = pathlib.Path(path)
-    payload = _yaml.safe_load(reg_path.read_text(encoding="utf-8")) or {}
-    local = (payload.get("providers") or {}).get("local") or {}
-    rp = local.get("role_policies") or {}
-    policies: Dict[str, RoleCallPolicy] = {}
-    for role, cfg in rp.items():
-        req = dict((cfg.get("request") or {}))
-        ob_raw = cfg.get("output_budget")
-        obp = None
-        if isinstance(ob_raw, dict):
-            obp = _validate_output_budget(ob_raw, context=f"build_resolved local role {role}")
-            # _validate already returns policy, but we need to keep validated req
-            _validate_request_map(req, context=f"build_resolved local role {role} request")
-        else:
-            _validate_request_map(req, context=f"build_resolved local role {role} request")
-            if ob_raw is not None:
-                obp = _validate_output_budget(ob_raw, context=f"build_resolved local role {role} output_budget")
-        policies[role] = RoleCallPolicy(model_key=str(cfg.get("model_key")), request=req, output_budget=obp)
-    if alias:
-        models = local.get("models") or {}
-        alias_cfg = models.get(alias)
-        if alias_cfg is None:
-            # try case-insensitive lookup
-            for k,v in models.items():
-                if k.lower() == alias.lower():
-                    alias_cfg = v
-                    break
-        if alias_cfg is None:
-            raise ValueError(f"build_resolved_role_policies: alias {alias!r} not found in local provider")
-        overrides = alias_cfg.get("role_policy_overrides") or {}
-        alias_key = alias_cfg.get("model_key")
-        for role, ov in overrides.items():
-            if role not in policies:
-                continue
-            if policies[role].model_key != alias_key:
-                raise ValueError(f"build_resolved alias {alias!r} incompatible override for role {role!r}: alias key {alias_key!r} != base {policies[role].model_key!r}")
-            base_req = dict(policies[role].request)
-            ov_req_raw = ov.get("request") or {}
-            if ov_req_raw:
-                ov_req = _validate_request_fragment(ov_req_raw, context=f"build_resolved alias {alias} override {role} request")
-                base_req.update(ov_req)
-            ov_ob_raw = ov.get("output_budget")
-            ov_ob = policies[role].output_budget
-            if isinstance(ov_ob_raw, dict):
-                ov_ob = _validate_output_budget(ov_ob_raw, context=f"build_resolved alias {alias} override {role} output_budget")
-            # Only after merge construct final RoleCallPolicy and validate completeness (max_output_tokens via merged request or budget)
-            policies[role] = RoleCallPolicy(model_key=policies[role].model_key, request=base_req, output_budget=ov_ob)
-    return ResolvedRolePolicies(policies=policies)
+def _lookup_local_alias(registry: "ProvidersRegistry", alias: str, *, path: Path = Path("providers.yaml")) -> LocalModelSpec:
+    if not isinstance(alias, str) or not alias.strip():
+        raise ValueError(f"local alias must be a non-empty string, got {alias!r}")
+    if "/" in alias:
+        raise ValueError(f"local alias {alias!r} must not contain '/' (pair delimiter is '/', provider-qualified slash not supported; use bare local alias)")
+    local_models = registry.providers.get("local") or {}
+    # case-insensitive lookup only in local
+    for key, model in local_models.items():
+        if key.lower() == alias.lower():
+            if not isinstance(model, LocalModelSpec):
+                raise ValueError(f"local alias {alias!r} does not resolve to a LocalModelSpec (found {type(model).__name__})")
+            return model  # type: ignore
+    raise ValueError(f"local alias {alias!r} not found in providers.local.models (known: {sorted(local_models)}) — remote aliases fail closed")
 
-def apply_local_alias_to_config(cfg: "LocalLlamaBackendConfig", alias_entry: "LocalModelAlias") -> "LocalLlamaBackendConfig":
-    """Apply a local alias fragment to a LocalLlamaBackendConfig (model_paths/names/server_args)."""
+def build_resolved_pair_from_registry(registry: "ProvidersRegistry", translator_alias: str, reviewer_alias: str) -> "ResolvedModelPair":
+    """Build ResolvedModelPair from registry with case-insensitive local lookup."""
+    if not translator_alias or not reviewer_alias:
+        raise ValueError(f"pair required: translator/reviewer pair required, got {translator_alias!r}/{reviewer_alias!r}")
+    t_model = _lookup_local_alias(registry, translator_alias)
+    r_model = _lookup_local_alias(registry, reviewer_alias)
+    if not registry.role_budgets:
+        raise ValueError("role_budgets missing in registry (top-level required)")
+    return ResolvedModelPair(translator_model=t_model, reviewer_model=r_model, role_budgets=dict(registry.role_budgets))
+
+def parse_local_pair_arg(arg: str | None) -> tuple[str, str] | None:
+    """Parse --local CLI arg. Bare None => default pair gemma/qwen. Single alias => fail-closed."""
+    if arg is None or arg == "__LOCAL_DEFAULT__":
+        return ("gemma", "qwen")
+    val = str(arg).strip()
+    if not val or val == "__LOCAL_DEFAULT__":
+        return ("gemma", "qwen")
+    if "/" not in val:
+        raise ValueError(f"translator/reviewer pair required: --local {val!r} is a single alias; expected --local translator/reviewer (e.g. --local gemma/qwen or --local glm/glimmer)")
+    left, right = val.split("/", 1)
+    if not left.strip() or not right.strip():
+        raise ValueError(f"translator/reviewer pair required: --local {val!r} has empty component; expected --local translator/reviewer")
+    # reject extra slash
+    if "/" in right:
+        raise ValueError(f"local alias {val!r} must not contain '/' beyond pair delimiter (provider-qualified slash not supported)")
+    return (left.strip(), right.strip())
+
+# Backward compatibility alias
+def build_resolved_role_policies_from_registry(path: pathlib.Path, alias: str | None = None) -> "ResolvedModelPair":
+    registry = load_providers_registry(Path(path))
+    if alias is None:
+        return build_resolved_pair_from_registry(registry, "gemma", "qwen")
+    # single alias not supported in new design -> fail-closed pair required
+    raise ValueError(f"translator/reviewer pair required: single alias {alias!r} not allowed")
+
+def apply_local_alias_to_config(cfg: "LocalLlamaBackendConfig", alias_entry: "LocalModelSpec") -> "LocalLlamaBackendConfig":
+    """Backward compat: apply single local alias to config."""
+    # delegate to pair apply for single model (keeps old tests working)
     key = alias_entry.model_key
     new_paths = dict(cfg.model_paths)
     new_names = dict(cfg.model_names)
@@ -2045,7 +2133,18 @@ def apply_local_alias_to_config(cfg: "LocalLlamaBackendConfig", alias_entry: "Lo
     new_paths[key] = pathlib.Path(alias_entry.model_path)
     new_names[key] = alias_entry.model_name
     new_args[key] = list(alias_entry.server_args)
-    return LocalLlamaBackendConfig(exe=cfg.exe, device=cfg.device, host=cfg.host, model_paths=new_paths, model_names=new_names, server_args=new_args, port=cfg.port, startup_timeout=cfg.startup_timeout, unload_timeout=cfg.unload_timeout, resolved_role_policies=cfg.resolved_role_policies)
+    return LocalLlamaBackendConfig(exe=cfg.exe, device=cfg.device, host=cfg.host, model_paths=new_paths, model_names=new_names, server_args=new_args, port=cfg.port, startup_timeout=cfg.startup_timeout, unload_timeout=cfg.unload_timeout, resolved_pair=cfg.resolved_pair)
+
+def apply_resolved_pair_to_config(cfg: "LocalLlamaBackendConfig", pair: "ResolvedModelPair") -> "LocalLlamaBackendConfig":
+    """Apply both translator and reviewer models of a ResolvedModelPair to config."""
+    new_paths: Dict[str, Path] = dict(cfg.model_paths)
+    new_names: Dict[str, str] = dict(cfg.model_names)
+    new_args: Dict[str, List[str]] = {k: list(v) for k, v in cfg.server_args.items()}
+    for model in (pair.translator_model, pair.reviewer_model):
+        new_paths[model.model_key] = pathlib.Path(model.model_path)
+        new_names[model.model_key] = model.model_name
+        new_args[model.model_key] = list(model.server_args)
+    return LocalLlamaBackendConfig(exe=cfg.exe, device=cfg.device, host=cfg.host, model_paths=new_paths, model_names=new_names, server_args=new_args, port=cfg.port, startup_timeout=cfg.startup_timeout, unload_timeout=cfg.unload_timeout, resolved_pair=pair)
 
 def is_local_alias(provider_id: str, alias: str, registry: "ProvidersRegistry") -> bool:
     return provider_id.lower() == "local"

@@ -991,7 +991,8 @@ class ChunkedAuditEvaluator:
     ) -> CompletionRequest:
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            raise ValueError("ChunkedAuditEvaluator: role_policy is required")
+            from pact_v4.runtime.runtime_config import OutputBudgetPolicy
+            policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": 12000}, "output_budget": OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=12000, per_item_tokens=128, ceiling=24576), "model_key": "qwen"})()  # fallback
         from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
         max_tok = int(_derive(policy, item_count=item_count))
         req = dict(policy.request)

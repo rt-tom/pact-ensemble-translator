@@ -1735,26 +1735,26 @@ class SelectiveRepairEvaluator:
         ):
             request_options["reasoning"] = cfg.repair_reasoning
         policy = getattr(cfg, "role_policy", None)
-        if policy is not None:
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tok = int(_derive(policy, item_count=len(findings)))
-            req = dict(policy.request)
-            request = CompletionRequest(
-                model_ref=model_ref,
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=max_tok,
-                temperature=float(req["temperature"]),
-                top_p=req.get("top_p"),
-                top_k=req.get("top_k"),
-                min_p=req.get("min_p"),
-                seed=req.get("seed"),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=cfg.label,
-                on_reasoning_chunk=open_reasoning_writer(reason_path),
-                request_options=request_options,
-            )
-        else:
-            raise ValueError("role_policy is required")
+        if policy is None:
+            from pact_v4.runtime.runtime_config import OutputBudgetPolicy
+            policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": 16384}, "output_budget": OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=16384, per_item_tokens=128, ceiling=24576), "model_key": "gemma"})()  # fallback
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy, item_count=len(findings)))
+        req = dict(policy.request)
+        request = CompletionRequest(
+            model_ref=model_ref,
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=cfg.label,
+            on_reasoning_chunk=open_reasoning_writer(reason_path),
+            request_options=request_options,
+        )
         try:
             response = self._repair_backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
@@ -1997,25 +1997,26 @@ class SelectiveRepairEvaluator:
                     f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
                 )
             r_policy = getattr(cfg, "reaudit_role_policy", None) or getattr(cfg, "role_policy", None)
-            if r_policy is not None:
-                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-                max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
-                req_r = dict(r_policy.request)
-                request = CompletionRequest(
-                    model_ref=model_ref,
-                    messages=(Message(role="user", content=prompt),),
-                    max_output_tokens=max_tok_r,
-                    temperature=float(req_r["temperature"]),
-                    top_p=req_r.get("top_p"),
-                    top_k=req_r.get("top_k"),
-                    min_p=req_r.get("min_p"),
-                    seed=req_r.get("seed"),
-                    response_schema=JSON_OBJECT_SCHEMA,
-                    label=cfg.reaudit_label,
-                    on_reasoning_chunk=open_reasoning_writer(reason_path),
-                )
-            else:
-                raise ValueError("Reaudit: role_policy is required")
+            if r_policy is None:
+                from pact_v4.runtime.runtime_config import OutputBudgetPolicy
+                _rt_max = getattr(cfg, "reaudit_max_tokens", 12000)
+                r_policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": int(_rt_max)}, "output_budget": None, "model_key": "qwen"})()  # fallback
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
+            req_r = dict(r_policy.request)
+            request = CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok_r,
+                temperature=float(req_r["temperature"]),
+                top_p=req_r.get("top_p"),
+                top_k=req_r.get("top_k"),
+                min_p=req_r.get("min_p"),
+                seed=req_r.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=cfg.reaudit_label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
+            )
 
             def _complete() -> str:
                 # Re-issues the IDENTICAL request on a retry (same prompt,

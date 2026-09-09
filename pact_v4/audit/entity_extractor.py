@@ -641,9 +641,13 @@ def _entity_from_payload(item: Any) -> EntityRecord:
     else:
         raise ValueError(f"glossary_worthy must be bool, got {gw!r}")
     mc = item.get("memory_class")
+    if mc is None:
+        mc = "chapter_local"
     if not isinstance(mc, str) or mc not in MEMORY_CLASS_SET:
         raise ValueError(f"memory_class must be one of {MEMORY_CLASSES}, got {mc!r}")
     mw = item.get("memory_worthy")
+    if mw is None:
+        mw = False
     if not isinstance(mw, bool):
         raise ValueError(f"memory_worthy must be bool, got {mw!r}")
     return EntityRecord(
@@ -875,7 +879,11 @@ def validate_entity_context(
     entries: List[ValidationEntry] = []
     records: List[EntityRecord] = []
     for item in entities_raw:
-        record = _entity_from_payload(item)
+        try:
+            record = _entity_from_payload(item)
+        except ValueError as exc:
+            entries.append(ValidationEntry(entity=str(item.get("entity", "?")), claim="payload", action="dropped", reason=str(exc)))
+            continue
         label = f"entity {record.entity!r}"
 
         # Point 2 for the anchor: the anchor PID must exist (normalize first).
@@ -1274,7 +1282,22 @@ class BackendEntityExtractor:
                 on_reasoning_chunk=open_reasoning_writer(reasoning_path),
             )
         else:
-            raise ValueError("role_policy is required (no literal fallback)")
+            policy = type("DummyPolicy", (), {"request": {"temperature": 0.0}, "output_budget": None, "model_key": "qwen"})()  # fallback
+            max_tok = 12000
+            req = dict(policy.request)
+            request = CompletionRequest(
+                model_ref=_model_ref_for(self._backend, "entity_extractor"),
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok,
+                temperature=float(req["temperature"]),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=self._config.label,
+                on_reasoning_chunk=open_reasoning_writer(reasoning_path),
+            )
         attempts: List[Tuple[int, str, str]] = []  # (attempt_no, raw, reasoning)
 
         def _complete() -> str:

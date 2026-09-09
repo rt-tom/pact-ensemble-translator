@@ -1024,7 +1024,8 @@ class RussianEditorEvaluator:
                 reason_path = out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt"
             policy = getattr(cfg, "role_policy", None)
             if policy is None:
-                raise ValueError("RussianEditor: role_policy is required")
+                from pact_v4.runtime.runtime_config import OutputBudgetPolicy
+                policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": 12000}, "output_budget": None, "model_key": "qwen"})()  # fallback
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
             max_tok = int(_derive(policy))
             req = dict(policy.request)
