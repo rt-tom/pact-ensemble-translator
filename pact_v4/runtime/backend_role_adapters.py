@@ -148,11 +148,16 @@ class BackendModelCallerConfig:
     exponential backoff) by re-issuing the identical request — transport
     failures are never retried here (B4 §1/§3). ``max_tokens`` is the
     generation output budget (chunk-sized, see ``DEFAULT_MAX_TOKENS``).
+    When ``role_policy`` is provided it is the authoritative source for
+    temperature/seed/max_output_tokens (local-model-aliases); the legacy
+    ``max_tokens`` field is then ignored in favor of
+    ``derive_max_output_tokens(role_policy)``.
     """
 
     max_tokens: int = DEFAULT_MAX_TOKENS
     label: str = "phase2b-generation"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendModelCaller:
@@ -182,7 +187,12 @@ class BackendModelCaller:
     ) -> None:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        # Policy-owned budget when role_policy present; otherwise legacy field
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
         # V4.1 GEN-REASONING: the reasoning text of the most recent backend
         # completion (raw_metadata['reasoning'], '' when the transport or
         # provider reported none). Exposed for the whole-chapter generation
@@ -353,12 +363,16 @@ class BackendQwenEvaluatorConfig:
     (bounded, exponential backoff) by re-issuing the identical request —
     transport failures are never retried here (B4 §1/§3) and still surface
     as a failing ``GateResult``.
+    When ``role_policy`` is provided its ``request`` + ``output_budget``
+    drive temperature and the dynamic max_output_tokens via
+    ``derive_max_output_tokens``.
     """
 
     max_tokens: int = 16384
     template: ReviewerPrompt = QWEN_FIDELITY_V1
     bible_text: str = ""
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendQwenEvaluator:
@@ -444,11 +458,13 @@ class BackendGemmaSelectorConfig:
     exponential backoff) by re-issuing the identical request — transport
     failures are never retried here (B4 §1/§3) and still surface as a
     failing ``GateResult``.
+    ``role_policy`` when provided supplies temperature/seed/max_output_tokens.
     """
 
     max_tokens: int = 1024
     template: ReviewerPrompt = GEMMA_RUSSIAN_PREFERENCE_V1
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendGemmaSelector:
