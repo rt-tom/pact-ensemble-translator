@@ -67,7 +67,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from pact_v4.audit.chunked_audit import (
     DEFAULT_REASONING_BUDGET,
@@ -491,6 +491,19 @@ class StrictRunConfig:
     # role views (translator / audit_repair / russian_editor / glossary) into
     # the real whole-chapter consumers.
     book_memory_role_views_enabled: bool = False
+    # book-chapter-retry (owner decision 2026-09-09): operational resume
+    # flags. Explicitly NOT part of the config identity (to_config_artifact
+    # below): they select HOW a run continues in an existing out-dir, never
+    # what the run computes. Without them behavior is byte-identical.
+    # ``resume``: reuse valid completed stages, rerun only the first
+    # unfinished stage plus dependents. ``retry_incomplete``: rewind the
+    # generation journal to the first ``incomplete_generation`` entry and
+    # regenerate it plus the dependent tail (append-only, attempt markers).
+    # ``force_rerun``: regenerate everything as a new attempt (book
+    # --force-rerun-chapter); prior journal entries stay on disk.
+    resume: bool = False
+    retry_incomplete: bool = False
+    force_rerun: bool = False
 
     def __post_init__(self) -> None:
         # v4.2 enablement hook: the owner runs v4.2 via a separate runtime
@@ -812,6 +825,12 @@ class JournalEntry:
     selected_role: Optional[str]
     switch_indices: List[int]  # indices into the run's flat local-switch list
     backend_event_indices: List[int] = field(default_factory=list)  # indices into the run's flat backend-event list
+    # book-chapter-retry: monotonic attempt/revision marker for append-only
+    # retry. Legacy entries (written before this change) carry 0; replay
+    # selects the latest entry per chunk so an old len() can never hide a
+    # retry. Never part of resume identity (provenance only).
+    attempt: int = 0
+    revision: int = 0
 
     def to_json(self) -> Dict[str, Any]:
         return {"schema": JOURNAL_SCHEMA, **self.__dict__}
@@ -821,6 +840,78 @@ def _left_context_hash(left_context: Tuple[Tuple[str, str], ...]) -> str:
     if not left_context:
         return canonical_json_hash({"left_context": NO_LEFT_CONTEXT_SENTINEL})
     return canonical_json_hash({"left_context": list(left_context)})
+
+
+def _write_stage_checkpoints(
+    *,
+    out_dir: Path,
+    backend_identity_hash: str,
+    snapshot_hash: str,
+    chunk_plan_hash: str,
+    config_identity: str,
+    attempt: int,
+    generation_complete: bool,
+    step6: Mapping[str, Any],
+    step7: Mapping[str, Any],
+    step8: Mapping[str, Any],
+    generation_artifacts: Sequence[str],
+    audit_artifacts: Sequence[str],
+    repair_artifacts: Sequence[str],
+    formatting_artifacts: Sequence[str],
+) -> None:
+    """Persist durable stage checkpoints (book-chapter-retry, best-effort).
+
+    Called once per run after the trial record is written. Each completed
+    stage binds its input hashes and exact artifact set; a failed stage is
+    journaled as an attempt and never replaces the last completed
+    checkpoint. Intentionally skipped stages are recorded complete with an
+    empty artifact set (nothing to rerun). Never breaks the run: every
+    failure is swallowed as a warning -- the checkpoints are a resume aid,
+    not a gate.
+    """
+    try:
+        from pact_v4.pipeline.v4_retry import write_stage_checkpoint as _write
+    except Exception:
+        return
+    inputs = {
+        "snapshot_hash": snapshot_hash,
+        "chunk_plan_hash": chunk_plan_hash,
+        "config_identity": config_identity,
+        "backend_identity_hash": backend_identity_hash,
+    }
+    try:
+        _write(
+            out_dir, "generation",
+            status="complete" if generation_complete else "failed",
+            attempt=attempt, inputs=inputs,
+            artifacts=list(generation_artifacts) if generation_complete else [],
+        )
+        for stage, step, artifacts in (
+            ("audit", step6, audit_artifacts),
+            ("repair", step7, repair_artifacts),
+            ("formatting", step8, formatting_artifacts),
+        ):
+            status = str((step or {}).get("status", ""))
+            # accepted_degraded is a converged terminal state, not a
+            # failure: its artifacts are complete and reusable. The actual
+            # degraded status is preserved verbatim in inputs.step_status
+            # (and in the trial record); only failures write failed
+            # attempts. Without this, degraded chapters could never
+            # validate and every resume reran them.
+            if status in ("complete", "accepted_degraded") or status.startswith("skipped"):
+                _write(
+                    out_dir, stage, status="complete", attempt=attempt,
+                    inputs={**inputs, "step_status": status},
+                    artifacts=[] if status.startswith("skipped") else list(artifacts),
+                )
+            else:
+                _write(
+                    out_dir, stage, status="failed", attempt=attempt,
+                    inputs={**inputs, "step_status": status},
+                    artifacts=[],
+                )
+    except Exception:  # noqa: BLE001 -- resume aid, never a gate
+        LOG.warning("stage checkpoint write failed", exc_info=True)
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
@@ -1299,6 +1390,9 @@ def _merge_selection_meta(
     snapshot: Any,
     chunk_plan: ChunkPlanArtifact,
     config: ConfigArtifact,
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
 ) -> List[Dict[str, Any]]:
     """Merge the persisted ``selection_meta.json`` with this session's records.
 
@@ -1327,9 +1421,17 @@ def _merge_selection_meta(
             raise ValueError(
                 f"Foreign identity: selection_meta schema={payload.get('schema')!r}"
             )
+        from pact_v4.pipeline.v4_retry import lineage_accepted
         if (
-            payload.get("snapshot_hash") != snapshot.snapshot_hash
-            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            not lineage_accepted(
+                payload.get("snapshot_hash"),
+                payload.get("chunk_plan_hash"),
+                live_snapshot_hash=snapshot.snapshot_hash,
+                live_plan_hash=chunk_plan.plan_hash,
+                record_snapshot_hash=record_snapshot_hash,
+                record_plan_hash=record_plan_hash,
+                allow_drift=allow_snapshot_drift,
+            )
             or payload.get("config_identity") != config.config_identity
         ):
             raise ValueError(
@@ -1432,6 +1534,9 @@ def _merge_generation_outcomes(
     snapshot: Any,
     chunk_plan: ChunkPlanArtifact,
     config: ConfigArtifact,
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
 ) -> List[Dict[str, Any]]:
     """Merge the persisted ``generation_outcomes.json`` with this session's
     records so Step 6 can select best-variants for quarantined chunks of
@@ -1453,9 +1558,17 @@ def _merge_generation_outcomes(
     prior: List[Dict[str, Any]] = []
     if path.exists():
         payload = json.loads(path.read_text(encoding="utf-8"))
+        from pact_v4.pipeline.v4_retry import lineage_accepted
         if (
-            payload.get("snapshot_hash") != snapshot.snapshot_hash
-            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            not lineage_accepted(
+                payload.get("snapshot_hash"),
+                payload.get("chunk_plan_hash"),
+                live_snapshot_hash=snapshot.snapshot_hash,
+                live_plan_hash=chunk_plan.plan_hash,
+                record_snapshot_hash=record_snapshot_hash,
+                record_plan_hash=record_plan_hash,
+                allow_drift=allow_snapshot_drift,
+            )
             or payload.get("config_identity") != config.config_identity
         ):
             raise ValueError(
@@ -2008,6 +2121,577 @@ def _run_step7_repair(
 
 
 # ---------------------------------------------------------------------------
+# book-chapter-retry: stage-selected resume (preceding stages not invoked).
+# ---------------------------------------------------------------------------
+
+def _load_reused_step6_inputs(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    selection_records: List[Dict[str, Any]],
+    selected_text_by_chunk: Dict[str, Dict[str, str]],
+    generation_records: List[Dict[str, Any]],
+    backend_identity_hashes: Sequence[str],
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
+    """Reconstruct Step 6 outputs from validated prior-run artifacts.
+
+    Used when ``--resume`` selects ``repair`` or ``formatting`` as the
+    first unfinished stage: the audit stage is NOT invoked (no
+    ``run_chapter_audit`` call, no audit model units). Instead the candidate
+    map and assembled chapter are rebuilt deterministically from the
+    replayed journal + merged generation records, and the findings store,
+    region plan and handoff rows are reloaded from
+    ``audit_findings.json`` / ``b2_handoff.json`` after fail-closed
+    validation:
+
+    * both payloads parse and carry the expected schemas;
+    * both payloads agree on ``chapter_hash`` with each other;
+    * the payload snapshot/plan legs match the live run -- or, under
+      explicit retry flags with additive shared-memory drift, the recorded
+      pair -- while source/config match exactly and the backend hash is
+      acceptable (same lineage contract as the journal check);
+    * the audited text is proven byte-identical: the chapter hash
+      recomputed over the payload's own snapshot/plan legs with the live
+      assembled translation must equal the audited hash, so findings raised
+      against different text can never be reused;
+    * the handoff rows cover exactly the deterministically rebuilt chunk
+      set.
+
+    Returns ``(step6_report, phase4_inputs, reused)``. ``phase4_inputs``
+    has the exact shape ``_run_step6_audit`` returns, with ``"reused":
+    True`` added to the report. On ANY inconsistency returns
+    ``({}, None, False)`` -- the caller falls back to the normal full Step
+    6 invocation (fail-closed to recompute, never to silent reuse).
+    """
+    from pact_v4.phase3.findings import FindingStore
+    from pact_v4.phase3.region_resolver import resolve_regions
+    from pact_v4.pipeline.v4_retry import lineage_accepted
+
+    def _decline(reason: str) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
+        LOG.info(
+            "Step 6 reuse declined for %s (%s); running full audit instead",
+            cfg.chapter_id, reason,
+        )
+        return {}, None, False
+
+    try:
+        candidates, fresh_rows = _audit_candidate_map(
+            selection_records=selection_records,
+            selected_text_by_chunk=selected_text_by_chunk,
+            generation_records=generation_records,
+            chunk_plan=chunk_plan, source=source, snapshot=snapshot, config=config,
+        )
+        if not candidates:
+            return _decline("no auditable candidates")
+        chapter = AssembledChapter.assemble(
+            source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            config=config, candidates=candidates,
+        )
+        live_translation = dict(chapter.as_pid_map())
+    except Exception as exc:  # noqa: BLE001 -- deterministic rebuild failed
+        return _decline(f"candidate rebuild failed: {exc}")
+    try:
+        findings_payload = json.loads(
+            _audit_findings_path(cfg.out_dir).read_text(encoding="utf-8"))
+        handoff_payload = json.loads(
+            _b2_handoff_path(cfg.out_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _decline(f"audit artifacts unreadable: {exc}")
+    if not isinstance(findings_payload, dict) or not isinstance(handoff_payload, dict):
+        return _decline("audit artifacts are not JSON objects")
+    if findings_payload.get("schema") != AUDIT_FINDINGS_SCHEMA:
+        return _decline(
+            f"findings schema={findings_payload.get('schema')!r}")
+    if handoff_payload.get("schema") != HANDOFF_SCHEMA:
+        return _decline(
+            f"handoff schema={handoff_payload.get('schema')!r}")
+    audited_hash = findings_payload.get("chapter_hash")
+    if not isinstance(audited_hash, str) or not audited_hash:
+        return _decline("findings carry no chapter_hash")
+    if handoff_payload.get("chapter_hash") != audited_hash:
+        return _decline("handoff/findings chapter_hash disagreement")
+    for payload, label in ((findings_payload, "findings"),
+                           (handoff_payload, "handoff")):
+        if not lineage_accepted(
+            payload.get("snapshot_hash"),
+            payload.get("chunk_plan_hash"),
+            live_snapshot_hash=snapshot.snapshot_hash,
+            live_plan_hash=chunk_plan.plan_hash,
+            record_snapshot_hash=record_snapshot_hash,
+            record_plan_hash=record_plan_hash,
+            allow_drift=allow_snapshot_drift,
+        ):
+            return _decline(f"{label} snapshot/plan lineage mismatch")
+        if payload.get("config_identity") != config.config_identity:
+            return _decline(f"{label} config mismatch")
+        if payload.get("backend_identity_hash") not in backend_identity_hashes:
+            return _decline(f"{label} backend mismatch")
+        if payload.get("source_hash") != source.source_hash:
+            return _decline(f"{label} source mismatch")
+    # Text-identity proof: the findings audited byte-identical text. The
+    # hash is recomputed over the payload's own snapshot/plan legs with the
+    # live assembled translation, so additive memory drift (which moves the
+    # live legs but never the text) still reuses, while any text difference
+    # -- however small -- fails closed to a full re-audit.
+    try:
+        text_proof_hash = canonical_json_hash({
+            "artifact": "pact-v4-assembled-chapter/v1",
+            "source_hash": source.source_hash,
+            "snapshot_hash": findings_payload.get("snapshot_hash"),
+            "chunk_plan_hash": findings_payload.get("chunk_plan_hash"),
+            "config_identity": config.config_identity,
+            "translation": [list(item) for item in sorted(live_translation.items())],
+        })
+    except Exception as exc:  # noqa: BLE001 -- unhashable translation shape
+        return _decline(f"translation proof failed: {exc}")
+    if text_proof_hash != audited_hash:
+        return _decline("audited text differs from assembled translation")
+    try:
+        store = FindingStore.from_payload(findings_payload.get("store"))
+    except Exception as exc:  # noqa: BLE001 -- corrupt findings store
+        return _decline(f"findings store invalid: {exc}")
+    try:
+        region_plan = resolve_regions(list(store))
+    except Exception as exc:  # noqa: BLE001 -- region rebuild failed
+        return _decline(f"region plan rebuild failed: {exc}")
+    persisted_regions = findings_payload.get("region_plan") or {}
+    if len(region_plan) != len(persisted_regions.get("regions", [])):
+        return _decline("region plan inconsistent with findings store")
+    rows = handoff_payload.get("chunks")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) for row in rows
+    ):
+        return _decline("handoff rows malformed")
+    if sorted(row.get("chunk_id") for row in rows) != sorted(
+        row.get("chunk_id") for row in fresh_rows
+    ):
+        return _decline("handoff rows cover a different chunk set")
+    raw_units = findings_payload.get("failed_units") or []
+    if not isinstance(raw_units, list) or any(
+        not isinstance(unit, list) or len(unit) != 2 for unit in raw_units
+    ):
+        return _decline("failed_units malformed")
+    step6 = {
+        "status": findings_payload.get("status"),
+        "reused": True,
+        "chapter_hash": audited_hash,
+        "finding_count": len(store),
+        "region_count": len(region_plan),
+        "failed_units": [list(unit) for unit in raw_units],
+        "covered_chunks": len(candidates),
+        "uncovered_chunks": len(chunk_plan.chunks) - len(candidates),
+        "audit_cache_path": str(_audit_cache_path(cfg.out_dir)),
+        "audit_findings_path": str(_audit_findings_path(cfg.out_dir)),
+        "b2_handoff_path": str(_b2_handoff_path(cfg.out_dir)),
+    }
+    phase4_inputs = {
+        "candidates": candidates,
+        "handoff_chunks": rows,
+        "findings_store": store,
+        "region_plan": region_plan,
+        "chapter": chapter,
+    }
+    LOG.info("Resuming %s: reusing validated Step 6 audit artifacts "
+             "(findings=%d, regions=%d) without re-invoking the audit stage",
+             cfg.chapter_id, len(store), len(region_plan))
+    return step6, phase4_inputs, True
+
+
+def _load_validated_repair_report(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    backend_identity_hashes: Sequence[str],
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
+    audited_chapter_hash: str = "",
+    label: str = "resume",
+) -> Dict[str, Any]:
+    """Load ``repair_report.json`` after fail-closed identity validation.
+
+    The report must parse with the expected schema and belong to this
+    chapter/run lineage: snapshot/plan legs match the live run -- or, under
+    explicit retry flags with additive drift, the recorded pair -- while
+    source/config match exactly, the backend hash is acceptable, and the
+    report's ``chapter_hash`` equals the audited assembly hash whose
+    findings were reused (not necessarily the live snapshot-bound hash,
+    which additive memory drift moves while the audited text stays
+    byte-identical). Raises on any inconsistency; callers fall back to the
+    full path (fail-closed to recompute, never to silent reuse).
+    """
+    from pact_v4.pipeline.v4_retry import lineage_accepted
+
+    report_path = _repair_report_path(cfg.out_dir)
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"{label}: repair_report.json unreadable: {exc}"
+        ) from exc
+    if not isinstance(report, dict) or report.get("schema") != REPAIR_REPORT_SCHEMA:
+        raise ValueError(
+            f"{label}: repair_report.json schema mismatch"
+        )
+    if (
+        not lineage_accepted(
+            report.get("snapshot_hash"),
+            report.get("chunk_plan_hash"),
+            live_snapshot_hash=snapshot.snapshot_hash,
+            live_plan_hash=chunk_plan.plan_hash,
+            record_snapshot_hash=record_snapshot_hash,
+            record_plan_hash=record_plan_hash,
+            allow_drift=allow_snapshot_drift,
+        )
+        or report.get("config_identity") != config.config_identity
+        or report.get("backend_identity_hash") not in backend_identity_hashes
+        or report.get("source_hash") != source.source_hash
+        or not audited_chapter_hash
+        or report.get("chapter_hash") != audited_chapter_hash
+    ):
+        raise ValueError(
+            f"{label}: repair_report.json identity mismatch"
+        )
+    return report
+
+
+def _formatting_block_from_payload(
+    formatting_payload: Optional[Mapping[str, Any]],
+    *,
+    out_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Rebuild the Step 7 ``formatting`` summary block from a report payload."""
+    if not isinstance(formatting_payload, dict):
+        return None
+    return {
+        "status": "blocking" if formatting_payload["blocking"] else "ok",
+        "resolved_count": formatting_payload["resolved_count"],
+        "incident_count": formatting_payload["incident_count"],
+        "model_fallback_count": formatting_payload["model_fallback_count"],
+        "model_call_count": formatting_payload["model_call_count"],
+        "max_formatting_incidents": formatting_payload["max_formatting_incidents"],
+        "report_path": str(Path(out_dir) / "formatting_report.json"),
+    }
+
+
+def _run_formatting_only_stage(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    det_data: DeterministicGateData,
+    phase4_inputs: Dict[str, Any],
+    backend_identity_hashes: Sequence[str],
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
+    formatting_step: Optional[Any] = None,
+    audited_chapter_hash: str = "",
+    prior_record: Optional[Mapping[str, Any]] = None,
+    now: Optional[Any] = None,
+    progress: Optional[Any] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Any]:
+    """Run only formatting/finalization for a ``--resume`` at that stage.
+
+    Neither Step 6 nor Step 7 is invoked: the validated repair report
+    supplies the converged translation, debt trace, rounds history and B6
+    markers, and only the deterministic Phase 5 formatting step runs (0
+    model calls by rule) followed by the standard integrity check and
+    terminal transition. The repair report is refreshed atomically
+    (final translation, formatting outcome, integrity, terminal, debt) so
+    the next resume re-validates against current bytes; files covered by
+    other stages' checkpoints are otherwise untouched.
+
+    Returns ``(step7, step8, repair_phase_result)`` where the last item is
+    a minimal stand-in exposing ``final_translation`` for the shared
+    finalization below. Raises on any inconsistency -- the caller falls
+    back to the full repair path (fail-closed to recompute).
+    """
+    from pact_v4.pipeline.v4_retry import lineage_accepted
+
+    if formatting_step is None:
+        raise ValueError(
+            "formatting-only resume requires formatting "
+            "(cfg.formatting_required is off)"
+        )
+    chapter = phase4_inputs["chapter"]
+    original_translation = dict(chapter.as_pid_map())
+    report_path = _repair_report_path(cfg.out_dir)
+    chapter = phase4_inputs["chapter"]
+    original_translation = dict(chapter.as_pid_map())
+    report_path = _repair_report_path(cfg.out_dir)
+    report = _load_validated_repair_report(
+        cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+        config=config, backend_identity_hashes=backend_identity_hashes,
+        record_snapshot_hash=record_snapshot_hash,
+        record_plan_hash=record_plan_hash,
+        allow_snapshot_drift=allow_snapshot_drift,
+        audited_chapter_hash=audited_chapter_hash,
+        label="formatting-only resume",
+    )
+    prior_translation = report.get("final_translation") or []
+    try:
+        base_translation = {pid: text for pid, text in prior_translation}
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "formatting-only resume: final_translation malformed"
+        ) from exc
+    if not base_translation:
+        raise ValueError(
+            "formatting-only resume: empty final_translation in repair report"
+        )
+    outcome = formatting_step(translation=dict(base_translation))
+    formatted_map = dict(outcome.formatted_text)
+    if set(formatted_map) != set(base_translation):
+        raise ValueError(
+            "Formatting must preserve the PID map; got "
+            f"{len(formatted_map)} PIDs, expected {len(base_translation)}"
+        )
+    for pid, text in base_translation.items():
+        if text and not formatted_map.get(pid):
+            raise ValueError(
+                f"Formatting dropped the text of PID {pid}"
+            )
+    if progress is not None:
+        progress.formatting_done(
+            incidents=outcome.incident_count,
+            blocking=outcome.blocking,
+        )
+    debt = list(report.get("debt_trace") or [])
+    for incident in outcome.incidents:
+        debt.append(
+            f"formatting:{incident.pid}:{incident.span_id}: "
+            f"unresolved required span ({incident.reason}, "
+            f"tier={incident.tier})"
+        )
+    debt = list(dict.fromkeys(debt))
+    # Re-audit scope: chunks the converged repair changed, plus discourse
+    # neighbours -- the same scope the full path re-audited, recovered
+    # from the report's round history.
+    order = [chunk.chunk_id for chunk in chunk_plan.chunks]
+    changed: List[str] = []
+    for rnd in report.get("rounds") or []:
+        if isinstance(rnd, dict):
+            changed.extend(rnd.get("changed_chunk_ids") or [])
+    scope_pids = set()
+    for chunk_id in dict.fromkeys(changed):
+        try:
+            index = order.index(chunk_id)
+        except ValueError:
+            continue
+        scope_pids.add(chunk_id)
+        if index > 0:
+            scope_pids.add(order[index - 1])
+        if index < len(order) - 1:
+            scope_pids.add(order[index + 1])
+    reaudited_pids = frozenset(
+        pid
+        for chunk_id in scope_pids
+        if chunk_id in order
+        for pid in chunk_plan.chunk(chunk_id).pids
+    )
+    integrity = run_integrity_check(
+        source=source,
+        snapshot=snapshot,
+        chunk_plan=chunk_plan,
+        config=config,
+        det_data=det_data,
+        final_translation=formatted_map,
+        original_translation=original_translation,
+        reaudited_pids=reaudited_pids,
+    )
+    provenance = _build_phase4_provenance(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+        config=config, chapter_hash=chapter.chapter_hash,
+    )
+    terminal = decide_terminal_state(
+        chunk_plan=chunk_plan,
+        final_translation=formatted_map,
+        debt_reasons=debt,
+        provenance=provenance,
+    )
+    formatting_payload = outcome.to_payload()
+    formatting_block = _formatting_block_from_payload(
+        formatting_payload, out_dir=cfg.out_dir)
+    ordered_final = [
+        [pid, formatted_map.get(pid, "")] for pid in snapshot.pids
+    ]
+    report["final_translation"] = ordered_final
+    report["formatting"] = formatting_payload
+    report["integrity"] = integrity
+    report["terminal"] = {"state_id": terminal.state_id, "status": terminal.status}
+    report["debt_trace"] = debt
+    report["status"] = terminal.status
+    if now is not None:
+        report["finished_at"] = now().isoformat(timespec="seconds")
+    _atomic_write_json(report_path, report)
+    _atomic_write_json(_formatting_report_path(cfg.out_dir), {
+        "schema": FORMATTING_REPORT_SCHEMA,
+        "chapter_id": cfg.chapter_id,
+        "source_hash": source.source_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "chunk_plan_hash": chunk_plan.plan_hash,
+        "config_identity": config.config_identity,
+        "backend_identity_hash": cfg.backend.identity_hash,
+        "outcome": formatting_payload,
+    })
+    rounds = report.get("rounds") or []
+    step7 = {
+        "status": terminal.status,
+        "rounds": len(rounds),
+        "repair_count": sum(
+            len(rnd.get("records", [])) for rnd in rounds
+            if isinstance(rnd, dict)
+        ),
+        "committed_count": sum(
+            sum(1 for rec in rnd.get("records", [])
+                if isinstance(rec, dict) and rec.get("committed"))
+            for rnd in rounds if isinstance(rnd, dict)
+        ),
+        "debt_count": len(debt),
+        "integrity": integrity,
+        "terminal": terminal.status,
+        "formatting": formatting_block,
+        "report_path": str(report_path),
+        "cache_path": str(_repair_cache_path(cfg.out_dir)),
+    }
+    prior_step7 = (prior_record.get("step7") or {}) if isinstance(prior_record, dict) else {}
+    if isinstance(prior_step7, dict) and prior_step7.get("quarantined_retry") is not None:
+        step7["quarantined_retry"] = prior_step7["quarantined_retry"]
+    step8 = {
+        "status": terminal.status,
+        "integrity": integrity,
+        "debt_trace": None,  # recorded in repair_report.json
+        "formatting": formatting_block,
+    }
+    # Stand-in for finalization below, which reads only
+    # ``repair_phase_result.final_translation`` (preferring the refreshed
+    # on-disk report). Repair converged in a prior session; nothing here
+    # re-invokes it.
+    import types as _types
+    repair_stand_in = _types.SimpleNamespace(
+        final_translation=tuple((pid, formatted_map.get(pid, "")) for pid in snapshot.pids),
+    )
+    return step7, step8, repair_stand_in  # type: ignore[return-value]
+
+
+def _run_completed_only_stage(
+    *,
+    cfg: StrictRunConfig,
+    source: Any,
+    snapshot: Any,
+    chunk_plan: ChunkPlanArtifact,
+    config: ConfigArtifact,
+    backend_identity_hashes: Sequence[str],
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
+    audited_chapter_hash: str = "",
+    prior_record: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Any]:
+    """Revalidate a fully completed chapter with zero model calls.
+
+    Used when ``--resume`` finds every stage checkpoint satisfied: audit,
+    repair and formatting all converged in a prior session, so no stage is
+    invoked at all -- not generation (journal fully replayed upstream), not
+    the audit (no ``run_chapter_audit`` call), not repair (no
+    ``run_repair_phase`` call), not the quarantined-retry cycle. Step 6 is
+    supplied by the caller from the reuse loader; Step 7/8 are rebuilt
+    here from the validated repair report (rounds history, debt trace,
+    integrity, terminal, formatting outcome, B6 markers), which the
+    manifest already proved byte-current. The shared finalization below
+    still rewrites the cumulative artifacts and the record, and the
+    narrator check in the tail still applies.
+
+    Returns ``(step7, step8, repair_phase_result)`` with the same minimal
+    ``final_translation`` stand-in the formatting-only path uses. Raises on
+    any inconsistency -- the caller falls back to the full path
+    (fail-closed to recompute).
+    """
+    report = _load_validated_repair_report(
+        cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+        config=config, backend_identity_hashes=backend_identity_hashes,
+        record_snapshot_hash=record_snapshot_hash,
+        record_plan_hash=record_plan_hash,
+        allow_snapshot_drift=allow_snapshot_drift,
+        audited_chapter_hash=audited_chapter_hash,
+        label="completed-only resume",
+    )
+    prior_translation = report.get("final_translation") or []
+    try:
+        final_map = {pid: text for pid, text in prior_translation}
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "completed-only resume: final_translation malformed"
+        ) from exc
+    if not final_map:
+        raise ValueError(
+            "completed-only resume: empty final_translation in repair report"
+        )
+    formatting_block = _formatting_block_from_payload(
+        report.get("formatting"), out_dir=cfg.out_dir)
+    debt = list(report.get("debt_trace") or [])
+    integrity = report.get("integrity")
+    if not isinstance(integrity, dict):
+        raise ValueError(
+            "completed-only resume: repair report integrity missing"
+        )
+    terminal_status = str(report.get("status") or "")
+    if terminal_status not in ("complete", "accepted_degraded"):
+        raise ValueError(
+            f"completed-only resume: repair report status {terminal_status!r} "
+            "is not a converged terminal state"
+        )
+    rounds = report.get("rounds") or []
+    step7 = {
+        "status": terminal_status,
+        "rounds": len(rounds),
+        "repair_count": sum(
+            len(rnd.get("records", [])) for rnd in rounds
+            if isinstance(rnd, dict)
+        ),
+        "committed_count": sum(
+            sum(1 for rec in rnd.get("records", [])
+                if isinstance(rec, dict) and rec.get("committed"))
+            for rnd in rounds if isinstance(rnd, dict)
+        ),
+        "debt_count": len(debt),
+        "integrity": integrity,
+        "terminal": terminal_status,
+        "formatting": formatting_block,
+        "report_path": str(_repair_report_path(cfg.out_dir)),
+        "cache_path": str(_repair_cache_path(cfg.out_dir)),
+    }
+    prior_step7 = (prior_record.get("step7") or {}) if isinstance(prior_record, dict) else {}
+    if isinstance(prior_step7, dict) and prior_step7.get("quarantined_retry") is not None:
+        step7["quarantined_retry"] = prior_step7["quarantined_retry"]
+    step8 = {
+        "status": terminal_status,
+        "integrity": integrity,
+        "debt_trace": None,  # recorded in repair_report.json
+        "formatting": formatting_block,
+    }
+    # Same stand-in contract as the formatting-only path: finalization
+    # reads the converged map back from the validated on-disk report.
+    import types as _types
+    repair_stand_in = _types.SimpleNamespace(
+        final_translation=tuple((pid, final_map.get(pid, "")) for pid in snapshot.pids),
+    )
+    return step7, step8, repair_stand_in  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
 # B6: separate quarantined-retry cycle (V4_B6_QUARANTINED_RETRY_TASK_RU.md)
 # ---------------------------------------------------------------------------
 
@@ -2023,6 +2707,9 @@ def _load_prior_quarantined_retries(
     chunk_plan: ChunkPlanArtifact,
     config: ConfigArtifact,
     acceptable_backend_hashes: Sequence[str],
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
 ) -> Tuple[Dict[str, QuarantinedRetryAttempt], Optional[str], bool]:
     """Reload a prior session's retry history, refusing foreign identity.
 
@@ -2054,9 +2741,17 @@ def _load_prior_quarantined_retries(
         raise ValueError(
             f"Foreign identity: quarantined_retry schema={payload.get('schema')!r}"
         )
+    from pact_v4.pipeline.v4_retry import lineage_accepted
     if (
-        payload.get("snapshot_hash") != snapshot.snapshot_hash
-        or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+        not lineage_accepted(
+            payload.get("snapshot_hash"),
+            payload.get("chunk_plan_hash"),
+            live_snapshot_hash=snapshot.snapshot_hash,
+            live_plan_hash=chunk_plan.plan_hash,
+            record_snapshot_hash=record_snapshot_hash,
+            record_plan_hash=record_plan_hash,
+            allow_drift=allow_snapshot_drift,
+        )
         or payload.get("config_identity") != config.config_identity
     ):
         raise ValueError(
@@ -2121,6 +2816,9 @@ def _run_quarantined_retry_cycle(
     progress: Optional[Any],
     existing_generation_records: Sequence[Mapping[str, Any]],
     bible_text: str = "",
+    record_snapshot_hash: Optional[str] = None,
+    record_plan_hash: Optional[str] = None,
+    allow_snapshot_drift: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Run the separate quarantined-retry cycle (V4 B6).
 
@@ -2154,6 +2852,9 @@ def _run_quarantined_retry_cycle(
         chunk_plan=chunk_plan,
         config=config,
         acceptable_backend_hashes=acceptable_backend_hashes,
+        record_snapshot_hash=record_snapshot_hash,
+        record_plan_hash=record_plan_hash,
+        allow_snapshot_drift=allow_snapshot_drift,
     )
     # Trigger = quarantined chunks that carry current repair debt OR have a
     # prior retry attempt. The prior-history branch matters on resume: the
@@ -2822,11 +3523,76 @@ def run_chapter_strict(
     selection_records: List[Dict[str, Any]] = []
 
     acceptable_backend_hashes = list(cfg.backend.acceptable_identity_hashes())
+    from pact_v4.pipeline.v4_retry import (
+        accumulate_resumed_from as _accumulate_resumed_from,
+        authorized_resumed_pairs as _authorized_resumed_pairs,
+        lineage_accepted as _lineage_accepted,
+        resolve_resume_lineage as _resolve_lineage,
+    )
+    # book-chapter-retry: additive shared-memory tolerance under explicit
+    # retry flags only. When the trial record proves source/config/backend
+    # are unchanged, a journal entry stamped with the RECORDED pair is
+    # reusable even though later downstream observations moved the live
+    # snapshot (and its snapshot-bound plan hash). Source drift is never
+    # tolerated. Without flags the legacy exact check below is unchanged.
+    _allow_snapshot_drift = False
+    _record_snapshot_hash: Optional[str] = None
+    _record_plan_hash: Optional[str] = None
+    _resumed_pairs: FrozenSet[Tuple[str, str]] = frozenset()
+    _record_payload: Dict[str, Any] = {}
+    if cfg.resume or cfg.retry_incomplete or cfg.force_rerun:
+        try:
+            _record_payload = json.loads(
+                (cfg.out_dir / "strict_chapter_trial_record.json").read_text(
+                    encoding="utf-8"))
+        except (OSError, ValueError):
+            _record_payload = {}
+        if not isinstance(_record_payload, dict):
+            _record_payload = {}
+        (
+            _allow_snapshot_drift,
+            _record_snapshot_hash,
+            _record_plan_hash,
+        ) = _resolve_lineage(
+            record=_record_payload,
+            source_hash=source.source_hash,
+            config_identity=config.config_identity,
+            acceptable_backend_hashes=acceptable_backend_hashes,
+        )
+        if _allow_snapshot_drift:
+            # Pairs explicitly recorded by prior drift resumes stay
+            # acceptable here: each already passed this exact gate once
+            # (source/config/backend validated then and re-validated
+            # below), so refusing them would strand legitimate
+            # append-only history after further drifts. Empty without flags.
+            _resumed_pairs = _authorized_resumed_pairs(
+                _record_payload, prior_entries)
+        if _allow_snapshot_drift and (
+            _record_snapshot_hash != snapshot.snapshot_hash
+            or _record_plan_hash != chunk_plan.plan_hash
+        ):
+            LOG.warning(
+                "Resuming %s with shared-memory drift: completed stages "
+                "stamped with the recorded snapshot are reused; new stages "
+                "run on current memory (additive, no rollback)",
+                cfg.chapter_id,
+            )
+    _live_chunk_ids = {chunk.chunk_id for chunk in chunk_plan.chunks}
     for entry in prior_entries:
-        if entry.get("snapshot_hash") != snapshot.snapshot_hash or \
-                entry.get("chunk_plan_hash") != chunk_plan.plan_hash or \
+        if not (_lineage_accepted(
+            entry.get("snapshot_hash"),
+            entry.get("chunk_plan_hash"),
+            live_snapshot_hash=snapshot.snapshot_hash,
+            live_plan_hash=chunk_plan.plan_hash,
+            record_snapshot_hash=_record_snapshot_hash,
+            record_plan_hash=_record_plan_hash,
+            allow_drift=_allow_snapshot_drift,
+        ) or ((
+            entry.get("snapshot_hash"), entry.get("chunk_plan_hash")
+        ) in _resumed_pairs)) or \
                 entry.get("config_identity") != config.config_identity or \
-                entry.get("backend_identity_hash") not in acceptable_backend_hashes:
+                entry.get("backend_identity_hash") not in acceptable_backend_hashes or \
+                entry.get("chunk_id") not in _live_chunk_ids:
             raise ValueError(
                 "Foreign identity: journal entry for "
                 f"{entry.get('chunk_id')} was written under a different "
@@ -2834,7 +3600,49 @@ def run_chapter_strict(
                 "against a stale journal."
             )
     resumed_from_index = len(prior_entries)
-    if prior_entries:
+    # book-chapter-retry: explicit retry flags select the resume point.
+    # --retry-incomplete rewinds to the first chunk whose LATEST replay
+    # outcome is incomplete_generation (that chunk plus the dependent tail
+    # regenerate); --resume rewinds automatically in the same situation
+    # (continuing the generation stage MEANS regenerating it, otherwise a
+    # resume would skip the failed chunks forever); --force-rerun starts at
+    # 0 as a new attempt (prior entries stay on disk, append-only).
+    # Without flags the legacy positional resume is unchanged.
+    from pact_v4.pipeline.v4_retry import (
+        next_attempt as _next_attempt,
+        replay_entries as _replay_entries,
+    )
+    _replay_for_resume = _replay_entries(prior_entries)
+    _rewind_incomplete = bool(cfg.retry_incomplete) or (
+        bool(cfg.resume) and not bool(cfg.force_rerun) and any(
+            e.get("outcome") == "incomplete_generation"
+            for e in _replay_for_resume
+        )
+    )
+    _retry_attempt = 0
+    if cfg.force_rerun or _rewind_incomplete:
+        _retry_attempt = _next_attempt(prior_entries)
+        if cfg.force_rerun:
+            resumed_from_index = 0
+        else:
+            # Rewind to the first chunk whose LATEST replay outcome is
+            # incomplete_generation (that chunk plus the dependent tail
+            # regenerate). A chunk already fixed by a later attempt does
+            # not rewind. No incomplete chunk -> nothing to rewind to.
+            _replay = _replay_for_resume
+            _positions = [
+                int(e.get("chunk_index")) for e in _replay
+                if e.get("outcome") == "incomplete_generation"
+                and isinstance(e.get("chunk_index"), int)
+            ]
+            if _positions:
+                resumed_from_index = min(_positions)
+        LOG.info(
+            "Retrying %s from chunk index %d (attempt %d, retry_incomplete=%s force_rerun=%s)",
+            cfg.chapter_id, resumed_from_index, _retry_attempt,
+            cfg.retry_incomplete, cfg.force_rerun,
+        )
+    if prior_entries and resumed_from_index == len(prior_entries):
         LOG.info("Resuming %s from chunk index %d (%d chunks already journaled)",
                   cfg.chapter_id, resumed_from_index, resumed_from_index)
 
@@ -2863,7 +3671,7 @@ def run_chapter_strict(
     # where the incremental translations.json still holds the un-repaired
     # candidates).
     prior_translations: Dict[str, str] = {}
-    if prior_entries and translations_path_exists(cfg.out_dir):
+    if prior_entries and resumed_from_index > 0 and translations_path_exists(cfg.out_dir):
         prior_translations = json.loads(
             (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
         )
@@ -2874,10 +3682,29 @@ def run_chapter_strict(
         for _rec in _merge_generation_outcomes(
             cfg.out_dir, [], snapshot=snapshot, chunk_plan=chunk_plan,
             config=config,
+            record_snapshot_hash=_record_snapshot_hash,
+            record_plan_hash=_record_plan_hash,
+            allow_snapshot_drift=_allow_snapshot_drift,
         ):
             prior_generation_by_chunk[_rec["chunk_id"]] = _rec
 
-    for entry in prior_entries:
+    # book-chapter-retry: reconstruct the logical replay state, not the raw
+    # line sequence. A retry appends new attempts for already-journaled
+    # chunks, so only the latest entry per chunk counts (an old len() must
+    # never hide a retry), and only chunks before the resume point are
+    # reconstructed (a rewound tail regenerates instead of being reused).
+    # Without retries this equals prior_entries in order: legacy unchanged.
+    if cfg.force_rerun:
+        _replay_source: List[Dict[str, Any]] = []
+    elif _rewind_incomplete:
+        _replay_source = [
+            e for e in _replay_entries(prior_entries)
+            if isinstance(e.get("chunk_index"), int)
+            and int(e["chunk_index"]) < resumed_from_index
+        ]
+    else:
+        _replay_source = list(_replay_entries(prior_entries))
+    for entry in _replay_source:
         outcome = entry["outcome"]
         selection_records.append({
             "chunk_id": entry["chunk_id"], "status": outcome,
@@ -2961,6 +3788,11 @@ def run_chapter_strict(
     # reviewers shouldn't have to open selection_results.json separately
     # to see why an operational-policy halt fired.
     recent_nonselection_reasons: List[str] = []
+    # book-chapter-retry: tracks whether Phase 1-2 processed any chunk
+    # this session. When nothing was generated (full journal replay), a
+    # --resume may skip already-completed downstream stages instead of
+    # re-invoking them (see the stage-selected resume below).
+    _generation_processed_any = False
 
     try:
         with open(journal_path, "a", encoding="utf-8") as journal_file:
@@ -2970,6 +3802,7 @@ def run_chapter_strict(
                 # prior run's translations.json -- nothing to redo here.
                 if index < resumed_from_index:
                     continue
+                _generation_processed_any = True
 
                 risk = risk_by_chunk[plan_chunk.chunk_id]
                 left_context = _left_ru_for_chunk(
@@ -3055,6 +3888,7 @@ def run_chapter_strict(
                         candidate_ids=list(outcome.candidates.keys()),
                         gate_trace=[], outcome="incomplete_generation",
                         selected_candidate_id=None, selected_role=None,
+                        attempt=_retry_attempt, revision=_retry_attempt,
                         switch_indices=runtime.local_switch_event_indices(events_before),
                         backend_event_indices=list(range(events_before, runtime.event_count())),
                     )
@@ -3128,6 +3962,7 @@ def run_chapter_strict(
                         candidate_ids=[c.candidate_id for c in candidates],
                         gate_trace=[], outcome="quarantined",
                         selected_candidate_id=None, selected_role=None,
+                        attempt=_retry_attempt, revision=_retry_attempt,
                         switch_indices=runtime.local_switch_event_indices(events_before),
                         backend_event_indices=list(range(events_before, runtime.event_count())),
                     )
@@ -3295,6 +4130,7 @@ def run_chapter_strict(
                     gate_trace=gate_trace, outcome=entry_outcome,
                     selected_candidate_id=result.selected_candidate_id,
                     selected_role=result.selected_role if entry_outcome == "selected" else None,
+                    attempt=_retry_attempt, revision=_retry_attempt,
                     switch_indices=runtime.local_switch_event_indices(events_before),
                     backend_event_indices=list(range(events_before, runtime.event_count())),
                 )
@@ -3332,6 +4168,49 @@ def run_chapter_strict(
             LOG.exception("Failed to release runtime at end of Phase 1-2")
 
     # ------------------------------------------------------------------
+    # book-chapter-retry: stage-selected resume. ``first_unfinished_stage``
+    # was previously computed but never consulted by production: every
+    # resume re-invoked Step 6 and Step 7/8 after journal replay. When
+    # explicit retry flags are set, no generation work ran this session,
+    # and this is not a force-rerun, the first unfinished stage is wired
+    # in: "repair" reuses validated audit artifacts without invoking the
+    # audit stage, "formatting" additionally skips the repair stage
+    # (formatting-only + Step 8), and a fully satisfied chapter takes the
+    # "completed" path that reuses every validated stage with zero model
+    # calls (only finalization/checkpoints below). Anything else runs the
+    # normal full path. Without resume flags this is always inactive.
+    # ------------------------------------------------------------------
+    _resume_stage: Optional[str] = None
+    _resume_reason = ""
+    if ((cfg.resume or cfg.retry_incomplete) and not cfg.force_rerun
+            and not _generation_processed_any):
+        try:
+            from pact_v4.pipeline.v4_retry import (
+                first_unfinished_stage as _first_unfinished_stage,
+            )
+            _resume_stage, _resume_reason = _first_unfinished_stage(cfg.out_dir)
+        except Exception as exc:  # noqa: BLE001 -- stage aid must never crash a run
+            LOG.warning("Stage selection failed for %s (%s); running full path",
+                        cfg.chapter_id, exc)
+            _resume_stage, _resume_reason = None, ""
+        if _resume_stage == "generation":
+            _resume_stage = None
+        elif (_resume_stage == "formatting"
+                and _resume_reason == "all stages satisfied"):
+            _resume_stage = "completed"
+            LOG.info(
+                "Resuming %s: all stages satisfied; reusing every validated "
+                "completed stage with zero model calls",
+                cfg.chapter_id,
+            )
+        elif _resume_stage is not None:
+            LOG.info(
+                "Resuming %s at stage %s (%s); completed predecessor stages "
+                "are reused without re-invoking them",
+                cfg.chapter_id, _resume_stage, _resume_reason,
+            )
+
+    # ------------------------------------------------------------------
     # Step 6: assembled-chapter audit (Phase 3B, DECISIONS 2026-08-01,
     # owner decision 2026-08-02: audit ALL chunks — best-variant for
     # quarantine). Runs after the Phase 1-2 loop, so the audit's
@@ -3350,6 +4229,9 @@ def run_chapter_strict(
     merged_generation_records = _merge_generation_outcomes(
         cfg.out_dir, generation_records,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        record_snapshot_hash=_record_snapshot_hash,
+        record_plan_hash=_record_plan_hash,
+        allow_snapshot_drift=_allow_snapshot_drift,
     )
     # The journal (v1) does not persist quarantine_reason, so merge the
     # cumulative selection_meta.json sidecar to restore it (and the rest of
@@ -3359,6 +4241,9 @@ def run_chapter_strict(
     merged_selection_records = _merge_selection_meta(
         cfg.out_dir, selection_records,
         snapshot=snapshot, chunk_plan=chunk_plan, config=config,
+        record_snapshot_hash=_record_snapshot_hash,
+        record_plan_hash=_record_plan_hash,
+        allow_snapshot_drift=_allow_snapshot_drift,
     )
     # B5: whole-chapter source-derived allowlist for the Step 6 audit / Step 7
     # repair. The assembled chapter is built from the committed selections and
@@ -3406,27 +4291,44 @@ def run_chapter_strict(
         events_before_step6 = runtime.event_count()
         step6: Dict[str, Any]
         phase4_inputs: Optional[Dict[str, Any]] = None
-        try:
-            step6, phase4_inputs = _run_step6_audit(
+        # book-chapter-retry: when the resume stage is repair/formatting,
+        # validated audit artifacts are reused without invoking the audit
+        # stage (no run_chapter_audit call, no audit model units). Any
+        # inconsistency falls back to the normal invocation below.
+        _step6_reused = False
+        if _resume_stage in ("repair", "formatting", "completed"):
+            step6, phase4_inputs, _step6_reused = _load_reused_step6_inputs(
                 cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-                config=config, det_data=det_data_full, selection_records=merged_selection_records,
+                config=config, selection_records=merged_selection_records,
                 selected_text_by_chunk=selected_text_by_chunk,
                 generation_records=merged_generation_records,
-                qwen_audit_evaluator=qwen_audit_evaluator,
-                gemma_audit_evaluator=gemma_audit_evaluator,
-                backend_identity_hash=cfg.backend.identity_hash,
                 backend_identity_hashes=acceptable_backend_hashes,
-                progress=progress_writer,
+                record_snapshot_hash=_record_snapshot_hash,
+                record_plan_hash=_record_plan_hash,
+                allow_snapshot_drift=_allow_snapshot_drift,
             )
-        except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
-            LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
-            step6 = {"status": "failed", "error": str(exc)}
-            phase4_inputs = None
-        finally:
+        if not _step6_reused:
             try:
-                runtime.release()
-            except Exception:  # noqa: BLE001
-                LOG.exception("Failed to release runtime after Step 6 audit")
+                step6, phase4_inputs = _run_step6_audit(
+                    cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+                    config=config, det_data=det_data_full, selection_records=merged_selection_records,
+                    selected_text_by_chunk=selected_text_by_chunk,
+                    generation_records=merged_generation_records,
+                    qwen_audit_evaluator=qwen_audit_evaluator,
+                    gemma_audit_evaluator=gemma_audit_evaluator,
+                    backend_identity_hash=cfg.backend.identity_hash,
+                    backend_identity_hashes=acceptable_backend_hashes,
+                    progress=progress_writer,
+                )
+            except Exception as exc:  # noqa: BLE001 -- a Step 6 failure is a record, not a crash
+                LOG.exception("Step 6 audit failed for %s", cfg.chapter_id)
+                step6 = {"status": "failed", "error": str(exc)}
+                phase4_inputs = None
+            finally:
+                try:
+                    runtime.release()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("Failed to release runtime after Step 6 audit")
 
         # ------------------------------------------------------------------
         # Step 7/8: Phase 4 repair + convergence + terminal (B2). Runs only
@@ -3442,117 +4344,185 @@ def run_chapter_strict(
         # B13: the repair phase result (or None when repair never ran / failed /
         # was skipped) decides the final translations.json write below.
         repair_phase_result: Optional[RepairPhaseResult] = None
-        if repair_adapters is not None and phase4_inputs is not None:
-            # Phase 5 formatting (B3, card C): build the formatting step over
-            # the source blocks. Formatting is model-free by rule — there is
-            # no injected caller, only the deterministic tiers (preserved /
-            # exact / occurrence_aware / fuzzy). A span they cannot locate
-            # becomes a blocking incident (debt), never a model call. Applied
-            # between Step 7 convergence and Step 8 inside
-            # run_repair_phase.
-            #
-            # ``cfg.formatting_required`` is the runtime master switch (§6.1
-            # ``formatting.required=true``): when the policy says formatting
-            # is not required, the step is skipped entirely.
-            formatting_step = None
-            if cfg.formatting_required:
+        # Phase 5 formatting (B3, card C): the formatting step over the
+        # source blocks. Formatting is model-free by rule — there is no
+        # injected caller, only the deterministic tiers (preserved / exact /
+        # occurrence_aware / fuzzy). A span they cannot locate becomes a
+        # blocking incident (debt), never a model call. Hoisted here (was
+        # built inside the repair branch) so the formatting-only resume path
+        # below reuses the identical step; ``cfg.formatting_required`` is
+        # the runtime master switch (§6.1 ``formatting.required=true``).
+        formatting_step = None
+        if cfg.formatting_required:
 
-                def _formatting_step(*, translation):
-                    return run_formatting_align(
-                        blocks=blocks,
-                        translation=translation,
-                        backend_identity_hash=cfg.backend.identity_hash,
-                        policy_version=cfg.formatting_policy_version,
-                        max_formatting_incidents=cfg.max_formatting_incidents,
-                    )
-
-                formatting_step = _formatting_step
-            try:
-                step7, repair_phase_result = _run_step7_repair(
-                    cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
-                    config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
-                    repair_adapters=repair_adapters,
+            def _formatting_step(*, translation):
+                return run_formatting_align(
+                    blocks=blocks,
+                    translation=translation,
                     backend_identity_hash=cfg.backend.identity_hash,
-                    backend_identity_hashes=acceptable_backend_hashes,
-                    now=now_fn,
-                    formatting=formatting_step,
-                    progress=progress_writer,
+                    policy_version=cfg.formatting_policy_version,
+                    max_formatting_incidents=cfg.max_formatting_incidents,
                 )
-                step8 = {
-                    "status": step7["terminal"],
-                    "integrity": step7["integrity"],
-                    "debt_trace": None,  # recorded in repair_report.json
-                    "formatting": step7.get("formatting"),
-                }
-                # B6: separate bounded quarantined-retry cycle. A quarantined
-                # chunk with repair debt is regenerated with look-ahead context and
-                # re-cascaded; a winner replaces its best-variant, a still-failed
-                # chunk is accepted as final (quarantined_final). A failure here is
-                # recorded in step7, never a crash of the completed run.
+
+            formatting_step = _formatting_step
+        # book-chapter-retry: when the resume stage is formatting, neither
+        # Step 6 (handled above) nor the Step 7 repair loop is invoked.
+        # Only deterministic formatting runs, on the validated converged
+        # repair artifacts. Any inconsistency falls back to the normal path
+        # below (fail-closed to recompute).
+        _formatting_only_done = False
+        _completed_only_done = False
+        if (_resume_stage == "completed" and _step6_reused
+                and phase4_inputs is not None):
+            try:
+                step7, step8, repair_phase_result = _run_completed_only_stage(
+                    cfg=cfg, source=source, snapshot=snapshot,
+                    chunk_plan=chunk_plan, config=config,
+                    backend_identity_hashes=acceptable_backend_hashes,
+                    record_snapshot_hash=_record_snapshot_hash,
+                    record_plan_hash=_record_plan_hash,
+                    allow_snapshot_drift=_allow_snapshot_drift,
+                    audited_chapter_hash=str(step6.get("chapter_hash") or ""),
+                    prior_record=_record_payload,
+                )
+                _completed_only_done = True
+                LOG.info("Resuming %s: completed-only resume finished "
+                         "without invoking audit, repair, or retry stages",
+                         cfg.chapter_id)
+            except Exception:  # noqa: BLE001 -- fall back to full path
+                LOG.exception(
+                    "Completed-only resume failed for %s; falling back to "
+                    "the full path", cfg.chapter_id)
+        if not _completed_only_done and (_resume_stage == "formatting" and _step6_reused
+                and phase4_inputs is not None):
+            try:
+                step7, step8, repair_phase_result = _run_formatting_only_stage(
+                    cfg=cfg, source=source, snapshot=snapshot,
+                    chunk_plan=chunk_plan, config=config,
+                    det_data=det_data_full, phase4_inputs=phase4_inputs,
+                    backend_identity_hashes=acceptable_backend_hashes,
+                    record_snapshot_hash=_record_snapshot_hash,
+                    record_plan_hash=_record_plan_hash,
+                    allow_snapshot_drift=_allow_snapshot_drift,
+                    formatting_step=formatting_step,
+                    audited_chapter_hash=str(step6.get("chapter_hash") or ""),
+                    prior_record=_record_payload,
+                    now=now_fn, progress=progress_writer,
+                )
+                _formatting_only_done = True
+                LOG.info("Resuming %s: formatting-only resume completed "
+                         "without invoking audit or repair stages",
+                         cfg.chapter_id)
+            except Exception as exc:  # noqa: BLE001 -- fall back to full path
+                LOG.exception(
+                    "Formatting-only resume failed for %s; falling back to "
+                    "the full repair path", cfg.chapter_id)
+        if not (_formatting_only_done or _completed_only_done):
+            if repair_adapters is not None and phase4_inputs is not None:
                 try:
-                    retry_summary = _run_quarantined_retry_cycle(
-                        cfg=cfg,
-                        source=source,
-                        snapshot=snapshot,
-                        chunk_plan=chunk_plan,
-                        config=config,
-                        det_data_base=det_data_base,
-                        det_data_full=det_data_full,
-                        risk_by_chunk=risk_by_chunk,
-                        glossary=glossary,
-                        generation_params=generation_params,
-                        model_caller=model_caller,
-                        gen_cache=gen_cache,
-                        qwen_evaluator=qwen_evaluator,
-                        gemma_selector=gemma_selector,
-                        selected_text_by_chunk=selected_text_by_chunk,
-                        phase4_inputs=phase4_inputs,
-                        repair_phase_result=repair_phase_result,
+                    step7, repair_phase_result = _run_step7_repair(
+                        cfg=cfg, source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+                        config=config, det_data=det_data_full, phase4_inputs=phase4_inputs,
                         repair_adapters=repair_adapters,
-                        formatting_step=formatting_step,
                         backend_identity_hash=cfg.backend.identity_hash,
-                        acceptable_backend_hashes=acceptable_backend_hashes,
+                        backend_identity_hashes=acceptable_backend_hashes,
                         now=now_fn,
+                        formatting=formatting_step,
                         progress=progress_writer,
-                        existing_generation_records=merged_generation_records,
-                        bible_text=bible_text,
                     )
-                except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
-                    LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
-                    step7 = dict(step7)
-                    step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
-                else:
-                    if retry_summary is not None:
-                        merged_generation_records = retry_summary["generation_records"]
-                        retry_block = {
-                            key: value
-                            for key, value in retry_summary.items()
-                            if key != "generation_records"
-                        }
-                        step7 = {**step7, "quarantined_retry": retry_block}
-                        step8 = {
-                            "status": retry_summary["terminal"],
-                            "integrity": retry_summary["integrity"],
-                            "debt_trace": None,  # recorded in repair_report.json
-                            "formatting": (
-                                retry_summary.get("formatting")
-                                if "formatting" in retry_summary
-                                else step7.get("formatting")
-                            ),
-                        }
-            except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
-                LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
-                step7 = {"status": "failed", "error": str(exc)}
-                step8 = {"status": "failed", "error": str(exc)}
-            finally:
-                try:
-                    runtime.release()
-                except Exception:  # noqa: BLE001
-                    LOG.exception("Failed to release runtime after Step 7 repair")
-        else:
-            reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
-            step7 = {"status": "skipped", "reason": reason}
-            step8 = {"status": "skipped", "reason": reason}
+                    step8 = {
+                        "status": step7["terminal"],
+                        "integrity": step7["integrity"],
+                        "debt_trace": None,  # recorded in repair_report.json
+                        "formatting": step7.get("formatting"),
+                    }
+                    # book-chapter-retry: on a stage-aware repair resume the
+                    # quarantined-retry cycle (B6) is suppressed. B6 can
+                    # regenerate quarantined chunks (generation model
+                    # calls), but an approved repair resume reruns
+                    # repair/finalization, never generation, and
+                    # quarantined chunks are not separately retried by this
+                    # operation -- they keep their terminal state and debt
+                    # stays visible. (Formatting/completed paths already
+                    # skip B6 by not entering the repair branch.)
+                    if _resume_stage != "repair":
+                        # B6: separate bounded quarantined-retry cycle. A quarantined
+                        # chunk with repair debt is regenerated with look-ahead context and
+                        # re-cascaded; a winner replaces its best-variant, a still-failed
+                        # chunk is accepted as final (quarantined_final). A failure here is
+                        # recorded in step7, never a crash of the completed run.
+                        try:
+                            retry_summary = _run_quarantined_retry_cycle(
+                                cfg=cfg,
+                                source=source,
+                                snapshot=snapshot,
+                                chunk_plan=chunk_plan,
+                                config=config,
+                                det_data_base=det_data_base,
+                                det_data_full=det_data_full,
+                                risk_by_chunk=risk_by_chunk,
+                                glossary=glossary,
+                                generation_params=generation_params,
+                                model_caller=model_caller,
+                                gen_cache=gen_cache,
+                                qwen_evaluator=qwen_evaluator,
+                                gemma_selector=gemma_selector,
+                                selected_text_by_chunk=selected_text_by_chunk,
+                                phase4_inputs=phase4_inputs,
+                                repair_phase_result=repair_phase_result,
+                                repair_adapters=repair_adapters,
+                                formatting_step=formatting_step,
+                                backend_identity_hash=cfg.backend.identity_hash,
+                                acceptable_backend_hashes=acceptable_backend_hashes,
+                                now=now_fn,
+                                progress=progress_writer,
+                                existing_generation_records=merged_generation_records,
+                                bible_text=bible_text,
+                                record_snapshot_hash=_record_snapshot_hash,
+                                allow_snapshot_drift=_allow_snapshot_drift,
+                            )
+                        except Exception as exc:  # noqa: BLE001 -- a retry failure is a record, not a crash
+                            LOG.exception("Quarantined retry cycle failed for %s", cfg.chapter_id)
+                            step7 = dict(step7)
+                            step7["quarantined_retry"] = {"status": "failed", "error": str(exc)}
+                        else:
+                            if retry_summary is not None:
+                                merged_generation_records = retry_summary["generation_records"]
+                                retry_block = {
+                                    key: value
+                                    for key, value in retry_summary.items()
+                                    if key != "generation_records"
+                                }
+                                step7 = {**step7, "quarantined_retry": retry_block}
+                                step8 = {
+                                    "status": retry_summary["terminal"],
+                                    "integrity": retry_summary["integrity"],
+                                    "debt_trace": None,  # recorded in repair_report.json
+                                    "formatting": (
+                                        retry_summary.get("formatting")
+                                        if "formatting" in retry_summary
+                                        else step7.get("formatting")
+                                    ),
+                                }
+                    else:
+                        LOG.info(
+                            "Resuming %s: skipping quarantined-retry cycle "
+                            "on repair-stage resume (no generation)",
+                            cfg.chapter_id,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- a repair failure is a record, not a crash
+                    LOG.exception("Phase 4 repair failed for %s", cfg.chapter_id)
+                    step7 = {"status": "failed", "error": str(exc)}
+                    step8 = {"status": "failed", "error": str(exc)}
+                finally:
+                    try:
+                        runtime.release()
+                    except Exception:  # noqa: BLE001
+                        LOG.exception("Failed to release runtime after Step 7 repair")
+            else:
+                reason = "repair_adapters_not_configured" if repair_adapters is None else "no_step6_phase4_inputs"
+                step7 = {"status": "skipped", "reason": reason}
+                step8 = {"status": "skipped", "reason": reason}
 
         step7_events = [
             event for event in runtime.events_since(events_before_step7)
@@ -3691,6 +4661,17 @@ def run_chapter_strict(
             ),
         })
 
+    # book-chapter-retry: lineage pairs retained from prior runs under
+    # approved additive-memory drift (see accumulate_resumed_from). The
+    # union of previously recorded pairs and non-live journal pairs is
+    # stored in the rewritten record below so later readiness accepts
+    # exactly those retained entries; empty unless drift reuse happened.
+    _resumed_from_list = _accumulate_resumed_from(
+        prior_entries,
+        live_snapshot_hash=snapshot.snapshot_hash,
+        live_plan_hash=chunk_plan.plan_hash,
+        prior_record=_record_payload,
+    )
     finished_at = now_fn().isoformat(timespec="seconds")
     runtime_summary = dict(runtime.summary())
     local_lifecycle = runtime_summary.get("local_lifecycle")
@@ -3787,7 +4768,38 @@ def run_chapter_strict(
         },
     }
     record_path = cfg.out_dir / "strict_chapter_trial_record.json"
+    if _resumed_from_list:
+        # Provenance only: the retained append-only entries were
+        # validated by this run's resume gate; source/config/backend
+        # checks stay fail-closed everywhere they already apply.
+        record["resumed_from"] = _resumed_from_list
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # book-chapter-retry: durable stage checkpoints for stage-aware resume.
+    # Generation completed unless the operational policy halted Phase 1-2
+    # early (an intentional stop_after_generation halt still completed it).
+    _write_stage_checkpoints(
+        out_dir=cfg.out_dir,
+        backend_identity_hash=cfg.backend.identity_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        chunk_plan_hash=chunk_plan.plan_hash,
+        config_identity=config.config_identity,
+        attempt=_retry_attempt,
+        generation_complete=not halted_early or halt_reason == "stop_after_generation",
+        step6=step6, step7=step7, step8=step8,
+        generation_artifacts=(
+            "journal.ndjson", "generation_outcomes.json",
+            "selection_results.json", "translations.json",
+        ),
+        audit_artifacts=(
+            "audit_cache.json", "audit_findings.json", "b2_handoff.json",
+        ),
+        repair_artifacts=("repair_cache.json", "repair_report.json"),
+        formatting_artifacts=(
+            ("formatting_report.json", "translations.json")
+            if cfg.formatting_required else ("translations.json",)
+        ),
+    )
 
     # Terminal teardown only at the very end: closes the remote backend /
     # stops a managed server the runtime started, releases the local router.
@@ -4312,6 +5324,43 @@ def _run_whole_chapter_strict_impl(
     # ------------------------------------------------------------------
     prior_entries = _load_journal(journal_path)
     acceptable_backend_hashes = list(cfg.backend.acceptable_identity_hashes())
+    from pact_v4.pipeline.v4_retry import (
+        accumulate_resumed_from as _wc_accumulate_resumed_from,
+        authorized_resumed_pairs as _wc_authorized_resumed_pairs,
+        lineage_accepted as _wc_lineage_accepted,
+        resolve_resume_lineage as _wc_resolve_lineage,
+    )
+    _wc_allow_drift = False
+    _wc_record_snapshot: Optional[str] = None
+    _wc_record_plan: Optional[str] = None
+    _wc_resumed_pairs: FrozenSet[Tuple[str, str]] = frozenset()
+    _wc_record_payload: Dict[str, Any] = {}
+    if cfg.resume or cfg.retry_incomplete or cfg.force_rerun:
+        try:
+            _wc_record_payload = json.loads(
+                (cfg.out_dir / "strict_chapter_trial_record.json").read_text(
+                    encoding="utf-8"))
+        except (OSError, ValueError):
+            _wc_record_payload = {}
+        if not isinstance(_wc_record_payload, dict):
+            _wc_record_payload = {}
+        (
+            _wc_allow_drift,
+            _wc_record_snapshot,
+            _wc_record_plan,
+        ) = _wc_resolve_lineage(
+            record=_wc_record_payload,
+            source_hash=source.source_hash,
+            config_identity=config.config_identity,
+            acceptable_backend_hashes=acceptable_backend_hashes,
+        )
+        if _wc_allow_drift:
+            # Pairs explicitly recorded by prior drift resumes stay
+            # acceptable here: each already passed this exact gate once
+            # (source/config/backend validated then and re-validated
+            # below). Empty without flags.
+            _wc_resumed_pairs = _wc_authorized_resumed_pairs(
+                _wc_record_payload, prior_entries)
     for entry in prior_entries:
         if not isinstance(entry, dict):
             raise ValueError(
@@ -4320,8 +5369,17 @@ def _run_whole_chapter_strict_impl(
                 "refusing to resume against a corrupt journal."
             )
         if (
-            entry.get("snapshot_hash") != snapshot.snapshot_hash
-            or entry.get("chunk_plan_hash") != chunk_plan.plan_hash
+            not (_wc_lineage_accepted(
+                entry.get("snapshot_hash"),
+                entry.get("chunk_plan_hash"),
+                live_snapshot_hash=snapshot.snapshot_hash,
+                live_plan_hash=chunk_plan.plan_hash,
+                record_snapshot_hash=_wc_record_snapshot,
+                record_plan_hash=_wc_record_plan,
+                allow_drift=_wc_allow_drift,
+            ) or ((
+                entry.get("snapshot_hash"), entry.get("chunk_plan_hash")
+            ) in _wc_resumed_pairs))
             or entry.get("config_identity") != config.config_identity
             or entry.get("backend_identity_hash") not in acceptable_backend_hashes
         ):
@@ -4332,6 +5390,36 @@ def _run_whole_chapter_strict_impl(
                 "against a stale journal."
             )
     resumed_from_index = len(prior_entries)
+    # book-chapter-retry: explicit retry flags for whole-chapter runs.
+    # --retry-incomplete regenerates when the latest replay outcome is
+    # incomplete_generation (else the halt would loop forever); --force-rerun
+    # always regenerates as a new attempt. The journal stays append-only:
+    # the fresh generation below appends a new entry with a monotonic
+    # attempt/revision marker, and replay below reads the latest entry.
+    from pact_v4.pipeline.v4_retry import (
+        next_attempt as _wc_next_attempt,
+        replay_entries as _wc_replay_entries,
+    )
+    _wc_latest = _wc_replay_entries(prior_entries)
+    # --resume rewinds automatically when the latest outcome is incomplete
+    # (else the prior halt would loop forever); explicit
+    # --retry-incomplete forces the same rewind.
+    _wc_has_incomplete = any(
+        e.get("outcome") == "incomplete_generation" for e in _wc_latest
+    )
+    _retry_attempt = 0
+    if cfg.force_rerun or cfg.retry_incomplete or (
+        cfg.resume and _wc_has_incomplete
+    ):
+        _retry_attempt = _wc_next_attempt(prior_entries)
+        _wc_regenerate = cfg.force_rerun or _wc_has_incomplete
+        if _wc_regenerate:
+            resumed_from_index = 0
+            LOG.info(
+                "Retrying whole-chapter %s with fresh generation (attempt %d, retry_incomplete=%s force_rerun=%s)",
+                cfg.chapter_id, _retry_attempt,
+                cfg.retry_incomplete, cfg.force_rerun,
+            )
 
     final_text_by_pid: Dict[str, str] = {}
     selected_role_counts: Dict[str, int] = {}
@@ -4401,22 +5489,39 @@ def _run_whole_chapter_strict_impl(
 
     if resumed_from_index > 0:
         # Whole-chapter resume journal contract: exactly ONE whole_chapter
-        # entry. A duplicate or malformed journal is a data-integrity failure
-        # and must fail closed — never silently replayed past via
-        # prior_entries[0] with authoritative counts/provenance untrustworthy.
-        if len(prior_entries) != 1:
-            raise ValueError(
-                "Data loss: whole-chapter resume journal must contain "
-                f"exactly one entry, found {len(prior_entries)} — refusing "
-                "to resume against a duplicate or corrupt journal."
-            )
-        entry = prior_entries[0]
-        if entry.get("chunk_id") != WHOLE_CHAPTER_CHUNK_ID:
-            raise ValueError(
-                "Data loss: malformed whole-chapter journal entry — expected "
-                f"chunk_id {WHOLE_CHAPTER_CHUNK_ID!r}, found "
-                f"{entry.get('chunk_id')!r} — refusing to resume."
-            )
+        # entry per attempt. A duplicate or malformed journal is a
+        # data-integrity failure and must fail closed — never silently
+        # replayed past via prior_entries[0] with authoritative
+        # counts/provenance untrustworthy. book-chapter-retry: a retry
+        # appends a NEW entry with a monotonic attempt marker (the journal
+        # stays append-only), so a chain with strictly increasing attempts
+        # replays its latest entry; legacy same-attempt duplicates still
+        # fail closed.
+        from pact_v4.pipeline.v4_retry import entry_attempt as _wc_entry_attempt
+        for _prior in prior_entries:
+            if _prior.get("chunk_id") != WHOLE_CHAPTER_CHUNK_ID:
+                raise ValueError(
+                    "Data loss: malformed whole-chapter journal entry — expected "
+                    f"chunk_id {WHOLE_CHAPTER_CHUNK_ID!r}, found "
+                    f"{_prior.get('chunk_id')!r} — refusing to resume."
+                )
+        _wc_attempts = [_wc_entry_attempt(_prior) for _prior in prior_entries]
+        if all(_attempt == 0 for _attempt in _wc_attempts):
+            if len(prior_entries) != 1:
+                raise ValueError(
+                    "Data loss: whole-chapter resume journal must contain "
+                    f"exactly one entry, found {len(prior_entries)} — refusing "
+                    "to resume against a duplicate or corrupt journal."
+                )
+            entry = prior_entries[0]
+        else:
+            if any(b <= a for a, b in zip(_wc_attempts, _wc_attempts[1:])):
+                raise ValueError(
+                    "Data loss: whole-chapter resume journal attempt markers "
+                    f"are not strictly increasing ({_wc_attempts}) — refusing "
+                    "to resume against a corrupt journal."
+                )
+            entry = prior_entries[-1]
         outcome = entry.get("outcome")
         if outcome == "selected":
             selected_candidate_id = entry.get("selected_candidate_id")
@@ -4538,8 +5643,15 @@ def _run_whole_chapter_strict_impl(
                 "identity fields (empty or malformed provenance artifact)."
             )
         if (
-            payload.get("snapshot_hash") != snapshot.snapshot_hash
-            or payload.get("chunk_plan_hash") != chunk_plan.plan_hash
+            not _wc_lineage_accepted(
+                payload.get("snapshot_hash"),
+                payload.get("chunk_plan_hash"),
+                live_snapshot_hash=snapshot.snapshot_hash,
+                live_plan_hash=chunk_plan.plan_hash,
+                record_snapshot_hash=_wc_record_snapshot,
+                record_plan_hash=_wc_record_plan,
+                allow_drift=_wc_allow_drift,
+            )
             or payload.get("config_identity") != config.config_identity
         ):
             raise ValueError(
@@ -4870,6 +5982,7 @@ def _run_whole_chapter_strict_impl(
             outcome=journal_outcome,
             selected_candidate_id=selected_candidate_id,
             selected_role=("balanced_literary" if journal_outcome == "selected" else None),
+            attempt=_retry_attempt, revision=_retry_attempt,
             switch_indices=runtime.local_switch_event_indices(events_before),
             backend_event_indices=list(range(events_before, runtime.event_count())),
         )
@@ -5161,6 +6274,17 @@ def _run_whole_chapter_strict_impl(
         candidate = cfg.out_dir / name
         if candidate.exists():
             artefacts[key] = str(candidate)
+    # book-chapter-retry: lineage pairs retained from prior runs under
+    # approved additive-memory drift (see accumulate_resumed_from). The
+    # union of previously recorded pairs and non-live journal pairs is
+    # stored in the rewritten record below so later readiness accepts
+    # exactly those retained entries; empty unless drift reuse happened.
+    _resumed_from_list = _wc_accumulate_resumed_from(
+        prior_entries,
+        live_snapshot_hash=snapshot.snapshot_hash,
+        live_plan_hash=chunk_plan.plan_hash,
+        prior_record=_wc_record_payload,
+    )
     record: Dict[str, Any] = {
         "schema": RECORD_SCHEMA,
         "run_label": cfg.run_label,
@@ -5290,7 +6414,44 @@ def _run_whole_chapter_strict_impl(
         },
         "artefacts": artefacts,
     }
+    if _resumed_from_list:
+        # Provenance only: the retained append-only entries were
+        # validated by this run's resume gate; source/config/backend
+        # checks stay fail-closed everywhere they already apply.
+        record["resumed_from"] = _resumed_from_list
     record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # book-chapter-retry: durable stage checkpoints for stage-aware resume.
+    # Completed whole-chapter stages bind their actual B3 artifacts (an
+    # empty set would let a ready/degraded chapter skip with zero B3
+    # validation): audit binds the B3 journal + cache (+ entity cache when
+    # the run enabled entity context), repair binds the repaired map + the
+    # B3 cache holding repair stage state, formatting binds the final
+    # alias. Skipped steps still record empty sets; anything else records
+    # a failed attempt. Existence is re-verified before recording
+    # complete, so a missing file routes to rerun instead of validating.
+    _wc_audit_files = ["audit_journal.ndjson", "audit_cache_b3.json"]
+    if isinstance(step6, dict) and step6.get("status") == "complete" \
+            and step6.get("entity_context_enabled"):
+        _wc_audit_files.append("entity_context_cache.json")
+    _write_stage_checkpoints(
+        out_dir=cfg.out_dir,
+        backend_identity_hash=cfg.backend.identity_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        chunk_plan_hash=chunk_plan.plan_hash,
+        config_identity=config.config_identity,
+        attempt=_retry_attempt,
+        generation_complete=not halted_early,
+        step6=step6, step7=step7, step8=step8,
+        generation_artifacts=(
+            "journal.ndjson", "generation_outcomes.json",
+            "selection_results.json", "translations_raw.json",
+            "translations.json",
+        ),
+        audit_artifacts=tuple(_wc_audit_files),
+        repair_artifacts=("translations_repaired.json", "audit_cache_b3.json"),
+        formatting_artifacts=("translations.json",),
+    )
 
     # Terminal teardown lives in the wrapper's finally (_run_whole_chapter_strict),
     # which runs on success AND on fail-closed resume-validation errors; nothing
