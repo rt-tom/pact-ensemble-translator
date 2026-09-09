@@ -1,85 +1,61 @@
 ## Purpose
 
-Defines alias-driven local model selection and explicit provider-owned model-call policy for every V4 strict/book stage.
+Model-centric local selection with per-model sampling and per-role output budgets, identical role set for local and remote.
 
 ## ADDED Requirements
 
-### Requirement: Complete provider-owned role policy
+### Requirement: Model-owned sampling, role-owned budgets
 
-The system SHALL obtain every V4 strict/book model-call body setting from a validated provider registry role policy, not from a code literal or descriptor-introspection fallback. Required roles SHALL be `generator`, `fidelity_reviewer`, `russian_selector`, `qwen_audit`, `gemma_audit`, `repair`, `entity_extractor`, `russian_editor`, `formatting`, and `glossary_resolver`.
+The system SHALL store `temperature/top_p/top_k/min_p/seed` on `local.models.<alias>.request` and `max_output_tokens/output_budget` on `local.role_budgets.<role>` for the fixed role set identical to remote. Unknown request field, wrong type/range, or `max_output_tokens` inside model `request` SHALL fail-closed before preflight.
 
-Each role policy SHALL declare its routing model key/binding and a `request` map whose allowed fields are `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`. A dynamically sized request SHALL additionally declare all deterministic budget inputs (mode, base/floor, per-item allowance, and ceiling) in `output_budget`.
+#### Scenario: Model sampling used by its group
 
-#### Scenario: Complete default local policy
+- **WHEN** `local.models.gemma.request.temperature` is `0.2` and translator group is `gemma`
+- **THEN** every translator role (`generator/repair/russian_selector/gemma_audit/formatting`) SHALL send `temperature 0.2` (and other model fields) from that model, with `max_output_tokens` from `role_budgets[role]`.
 
-- **WHEN** bare `book --local` is resolved
-- **THEN** the resolved local provider policy SHALL contain every required role and preserve each former generation/audit/repair/editor/formatting/resolver request setting without reading a sampling/output default from code.
+#### Scenario: Budget is role-owned
 
-#### Scenario: Missing or unknown role fails closed
+- **WHEN** `role_budgets.generator.max_output_tokens` is `70000`
+- **THEN** generator SHALL use `70000` regardless of which translator model (`gemma` or `glm`) is selected.
 
-- **WHEN** a provider policy omits a required role, names an unknown role, supplies an unknown request field, or has an invalid value/range
-- **THEN** registry loading SHALL fail before preflight, server start, or model call.
+### Requirement: Local alias pair and bare defaults
 
-#### Scenario: Dynamic audit budget is policy-owned
+The system SHALL accept `book|chapter --local` (bare → `gemma/qwen`) and `book|chapter --local a/b` (pair). Single `book --local a` SHALL fail-closed with “pair required”. Each `a`/`b` SHALL resolve to a `local` model; remote alias under `--local` SHALL fail-closed.
 
-- **WHEN** a `qwen_audit` policy uses a per-PID output budget
-- **THEN** its base/floor, per-PID allowance, and ceiling SHALL be read from the role policy and the final derived `max_output_tokens` SHALL be recorded in the request identity.
+#### Scenario: Bare uses production pair
 
-### Requirement: Unified local alias registry
+- **WHEN** `book --local` is invoked
+- **THEN** translator SHALL be `local/gemma`, reviewer `local/qwen` with their production `model_path/server_args`.
 
-The system SHALL allow a `local` provider of `kind: local_llama` in `configs/providers.yaml`. Its explicit `role_policies` are required; its `models` mapping MAY be empty until a local alias is added. Each alias SHALL define `model_key`, `model_path`, `model_name`, `server_args`, optional `reasoning_budget`, and optional role-keyed policy overrides.
+#### Scenario: Pair overrides both groups
 
-#### Scenario: Compatible alias override
+- **WHEN** `book --local glm/glimmer` is invoked
+- **THEN** translator roles SHALL use `glm`, reviewer roles `glimmer`; each side's `server_args/request` from its model.
 
-- **WHEN** `local/mygemma` replaces model key `gemma` and overrides `generator.request.temperature`
-- **THEN** it SHALL replace only the Gemma server fragment and compatible role policies; a Qwen audit role SHALL retain the local provider default unless independently and compatibly overridden.
+#### Scenario: Bare alias inside pair is globally unique
 
-#### Scenario: Invalid local model entry fails closed
+- **WHEN** alias `glm` is globally unique
+- **THEN** `glm` and `local/glm` SHALL resolve identically; duplicate normalized alias across providers SHALL fail at load.
 
-- **WHEN** a local alias has an unsupported model key, empty path/name, non-string server argument, incompatible role override, or `reasoning_budget` that differs from `--reasoning-budget`
-- **THEN** registry loading SHALL fail closed with the alias and field identified.
+### Requirement: Local request transport and reasoning
 
-#### Scenario: Alias uniqueness and qualified selection
+Local transport SHALL serialize `temperature/top_p/top_k/min_p/seed` from the selected model and `max_output_tokens` from `role_budgets[role]`. `reasoning` SHALL remain rejected for local; `reasoning_budget` SHALL equal `server_args --reasoning-budget`.
 
-- **WHEN** a bare alias is globally unique
-- **THEN** it SHALL resolve case-insensitively; a duplicate normalized alias across providers SHALL fail at registry load, while `local/alias` remains a supported qualified form.
+#### Scenario: Sampling from model
 
-### Requirement: Local request body and reasoning transport
-
-The local OpenAI-compatible transport SHALL serialize every declared local sampling field that it supports: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, and `max_output_tokens`. Local reasoning SHALL remain exclusively a `llama-server` policy (`server_args --reasoning-budget`) and SHALL NOT be serialized as remote `reasoning` request options.
-
-#### Scenario: Local seed and sampling serialization
-
-- **WHEN** a local role policy supplies `seed`, `top_p`, `top_k`, or `min_p`
-- **THEN** the local request body SHALL contain that exact value, the effective policy/identity SHALL contain it, and no value SHALL be silently ignored or replaced with a code default.
-
-#### Scenario: Unsupported local request option
-
-- **WHEN** a local policy requests a field unsupported by the verified local transport contract
-- **THEN** registry validation or preflight SHALL fail with a clear error; the transport SHALL not silently drop the field.
+- **WHEN** `local.models.gemma.request.seed` is `7`
+- **THEN** generator `CompletionRequest` SHALL carry `seed 7`.
 
 #### Scenario: Local reasoning remains server-side
 
-- **WHEN** a local alias uses reasoning
-- **THEN** its `reasoning_budget` SHALL agree with `server_args --reasoning-budget`, local `CompletionRequest` SHALL have no `reasoning` request option, and the local server start/preflight validation SHALL enforce the required reasoning server flags.
+- **WHEN** `local.models.qwen.reasoning_budget` is `8192`
+- **THEN** `server_args` SHALL contain `--reasoning-budget 8192` and no `reasoning` request option SHALL be sent.
 
-### Requirement: Alias CLI, provenance, and cache identity
+### Requirement: Fixed role groups and preflight
 
-The system SHALL accept `book|chapter --local [alias]`. Bare local SHALL use the canonical runtime transport and the explicit provider default role policies; alias local SHALL use the alias-resolved transport and policies. `--local`, `--remote`, and `--runtime-config` SHALL remain mutually exclusive.
+Translator group SHALL be `generator, repair, russian_selector, gemma_audit, formatting`; reviewer group SHALL be `qwen_audit, fidelity_reviewer, entity_extractor, russian_editor, glossary_resolver`. Preflight SHALL resolve the same pair/budgets, validate paths/server_args/reasoning agreement, and report sanitized pair + per-role budgets without network/server start. Sampling changes (`request`) SHALL NOT affect cache identity (overwrite in place).
 
-The complete resolved role-policy map SHALL have an aggregate identity hash. Every model-call producer SHALL include its own role-policy hash and final derived request budget in the cache/artifact identity that governs its output.
+#### Scenario: Sampling change overwrites
 
-#### Scenario: Audit-only policy change invalidates audit data
-
-- **WHEN** only `qwen_audit.request.temperature` or its dynamic-budget inputs change
-- **THEN** audit/re-audit cache identity and audit provenance SHALL change, prior audit results SHALL not be replayed, and unrelated role policy hashes SHALL remain unchanged.
-
-#### Scenario: Generation policy change invalidates generation data
-
-- **WHEN** `generator.request.temperature`, `seed`, or output-budget policy changes
-- **THEN** `PromptBundle.bundle_hash`, generation provenance, and run identity SHALL change before cached generation output can be reused.
-
-#### Scenario: Preflight is side-effect free and complete
-
-- **WHEN** `book --local mygemma --preflight` is invoked
-- **THEN** it SHALL resolve the same alias and complete role-policy map as execution, validate model path/server arguments and transport field support, print sanitized per-role policies and hashes, and neither start a server nor make a network call.
+- **WHEN** `local.models.gemma.request.temperature` changes from `0.2` to `0.7`
+- **THEN** next run SHALL reuse the same output directory/cache (overwrite), not require a new `--out-base`.
