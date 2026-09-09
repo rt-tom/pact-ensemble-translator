@@ -163,6 +163,10 @@ class StubApiClient:
         response_format_json: bool = True,
         label: str = "stub",
         on_reasoning_chunk=None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> str:
         self.calls.append({
             "messages": list(messages),

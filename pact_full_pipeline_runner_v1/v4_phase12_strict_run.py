@@ -207,6 +207,8 @@ def build_argparser() -> argparse.ArgumentParser:
                         "PACT_EFFICIENCY_LAZY_BALANCED env var; default true. "
                         "--no-lazy-balanced restores the legacy 2-candidate A/B + Gemma "
                         "scheme (full rollback).")
+    p.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="ALIAS",
+                    help="Select canonical local profile; optional alias from providers.yaml (bare --local preserves current behavior)")
     p.add_argument("--runtime-config", type=Path, default=None, metavar="FILE",
                     help="YAML/JSON tagged runtime profile (kind local_llama | "
                          "opencode_server | composite). When absent the historical "
@@ -1170,8 +1172,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "opencode_server or composite profile); the historical local "
             "llama-server path has no remote model bindings"
         )
+    # --local vs --runtime-config mutual exclusion (local-model-aliases)
+    if args.local is not None and args.runtime_config is not None:
+        raise ValueError("--local and --runtime-config are mutually exclusive")
+    if args.local is not None and (args.translator or args.reviewer):
+        raise ValueError("--translator/--reviewer cannot be combined with --local; use --local alias or advanced --runtime-config mode")
+    # --local alias handling: bare --local preserves historical local path; --local alias selects local alias profile
+    if args.local is not None:
+        alias = None if args.local == "__LOCAL_DEFAULT__" else (str(args.local).strip() or None)
+        if alias:
+            # Resolve alias via providers.yaml to validate existence and compatibility (fail-closed)
+            from pact_v4.runtime.runtime_config import load_providers_registry
+            prov_path = args.providers_config or _default_providers_config()
+            if prov_path.is_file():
+                registry = load_providers_registry(prov_path)
+                # Trigger validation that alias exists (bare or qualified)
+                try:
+                    if "/" in alias:
+                        registry.resolve(alias)
+                    else:
+                        registry.resolve_bare(alias)
+                except ValueError as exc:
+                    raise ValueError(f"--local alias {alias!r}: {exc}") from exc
+        # Preflight for --local path
+        if args.preflight or args.preflight_json:
+            # For local preflight, use run_local_default's backend construction but via offline check
+            # Minimal: construct backend as run_local_default would and run preflight
+            effective_reasoning = _resolve_effective_reasoning(args, StrictBackendConfig(exe=Path("dummy"), device="SYCL0", host="127.0.0.1", model_paths={"gemma": Path("/tmp/g"), "qwen": Path("/tmp/q")}, model_names={"gemma": "g", "qwen": "q"}, server_args={"gemma": [], "qwen": []})) if False else None
+            # Actual local backend for preflight check
+            from pathlib import Path as _P
+            eff = int(args.reasoning) if args.reasoning is not None else 0
+            _backend = StrictBackendConfig(exe=_P(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"), device="SYCL0", host=args.host, model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH}, model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name}, server_args={"gemma": _gemma_server_args_for_reasoning(eff), "qwen": QWEN_SERVER_ARGS}, port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout)
+            from pact_v4.runtime.runtime_config import run_runtime_preflight as _rp
+            report = _rp(_backend, reasoning=eff)
+            if args.preflight_json:
+                print(report.to_json())
+            else:
+                print(report.format_human())
+            return 0 if report.ok else 1
+        return run_local_default(args)
     if (args.preflight or args.preflight_json) and args.runtime_config is None:
-        raise ValueError("--preflight/--preflight-json require --runtime-config (offline preflight is only for the configured profile path)")
+        raise ValueError("--preflight/--preflight-json require --runtime-config or --local (offline preflight is only for a configured profile)")
     if args.runtime_config is not None:
         return run_with_runtime_config(args)
     return run_local_default(args)
