@@ -647,3 +647,11 @@ counts, media confirmation/error.
 поведения источником истины является код и артефакты конкретного run. Разницу
 следует оформлять как отдельное решение/изменение, а не незаметно устранять в
 документации.
+
+
+## Local-model-aliases (book|chapter --local [alias])
+- 10-role matrix: generator, fidelity_reviewer, russian_selector, qwen_audit, gemma_audit, repair, entity_extractor, russian_editor, formatting, glossary_resolver — all policies from configs/providers.yaml local role_policies.
+- Syntax: --local (bare) or --local alias / --local local/alias. Local vs remote reasoning: local via server_args --reasoning-budget, remote via request_options reasoning.
+- Policy identity: ResolvedRolePolicies.aggregate_hash in config artifact, preflight output and StrictRunConfig; per-role hash + derived_max_output_tokens in PromptBundle (v4) and audit/repair envelopes.
+- Preflight: run_runtime_preflight resolves alias + policies, validates alias/path/server_args/reasoning-budget/transport fields fail-closed, emits sanitized routing + server_args + per-role hashes, no network.
+- New model: add entry to providers.yaml local.models with model_key/path/name/server_args and optional compatible role overrides, then --preflight to validate.

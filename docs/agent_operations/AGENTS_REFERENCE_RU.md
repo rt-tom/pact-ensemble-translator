@@ -201,3 +201,8 @@ Promoted this run: glossary committed 0 · memory committed 0 · memory promotio
   `ssh rt 'powershell -NoProfile -Command "git -C D:/pact/pact_translator_v4_1 pull --ff-only"'`
 - Пути на RT — Windows; внутри powershell-команды используйте `D:/...` (прямой слэш). Внутри cmd-шелла одинарные кавычки не распознаются — оборачивайте удалённую команду внешними одинарными кавычками, а строки/пути внутри powershell — двойными.
 - Сам пайплайн удалённо НЕ запускать: владелец стартует его на RT вручную (manual-only).
+
+
+## Local aliases
+- Use book|chapter --local [alias] (bare preserves explicit defaults, alias from configs/providers.yaml). No mix with --runtime-config/--remote.
+- 10-role policy matrix driven by registry; per-role hash invalidates cache/resume.
