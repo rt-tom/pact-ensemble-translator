@@ -45,7 +45,11 @@ from pact_v4.repair.selective_repair import (
     SelectiveRepairEvaluator,
     SelectiveRepairOutcome,
 )
-from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
+from pact_v4.runtime.api_client import (
+    ApiClient,
+    ApiClientConfig,
+    DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
+)
 from pact_v4.runtime.backend_role_adapters import (
     BackendGemmaAuditEvaluator,
     BackendGemmaAuditEvaluatorConfig,
@@ -100,7 +104,7 @@ class LifecycleModelCaller:
         api_config = (config.api if config else ApiClientConfig()).__class__(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
-            timeout_seconds=(config.api.timeout_seconds if config else 1800.0),
+            timeout_seconds=(config.api.timeout_seconds if config else DEFAULT_LOCAL_READ_TIMEOUT_SECONDS),
             context_size=(config.api.context_size if config else 32768),
             temperature=(config.api.temperature if config else 0.2),
         )
@@ -188,7 +192,7 @@ class LifecycleQwenEvaluator:
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
-            timeout_seconds=(config.api.timeout_seconds if config else 1800.0),
+            timeout_seconds=(config.api.timeout_seconds if config else DEFAULT_LOCAL_READ_TIMEOUT_SECONDS),
             context_size=(config.api.context_size if config else 32768),
             temperature=(config.api.temperature if config else 0.2),
         )
@@ -231,7 +235,7 @@ class LifecycleGemmaSelector:
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
-            timeout_seconds=(config.api.timeout_seconds if config else 1800.0),
+            timeout_seconds=(config.api.timeout_seconds if config else DEFAULT_LOCAL_READ_TIMEOUT_SECONDS),
             context_size=(config.api.context_size if config else 32768),
             temperature=(config.api.temperature if config else 0.2),
         )
@@ -300,7 +304,7 @@ class LifecycleQwenAuditEvaluator:
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
-            timeout_seconds=1800.0,
+            timeout_seconds=DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
             context_size=49152,
             temperature=float(0),
         )
@@ -386,7 +390,7 @@ class LifecycleGemmaAuditEvaluator:
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
-            timeout_seconds=1800.0,
+            timeout_seconds=DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
             context_size=32768,
             temperature=float(0),
         )
@@ -443,7 +447,7 @@ class LifecycleQwenEntityExtractor:
         api_config = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=model_name,
-            timeout_seconds=1800.0,
+            timeout_seconds=DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
             context_size=32768,
             temperature=float(0),
         )
@@ -529,7 +533,7 @@ class LifecycleSelectiveRepairEvaluator:
         repair_api = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=repair_model_name,
-            timeout_seconds=1800.0,
+            timeout_seconds=DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
             context_size=49152,
             temperature=float(0),
         )
@@ -539,7 +543,7 @@ class LifecycleSelectiveRepairEvaluator:
         reaudit_api = ApiClientConfig(
             chat_url=f"{router.base_url}/v1/chat/completions",
             model=reaudit_model_name,
-            timeout_seconds=1800.0,
+            timeout_seconds=DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
             context_size=49152,
             temperature=float(0),
         )

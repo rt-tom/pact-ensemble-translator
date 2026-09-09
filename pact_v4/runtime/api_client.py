@@ -30,6 +30,16 @@ import requests
 LOG = logging.getLogger(__name__)
 
 
+# Local llama-server HTTP read timeout (seconds): 45 min headroom so slow
+# local generation (e.g. phase2b-generation) is not cut off at 30 min.
+# Shared default for every local transport construction path
+# (ApiClientConfig default, LocalRoutingBackend fallback clients, lifecycle
+# adapters); explicit per-client ``timeout_seconds`` overrides are preserved
+# by the call sites. Remote OpenCode defaults (900s) are intentionally
+# untouched.
+DEFAULT_LOCAL_READ_TIMEOUT_SECONDS = 2700.0
+
+
 class ApiClientError(RuntimeError):
     """All non-recoverable HTTP/parse failures raise this."""
 
@@ -46,7 +56,7 @@ class ApiClientConfig:
 
     chat_url: str = "http://127.0.0.1:8080/v1/chat/completions"
     model: str = "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
-    timeout_seconds: float = 1800.0
+    timeout_seconds: float = DEFAULT_LOCAL_READ_TIMEOUT_SECONDS
     http_retries: int = 3
     retry_delay_seconds: float = 8.0
     context_size: int = 32768

@@ -39,7 +39,11 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from pact_v4.phase1.models import canonical_json_hash
-from pact_v4.runtime.api_client import ApiClient, ApiClientConfig
+from pact_v4.runtime.api_client import (
+    ApiClient,
+    ApiClientConfig,
+    DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
+)
 from pact_v4.runtime.backend_protocol import (
     KIND_COMPOSITE,
     KIND_LOCAL_LLAMA,
@@ -949,7 +953,7 @@ class LocalRoutingBackend:
             api_config = ApiClientConfig(
                 chat_url=f"{self._router.base_url}/v1/chat/completions",
                 model=request.model_ref,
-                timeout_seconds=1800.0,
+                timeout_seconds=DEFAULT_LOCAL_READ_TIMEOUT_SECONDS,
                 context_size=32768,
                 temperature=request.temperature,
             )
