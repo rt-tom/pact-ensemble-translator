@@ -878,8 +878,9 @@ def test_simple_local_injects_media_defaults_and_whole_chapter(tmp_path, monkeyp
             assert "--media-root" in delegated and delegated[delegated.index("--media-root")+1] == "/home/rt/pact_runs"
             # Single shorthand 28 -> delegated contains full stem 0028_alpha
             assert "0028_alpha" in delegated
-            # No duplicate --local leakage
-            assert "--local" not in delegated
+            # Local simple mode forwards --local (bare) without --runtime-config (mutual exclusion, local-model-aliases)
+            assert "--local" in delegated
+            assert "--runtime-config" not in delegated
 
 
 def test_simple_bare_remote_uses_profile_defaults(tmp_path, monkeypatch):
