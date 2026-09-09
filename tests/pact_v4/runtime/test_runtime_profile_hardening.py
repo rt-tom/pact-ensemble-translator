@@ -151,7 +151,7 @@ def test_canonical_local_example_loads_and_is_strict():
 def test_alias_duplicate_case_insensitive_rejected(tmp_path: Path):
     path = tmp_path / "providers.yaml"
     path.write_text(
-        "providers:\n"
+        "role_budgets:\n  generator: {max_output_tokens: 70000}\n  repair: {max_output_tokens: 16384}\n  formatting: {max_output_tokens: 8000}\n  gemma_audit: {max_output_tokens: 4096}\n  qwen_audit: {max_output_tokens: 12000}\n  fidelity_reviewer: {max_output_tokens: 16384}\n  russian_selector: {max_output_tokens: 1024}\n  entity_extractor: {max_output_tokens: 12000}\n  russian_editor: {max_output_tokens: 12000}\n  glossary_resolver: {max_output_tokens: 4096}\nproviders:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
         "    models:\n"
@@ -175,7 +175,7 @@ def test_alias_duplicate_case_insensitive_rejected(tmp_path: Path):
 def test_alias_resolve_case_insensitive(tmp_path: Path):
     path = tmp_path / "providers.yaml"
     path.write_text(
-        "providers:\n"
+        "role_budgets:\n  generator: {max_output_tokens: 70000}\n  repair: {max_output_tokens: 16384}\n  formatting: {max_output_tokens: 8000}\n  gemma_audit: {max_output_tokens: 4096}\n  qwen_audit: {max_output_tokens: 12000}\n  fidelity_reviewer: {max_output_tokens: 16384}\n  russian_selector: {max_output_tokens: 1024}\n  entity_extractor: {max_output_tokens: 12000}\n  russian_editor: {max_output_tokens: 12000}\n  glossary_resolver: {max_output_tokens: 4096}\nproviders:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
         "    models:\n"
@@ -200,7 +200,7 @@ def test_alias_resolve_case_insensitive(tmp_path: Path):
 def test_bare_alias_unique_resolves_and_duplicate_fails(tmp_path: Path):
     path = tmp_path / "providers.yaml"
     path.write_text(
-        "providers:\n"
+        "role_budgets:\n  generator: {max_output_tokens: 70000}\n  repair: {max_output_tokens: 16384}\n  formatting: {max_output_tokens: 8000}\n  gemma_audit: {max_output_tokens: 4096}\n  qwen_audit: {max_output_tokens: 12000}\n  fidelity_reviewer: {max_output_tokens: 16384}\n  russian_selector: {max_output_tokens: 1024}\n  entity_extractor: {max_output_tokens: 12000}\n  russian_editor: {max_output_tokens: 12000}\n  glossary_resolver: {max_output_tokens: 4096}\nproviders:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
         "    models:\n"
@@ -220,7 +220,7 @@ def test_bare_alias_unique_resolves_and_duplicate_fails(tmp_path: Path):
 def test_provider_qualified_resolution_remains_supported(tmp_path: Path):
     path = tmp_path / "providers.yaml"
     path.write_text(
-        "providers:\n"
+        "role_budgets:\n  generator: {max_output_tokens: 70000}\n  repair: {max_output_tokens: 16384}\n  formatting: {max_output_tokens: 8000}\n  gemma_audit: {max_output_tokens: 4096}\n  qwen_audit: {max_output_tokens: 12000}\n  fidelity_reviewer: {max_output_tokens: 16384}\n  russian_selector: {max_output_tokens: 1024}\n  entity_extractor: {max_output_tokens: 12000}\n  russian_editor: {max_output_tokens: 12000}\n  glossary_resolver: {max_output_tokens: 4096}\nproviders:\n"
         "  openai:\n"
         "    kind: opencode_server\n"
         "    models:\n"
@@ -443,7 +443,7 @@ def test_preflight_reports_resolved_remote_defaults_and_overrides(monkeypatch, t
     from pact_v4.runtime.runtime_config import apply_provider_flags
     _prov = tmp_path / "providers.yaml"
     _prov.write_text(
-        "providers:\n"
+        "role_budgets:\n  generator: {max_output_tokens: 70000}\n  repair: {max_output_tokens: 16384}\n  formatting: {max_output_tokens: 8000}\n  gemma_audit: {max_output_tokens: 4096}\n  qwen_audit: {max_output_tokens: 12000}\n  fidelity_reviewer: {max_output_tokens: 16384}\n  russian_selector: {max_output_tokens: 1024}\n  entity_extractor: {max_output_tokens: 12000}\n  russian_editor: {max_output_tokens: 12000}\n  glossary_resolver: {max_output_tokens: 4096}\nproviders:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
         "    models:\n"

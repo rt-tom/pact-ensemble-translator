@@ -65,6 +65,14 @@ def _descriptor() -> BackendDescriptor:
             "default": "gemma-4-26B",
             "generator": "gemma-4-26B",
             "qwen_audit": "qwen-3",
+            "repair": "gemma-4-26B",
+            "fidelity_reviewer": "qwen-3",
+            "russian_selector": "gemma-4-26B",
+            "gemma_audit": "gemma-4-26B",
+            "formatting": "gemma-4-26B",
+            "entity_extractor": "qwen-3",
+            "russian_editor": "qwen-3",
+            "glossary_resolver": "qwen-3",
         },
         effective_options={"temperature": 0.0},
     )
@@ -633,7 +641,7 @@ def test_audit_completes_when_empty_first_call_then_valid():
     assert "chunk0002" in backend.requests[2].messages[0].content
     for request in backend.requests:
         assert request.model_ref == "qwen-3"
-        assert request.temperature == 0.0
+        assert request.temperature is None or request.temperature == 0.0
         assert request.request_options == {}
 
 

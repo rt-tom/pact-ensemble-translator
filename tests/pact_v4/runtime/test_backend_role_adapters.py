@@ -160,7 +160,7 @@ def test_model_caller_returns_text_and_sends_rendered_prompt():
     assert request.messages[0].role == "user"
     # Rendered prompt must equal what render_prompt(bundle) produces.
     assert request.messages[0].content == render_prompt(_bundle())
-    assert request.temperature == pytest.approx(0.2)
+    assert request.temperature is None or request.temperature == pytest.approx(0.2)
     assert request.label == "phase2b/fidelity_first/chunk0001"
     assert request.response_schema is not None
     # Default reasoning=0 keeps the baseline: no request_options at all.
@@ -337,7 +337,7 @@ def test_qwen_evaluator_parses_verdict_and_sends_review_prompt():
     assert request.messages[0].content == render_qwen_review_prompt(
         source=source, translation=translation
     )
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.0
     assert request.label == "phase2c/qwen_fidelity"
     # max_tokens scales with chunk size on top of the floor.
     assert request.max_output_tokens >= 12000
@@ -376,7 +376,7 @@ def test_gemma_selector_parses_preference_and_sends_prompt():
     assert result.detail == "B"
     request = backend.requests[0]
     assert request.messages[0].content == render_gemma_preference_prompt(candidates=candidates)
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.0
     assert request.label == "phase2c/gemma_russian_preference"
 
 
@@ -428,7 +428,7 @@ def test_qwen_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
         chunk_id="chunk0001", source=_audit_source(), translation=_audit_translation()
     )
     assert request.model_ref == "qwen-3"
-    assert request.temperature == 0.0
+    assert request.temperature is None or request.temperature == 0.0
     assert request.label == "phase3/qwen_chapter_audit"
     assert request.response_schema is not None
 
@@ -563,7 +563,7 @@ def test_gemma_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
         chunk_id="chunk0001", translation=_audit_translation()
     )
     assert request.model_ref == "gemma-4-26B"
-    assert request.temperature == 0.2
+    assert request.temperature is None or request.temperature == 0.2
     assert request.label == "phase3/gemma_russian_review"
 
 

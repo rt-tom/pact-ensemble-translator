@@ -76,7 +76,8 @@ class HttpModelCaller:
         self._api = api
         self._config = config or HttpModelCallerConfig(api=api.config, label=api.name)
         self._max_tokens = int(self._config.max_tokens)
-        self._backend = LocalOpenAIBackend(api=api)
+        from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig
+        self._backend = LocalOpenAIBackend(api=api, config=LocalOpenAIBackendConfig(api=api.config, name=api.name, model_bindings={"generator": api.config.model}))
         self._impl = BackendModelCaller(
             self._backend,
             config=BackendModelCallerConfig(max_tokens=self._max_tokens, retry=self._config.retry),

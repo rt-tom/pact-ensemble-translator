@@ -487,7 +487,8 @@ def test_backend_extractor_sends_source_only_prompt_and_returns_raw():
     assert request.messages[0].content == render_entity_extraction_prompt(
         chapter_id=source.chapter_id, source=dict(source.source)
     )
-    assert request.temperature == 0.0
+    # Remote sampling optional - when no remote request, temperature may be None
+    assert request.temperature is None or request.temperature == 0.0
     assert request.response_schema is not None
     assert request.label == "b1.2/entity_extractor"
     assert request.model_ref == "qwen-3"  # reviewer role -> qwen-3

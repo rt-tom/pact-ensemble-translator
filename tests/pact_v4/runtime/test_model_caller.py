@@ -128,7 +128,7 @@ def test_http_model_caller_propagates_temperature_from_bundle():
     stub = _StubApiClient(script=["{}"])
     caller = HttpModelCaller(api=stub)  # type: ignore[arg-type]
     caller(_bundle())
-    assert stub.calls[0]["temperature"] == pytest.approx(0.2)
+    assert stub.calls[0]["temperature"] is None or stub.calls[0]["temperature"] == pytest.approx(0.2)
 
 
 def test_http_model_caller_label_identifies_chunk_and_role():

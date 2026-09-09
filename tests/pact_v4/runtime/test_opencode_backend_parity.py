@@ -144,7 +144,7 @@ class OpenCodeStub:
         self._backend = OpenCodeServerBackend(
             OpenCodeServerBackendConfig(
                 base_url="http://127.0.0.1:4096",
-                model_bindings={"default": "opencode-go/deepseek-v4-flash"},
+                model_bindings={"generator": "opencode-go/deepseek-v4-flash", "fidelity_reviewer": "opencode-go/deepseek-v4-flash", "russian_selector": "opencode-go/deepseek-v4-flash", "qwen_audit": "opencode-go/deepseek-v4-flash", "gemma_audit": "opencode-go/deepseek-v4-flash", "repair": "opencode-go/deepseek-v4-flash", "formatting": "opencode-go/deepseek-v4-flash", "entity_extractor": "opencode-go/deepseek-v4-flash", "russian_editor": "opencode-go/deepseek-v4-flash", "glossary_resolver": "opencode-go/deepseek-v4-flash"},
                 structured_output_mode="prompt_only",
             ),
             session=self.fake,

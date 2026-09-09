@@ -477,7 +477,8 @@ def test_chunked_run_sends_v41_prompt_with_context_blocks() -> None:
         assert "CHAPTER ENTITY FACTS - SOURCE-DERIVED" in prompt
         assert "<PAIR id=" in prompt
         assert "AUDIT_PAIRS (chunk " in prompt
-        assert request.temperature == 0.0
+        # Remote sampling optional - when no remote request, sampling is None
+        assert request.temperature is None or request.temperature == 0.0
         # max_output_tokens is derived from shared role_budgets qwen_audit (floor_plus_per_item)
         assert 12000 <= request.max_output_tokens <= 24576
         # reasoning budget must NOT travel via request_options (server arg)

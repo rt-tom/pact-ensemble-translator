@@ -550,22 +550,15 @@ class SelectiveRepairOutcome:
         }
 
 
-# Roles that may serve the repair call, in priority order (generator first —
-# the repair model is the generator by owner decision, Kocmi-safe).
-_REPAIR_ROLES = ("generator", "default")
-
-
 def repair_model_ref(backend: CompletionBackend) -> str:
-    """Resolve the model reference for the repair role (generator, else
-    ``default``); raises when unbound so a misconfigured role fails loudly."""
+    """Resolve the model reference for the exact ``repair`` role; raises when unbound (no fallback)."""
     bindings = backend.descriptor.model_bindings
-    for role in _REPAIR_ROLES:
-        ref = bindings.get(role)
-        if ref:
-            return str(ref)
+    ref = bindings.get("repair")
+    if ref:
+        return str(ref)
     raise ValueError(
-        f"no model binding for repair role(s) {list(_REPAIR_ROLES)!r}; "
-        f"backend model_bindings={dict(bindings)!r}"
+        f"no model binding for repair role 'repair'; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
     )
 
 

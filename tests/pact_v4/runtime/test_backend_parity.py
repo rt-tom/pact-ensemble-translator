@@ -227,7 +227,8 @@ def test_generation_parity_fake_vs_local_backend():
 
     # Backend path: BackendModelCaller over LocalOpenAIBackend (fake ApiClient).
     stub = StubApiClient([canned, canned])
-    backend = LocalOpenAIBackend(api=stub)  # type: ignore[arg-type]
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig
+    backend = LocalOpenAIBackend(api=stub, config=LocalOpenAIBackendConfig(api=stub.config, model_bindings={"generator": stub.config.model, "fidelity_reviewer": stub.config.model, "russian_selector": stub.config.model, "repair": stub.config.model, "qwen_audit": stub.config.model, "gemma_audit": stub.config.model}))  # type: ignore[arg-type]
     back_caller = BackendModelCaller(
         backend,
         config=BackendModelCallerConfig(max_tokens=512, role_policy=_dummy_policy(512)),
@@ -276,7 +277,8 @@ def test_qwen_gate_parity():
     ref = _parse_qwen_verdict(canned)
 
     stub = StubApiClient([canned])
-    evaluator = BackendQwenEvaluator(LocalOpenAIBackend(api=stub), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendQwenEvaluatorConfig']).BackendQwenEvaluatorConfig(role_policy=_dummy_policy(512, per_item=True)))  # type: ignore[arg-type]
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig as _LC
+    evaluator = BackendQwenEvaluator(LocalOpenAIBackend(api=stub, config=_LC(api=stub.config, model_bindings={"fidelity_reviewer": stub.config.model}) ), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendQwenEvaluatorConfig']).BackendQwenEvaluatorConfig(role_policy=_dummy_policy(512, per_item=True)))  # type: ignore[arg-type]
     got = evaluator(source, translation)
 
     assert got == ref
@@ -294,7 +296,8 @@ def test_gemma_gate_parity():
     ref = _parse_gemma_preference(canned, valid_candidate_ids=["A", "B"])
 
     stub = StubApiClient([canned])
-    selector = BackendGemmaSelector(LocalOpenAIBackend(api=stub), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendGemmaSelectorConfig']).BackendGemmaSelectorConfig(role_policy=_dummy_policy(512)))  # type: ignore[arg-type]
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig as _LC2
+    selector = BackendGemmaSelector(LocalOpenAIBackend(api=stub, config=_LC2(api=stub.config, model_bindings={"russian_selector": stub.config.model}) ), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendGemmaSelectorConfig']).BackendGemmaSelectorConfig(role_policy=_dummy_policy(512)))  # type: ignore[arg-type]
     got = selector(candidates)
 
     assert got == ref
@@ -336,7 +339,7 @@ def test_selection_parity_fake_vs_local_backend():
         config=config,
         params=make_params(),
         model_caller=BackendModelCaller(
-            LocalOpenAIBackend(api=StubApiClient([canned_out, canned_out])),  # type: ignore[arg-type]
+            LocalOpenAIBackend(api=StubApiClient([canned_out, canned_out]), config=__import__("pact_v4.runtime.local_openai_backend", fromlist=["LocalOpenAIBackendConfig"]).LocalOpenAIBackendConfig(api=ApiClientConfig(), model_bindings={"generator": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"})),  # type: ignore[arg-type]
             config=BackendModelCallerConfig(max_tokens=512, role_policy=_dummy_policy(512)),
         ),
         lazy_balanced=False,
@@ -366,10 +369,10 @@ def test_selection_parity_fake_vs_local_backend():
 
     # --- backend gates ------------------------------------------------------
     back_qwen = BackendQwenEvaluator(
-        LocalOpenAIBackend(api=StubApiClient([canned_qwen, canned_qwen])), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendQwenEvaluatorConfig']).BackendQwenEvaluatorConfig(role_policy=_dummy_policy(512, per_item=True))  # type: ignore[arg-type]
+        LocalOpenAIBackend(api=StubApiClient([canned_qwen, canned_qwen]), config=__import__("pact_v4.runtime.local_openai_backend", fromlist=["LocalOpenAIBackendConfig"]).LocalOpenAIBackendConfig(api=ApiClientConfig(), model_bindings={"fidelity_reviewer": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"})), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendQwenEvaluatorConfig']).BackendQwenEvaluatorConfig(role_policy=_dummy_policy(512, per_item=True))  # type: ignore[arg-type]
     )
     back_gemma = BackendGemmaSelector(
-        LocalOpenAIBackend(api=StubApiClient([canned_gemma])), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendGemmaSelectorConfig']).BackendGemmaSelectorConfig(role_policy=_dummy_policy(512))  # type: ignore[arg-type]
+        LocalOpenAIBackend(api=StubApiClient([canned_gemma]), config=__import__("pact_v4.runtime.local_openai_backend", fromlist=["LocalOpenAIBackendConfig"]).LocalOpenAIBackendConfig(api=ApiClientConfig(), model_bindings={"russian_selector": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"})), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendGemmaSelectorConfig']).BackendGemmaSelectorConfig(role_policy=_dummy_policy(512))  # type: ignore[arg-type]
     )
     back_selection = select_candidate(
         chunk_id=chunk.chunk_id,
@@ -425,8 +428,9 @@ def test_repair_caller_parity_rendered_prompt_is_backend_agnostic():
     stub = StubApiClient([
         json.dumps({"repaired": {"p1": "Здравствуйте."}, "reason": "parity"}, ensure_ascii=False)
     ])
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig as _LC3
     caller = BackendRepairCaller(
-        LocalOpenAIBackend(api=stub),  # type: ignore[arg-type]
+        LocalOpenAIBackend(api=stub, config=_LC3(api=stub.config, model_bindings={"repair": stub.config.model})),  # type: ignore[arg-type]
         config=BackendRepairCallerConfig(max_tokens=512, role_policy=_dummy_policy(512, per_item=True)),
     )
     raw = caller(
@@ -475,8 +479,9 @@ def test_region_fidelity_gate_parity_rendered_prompt_is_backend_agnostic():
             "passed": True,
         }, ensure_ascii=False)
     ])
+    from pact_v4.runtime.local_openai_backend import LocalOpenAIBackendConfig as _LC4
     gate = BackendRegionFidelityGate(
-        LocalOpenAIBackend(api=stub),  # type: ignore[arg-type]
+        LocalOpenAIBackend(api=stub, config=_LC4(api=stub.config, model_bindings={"fidelity_reviewer": stub.config.model})),  # type: ignore[arg-type]
         config=BackendRegionFidelityGateConfig(max_tokens=512, role_policy=_dummy_policy(512)),
     )
     result = gate(
