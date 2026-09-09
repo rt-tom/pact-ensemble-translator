@@ -1155,11 +1155,30 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # and as explicit --preflight check-and-exit. Sanitized report, no server/
     # network/artifact side effects, no credential values.
     preflight_report = run_runtime_preflight(backend, reasoning=effective_reasoning)
+    # Augment preflight with resolved role policies provenance (aggregate + per-role hashes)
+    _resolved_for_preflight = _load_resolved_role_policies(None)
+    if _resolved_for_preflight is not None:
+        extra = {"resolved_role_policies_hash": _resolved_for_preflight.aggregate_hash, "per_role_hashes": {k: v.policy_hash for k, v in _resolved_for_preflight.policies.items()}}
+        # monkey-patch report dict for JSON output
+        orig_to_dict = preflight_report.to_dict
+        def _aug_dict():
+            d = orig_to_dict()
+            d.update(extra)
+            return d
+        preflight_report.to_dict = _aug_dict  # type: ignore[attr-defined]
+        orig_to_json = preflight_report.to_json
+        def _aug_json():
+            import json as _j
+            return _j.dumps(_aug_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+        preflight_report.to_json = _aug_json  # type: ignore[attr-defined]
     if args.preflight or args.preflight_json:
         if args.preflight_json:
             print(preflight_report.to_json())
         else:
             print(preflight_report.format_human())
+            # also emit provenance line
+            if _resolved_for_preflight is not None:
+                print(f"  resolved_role_policies_hash: {_resolved_for_preflight.aggregate_hash}")
         return 0 if preflight_report.ok else 1
     if not preflight_report.ok:
         LOG.error("Offline preflight failed — refusing to start pipeline:\n%s", preflight_report.format_human())
@@ -1251,6 +1270,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _backend = StrictBackendConfig(exe=_P(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"), device="SYCL0", host=args.host, model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH}, model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name}, server_args={"gemma": _gemma_server_args_for_reasoning(eff), "qwen": QWEN_SERVER_ARGS}, port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout)
             from pact_v4.runtime.runtime_config import run_runtime_preflight as _rp
             report = _rp(_backend, reasoning=eff)
+            _resolved_local = _load_resolved_role_policies(alias)
+            if _resolved_local is not None:
+                import json as _j
+                extra = {"resolved_role_policies_hash": _resolved_local.aggregate_hash, "per_role_hashes": {k: v.policy_hash for k, v in _resolved_local.policies.items()}}
+                orig = report.to_dict()
+                orig.update(extra)
+                if args.preflight_json:
+                    print(_j.dumps(orig, ensure_ascii=False, indent=2, sort_keys=True))
+                else:
+                    print(report.format_human())
+                    print(f"  resolved_role_policies_hash: {_resolved_local.aggregate_hash}")
+                return 0 if report.ok else 1
             if args.preflight_json:
                 print(report.to_json())
             else:

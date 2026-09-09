@@ -166,6 +166,8 @@ class PromptBundle:
     bible_text: str
     config_identity: str
     params: GenerationParams
+    role_policy_hash: Optional[str] = None
+    derived_max_output_tokens: Optional[int] = None
     bundle_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -190,7 +192,7 @@ class PromptBundle:
 
     def _identity_payload(self) -> dict:
         return {
-            "artifact": "pact-v4-prompt-bundle/v3",
+            "artifact": "pact-v4-prompt-bundle/v4",
             "template_role": self.template.role,
             "template_version": self.template.version,
             "template_instructions_hash": canonical_json_hash(self.template.instructions),
@@ -220,6 +222,8 @@ class PromptBundle:
                 "max_tokens": self.params.max_tokens,
                 "reasoning": self.params.reasoning,
             },
+            "role_policy_hash": self.role_policy_hash,
+            "derived_max_output_tokens": self.derived_max_output_tokens,
         }
 
 

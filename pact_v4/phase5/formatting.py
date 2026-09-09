@@ -122,7 +122,7 @@ TIER_MODEL_TARGET = "model_target"
 DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "enabled": True,
     "required": False,
-    "temperature": float("0.1"),
+    "temperature": float("0.1")  # test-only fallback; production must supply role_policy,
     "top_p": 0.9,
     "top_k": 32,
     "enable_thinking": False,
@@ -147,6 +147,7 @@ _FORMATTING_SINGLE_CALL_PROMPT_LIMIT = 12000
 
 
 def _effective_max_tokens(span_count: int, cfg_max: Any, role_policy: Any = None) -> int:
+    """Policy-owned derivation; when role_policy is None the caller is test-only."""
     """v41 dynamic budget: max(800, 40*span_count+500, cfg_max) capped at 8192.
     When ``role_policy`` is provided, ``derive_max_output_tokens`` drives the
     ceiling/span-formula, never a literal."""
