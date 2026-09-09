@@ -16,7 +16,7 @@ from pact_v4.phase2.risk import GlossaryEntry
 
 
 def test_balanced_literary_v4_version_and_contract():
-    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v6"
+    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v7"
     assert FIDELITY_FIRST_V1.version == "pact-v4-prompt-fidelity-first/v3"
     for template in (BALANCED_LITERARY_V4, FIDELITY_FIRST_V1):
         instructions = template.instructions
@@ -51,7 +51,8 @@ def test_balanced_literary_v4_version_and_contract():
         assert "pid/text" in instructions or '"pid"' in instructions
         assert "do not nest the translations inside another object or array" in instructions.lower()
         # Every value is a Russian string, keys are exactly OWNED_SOURCE.
-        assert "Every top-level value must be a Russian string" in instructions
+        assert ("Every top-level value must be a Russian string" in instructions
+                or "Every top-level value must be a Russian-language string" in instructions)
         assert "no missing keys, no extra keys, no duplicate keys" in instructions
         assert "no keys outside OWNED_SOURCE" in instructions
         assert "in exactly the same order as OWNED_SOURCE" in instructions
@@ -110,7 +111,7 @@ def test_render_prompt_v4_substitutes_book_context_and_glossary():
     assert "BOOK CONTEXT (locked, authoritative — do not contradict):" in rendered
     assert "BIBLE:" in rendered
     assert "Narrator: male" in rendered
-    assert "LOCKED GLOSSARY (use these translations consistently, do not vary):" in rendered
+    assert "LOCKED GLOSSARY (canonical lexical choices and spellings):" in rendered
     assert "Blake -> Блэйк" in rendered
     # The inline tokens were consumed; no duplicate trailing GLOSSARY block.
     assert "{book_context}" not in rendered
@@ -150,7 +151,8 @@ def test_render_prompt_contract_object_not_array_and_forbids_wrappers():
     assert '"paragraphs"' in rendered or "paragraphs" in rendered
     assert "pid/text" in rendered or '"pid"' in rendered
     assert "do not nest the translations inside another object or array" in rendered.lower()
-    assert "Every top-level value must be a Russian string" in rendered
+    assert ("Every top-level value must be a Russian string" in rendered
+            or "Every top-level value must be a Russian-language string" in rendered)
     assert "Keys must be exactly the PIDs" in rendered or "keys must be exactly the PIDs" in rendered.lower() or "no missing keys" in rendered
     assert "in exactly the same order as OWNED_SOURCE" in rendered
     assert "Do not wrap the JSON in markdown fences" in rendered
@@ -195,9 +197,9 @@ def test_prompt_cache_identity_changes_with_version_and_instructions():
     bundle_reworded = PromptBundle(template=template_v3_reworded, **common)
     assert bundle_v2.bundle_hash != bundle_v3.bundle_hash
     assert bundle_v3.bundle_hash != bundle_reworded.bundle_hash
-    # Real templates also participate: their current versions are v3/v6.
+    # Real templates also participate: their current versions are v3/v7.
     assert FIDELITY_FIRST_V1.version == "pact-v4-prompt-fidelity-first/v3"
-    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v6"
+    assert BALANCED_LITERARY_V4.version == "pact-v4-prompt-balanced-literary/v7"
 
 # ---------------------------------------------------------------------------
 # Gemma server args per §3.4
