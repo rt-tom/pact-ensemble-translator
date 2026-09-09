@@ -4,28 +4,47 @@
 #
 # CLI usage:
 #   Remote: --translator <provider>/<alias> e.g. opencode-go/musefree  --reviewer openai/luna
-#   Local:  --local (gemma/qwen) | --local translator/reviewer  e.g. --local glm/glimmer
+#   Local:  --local (gemma/qwen) | --local translator/reviewer  e.g. --local gemma31/qwen38
 #           where both components are local aliases (case-insensitive, no provider slash).
 #
-# Fixed shared role groups (local & remote):
-#   translator = generator, repair, formatting, gemma_audit
-#   reviewer   = qwen_audit, fidelity_reviewer, russian_selector, entity_extractor, russian_editor, glossary_resolver
+# Fixed shared role groups (local & remote, local-matrix-v2):
+#   translator = generator, repair, gemma_audit
+#   reviewer   = formatting, qwen_audit, fidelity_reviewer, russian_selector, entity_extractor, russian_editor, glossary_resolver
 # Every role is bound explicitly to its group model; no role->role or default fallback.
 #
-# Local model owns: model_key, model_path, model_name, server_args, reasoning_budget, request{temperature,top_p,top_k,min_p,seed}
-# Role budgets own only max_output_tokens / output_budget. Request must NOT contain max_output_tokens.
+# Authoritative role x model matrix (local-matrix-v2):
+#   role              group       max_out   model base (server reasoning)   request sampling (model-owned)                 effective (base+delta)
+#   generator         translator  70000     gemma 2048 / gemma31 2000       gemma 0.2/seed7 | gemma31 1.0/0.95/64/0.0/1.0  4000 on gemma31 (2000+2000)
+#   repair            translator  16384*    same as generator               same                                             2000 on gemma31 (2000+0)
+#   gemma_audit       translator  4096      same                            same                                             2000
+#   formatting        reviewer    8000*     qwen 8192 / qwen38 8192+xhigh    qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           8192 on qwen38 (8192+0)
+#   qwen_audit        reviewer    12000*    same                            same                                             10192 (8192+2000)
+#   fidelity_reviewer reviewer    16384*    same                            same                                             8192
+#   russian_selector  reviewer    1024      same                            same                                             8192
+#   entity_extractor  reviewer    12000     same                            same                                             10192 (8192+2000)
+#   russian_editor    reviewer    12000     same                            same                                             8192
+#   glossary_resolver reviewer    4096      same                            same                                             8192
+#   (* floor/span output_budget, see below.) Hybrid effective reasoning is LOCAL only:
+#   effective(role, model) = model.reasoning_budget + (role_budgets[role].reasoning_budget or 0).
+#   The router restarts/relaunches the SAME model with a replaced --reasoning-budget when the
+#   next role needs a different effective value (no group-max substitute). Effective reasoning
+#   is NOT part of run identity and never invalidates request cache or resume artifacts.
+#
+# Local model owns: model_key, model_path, model_name, server_args, reasoning_budget, request{temperature,top_p,top_k,min_p,seed,repeat_penalty,repeat_last_n,frequency_penalty,presence_penalty}
+# Role budgets own max_output_tokens / output_budget + optional hybrid reasoning_budget delta (int 0..8192).
+# Request must NOT contain max_output_tokens/reasoning/reasoning_budget; unknown sampling keys fail closed.
 # Sampling is excluded from run identity (same output dir) but INCLUDED in each request cache key/provenance.
 role_budgets:
-  generator: {max_output_tokens: 70000}
-  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
-  formatting: {max_output_tokens: 8000, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
-  gemma_audit: {max_output_tokens: 4096}
-  qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}}
-  fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
-  russian_selector: {max_output_tokens: 1024}
-  entity_extractor: {max_output_tokens: 12000}
-  russian_editor: {max_output_tokens: 12000}
-  glossary_resolver: {max_output_tokens: 4096}
+  generator: {max_output_tokens: 70000, reasoning_budget: 2000}
+  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 0}
+  formatting: {max_output_tokens: 8000, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}, reasoning_budget: 0}
+  gemma_audit: {max_output_tokens: 4096, reasoning_budget: 0}
+  qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 2000}
+  fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 0}
+  russian_selector: {max_output_tokens: 1024, reasoning_budget: 0}
+  entity_extractor: {max_output_tokens: 12000, reasoning_budget: 2000}
+  russian_editor: {max_output_tokens: 12000, reasoning_budget: 0}
+  glossary_resolver: {max_output_tokens: 4096, reasoning_budget: 0}
 providers:
   opencode-go:
     kind: opencode_server
@@ -61,16 +80,30 @@ providers:
         model_key: gemma
         model_path: C:/llama-cpp/models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
         model_name: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
-        server_args: [-ngl, "99", -ncmoe, "18", --load-mode, mmap, --reasoning-budget, "2048", -np, "1", -c, "49152", -fa, "on", --jinja, -ctk, q8_0, -ctv, q4_0, --cache-ram, "0", --ctx-checkpoints, "0"]
+        server_args: [-ngl, "99", -ncmoe, "18", --load-mode, mmap, --reasoning-budget, "2048", --reasoning-budget-enable, -np, "1", -c, "49152", -fa, "on", --jinja, -ctk, q8_0, -ctv, q4_0, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 2048
         request: {temperature: 0.2, seed: 7}
       qwen:
         model_key: qwen
         model_path: C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
         model_name: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
-        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "3", --device, SYCL0, -fit, "on", -fitt, "1280", -b, "2048", -ub, "512", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --reasoning-budget, "8192", -np, "1", -c, "49152", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
+        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "3", --device, SYCL0, -fit, "on", -fitt, "1280", -b, "2048", -ub, "512", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --reasoning-budget, "8192", --reasoning-budget-enable, -np, "1", -c, "49152", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 8192
         request: {temperature: 0.0}
+      gemma31:
+        model_key: gemma31
+        model_path: C:/llama-cpp/models/Gemma4-31B-Q5/gemma-4-31B-it-UD-Q5_K_XL.gguf
+        model_name: gemma-4-31B-it-UD-Q5_K_XL.gguf
+        server_args: [-dev, SYCL0, -fit, "on", -fitt, "512", -b, "1024", -ub, "512", -ctk, q8_0, -ctv, q4_0, -t, "12", -tb, "12", -fa, "on", --load-mode, mmap, -c, "44000", -np, "1", --reasoning, "on", --reasoning-budget-enable, --reasoning-budget, "2000", --cache-ram, "0", --ctx-checkpoints, "0", --jinja]
+        reasoning_budget: 2000
+        request: {temperature: 1.0, top_p: 0.95, top_k: 64, min_p: 0.0, repeat_penalty: 1.0}
+      qwen38:
+        model_key: qwen38
+        model_path: C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf
+        model_name: Qwen3.8-27B-UD-Q4_K_XL.gguf
+        server_args: [-md, "C:/llama-cpp/models/Qwen3.8-27B/MTP/mtp-Qwen3.8-27B-Q4_0.gguf", --spec-type, draft-mtp, --spec-draft-n-max, "2", --spec-draft-ngl, "99", --spec-draft-device, SYCL0, -ngl, "99", -dev, SYCL0, --load-mode, mmap, -b, "2048", -ub, "1024", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", -np, "1", -c, "44000", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0", --reasoning, "on", --reasoning-budget-enable, --reasoning-effort, "xhigh", --reasoning-budget, "8192"]
+        reasoning_budget: 8192
+        request: {temperature: 0.2, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0}
   openai:
     kind: opencode_server
     models:

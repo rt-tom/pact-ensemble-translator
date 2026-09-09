@@ -728,24 +728,65 @@ def build_strict_lifecycle(
     )
     runtime = backend.build_runtime(log_dir=log_dir)
     router = runtime.router
+    # Local-matrix-v2: translator/reviewer model keys AND names come from
+    # the ResolvedModelPair when present (--local gemma31/qwen38 serves
+    # translator roles with gemma31, reviewer roles with qwen38); legacy
+    # gemma/qwen defaults otherwise. Each wrapper carries its fixed role +
+    # pair so the router relaunches on role-effective budget changes.
+    _pair = getattr(backend, "resolved_pair", None)
+    if _pair is not None:
+        _t_key = _pair.translator_model.model_key
+        _t_name = _pair.translator_model.model_name
+        _r_key = _pair.reviewer_model.model_key
+        _r_name = _pair.reviewer_model.model_name
+    else:
+        _t_key, _t_name = GEMMA_MODEL_KEY, backend.model_names[GEMMA_MODEL_KEY]
+        _r_key, _r_name = QWEN_MODEL_KEY, backend.model_names[QWEN_MODEL_KEY]
     model_caller = LifecycleModelCaller(
-        router, model_name=backend.model_names[GEMMA_MODEL_KEY],
+        router, model_name=_t_name,
         json_retry_policy=json_retry_policy,
+        model_key=_t_key, role="generator", pair=_pair,
     )
     qwen_evaluator = LifecycleQwenEvaluator(
-        router, model_name=backend.model_names[QWEN_MODEL_KEY],
+        router, model_name=_r_name,
         config=HttpQwenEvaluatorConfig(bible_text=bible_text),
+        model_key=_r_key, role="fidelity_reviewer", pair=_pair,
     )
-    gemma_selector = LifecycleGemmaSelector(router, model_name=backend.model_names[GEMMA_MODEL_KEY])
+    # Local-matrix-v2: russian_selector is reviewer-group in the shared
+    # fixed-role contract, so it is served by the reviewer model/profile
+    # with its role-effective budget (relaunch on change like every
+    # other reviewer role).
+    gemma_selector = LifecycleGemmaSelector(
+        router, model_name=_r_name,
+        model_key=_r_key, role="russian_selector", pair=_pair,
+    )
     qwen_audit_evaluator = LifecycleQwenAuditEvaluator(
-        router, model_name=backend.model_names[QWEN_MODEL_KEY],
+        router, model_name=_r_name,
         config=BackendQwenAuditEvaluatorConfig(bible_text=bible_text),
+        model_key=_r_key, role="qwen_audit", pair=_pair,
     )
     gemma_audit_evaluator = LifecycleGemmaAuditEvaluator(
-        router, model_name=backend.model_names[GEMMA_MODEL_KEY],
+        router, model_name=_t_name,
         config=BackendGemmaAuditEvaluatorConfig(bible_text=bible_text),
+        model_key=_t_key, role="gemma_audit", pair=_pair,
     )
     return router, model_caller, qwen_evaluator, gemma_selector, qwen_audit_evaluator, gemma_audit_evaluator
+
+
+def _model_matrix_block(cfg: Any) -> Optional[List[Dict[str, Any]]]:
+    """Authoritative role x model matrix for the trial record (task 3.1).
+
+    Returns ``pair.matrix_rows()`` when the run carries a ResolvedModelPair,
+    else ``None``. Provenance only — never identity (see
+    ``ResolvedModelPair.matrix_rows`` / ``RoleBudget.budget_hash``).
+    """
+    try:
+        pair = getattr(cfg, "resolved_pair", None) or getattr(cfg, "resolved_role_policies", None)
+        if pair is None or not hasattr(pair, "matrix_rows"):
+            return None
+        return pair.matrix_rows()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3676,6 +3717,12 @@ def run_chapter_strict(
             "local_lifecycle": local_lifecycle,
             "remote_calls": remote_calls,
         },
+        # Local-matrix-v2 (task 3.1): the authoritative role x model matrix
+        # (role x group x max_output/output_budget x model base x request
+        # sampling x effective reasoning). Provenance only — effective
+        # reasoning never enters run identity (RoleBudget.budget_hash).
+        # Absent when the run carries no pair.
+        "model_matrix": _model_matrix_block(cfg),
         "operational_policy": {
             "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
             # V4.1: pinned-before-run generation reasoning budget and early-exit
@@ -5137,6 +5184,8 @@ def _run_whole_chapter_strict_impl(
             "local_lifecycle": local_lifecycle,
             "remote_calls": remote_calls,
         },
+        # Local-matrix-v2 (task 3.1): see chunked-path record above.
+        "model_matrix": _model_matrix_block(cfg),
         "operational_policy": {
             "max_consecutive_terminal_nonselections": cfg.max_consecutive_terminal_nonselections,
             "reasoning": cfg.reasoning,

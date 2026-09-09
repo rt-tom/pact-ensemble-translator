@@ -81,8 +81,9 @@ def test_formatting_backend_with_overrides_composite_external_promotes():
     assert out.backends["opencode"].server_mode == "managed"
     assert out.backends["opencode"].managed.port == 4097
     assert out.backends["opencode"].server.reasoning == 0
-    # local gemma reasoning 0
-    assert out.backends["local"].server_args["gemma"] == _gemma_server_args_for_reasoning(0)
+    # local-matrix-v2: local sub-backends keep their resolved launch args
+    # (reviewer-model formatting server; no reasoning-0 override).
+    assert out.backends["local"].server_args["gemma"] == _gemma_server_args_for_reasoning(3)
 
 
 def test_build_formatting_client_leak_runtime_close_on_build_role_failure(tmp_path: Path, monkeypatch):

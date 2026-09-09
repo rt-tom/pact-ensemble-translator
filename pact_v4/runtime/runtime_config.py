@@ -114,21 +114,37 @@ REQUIRED_ROLES = frozenset({
     ROLE_GLOSSARY_RESOLVER,
 })
 
-# Model-owned sampling fields (forbid max_output_tokens in model request)
+# Model-owned sampling fields (forbid max_output_tokens/reasoning in model request).
+# Local-matrix-v2: extensible sampling — repeat_penalty/repeat_last_n/
+# frequency_penalty/presence_penalty allowlisted; a future sampling param
+# is one frozenset entry + one validator branch below.
 ALLOWED_MODEL_REQUEST_FIELDS = frozenset({
     "temperature", "top_p", "top_k", "min_p", "seed",
+    "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty",
 })
 
-# Role budgets own only max_output_tokens / output_budget
+# Request keys that are NEVER model sampling (fail-closed with an explicit
+# message, not the generic unknown-field error).
+FORBIDDEN_MODEL_REQUEST_FIELDS = frozenset({
+    "max_output_tokens", "reasoning", "reasoning_budget",
+})
+
+# Role budgets own max_output_tokens / output_budget + optional hybrid
+# reasoning delta (local-matrix-v2: int 0..8192, default 0).
 ALLOWED_OUTPUT_BUDGET_MODES = frozenset({"fixed", "floor_plus_per_item", "span_formula"})
-ALLOWED_ROLE_BUDGET_FIELDS = frozenset({"max_output_tokens", "output_budget"})
+ALLOWED_ROLE_BUDGET_FIELDS = frozenset({"max_output_tokens", "output_budget", "reasoning_budget"})
+
+# Hybrid-reasoning range for role deltas (matches model base range).
+ROLE_REASONING_BUDGET_MIN = 0
+ROLE_REASONING_BUDGET_MAX = 8192
 
 def _validate_model_request(req: object, *, context: str) -> Dict[str, object]:
-    """Validate model-owned sampling request. Forbids max_output_tokens."""
+    """Validate model-owned sampling request. Forbids max_output_tokens/reasoning."""
     if not isinstance(req, dict):
         raise ValueError(f"{context}: request must be a mapping, got {type(req).__name__}")
-    if "max_output_tokens" in req:
-        raise ValueError(f"{context}: max_output_tokens is not allowed in model request (belongs to role_budgets)")
+    forbidden = set(req) & FORBIDDEN_MODEL_REQUEST_FIELDS
+    if forbidden:
+        raise ValueError(f"{context}: {sorted(forbidden)} not allowed in model request (belongs to role_budgets / server_args, never sampling)")
     unknown = set(req) - ALLOWED_MODEL_REQUEST_FIELDS
     if unknown:
         raise ValueError(f"{context}: unknown request field(s) {sorted(unknown)}; allowed {sorted(ALLOWED_MODEL_REQUEST_FIELDS)}")
@@ -165,6 +181,33 @@ def _validate_model_request(req: object, *, context: str) -> Dict[str, object]:
             if not isinstance(v, int) or isinstance(v, bool):
                 raise ValueError(f"{context}: seed must be int, got {v!r}")
             out[k] = int(v)
+        elif k == "repeat_penalty":
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{context}: repeat_penalty must be number, got {v!r}")
+            fv = float(v)
+            if not (0 <= fv <= 5):
+                raise ValueError(f"{context}: repeat_penalty must be in [0,5], got {fv!r}")
+            out[k] = fv
+        elif k == "repeat_last_n":
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"{context}: repeat_last_n must be int, got {v!r}")
+            if not (-1 <= int(v) <= 65536):
+                raise ValueError(f"{context}: repeat_last_n must be in [-1,65536], got {v!r}")
+            out[k] = int(v)
+        elif k == "frequency_penalty":
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{context}: frequency_penalty must be number, got {v!r}")
+            fv = float(v)
+            if not (-2 <= fv <= 2):
+                raise ValueError(f"{context}: frequency_penalty must be in [-2,2], got {fv!r}")
+            out[k] = fv
+        elif k == "presence_penalty":
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"{context}: presence_penalty must be number, got {v!r}")
+            fv = float(v)
+            if not (-2 <= fv <= 2):
+                raise ValueError(f"{context}: presence_penalty must be in [-2,2], got {fv!r}")
+            out[k] = fv
     return out
 
 def _validate_output_budget(ob: object, *, context: str) -> "OutputBudgetPolicy":
@@ -217,7 +260,7 @@ class LocalModelSpec:
     model_name: str
     server_args: Tuple[str, ...]
     reasoning_budget: Optional[int] = None
-    request: Mapping[str, Any] = field(default_factory=dict)  # temperature/top_p/top_k/min_p/seed only
+    request: Mapping[str, Any] = field(default_factory=dict)  # sampling allowlist (ALLOWED_MODEL_REQUEST_FIELDS only)
     def __post_init__(self) -> None:
         if not isinstance(self.model_key, str) or self.model_key not in SUPPORTED_LOCAL_MODEL_KEYS:
             raise ValueError(f"LocalModelSpec: model_key {self.model_key!r} must be one of {sorted(SUPPORTED_LOCAL_MODEL_KEYS)}")
@@ -229,6 +272,18 @@ class LocalModelSpec:
         bad = [a for a in self.server_args if not isinstance(a, str)]
         if bad:
             raise ValueError(f"LocalModelSpec: server_args must contain only strings, got {bad!r}")
+        # Local-matrix-v2 contract: model reasoning_budget is required (int)
+        # and must exactly match --reasoning-budget in server_args.
+        if self.reasoning_budget is None:
+            raise ValueError(f"LocalModelSpec[{self.model_key}]: reasoning_budget is required (int) and must equal --reasoning-budget in server_args")
+        if not isinstance(self.reasoning_budget, int) or isinstance(self.reasoning_budget, bool):
+            raise ValueError(f"LocalModelSpec[{self.model_key}]: reasoning_budget must be int, got {self.reasoning_budget!r}")
+        try:
+            budget_in_args = _reasoning_budget_from_server_args(self.server_args)
+        except ValueError as exc:
+            raise ValueError(f"LocalModelSpec[{self.model_key}]: {exc}") from None
+        if budget_in_args != self.reasoning_budget:
+            raise ValueError(f"LocalModelSpec[{self.model_key}]: reasoning_budget {self.reasoning_budget!r} must equal --reasoning-budget in server_args ({budget_in_args!r})")
         # validate request sampling (forbid max_output_tokens)
         validated = _validate_model_request(self.request, context=f"LocalModelSpec[{self.model_key}] request")
         object.__setattr__(self, "request", dict(validated))
@@ -277,9 +332,18 @@ class OutputBudgetPolicy:
 
 @dataclass(frozen=True)
 class RoleBudget:
-    """Shared role-owned budget (role_budgets.<role>)."""
+    """Shared role-owned budget (role_budgets.<role>).
+
+    Local-matrix-v2: optional ``reasoning_budget`` is the role's hybrid-
+    reasoning DELTA added to the serving model's base
+    (``effective = model.reasoning_budget + role.reasoning_budget``).
+    It is deliberately EXCLUDED from ``budget_hash``: the dynamic
+    effective value must not alter run identity or invalidate/reject
+    request cache or resume artifacts.
+    """
     max_output_tokens: int
     output_budget: Optional[OutputBudgetPolicy] = None
+    reasoning_budget: int = 0
     def __post_init__(self) -> None:
         if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
             raise ValueError(f"RoleBudget: max_output_tokens must be int, got {self.max_output_tokens!r}")
@@ -287,6 +351,10 @@ class RoleBudget:
             raise ValueError(f"RoleBudget: max_output_tokens must be in (0,200000], got {self.max_output_tokens!r}")
         if self.output_budget is not None and not isinstance(self.output_budget, OutputBudgetPolicy):
             raise ValueError("RoleBudget output_budget must be OutputBudgetPolicy")
+        if not isinstance(self.reasoning_budget, int) or isinstance(self.reasoning_budget, bool):
+            raise ValueError(f"RoleBudget: reasoning_budget must be int, got {self.reasoning_budget!r}")
+        if not (ROLE_REASONING_BUDGET_MIN <= self.reasoning_budget <= ROLE_REASONING_BUDGET_MAX):
+            raise ValueError(f"RoleBudget: reasoning_budget must be in [{ROLE_REASONING_BUDGET_MIN},{ROLE_REASONING_BUDGET_MAX}], got {self.reasoning_budget!r}")
     @property
     def budget_hash(self) -> str:
         return canonical_json_hash({
@@ -404,10 +472,88 @@ class ResolvedModelPair:
             return self.role_budgets[role]
         except KeyError:
             raise ValueError(f"ResolvedModelPair: role {role!r} not in role_budgets (no fallback)") from None
+    def model_for_role(self, role: str) -> LocalModelSpec:
+        """The group model serving ``role`` (translator/reviewer fixed contract)."""
+        if role in TRANSLATOR_ROLES:
+            return self.translator_model
+        if role in REVIEWER_ROLES:
+            return self.reviewer_model
+        raise ValueError(f"ResolvedModelPair: unknown role {role!r} (not in fixed groups)")
+    def effective_reasoning_budget(self, role: str) -> int:
+        """Hybrid effective reasoning for one call (local-matrix-v2).
 
-# Fixed shared groups (local & remote) — owner-approved 2026-09
-TRANSLATOR_ROLES = (ROLE_GENERATOR, ROLE_REPAIR, ROLE_FORMATTING, ROLE_GEMMA_AUDIT)
+        ``model.reasoning_budget + (role_budgets[role].reasoning_budget or 0)``
+        — e.g. ``gemma31`` (2000) + ``generator`` (2000) = 4000;
+        ``qwen38`` (8192) + ``qwen_audit`` (2000) = 10192.
+        Universal for all aliases; never part of run identity.
+        """
+        model = self.model_for_role(role)
+        base = model.reasoning_budget or 0
+        delta = self.budget_for_role(role).reasoning_budget or 0
+        return int(base) + int(delta)
+    def launch_args_for_role(self, role: str) -> List[str]:
+        """The model's server args with ``--reasoning-budget`` REPLACED
+        (never appended) by the role-effective value. Fail-closed when the
+        model profile carries no ``--reasoning-budget`` flag."""
+        from pact_v4.runtime.model_lifecycle import with_reasoning_budget as _with_budget
+        model = self.model_for_role(role)
+        return _with_budget(list(model.server_args), self.effective_reasoning_budget(role))
+    def reasoning_provenance_for_role(self, role: str) -> Dict[str, Any]:
+        """Fresh-call provenance: model base + role delta + effective +
+        actual launch args. Cache hits keep their ORIGINAL provenance — this
+        record is written only for fresh calls, never backfilled."""
+        model = self.model_for_role(role)
+        return {
+            "model_key": model.model_key,
+            "model_base": int(model.reasoning_budget or 0),
+            "role": role,
+            "role_delta": int(self.budget_for_role(role).reasoning_budget or 0),
+            "effective": self.effective_reasoning_budget(role),
+            "launch_args": self.launch_args_for_role(role),
+        }
+    def matrix_rows(self) -> List[Dict[str, Any]]:
+        """One authoritative matrix row per role (docs + trial-record provenance)."""
+        rows: List[Dict[str, Any]] = []
+        for role in sorted(self.role_budgets):
+            model = self.model_for_role(role)
+            budget = self.budget_for_role(role)
+            rows.append({
+                "role": role,
+                "group": "translator" if role in TRANSLATOR_ROLES else "reviewer",
+                "max_output_tokens": int(budget.max_output_tokens),
+                "output_budget": {
+                    "mode": budget.output_budget.mode,
+                    "base_tokens": budget.output_budget.base_tokens,
+                    "floor_tokens": budget.output_budget.floor_tokens,
+                    "per_item_tokens": budget.output_budget.per_item_tokens,
+                    "per_span_tokens": budget.output_budget.per_span_tokens,
+                    "ceiling": budget.output_budget.ceiling,
+                } if budget.output_budget is not None else None,
+                "model_key": model.model_key,
+                "model_base": int(model.reasoning_budget or 0),
+                "request": dict(sorted(model.request.items())),
+                "role_delta": int(budget.reasoning_budget or 0),
+                "effective": self.effective_reasoning_budget(role),
+            })
+        return rows
+
+
+def effective_reasoning_budget(pair: "ResolvedModelPair", role: str) -> int:
+    """Module-level hybrid effective reasoning (local-matrix-v2).
+
+    ``pair.translator/reviewer`` base + ``role_budgets[role]`` delta.
+    Fail-closed on unknown roles; never part of run identity.
+    """
+    if not isinstance(pair, ResolvedModelPair):
+        raise ValueError(f"effective_reasoning_budget: pair must be ResolvedModelPair, got {type(pair).__name__}")
+    return pair.effective_reasoning_budget(role)
+
+# Fixed shared groups (local & remote) — owner-approved 2026-09.
+# Local-matrix-v2 (Q2): `formatting` moved to reviewer (`qwen*`) in the
+# shared local/remote fixed-role contract (remote behavior change in scope).
+TRANSLATOR_ROLES = (ROLE_GENERATOR, ROLE_REPAIR, ROLE_GEMMA_AUDIT)
 REVIEWER_ROLES = (
+    ROLE_FORMATTING,
     ROLE_QWEN_AUDIT,
     ROLE_FIDELITY_REVIEWER,
     ROLE_RUSSIAN_SELECTOR,
@@ -596,9 +742,12 @@ class LocalLlamaBackendConfig:
             self.model_paths,
             startup_timeout=self.startup_timeout, unload_timeout=self.unload_timeout,
         )
+        # Local-matrix-v2: profile names cover every configured model key
+        # (gemma/qwen + gemma31/qwen38); unknown keys fall back to the key.
+        _profile_names = {"gemma": "Gemma", "qwen": "Qwen", "gemma31": "Gemma31", "qwen38": "Qwen38"}
         router = ModelRouter(
             adapter,
-            role_profile_names={"gemma": "Gemma", "qwen": "Qwen"},
+            role_profile_names={k: _profile_names.get(k, k) for k in self.server_args},
             role_args=dict(self.server_args),
         )
         return LocalLifecycleCoordinator(router, descriptor=self.build_descriptor())
@@ -764,7 +913,37 @@ class LocalRoutingBackend:
                 f"LocalRoutingBackend: model_ref {request.model_ref!r} is not a "
                 f"local model (known: {sorted(self._ref_to_key)})"
             )
-        self._router.ensure_resident(key)
+        # Local-matrix-v2 hybrid reasoning: when the request carries its
+        # fixed pipeline role AND the config carries a ResolvedModelPair,
+        # the router relaunches the SAME model with the role-effective
+        # --reasoning-budget when it differs (no group-max substitute).
+        # A role bound to a different model than the request names is a
+        # misroute — fail closed. Without role/pair, legacy residency by
+        # model only (remote/composite fixtures, old callers).
+        pair = getattr(self._cfg, "resolved_pair", None)
+        role = getattr(request, "role", None)
+        if role is not None and pair is not None:
+            try:
+                expected_key = pair.model_for_role(role).model_key
+            except ValueError as exc:
+                raise CompletionError(f"LocalRoutingBackend: {exc}") from None
+            if expected_key != key:
+                raise CompletionError(
+                    f"LocalRoutingBackend: role {role!r} is served by model "
+                    f"{expected_key!r}, not requested {request.model_ref!r} "
+                    f"(key {key!r}); refusing to misroute"
+                )
+            # Fresh-call provenance (model base + role delta + effective +
+            # actual launch args) rides the SwitchRecord on launch/relaunch
+            # only; resident hits return None and rewrite nothing.
+            prov = pair.reasoning_provenance_for_role(role)
+            self._router.ensure_resident(
+                key,
+                reasoning_budget=int(prov["effective"]),
+                reasoning_provenance=prov,
+            )
+        else:
+            self._router.ensure_resident(key)
         backend = self._backends.get(request.model_ref)
         if backend is None:
             api_config = ApiClientConfig(
@@ -1197,6 +1376,28 @@ def validate_reasoning_backend(reasoning: Optional[int], backend: Any) -> None:
         # OpenCode / composite-remote: reasoning travels via request_options
         # (1/2/3 -> reasoningEffort low/medium/high); any value is expressible.
         return
+    # Local-matrix-v2 (HIGH finding): a model-centric local run (--local
+    # pair) carries role-effective reasoning. Its static server args are
+    # pair identity (registry-validated at load: reasoning_budget required
+    # and equal to --reasoning-budget), and the router launches
+    # role-effective budgets dynamically — never run identity, never
+    # request-cache/resume keys. The A2 static-agreement gate below is
+    # superseded here: a CLI --reasoning 0 baseline (or omitted --reasoning)
+    # legitimately runs on nonzero base budgets (bare --local gemma 2048,
+    # gemma31/qwen38 2000/8192). For --reasoning > 0 the transport must
+    # still express reasoning: require a nonzero generator role-effective
+    # budget, fail-closed otherwise. Non-pair backends keep exact A2 semantics.
+    pair = getattr(gen, "resolved_pair", None)
+    if pair is not None:
+        if reasoning != 0:
+            eff = pair.effective_reasoning_budget(ROLE_GENERATOR)
+            if eff <= 0:
+                raise ValueError(
+                    f"--reasoning {reasoning} requested but the local pair's "
+                    f"generator role-effective budget is {eff}: the transport "
+                    f"cannot express the requested reasoning."
+                )
+        return
     budget = _reasoning_budget_from_server_args(_local_generator_server_args(gen))
     if reasoning == 0:
         if budget not in (None, 0):
@@ -1627,7 +1828,13 @@ def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, 
         ob = None
         if ob_raw is not None:
             ob = _validate_output_budget(ob_raw, context=f"{path}: role_budgets {role!r} output_budget")
-        out[role] = RoleBudget(max_output_tokens=int(max_tok), output_budget=ob)
+        # Local-matrix-v2: optional hybrid-reasoning delta (universal for all aliases).
+        delta_raw = cfg.get("reasoning_budget", 0)
+        if not isinstance(delta_raw, int) or isinstance(delta_raw, bool):
+            raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget must be int, got {delta_raw!r}")
+        if not (ROLE_REASONING_BUDGET_MIN <= int(delta_raw) <= ROLE_REASONING_BUDGET_MAX):
+            raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget must be in [{ROLE_REASONING_BUDGET_MIN},{ROLE_REASONING_BUDGET_MAX}], got {delta_raw!r}")
+        out[role] = RoleBudget(max_output_tokens=int(max_tok), output_budget=ob, reasoning_budget=int(delta_raw))
     return out
 
 def _load_local_model_spec(alias: str, raw_model: Mapping[str, Any], path: Path) -> LocalModelSpec:
@@ -1651,20 +1858,16 @@ def _load_local_model_spec(alias: str, raw_model: Mapping[str, Any], path: Path)
         if not isinstance(item, str):
             raise ValueError(f"{path}: local model {alias!r} server_args must contain only strings, got {item!r}")
     reasoning_budget = raw_model.get("reasoning_budget")
-    if reasoning_budget is not None:
-        if not isinstance(reasoning_budget, int) or isinstance(reasoning_budget, bool):
-            raise ValueError(f"{path}: local model {alias!r} reasoning_budget must be int, got {reasoning_budget!r}")
-        try:
-            budget_in_args = _reasoning_budget_from_server_args(server_args)
-        except ValueError as exc:
-            raise ValueError(f"{path}: local model {alias!r} {exc}") from None
-        if budget_in_args != reasoning_budget:
-            raise ValueError(f"{path}: local model {alias!r} reasoning_budget {reasoning_budget!r} must equal --reasoning-budget in server_args ({budget_in_args!r})")
-    else:
-        try:
-            _reasoning_budget_from_server_args(server_args)
-        except ValueError as exc:
-            raise ValueError(f"{path}: local model {alias!r} {exc}") from None
+    if reasoning_budget is None:
+        raise ValueError(f"{path}: local model {alias!r} reasoning_budget is required (int) and must equal --reasoning-budget in server_args")
+    if not isinstance(reasoning_budget, int) or isinstance(reasoning_budget, bool):
+        raise ValueError(f"{path}: local model {alias!r} reasoning_budget must be int, got {reasoning_budget!r}")
+    try:
+        budget_in_args = _reasoning_budget_from_server_args(server_args)
+    except ValueError as exc:
+        raise ValueError(f"{path}: local model {alias!r} {exc}") from None
+    if budget_in_args != reasoning_budget:
+        raise ValueError(f"{path}: local model {alias!r} reasoning_budget {reasoning_budget!r} must equal --reasoning-budget in server_args ({budget_in_args!r})")
     request_raw = raw_model.get("request") or {}
     if not isinstance(request_raw, Mapping):
         raise ValueError(f"{path}: local model {alias!r} request must be mapping, got {type(request_raw).__name__}")
@@ -2064,7 +2267,9 @@ def load_runtime_config(payload: Mapping[str, Any]) -> BackendRuntimeConfig:
     raise ValueError(f"load_runtime_config: unknown kind {kind!r}")
 
 
-SUPPORTED_LOCAL_MODEL_KEYS = frozenset({"gemma", "qwen"})
+# Local-matrix-v2: production aliases gemma31 (31B Q5) and qwen38 (27B+mtp)
+# alongside the existing gemma/qwen. model_key == registry alias for locals.
+SUPPORTED_LOCAL_MODEL_KEYS = frozenset({"gemma", "qwen", "gemma31", "qwen38"})
 
 def _lookup_local_alias(registry: "ProvidersRegistry", alias: str, *, path: Path = Path("providers.yaml")) -> LocalModelSpec:
     if not isinstance(alias, str) or not alias.strip():
@@ -2706,4 +2911,8 @@ __all__ = [
     "PreflightReport",
     "run_runtime_preflight",
     "SUPPORTED_LOCAL_MODEL_KEYS",
+    "ALLOWED_MODEL_REQUEST_FIELDS",
+    "FORBIDDEN_MODEL_REQUEST_FIELDS",
+    "ALLOWED_ROLE_BUDGET_FIELDS",
+    "effective_reasoning_budget",
 ]

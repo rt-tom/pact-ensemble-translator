@@ -182,10 +182,14 @@ class LocalOpenAIBackend:
                     top_k=request.top_k,
                     min_p=request.min_p,
                     seed=request.seed,
+                    repeat_penalty=request.repeat_penalty,
+                    repeat_last_n=request.repeat_last_n,
+                    frequency_penalty=request.frequency_penalty,
+                    presence_penalty=request.presence_penalty,
                 )
             except TypeError as te:
                 # Backward compat with test stubs that don't accept new sampling kwargs
-                if "unexpected keyword argument" in str(te) and any(k in str(te) for k in ("top_p", "top_k", "min_p", "seed")):
+                if "unexpected keyword argument" in str(te) and any(k in str(te) for k in ("top_p", "top_k", "min_p", "seed", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty")):
                     text = self._api.complete(
                         messages,
                         max_tokens=request.max_output_tokens,

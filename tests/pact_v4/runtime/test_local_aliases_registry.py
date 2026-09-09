@@ -64,7 +64,8 @@ providers:
         model_key: gemma
         model_path: /tmp/a
         model_name: a
-        server_args: []
+        server_args: ["--reasoning-budget", "2000"]
+        reasoning_budget: 2000
         request: {unknown_field: 1}
 """)
     p = tmp_path / "providers.yaml"
@@ -97,7 +98,8 @@ providers:
         model_key: gemma
         model_path: /tmp/a
         model_name: a
-        server_args: []
+        server_args: ["--reasoning-budget", "2000"]
+        reasoning_budget: 2000
         request: {temperature: 0.2, max_output_tokens: 1000}
 """)
     p = tmp_path / "providers.yaml"
@@ -130,13 +132,15 @@ providers:
         model_key: gemma
         model_path: /tmp/gemma.gguf
         model_name: gemma-test
-        server_args: ["--ctx-size", "8192"]
+        server_args: ["--ctx-size", "8192", "--reasoning-budget", "2000"]
+        reasoning_budget: 2000
         request: {temperature: 0.2}
       myqwen:
         model_key: qwen
         model_path: /tmp/qwen.gguf
         model_name: qwen-test
-        server_args: ["--ctx-size", "8192"]
+        server_args: ["--ctx-size", "8192", "--reasoning-budget", "8192"]
+        reasoning_budget: 8192
         request: {temperature: 0.0}
 """)
     p = tmp_path / "providers.yaml"
@@ -196,7 +200,7 @@ providers:
   local:
     kind: local_llama
     models:
-      dup: {model_key: gemma, model_path: /tmp/a, model_name: a, server_args: [], request: {temperature: 0.0}}
+      dup: {model_key: gemma, model_path: /tmp/a, model_name: a, server_args: ["--reasoning-budget", "2000"], reasoning_budget: 2000, request: {temperature: 0.0}}
   opencode-go:
     kind: opencode_server
     models:
@@ -236,8 +240,8 @@ providers:
   local:
     kind: local_llama
     models:
-      localone: {model_key: gemma, model_path: /tmp/a, model_name: a, server_args: [], request: {temperature: 0.0}}
-      localtwo: {model_key: qwen, model_path: /tmp/b, model_name: b, server_args: [], request: {temperature: 0.0}}
+      localone: {model_key: gemma, model_path: /tmp/a, model_name: a, server_args: ["--reasoning-budget", "2000"], reasoning_budget: 2000, request: {temperature: 0.0}}
+      localtwo: {model_key: qwen, model_path: /tmp/b, model_name: b, server_args: ["--reasoning-budget", "8192"], reasoning_budget: 8192, request: {temperature: 0.0}}
   opencode-go:
     kind: opencode_server
     models:

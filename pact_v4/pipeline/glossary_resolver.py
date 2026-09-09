@@ -536,8 +536,13 @@ class GlossaryResolver:
             top_k=req_vals.get("top_k"),
             min_p=req_vals.get("min_p"),
             seed=req_vals.get("seed"),
+            repeat_penalty=req_vals.get("repeat_penalty"),
+            repeat_last_n=req_vals.get("repeat_last_n"),
+            frequency_penalty=req_vals.get("frequency_penalty"),
+            presence_penalty=req_vals.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
             label="glossary_resolver",
+            role="glossary_resolver",
         )
         # Prompt-only structured output mode (reuse reviewer setting)
         # CompletionRequest validates response_schema implies prompt_only; keep as is.
@@ -548,7 +553,7 @@ class GlossaryResolver:
                     req_kwargs["request_options"] = {"reasoning": ri}  # type: ignore[assignment]
             except Exception:
                 pass
-        request = CompletionRequest(**{k: v for k, v in req_kwargs.items() if v is not None or k in ("temperature", "max_output_tokens", "model_ref", "messages", "response_schema", "label")})  # type: ignore[arg-type]
+        request = CompletionRequest(**{k: v for k, v in req_kwargs.items() if v is not None or k in ("temperature", "max_output_tokens", "model_ref", "messages", "response_schema", "label", "role")})  # type: ignore[arg-type]
         # Bounded retry: 3 attempts for JSON parse / truncation
         attempts = []
         def _complete_once() -> str:

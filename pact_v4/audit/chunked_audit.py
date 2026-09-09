@@ -996,7 +996,12 @@ class ChunkedAuditEvaluator:
             top_k=req.get("top_k"),
             min_p=req.get("min_p"),
             seed=req.get("seed"),
+            repeat_penalty=req.get("repeat_penalty"),
+            repeat_last_n=req.get("repeat_last_n"),
+            frequency_penalty=req.get("frequency_penalty"),
+            presence_penalty=req.get("presence_penalty"),
             response_schema=JSON_OBJECT_SCHEMA,
+            role="qwen_audit",
             label=self._config.label,
             on_reasoning_chunk=on_reasoning_chunk,
         )
