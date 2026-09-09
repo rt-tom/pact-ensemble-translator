@@ -78,6 +78,20 @@ providers:
         ref: opencode-go/ox-alpha-free
         reasoning_contract:
           variants: [low, high, max]
+  local:
+    kind: local_llama
+    role_policies:
+      generator: {model_key: gemma, request: {temperature: 0.2, seed: 7, max_output_tokens: 70000}}
+      fidelity_reviewer: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 16384}, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+      russian_selector: {model_key: gemma, request: {temperature: 0.0, max_output_tokens: 1024}}
+      qwen_audit: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}}
+      gemma_audit: {model_key: gemma, request: {temperature: 0.0, max_output_tokens: 4096}}
+      repair: {model_key: gemma, request: {temperature: 0.0, max_output_tokens: 16384}, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+      entity_extractor: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}}
+      russian_editor: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 12000}}
+      formatting: {model_key: gemma, request: {temperature: 0.1, max_output_tokens: 8000}, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}}
+      glossary_resolver: {model_key: qwen, request: {temperature: 0.0, max_output_tokens: 4096}}
+    models: {}
   openai:
     kind: opencode_server
     models:

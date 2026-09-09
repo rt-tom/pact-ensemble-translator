@@ -177,6 +177,11 @@ class CompletionRequest:
     response_schema: Mapping[str, Any] | None
     label: str
     request_options: Mapping[str, Any] = field(default_factory=dict)
+    # Typed sampling fields (local-model-aliases): explicit, validated, identity-bearing.
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    seed: Optional[int] = None
     # OpenCode transport body shape: when True, the neutral system prompt
     # and the all-disabled tools map are omitted from the message body
     # (serve 1.4.7 applied a default ~32k output budget to requests that
@@ -218,6 +223,14 @@ class CompletionRequest:
                 "CompletionRequest: unknown request option(s) "
                 f"{sorted(unknown)}; allowed: {sorted(ALLOWED_REQUEST_OPTIONS)}"
             )
+        if self.top_p is not None and not (0 < float(self.top_p) <= 1.0):
+            raise ValueError(f"CompletionRequest: top_p must be in (0,1], got {self.top_p!r}")
+        if self.top_k is not None and int(self.top_k) <= 0:
+            raise ValueError(f"CompletionRequest: top_k must be positive, got {self.top_k!r}")
+        if self.min_p is not None and not (0 <= float(self.min_p) <= 1.0):
+            raise ValueError(f"CompletionRequest: min_p must be in [0,1], got {self.min_p!r}")
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError(f"CompletionRequest: seed must be int, got {self.seed!r}")
         if self.on_reasoning_chunk is not None and not callable(
             self.on_reasoning_chunk
         ):

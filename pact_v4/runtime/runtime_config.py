@@ -97,6 +97,93 @@ ROLE_REPAIR = "repair"
 # lacks it; the providers registry maps it explicitly under --reviewer so a
 # reviewer model can serve every audit role.
 ROLE_ENTITY_EXTRACTOR = "entity_extractor"
+ROLE_RUSSIAN_EDITOR = "russian_editor"
+ROLE_GLOSSARY_RESOLVER = "glossary_resolver"
+
+REQUIRED_ROLES = frozenset({
+    ROLE_GENERATOR,
+    ROLE_FIDELITY_REVIEWER,
+    ROLE_RUSSIAN_SELECTOR,
+    ROLE_QWEN_AUDIT,
+    ROLE_GEMMA_AUDIT,
+    ROLE_REPAIR,
+    ROLE_ENTITY_EXTRACTOR,
+    ROLE_RUSSIAN_EDITOR,
+    ROLE_FORMATTING,
+    ROLE_GLOSSARY_RESOLVER,
+})
+
+ALLOWED_REQUEST_FIELDS = frozenset({
+    "temperature", "top_p", "top_k", "min_p", "seed", "max_output_tokens",
+})
+
+@dataclass(frozen=True)
+class OutputBudgetPolicy:
+    mode: str = "fixed"
+    base_tokens: Optional[int] = None
+    floor_tokens: Optional[int] = None
+    per_item_tokens: Optional[int] = None
+    per_span_tokens: Optional[int] = None
+    ceiling: Optional[int] = None
+    def derive(self, *, item_count: int = 0, span_tokens: int = 0) -> Optional[int]:
+        if self.mode == "fixed":
+            return self.base_tokens
+        if self.mode == "floor_plus_per_item":
+            floor = self.floor_tokens if self.floor_tokens is not None else self.base_tokens or 0
+            per = self.per_item_tokens or 0
+            val = floor + per * int(item_count)
+            if self.ceiling is not None:
+                val = min(val, int(self.ceiling))
+            return val
+        if self.mode == "span_formula":
+            base = self.base_tokens or 0
+            per = self.per_span_tokens or self.per_item_tokens or 0
+            val = base + per * int(span_tokens)
+            if self.ceiling is not None:
+                val = min(val, int(self.ceiling))
+            return val
+        return self.base_tokens
+
+@dataclass(frozen=True)
+class RoleCallPolicy:
+    model_key: str
+    request: Mapping[str, Any]
+    output_budget: Optional[OutputBudgetPolicy] = None
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "request", dict(self.request))
+        if self.output_budget is not None and not isinstance(self.output_budget, OutputBudgetPolicy):
+            raise ValueError("RoleCallPolicy output_budget must be OutputBudgetPolicy")
+    @property
+    def policy_hash(self) -> str:
+        return canonical_json_hash({"model_key": self.model_key, "request": dict(sorted(self.request.items())), "output_budget": {"mode": self.output_budget.mode, "base_tokens": self.output_budget.base_tokens, "floor_tokens": self.output_budget.floor_tokens, "per_item_tokens": self.output_budget.per_item_tokens, "per_span_tokens": self.output_budget.per_span_tokens, "ceiling": self.output_budget.ceiling} if self.output_budget else None})
+
+@dataclass(frozen=True)
+class ResolvedRolePolicies:
+    policies: Mapping[str, RoleCallPolicy]
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "policies", dict(self.policies))
+        missing = REQUIRED_ROLES - set(self.policies.keys())
+        if missing:
+            raise ValueError(f"ResolvedRolePolicies missing required roles: {sorted(missing)}")
+        extra = set(self.policies.keys()) - REQUIRED_ROLES
+        if extra:
+            raise ValueError(f"ResolvedRolePolicies unknown roles: {sorted(extra)}")
+    @property
+    def aggregate_hash(self) -> str:
+        payload = {role: self.policies[role].policy_hash for role in sorted(self.policies)}
+        return canonical_json_hash(payload)
+    def per_role_hash(self, role: str) -> str:
+        return self.policies[role].policy_hash
+
+def derive_max_output_tokens(policy: RoleCallPolicy, *, item_count: int = 0, span_tokens: int = 0) -> int:
+    if policy.output_budget is not None:
+        derived = policy.output_budget.derive(item_count=item_count, span_tokens=span_tokens)
+        if derived is not None:
+            return int(derived)
+    val = policy.request.get("max_output_tokens")
+    if val is None:
+        raise ValueError(f"derive_max_output_tokens: role {policy.model_key!r} has no max_output_tokens")
+    return int(val)
 
 # Roles bound by the --translator CLI flag (owner decision 2026-08-14):
 # generation + region repair (repair falls back to generator anyway).
@@ -1221,17 +1308,36 @@ def load_providers_registry(path: Path) -> ProvidersRegistry:
                 f"(kind + models), got {type(provider_entry).__name__}"
             )
         kind = provider_entry.get("kind")
-        if kind != "opencode_server":
+        if kind not in ("opencode_server", "local_llama"):
             raise ValueError(
                 f"{path}: provider {provider_id!r} has unsupported kind {kind!r} "
-                "(only 'opencode_server' is supported)"
+                "(only 'opencode_server' and 'local_llama' are supported)"
             )
+        # Validate role_policies for local provider (required) and for any provider that declares them
+        if kind == "local_llama":
+            rp = provider_entry.get("role_policies")
+            if not isinstance(rp, Mapping) or not rp:
+                raise ValueError(f"{path}: local provider {provider_id!r} must declare non-empty 'role_policies'")
+            # Minimal validation: check required roles present
+            missing = REQUIRED_ROLES - set(rp.keys())
+            if missing:
+                raise ValueError(f"{path}: local provider {provider_id!r} missing required roles {sorted(missing)}")
+            extra = set(rp.keys()) - REQUIRED_ROLES
+            if extra:
+                raise ValueError(f"{path}: local provider {provider_id!r} unknown roles {sorted(extra)}")
         raw_models = provider_entry.get("models")
-        if not isinstance(raw_models, Mapping) or not raw_models:
-            raise ValueError(
-                f"{path}: provider {provider_id!r} must declare a non-empty "
-                "'models:' mapping"
-            )
+        if kind == "local_llama":
+            if raw_models is None:
+                raw_models = {}
+            if not isinstance(raw_models, Mapping):
+                raise ValueError(f"{path}: provider {provider_id!r} 'models' must be a mapping")
+            # empty allowed for local
+        else:
+            if not isinstance(raw_models, Mapping) or not raw_models:
+                raise ValueError(
+                    f"{path}: provider {provider_id!r} must declare a non-empty "
+                    "'models:' mapping"
+                )
         models: Dict[str, ProviderModel] = {}
         for alias, raw_model in raw_models.items():
             if not isinstance(raw_model, Mapping):
