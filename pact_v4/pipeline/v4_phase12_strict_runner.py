@@ -273,6 +273,7 @@ class StrictRunConfig:
     memory_dir: Path
     out_dir: Path
     backend: BackendRuntimeConfig
+    resolved_role_policies: Optional[Any] = None
     min_chunk_words: int = DEFAULT_MIN_WORDS
     target_chunk_words: int = DEFAULT_TARGET_WORDS
     max_chunk_words: int = DEFAULT_MAX_WORDS
@@ -500,9 +501,19 @@ class StrictRunConfig:
             object.__setattr__(self, "book_memory_role_views_enabled", True)
 
     def to_config_artifact(self, *, model_profile: str) -> ConfigArtifact:
+        _resolved_hash = None
+        _per_role = {}
+        try:
+            if self.resolved_role_policies is not None:
+                _resolved_hash = self.resolved_role_policies.aggregate_hash  # type: ignore[attr-defined]
+                _per_role = {k: v.policy_hash for k, v in self.resolved_role_policies.policies.items()}  # type: ignore[attr-defined]
+        except Exception:
+            _resolved_hash = None
         values = {
             "chapter_id": self.chapter_id,
             "model_profile": model_profile,
+            "resolved_role_policies_hash": _resolved_hash,
+            "resolved_role_policies_per_role": _per_role,
             "chunk_min_words": self.min_chunk_words,
             "chunk_target_words": self.target_chunk_words,
             "chunk_max_words": self.max_chunk_words,

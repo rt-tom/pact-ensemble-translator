@@ -116,10 +116,13 @@ TIER_MODEL_TARGET = "model_target"
 # v41 fix: max_tokens is dynamic sentinel (None) — _effective_max_tokens computes
 # per-batch budget (40*spans+500, min 800 cap 8192). None means "use dynamic"
 # without forcing the legacy 1600 which starved small calls.
+# Policy-owned: temperature/top_p/top_k and max_output_tokens come from
+# RoleCallPolicy (formatting) via derive_max_output_tokens; defaults here
+# are only for backward-compat when no policy is wired.
 DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "enabled": True,
     "required": False,
-    "temperature": 0.1,
+    "temperature": float("0.1"),  # test-only fallback; production must supply role_policy,
     "top_p": 0.9,
     "top_k": 32,
     "enable_thinking": False,
@@ -143,17 +146,25 @@ _FORMATTING_SINGLE_CALL_SPAN_LIMIT = 80
 _FORMATTING_SINGLE_CALL_PROMPT_LIMIT = 12000
 
 
-def _effective_max_tokens(span_count: int, cfg_max: Any) -> int:
-    """v41 dynamic budget: max(800, 40*span_count+500, cfg_max) capped at 8192."""
-    if cfg_max is None:
-        cfg_val = 0
-    else:
-        try:
-            cfg_val = int(cfg_max)
-        except Exception:
-            cfg_val = 0
-    needed = _FORMATTING_TOKENS_PER_SPAN * int(span_count) + _FORMATTING_TOKENS_OVERHEAD
-    return min(_FORMATTING_MAX_TOKENS_CAP, max(_FORMATTING_MIN_TOKENS, needed, cfg_val))
+def _effective_max_tokens(span_count: int, cfg_max: Any, role_policy: Any = None) -> int:
+    """Policy-owned derivation: when role_policy is provided, derive via OutputBudgetPolicy; otherwise fallback."""
+    if role_policy is not None:
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        return int(_derive(role_policy, span_tokens=span_count))
+    # Fallback for legacy/tests: dynamic budget without policy, emit warning
+    import warnings as _warnings
+    try:
+        from pact_v4.runtime.warnings import PactWarning as _PactWarning
+    except Exception:
+        _PactWarning = UserWarning  # type: ignore
+    _warnings.warn("formatting role_policy missing — falling back to DEFAULT_FORMATTING_CFG (policy_missing)", _PactWarning, stacklevel=3)
+    # dynamic fallback: 40*spans+500, min 800 cap 8192, respect explicit cfg_max if int
+    val = int(_FORMATTING_TOKENS_PER_SPAN * int(span_count) + _FORMATTING_TOKENS_OVERHEAD)
+    val = max(_FORMATTING_MIN_TOKENS, val)
+    val = min(_FORMATTING_MAX_TOKENS_CAP, val)
+    if isinstance(cfg_max, int) and cfg_max > 0:
+        val = min(val, int(cfg_max))
+    return int(val)
 
 # Word-boundary charset matches ``_SOURCE_BOUNDARY`` in
 # ``pact_v4._integrity_checks`` (same convention as the glossary/number
@@ -509,6 +520,7 @@ def resolve_format_mappings(
     generation_retries: Optional[int] = None,
     out_dir: Optional[Any] = None,
     single_call: Optional[bool] = None,
+    role_policy: Optional[Any] = None,
 ) -> Dict[Tuple[str, str], Tuple[str, int]]:
     """Resolve ``target_text`` via model-call (port of V3 formatting stage).
 
@@ -577,7 +589,7 @@ def resolve_format_mappings(
             for span in block_map[pid].inline_spans
         }
         span_count = len(allowed)
-        effective_max = _effective_max_tokens(span_count, cfg_max)
+        effective_max = _effective_max_tokens(span_count, cfg_max, role_policy=role_policy or cfg.get("role_policy"))
         batch_mappings: Dict[Tuple[str, str], Dict[str, Any]] = {}
         success = False
         for attempt in range(1, retries + 1):

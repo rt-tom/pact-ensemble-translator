@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pact_v4.phase1.models import canonical_json_hash
@@ -177,6 +177,11 @@ class CompletionRequest:
     response_schema: Mapping[str, Any] | None
     label: str
     request_options: Mapping[str, Any] = field(default_factory=dict)
+    # Typed sampling fields (local-model-aliases): explicit, validated, identity-bearing.
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    seed: Optional[int] = None
     # OpenCode transport body shape: when True, the neutral system prompt
     # and the all-disabled tools map are omitted from the message body
     # (serve 1.4.7 applied a default ~32k output budget to requests that
@@ -218,6 +223,14 @@ class CompletionRequest:
                 "CompletionRequest: unknown request option(s) "
                 f"{sorted(unknown)}; allowed: {sorted(ALLOWED_REQUEST_OPTIONS)}"
             )
+        if self.top_p is not None and not (0 < float(self.top_p) <= 1.0):
+            raise ValueError(f"CompletionRequest: top_p must be in (0,1], got {self.top_p!r}")
+        if self.top_k is not None and int(self.top_k) <= 0:
+            raise ValueError(f"CompletionRequest: top_k must be positive, got {self.top_k!r}")
+        if self.min_p is not None and not (0 <= float(self.min_p) <= 1.0):
+            raise ValueError(f"CompletionRequest: min_p must be in [0,1], got {self.min_p!r}")
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError(f"CompletionRequest: seed must be int, got {self.seed!r}")
         if self.on_reasoning_chunk is not None and not callable(
             self.on_reasoning_chunk
         ):
@@ -383,17 +396,24 @@ class BackendDescriptor:
         the backend after preflight reads the health endpoint) — never part
         of ``identity_hash``, so it is safe to persist and does not affect
         cache/resume identity.
+        Includes resolved role-policy provenance when present in effective_options.
         """
-        return {
+        eff = _sanitize_secrets(dict(self.effective_options))
+        rec: Dict[str, Any] = {
             "kind": self.kind,
             "transport_version": self.transport_version,
             "endpoint_family": self.endpoint_family,
             "public_endpoint": _canonical_endpoint(self.public_endpoint, drop_port=False),
             "model_bindings": dict(sorted(self.model_bindings.items())),
-            "effective_options": _sanitize_secrets(dict(self.effective_options)),
+            "effective_options": eff,
             "observed_server_version": self.observed_server_version,
             "identity_hash": self.identity_hash,
         }
+        if "resolved_role_policies_hash" in eff:
+            rec["resolved_role_policies_hash"] = eff["resolved_role_policies_hash"]
+        if "per_role_hashes" in eff:
+            rec["per_role_hashes"] = eff["per_role_hashes"]
+        return rec
 
 
 class CompletionBackend(Protocol):

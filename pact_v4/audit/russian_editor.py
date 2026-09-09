@@ -214,6 +214,8 @@ class ReviewCandidate:
 @dataclass(frozen=True)
 class RussianEditorConfig:
     """Settings for one Russian-editor pass (frozen contract of the run).
+    When ``role_policy`` is provided its ``request`` drives temperature and
+    max_output_tokens via ``derive_max_output_tokens``.
 
     ``safe_classes`` is the class threshold: any class in this frozenset is
     auto-applied (with the diff-gate); every other known class routes to
@@ -237,6 +239,7 @@ class RussianEditorConfig:
     # bearing via StrictRunConfig (F5): flipping it must invalidate cache.
     retry_max_retries: int = DEFAULT_RETRY_MAX_RETRIES
     retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
+    role_policy: Optional[Any] = None
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -805,8 +808,8 @@ class RussianEditorEvaluator:
             translation={"p00001": "…", ...},   # RUSSIAN only, no source
         )
 
-    One ``CompletionRequest`` per chunk (``max_output_tokens`` from config,
-    temperature 0.0, ``json_object`` schema — never ``request_options``; the
+    One ``CompletionRequest`` per chunk (``max_output_tokens`` from policy
+    via ``derive_max_output_tokens``, temperature from policy, ``json_object`` schema — never ``request_options``; the
     reasoning budget is a server arg). The model ref resolves to the audit
     (Qwen) role — the editor is the audit model (owner decision, 0 restarts).
     """
@@ -1019,11 +1022,23 @@ class RussianEditorEvaluator:
             reason_path: Optional[Path] = None
             if out_dir is not None:
                 reason_path = out_dir / f"{out_base}_chunk{chunk_index}_reasoning.txt"
+            policy = getattr(cfg, "role_policy", None)
+            if policy is None:
+                raise ValueError("RussianEditor: role_policy is required")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
+            if "temperature" not in req:
+                raise ValueError("RussianEditor: role_policy missing temperature")
             request = CompletionRequest(
                 model_ref=model_ref,
                 messages=(Message(role="user", content=prompt),),
-                max_output_tokens=cfg.max_tokens,
-                temperature=0.0,
+                max_output_tokens=max_tok,
+                temperature=float(req["temperature"]),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=cfg.label,
                 on_reasoning_chunk=open_reasoning_writer(reason_path),

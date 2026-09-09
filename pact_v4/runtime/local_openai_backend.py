@@ -133,10 +133,9 @@ class LocalOpenAIBackend:
             raise CompletionError(
                 f"{self._cfg.name}: backend is closed; cannot complete a request"
             )
+        # Local sampling fields are typed on CompletionRequest and serialized via payload.
+        # Only remote `reasoning` remains a request option; local reasoning stays server_args.
         if request.request_options:
-            # The local adapter applies request fields directly through
-            # ApiClient.complete and cannot silently honour transport
-            # options that would change the model answer.
             if "reasoning" in request.request_options:
                 # V4.1 A2: the local generator receives its reasoning budget
                 # from the SERVER ARGS (--reasoning-budget, see plan §3.4),
@@ -178,6 +177,10 @@ class LocalOpenAIBackend:
                 response_format_json=request.response_schema is not None,
                 label=request.label,
                 on_reasoning_chunk=request.on_reasoning_chunk,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                min_p=request.min_p,
+                seed=request.seed,
             )
         except ApiClientError as exc:
             LOG.error("%s: %s API failure: %s", self._cfg.name, self._api.name, exc)

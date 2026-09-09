@@ -3350,10 +3350,12 @@ class B3AuditRepair:
         entity_backend: Optional[CompletionBackend] = None,
         config: Optional[B3AuditRepairConfig] = None,
         progress: Optional[Any] = None,
+        resolved_role_policies: Optional[Any] = None,
     ) -> None:
         self._audit_backend = audit_backend
         self._repair_backend = repair_backend or audit_backend
         self._config = config or B3AuditRepairConfig()
+        self._resolved_role_policies = resolved_role_policies
         # Entity extraction runs on the audit (Qwen) model; the view adds
         # the missing entity_extractor role without touching backend
         # identity (role resolution only).
@@ -3436,11 +3438,17 @@ class B3AuditRepair:
             return None
         entity_cache = _load_entity_cache(out_dir)
         try:
+            _entity_policy = None
+            if getattr(self, "_resolved_role_policies", None) is not None:
+                try:
+                    _entity_policy = self._resolved_role_policies.policies.get("entity_extractor")
+                except Exception:
+                    _entity_policy = None
             extraction = extract_entity_context(
                 source_artifact=source,
                 extractor=BackendEntityExtractor(
                     self._entity_backend,
-                    config=BackendEntityExtractorConfig(),
+                    config=BackendEntityExtractorConfig(role_policy=_entity_policy) if _entity_policy is not None else BackendEntityExtractorConfig(),
                 ),
                 cache=entity_cache,
                 extractor_version=cfg.extractor_version,
@@ -3553,6 +3561,12 @@ class B3AuditRepair:
                 )
                 self._emit_progress("r_editor_chunk_done", chunk=fields.get("chunk"), total=fields.get("total"), status=fields.get("status"), edit_count=fields.get("edit_count", 0), warning_count=fields.get("warning_count", 0), error=fields.get("error"), reused=fields.get("reused"))
 
+        _russian_policy = None
+        if getattr(self, "_resolved_role_policies", None) is not None:
+            try:
+                _russian_policy = self._resolved_role_policies.policies.get("russian_editor")
+            except Exception:
+                _russian_policy = None
         evaluator = RussianEditorEvaluator(
             self._audit_backend,
             config=RussianEditorConfig(
@@ -3565,6 +3579,7 @@ class B3AuditRepair:
                 max_edits_per_pid=cfg.russian_editor_max_edits_per_pid,
                 retry_max_retries=cfg.russian_editor_retry_max_retries,
                 retry_base_delay_seconds=cfg.russian_editor_retry_base_delay_seconds,
+                role_policy=_russian_policy,
             ),
             on_chunk_event=_journal_r_editor_chunk_event,
             on_progress=on_progress,
@@ -4214,6 +4229,12 @@ class B3AuditRepair:
                 }
                 _save_stage_progress()
 
+            _audit_policy = None
+            if getattr(self, "_resolved_role_policies", None) is not None:
+                try:
+                    _audit_policy = self._resolved_role_policies.policies.get("qwen_audit")
+                except Exception:
+                    _audit_policy = None
             evaluator = ChunkedAuditEvaluator(
                 self._audit_backend,
                 config=ChunkedAuditConfig(
@@ -4223,11 +4244,9 @@ class B3AuditRepair:
                     reasoning_budget=cfg.reasoning_budget,
                     harness_version=cfg.harness_version,
                     prompt_version=cfg.prompt_version,
-                    # R-RETRY (t_8ab8ab35, F5): the chunk-level TRANSPORT_ERROR
-                    # retry policy is wired from the B3 config (identity
-                    # carries it) — never silently left at module defaults.
                     transport_max_retries=cfg.audit_transport_max_retries,
                     transport_base_delay_seconds=cfg.audit_transport_base_delay_seconds,
+                    role_policy=_audit_policy,
                 ),
                 on_chunk_event=_journal_chunk_event,
                 on_progress=_on_audit_progress,
@@ -4441,6 +4460,14 @@ class B3AuditRepair:
                     }
                     _save_stage_progress()
 
+            _repair_policy = None
+            _reaudit_policy = None
+            if getattr(self, "_resolved_role_policies", None) is not None:
+                try:
+                    _repair_policy = self._resolved_role_policies.policies.get("repair")
+                    _reaudit_policy = self._resolved_role_policies.policies.get("qwen_audit")
+                except Exception:
+                    _repair_policy = _reaudit_policy = None
             repair_evaluator = SelectiveRepairEvaluator(
                 self._repair_backend,
                 reaudit_backend=self._audit_backend,
@@ -4448,6 +4475,8 @@ class B3AuditRepair:
                     findings_cap=cfg.repair_findings_cap,
                     microbatch_trigger=cfg.repair_microbatch_trigger,
                     microbatch_target=cfg.repair_microbatch_target,
+                    role_policy=_repair_policy,
+                    reaudit_role_policy=_reaudit_policy,
                     # REPAIR-MAX-TOKENS (owner decision 2026-08-15): wired
                     # from the B3 config (identity carries it) — the repair
                     # output budget is never a silent module default.
@@ -4872,7 +4901,13 @@ class B3AuditRepair:
                         existing_keys[entry.casefold()] = entry
         except Exception:
             pass
-        resolver = GlossaryResolver(self._audit_backend, progress=self._progress)
+        _glossary_policy = None
+        if getattr(self, "_resolved_role_policies", None) is not None:
+            try:
+                _glossary_policy = self._resolved_role_policies.policies.get("glossary_resolver")
+            except Exception:
+                _glossary_policy = None
+        resolver = GlossaryResolver(self._audit_backend, progress=self._progress, role_policy=_glossary_policy)
         _glossary_card = None
         if book_memory_role_views is not None:
             _glossary_card = book_memory_role_views.get("glossary")

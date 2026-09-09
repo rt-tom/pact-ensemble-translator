@@ -42,6 +42,7 @@ from pact_v4.runtime.backend_role_adapters import (
     BackendModelCallerConfig,
     BackendQwenEvaluator,
 )
+from pact_v4.runtime.runtime_config import RoleCallPolicy, OutputBudgetPolicy
 from pact_v4.runtime.gemma_selector import _parse_gemma_preference
 from pact_v4.runtime.local_openai_backend import LocalOpenAIBackend
 from pact_v4.runtime.prompts_runtime import (
@@ -163,6 +164,10 @@ class StubApiClient:
         response_format_json: bool = True,
         label: str = "stub",
         on_reasoning_chunk=None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> str:
         self.calls.append({
             "messages": list(messages),
@@ -174,6 +179,11 @@ class StubApiClient:
             raise AssertionError("StubApiClient: script exhausted")
         return self.script.pop(0)
 
+
+def _dummy_policy(max_tokens: int = 512, per_item: bool = False) -> RoleCallPolicy:
+    if per_item:
+        return RoleCallPolicy(model_key="qwen", request={"temperature": int(0), "max_output_tokens": max_tokens}, output_budget=OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=max_tokens, per_item_tokens=10, ceiling=max_tokens+1024))
+    return RoleCallPolicy(model_key="gemma", request={"temperature": int(0), "max_output_tokens": max_tokens})
 
 def _qwen_pass_verdict() -> str:
     return json.dumps({
@@ -220,7 +230,7 @@ def test_generation_parity_fake_vs_local_backend():
     backend = LocalOpenAIBackend(api=stub)  # type: ignore[arg-type]
     back_caller = BackendModelCaller(
         backend,
-        config=BackendModelCallerConfig(max_tokens=512),
+        config=BackendModelCallerConfig(max_tokens=512, role_policy=_dummy_policy(512)),
     )
     back_outcome = generate_for_chunk(
         chunk_id=chunk.chunk_id,
@@ -266,7 +276,7 @@ def test_qwen_gate_parity():
     ref = _parse_qwen_verdict(canned)
 
     stub = StubApiClient([canned])
-    evaluator = BackendQwenEvaluator(LocalOpenAIBackend(api=stub))  # type: ignore[arg-type]
+    evaluator = BackendQwenEvaluator(LocalOpenAIBackend(api=stub), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendQwenEvaluatorConfig']).BackendQwenEvaluatorConfig(role_policy=_dummy_policy(512, per_item=True)))  # type: ignore[arg-type]
     got = evaluator(source, translation)
 
     assert got == ref
@@ -284,7 +294,7 @@ def test_gemma_gate_parity():
     ref = _parse_gemma_preference(canned, valid_candidate_ids=["A", "B"])
 
     stub = StubApiClient([canned])
-    selector = BackendGemmaSelector(LocalOpenAIBackend(api=stub))  # type: ignore[arg-type]
+    selector = BackendGemmaSelector(LocalOpenAIBackend(api=stub), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendGemmaSelectorConfig']).BackendGemmaSelectorConfig(role_policy=_dummy_policy(512)))  # type: ignore[arg-type]
     got = selector(candidates)
 
     assert got == ref
@@ -327,7 +337,7 @@ def test_selection_parity_fake_vs_local_backend():
         params=make_params(),
         model_caller=BackendModelCaller(
             LocalOpenAIBackend(api=StubApiClient([canned_out, canned_out])),  # type: ignore[arg-type]
-            config=BackendModelCallerConfig(max_tokens=512),
+            config=BackendModelCallerConfig(max_tokens=512, role_policy=_dummy_policy(512)),
         ),
         lazy_balanced=False,
     )
@@ -356,10 +366,10 @@ def test_selection_parity_fake_vs_local_backend():
 
     # --- backend gates ------------------------------------------------------
     back_qwen = BackendQwenEvaluator(
-        LocalOpenAIBackend(api=StubApiClient([canned_qwen, canned_qwen]))  # type: ignore[arg-type]
+        LocalOpenAIBackend(api=StubApiClient([canned_qwen, canned_qwen])), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendQwenEvaluatorConfig']).BackendQwenEvaluatorConfig(role_policy=_dummy_policy(512, per_item=True))  # type: ignore[arg-type]
     )
     back_gemma = BackendGemmaSelector(
-        LocalOpenAIBackend(api=StubApiClient([canned_gemma]))  # type: ignore[arg-type]
+        LocalOpenAIBackend(api=StubApiClient([canned_gemma])), config=__import__('pact_v4.runtime.backend_role_adapters', fromlist=['BackendGemmaSelectorConfig']).BackendGemmaSelectorConfig(role_policy=_dummy_policy(512))  # type: ignore[arg-type]
     )
     back_selection = select_candidate(
         chunk_id=chunk.chunk_id,
@@ -417,7 +427,7 @@ def test_repair_caller_parity_rendered_prompt_is_backend_agnostic():
     ])
     caller = BackendRepairCaller(
         LocalOpenAIBackend(api=stub),  # type: ignore[arg-type]
-        config=BackendRepairCallerConfig(max_tokens=512),
+        config=BackendRepairCallerConfig(max_tokens=512, role_policy=_dummy_policy(512, per_item=True)),
     )
     raw = caller(
         chunk_id="c1", source=source, translation=translation,
@@ -467,7 +477,7 @@ def test_region_fidelity_gate_parity_rendered_prompt_is_backend_agnostic():
     ])
     gate = BackendRegionFidelityGate(
         LocalOpenAIBackend(api=stub),  # type: ignore[arg-type]
-        config=BackendRegionFidelityGateConfig(max_tokens=512),
+        config=BackendRegionFidelityGateConfig(max_tokens=512, role_policy=_dummy_policy(512)),
     )
     result = gate(
         source_text=source_text, repaired_text=repaired_text, region=region,

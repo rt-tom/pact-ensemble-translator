@@ -148,11 +148,16 @@ class BackendModelCallerConfig:
     exponential backoff) by re-issuing the identical request — transport
     failures are never retried here (B4 §1/§3). ``max_tokens`` is the
     generation output budget (chunk-sized, see ``DEFAULT_MAX_TOKENS``).
+    When ``role_policy`` is provided it is the authoritative source for
+    temperature/seed/max_output_tokens (local-model-aliases); the legacy
+    ``max_tokens`` field is then ignored in favor of
+    ``derive_max_output_tokens(role_policy)``.
     """
 
     max_tokens: int = DEFAULT_MAX_TOKENS
     label: str = "phase2b-generation"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendModelCaller:
@@ -182,7 +187,12 @@ class BackendModelCaller:
     ) -> None:
         self._backend = backend
         self._config = config or BackendModelCallerConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        # Policy-owned budget when role_policy present; otherwise legacy field
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
         # V4.1 GEN-REASONING: the reasoning text of the most recent backend
         # completion (raw_metadata['reasoning'], '' when the transport or
         # provider reported none). Exposed for the whole-chapter generation
@@ -262,22 +272,30 @@ class BackendModelCaller:
         if bundle.params.reasoning and _reasoning_transported_via_request_options(
             self._backend, model_ref
         ):
-            # V4.1: Phase 2B generation reasoning budget (0=off, 1=low,
-            # 2=medium, 3=high). Transported via request_options so the
-            # opencode backend can map it to the top-level ``reasoningEffort``
-            # field; 0/absent keeps the historical B1 baseline (no field).
-            # Only the generation caller carries it — the Qwen audit / repair
-            # / formatting adapters never set request_options. V4.1 A2: local
-            # llama-server transports receive the reasoning budget from their
-            # server args (--reasoning-budget), so the request to them must
-            # NOT carry request_options reasoning (LocalOpenAIBackend rejects
-            # it — a library-level guard, plan §3.4/§0.1).
             request_options["reasoning"] = bundle.params.reasoning
+        # Policy-owned sampling (local-model-aliases): when role_policy present, use its request fields
+        _policy = getattr(self._config, "role_policy", None)
+        if _policy is not None:
+            _req = dict(_policy.request)
+            if "temperature" not in _req:
+                raise ValueError("BackendModelCaller: role_policy missing temperature")
+            _temperature = float(_req["temperature"])
+            _top_p = _req.get("top_p")
+            _top_k = _req.get("top_k")
+            _min_p = _req.get("min_p")
+            _seed = _req.get("seed")
+        else:
+            _temperature = float(bundle.params.temperature)
+            _top_p = _top_k = _min_p = _seed = None
         request = CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=user_text),),
             max_output_tokens=self._max_tokens,
-            temperature=bundle.params.temperature,
+            temperature=_temperature,
+            top_p=_top_p,
+            top_k=_top_k,
+            min_p=_min_p,
+            seed=_seed,
             response_schema=JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,
@@ -353,12 +371,16 @@ class BackendQwenEvaluatorConfig:
     (bounded, exponential backoff) by re-issuing the identical request —
     transport failures are never retried here (B4 §1/§3) and still surface
     as a failing ``GateResult``.
+    When ``role_policy`` is provided its ``request`` + ``output_budget``
+    drive temperature and the dynamic max_output_tokens via
+    ``derive_max_output_tokens``.
     """
 
     max_tokens: int = 16384
     template: ReviewerPrompt = QWEN_FIDELITY_V1
     bible_text: str = ""
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendQwenEvaluator:
@@ -381,7 +403,13 @@ class BackendQwenEvaluator:
     ) -> None:
         self._backend = backend
         self._config = config or BackendQwenEvaluatorConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        # Policy-owned budget when role_policy present; otherwise legacy field
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            # derive with dummy count; actual per-call derived in __call__
+            self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -396,18 +424,25 @@ class BackendQwenEvaluator:
             template=self._config.template,
             bible_text=self._config.bible_text,
         )
-        # Floor (config.max_tokens) + per-PID headroom, capped at
-        # MAX_TOKENS_CEILING — see qwen_evaluator.py for the rationale.
-        dynamic_max_tokens = min(
-            MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
-        )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is None:
+            raise ValueError("BackendQwenEvaluator: role_policy is required (no literal fallback)")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendQwenEvaluator: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(
                 self._backend, ("fidelity_reviewer", "qwen_fidelity")
             ),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=0.0,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label="phase2c/qwen_fidelity",
         )
@@ -444,11 +479,13 @@ class BackendGemmaSelectorConfig:
     exponential backoff) by re-issuing the identical request — transport
     failures are never retried here (B4 §1/§3) and still surface as a
     failing ``GateResult``.
+    ``role_policy`` when provided supplies temperature/seed/max_output_tokens.
     """
 
     max_tokens: int = 1024
     template: ReviewerPrompt = GEMMA_RUSSIAN_PREFERENCE_V1
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendGemmaSelector:
@@ -471,7 +508,11 @@ class BackendGemmaSelector:
     ) -> None:
         self._backend = backend
         self._config = config or BackendGemmaSelectorConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -491,13 +532,25 @@ class BackendGemmaSelector:
             candidates=[(cid, dict(mapping)) for cid, mapping in candidates],
             template=self._config.template,
         )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is None:
+            raise ValueError("BackendGemmaSelector: role_policy is required")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendGemmaSelector: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(
                 self._backend, ("russian_selector", "gemma_russian_preference")
             ),
             messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens,
-            temperature=0.0,
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label="phase2c/gemma_russian_preference",
         )
@@ -543,6 +596,9 @@ class BackendQwenAuditEvaluatorConfig:
     ``bible_text`` is the B7 rendered book-memory section appended to the
     audit prompt so the model sees narrator gender, characters, facts, and
     address register when judging fidelity.
+    When ``role_policy`` is provided its ``request`` + ``output_budget``
+    drive temperature and the dynamic max_output_tokens via
+    ``derive_max_output_tokens``.
     """
 
     max_tokens: int = 16384
@@ -550,6 +606,7 @@ class BackendQwenAuditEvaluatorConfig:
     label: str = "phase3/qwen_chapter_audit"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
     bible_text: str = ""
+    role_policy: Optional[Any] = None
 
 
 class BackendQwenAuditEvaluator:
@@ -580,7 +637,11 @@ class BackendQwenAuditEvaluator:
     ) -> None:
         self._backend = backend
         self._config = config or BackendQwenAuditEvaluatorConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -596,19 +657,25 @@ class BackendQwenAuditEvaluator:
             template=self._config.template,
             bible_text=self._config.bible_text,
         )
-        # Floor (config.max_tokens) + per-PID headroom, capped at
-        # MAX_TOKENS_CEILING — same Qwen max_tokens fix as the fidelity
-        # gate (see qwen_evaluator.py for the rationale).
-        dynamic_max_tokens = min(
-            MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
-        )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is None:
+            raise ValueError("BackendQwenAuditEvaluator: role_policy is required")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendQwenAuditEvaluator: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(
                 self._backend, ("qwen_audit", "fidelity_reviewer", "qwen_fidelity")
             ),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=0.0,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
@@ -637,6 +704,8 @@ class BackendGemmaAuditEvaluatorConfig:
     exponential backoff) by re-issuing the identical request — transport
     failures are never retried here (B4 §1/§3) and still raise
     ``CompletionError`` for ``run_chapter_audit`` to record as a failed unit.
+    When ``role_policy`` is provided it supplies temperature/seed/max_output_tokens
+    via ``derive_max_output_tokens``.
     """
 
     max_tokens: int = 4096
@@ -644,6 +713,7 @@ class BackendGemmaAuditEvaluatorConfig:
     label: str = "phase3/gemma_russian_review"
     bible_text: str = ""
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendGemmaAuditEvaluator:
@@ -671,7 +741,11 @@ class BackendGemmaAuditEvaluator:
     ) -> None:
         self._backend = backend
         self._config = config or BackendGemmaAuditEvaluatorConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -684,13 +758,25 @@ class BackendGemmaAuditEvaluator:
             template=self._config.template,
             bible_text=self._config.bible_text,
         )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is None:
+            raise ValueError("BackendGemmaAuditEvaluator: role_policy is required")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendGemmaAuditEvaluator: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(
                 self._backend, ("gemma_audit", "russian_selector", "gemma_russian_preference")
             ),
             messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens,
-            temperature=0.0,
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
@@ -723,12 +809,16 @@ class BackendRepairCallerConfig:
     ``retry`` is the B4 JSON-resilience policy: a truncated-JSON repair body
     is retried (bounded, exponential backoff) by re-issuing the identical
     request — transport failures are never retried here (B4 §2/§3).
+    When ``role_policy`` is provided its ``request`` + ``output_budget``
+    drive temperature and dynamic max_output_tokens via
+    ``derive_max_output_tokens``.
     """
 
     max_tokens: int = 16384
     template: ReviewerPrompt = REPAIR_REGION_V1
     label: str = "phase4/region_repair"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendRepairCaller:
@@ -761,7 +851,11 @@ class BackendRepairCaller:
     ) -> None:
         self._backend = backend
         self._config = config or BackendRepairCallerConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy, item_count=0))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -784,14 +878,23 @@ class BackendRepairCaller:
             findings=[dict(item) for item in findings],
             template=self._config.template,
         )
-        dynamic_max_tokens = min(
-            MAX_TOKENS_CEILING, self._max_tokens + TOKENS_PER_PID * len(translation),
-        )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is None:
+            raise ValueError("BackendRepairCaller: role_policy is required")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        dynamic_max_tokens = int(_derive(policy, item_count=len(translation)))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendRepairCaller: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(self._backend, ("repair", "generator")),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
-            temperature=0.0,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
@@ -815,6 +918,8 @@ class BackendRepairCaller:
 @dataclass(frozen=True)
 class BackendRegionFidelityGateConfig:
     """L2b narrow Qwen re-gate call settings (``region_fidelity_gate``).
+    When ``role_policy`` is provided its ``request`` drives temperature and
+    max_output_tokens via ``derive_max_output_tokens``.
 
     The verdict output is the same short JSON object the full-chunk fidelity
     reviewer returns (parsed via ``_parse_qwen_verdict``), so narrow verdicts
@@ -837,6 +942,7 @@ class BackendRegionFidelityGateConfig:
     batch_template: ReviewerPrompt = REGION_FIDELITY_GATE_BATCH_V1
     label: str = "phase4/region_fidelity_gate"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendRegionFidelityGate:
@@ -868,7 +974,11 @@ class BackendRegionFidelityGate:
     ) -> None:
         self._backend = backend
         self._config = config or BackendRegionFidelityGateConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -883,13 +993,25 @@ class BackendRegionFidelityGate:
             region=region,
             template=self._config.template,
         )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is None:
+            raise ValueError("BackendRegionFidelityGate: role_policy is required")
+        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+        max_tok = int(_derive(policy))
+        req = dict(policy.request)
+        if "temperature" not in req:
+            raise ValueError("BackendRegionFidelityGate: role_policy missing temperature")
         request = CompletionRequest(
             model_ref=_model_ref_for(
                 self._backend, ("fidelity_reviewer", "qwen_fidelity")
             ),
             messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens,
-            temperature=0.0,
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
         )
@@ -951,14 +1073,25 @@ class BackendRegionFidelityGate:
                 items=[dict(item) for item in chunk],
                 template=self._config.batch_template,
             )
-            max_tokens = min(MAX_TOKENS_CEILING, 4096 * len(chunk))
+            policy = getattr(self._config, "role_policy", None)
+            if policy is None:
+                raise ValueError("BackendRegionFidelityGate.batch: role_policy is required")
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tokens = int(_derive(policy, item_count=len(chunk)))
+            req = dict(policy.request)
+            if "temperature" not in req:
+                raise ValueError("BackendRegionFidelityGate.batch: role_policy missing temperature")
             request = CompletionRequest(
                 model_ref=_model_ref_for(
                     self._backend, ("fidelity_reviewer", "qwen_fidelity")
                 ),
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tokens,
-                temperature=0.0,
+                temperature=float(req["temperature"]),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
                 response_schema=JSON_OBJECT_SCHEMA,
                 label=self._config.label,
             )

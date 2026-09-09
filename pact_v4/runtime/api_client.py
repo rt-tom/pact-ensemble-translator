@@ -128,16 +128,27 @@ class ApiClient:
         temperature: float,
         response_format_json: bool = True,
         stream: bool = False,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self._cfg.model,
             "messages": list(messages),
             "max_tokens": int(max_tokens),
             "temperature": float(temperature),
-            "top_p": float(self._cfg.top_p),
-            "top_k": int(self._cfg.top_k),
             "stream": bool(stream),
         }
+        # Policy-owned sampling fields: only send fields explicitly present in the resolved policy/request.
+        if top_p is not None:
+            payload["top_p"] = float(top_p)
+        if top_k is not None:
+            payload["top_k"] = int(top_k)
+        if min_p is not None:
+            payload["min_p"] = float(min_p)
+        if seed is not None:
+            payload["seed"] = int(seed)
         if response_format_json and self._json_response_format_supported:
             payload["response_format"] = {"type": "json_object"}
         return payload
@@ -155,6 +166,10 @@ class ApiClient:
         response_format_json: bool = True,
         label: str = "v4-call",
         on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> str:
         """Send a single chat-completions request, return the model text.
 
@@ -200,6 +215,10 @@ class ApiClient:
                         temperature=temp,
                         response_format_json=response_format_json,
                         on_reasoning_chunk=on_reasoning_chunk,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        seed=seed,
                     )
                     streamed = True
                 except ApiClientError as exc:
@@ -212,6 +231,10 @@ class ApiClient:
                         max_tokens=max_tokens,
                         temperature=temp,
                         response_format_json=response_format_json,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        seed=seed,
                     )
                     data, http_status, fmt_attempted, attempts = self._post_with_retry(
                         payload
@@ -244,6 +267,10 @@ class ApiClient:
                     max_tokens=max_tokens,
                     temperature=temp,
                     response_format_json=response_format_json,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    seed=seed,
                 )
                 data, http_status, fmt_attempted, attempts = self._post_with_retry(
                     payload
@@ -435,6 +462,10 @@ class ApiClient:
         temperature: float,
         response_format_json: bool,
         on_reasoning_chunk: Callable[[str], None],
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        seed: Optional[int] = None,
     ) -> tuple[str, Optional[str], Dict[str, Any], str, int, bool, int]:
         """POST with ``stream=True`` and SSE-iterate ``reasoning_content``.
 
@@ -457,6 +488,10 @@ class ApiClient:
             temperature=temperature,
             response_format_json=response_format_json,
             stream=True,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            seed=seed,
         )
         attempts = 0
         last_error: Optional[Exception] = None
