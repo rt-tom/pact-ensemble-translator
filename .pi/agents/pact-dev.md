@@ -1,7 +1,7 @@
 ---
 name: pact-dev
 description: Implements approved OpenSpec changes and coding tasks.
-model: opencode-go/muse-spark-1.2-contributor
+model: opencode-go/muse-spark-1.3-contributor
 thinking: medium
 async: true
 tools:
