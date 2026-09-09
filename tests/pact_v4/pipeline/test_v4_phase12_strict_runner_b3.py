@@ -836,9 +836,9 @@ def test_b3_verified_only_alias_rejects_substring_of_anchor(tmp_path: Path) -> N
 
 
 def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:
-    """P1 АРКИ (owner decision 2026-08-14): when the run config carries a
+    """P1 АРКИ / CHAPTERS (owner decision 2026-08-14, renamed to CHAPTERS in prompt v7): when the run config carries a
     deterministic arc mapping, the whole-chapter generation prompt includes
-    an 'АРКИ:' block (Bonds → Узы). The block rides inside the book-context
+    a 'CHAPTERS:' block (Bonds → Узы). The block rides inside the book-context
     text, so it is part of the bundle identity (a changed mapping
     invalidates the generation cache)."""
     cfg = _whole_chapter_cfg(
@@ -852,14 +852,14 @@ def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:
     )
     assert result.step6["entity_context_enabled"] is True
 
-    # The whole-chapter generation bundle carried the АРКИ block (the
+    # The whole-chapter generation bundle carried the CHAPTERS block (the
     # prompt is rendered from bundle.bible_text; render_prompt is the same
     # text the model saw).
     from pact_v4.phase2.prompts import render_prompt
 
     assert caller.calls
     prompts = [render_prompt(b) for b in caller.calls]
-    assert any("АРКИ:" in p and "- Bonds → Узы" in p for p in prompts)
+    assert any("CHAPTERS:" in p and "- Bonds → Узы" in p for p in prompts)
 
 
 def test_b3_no_arc_names_no_arc_block(tmp_path: Path) -> None:
@@ -873,6 +873,7 @@ def test_b3_no_arc_names_no_arc_block(tmp_path: Path) -> None:
     assert caller.calls
     prompts = [render_prompt(b) for b in caller.calls]
     assert all("АРКИ:" not in p for p in prompts)
+    assert all("CHAPTERS:" not in p for p in prompts)
 
 
 def test_b3_entity_disabled_skips_prepass(tmp_path: Path) -> None:

@@ -4600,15 +4600,15 @@ def _run_whole_chapter_strict_impl(
                 )
             except Exception:
                 pass
-        # P1 АРКИ (owner decision 2026-08-14): deterministic arc-name block
-        # from arc_names.json so chapter headings translate consistently
-        # (Bonds = Узы in every chapter). Part of the bundle identity via
-        # bible_text — a changed mapping invalidates the generation cache.
+        # P1 АРКИ (owner decision 2026-08-14, renamed to CHAPTERS per 2026-09 prompt v7):
+        # deterministic arc-name block from arc_names.json so chapter headings
+        # translate consistently (Bonds = Узы in every chapter). Part of the
+        # bundle identity via bible_text — a changed mapping invalidates the generation cache.
         if cfg.deterministic_arc_names:
             arcs_block = "\n".join(
                 f"- {en} → {ru}" for en, ru in cfg.deterministic_arc_names
             )
-            gen_bible_text = f"{gen_bible_text}\nАРКИ:\n{arcs_block}"
+            gen_bible_text = f"{gen_bible_text}\nCHAPTERS:\n{arcs_block}"
 
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)
