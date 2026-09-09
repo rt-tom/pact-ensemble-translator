@@ -33,6 +33,17 @@ from pact_v4.runtime.runtime_config import (
 )
 
 REGISTRY_YAML = """\
+role_budgets:
+  generator: {max_output_tokens: 1000}
+  repair: {max_output_tokens: 1000}
+  formatting: {max_output_tokens: 1000}
+  gemma_audit: {max_output_tokens: 1000}
+  qwen_audit: {max_output_tokens: 1000}
+  fidelity_reviewer: {max_output_tokens: 1000}
+  russian_selector: {max_output_tokens: 1000}
+  entity_extractor: {max_output_tokens: 1000}
+  russian_editor: {max_output_tokens: 1000}
+  glossary_resolver: {max_output_tokens: 1000}
 providers:
   opencode-go:
     kind: opencode_server
@@ -118,6 +129,17 @@ def test_load_registry_rejects_flat_model_entry(registry_path: Path):
     # Every model must carry its reasoning contract (acceptance: adding a
     # model REQUIRES variants verification + reasoning_contract fixation).
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
@@ -131,6 +153,17 @@ def test_load_registry_rejects_flat_model_entry(registry_path: Path):
 
 def test_load_registry_requires_reasoning_variants(registry_path: Path):
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
@@ -145,6 +178,17 @@ def test_load_registry_requires_reasoning_variants(registry_path: Path):
 
 def test_load_registry_rejects_unknown_variant(registry_path: Path):
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: opencode_server\n"
@@ -161,6 +205,17 @@ def test_load_registry_rejects_unknown_variant(registry_path: Path):
 
 def test_load_registry_rejects_unsupported_kind(registry_path: Path):
     registry_path.write_text(
+        "role_budgets:\n"
+        "  generator: {max_output_tokens: 1000}\n"
+        "  repair: {max_output_tokens: 1000}\n"
+        "  formatting: {max_output_tokens: 1000}\n"
+        "  gemma_audit: {max_output_tokens: 1000}\n"
+        "  qwen_audit: {max_output_tokens: 1000}\n"
+        "  fidelity_reviewer: {max_output_tokens: 1000}\n"
+        "  russian_selector: {max_output_tokens: 1000}\n"
+        "  entity_extractor: {max_output_tokens: 1000}\n"
+        "  russian_editor: {max_output_tokens: 1000}\n"
+        "  glossary_resolver: {max_output_tokens: 1000}\n"
         "providers:\n"
         "  opencode-go:\n"
         "    kind: codex_cli\n"
@@ -496,7 +551,7 @@ def test_composite_fallback_resolving_to_local_backend_fails_loudly():
         backends={"local": local},
         role_backend_map={"generator": "local"},
     )
-    with pytest.raises(ValueError, match="local backend"):
+    with pytest.raises(ValueError, match="is not routed"):
         apply_role_models(cfg, {"repair": "opencode-go/deepseek-v4-flash"})
 
 

@@ -500,31 +500,21 @@ class LocalLlamaBackendConfig:
 
     def _role_bindings(self) -> Dict[str, str]:
         # Explicit binding for every fixed role, no fallback to another role or default
-        if self.resolved_pair is not None:
-            # Use resolved pair's models: translator for translator roles, reviewer for reviewer roles
-            t_name = self.resolved_pair.translator_model.model_name
-            r_name = self.resolved_pair.reviewer_model.model_name
-            bindings: Dict[str, str] = {}
-            for role in TRANSLATOR_ROLES:
-                bindings[role] = t_name
-            for role in REVIEWER_ROLES:
-                bindings[role] = r_name
-            return bindings
-        # Fallback when no pair yet (config loading before pair resolved):
-        # For backward compat with composite fallback tests, keep old 5-role binding.
-        # Production local execution always has a resolved_pair (fail-closed otherwise),
-        # so this fallback is only for test fixtures / legacy composites.
-        names = self.model_names
+        if self.resolved_pair is None:
+            # Composite test fixtures may declare a local sub-backend that is
+            # not the role owner (remote serves all). Returning empty keeps
+            # descriptor construction valid for those fixtures; normal local
+            # execution is fail-closed via the strict runner's pair check
+            # (build_role_adapters requires pair). Never synthesize fallback
+            # bindings here.
+            return {}
+        t_name = self.resolved_pair.translator_model.model_name
+        r_name = self.resolved_pair.reviewer_model.model_name
         bindings: Dict[str, str] = {}
-        if "gemma" in names:
-            bindings[ROLE_GENERATOR] = names["gemma"]
-            bindings[ROLE_RUSSIAN_SELECTOR] = names["gemma"]
-            bindings[ROLE_GEMMA_AUDIT] = names["gemma"]
-        if "qwen" in names:
-            bindings[ROLE_FIDELITY_REVIEWER] = names["qwen"]
-            bindings[ROLE_QWEN_AUDIT] = names["qwen"]
-        if not bindings and names:
-            bindings["default"] = next(iter(names.values()))
+        for role in TRANSLATOR_ROLES:
+            bindings[role] = t_name
+        for role in REVIEWER_ROLES:
+            bindings[role] = r_name
         return bindings
 
     @property
@@ -1577,8 +1567,7 @@ def _default_role_budgets() -> Dict[str, RoleBudget]:
 def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, RoleBudget]:
     rb_raw = payload.get("role_budgets")
     if rb_raw is None:
-        # Backward compat for tests/fixtures without role_budgets: synthesize defaults
-        return _default_role_budgets()
+        raise ValueError(f"{path}: top-level 'role_budgets' is required (must contain all ten roles {sorted(REQUIRED_ROLES)})")
     if not isinstance(rb_raw, Mapping) or not rb_raw:
         raise ValueError(f"{path}: top-level 'role_budgets' must be a non-empty mapping with all ten roles")
     missing = REQUIRED_ROLES - set(rb_raw.keys())
@@ -1796,20 +1785,6 @@ def build_reasoning_effort_map(
     return {level: nearest_declared_effort(level, variants) for level in (1, 2, 3)}
 
 
-# Roles the runtime resolves through a documented fallback when a composite
-# profile omits them: ``repair`` rides the generator binding
-# (``backend_role_adapters`` resolves ("repair", "generator");
-# ``selective_repair.repair_model_ref`` uses ("generator", "default")) and
-# ``entity_extractor`` is derived from the audit (Qwen) model at runtime
-# (B3 ``_EntityRoleView``). The provider override follows the same chain so
-# ``--translator``/``--reviewer`` do not turn a valid composite into a
-# "role is not routed" error.
-_COMPOSITE_ROLE_FALLBACKS = {
-    ROLE_REPAIR: ROLE_GENERATOR,
-    ROLE_ENTITY_EXTRACTOR: ROLE_QWEN_AUDIT,
-}
-
-
 def _resolve_role_backend(
     role_backend_map: Mapping[str, str],
     bindings_by_backend: Mapping[str, Mapping[str, str]],
@@ -1817,32 +1792,14 @@ def _resolve_role_backend(
 ) -> Optional[str]:
     """The sub-backend serving ``role`` (or ``None`` when unrouted).
 
-    Resolution order mirrors the runtime: an explicit ``role_backend_map``
-    entry wins; else the first sub-backend whose descriptor declares the
-    role; else the documented role fallback (``repair`` -> ``generator``,
-    ``entity_extractor`` -> ``qwen_audit``) resolved the same way (explicit
-    route first, then a sub-backend declaring the fallback role or
-    ``default``). This is the single source of truth shared by
-    ``CompositeBackendConfig.build_descriptor`` (which model ref the role
-    adapters resolve), ``CompositeCompletionBackend`` (which concrete
-    backend serves that ref) and ``apply_role_models`` (where a
-    ``--translator``/``--reviewer`` override lands), so the three can never
-    disagree about which backend serves a role.
+    Resolution is exact: explicit ``role_backend_map`` entry, else the first
+    sub-backend declaring the role. No fallback to another role or ``default``.
     """
     backend_name = role_backend_map.get(role)
     if backend_name is not None:
         return backend_name
     for name, bindings in bindings_by_backend.items():
         if role in bindings:
-            return name
-    fallback_role = _COMPOSITE_ROLE_FALLBACKS.get(role)
-    if fallback_role is None:
-        return None
-    backend_name = role_backend_map.get(fallback_role)
-    if backend_name is not None:
-        return backend_name
-    for name, bindings in bindings_by_backend.items():
-        if fallback_role in bindings or "default" in bindings:
             return name
     return None
 

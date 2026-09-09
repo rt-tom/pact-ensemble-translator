@@ -504,9 +504,14 @@ class StrictRunConfig:
         _resolved_hash = None
         _per_role = {}
         try:
-            if self.resolved_role_policies is not None:
-                _resolved_hash = self.resolved_role_policies.aggregate_hash  # type: ignore[attr-defined]
-                _per_role = {k: v.policy_hash for k, v in self.resolved_role_policies.policies.items()}  # type: ignore[attr-defined]
+            pair = self.resolved_role_policies
+            if pair is not None:
+                if hasattr(pair, "role_budgets"):
+                    _resolved_hash = pair.aggregate_hash  # type: ignore[attr-defined]
+                    _per_role = {k: pair.per_role_hash(k) for k in pair.role_budgets}  # type: ignore[attr-defined]
+                elif hasattr(pair, "policies"):
+                    _resolved_hash = pair.aggregate_hash  # type: ignore[attr-defined]
+                    _per_role = {k: v.policy_hash for k, v in pair.policies.items()}  # type: ignore[attr-defined]
         except Exception:
             _resolved_hash = None
         values = {

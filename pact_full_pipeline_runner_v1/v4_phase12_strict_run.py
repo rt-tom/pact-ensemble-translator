@@ -1186,7 +1186,11 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # Augment preflight with resolved role policies provenance (aggregate + per-role hashes)
     _resolved_for_preflight = _load_resolved_role_policies(None, providers_config=args.providers_config)
     if _resolved_for_preflight is not None:
-        extra = {"resolved_role_policies_hash": _resolved_for_preflight.aggregate_hash, "per_role_hashes": {k: v.policy_hash for k, v in _resolved_for_preflight.policies.items()}}
+        # ResolvedModelPair (model-centric) has role_budgets + per_role_hash
+        if hasattr(_resolved_for_preflight, "role_budgets"):
+            extra = {"resolved_pair_hash": _resolved_for_preflight.aggregate_hash, "per_role_hashes": {k: _resolved_for_preflight.per_role_hash(k) for k in _resolved_for_preflight.role_budgets}}
+        else:
+            extra = {"resolved_role_policies_hash": _resolved_for_preflight.aggregate_hash, "per_role_hashes": {k: v.policy_hash for k, v in _resolved_for_preflight.policies.items()}}
         # monkey-patch report dict for JSON output
         orig_to_dict = preflight_report.to_dict
         def _aug_dict():
@@ -1206,7 +1210,19 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
             print(preflight_report.format_human())
             # also emit provenance line
             if _resolved_for_preflight is not None:
-                print(f"  resolved_role_policies_hash: {_resolved_for_preflight.aggregate_hash}")
+                # handle both pair and legacy
+                h = getattr(_resolved_for_preflight, "aggregate_hash", None)
+                if h is None:
+                    h = "unknown"
+                else:
+                    try:
+                        h = _resolved_for_preflight.aggregate_hash
+                    except Exception:
+                        h = "unknown"
+                if hasattr(_resolved_for_preflight, "role_budgets"):
+                    print(f"  resolved_pair_hash: {h}")
+                else:
+                    print(f"  resolved_role_policies_hash: {h}")
         return 0 if preflight_report.ok else 1
     if not preflight_report.ok:
         LOG.error("Offline preflight failed — refusing to start pipeline:\n%s", preflight_report.format_human())
@@ -1217,15 +1233,23 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     _warn_remote_acknowledgement(backend)
     # Build StrictRunConfig first to obtain resolved_role_policies, then wire onto backend for adapter construction
     cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
-    if getattr(cfg, "resolved_role_policies", None) is not None and getattr(backend, "resolved_role_policies", None) is None:
+    # Wire ResolvedModelPair onto backend (model-centric) – support both names for backward compat
+    _resolved = getattr(cfg, "resolved_role_policies", None) or getattr(cfg, "resolved_pair", None)
+    if _resolved is not None and getattr(backend, "resolved_pair", None) is None and getattr(backend, "resolved_role_policies", None) is None:
         from dataclasses import replace as _replace2
         if isinstance(backend, LocalLlamaBackendConfig):
-            backend = _replace2(backend, resolved_role_policies=cfg.resolved_role_policies)
+            try:
+                backend = _replace2(backend, resolved_pair=_resolved)  # type: ignore[call-arg]
+            except TypeError:
+                backend = _replace2(backend, resolved_role_policies=_resolved)  # type: ignore[call-arg]
         elif isinstance(backend, CompositeBackendConfig):
             new_backends = {}
             for name, sub in backend.backends.items():
-                if isinstance(sub, LocalLlamaBackendConfig) and getattr(sub, "resolved_role_policies", None) is None:
-                    new_backends[name] = _replace2(sub, resolved_role_policies=cfg.resolved_role_policies)
+                if isinstance(sub, LocalLlamaBackendConfig) and getattr(sub, "resolved_pair", None) is None and getattr(sub, "resolved_role_policies", None) is None:
+                    try:
+                        new_backends[name] = _replace2(sub, resolved_pair=_resolved)  # type: ignore[call-arg]
+                    except TypeError:
+                        new_backends[name] = _replace2(sub, resolved_role_policies=_resolved)  # type: ignore[call-arg]
                 else:
                     new_backends[name] = sub
             backend = _replace2(backend, backends=new_backends)

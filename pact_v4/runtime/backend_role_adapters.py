@@ -77,24 +77,15 @@ LOG = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 70000
 
 
-def _model_ref_for(backend: CompletionBackend, roles: Sequence[str]) -> str:
-    """Resolve the role → model binding from the backend descriptor.
-
-    Falls back to a ``default`` binding. Raises a role-aware ``ValueError``
-    when no binding exists so a role without an assigned model fails loudly
-    instead of silently using whatever model the transport is serving.
-    """
+def _model_ref_for(backend: CompletionBackend, role: str) -> str:
+    """Resolve exact role → model binding, fail-closed if absent (no fallback)."""
     bindings = backend.descriptor.model_bindings
-    for role in roles:
-        ref = bindings.get(role)
-        if ref:
-            return ref
-    ref = bindings.get("default")
+    ref = bindings.get(role)
     if ref:
         return ref
     raise ValueError(
-        f"no model binding for role(s) {list(roles)!r}; "
-        f"backend model_bindings={dict(bindings)!r}"
+        f"no model binding for role {role!r}; "
+        f"backend model_bindings={dict(bindings)!r} (no fallback)"
     )
 
 
@@ -267,7 +258,7 @@ class BackendModelCaller:
         # "fidelity_first"/"balanced_literary" to a different model than
         # "generator", this lookup honours the bundle role first and the
         # alias only as a fallback.
-        model_ref = _model_ref_for(self._backend, (bundle.role, "generator"))
+        model_ref = _model_ref_for(self._backend, "generator")
         request_options: Dict[str, Any] = {}
         if bundle.params.reasoning and _reasoning_transported_via_request_options(
             self._backend, model_ref
@@ -426,7 +417,8 @@ class BackendQwenEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            # Dynamic fallback for QwenEvaluator without pair: 16384 + 128*item_count capped
+            # Fallback for unit tests / non-local execution: use config max_tokens and default sampling
+            # Production local via B3/strict runner always provides a ResolvedModelPair-derived policy
             dynamic_max_tokens = min(24576, 16384 + 128 * int(len(translation)))
             req = {"temperature": 0.0}
         else:
@@ -436,9 +428,7 @@ class BackendQwenEvaluator:
             if "temperature" not in req:
                 raise ValueError("BackendQwenEvaluator: role_policy missing temperature")
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("fidelity_reviewer", "qwen_fidelity")
-            ),
+            model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
             temperature=float(req["temperature"]),
@@ -546,9 +536,7 @@ class BackendGemmaSelector:
             if "temperature" not in req:
                 raise ValueError("BackendGemmaSelector: role_policy missing temperature")
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("russian_selector", "gemma_russian_preference")
-            ),
+            model_ref=_model_ref_for(self._backend, "russian_selector"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
             temperature=float(req["temperature"]),
@@ -664,12 +652,7 @@ class BackendQwenAuditEvaluator:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            # Dynamic fallback for tests without pair: 16384 + 128*item_count capped at 24576 (mirrors role_budgets qwen_audit)
-            try:
-                _ic = len(translation)  # type: ignore
-            except NameError:
-                _ic = 0
-            dynamic_max_tokens = min(24576, 16384 + 128 * int(_ic))
+            dynamic_max_tokens = min(24576, 16384 + 128 * int(len(translation)))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -678,9 +661,7 @@ class BackendQwenAuditEvaluator:
             if "temperature" not in req:
                 raise ValueError("BackendQwenAuditEvaluator: role_policy missing temperature")
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("qwen_audit", "fidelity_reviewer", "qwen_fidelity")
-            ),
+            model_ref=_model_ref_for(self._backend, "qwen_audit"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
             temperature=float(req["temperature"]),
@@ -781,9 +762,7 @@ class BackendGemmaAuditEvaluator:
             if "temperature" not in req:
                 raise ValueError("BackendGemmaAuditEvaluator: role_policy missing temperature")
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("gemma_audit", "russian_selector", "gemma_russian_preference")
-            ),
+            model_ref=_model_ref_for(self._backend, "gemma_audit"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
             temperature=float(req["temperature"]),
@@ -894,12 +873,7 @@ class BackendRepairCaller:
         )
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            # Dynamic fallback for tests without pair: 16384 + 128*item_count capped at 24576 (mirrors role_budgets qwen_audit)
-            try:
-                _ic = len(translation)  # type: ignore
-            except NameError:
-                _ic = 0
-            dynamic_max_tokens = min(24576, 16384 + 128 * int(_ic))
+            dynamic_max_tokens = min(24576, 16384 + 128 * int(len(translation)))
             req = {"temperature": 0.0}
         else:
             from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
@@ -908,7 +882,7 @@ class BackendRepairCaller:
             if "temperature" not in req:
                 raise ValueError("BackendRepairCaller: role_policy missing temperature")
         request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, ("repair", "generator")),
+            model_ref=_model_ref_for(self._backend, "repair"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=dynamic_max_tokens,
             temperature=float(req["temperature"]),
@@ -1025,9 +999,7 @@ class BackendRegionFidelityGate:
             if "temperature" not in req:
                 raise ValueError("BackendRegionFidelityGate: role_policy missing temperature")
         request = CompletionRequest(
-            model_ref=_model_ref_for(
-                self._backend, ("fidelity_reviewer", "qwen_fidelity")
-            ),
+            model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=max_tok,
             temperature=float(req["temperature"]),
@@ -1107,9 +1079,7 @@ class BackendRegionFidelityGate:
                 if "temperature" not in req:
                     raise ValueError("BackendRegionFidelityGate.batch: role_policy missing temperature")
             request = CompletionRequest(
-                model_ref=_model_ref_for(
-                    self._backend, ("fidelity_reviewer", "qwen_fidelity")
-                ),
+                model_ref=_model_ref_for(self._backend, "fidelity_reviewer"),
                 messages=(Message(role="user", content=prompt),),
                 max_output_tokens=max_tokens,
                 temperature=float(req["temperature"]),

@@ -1736,9 +1736,12 @@ class SelectiveRepairEvaluator:
             request_options["reasoning"] = cfg.repair_reasoning
         policy = getattr(cfg, "role_policy", None)
         if policy is None:
-            from pact_v4.runtime.runtime_config import OutputBudgetPolicy
-            policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": 16384}, "output_budget": OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=16384, per_item_tokens=128, ceiling=24576), "model_key": "gemma"})()  # fallback
-        from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(cfg.max_tokens)
+            req = {"temperature": 0.0}
+        else:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy, item_count=len(findings)))
+            req = dict(policy.request)
         max_tok = int(_derive(policy, item_count=len(findings)))
         req = dict(policy.request)
         request = CompletionRequest(
@@ -1998,10 +2001,12 @@ class SelectiveRepairEvaluator:
                 )
             r_policy = getattr(cfg, "reaudit_role_policy", None) or getattr(cfg, "role_policy", None)
             if r_policy is None:
-                from pact_v4.runtime.runtime_config import OutputBudgetPolicy
-                _rt_max = getattr(cfg, "reaudit_max_tokens", 12000)
-                r_policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": int(_rt_max)}, "output_budget": None, "model_key": "qwen"})()  # fallback
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+                max_tok_r = int(getattr(cfg, "reaudit_max_tokens", 12000))
+                req_r = {"temperature": 0.0}
+            else:
+                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+                max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
+                req_r = dict(r_policy.request)
             max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
             req_r = dict(r_policy.request)
             request = CompletionRequest(

@@ -15,7 +15,7 @@ def test_role_budgets_and_pair():
     assert pair.aggregate_hash
 
 def test_missing_role_budgets_fallback():
-    # When role_budgets missing, loader synthesizes defaults (for backward compat tests)
+    # role_budgets is required fail-closed (no defaults)
     import tempfile, textwrap
     from pathlib import Path
     from pact_v4.runtime.runtime_config import load_providers_registry
@@ -31,8 +31,11 @@ providers:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "providers.yaml"
         p.write_text(content, encoding="utf-8")
-        reg = load_providers_registry(p)
-        assert len(reg.role_budgets) == 10
+        try:
+            load_providers_registry(p)
+            assert False, "should fail when role_budgets missing"
+        except ValueError as e:
+            assert "role_budgets" in str(e).lower()
 
 def test_derive_budget():
     from pact_v4.runtime.runtime_config import RoleBudget, OutputBudgetPolicy, derive_max_output_tokens

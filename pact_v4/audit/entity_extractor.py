@@ -641,13 +641,9 @@ def _entity_from_payload(item: Any) -> EntityRecord:
     else:
         raise ValueError(f"glossary_worthy must be bool, got {gw!r}")
     mc = item.get("memory_class")
-    if mc is None:
-        mc = "chapter_local"
     if not isinstance(mc, str) or mc not in MEMORY_CLASS_SET:
         raise ValueError(f"memory_class must be one of {MEMORY_CLASSES}, got {mc!r}")
     mw = item.get("memory_worthy")
-    if mw is None:
-        mw = False
     if not isinstance(mw, bool):
         raise ValueError(f"memory_worthy must be bool, got {mw!r}")
     return EntityRecord(
@@ -879,11 +875,7 @@ def validate_entity_context(
     entries: List[ValidationEntry] = []
     records: List[EntityRecord] = []
     for item in entities_raw:
-        try:
-            record = _entity_from_payload(item)
-        except ValueError as exc:
-            entries.append(ValidationEntry(entity=str(item.get("entity", "?")), claim="payload", action="dropped", reason=str(exc)))
-            continue
+        record = _entity_from_payload(item)
         label = f"entity {record.entity!r}"
 
         # Point 2 for the anchor: the anchor PID must exist (normalize first).
@@ -1264,10 +1256,10 @@ class BackendEntityExtractor:
             out_dir.mkdir(parents=True, exist_ok=True)
             reasoning_path = out_dir / "b1.2_entity_reasoning.txt"
         policy = getattr(self._config, "role_policy", None)
-        if policy is not None:
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            max_tok = int(_derive(policy))
-            req = dict(policy.request)
+        if policy is None:
+            # Unit-test fallback: use config max_tokens and default sampling
+            max_tok = int(self._config.max_tokens)
+            req = {"temperature": 0.0}
             request = CompletionRequest(
                 model_ref=_model_ref_for(self._backend, "entity_extractor"),
                 messages=(Message(role="user", content=prompt),),
@@ -1282,22 +1274,24 @@ class BackendEntityExtractor:
                 on_reasoning_chunk=open_reasoning_writer(reasoning_path),
             )
         else:
-            policy = type("DummyPolicy", (), {"request": {"temperature": 0.0}, "output_budget": None, "model_key": "qwen"})()  # fallback
-            max_tok = 12000
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
             req = dict(policy.request)
+            if "temperature" not in req:
+                raise ValueError("BackendEntityExtractor: role_policy missing temperature")
             request = CompletionRequest(
-                model_ref=_model_ref_for(self._backend, "entity_extractor"),
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=max_tok,
-                temperature=float(req["temperature"]),
-                top_p=req.get("top_p"),
-                top_k=req.get("top_k"),
-                min_p=req.get("min_p"),
-                seed=req.get("seed"),
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=self._config.label,
-                on_reasoning_chunk=open_reasoning_writer(reasoning_path),
-            )
+            model_ref=_model_ref_for(self._backend, "entity_extractor"),
+            messages=(Message(role="user", content=prompt),),
+            max_output_tokens=max_tok,
+            temperature=float(req["temperature"]),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            min_p=req.get("min_p"),
+            seed=req.get("seed"),
+            response_schema=JSON_OBJECT_SCHEMA,
+            label=self._config.label,
+            on_reasoning_chunk=open_reasoning_writer(reasoning_path),
+        )
         attempts: List[Tuple[int, str, str]] = []  # (attempt_no, raw, reasoning)
 
         def _complete() -> str:

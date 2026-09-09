@@ -991,8 +991,24 @@ class ChunkedAuditEvaluator:
     ) -> CompletionRequest:
         policy = getattr(self._config, "role_policy", None)
         if policy is None:
-            from pact_v4.runtime.runtime_config import OutputBudgetPolicy
-            policy = type("DummyPolicy", (), {"request": {"temperature": 0.0, "max_output_tokens": 12000}, "output_budget": OutputBudgetPolicy(mode="floor_plus_per_item", floor_tokens=12000, per_item_tokens=128, ceiling=24576), "model_key": "qwen"})()  # fallback
+            # Unit-test fallback: use config's max_tokens and default sampling
+            # Production local execution via B3 always provides a ResolvedModelPair-derived policy,
+            # so this path is only for tests/mocks without pair (fail-closed for local is enforced at B3/strict runner)
+            max_tok = int(self._config.max_tokens)
+            req = {"temperature": 0.0}
+            return CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok,
+                temperature=float(req["temperature"]),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=self._config.label,
+                on_reasoning_chunk=on_reasoning_chunk,
+            )
         from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
         max_tok = int(_derive(policy, item_count=item_count))
         req = dict(policy.request)
