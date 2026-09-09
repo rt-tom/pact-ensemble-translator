@@ -1,25 +1,25 @@
-## 1. Registry contract
+## 1. Registry and fixed role map
 
-- [ ] 1.1 Replace `role_policies` with `models.<alias>.request` (temperature/top_p/top_k/min_p/seed) and `role_budgets` (max_output_tokens/output_budget) for the fixed role set identical to remote. Enforce `model_key` enum, non-empty path/name, `server_args` list-of-strings, `reasoning_budget == --reasoning-budget`, fail-closed on unknown field/type/range/`max_output_tokens` in model request.
-- [ ] 1.2 Keep `local` provider `models` containing production `gemma`/`qwen` with production paths/server_args; validate global alias uniqueness and qualified `local/alias` inside `a/b`.
-- [ ] 1.3 Define fixed `TRANSLATOR_ROLES`/`REVIEWER_ROLES` identical to remote and expose `ResolvedLocalPair` (translator_model, reviewer_model, role_budgets).
+- [ ] 1.1 Define one fixed role mapping, used by local and remote: translator (`generator/repair/russian_selector/gemma_audit/formatting`) and reviewer (`qwen_audit/fidelity_reviewer/entity_extractor/russian_editor/glossary_resolver`). Update remote `TRANSLATOR_ROLES`/`REVIEWER_ROLES`, runtime profiles, defaults, and binding tests to this map.
+- [ ] 1.2 Replace local `role_policies` with top-level shared `role_budgets` (all ten roles, only `max_output_tokens/output_budget`) and model-owned `providers.local.models.<alias>.request` (`temperature/top_p/top_k/min_p/seed`). Validate all shapes/types/ranges and reject model request `max_output_tokens` fail-closed.
+- [ ] 1.3 Retain production `gemma`/`qwen` aliases from `runtime_local.example.yaml`; validate paths/names/string args/reasoning agreement. Define immutable `ResolvedModelPair` and case-insensitive local alias lookup.
 
-## 2. Transport and wiring
+## 2. Transport and producers
 
-- [ ] 2.1 Extend `CompletionRequest/ApiClient/LocalOpenAIBackend` to serialize sampling from model and budget from role (`temperature/top_p/top_k/min_p/seed` + `max_output_tokens`), `min_p` validated, `reasoning` rejected for local.
-- [ ] 2.2 Wire all V4 producers via fixed groups: translator group uses `translator_model.request` + `role_budgets[role]`, reviewer group uses `reviewer_model.request` + `role_budgets[role]`. Remove descriptor introspection in glossary resolver. Budgets derived via single `derive_max_output_tokens(role, item_count)`.
-- [ ] 2.3 Ensure `StrictRunConfig`/`B3` carry `ResolvedLocalPair`; no per-role sampling literal remains.
+- [ ] 2.1 Wire every V4 producer to `ResolvedModelPair`: translator roles take model request from left pair model, reviewer roles from right; final budget from `role_budgets[role]` through one `derive_max_output_tokens` helper. Remove sampling/budget code literals and glossary descriptor introspection.
+- [ ] 2.2 Serialize local `temperature/top_p/top_k/min_p/seed` from selected model and `max_output_tokens` from role budget; local `reasoning` rejected, server args only. Apply to generation/repair/selector/Gemma audit/formatting/Qwen audit/fidelity/re-gate/entity/Russian editor/glossary/B3.
+- [ ] 2.3 Thread resolved pair through strict config, B3, role adapters, formatting and glossary; code must fail closed if normal simple local execution has no pair.
 
-## 3. CLI, preflight, identity
+## 3. CLI, cache, preflight
 
-- [ ] 3.1 CLI `--local` → `nargs="?"` pair `a/b` (bare `a` fail-closed “pair required”), bare `--local` → `gemma/qwen`, inside `a/b` bare `glm` or qualified `local/glm` both accepted as with `remote`. Mutual exclusion with `--remote/--runtime-config/--translator/--reviewer`, delegation forwards `a/b` + `providers-config`, output label `local` vs `local_<a>_<b>`.
-- [ ] 3.2 Preflight resolves same pair/budgets, validates paths/server_args/reasoning agreement, reports sanitized pair + budgets without network/server start.
-- [ ] 3.3 Identity: only routing (`model_path/server_args/alias`) + role budgets are identity-bearing; model `request` (temperature etc) is **not** identity-bearing (overwrite). Update `BackendDescriptor.public_record`/`StrictRunConfig.to_config_artifact`/trial provenance accordingly, bump cache schemas only for budget/routing changes.
+- [ ] 3.1 Implement `book|chapter --local` → `gemma/qwen`, `--local a/b` → left translator/right reviewer, single `a` fail-closed. Resolve components only under local registry; forward pair and providers config through delegation; labels `local` and `local_<a>_<b>`.
+- [ ] 3.2 Preflight resolves/validates same pair plus all shared budgets, paths/server args/reasoning agreement, reports sanitized pair/request/budget data, no network/server start.
+- [ ] 3.3 Routing/server args/budgets remain run identity-bearing. Sampling is excluded from run/output-dir identity but included in each request cache key/provenance: changed sampling must regenerate and overwrite in same directory, never replay stale sample. Update schemas and stale-cache tests accordingly.
 
 ## 4. Tests, docs, verification
 
-- [ ] 4.1 Registry tests: bare → `gemma/qwen`, pair `glm/glimmer` and `local/glm/local/glimmer`, single `a` fail-closed, remote alias under `--local` fail-closed, malformed request/budget fields fail-closed, global alias collision.
-- [ ] 4.2 Transport payload-capture tests for sampling from model + budget from role, both transports, no silent drop, local `reasoning` rejected.
-- [ ] 4.3 One producer test per fixed group (translator vs reviewer) proving sampling from correct model and budget from role, plus overwrite semantics for sampling change (reuse, not new dir).
-- [ ] 4.4 Docs: `V4_BOOK_PIPELINE_INVENTORY_RU.md`, `AGENTS_REFERENCE_RU.md`, help, `providers.yaml` comments — document pair syntax, fixed groups (translator/reviewer), model-owned sampling vs role-owned budgets, overwrite identity, `runtime_local.example.yaml` as doc-only.
-- [ ] 4.5 `openspec validate local-model-aliases --strict`, relevant runtime/adapter/strict/book tests, `git diff --check`; no server/pipeline execution.
+- [ ] 4.1 Tests: bare `gemma/qwen`, explicit `glm/glimmer`, single-alias rejection, remote-under-local rejection, malformed model request/budget/reasoning input, remote fixed-group bindings, pair preflight.
+- [ ] 4.2 Payload-capture: model sampling + role budget for both group positions, all allowed fields, local reasoning rejection/no silent drop.
+- [ ] 4.3 Producer/cache matrix: every role receives correct group model and role budget; changing sampling regenerates only affected group in same output directory; budget/routing change has correct stale-resume behavior.
+- [ ] 4.4 Docs/help: pair syntax, fixed shared groups, model sampling vs role budgets, overwrite semantics, `runtime_local.example.yaml` reference-only status.
+- [ ] 4.5 Run `openspec validate local-model-aliases --strict`, focused runtime/adapter/strict/book tests, `git diff --check`; no server/pipeline execution.

@@ -1,65 +1,88 @@
 ## Context
 
-Remote aliases are resolved from `configs/providers.yaml`; local runs used static `LocalLlamaBackendConfig`. Sampling settings were scattered and role budgets were literals. The new requirement is model-centric: sampling (`temperature/top_p/top_k/min_p/seed`) belongs to the model, output budget (`max_output_tokens/output_budget`) belongs to the role. Role groups are fixed and identical for local and remote.
+Current remote CLI overrides bind only a subset of roles (`TRANSLATOR_ROLES = generator, repair`; `REVIEWER_ROLES = qwen_audit, fidelity_reviewer, russian_selector, entity_extractor`). Current local aliases are role-policy-centric. Neither matches the owner's required model-centric design: two models in every run, fixed groups identical across transports, sampling on models, budgets on roles.
 
 ## Goals / Non-Goals
 
 **Goals**
-- `book|chapter --local` (bare) uses `gemma` (translator) + `qwen` (reviewer) with production paths/server_args, preserving current behavior.
-- `book|chapter --local a/b` requires a pair, each `a`/`b` resolves to a `local` model; `a` supplies all translator roles, `b` all reviewer roles.
-- Sampling is model-owned, budgets role-owned, both validated fail-closed before preflight.
-- Local transport serializes model sampling + role budget; `reasoning` remains server-start only.
-- Sampling changes overwrite in place (not identity-bearing), per owner; routing/budget/alias/server_args remain identity-bearing.
+- Bare `--local` preserves production `gemma` translator + `qwen` reviewer.
+- `--local translator/reviewer` switches both models atomically; one alias is invalid.
+- Fixed groups are the same for local and remote, and no model config can alter them.
+- Sampling is on model; budgets are shared role policy; no model-call setting is a code default.
+- Changed sampling regenerates the affected request in the same output directory; it does not demand a new directory or replay a stale cache.
 
 **Non-Goals**
-- No new local model beyond `gemma`/`qwen`; no `runtime_localN.yaml`.
-- No per-role sampling knobs, no dynamic budget literals in call sites.
-- No change to prompt/retry/parsing/lifecycle; `runtime_local.example.yaml` kept as doc example only, pipeline does not read it.
+- Add no new model in this implementation (schema permits later `glm`/`glimmer`).
+- Do not delete `runtime_local.example.yaml`; it remains a documentation/reference profile, not the simple local runtime source.
+- Do not alter prompts, retries, parsers, lifecycle, or start a server/pipeline.
 
 ## Decisions
 
-### 1. Registry shape (identical role set for local and remote)
+### 1. Shared fixed role map
+
+This is the sole role map for local **and remote**, including alias overrides and runtime profile bindings:
+
+```text
+translator = generator, repair, russian_selector, gemma_audit, formatting
+reviewer   = qwen_audit, fidelity_reviewer, entity_extractor,
+             russian_editor, glossary_resolver
+```
+
+Implementation changes existing `TRANSLATOR_ROLES`/`REVIEWER_ROLES` and adds explicit bindings/fallbacks for all ten roles in remote profiles. No `models.<alias>` field controls role membership. A formatter/auditor model change is therefore always selected by its group position, never by an ad hoc role setting.
+
+### 2. Registry shape
 
 ```yaml
+role_budgets:                       # shared by local and remote
+  generator: {max_output_tokens: 70000}
+  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
+  # all ten fixed roles required
 providers:
   local:
     kind: local_llama
     models:
-      gemma: {model_key: gemma, model_path: C:/..., server_args: [...], reasoning_budget: 2048, request: {temperature: 0.2, seed: 7}}
-      qwen:  {model_key: qwen,  model_path: C:/..., server_args: [...], reasoning_budget: 8192, request: {temperature: 0.0}}
-      # future: glm: {model_key: gemma, ...}  # model_key may differ from alias
-    role_budgets:
-      generator: {max_output_tokens: 70000}
-      repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}}
-      # ... fixed set identical to remote role set
+      gemma:
+        model_key: gemma
+        model_path: C:/...
+        model_name: gemma.gguf
+        server_args: [..., --reasoning-budget, "2048", ...]
+        reasoning_budget: 2048
+        request: {temperature: 0.2, seed: 7}
+      qwen: {model_key: qwen, ...}
 ```
 
-- `models.<alias>` allowed fields: `model_key`, `model_path`, `model_name`, `server_args` (list-of-strings), `reasoning_budget` (must equal `--reasoning-budget` in `server_args`), `request` (only `temperature/top_p/top_k/min_p/seed`, validated type/range; `max_output_tokens` forbidden). Unknown field → fail-closed.
-- `role_budgets` required for every fixed role, same keys for local and remote; each entry is `max_output_tokens` + optional `output_budget` (`mode/base/floor/per_item/per_span/ceiling`). Unknown role/field → fail-closed.
-- Global bare-alias uniqueness as with remote; `local/glm` qualified supported; bare `glm` inside `a/b` resolves via global index.
+`models.<alias>.request` permits only `temperature`, `top_p`, `top_k`, `min_p`, `seed`; it forbids `max_output_tokens`. It is validated type/range fail-closed. Models require a non-empty path/name, string-only `server_args`, and exact `reasoning_budget` agreement with `--reasoning-budget`.
 
-### 2. Fixed role groups (translator / reviewer)
+Top-level `role_budgets` requires all ten role keys, only output-budget fields, and is the sole source of output limit calculations for both transports. This avoids duplicating budgets per provider/model while preserving provider-file ownership.
 
-- `translator_roles = (generator, repair, russian_selector, gemma_audit, formatting)` — always bound to the first alias of the pair (and to `gemma` for bare).
-- `reviewer_roles = (qwen_audit, fidelity_reviewer, entity_extractor, russian_editor, glossary_resolver)` — always bound to the second alias (and to `qwen` for bare).
-- The set never varies per model; adding a model never adds a role.
+### 3. CLI grammar
 
-### 3. CLI pair syntax
-
-- `--local` → `nargs="?"` with bare sentinel, but validation requires: `None` → bare `gemma/qwen`; `a` (single slash-less) → fail-closed “pair required”; `a/b` → two aliases, each resolved fail-closed as local model (reject remote alias). `local/a` qualified inside pair accepted.
-- `--local` mutually exclusive with `--remote/--runtime-config/--translator/--reviewer`. Delegation forwards `a/b` unchanged via `--local a/b --providers-config`.
+- `--local` → default pair `local/gemma` + `local/qwen`.
+- `--local a/b` → local model `a` for translator and local model `b` for reviewer.
+- `--local a` → fail closed (“translator/reviewer pair required”).
+- Each `a` and `b` is looked up only in `providers.local.models`, case-insensitively. Provider-qualified components are deliberately not supported because `/` is the pair delimiter; use aliases unique inside `local`.
+- Same positional semantics as remote (`left=translator`, `right=reviewer`); local/remote/runtime-config/translator/reviewer options remain mutually exclusive.
 
 ### 4. Wiring
 
-- `ResolvedLocalPair = (translator_model: LocalModelAlias, reviewer_model: LocalModelAlias, role_budgets: Mapping[role, OutputBudgetPolicy])` with `derive_max_output_tokens(role, item_count)` using `role_budgets[role]`.
-- Each producer receives `(model_request, role_budget)`: `CompletionRequest.temperature/top_p/...` from `model.request`, `max_output_tokens` from `role_budgets[role].derive(...)`. No fallback literal.
-- `ApiClient/LocalOpenAIBackend` serializes `temperature/top_p/top_k/min_p/seed` from model and `max_output_tokens` from role; `reasoning` rejected for local.
+`ResolvedModelPair(translator_model, reviewer_model, role_budgets)` is immutable. Every producer obtains:
 
-### 5. Identity
+- request sampling from translator model for translator role, reviewer model for reviewer role;
+- final `max_output_tokens` only from `derive_max_output_tokens(role_budgets[role], item_count/span_count)`;
+- local reasoning only from the selected model's `server_args`.
 
-- Sampling (`request`) changes are **not** identity-bearing (overwrite, per owner). `BackendDescriptor`/`StrictRunConfig.to_config_artifact` include only routing (`model_path/server_args`/`alias`), role budgets, and `role_budgets` hash. Cache resume reuses previous outputs after a sampling change — intentional.
-- `run_runtime_preflight` validates alias/pair, server_args/reasoning agreement, and transport field support, and reports sanitized pair + budgets without network/server start.
+All ten producers (generation, repair, selector, Gemma audit, formatting, Qwen audit, fidelity/re-gate, entity extractor, Russian editor, glossary resolver) receive that resolved pair. `ApiClient` only serializes sampling explicitly in that model request and limit explicitly derived from role budget.
 
-## Risks / Migration
+### 5. Cache and provenance
 
-Pair requirement is breaking for single-alias callers (intentional). Bare `--local` preserves old behavior. `role_budgets` identical for local/remote ensures a budget change invalidates the correct role cache (still identity-bearing), while sampling changes do not.
+Routing (`translator/reviewer aliases`, path/name/server args) and shared role budgets are run identity-bearing. Sampling is excluded from run/output-directory identity, so changing `temperature` does not force a new out-base.
+
+Sampling is included in each request-level cache key and provenance. A sampling change yields a cache miss, regenerates the affected output, and overwrites it in the same directory. It must not reuse an older sample. Trial records report both run routing/budget identity and per-call sampling fingerprint.
+
+### 6. Preflight
+
+Preflight resolves precisely the same default/pair, checks both models' path/server args/reasoning agreement plus budget/request shapes, and prints sanitized pair, model requests, and role budgets without network/server side effects.
+
+## Migration / Risks
+
+`--local a` becomes deliberately invalid; bare `--local` stays compatible. Existing remote routing changes to the owner-approved fixed groups, so focused remote binding regression tests are required. Sampling-cache behavior is intentionally revised from “new output directory” to “regenerate/overwrite in place”.
