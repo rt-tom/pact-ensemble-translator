@@ -49,6 +49,7 @@ class _MockBackend(CompletionBackend):
         "default": "qwen-3.6-35b",
         "qwen_audit": "qwen-3.6-35b",
         "fidelity_reviewer": "qwen-3.6-35b",
+        "russian_editor": "qwen-3.6-35b",
     }
 
     def __init__(
@@ -1338,6 +1339,32 @@ def test_evaluator_empty_translation_rejected() -> None:
     evaluator = RussianEditorEvaluator(backend)
     with pytest.raises(ValueError):
         evaluator(chapter_id="0001", translation={})
+
+
+def test_evaluator_exact_russian_editor_binding_fail_closed() -> None:
+    """Exact-role contract: the editor resolves ONLY ``russian_editor``.
+
+    A backend binding ``qwen_audit`` (the same reviewer model) but no
+    ``russian_editor`` role must fail closed — role-to-role fallback is
+    forbidden even though the same model usually serves both roles.
+    """
+    from pact_v4.audit.russian_editor import russian_editor_model_ref
+
+    class _NoEditorBinding(_MockBackend):
+        _BINDINGS = {
+            "default": "qwen-3.6-35b",
+            "qwen_audit": "qwen-3.6-35b",
+        }
+
+    backend = _NoEditorBinding()
+    assert backend.descriptor.model_bindings.get("qwen_audit") == "qwen-3.6-35b"
+    with pytest.raises(ValueError, match="russian_editor"):
+        russian_editor_model_ref(backend)
+    evaluator = RussianEditorEvaluator(backend)
+    with pytest.raises(ValueError, match="russian_editor"):
+        evaluator(chapter_id="0001", translation={"p00001": "\u041f\u0440\u0438\u0432\u0435\u0442 \u043c\u0438\u0440"})
+    # The exact binding resolves when present (reviewer model under its own role).
+    assert russian_editor_model_ref(_MockBackend()) == "qwen-3.6-35b"
 
 
 def test_outcome_payload_roundtrip() -> None:

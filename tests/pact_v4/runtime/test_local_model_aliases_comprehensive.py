@@ -82,7 +82,18 @@ class _FakeBackend:
     def complete(self, request: CompletionRequest):
         self.last_request = request
         from pact_v4.runtime.backend_protocol import CompletionResponse
-        return CompletionResponse(text='{"ok": true}', provider="test", model=request.model_ref, finish_reason="stop", usage={}, wall_seconds=0.1, request_id=None, session_id=None, retry_count=0, raw_metadata={})
+        import json as _json
+        # Role-aware canned payloads so every real producer succeeds through
+        # its genuine parse path (no fabrication, no skips): glossary needs
+        # {"proposals": [...]}, formatting needs {"mappings": [...]}.
+        _label = str(getattr(request, "label", "") or "")
+        if "glossary" in _label:
+            _text = _json.dumps({"proposals": []})
+        elif "formatting" in _label:
+            _text = _json.dumps({"mappings": []})
+        else:
+            _text = '{"ok": true}'
+        return CompletionResponse(text=_text, provider="test", model=request.model_ref, finish_reason="stop", usage={}, wall_seconds=0.1, request_id=None, session_id=None, retry_count=0, raw_metadata={})
 
 
 def test_payload_captures_all_sampling_fields(tmp_path):
@@ -454,26 +465,13 @@ def test_all_ten_producers_capture_completion_requests(tmp_path):
             class _Region: pid="p00001"; start=0; end=5
             rc(chunk_id="c", source={"p00001":"Hello"}, translation={"p00001":"Привет"}, region=_Region(), findings=[{"pid":"p00001","category":"omission","note":"x","excerpt":"y"}])
         elif role == "formatting":
-            # Actually invoke formatting via resolve_format_mappings with fake backend adapter
+            # Real producer: resolve_format_mappings through the REAL
+            # _FormattingBackendClient (exact formatting binding + pair
+            # sampling) over the fake backend.
             from pact_v4.phase5.formatting import resolve_format_mappings
             from pact_v4.phase0b.source_html import SourceBlock, SourceSpan
-            class _FmtGen:
-                def __init__(self, text): self.content=text; self.text=text; self.finish_reason="stop"; self.usage={"prompt_tokens": 5}; self.reasoning=""; self.reasoning_content=""; self.response_format_attempted=True
-            class _FmtClient:
-                def __init__(self, be, pol):
-                    self._be = be
-                    self._pol = pol
-                def complete(self, messages, cfg, max_tokens, label=None):
-                    # Capture CompletionRequest via backend
-                    from pact_v4.runtime.backend_protocol import CompletionRequest, Message, JSON_OBJECT_SCHEMA
-                    req_vals = dict(self._pol.request)
-                    from pact_v4.runtime.backend_protocol import CompletionRequest as _CR, Message as _Msg, JSON_OBJECT_SCHEMA as _JS
-                    cr = _CR(model_ref=self._be.descriptor.model_bindings.get("formatting", "test"), messages=(_Msg(role="user", content=str(messages)),), max_output_tokens=max_tokens, temperature=float(req_vals["temperature"]) if "temperature" in req_vals else None, top_p=req_vals.get("top_p"), top_k=req_vals.get("top_k"), min_p=req_vals.get("min_p"), seed=req_vals.get("seed"), response_schema=_JS, label=label or "formatting")
-                    self._be.last_request = cr
-                    # Return empty mappings
-                    import json
-                    return _FmtGen(json.dumps({"mappings": []}))
-            fmt_client = _FmtClient(backend, policy)
+            from pact_full_pipeline_runner_v1.v4_book_run import _FormattingBackendClient
+            fmt_client = _FormattingBackendClient(backend, runtime=None, role_policy=policy)
             blocks = [SourceBlock(pid="p00001", index=0, tag="p", text="Hello world", html="<p>Hello world</p>", structural_role="body", inline_spans=(SourceSpan(span_id="s1", tag="em", text="world", attrs={}, occurrence=1),), word_count=2)]
             translations = {"p00001": "Привет мир"}
             resolve_format_mappings(fmt_client, {}, blocks, translations, out_dir=None, role_policy=policy)
@@ -491,29 +489,18 @@ def test_all_ten_producers_capture_completion_requests(tmp_path):
             # fall through
         elif role == "glossary_resolver":
             from pact_v4.pipeline.glossary_resolver import GlossaryResolver
-            # Minimal entity records: one proper name entity with single occurrence
+            # Entity record in the resolver's real shape (entity/canonical_type/aliases).
             class _Ent:
-                term="John"; kind="person"; pids=("p00001",)
-            # Use resolver with role_policy
+                entity = "John"
+                canonical_type = "person"
+                aliases = ()
             resolver = GlossaryResolver(backend, role_policy=policy)
-            # Build minimal source/translation maps
-            source_map = {"p00001": "Hello John"}
-            translations_map = {"p00001": "Привет Джон"}
-            allowed = {"John": {"p00001"}}
-            try:
-                resolver.resolve(chapter_id="0001", entity_records=[_Ent()], source_map=source_map, translations=translations_map, allowed_pids=allowed, out_dir=None)
-            except Exception:
-                pass
-            # If backend not called due to validation, manually ensure request via direct CompletionRequest capture
-            if backend.last_request is None:
-                from pact_v4.runtime.backend_protocol import CompletionRequest, Message, JSON_OBJECT_SCHEMA
-                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-                tok = int(_derive(policy))
-                vals = dict(policy.request)
-                backend.last_request = CompletionRequest(model_ref=backend.descriptor.model_bindings.get("glossary_resolver", "test"), messages=(Message(role="user", content="dummy"),), max_output_tokens=tok, temperature=float(vals["temperature"]) if "temperature" in vals else None, response_schema=JSON_OBJECT_SCHEMA, label="glossary_resolver")
+            result = resolver.resolve(chapter_id="0001", entity_records=[_Ent()], source_map={"p00001": "Hello John"}, translations={"p00001": "Привет Джон"}, allowed_pids={"John": {"p00001"}}, out_dir=None)
+            # The real producer must succeed through its genuine parse path
+            # (fake backend answers {"proposals": []}) — no fabrication.
+            assert result is not None, "glossary_resolver must succeed via real producer"
+            assert result.get("raw_proposals") == []
             # fall through
-        else:
-            continue
         rq = backend.last_request
         assert rq is not None, f"{role} should have captured request"
         # Verify all sampling fields are from correct group
@@ -567,7 +554,7 @@ def test_repair_reaudit_capture(tmp_path):
                 return CompletionResponse(text=json.dumps({"issues":[]}), provider="test", model=request.model_ref, finish_reason="stop", usage={}, wall_seconds=0.1, request_id=None, session_id=None, retry_count=0, raw_metadata={})
             else:
                 repair_requests.append(request)
-                return CompletionResponse(text=json.dumps({"results":[{"index":1,"decision":"repair","pid":"p00001","repaired_translation":"Привет","reason":"ok"}]}), provider="test", model=request.model_ref, finish_reason="stop", usage={}, wall_seconds=0.1, request_id=None, session_id=None, retry_count=0, raw_metadata={})
+                return CompletionResponse(text=json.dumps({"results":[{"index":1,"decision":"repair","pid":"p00001","repaired_translation":"Привет, мир","reason":"ok"}]}), provider="test", model=request.model_ref, finish_reason="stop", usage={}, wall_seconds=0.1, request_id=None, session_id=None, retry_count=0, raw_metadata={})
     cap_backend = _CaptureBackend(bindings)
     # Separate backend for reaudit to distinguish
     class _ReauditBackend(_FakeBackend):
@@ -579,46 +566,27 @@ def test_repair_reaudit_capture(tmp_path):
             return CompletionResponse(text=json.dumps({"issues":[]}), provider="test", model=request.model_ref, finish_reason="stop", usage={}, wall_seconds=0.1, request_id=None, session_id=None, retry_count=0, raw_metadata={})
     reaudit_be = _ReauditBackend(bindings)
     evaluator = SelectiveRepairEvaluator(cap_backend, reaudit_backend=reaudit_be, config=cfg)
-    # Actually trigger repair + re-audit via selective repair evaluate method if available, else direct reaudit call
-    # Try to invoke evaluator on a single finding to force reaudit
-    try:
-        # Use the public API: evaluator.repair or evaluator.__call__ if exists
-        # Fallback: directly simulate reaudit via the reaudit backend
-        from pact_v4.repair.selective_repair import RepairInput
-        # If RepairInput exists, try simple call; otherwise just verify config and manually trigger reaudit request
-        if hasattr(evaluator, "repair"):
-            evaluator.repair(chapter_id="0001", source={"p00001": "Hello"}, translation={"p00001": "Привет"}, findings=[{"pid":"p00001","category":"omission","note":"x","excerpt":"y"}])
-        elif hasattr(evaluator, "__call__"):
-            evaluator(chapter_id="0001", source={"p00001": "Hello"}, translation={"p00001": "Привет"}, findings=[{"pid":"p00001","category":"omission","note":"x","excerpt":"y"}])
-        else:
-            # Directly invoke reaudit backend to capture request
-            from pact_v4.runtime.backend_protocol import CompletionRequest, Message, JSON_OBJECT_SCHEMA
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            tok = int(_derive(qwen_policy, item_count=1))
-            vals = dict(qwen_policy.request)
-            req = CompletionRequest(model_ref=bindings["qwen_audit"], messages=(Message(role="user", content="reaudit"),), max_output_tokens=tok, temperature=float(vals["temperature"]) if "temperature" in vals else None, response_schema=JSON_OBJECT_SCHEMA, label="reaudit")
-            reaudit_be.complete(req)
-    except Exception:
-        # Ensure reaudit request captured even on error
-        if not reaudit_requests:
-            from pact_v4.runtime.backend_protocol import CompletionRequest, Message, JSON_OBJECT_SCHEMA
-            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
-            tok = int(_derive(qwen_policy, item_count=1))
-            vals = dict(qwen_policy.request)
-            req = CompletionRequest(model_ref=bindings["qwen_audit"], messages=(Message(role="user", content="reaudit"),), max_output_tokens=tok, temperature=float(vals["temperature"]) if "temperature" in vals else None, response_schema=JSON_OBJECT_SCHEMA, label="reaudit")
-            reaudit_be.complete(req)
+    # Invoke the REAL public API with one CONFIRMED Tier-A finding: the fake
+    # repair backend answers decision=repair (committed) which triggers the
+    # real re-audit path on the reaudit backend (answers {"issues": []}).
+    # No fabrication, no try/except fallback — the invocation must succeed.
+    from pact_v4.audit.hard_filters import FilteredIssue
+    issue = {"id": "p00001", "category": "omission", "severity": "major", "confidence": "high", "note": "x", "excerpt": "y"}
+    filtered = [FilteredIssue(issue=issue, verdict="confirmed", filter_name="test", reason="test")]
+    outcome = evaluator(chapter_id="0001", source={"p00001": "Hello"}, translation={"p00001": "Привет"}, filtered=filtered)
+    assert outcome.committed, "repair must commit via the fake backend"
+    assert outcome.reaudit is not None, "a commit must trigger the real re-audit path"
     # Verify both sampling and budget captured
     assert evaluator._config.reaudit_role_policy.request["temperature"] == 0.3
     assert evaluator._config.role_policy.request["temperature"] == 0.7
-    assert len(repair_requests) >= 1 or len(reaudit_requests) >= 1, "must have captured at least one repair/reaudit request"
-    # Verify reaudit request has reviewer sampling
-    if reaudit_requests:
-        rq = reaudit_requests[0]
-        assert rq.temperature == 0.3
-        # top_p etc are optional for remote empty sampling; if present check, else allow None
-        if rq.top_p is not None:
-            assert rq.top_p == 0.95
-        assert rq.max_output_tokens == int(qwen_budget.max_output_tokens) or rq.max_output_tokens > 0
+    assert len(repair_requests) >= 1, "must have captured the repair request"
+    assert len(reaudit_requests) >= 1, "must have captured the re-audit request"
+    # Verify repair request has translator sampling and reaudit has reviewer sampling
+    assert repair_requests[0].temperature == 0.7
+    rq = reaudit_requests[0]
+    assert rq.temperature == 0.3
+    assert rq.top_p == 0.95
+    assert rq.max_output_tokens == int(qwen_budget.max_output_tokens) or rq.max_output_tokens > 0
 
 
 def test_same_directory_cache_overwrite(tmp_path):
@@ -815,11 +783,35 @@ providers:
             rc = BackendRepairCaller(be, config=BackendRepairCallerConfig(role_policy=pol))
             class _Region: pid="p00001"; start=0; end=5
             rc(chunk_id="c", source={"p00001":"Hello"}, translation={"p00001":"Привет"}, region=_Region(), findings=[{"pid":"p00001","category":"omission","note":"x","excerpt":"y"}])
+        elif role == "formatting":
+            # Real producer: resolve_format_mappings through the REAL
+            # _FormattingBackendClient (exact formatting binding + pair
+            # sampling) over the fake backend.
+            from pact_v4.phase5.formatting import resolve_format_mappings
+            from pact_v4.phase0b.source_html import SourceBlock, SourceSpan
+            from pact_full_pipeline_runner_v1.v4_book_run import _FormattingBackendClient
+            fmt_client = _FormattingBackendClient(be, runtime=None, role_policy=pol)
+            _blocks = [SourceBlock(pid="p00001", index=0, tag="p", text="Hello world", html="<p>Hello world</p>", structural_role="body", inline_spans=(SourceSpan(span_id="s1", tag="em", text="world", attrs={}, occurrence=1),), word_count=2)]
+            resolve_format_mappings(fmt_client, {}, _blocks, {"p00001": "Привет мир"}, out_dir=None, role_policy=pol)
+        elif role == "entity_extractor":
+            from pact_v4.audit.entity_extractor import BackendEntityExtractor, BackendEntityExtractorConfig
+            ee = BackendEntityExtractor(be, config=BackendEntityExtractorConfig(role_policy=pol))
+            ee(chapter_id="0001", source={"p00001": "Hello world"})
+        elif role == "russian_editor":
+            from pact_v4.audit.russian_editor import RussianEditorEvaluator, RussianEditorConfig
+            re_eval = RussianEditorEvaluator(be, config=RussianEditorConfig(role_policy=pol))
+            re_eval(chapter_id="0001", translation={"p00001": "Привет мир"})
+        elif role == "glossary_resolver":
+            from pact_v4.pipeline.glossary_resolver import GlossaryResolver
+            class _EntAllTen:
+                entity = "John"
+                canonical_type = "person"
+                aliases = ()
+            resolver = GlossaryResolver(be, role_policy=pol)
+            _gres = resolver.resolve(chapter_id="0001", entity_records=[_EntAllTen()], source_map={"p00001": "Hello John"}, translations={"p00001": "Привет Джон"}, allowed_pids={"John": {"p00001"}}, out_dir=None)
+            assert _gres is not None, "glossary_resolver must succeed via real producer"
         else:
-            # formatting, entity_extractor, russian_editor, glossary_resolver: verify sampling/budget without backend call
-            expected_temp = 0.7 if role in TRANSLATOR_ROLES else 0.3
-            assert s["temperature"] == expected_temp
-            continue
+            raise AssertionError(f"unhandled role {role!r} — every one of the ten roles must invoke its real producer")
         assert be.last_request is not None, f"{role} must capture request"
         assert be.last_request.temperature == s["temperature"]
     # Repair re-audit capture (requires explicit reaudit_role_policy, no fallback)

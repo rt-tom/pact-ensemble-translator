@@ -217,8 +217,8 @@ def test_build_formatting_client_default_path_without_runtime_config_non_mocked(
             self.span_id = span_id_
             self.calls = 0
             self.last_model_ref = None
-            # descriptor with generator binding so _FormattingBackendClient resolves role "generator"
-            self.descriptor = type("D", (), {"model_bindings": {"generator": "stub-model", "default": "stub-model"}})()
+            # descriptor with exact formatting binding so _FormattingBackendClient resolves role "formatting"
+            self.descriptor = type("D", (), {"model_bindings": {"formatting": "stub-model"}})()
         def complete(self, req):
             self.calls += 1
             self.last_model_ref = getattr(req, "model_ref", None)
@@ -251,8 +251,8 @@ def test_build_formatting_client_default_path_without_runtime_config_non_mocked(
     assert client is not None, "default path without --runtime-config must yield a formatting client, not None"
     assert isinstance(client, v4_book_run._FormattingBackendClient)
     assert client._backend is stub_backend
-    # generator role must be resolved (descriptor carries generator binding)
-    assert stub_backend.descriptor.model_bindings.get("generator") == "stub-model"
+    # exact formatting role must be resolved (descriptor carries formatting binding)
+    assert stub_backend.descriptor.model_bindings.get("formatting") == "stub-model"
 
     # --- prove run_book with this REAL client actually calls resolve_format_mappings and restores <em> ---
     memory = _setup_memory(tmp_path)

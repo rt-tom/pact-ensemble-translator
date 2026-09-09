@@ -79,6 +79,7 @@ class _B3MockBackend(CompletionBackend):
         "qwen_audit": "qwen-3.6-35b",
         "fidelity_reviewer": "qwen-3.6-35b",
         "entity_extractor": "qwen-3.6-35b",
+        "russian_editor": "qwen-3.6-35b",
     }
 
     def __init__(
