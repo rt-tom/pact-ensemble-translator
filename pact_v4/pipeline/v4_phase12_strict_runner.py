@@ -273,6 +273,7 @@ class StrictRunConfig:
     memory_dir: Path
     out_dir: Path
     backend: BackendRuntimeConfig
+    resolved_role_policies: Optional[Any] = None
     min_chunk_words: int = DEFAULT_MIN_WORDS
     target_chunk_words: int = DEFAULT_TARGET_WORDS
     max_chunk_words: int = DEFAULT_MAX_WORDS

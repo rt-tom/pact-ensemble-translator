@@ -320,6 +320,8 @@ class SelectiveRepairConfig:
     repair_context_window_by_category: Mapping[str, int] = field(
         default_factory=lambda: dict(DEFAULT_REPAIR_CONTEXT_WINDOW_BY_CATEGORY)
     )
+    role_policy: Optional[Any] = None
+    reaudit_role_policy: Optional[Any] = None
     reaudit_enabled: bool = True
     reaudit_neighbour_window: int = DEFAULT_REAUDIT_NEIGHBOUR_WINDOW
     # REPAIR-CTX (t_97b31f81): the re-audit is a CHUNKED audit over the
@@ -1732,16 +1734,36 @@ class SelectiveRepairEvaluator:
             self._repair_backend, model_ref
         ):
             request_options["reasoning"] = cfg.repair_reasoning
-        request = CompletionRequest(
-            model_ref=model_ref,
-            messages=(Message(role="user", content=prompt),),
-            max_output_tokens=cfg.max_tokens,
-            temperature=0.0,
-            response_schema=JSON_OBJECT_SCHEMA,
-            label=cfg.label,
-            on_reasoning_chunk=open_reasoning_writer(reason_path),
-            request_options=request_options,
-        )
+        policy = getattr(cfg, "role_policy", None)
+        if policy is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy, item_count=len(findings)))
+            req = dict(policy.request)
+            request = CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok,
+                temperature=float(req.get("temperature", 0)),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=cfg.label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
+                request_options=request_options,
+            )
+        else:
+            request = CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=cfg.max_tokens,
+                temperature=float(0),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=cfg.label,
+                on_reasoning_chunk=open_reasoning_writer(reason_path),
+                request_options=request_options,
+            )
         try:
             response = self._repair_backend.complete(request)
         except Exception as exc:  # CompletionError and any transport-level failure
@@ -1983,15 +2005,34 @@ class SelectiveRepairEvaluator:
                 reason_path = out_dir / (
                     f"{out_base}_reaudit_chunk{chunk_index}_reasoning.txt"
                 )
-            request = CompletionRequest(
-                model_ref=model_ref,
-                messages=(Message(role="user", content=prompt),),
-                max_output_tokens=cfg.reaudit_max_tokens,
-                temperature=0.0,
-                response_schema=JSON_OBJECT_SCHEMA,
-                label=cfg.reaudit_label,
-                on_reasoning_chunk=open_reasoning_writer(reason_path),
-            )
+            r_policy = getattr(cfg, "reaudit_role_policy", None) or getattr(cfg, "role_policy", None)
+            if r_policy is not None:
+                from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+                max_tok_r = int(_derive(r_policy, item_count=len(chunk_pairs)))
+                req_r = dict(r_policy.request)
+                request = CompletionRequest(
+                    model_ref=model_ref,
+                    messages=(Message(role="user", content=prompt),),
+                    max_output_tokens=max_tok_r,
+                    temperature=float(req_r.get("temperature", 0)),
+                    top_p=req_r.get("top_p"),
+                    top_k=req_r.get("top_k"),
+                    min_p=req_r.get("min_p"),
+                    seed=req_r.get("seed"),
+                    response_schema=JSON_OBJECT_SCHEMA,
+                    label=cfg.reaudit_label,
+                    on_reasoning_chunk=open_reasoning_writer(reason_path),
+                )
+            else:
+                request = CompletionRequest(
+                    model_ref=model_ref,
+                    messages=(Message(role="user", content=prompt),),
+                    max_output_tokens=cfg.reaudit_max_tokens,
+                    temperature=float(0),
+                    response_schema=JSON_OBJECT_SCHEMA,
+                    label=cfg.reaudit_label,
+                    on_reasoning_chunk=open_reasoning_writer(reason_path),
+                )
 
             def _complete() -> str:
                 # Re-issues the IDENTICAL request on a retry (same prompt,

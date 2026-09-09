@@ -477,12 +477,16 @@ def load_and_validate_sidecar(
     return payload, None
 
 class GlossaryResolver:
-    """Batched LLM resolver on reviewer transport."""
+    """Batched LLM resolver on reviewer transport.
+    Takes an explicit ``RoleCallPolicy`` (glossary_resolver) — no descriptor
+    introspection for hidden temperature/top_p/seed values.
+    """
 
-    def __init__(self, backend: CompletionBackend, *, progress: Optional[Any] = None, usage_sink: Optional[Any] = None):
+    def __init__(self, backend: CompletionBackend, *, progress: Optional[Any] = None, usage_sink: Optional[Any] = None, role_policy: Optional[Any] = None):
         self._backend = backend
         self._progress = progress
         self._usage_sink = usage_sink
+        self._role_policy = role_policy
 
     def resolve(
         self,
@@ -503,34 +507,18 @@ class GlossaryResolver:
             LOG.warning("glossary_resolver: no reviewer binding, fail-closed")
             return None
         prompt = render_resolver_prompt(entity_records, allowed_pids, translations, source_map, role_view_card=role_view_card)
-        # Reuse reviewer role's configured max_output_tokens unchanged (no hard-code, no clamp)
-        # Spec D8: inherit reviewer max_output_tokens as is; do not introduce separate 4096/16384 budget
-        _reviewer_max_tokens = None
+        policy = getattr(self, "_role_policy", None)
+        if policy is None:
+            LOG.warning("glossary_resolver: no RoleCallPolicy, fail-closed")
+            return None
+        try:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            tok = int(_derive(policy))
+            req_vals = dict(policy.request)
+        except Exception as exc:
+            LOG.warning("glossary_resolver: policy derive failed %r", exc)
+            return None
         _reviewer_reasoning = None
-        _reviewer_temperature = 0.0
-        _reviewer_seed = None
-        try:
-            desc = getattr(self._backend, "descriptor", None)
-            eff = getattr(desc, "effective_options", {}) if desc is not None else {}
-            # effective_options may be MappingProxyType (not dict), so check Mapping
-            try:
-                _reviewer_max_tokens = eff.get("max_output_tokens") or eff.get("default_max_output_tokens") or eff.get("reviewer_max_output_tokens")  # type: ignore[attr-defined]
-            except Exception:
-                _reviewer_max_tokens = None
-            if _reviewer_max_tokens is None:
-                _reviewer_max_tokens = getattr(self._backend, "_max_tokens", None) or getattr(self._backend, "max_output_tokens", None)
-            # No hard-coded fallback (4096/16384) and no clamp — use reviewer budget as is
-        except Exception:
-            _reviewer_max_tokens = None
-        if _reviewer_max_tokens is None:
-            LOG.warning("glossary_resolver: reviewer max_output_tokens unknown, fail-closed (reuse unchanged)")
-            return None
-        try:
-            tok = int(_reviewer_max_tokens)
-        except Exception:
-            LOG.warning("glossary_resolver: invalid reviewer max_output_tokens %r", _reviewer_max_tokens)
-            return None
-        # Inherit reasoning if backend supports it (bounded 0-3)
         try:
             _reviewer_reasoning = getattr(self._backend, "_reasoning", None)
             if _reviewer_reasoning is None and hasattr(self._backend, "descriptor"):
@@ -541,7 +529,11 @@ class GlossaryResolver:
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=tok,
-            temperature=float(_reviewer_temperature),
+            temperature=float(req_vals.get("temperature", 0)),
+            top_p=req_vals.get("top_p"),
+            top_k=req_vals.get("top_k"),
+            min_p=req_vals.get("min_p"),
+            seed=req_vals.get("seed"),
             response_schema=JSON_OBJECT_SCHEMA,
             label="glossary_resolver",
         )
@@ -554,12 +546,7 @@ class GlossaryResolver:
                     req_kwargs["request_options"] = {"reasoning": ri}  # type: ignore[assignment]
             except Exception:
                 pass
-        if _reviewer_seed is not None:
-            try:
-                req_kwargs["seed"] = int(_reviewer_seed)  # type: ignore[assignment]
-            except Exception:
-                pass
-        request = CompletionRequest(**req_kwargs)  # type: ignore[arg-type]
+        request = CompletionRequest(**{k: v for k, v in req_kwargs.items() if v is not None or k in ("temperature", "max_output_tokens", "model_ref", "messages", "response_schema", "label")})  # type: ignore[arg-type]
         # Bounded retry: 3 attempts for JSON parse / truncation
         attempts = []
         def _complete_once() -> str:

@@ -248,8 +248,8 @@ class LifecycleQwenAuditEvaluator:
                  config: Optional[BackendQwenAuditEvaluatorConfig] = None):
         self._router = router
         cfg = config or BackendQwenAuditEvaluatorConfig()
-        # temperature=0.0, not 0.2: the audit adapters always send
-        # ``request.temperature == 0.0`` (same as the gate evaluations), so
+        # temperature=float(0), not 0.2: the audit adapters always send
+        # ``request.temperature == 0`` (same as the gate evaluations), so
         # keeping the ApiClientConfig in sync keeps the backend descriptor's
         # ``effective_options`` honest about what is actually sent.
         api_config = ApiClientConfig(
@@ -257,7 +257,7 @@ class LifecycleQwenAuditEvaluator:
             model=model_name,
             timeout_seconds=1800.0,
             context_size=49152,
-            temperature=0.0,
+            temperature=float(0),
         )
         self._backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
         self._evaluator = BackendQwenAuditEvaluator(
@@ -337,7 +337,7 @@ class LifecycleGemmaAuditEvaluator:
             model=model_name,
             timeout_seconds=1800.0,
             context_size=32768,
-            temperature=0.0,
+            temperature=float(0),
         )
         # MONITOR-V2 (2.4): keep the owned LocalOpenAIBackend so
         # set_usage_sink can reach it (legacy/default local path wiring).
@@ -371,7 +371,7 @@ class LifecycleQwenEntityExtractor:
     transport-neutral, so this wrapper supplies the local ``llama-server``
     transport (``LocalOpenAIBackend`` over an ``ApiClient`` pointed at the
     router's base URL) and ensures Qwen is resident before every call.
-    temperature=0.0: the extraction input is the whole chapter source and
+    temperature=float(0): the extraction input is the whole chapter source and
     the output feeds a per-chapter cache, so determinism is required
     (konspekt V4_1_AUDIT_B1_RU.md §10 B1.2).
 
@@ -388,7 +388,7 @@ class LifecycleQwenEntityExtractor:
             model=model_name,
             timeout_seconds=1800.0,
             context_size=32768,
-            temperature=0.0,
+            temperature=float(0),
         )
         backend = LocalOpenAIBackend(api=ApiClient(api_config, name=cfg.label))
         # MONITOR-V2 (2.4): keep the owned LocalOpenAIBackend so
@@ -468,7 +468,7 @@ class LifecycleSelectiveRepairEvaluator:
             model=repair_model_name,
             timeout_seconds=1800.0,
             context_size=49152,
-            temperature=0.0,
+            temperature=float(0),
         )
         repair_backend = LocalOpenAIBackend(
             api=ApiClient(repair_api, name="b2_selective_repair")
@@ -478,7 +478,7 @@ class LifecycleSelectiveRepairEvaluator:
             model=reaudit_model_name,
             timeout_seconds=1800.0,
             context_size=49152,
-            temperature=0.0,
+            temperature=float(0),
         )
         reaudit_backend = LocalOpenAIBackend(
             api=ApiClient(reaudit_api, name="b2_reaudit_scope")

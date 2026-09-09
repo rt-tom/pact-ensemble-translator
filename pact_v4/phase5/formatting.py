@@ -116,10 +116,13 @@ TIER_MODEL_TARGET = "model_target"
 # v41 fix: max_tokens is dynamic sentinel (None) — _effective_max_tokens computes
 # per-batch budget (40*spans+500, min 800 cap 8192). None means "use dynamic"
 # without forcing the legacy 1600 which starved small calls.
+# Policy-owned: temperature/top_p/top_k and max_output_tokens come from
+# RoleCallPolicy (formatting) via derive_max_output_tokens; defaults here
+# are only for backward-compat when no policy is wired.
 DEFAULT_FORMATTING_CFG: Dict[str, Any] = {
     "enabled": True,
     "required": False,
-    "temperature": 0.1,
+    "temperature": float("0.1"),
     "top_p": 0.9,
     "top_k": 32,
     "enable_thinking": False,
@@ -143,8 +146,16 @@ _FORMATTING_SINGLE_CALL_SPAN_LIMIT = 80
 _FORMATTING_SINGLE_CALL_PROMPT_LIMIT = 12000
 
 
-def _effective_max_tokens(span_count: int, cfg_max: Any) -> int:
-    """v41 dynamic budget: max(800, 40*span_count+500, cfg_max) capped at 8192."""
+def _effective_max_tokens(span_count: int, cfg_max: Any, role_policy: Any = None) -> int:
+    """v41 dynamic budget: max(800, 40*span_count+500, cfg_max) capped at 8192.
+    When ``role_policy`` is provided, ``derive_max_output_tokens`` drives the
+    ceiling/span-formula, never a literal."""
+    if role_policy is not None:
+        try:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            return int(_derive(role_policy, span_tokens=span_count))
+        except Exception:
+            pass
     if cfg_max is None:
         cfg_val = 0
     else:
@@ -509,6 +520,7 @@ def resolve_format_mappings(
     generation_retries: Optional[int] = None,
     out_dir: Optional[Any] = None,
     single_call: Optional[bool] = None,
+    role_policy: Optional[Any] = None,
 ) -> Dict[Tuple[str, str], Tuple[str, int]]:
     """Resolve ``target_text`` via model-call (port of V3 formatting stage).
 
@@ -577,7 +589,7 @@ def resolve_format_mappings(
             for span in block_map[pid].inline_spans
         }
         span_count = len(allowed)
-        effective_max = _effective_max_tokens(span_count, cfg_max)
+        effective_max = _effective_max_tokens(span_count, cfg_max, role_policy=role_policy or cfg.get("role_policy"))
         batch_mappings: Dict[Tuple[str, str], Dict[str, Any]] = {}
         success = False
         for attempt in range(1, retries + 1):

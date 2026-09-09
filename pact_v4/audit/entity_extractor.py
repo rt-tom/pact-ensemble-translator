@@ -1190,7 +1190,9 @@ class EntityContextCache:
 
 @dataclass(frozen=True)
 class BackendEntityExtractorConfig:
-    """Extraction call settings (source-only, temp=0, deterministic).
+    """Extraction call settings (source-only, deterministic).
+    When ``role_policy`` is provided its ``request`` drives temperature and
+    max_output_tokens via ``derive_max_output_tokens``.
 
     ``max_tokens`` must cover the server's reasoning budget PLUS content
     headroom — the llama-server counts reasoning and content TOGETHER
@@ -1207,6 +1209,7 @@ class BackendEntityExtractorConfig:
     max_tokens: int = 20000
     label: str = "b1.2/entity_extractor"
     retry: JsonRetryPolicy = field(default_factory=JsonRetryPolicy)
+    role_policy: Optional[Any] = None
 
 
 class BackendEntityExtractor:
@@ -1227,7 +1230,11 @@ class BackendEntityExtractor:
     ) -> None:
         self._backend = backend
         self._config = config or BackendEntityExtractorConfig()
-        self._max_tokens = int(self._config.max_tokens)
+        if getattr(self._config, "role_policy", None) is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            self._max_tokens = int(_derive(self._config.role_policy))
+        else:
+            self._max_tokens = int(self._config.max_tokens)
 
     @property
     def backend(self) -> CompletionBackend:
@@ -1248,18 +1255,34 @@ class BackendEntityExtractor:
             out_dir = Path(out_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             reasoning_path = out_dir / "b1.2_entity_reasoning.txt"
-        request = CompletionRequest(
-            model_ref=_model_ref_for(self._backend, "entity_extractor"),
-            messages=(Message(role="user", content=prompt),),
-            max_output_tokens=self._max_tokens,
-            temperature=0.0,
-            response_schema=JSON_OBJECT_SCHEMA,
-            label=self._config.label,
-            # REASONING-STREAM: the reasoning file is created before the call
-            # and grows live (gemma_rewrite_v4 pattern); the final marked
-            # write below stays authoritative.
-            on_reasoning_chunk=open_reasoning_writer(reasoning_path),
-        )
+        policy = getattr(self._config, "role_policy", None)
+        if policy is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy))
+            req = dict(policy.request)
+            request = CompletionRequest(
+                model_ref=_model_ref_for(self._backend, "entity_extractor"),
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok,
+                temperature=float(req.get("temperature", 0)),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=self._config.label,
+                on_reasoning_chunk=open_reasoning_writer(reasoning_path),
+            )
+        else:
+            request = CompletionRequest(
+                model_ref=_model_ref_for(self._backend, "entity_extractor"),
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=self._max_tokens,
+                temperature=float(0),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=self._config.label,
+                on_reasoning_chunk=open_reasoning_writer(reasoning_path),
+            )
         attempts: List[Tuple[int, str, str]] = []  # (attempt_no, raw, reasoning)
 
         def _complete() -> str:

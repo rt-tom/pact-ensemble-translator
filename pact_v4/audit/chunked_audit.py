@@ -631,7 +631,11 @@ def validate_input_budget(
 
 @dataclass(frozen=True)
 class ChunkedAuditConfig:
-    """Settings for one chunked audit run (frozen contract of the run)."""
+    """Settings for one chunked audit run (frozen contract of the run).
+    When ``role_policy`` is provided its ``request`` + ``output_budget``
+    drive temperature and the dynamic max_output_tokens via
+    ``derive_max_output_tokens`` (per-PID headroom/ceiling from policy).
+    """
 
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS
     max_tokens: int = DEFAULT_MAX_TOKENS
@@ -639,6 +643,7 @@ class ChunkedAuditConfig:
     min_overlap_pairs: int = MIN_OVERLAP_PAIRS
     max_overlap_pairs: int = MAX_OVERLAP_PAIRS
     retry_shrink: bool = True
+    role_policy: Optional[Any] = None
     # R-RETRY (t_8ab8ab35, operator extension): bounded TRANSPORT_ERROR
     # retry with a NEW session (per_request backend → new session per
     # complete call). Identity-bearing via StrictRunConfig (F5) — a cache
@@ -711,7 +716,7 @@ class ChunkedAuditEvaluator:
         )
 
     Each chunk is one ``CompletionRequest`` (``max_output_tokens`` from
-    config, temperature 0.0, ``json_object`` schema) — never a reasoning
+    policy via ``derive_max_output_tokens``, temperature from policy, ``json_object`` schema) — never a reasoning
     ``request_options`` value (V4.1: the reasoning budget is a SERVER ARG
     ``--reasoning-budget``; ``LocalOpenAIBackend`` rejects request_options).
     """
@@ -982,12 +987,31 @@ class ChunkedAuditEvaluator:
         prompt: str,
         model_ref: str,
         on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+        item_count: int = 0,
     ) -> CompletionRequest:
+        policy = getattr(self._config, "role_policy", None)
+        if policy is not None:
+            from pact_v4.runtime.runtime_config import derive_max_output_tokens as _derive
+            max_tok = int(_derive(policy, item_count=item_count))
+            req = dict(policy.request)
+            return CompletionRequest(
+                model_ref=model_ref,
+                messages=(Message(role="user", content=prompt),),
+                max_output_tokens=max_tok,
+                temperature=float(req.get("temperature", 0)),
+                top_p=req.get("top_p"),
+                top_k=req.get("top_k"),
+                min_p=req.get("min_p"),
+                seed=req.get("seed"),
+                response_schema=JSON_OBJECT_SCHEMA,
+                label=self._config.label,
+                on_reasoning_chunk=on_reasoning_chunk,
+            )
         return CompletionRequest(
             model_ref=model_ref,
             messages=(Message(role="user", content=prompt),),
             max_output_tokens=self._config.max_tokens,
-            temperature=0.0,
+            temperature=float(0),
             response_schema=JSON_OBJECT_SCHEMA,
             label=self._config.label,
             on_reasoning_chunk=on_reasoning_chunk,
@@ -1054,6 +1078,7 @@ class ChunkedAuditEvaluator:
             prompt=prompt,
             model_ref=model_ref,
             on_reasoning_chunk=open_reasoning_writer(reason_path),
+            item_count=len(chunk_pairs),
         )
         try:
             self._emit_chunk_event(

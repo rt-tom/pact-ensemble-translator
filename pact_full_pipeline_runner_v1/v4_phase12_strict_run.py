@@ -642,9 +642,55 @@ def _with_reasoning_override(backend: Any, reasoning: int) -> Any:
     return backend
 
 
+def _load_resolved_role_policies(alias: Optional[str] = None):
+    try:
+        from pact_v4.runtime.runtime_config import ResolvedRolePolicies, RoleCallPolicy, OutputBudgetPolicy
+        import yaml, pathlib
+        prov_path = _default_providers_config()
+        if not prov_path.is_file():
+            return None
+        raw = yaml.safe_load(prov_path.read_text(encoding="utf-8")) or {}
+        local = (raw.get("providers") or {}).get("local") or {}
+        rp = local.get("role_policies") or {}
+        if not rp:
+            return None
+        policies = {}
+        for role, cfg in rp.items():
+            req = dict((cfg.get("request") or {}))
+            ob = cfg.get("output_budget")
+            obp = None
+            if isinstance(ob, dict):
+                obp = OutputBudgetPolicy(mode=ob.get("mode", "fixed"), base_tokens=ob.get("base_tokens"), floor_tokens=ob.get("floor_tokens"), per_item_tokens=ob.get("per_item_tokens"), per_span_tokens=ob.get("per_span_tokens"), ceiling=ob.get("ceiling"))
+            policies[role] = RoleCallPolicy(model_key=str(cfg.get("model_key") or ""), request=req, output_budget=obp)
+        # alias overrides (compatible only) — simplified: if alias present and models[alias].role_policy_overrides exists, merge where model_key matches
+        if alias:
+            models = local.get("models") or {}
+            alias_cfg = models.get(alias) or {}
+            overrides = alias_cfg.get("role_policy_overrides") or {}
+            alias_key = alias_cfg.get("model_key")
+            for role, ov in overrides.items():
+                if role in policies and policies[role].model_key == alias_key:
+                    base_req = dict(policies[role].request)
+                    base_req.update(dict((ov.get("request") or {})))
+                    ob2 = ov.get("output_budget")
+                    obp2 = policies[role].output_budget
+                    if isinstance(ob2, dict):
+                        obp2 = OutputBudgetPolicy(mode=ob2.get("mode", obp2.mode if obp2 else "fixed"), base_tokens=ob2.get("base_tokens", obp2.base_tokens if obp2 else None), floor_tokens=ob2.get("floor_tokens", obp2.floor_tokens if obp2 else None), per_item_tokens=ob2.get("per_item_tokens", obp2.per_item_tokens if obp2 else None), per_span_tokens=ob2.get("per_span_tokens", obp2.per_span_tokens if obp2 else None), ceiling=ob2.get("ceiling", obp2.ceiling if obp2 else None))
+                    policies[role] = RoleCallPolicy(model_key=policies[role].model_key, request=base_req, output_budget=obp2)
+        return ResolvedRolePolicies(policies=policies)
+    except Exception:
+        return None
+
 def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Optional[int] = None) -> StrictRunConfig:
     effective_reasoning = reasoning if reasoning is not None else _resolve_effective_reasoning(args, backend)
+    _alias = None
+    try:
+        _alias = None if getattr(args, "local", None) in (None, "__LOCAL_DEFAULT__") else (str(getattr(args, "local", "") or "").strip() or None)
+    except Exception:
+        _alias = None
+    _resolved = _load_resolved_role_policies(_alias)
     return StrictRunConfig(
+        resolved_role_policies=_resolved,
         chapter_id=args.chapter_id, chapter_html_path=args.chapter_html, memory_dir=args.memory_dir,
         out_dir=args.out_dir, backend=backend,
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
