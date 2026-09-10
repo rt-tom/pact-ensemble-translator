@@ -100,6 +100,9 @@ from pact_v4.phase1.glossary_candidates import (
 )
 from pact_v4.phase1.memory import MemoryManager, atomic_write
 from pact_v4.runtime.bible_renderer import render_bible_section
+from pact_full_pipeline_runner_v1.v4_phase12_strict_run import (
+    resolve_invocation_identities as _resolve_chapter_invocation,
+)
 
 # v41 italics: formatting model-call defaults (mirror V3 Defaults["formatting"])
 # v41 fix: dynamic max_tokens via resolve_format_mappings (40*spans+500, min 800 cap 8192)
@@ -1349,6 +1352,35 @@ def _build_formatting_client(args, extra, fmt_cfg, out_dir=None):
         return None
 
 
+def _book_resume_identity(extra_args: Sequence[str]) -> List[str]:
+    """Normalized chapter-run flag identity for the book resume gate.
+
+    Sorts the forwarded chapter flags after dropping operational resume
+    flags (``--resume``/``--retry-incomplete``/``--force-rerun-chapter`` +
+    values, both ``--flag value`` and ``--flag=value`` forms). The remaining
+    flags are the identity-bearing chapter knobs (models, reasoning,
+    audit/repair policy); a change between book runs means the ready
+    chapters' artifacts belong to a different configuration and must not be
+    silently reused.
+    """
+    operational = {"--resume", "--retry-incomplete", "--force-rerun-chapter"}
+    cleaned: List[str] = []
+    skip_next = False
+    for arg in list(extra_args):
+        if skip_next:
+            skip_next = False
+            continue
+        text = str(arg)
+        if text in operational:
+            if text == "--force-rerun-chapter":
+                skip_next = True
+            continue
+        if any(text == name or text.startswith(name + "=") for name in operational):
+            continue
+        cleaned.append(text)
+    return sorted(cleaned)
+
+
 def run_book(
     *,
     memory_dir: Path,
@@ -1378,12 +1410,59 @@ def run_book(
     glossary_resolver_mode: str = "promote",
     glossary_resolver_cache_miss_policy: str = "recompute",
     book_memory_policy: str = "promote_verified",
+    resume: bool = False,
+    force_rerun_chapters: Sequence[str] = (),
 ) -> Dict[str, Any]:
     # Media sync pre-init hook: fetch authoritative state before MemoryManager init
     if media_book_id is not None:
         from pact_v4.snapshot.run_hooks import pre_init_fetch
         _exec_host = media_exec_host if media_exec_host is not None else _detect_execution_host()
         pre_init_fetch(media_book_id, memory_dir, transport=media_transport, ssh_target=media_target, root=media_root, execution_host=_exec_host)
+    # book-chapter-retry: --resume continues an EXISTING book out-base.
+    # It never allocates a fresh directory: a missing out-base is a hard
+    # failure, not a reason to start over silently.
+    if resume and not out_base.exists():
+        raise ValueError(
+            f"book --resume requires an existing --out-base, missing: {out_base}"
+        )
+    # book-chapter-retry: the book never forwards --retry-incomplete to
+    # every chapter (automatic --resume selects each chapter's failed
+    # stage; generation rewind applies only when the chapter's own stage
+    # checkpoint selects it or the operator retries the chapter directly).
+    if "--retry-incomplete" in list(extra_args):
+        LOG.warning(
+            "book run ignores book-wide --retry-incomplete: per-chapter "
+            "generation rewind is selected by each chapter's stage "
+            "checkpoint, not by a book-wide flag (retry the chapter "
+            "directly for an explicit rewind)"
+        )
+        extra_args = [arg for arg in extra_args if arg != "--retry-incomplete"]
+    # book-chapter-retry: book-level config gate for resume. The chapter
+    # run flags that select models/config travel opaquely in extra_args; a
+    # ready chapter skipped under different flags would silently reuse stale
+    # artifacts, so the normalized flag identity is stored in book_run.json
+    # and a mismatch on --resume is a hard failure (new out-base required).
+    # Operational flags (--resume/--retry-incomplete/--force-rerun-chapter)
+    # never participate in the identity. Memory/source drift is additive or
+    # checked per chapter (see the skip-path source gate below).
+    _resume_identity = _book_resume_identity(extra_args)
+    if resume:
+        _prev_payload = _load_json(out_base / "book_run.json", None)
+        if isinstance(_prev_payload, dict) and "chapter_extra_args" in _prev_payload:
+            _prev_identity = sorted(str(arg) for arg in _prev_payload["chapter_extra_args"])
+            if _prev_identity != _resume_identity:
+                raise ValueError(
+                    "book --resume: chapter run flags changed since the previous "
+                    f"book run in {out_base} (was {_prev_identity}, now "
+                    f"{_resume_identity}) -- refusing to reuse artifacts; "
+                    "rerun in a new --out-base"
+                )
+        elif isinstance(_prev_payload, dict):
+            LOG.warning(
+                "book --resume: previous book_run.json has no flag identity "
+                "(legacy book); proceeding, but ready chapters skip only on "
+                "valid terminal record + identities + artifacts"
+            )
     memory_dir.mkdir(parents=True, exist_ok=True)
     out_base.mkdir(parents=True, exist_ok=True)
     # FINDING 4: explicit init for genuine new-state (all four missing) — promotion path still requires all four present (fail closed)
@@ -1429,15 +1508,126 @@ def run_book(
                 # Mark "ok" so the shared acceptance/promotion block below
                 # runs with the TUNED terminal status from the existing record.
                 result = {"status": "ok"}
+            # No manifest healing happens on this path (explicit reuse).
+            _manifest_blocked, _manifest_block_reason = False, ""
         else:
             out_dir = out_base / f"chapter_{chapter_id}"
-            result = _run_one_chapter(
-                chapter_id,
-                memory_dir=memory_dir,
-                chapter_html_path=chapter_html,
-                out_dir=out_dir,
-                extra_args=extra_args,
+            # book-chapter-retry: stage-aware resume. A ready chapter
+            # (valid terminal record + identities + artifacts) skips the
+            # strict model stages and runs acceptance+promotion only below;
+            # a failed chapter reruns from its first unfinished stage in
+            # its existing folder on current shared memory (memory is never
+            # rolled back, downstream chapters are never recalculated).
+            # --force-rerun-chapter excludes a chapter from every skip/reuse
+            # decision (new revision/attempt in the same out-dir).
+            from pact_v4.pipeline.v4_retry import (
+                chapter_extra_args as _chapter_extra_args,
+                chapter_manifest_blocked as _chapter_manifest_blocked,
+                normalize_chapter_id as _normalize_chapter_id,
+                should_skip_chapter as _should_skip_chapter,
             )
+            # Round-4: a present-but-unusable manifest blocks promotion
+            # for this invocation (reset per chapter below; force-rerun
+            # regenerates everything fresh and is exempt).
+            _manifest_blocked, _manifest_block_reason = False, ""
+            _forced_ids = {_normalize_chapter_id(item) for item in force_rerun_chapters}
+            _forced = _normalize_chapter_id(chapter_id) in _forced_ids
+            if resume and not _forced:
+                from pact_v4.pipeline.v4_retry import (
+                    chapter_invocation_matches as _chapter_invocation_matches,
+                    chapter_source_matches as _chapter_source_matches,
+                )
+                _skip, _reason = _should_skip_chapter(
+                    out_dir, resume=True, chapter_id=chapter_id,
+                )
+                if _skip:
+                    # Fail-closed source gate for skipped chapters (no model
+                    # calls): a changed chapter HTML must never reuse stale
+                    # artifacts. Hard failure -- a full rerun needs a new
+                    # out-base, never silent mixing in this folder.
+                    _src_ok, _src_reason = _chapter_source_matches(out_dir, chapter_html)
+                    if not _src_ok:
+                        raise ValueError(
+                            f"book --resume: chapter {chapter_id} is ready but "
+                            f"its source identity does not match ({_src_reason}) -- "
+                            "refusing to reuse stale artifacts; rerun in a new --out-base"
+                        )
+                    # Fail-closed invocation gate: the saved record/manifest
+                    # config + backend identities must equal the CURRENT
+                    # resolved invocation (same CLI flags but a changed
+                    # providers registry, model file, or server profile
+                    # resolves differently and must never promote foreign
+                    # artifacts silently). Resolution is side-effect-free
+                    # (no servers/models/preflight/artifacts).
+                    try:
+                        _invocation = _resolve_chapter_invocation([
+                            "--chapter-id", chapter_id,
+                            "--chapter-html", str(chapter_html),
+                            "--memory-dir", str(memory_dir),
+                            "--out-dir", str(out_dir),
+                            *extra_args,
+                        ])
+                    except Exception as exc:
+                        raise ValueError(
+                            f"book --resume: chapter {chapter_id} is ready but "
+                            f"the current invocation does not resolve ({exc}) -- "
+                            "refusing to reuse artifacts; rerun in a new --out-base"
+                        ) from exc
+                    _inv_ok, _inv_reason = _chapter_invocation_matches(
+                        out_dir,
+                        config_identity=str(_invocation.get("config_identity") or ""),
+                        acceptable_backend_hashes=list(
+                            _invocation.get("backend_identity_hashes") or []),
+                    )
+                    if not _inv_ok:
+                        raise ValueError(
+                            f"book --resume: chapter {chapter_id} is ready but "
+                            f"its config/backend identity does not match the current "
+                            f"invocation ({_inv_reason}) -- refusing to reuse stale "
+                            "artifacts; rerun in a new --out-base"
+                        )
+                    LOG.info("book --resume: skipping ready chapter %s (%s); promotion only",
+                             chapter_id, _reason)
+                    result = {"status": "ok"}
+                else:
+                    # Round-4: a present-but-unusable manifest blocks
+                    # promotion for this invocation. The chapter still
+                    # reruns (safe self-heal via stage-aware resume, then a
+                    # fresh manifest), but nothing healed here promotes
+                    # until a later invocation passes all gates fresh.
+                    (_manifest_blocked,
+                     _manifest_block_reason) = _chapter_manifest_blocked(out_dir)
+                    if _manifest_blocked:
+                        LOG.warning(
+                            "book --resume: chapter %s manifest blocked "
+                            "(%s); healing without promoting this invocation",
+                            chapter_id, _manifest_block_reason)
+                    LOG.info("book --resume: rerunning chapter %s from its failed stage (%s)",
+                             chapter_id, _reason)
+                    result = _run_one_chapter(
+                        chapter_id,
+                        memory_dir=memory_dir,
+                        chapter_html_path=chapter_html,
+                        out_dir=out_dir,
+                        extra_args=_chapter_extra_args(extra_args, resume=True),
+                    )
+            elif resume and _forced:
+                LOG.info("book --resume: force-rerunning chapter %s", chapter_id)
+                result = _run_one_chapter(
+                    chapter_id,
+                    memory_dir=memory_dir,
+                    chapter_html_path=chapter_html,
+                    out_dir=out_dir,
+                    extra_args=_chapter_extra_args(extra_args, resume=True, force_rerun=True),
+                )
+            else:
+                result = _run_one_chapter(
+                    chapter_id,
+                    memory_dir=memory_dir,
+                    chapter_html_path=chapter_html,
+                    out_dir=out_dir,
+                    extra_args=extra_args,
+                )
         hash_before = _book_memory_hash(memory_dir)
 
         terminal_status = "error"
@@ -1699,6 +1889,24 @@ def run_book(
                                 (_trans_path.parent / "formatting_report.json").write_text(json.dumps(_out2.to_payload(), ensure_ascii=False, indent=2), encoding="utf-8")
                             except Exception:
                                 pass
+                        # book-chapter-retry: the restoration above rewrites
+                        # chapter artifacts (translations.json and/or
+                        # formatting_report.json) after the chapter run, so
+                        # the stage checkpoints covering them must be
+                        # refreshed to current bytes -- otherwise the
+                        # manifest would permanently disagree and every
+                        # later resume would needlessly rerun valid stages.
+                        # Best-effort and manifest-preserving: only existing
+                        # completed checkpoints are re-hashed, never created.
+                        try:
+                            from pact_v4.pipeline.v4_retry import (
+                                refresh_stage_hashes as _refresh_stage_hashes,
+                            )
+                            _refresh_stage_hashes(
+                                out_dir, ("generation", "formatting"))
+                        except Exception:  # noqa: BLE001 -- resume aid only
+                            LOG.warning("stage manifest refresh skipped for %s",
+                                      chapter_id, exc_info=True)
             except Exception as exc:  # noqa: BLE001 -- formatting debt, never break a run
                 LOG.warning("v41 formatting step skipped for %s: %s", chapter_id, exc)
 
@@ -2291,6 +2499,19 @@ def run_book(
         # FINDING 1: independent mode gate — only promoting categories commit durable state
         _effective_bm_policy_for_promote = _effective_bm_policy if "_effective_bm_policy" in locals() else book_memory_policy
         _should_promote = terminal_status in _PROMOTING_STATUSES and (_mode == "promote" or _effective_bm_policy_for_promote == "promote_verified")
+        # Round-4: a chapter that entered this invocation with a
+        # present-but-unusable manifest heals (chapter rerun above) but
+        # must not promote in the same invocation -- promotion waits for a
+        # later invocation that passes all gates fresh. Loud, never silent.
+        if _manifest_blocked and terminal_status in _PROMOTING_STATUSES:
+            _should_promote = False
+            promotion_error = (
+                f"promotion blocked this invocation: {_manifest_block_reason} "
+                "(chapter self-healed; rerun book --resume to promote)"
+            )
+            promote_detail = promotion_error
+            LOG.warning("book --resume: chapter %s promotion blocked: %s",
+                        chapter_id, _manifest_block_reason)
         if _should_promote:
             if terminal_status == "complete":
                 assert not quarantined, (
@@ -2337,7 +2558,7 @@ def run_book(
                 # promoted; bytes preserved).
                 _strip_book_memory_observation_fields(memory_dir)
         else:
-            if terminal_status in _PROMOTING_STATUSES:
+            if terminal_status in _PROMOTING_STATUSES and not _manifest_blocked:
                 promote_detail = f"skipped promotion: glossary_mode={_mode} bm_policy={_effective_bm_policy_for_promote} (observation-only)"
 
 
@@ -2438,6 +2659,9 @@ def run_book(
     payload = {
         "schema": BOOK_RUN_SCHEMA,
         "memory_dir": str(memory_dir),
+        # book-chapter-retry: normalized chapter-run flag identity for the
+        # resume config gate above (rebuilt completely every run).
+        "chapter_extra_args": _book_resume_identity(extra_args),
         "candidates_ledger": str(ledger.path),
         "book_memory_candidates_ledger": str(bm_ledger.path),
         "chapters": [rec.to_payload() for rec in records],
@@ -2511,6 +2735,23 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--glossary-resolver-mode", choices=("off", "shadow", "promote"), default="promote", help="Glossary resolver mode (identity-bearing, default off): off/shadow/promote")
     parser.add_argument("--book-memory-policy", choices=("promote_verified", "observe", "off"), default="promote_verified", help="Book-memory policy (identity-bearing, default promote_verified): promote_verified/observe/off")
     parser.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute", help="Glossary resolver cache-miss policy (identity-bearing, default recompute)")
+    parser.add_argument("--resume", action="store_true",
+                        help="book-chapter-retry: resume an EXISTING --out-base "
+                             "(required, must already exist). Ready chapters "
+                             "(valid terminal record + identities + artifacts) "
+                             "skip model stages and run promotion only; failed "
+                             "chapters rerun from their first unfinished stage "
+                             "in their existing folder on current shared memory. "
+                             "Downstream chapters are never rolled back. A "
+                             "changed chapter-run flag identity is a hard "
+                             "failure (use a new --out-base). Without this "
+                             "flag every chapter runs unconditionally.")
+    parser.add_argument("--force-rerun-chapter", action="append", default=[],
+                        metavar="ID",
+                        help="book-chapter-retry: rerun chapter ID even when it "
+                             "is ready (repeatable; 1 equals 0001). Excluded "
+                             "from every skip/reuse decision; regenerates as a "
+                             "new revision/attempt in the same out-dir.")
     return parser
 
 
@@ -2552,6 +2793,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         glossary_resolver_mode=args.glossary_resolver_mode,
         glossary_resolver_cache_miss_policy=args.glossary_resolver_cache_miss_policy,
         book_memory_policy=args.book_memory_policy,
+        resume=bool(args.resume),
+        force_rerun_chapters=list(args.force_rerun_chapter or []),
     )
     failed = 0
     for rec in result["chapters"]:

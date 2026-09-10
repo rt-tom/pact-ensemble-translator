@@ -215,9 +215,16 @@ Host/layout and source (advanced overrides):
   Automatic output: host_output/book_0027-0032_local|remote_<timestamp> (label from descriptor).
   Source and mutable state must not be the same directory.
 
-Topology/resume (forwarded to strict per-chapter):
+Topology/resume (book-chapter-retry):
+  --resume                       Resume an EXISTING --out-base (must already exist): ready chapters
+                                 skip model stages (promotion only), failed chapters rerun from their first
+                                 unfinished stage in their existing folder on current shared memory.
+                                 Downstream chapters are never rolled back; a changed chapter-run flag
+                                 identity is a hard failure (use a new --out-base).
+  --force-rerun-chapter ID       Rerun even a ready chapter (repeatable; 1 equals 0001).
   --runtime-config FILE, --managed-server, --providers-config FILE;
-  out-base / out-dir isolation; config/profile identity invalidation — use a NEW --out-base/--out-dir when changing profile or translator/reviewer/reasoning. Resume follows existing strict/book semantics.
+  out-base / out-dir isolation; config/profile identity invalidation — use a NEW --out-base/--out-dir when changing profile or translator/reviewer/reasoning.
+  The book never forwards --retry-incomplete to every chapter (each chapter's stage checkpoint selects it).
 
 Audit/formatting (forwarded to strict per-chapter):
   --run-audit / --skip-audit, --entity-context / --no-entity-context, --no-russian-editor;
@@ -247,6 +254,11 @@ Optional:
   --runtime-config FILE
   --translator / --reviewer / --reasoning overrides (profile-aware, see top-level help)
   --markup preserve
+  --resume                       Continue this --out-dir from the first failed/incomplete/missing stage
+                                 (valid completed stages reused; quarantined chunks are NOT retried).
+  --retry-incomplete             Rewind the generation journal to the first incomplete_generation entry
+                                 and regenerate it plus the dependent tail (append-only, attempt markers).
+  --force-rerun                  Regenerate the whole chapter as a new attempt in the same out-dir.
 
 Preflight: automatic offline preflight before configured execution; --preflight / --json check-only.
 
@@ -1034,9 +1046,19 @@ def _handle_book(argv: Sequence[str]) -> int:
         _validate_layout({"source": layout["source"], "state": memory_dir, "output": _final_out})
     except Exception as exc:
         _error_exit(str(exc))
+    # book-chapter-retry: --resume continues an EXISTING --out-base and must
+    # never allocate a fresh timestamp directory. Fail before creating
+    # anything when no explicit existing --out-base was given.
+    _book_resume_requested = "--resume" in list(remaining)
+    if _book_resume_requested and not args.out_base:
+        _error_exit("book --resume requires an explicit existing --out-base "
+                    "(refusing to allocate a new timestamp directory)")
     # Automatic output directory — collision-safe (use out_root)
     if args.out_base:
         out_base = Path(args.out_base)
+        if _book_resume_requested and not out_base.exists():
+            _error_exit(f"book --resume requires an existing --out-base, "
+                        f"missing: {out_base}")
         try:
             out_base.mkdir(parents=True, exist_ok=True)
         except Exception as exc:

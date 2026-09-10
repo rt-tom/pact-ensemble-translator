@@ -37,7 +37,7 @@ import logging
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from pact_v4.pipeline.v4_phase12_strict_runner import (
     StrictBackendConfig,
@@ -291,6 +291,26 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--glossary-resolver-cache-miss-policy", choices=("recompute", "fail_closed"), default="recompute",
                    help="Glossary resolver cache-miss policy (identity-bearing, default recompute): recompute allows "
                         "acquire/restart on cache hit with missing/stale sidecar, fail_closed forbids calls and promotion.")
+    p.add_argument("--resume", action="store_true",
+                   help="book-chapter-retry: resume this out-dir from the first "
+                        "failed/incomplete/missing stage (durable stage checkpoints "
+                        "or legacy status/artifact files). Valid completed stages "
+                        "are reused; only that stage plus dependents rerun, on "
+                        "current shared memory. No manual step selection. "
+                        "Without this flag the legacy positional journal resume "
+                        "applies. Operational only: not part of run identity.")
+    p.add_argument("--retry-incomplete", action="store_true",
+                   help="book-chapter-retry: rewind the generation journal to the "
+                        "first incomplete_generation entry and regenerate it plus "
+                        "the dependent tail. The selected prefix is reused without "
+                        "model calls; quarantined chunks are NOT retried. The "
+                        "journal stays append-only (attempt/revision markers). "
+                        "Operational only: not part of run identity.")
+    p.add_argument("--force-rerun", action="store_true",
+                   help="book-chapter-retry: regenerate the whole chapter as a new "
+                        "attempt in the same out-dir (book --force-rerun-chapter "
+                        "forwards this). Prior journal entries stay on disk. "
+                        "Operational only: not part of run identity.")
     p.add_argument("--translator", default=None, metavar="PROVIDER/ALIAS",
                    help="PROVIDERS-REGISTRY (owner decision 2026-08-14): model "
                         "for the Translator role from configs/providers.yaml, "
@@ -737,6 +757,12 @@ def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Opti
         ),
         glossary_resolver_mode=getattr(args, "glossary_resolver_mode", "off"),
         glossary_resolver_cache_miss_policy=getattr(args, "glossary_resolver_cache_miss_policy", "recompute"),
+        # book-chapter-retry (owner decision 2026-09-09): operational resume
+        # flags (NOT part of the config identity). Without them the legacy
+        # positional journal resume is unchanged.
+        resume=bool(getattr(args, "resume", False)),
+        retry_incomplete=bool(getattr(args, "retry_incomplete", False)),
+        force_rerun=bool(getattr(args, "force_rerun", False)),
     )
 
 
@@ -1207,6 +1233,116 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
         )
 
 
+def _resolve_backend_and_config(args: argparse.Namespace):
+    """Resolve ``(backend, cfg, effective_reasoning)`` exactly as a run would.
+
+    Pure: no servers, models, preflight, mkdir, or artifacts. Shared by
+    ``run_local_default`` / ``run_with_runtime_config`` and the book
+    resume gate (``resolve_invocation_identities``), so a promotion-only
+    skip compares the saved record against the IDENTICAL invocation
+    identity the chapter would run with — a changed providers registry,
+    model file, or server profile changes the resolved identity even when
+    the CLI flags are unchanged. Combination errors are fail-closed
+    (``ValueError``), mirroring ``main``.
+    """
+    if args.local is not None and args.runtime_config is not None:
+        raise ValueError("--local and --runtime-config are mutually exclusive")
+    if (args.translator or args.reviewer) and args.runtime_config is None:
+        raise ValueError(
+            "--translator/--reviewer require --runtime-config (an "
+            "opencode_server or composite profile); the historical local "
+            "llama-server path has no remote model bindings"
+        )
+    if args.local is not None and (args.translator or args.reviewer):
+        raise ValueError("--translator/--reviewer cannot be combined with --local; use --local alias or advanced --runtime-config mode")
+    if args.runtime_config is not None:
+        backend = _load_runtime_config_file(args.runtime_config)
+        backend = _apply_provider_flags(args, backend)
+        if args.managed_server:
+            backend = force_managed(backend)
+        effective_reasoning = _resolve_effective_reasoning(args, backend)
+        if args.reasoning is not None:
+            backend = _with_reasoning_override(backend, effective_reasoning)
+        validate_reasoning_backend(effective_reasoning, backend)
+        _validate_b3_qwen_profile(args, backend)
+        cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
+        _resolved = getattr(cfg, "resolved_role_policies", None) or getattr(cfg, "resolved_pair", None)
+        if _resolved is not None and getattr(backend, "resolved_pair", None) is None and getattr(backend, "resolved_role_policies", None) is None:
+            from dataclasses import replace as _replace2
+            if isinstance(backend, LocalLlamaBackendConfig):
+                try:
+                    backend = _replace2(backend, resolved_pair=_resolved)  # type: ignore[call-arg]
+                except TypeError:
+                    backend = _replace2(backend, resolved_role_policies=_resolved)  # type: ignore[call-arg]
+            elif isinstance(backend, CompositeBackendConfig):
+                new_backends = {}
+                for name, sub in backend.backends.items():
+                    if isinstance(sub, LocalLlamaBackendConfig) and getattr(sub, "resolved_pair", None) is None and getattr(sub, "resolved_role_policies", None) is None:
+                        try:
+                            new_backends[name] = _replace2(sub, resolved_pair=_resolved)  # type: ignore[call-arg]
+                        except TypeError:
+                            new_backends[name] = _replace2(sub, resolved_role_policies=_resolved)  # type: ignore[call-arg]
+                    else:
+                        new_backends[name] = sub
+                backend = _replace2(backend, backends=new_backends)
+        return backend, cfg, effective_reasoning
+    effective_reasoning = int(args.reasoning) if args.reasoning is not None else 0
+    _local_pair_str = None if getattr(args, "local", None) in (None, "__LOCAL_DEFAULT__") else (str(getattr(args, "local", "") or "").strip() or None)
+    _pair = None
+    if _local_pair_str is not None:
+        from pact_v4.runtime.runtime_config import parse_local_pair_arg
+        _pair_parsed = parse_local_pair_arg(_local_pair_str)  # raises if single
+        _pair = _resolve_local_pair(_local_pair_str, args.providers_config)
+    elif getattr(args, "local", None) is not None:
+        _pair = _resolve_local_pair(None, args.providers_config)
+    backend = StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
+        model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
+        server_args={
+            "gemma": _gemma_server_args_for_reasoning(effective_reasoning),
+            "qwen": QWEN_SERVER_ARGS,
+        },
+        port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
+    )
+    if _pair is not None:
+        from pact_v4.runtime.runtime_config import apply_resolved_pair_to_config
+        backend = apply_resolved_pair_to_config(backend, _pair)
+    validate_reasoning_backend(effective_reasoning, backend)
+    _validate_b3_qwen_profile(args, backend)
+    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
+    resolved = getattr(cfg, "resolved_role_policies", None) or getattr(cfg, "resolved_pair", None)
+    if resolved is not None and getattr(backend, "resolved_pair", None) is None:
+        from dataclasses import replace as _replace
+        try:
+            backend = _replace(backend, resolved_pair=resolved)  # type: ignore
+        except TypeError:
+            backend = _replace(backend, resolved_role_policies=resolved)  # type: ignore
+    return backend, cfg, effective_reasoning
+
+
+def resolve_invocation_identities(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Resolved invocation identity for a chapter argv (no side effects).
+
+    Parses ``argv`` with the chapter CLI parser and resolves the backend +
+    run config exactly as a run would (see ``_resolve_backend_and_config``),
+    then returns ``{"config_identity", "backend_identity_hashes"}``.
+    No servers, models, preflight, mkdir, or artifacts are touched, so the
+    book resume gate can compare a ready chapter's saved record against the
+    current invocation before a promotion-only skip. Any resolution error
+    raises (fail-closed): an unresolvable invocation must never skip.
+    """
+    args = build_argparser().parse_args(argv)
+    backend, cfg, _reasoning = _resolve_backend_and_config(args)
+    config_artifact = cfg.to_config_artifact(
+        model_profile=backend.config_profile_name())
+    return {
+        "config_identity": config_artifact.config_identity,
+        "backend_identity_hashes": list(backend.acceptable_identity_hashes()),
+    }
+
+
 def run_local_default(args: argparse.Namespace) -> int:
     """The historical local-only path -- unchanged from before C3.
 
@@ -1215,53 +1351,9 @@ def run_local_default(args: argparse.Namespace) -> int:
     calls through the backend boundary (``build_repair_adapters``), so local
     and remote profiles run the identical Phase 4 algorithm.
     """
-    effective_reasoning = int(args.reasoning) if args.reasoning is not None else 0
-    _local_pair_str = None if getattr(args, "local", None) in (None, "__LOCAL_DEFAULT__") else (str(getattr(args, "local", "") or "").strip() or None)
-    _pair = None
-    if _local_pair_str is not None:
-        # Validate pair and local-only via helper (fail-closed single alias)
-        from pact_v4.runtime.runtime_config import parse_local_pair_arg
-        _pair_parsed = parse_local_pair_arg(_local_pair_str)  # raises if single
-        _pair = _resolve_local_pair(_local_pair_str, args.providers_config)
-    elif getattr(args, "local", None) is not None:
-        # bare --local => default pair
-        _pair = _resolve_local_pair(None, args.providers_config)
-    backend = StrictBackendConfig(
-        # V4.1 §3.4: sycl-edge build (reasoning-budget 2048 works; MTP off).
-        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
-        device="SYCL0", host=args.host,
-        model_paths={"gemma": GEMMA_PATH, "qwen": QWEN_PATH},
-        model_names={"gemma": GEMMA_PATH.name, "qwen": QWEN_PATH.name},
-        # V4.1 A2 review fix: the Gemma server args are DERIVED from the
-        # selected reasoning (budget 2048 for --reasoning>0 per §3.4, 0 for
-        # the B1 baseline), so CLI/config identity, server args and the
-        # actual transport always agree — a default --reasoning 0 run never
-        # starts the server with a reasoning budget the identity denies.
-        server_args={
-            "gemma": _gemma_server_args_for_reasoning(effective_reasoning),
-            "qwen": QWEN_SERVER_ARGS,
-        },
-        port=args.port, startup_timeout=args.startup_timeout, unload_timeout=args.unload_timeout,
-    )
-    # V4.1 A2: local reasoning via server_args; model-centric pair applies both models
-    if _pair is not None:
-        from pact_v4.runtime.runtime_config import apply_resolved_pair_to_config
-        backend = apply_resolved_pair_to_config(backend, _pair)
-    validate_reasoning_backend(effective_reasoning, backend)
-    # F3 (B3 review): when the B3 audit will run, the local Qwen profile
-    # must be B3-capable (MTP draft, reasoning 8192, context 49k) or the
-    # run fails loudly — never silently audits with a non-B3 server.
-    _validate_b3_qwen_profile(args, backend)
-    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
-    # Wire resolved pair onto backend for adapter construction (fail-closed)
-    # Support both old attribute name (resolved_role_policies) and new (resolved_pair)
-    resolved = getattr(cfg, "resolved_role_policies", None) or getattr(cfg, "resolved_pair", None)
-    if resolved is not None and getattr(backend, "resolved_pair", None) is None:
-        from dataclasses import replace as _replace
-        try:
-            backend = _replace(backend, resolved_pair=resolved)  # type: ignore
-        except TypeError:
-            backend = _replace(backend, resolved_role_policies=resolved)  # type: ignore
+    # Backend + run config resolved exactly as a run would (shared helper,
+    # so the book resume gate sees the identical invocation identity).
+    backend, cfg, effective_reasoning = _resolve_backend_and_config(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     # A2 review fix (whole-chapter retry ownership): in whole-chapter mode
@@ -1296,27 +1388,9 @@ def run_local_default(args: argparse.Namespace) -> int:
 
 def run_with_runtime_config(args: argparse.Namespace) -> int:
     """Generic backend path: load profile -> runtime -> role adapters."""
-    backend = _load_runtime_config_file(args.runtime_config)
-    # PROVIDERS-REGISTRY (owner decision 2026-08-14): --translator/--reviewer
-    # resolve provider/alias model specs through providers.yaml and bind the
-    # resolved refs to the mapped roles (translator -> generator + repair;
-    # reviewer -> all audit roles). Changing a flag changes the backend
-    # identity — cache/resume is not replayed, use a NEW --out-dir.
-    backend = _apply_provider_flags(args, backend)
-    if args.managed_server:
-        backend = force_managed(backend)
-    effective_reasoning = _resolve_effective_reasoning(args, backend)
-    # Profile-bearing reasoning: explicit CLI override updates backend identity/report.
-    if args.reasoning is not None:
-        backend = _with_reasoning_override(backend, effective_reasoning)
-    # V4.1 A2: local no longer blocks --reasoning > 0 — reasoning for local
-    # is transported via server args (--reasoning-budget), not
-    # request_options; validate_reasoning_backend accepts local now.
-    validate_reasoning_backend(effective_reasoning, backend)
-    # F3 (B3 review): a local runtime profile that will run the B3 audit
-    # must be B3-capable (MTP draft, reasoning 8192, context 49k) — fail
-    # loudly instead of silently auditing with a non-B3 server profile.
-    _validate_b3_qwen_profile(args, backend)
+    # Backend + run config resolved exactly as a run would (shared helper,
+    # so the book resume gate sees the identical invocation identity).
+    backend, cfg, effective_reasoning = _resolve_backend_and_config(args)
     # Offline host-local preflight: runs by default before every configured run
     # and as explicit --preflight check-and-exit. Sanitized report, no server/
     # network/artifact side effects, no credential values.
@@ -1369,28 +1443,8 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # Preflight passed — log sanitized report for auditability before startup
     LOG.info("Offline preflight PASS:\n%s", preflight_report.format_human())
     _warn_remote_acknowledgement(backend)
-    # Build StrictRunConfig first to obtain resolved_role_policies, then wire onto backend for adapter construction
-    cfg = _build_run_config(args, backend, reasoning=effective_reasoning)
-    # Wire ResolvedModelPair onto backend (model-centric) – support both names for backward compat
-    _resolved = getattr(cfg, "resolved_role_policies", None) or getattr(cfg, "resolved_pair", None)
-    if _resolved is not None and getattr(backend, "resolved_pair", None) is None and getattr(backend, "resolved_role_policies", None) is None:
-        from dataclasses import replace as _replace2
-        if isinstance(backend, LocalLlamaBackendConfig):
-            try:
-                backend = _replace2(backend, resolved_pair=_resolved)  # type: ignore[call-arg]
-            except TypeError:
-                backend = _replace2(backend, resolved_role_policies=_resolved)  # type: ignore[call-arg]
-        elif isinstance(backend, CompositeBackendConfig):
-            new_backends = {}
-            for name, sub in backend.backends.items():
-                if isinstance(sub, LocalLlamaBackendConfig) and getattr(sub, "resolved_pair", None) is None and getattr(sub, "resolved_role_policies", None) is None:
-                    try:
-                        new_backends[name] = _replace2(sub, resolved_pair=_resolved)  # type: ignore[call-arg]
-                    except TypeError:
-                        new_backends[name] = _replace2(sub, resolved_role_policies=_resolved)  # type: ignore[call-arg]
-                else:
-                    new_backends[name] = sub
-            backend = _replace2(backend, backends=new_backends)
+    # NOTE: backend/cfg above already carry the resolved pair wiring from
+    # _resolve_backend_and_config (identical to the historical inline code).
     args.out_dir.mkdir(parents=True, exist_ok=True)
     bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
     runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
