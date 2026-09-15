@@ -5,25 +5,25 @@
 
 ## 2. Canonical memory population
 
-- [ ] 2.1 Implement normalized all-scope identity lookup before book-memory insertion; verify `Callan`, `Paige`, `Peter`, and `Stephanie`-style cross-section collisions merge or no-op without a duplicate durable key
-- [ ] 2.2 Route created records by `memory_class`, retain verified gender only as an attribute, and preserve first-seen/evidence provenance; verify named characters, named places, terms, and claimless named identities land in their correct scopes
-- [ ] 2.3 Enforce verified-claim and verified-relation promotion independently of a verified surface; verify candidate local coreferences never become aliases/facts while B3 retains them in chapter-local entity context
-- [ ] 2.4 Merge multiple compatible matches (same normalized identity or policy-approved explicit alias, non-contradictory attributes/forms) into one canonical record with merged provenance and `memory_class` scope; treat only contradictory matches as conflict; add a fixture with two compatible duplicates existing before the current chapter and verify they are merged, not tripled
-- [ ] 2.5 Exclude any record still in an ambiguous conflict state from role views; verify pre-existing unresolved duplicates never appear as an ambiguous constraint
-- [ ] 2.6 Preserve established compatible facts by evidence append, record incompatible facts as non-prompt-visible conflicts, and emit create/merge/update/no-op/reject/conflict decisions; verify no incoming claim silently overwrites canonical data
-- [ ] 2.7 Expand the versioned candidate report with operation, target, scope, class, reason, and evidence; verify an accepted merge/no-op is distinguishable from a newly created record
+- [x] 2.1 Implement normalized all-scope identity lookup before book-memory insertion; verify `Callan`, `Paige`, `Peter`, and `Stephanie`-style cross-section collisions merge or no-op without a duplicate durable key
+- [x] 2.2 Route created records by `memory_class`, retain verified gender only as an attribute, and preserve first-seen/evidence provenance; verify named characters, named places, terms, and claimless named identities land in their correct scopes
+- [x] 2.3 Enforce verified-claim and verified-relation promotion independently of a verified surface; verify candidate local coreferences never become aliases/facts while B3 retains them in chapter-local entity context
+- [x] 2.4 Merge multiple compatible matches (same normalized identity or policy-approved explicit alias, non-contradictory attributes/forms) into one canonical record with merged provenance and `memory_class` scope; treat only contradictory matches as conflict; add a fixture with two compatible duplicates existing before the current chapter and verify they are merged, not tripled
+- [x] 2.5 Exclude any record still in an ambiguous conflict state from role views; verify pre-existing unresolved duplicates never appear as an ambiguous constraint
+- [x] 2.6 Preserve established compatible facts by evidence append, record incompatible facts as non-prompt-visible conflicts, and emit create/merge/update/no-op/reject/conflict decisions; verify no incoming claim silently overwrites canonical data
+- [x] 2.7 Expand the versioned candidate report with operation, target, scope, class, reason, and evidence; verify an accepted merge/no-op is distinguishable from a newly created record
 
 ## 3. Role-aware context compiler
 
-- [ ] 3.1 Add one pure `select_relevant(authoritative_state, source_map)` reusing the existing causal source-relevance logic; verify it is computed once per chapter and reused by every consumer rather than recomputed per stage
-- [ ] 3.2 Implement `render_book_context(role, relevance, authoritative_glossary, current_b1_2, glossary_candidates)` with text, included canonical IDs, resolved term-map, schema/version, and canonical hash; verify identical input renders byte-identically
-- [ ] 3.3 Resolve each established Russian form from the frozen authoritative glossary; when a glossary entry exists it overrides `book_memory.canonical_ru`; when they disagree, exclude the conflicting form and record a diagnostic; include the resolved glossary slice in the rendered hash; add a glossary/memory conflict test
-- [ ] 3.4 Enforce causal source relevance using canonical names and verified lexical variants only, with explicit narrator/seed/global-voice exceptions; verify later facts, generic roles, relationship descriptions, candidate aliases, and shared-RU-target matches do not enter a view
-- [ ] 3.5 Define concrete numeric per-role token/card budgets and fixed field/record priority as named constants in code (not prose), plus overflow behavior that trims lowest-priority extras; verify over-budget cards are trimmed, not used to add model calls
+- [x] 3.1 Add one pure `select_relevant(authoritative_state, source_map)` reusing the existing causal source-relevance logic; verify it is computed once per chapter and reused by every consumer rather than recomputed per stage
+- [x] 3.2 Implement `render_book_context(role, relevance, authoritative_glossary, current_b1_2, glossary_candidates)` with text, included canonical IDs, resolved term-map, schema/version, and canonical hash; verify identical input renders byte-identically
+- [x] 3.3 Resolve each established Russian form from the frozen authoritative glossary; when a glossary entry exists it overrides `book_memory.canonical_ru`; when they disagree, exclude the conflicting form and record a diagnostic; include the resolved glossary slice in the rendered hash; add a glossary/memory conflict test
+- [x] 3.4 Enforce causal source relevance using canonical names and verified lexical variants only, with explicit narrator/seed/global-voice exceptions; verify later facts, generic roles, relationship descriptions, candidate aliases, and shared-RU-target matches do not enter a view
+- [x] 3.5 Define concrete numeric per-role token/card budgets and fixed field/record priority as named constants in code (not prose), plus overflow behavior that trims lowest-priority extras; verify over-budget cards are trimmed, not used to add model calls
 - [ ] 3.6 Include the audit/repair card in the existing audit input-budget accounting; add a regression test asserting audit chunk count and retry budget are unchanged by an enabled card
-- [ ] 3.7 Compose the translator prompt from the causal durable view plus a separate labelled current-chapter verified B1.2 block with its own identity; verify the B1.2 block is not treated as a durable role view
-- [ ] 3.8 Render bounded audit/repair, Russian-editor, and glossary cards according to their role allowlists, source-prevails policy, and glossary-wins resolution; verify prompt snapshots contain required name/gender/address/term constraints and omit unrelated plot/chapter-local facts
-- [ ] 3.9 In `select_relevant`, explicitly document and implement narrator/seed/global-voice constraints as an exception always included from explicit policy independent of source presence; verify they appear in every role view and are not subject to relevance matching
+- [x] 3.7 Compose the translator prompt from the causal durable view plus a separate labelled current-chapter verified B1.2 block with its own identity; verify the B1.2 block is not treated as a durable role view
+- [x] 3.8 Render bounded audit/repair, Russian-editor, and glossary cards according to their role allowlists, source-prevails policy, and glossary-wins resolution; verify prompt snapshots contain required name/gender/address/term constraints and omit unrelated plot/chapter-local facts
+- [x] 3.9 In `select_relevant`, explicitly document and implement narrator/seed/global-voice constraints as an exception always included from explicit policy independent of source presence; verify they appear in every role view and are not subject to relevance matching
 
 ## 4. Default whole-chapter wiring and identity
 

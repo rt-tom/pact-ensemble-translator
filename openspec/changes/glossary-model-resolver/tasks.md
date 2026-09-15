@@ -1,7 +1,7 @@
 ## 1. Основа и флаг
 
 - [ ] 1.1 Ввести `glossary_resolver_mode = off | shadow | promote` и `glossary_resolver_cache_miss_policy = recompute | fail_closed` (оба identity-bearing, в `config_identity`/`runtime_config`/`B3AuditRepairConfig`) с default `off`/`recompute`, прокинуть через `v4_phase12_strict_runner` и `strict runner → B3` `quarantined_pids` plumbing; rollback `off` запрещает новые observations, отката к `align` нет — верификация: `config_identity` меняется при смене любого флага
-- [ ] 1.2 Расширить `B1.2` промпт полем `glossary_worthy` (model gate `false` — veto даже при коде `true`), без нового `source_aliases[]` (используется `aliases[]`), bump `EXTRACTOR_VERSION`/`prompt_version`/`CACHE_SCHEMA`, код-валидация `title-case`, не `EN_STOP`, поверхность word-boundary в source — верификация: `b1.2_entity_raw.txt` для `0033` содержит `glossary_worthy` и `Knights of the Basement` целиком, старый кэш инвалидируется
+- [x] 1.2 Расширить `B1.2` промпт полем `glossary_worthy` (model gate `false` — veto даже при коде `true`), без нового `source_aliases[]` (используется `aliases[]`), bump `EXTRACTOR_VERSION`/`prompt_version`/`CACHE_SCHEMA`, код-валидация `title-case`, не `EN_STOP`, поверхность word-boundary в source — верификация: `b1.2_entity_raw.txt` для `0033` содержит `glossary_worthy` и `Knights of the Basement` целиком, старый кэш инвалидируется
 
 ## 2. Batched resolver в B3 (единый пост-процессинг путь)
 
@@ -18,7 +18,7 @@
 ## 4. Депрекейт и линт
 
 - [ ] 4.1 Депрекейт `align_candidates` для `proper_name` в `glossary_observations_from_entity_context` (term-ветка остаётся только `library/diagnostic API`, production `book-run` её не запускает) — верификация: `Shotgun→Дробовик` резолвится, `door→дверь` не промоутится и скан не вызывается
-- [ ] 4.2 Заменить `pact-fidelity-lint` suffix/translit hard checks на проверку пары `proposed_ru + surface_forms[]` по `glossary_proposals.json` (deterministic `surface∈evidence` + `lemma_v1` + `blocklist`), `Кристоффа/Диониса` deterministic **не** падают (стем-равны), ловятся `shadow` quality evaluation; `Бабуль` — только regression — верификация: `Sandra→Сандра` и `Роксанна` не падают на `а`, `Кристоффа` не падает deterministic
+- [x] 4.2 Заменить `pact-fidelity-lint` suffix/translit hard checks на проверку пары `proposed_ru + surface_forms[]` по `glossary_proposals.json` (deterministic `surface∈evidence` + `lemma_v1` + `blocklist`), `Кристоффа/Диониса` deterministic **не** падают (стем-равны), ловятся `shadow` quality evaluation; `Бабуль` — только regression — верификация: `Sandra→Сандра` и `Роксанна` не падают на `а`, `Кристоффа` не падает deterministic
 
 ## 5. Модель и наблюдаемость
 
