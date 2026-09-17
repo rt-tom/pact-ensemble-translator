@@ -15,6 +15,68 @@ import pytest
 from pact_v4.runtime.runtime_config import PreflightCheck, PreflightReport
 
 
+# ---------------------------------------------------------------------------
+# V5 slice-1: manifest-driven chapter resolution helper
+# ---------------------------------------------------------------------------
+
+def _make_manifest_books(tmp_path, monkeypatch, files: dict[str, str]):
+    """Build a tmp ``books/pact`` profile covering ``files`` ({name: title}).
+
+    V5 slice-1: simple book mode resolves chapters ONLY from the book
+    manifest (never a source glob). Tests that override
+    ``PACT_V4_SOURCE_ROOT`` must therefore provide the matching profile
+    artifacts via ``PACT_V5_BOOKS_DIR``.
+    """
+    from pact_v4.phase0b.epub_splitter import generate_directory_manifest
+
+    books = tmp_path / "books"
+    home = books / "pact"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "book.yaml").write_text(
+        "schema_version: pact-v5-book-profile/v1\n"
+        "slug: pact\ntitle: Pact\ncontent_kind: prose\n"
+        "source_lang: en\ntarget_lang: ru\n"
+        "source:\n"
+        "  rt_root: D:/pact/pact_chapters\n"
+        "  media_root: /tmp/pact_chapters\n"
+        "  manifest: manifest.json\n"
+        "state:\n"
+        '  media_book_id: "1"\n'
+        "  rt_root: D:/pact/book_state\n"
+        "  media_root: /tmp/book_state\n"
+        "out:\n"
+        "  rt_root: D:/pact/gate_bench_runs\n"
+        "  media_root: /tmp/outputs\n"
+        "chapters: chapters.json\n"
+        "policy:\n  hard_filters: v4-en-ru\n  editor_pass: russian-editor-v1\n",
+        encoding="utf-8",
+    )
+    src = Path(__import__("os").environ["PACT_V4_SOURCE_ROOT"])
+    for name, title in files.items():
+        (src / name).write_text(
+            f"<html><head><title>{title}</title></head><body><h1>{title}</h1><p>x</p></body></html>",
+            encoding="utf-8",
+        )
+    generate_directory_manifest(src, "pact", manifest_out=home / "manifest.json")
+    orders = sorted(int(n[:4]) for n in files)
+    (home / "chapters.json").write_text(
+        json.dumps({
+            "schema_version": "pact-v5-approved-chapters/v1",
+            "book_slug": "pact",
+            "chapters": [
+                {"file": name, "order": order, "en_title": files[name],
+                 "ru_title": None, "pov": None, "notes": ""}
+                for name, order in sorted(
+                    ((n, int(n[:4])) for n in files), key=lambda e: e[1])
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PACT_V5_BOOKS_DIR", str(books))
+    return books
+
+
+
 def _ok_report(kind="local_llama"):
     return PreflightReport(
         ok=True,
@@ -858,15 +920,15 @@ def test_simple_local_injects_media_defaults_and_whole_chapter(tmp_path, monkeyp
     state = tmp_path / "state"
     out = tmp_path / "out"
     src.mkdir(); state.mkdir(); out.mkdir()
-    (src / "0028_alpha.html").write_text("<html/>")
     monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
     monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
     monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out))
+    _make_manifest_books(tmp_path, monkeypatch, {"0001_alpha.html": "Alpha 1.1"})
     ok = _ok_report(kind="local_llama")
     with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
         with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
             mock_book.return_value = 0
-            rc = v4_run.main(["book", "--chapters", "28", "--local"])
+            rc = v4_run.main(["book", "--chapters", "1", "--local"])
             assert rc == 0
             delegated = mock_book.call_args[0][0]
             # Whole-chapter injected
@@ -876,8 +938,8 @@ def test_simple_local_injects_media_defaults_and_whole_chapter(tmp_path, monkeyp
             assert delegated[delegated.index("--media-book-id")+1] == "1"
             assert "--media-target" in delegated and delegated[delegated.index("--media-target")+1] == "media-snap"
             assert "--media-root" in delegated and delegated[delegated.index("--media-root")+1] == "/home/rt/pact_runs"
-            # Single shorthand 28 -> delegated contains full stem 0028_alpha
-            assert "0028_alpha" in delegated
+            # Manifest order 1 -> delegated contains full stem 0001_alpha
+            assert "0001_alpha" in delegated
             # Local simple mode forwards --local (bare) without --runtime-config (mutual exclusion, local-model-aliases)
             assert "--local" in delegated
             assert "--runtime-config" not in delegated
@@ -889,15 +951,15 @@ def test_simple_bare_remote_uses_profile_defaults(tmp_path, monkeypatch):
     state = tmp_path / "state"
     out = tmp_path / "out"
     src.mkdir(); state.mkdir(); out.mkdir()
-    (src / "0030_b.html").write_text("<html/>")
     monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
     monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
     monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out))
+    _make_manifest_books(tmp_path, monkeypatch, {"0001_b.html": "B 1.1"})
     ok = _ok_report(kind="opencode_server")
     with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
         with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
             mock_book.return_value = 0
-            rc = v4_run.main(["book", "--chapters", "30", "--remote"])
+            rc = v4_run.main(["book", "--chapters", "1", "--remote"])
             assert rc == 0
             delegated = mock_book.call_args[0][0]
             assert "--managed-server" in delegated
@@ -911,15 +973,15 @@ def test_simple_remote_with_alias_override(tmp_path, monkeypatch):
     state = tmp_path / "state"
     out = tmp_path / "out"
     src.mkdir(); state.mkdir(); out.mkdir()
-    (src / "0031_x.html").write_text("<html/>")
     monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
     monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state))
     monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out))
+    _make_manifest_books(tmp_path, monkeypatch, {"0001_x.html": "X 1.1"})
     ok = _ok_report(kind="opencode_server")
     with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
         with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
             mock_book.return_value = 0
-            rc = v4_run.main(["book", "--chapters", "31", "--remote", "musefree/luna"])
+            rc = v4_run.main(["book", "--chapters", "1", "--remote", "musefree/luna"])
             assert rc == 0
             delegated = mock_book.call_args[0][0]
             assert "--translator" in delegated and "musefree" in delegated[delegated.index("--translator")+1]
@@ -1015,7 +1077,6 @@ def test_book_out_base_inside_source_or_snapshot_fails_before_mkdir(tmp_path, mo
     from pact_full_pipeline_runner_v1.v4_run import main
     src = tmp_path / "src"
     src.mkdir()
-    (src / "0028_a.html").write_text("<html/>")
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
@@ -1047,7 +1108,6 @@ def test_preflight_path_readiness_missing_and_unwritable(tmp_path, monkeypatch):
     from pact_full_pipeline_runner_v1.v4_run import main
     src = tmp_path / "src"
     src.mkdir()
-    (src / "0028_a.html").write_text("<html/>")
     # Use a nonexistent state dir whose parent exists and is writable -> should pass
     state_ok = tmp_path / "state_ok" / "nested"
     (tmp_path / "state_ok").mkdir()
@@ -1056,11 +1116,12 @@ def test_preflight_path_readiness_missing_and_unwritable(tmp_path, monkeypatch):
     monkeypatch.setenv("PACT_V4_SOURCE_ROOT", str(src))
     monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state_ok))
     monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out_ok))
+    _make_manifest_books(tmp_path, monkeypatch, {"0001_a.html": "A 1.1"})
     ok = _ok_report()
     with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
         with patch("pact_full_pipeline_runner_v1.v4_book_run.main") as mock_book:
             mock_book.return_value = 0
-            rc = main(["book", "--chapters", "28", "--local", "--preflight"])
+            rc = main(["book", "--chapters", "1", "--local", "--preflight"])
             assert rc == 0
     # Now make parent unwritable via mock
     unwritable_parent = tmp_path / "unwritable"
@@ -1069,7 +1130,7 @@ def test_preflight_path_readiness_missing_and_unwritable(tmp_path, monkeypatch):
     monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state_bad))
     with patch("os.access", return_value=False):
         with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
-            rc = main(["book", "--chapters", "28", "--local", "--preflight"])
+            rc = main(["book", "--chapters", "1", "--local", "--preflight"])
             assert rc == 1
     # Output unwritable similarly
     monkeypatch.setenv("PACT_V4_STATE_ROOT", str(state_ok))
@@ -1077,5 +1138,5 @@ def test_preflight_path_readiness_missing_and_unwritable(tmp_path, monkeypatch):
     monkeypatch.setenv("PACT_V4_OUT_ROOT", str(out_bad))
     with patch("os.access", return_value=False):
         with patch("pact_v4.runtime.runtime_config.run_runtime_preflight", return_value=ok):
-            rc = main(["book", "--chapters", "28", "--local", "--preflight"])
+            rc = main(["book", "--chapters", "1", "--local", "--preflight"])
             assert rc == 1

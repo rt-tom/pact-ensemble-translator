@@ -33,7 +33,7 @@ For a new book id (Pale: `2`), approved initial glossary entries and global memo
 - **THEN** it is read from `books/pale/` and no extra file is added to any snapshot `state/` directory
 
 ### Requirement: Approved chapters artifact is title authority, separate from glossary
-The approved `chapters.json` SHALL be the sole authority for Russian chapter titles and per-chapter POV for every book, including Pact; the runner SHALL deterministically derive its internal title map from its `en_title`/`ru_title` records for substitution in `v4_book_html.py` and for a neutral prompt block rendered only when that derived map is non-empty. Titles SHALL never merge into `glossary.json`. A one-time Pact metadata migration SHALL derive and review the Pact `chapters.json` from its current 150 HTML chapters, `arc_names.json`, and established POV; `arc_names.json` SHALL NOT remain a runtime input. The common renderer SHALL preserve Pact's current `CHAPTERS:` prompt bytes from the migrated metadata.
+The approved `chapters.json` SHALL be the sole authority for Russian chapter titles and per-chapter POV for every book, including Pact. Per-chapter records carry full `ru_title` (RU arc + original number format, e.g. `Bonds 1.1` → `Узы 1.1`, `Gathered Pages: 1` → `Собранные страницы: 1`, `Histories (Arc 2)` → `Хроники (Арка 2)`). The runner SHALL deterministically derive its internal title map from its `en_title`/`ru_title` records for substitution in `v4_book_html.py`, and the generation prompt block from unique arc pairs in book first-appearance order (arc extracted by stripping the trailing number/designator suffix), rendered only when that derived map is non-empty under the legacy `CHAPTERS:` label. Titles SHALL never merge into `glossary.json`. A one-time Pact metadata migration SHALL derive and review the Pact `chapters.json` from its current 150 HTML chapters, `arc_names.json` (15 legacy entries UNCHANGED) plus the owner-approved B1 RU arc table, and established POV; `arc_names.json` SHALL NOT remain a runtime input. No byte-regression of the legacy prompt block is required: the derived identity becomes the baseline (B4 waived).
 
 #### Scenario: Empty approved titles mean free title translation
 - **WHEN** Pale's approved `chapters.json` has no `ru_title` values
@@ -41,11 +41,15 @@ The approved `chapters.json` SHALL be the sole authority for Russian chapter tit
 
 #### Scenario: Approved chapters drive headings
 - **WHEN** an approved `chapters.json` contains a non-empty `ru_title` for a chapter
-- **THEN** the builder substitutes that RU heading and the generation prompt carries the neutral title block
+- **THEN** the builder substitutes that RU heading and the generation prompt carries the derived `CHAPTERS:` title block
 
-#### Scenario: Pact's migrated metadata preserves the heading prompt
+#### Scenario: Pact's derived block follows the approved table
 - **WHEN** a Pact `book-1` chapter renders the title mapping from its approved `chapters.json`
-- **THEN** its prompt contains byte-identical current `CHAPTERS:` content without reading `arc_names.json` at runtime
+- **THEN** its prompt contains a `CHAPTERS:` block with the unique arc pairs in book first-appearance order — `Bonds → Узы`, `Gathered Pages → Собранные страницы`, `Damages → Ущерб`, `Histories → Хроники`, `Breach → Разрыв`, `Collateral → Залог`, `Conviction → Обвинение`, `Subordination → Подчинение`, `Void → Пустота`, `Signature → Подпись`, `Null → Нуль`, `Mala Fide → Mala Fide`, `Malfeasance → Злоупотребление`, `Duress → Принуждение`, `Execution → Казнь`, `Sine Die → Sine Die`, `Possession → Одержимость`, `Judgment → Суд`, `Epilogue → Эпилог` — without reading `arc_names.json` at runtime
+
+#### Scenario: Zero-chapter entries are dropped from the block
+- **WHEN** the derived block is rendered for Pact
+- **THEN** `Transgression`, `Sundown`, and bare `Gathered` (zero chapters in the book, underivable from records) do not appear in it
 
 ### Requirement: Per-chapter POV with null global narrator for rotation books
 POV SHALL be a per-chapter attribute from the approved `chapters.json`: the bible renderer SHALL include a per-chapter `POV: <name> (<gender>)` line, and the book-level `pov.gender` for rotation books (Pale) SHALL be null. Pact's migrated `chapters.json` SHALL represent its established single narrator through the same renderer.

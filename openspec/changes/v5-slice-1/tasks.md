@@ -13,7 +13,7 @@
 ## 3. Профиль книги и раннер
 
 - [ ] 3.1 Одноразово сгенерировать и owner-review `books/pact/chapters.json` из 150 HTML, `arc_names.json` и established POV; ввести `books/<slug>/book.yaml` для Pact/Pale и единый резолв `--book <slug>` в `v4_run.py` (omitted = `pact`); хеш approved `chapters.json` включить в profile/prompt identity
-- [ ] 3.2 Обобщить `deterministic_arc_names` → `deterministic_title_map`, который для всех книг извлекается только из утверждённого `chapters.json`; удалить runtime fallback к `arc_names.json`; проверить пустые `ru_title` Pale, подстановку заголовков в `v4_book_html.py`, байт-идентичный `CHAPTERS:` и русские заголовки Pact
+- [ ] 3.2 Обобщить `deterministic_arc_names` → `deterministic_title_map`: single derivation из записей утверждённого `chapters.json` (полные `ru_title`; блок — unique arc pairs в порядке first-appearance, label `CHAPTERS:`; zero-chapter entries Transgression/Sundown/bare Gathered dropped); удалить runtime fallback к `arc_names.json`; B1 RU arc table как данные (+ review-флаги Breach/Null/Malfeasance в notes); проверить пустые `ru_title` Pale, подстановку заголовков в `v4_book_html.py` и русские заголовки Pact; byte-regression НЕ требуется — derived identity становится baseline (B4 waived)
 - [ ] 3.3 Ввести per-chapter POV в bible-рендер (`POV: <имя> (<пол>)` из approved `chapters.json`), книжный `pov.gender=null` для Pale; проверить общий renderer для Pact с сингл-нарратором
 - [ ] 3.4 Реализовать fail-closed изоляцию профилей (manifest/chapters/state принадлежат тому же slug); проверить негативными тестами
 - [ ] 3.5 Реализовать preflight-гейты профиля (`content_kind: prose`, `en/ru` only, известные policy); иное — fail-closed до output/state/model activity; проверить unit-тестами без запуска моделей
@@ -21,5 +21,5 @@
 ## 4. Пилот и приёмка
 
 - [ ] 4.1 Прогнать Pale 0.0, 1.0, 1.1 book-режимом тем же ансамблем (прогоны — владелец на RT); собрать глазную приёмку владельца
-- [ ] 4.2 Прогнать Pact `--book pact` и legacy-invocation без `--book` для 0001 strict (владелец на RT); сравнить resolved layout, `CHAPTERS:` bytes, итоговый русский heading и identity с baseline, зафиксировать отсутствие изменений `book-1`
+- [ ] 4.2 Прогнать Pact `--book pact` и legacy-invocation без `--book` для 0001 strict (владелец на RT); сравнить resolved layout, derived `CHAPTERS:` block (B1 table, §3.2), итоговый русский heading; зафиксировать НОВЫЙ derived identity baseline (byte-regression не требуется, B4 waived)
 - [ ] 4.3 Прогнать `openspec validate v5-slice-1 --strict`, `pact-fidelity-lint` (если тронуты промпты), узкие pytest по затронутым модулям, `pact-git-hygiene`; зафиксировать техдолг «резка глав 95–125K» post-pilot задачей

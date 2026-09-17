@@ -24,6 +24,41 @@ CHAPTER_INDEX_V2_SCHEMA = "pact-v4-chapter-index/v2"
 BOOK_MEMORY_V2_SCHEMA = "pact-v4-book-memory/v2"
 
 
+def _normalize_chapter_pov(chapter_pov: Any) -> Optional[tuple[str, Optional[str]]]:
+    """Normalize a per-chapter POV value to ``(name, gender)``.
+
+    Accepts a ``{"name", "gender"}`` mapping (approved ``chapters.json``),
+    an object with ``name``/``gender`` attributes, or a bare name string
+    (gender unknown). Returns ``None`` for absent/empty input.
+    """
+    if chapter_pov is None:
+        return None
+    if isinstance(chapter_pov, str):
+        name = chapter_pov.strip()
+        return (name, None) if name else None
+    if isinstance(chapter_pov, Mapping):
+        name = _norm_str(chapter_pov.get("name", ""))
+        if not name:
+            return None
+        gender = chapter_pov.get("gender")
+        gender = _norm_str(gender) if isinstance(gender, str) else ""
+        folded = gender.casefold() if gender else ""
+        if folded in ("male", "m"):
+            gender = "male"
+        elif folded in ("female", "f"):
+            gender = "female"
+        elif folded:
+            gender = folded
+        else:
+            gender = None
+        return (name, gender)
+    name = _norm_str(getattr(chapter_pov, "name", ""))
+    if not name:
+        return None
+    gender = _norm_str(getattr(chapter_pov, "gender", ""))
+    return (name, gender.casefold() if gender else None)
+
+
 def _norm_str(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -85,7 +120,46 @@ def _seed_facts(book_memory: Mapping) -> List[Mapping]:
     ]
 
 
-def _render_seed_bible(book_memory: Any) -> str:
+def _pov_lines(
+    book_memory: Any,
+    chapter_pov: Any = None,
+) -> List[str]:
+    """Narrator/POV lines for the ``BIBLE:`` block (v5 slice-1).
+
+    The per-chapter POV comes from the approved ``chapters.json`` (sole
+    authority, never the glossary). Additive-only rule — Pact stays
+    byte-identical:
+
+    * no chapter POV -> legacy ``Narrator: <gender>`` line (or nothing);
+    * chapter POV consistent with the book-level narrator (same gender,
+      or chapter gender unknown) -> legacy line only;
+      a rotation book (``pov.gender`` null, e.g. Pale) renders the
+      per-chapter ``POV: <name> (<gender>)`` line and asserts NO global
+      narrator;
+    * chapter POV conflicting with the book-level narrator -> the
+      per-chapter line wins explicitly (fail-closed: never assert a
+      wrong global narrator for this chapter).
+    """
+    normalized = _normalize_chapter_pov(chapter_pov)
+    narrator = extract_narrator_gender(book_memory)
+    if normalized is None:
+        return [f"  - Narrator: {narrator}"] if narrator else []
+    name, gender = normalized
+    if narrator is None:
+        # Rotation book (book-level pov.gender null): chapter POV only.
+        if gender:
+            return [f"  - POV: {name} ({gender})"]
+        return [f"  - POV: {name}"]
+    # Book-level narrator set (Pact single narrator): consistent chapter
+    # POV adds nothing — legacy line only (byte-identical prompts).
+    if gender is None or gender == narrator:
+        return [f"  - Narrator: {narrator}"]
+    if gender:
+        return [f"  - POV: {name} ({gender})"]
+    return [f"  - POV: {name}"]
+
+
+def _render_seed_bible(book_memory: Any, chapter_pov: Any = None) -> str:
     """Fail-soft minimum render: narrator + seed facts (NEVER a full dump).
 
     When no deterministic per-chapter index entry exists the bible must NOT
@@ -94,13 +168,12 @@ def _render_seed_bible(book_memory: Any) -> str:
     """
     if not isinstance(book_memory, Mapping):
         return ""
-    narrator = extract_narrator_gender(book_memory)
+    pov_lines = _pov_lines(book_memory, chapter_pov)
     seed_facts = _seed_facts(book_memory)
-    if not narrator and not seed_facts:
+    if not pov_lines and not seed_facts:
         return ""
     parts: List[str] = ["BIBLE:"]
-    if narrator:
-        parts.append(f"  - Narrator: {narrator}")
+    parts.extend(pov_lines)
     if seed_facts:
         parts.append("  - Seed facts:")
         for fact in seed_facts:
@@ -118,6 +191,7 @@ def render_bible_section(
     chapter_id: Any = None,
     chapter_index: Any = None,
     book_memory: Any = None,
+    chapter_pov: Any = None,
 ) -> str:
     """Render the book memory into a ``BIBLE:`` text block for prompts.
 
@@ -138,6 +212,14 @@ def render_bible_section(
     ``None``) keeps the same fail-soft seed render — the legacy full-memory
     form is gone.
 
+    ``chapter_pov`` (v5 slice-1): per-chapter POV from the approved
+    ``chapters.json`` (``{"name", "gender"}``, object with name/gender,
+    or bare name). Additive-only: ``None`` (default) renders exactly the
+    legacy output; a rotation book (book-level ``pov.gender`` null)
+    renders ``POV: <name> (<gender>)`` with no global narrator assertion;
+    a chapter POV consistent with an established single narrator (Pact)
+    keeps the legacy ``Narrator:`` line byte-identical.
+
     Returns an empty string when there is no renderable content (the
     caller omits the section entirely). The output is deterministic for
     the same input — no set iteration without sorting, no randomness.
@@ -151,7 +233,7 @@ def render_bible_section(
     if chapter_id is None or isinstance(chapter_id, Mapping):
         if isinstance(chapter_id, Mapping):
             book_memory = chapter_id
-        return _render_seed_bible(book_memory)
+        return _render_seed_bible(book_memory, chapter_pov)
 
     # v2 metadata check: BOTH $schema and $book_memory_policy_version must be present and exact (finding 2 refinement)
     # No alias fallback ("schema" / "policy_version" etc.) — aliases fail soft. Missing/unknown of EITHER fails soft.
@@ -159,16 +241,16 @@ def render_bible_section(
         schema = chapter_index.get("$schema")
         policy_ver = chapter_index.get("$book_memory_policy_version")
         if schema != CHAPTER_INDEX_V2_SCHEMA or policy_ver != BOOK_MEMORY_POLICY_VERSION:
-            return _render_seed_bible(book_memory)
+            return _render_seed_bible(book_memory, chapter_pov)
     entry = None
     if isinstance(chapter_index, Mapping):
         entry = chapter_index.get(chapter_id)
     if entry is None or not isinstance(entry, Mapping):
-        return _render_seed_bible(book_memory)
-    return _render_chapter_entry(entry, book_memory)
+        return _render_seed_bible(book_memory, chapter_pov)
+    return _render_chapter_entry(entry, book_memory, chapter_pov)
 
 
-def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
+def _render_chapter_entry(entry: Mapping, book_memory: Any, chapter_pov: Any = None) -> str:
     """Render a per-chapter index entry (narrator always; no caps).
 
     Index-only invariant: the character lines are rendered ONLY from data
@@ -186,7 +268,7 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
     """
     if not isinstance(book_memory, Mapping):
         book_memory = {}
-    narrator = extract_narrator_gender(book_memory)
+    pov_lines = _pov_lines(book_memory, chapter_pov)
 
     characters = entry.get("characters") or []
     named_entities = entry.get("named_entities") or []
@@ -207,12 +289,11 @@ def _render_chapter_entry(entry: Mapping, book_memory: Any) -> str:
         if seed_text not in facts:
             facts.append(seed_text)
 
-    if not narrator and not characters and not named_entities and not terms and not facts and not address:
+    if not pov_lines and not characters and not named_entities and not terms and not facts and not address:
         return ""
 
     parts: List[str] = ["BIBLE:"]
-    if narrator:
-        parts.append(f"  - Narrator: {narrator}")
+    parts.extend(pov_lines)
     if characters:
         parts.append("  - Characters:")
         for item in characters:

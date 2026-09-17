@@ -294,13 +294,28 @@ class StrictRunConfig:
     deterministic_glossary_terms: Tuple[Tuple[str, str], ...] = ()
     deterministic_names: Tuple[Tuple[str, str], ...] = ()
     deterministic_mixed_script_allow: Tuple[str, ...] = ()
-    # P1 АРКИ (owner decision 2026-08-14): deterministic English→Russian
-    # arc-name mapping (arc_names.json), e.g. ("Bonds", "Узы"). Rendered as
-    # an "АРКИ:" block in the whole-chapter generation prompt so chapter
-    # headings translate consistently (Bonds = Узы in every chapter). Part
-    # of the config identity (to_config_artifact) — changing the mapping
-    # invalidates cache/resume exactly like any other prompt input.
-    deterministic_arc_names: Tuple[Tuple[str, str], ...] = ()
+    # V5 slice-1 deterministic titles (generalizes P1 АРКИ, owner decision
+    # 2026-08-14; alternative B, owner decision): unique arc pairs in book
+    # first-appearance order, derived ONLY from the approved chapters.json
+    # records (e.g. ("Bonds", "Узы"), ("Breach", "Разрыв")). The legacy
+    # arc-names sidecar is NOT a runtime input. Rendered as a "CHAPTERS:"
+    # block in the whole-chapter generation prompt so chapter headings
+    # translate consistently; empty map => no block (free title
+    # translation). Part of the config identity (to_config_artifact) —
+    # changing the mapping invalidates cache/resume exactly like any other
+    # prompt input. No byte-regression required: the derived identity is
+    # the baseline (B4 waived).
+    deterministic_title_map: Tuple[Tuple[str, str], ...] = ()
+    # V5 slice-1 per-chapter POV from the approved chapters.json
+    # (``pov_for_chapter`` matched on the run chapter id; None/None when
+    # the book has no POV record for this chapter). Threaded into BOTH
+    # bible-construction paths (generation prompt + adapter injection) so
+    # rotation books (Pale) emit ``POV: <name> (<gender>)`` with no global
+    # narrator assertion. Identity-bearing: POV changes prompt bytes, so a
+    # POV change invalidates cache/resume exactly like any other prompt
+    # input (derived identity is the baseline, B4 waived).
+    chapter_pov_name: Optional[str] = None
+    chapter_pov_gender: Optional[str] = None
     config_version: str = "pact-v4-driver/phase12/strict/v1"
     run_label: str = "v4-phase12-strict"
     # Operational policy pinned before the run (see module docstring #4),
@@ -569,13 +584,19 @@ class StrictRunConfig:
             # input, so it is part of the run's config identity — changing it
             # invalidates cache/resume exactly like a memory/source change.
             "deterministic_mixed_script_allow": list(self.deterministic_mixed_script_allow),
-            # P1 АРКИ (owner decision 2026-08-14): the deterministic arc
-            # mapping renders an "АРКИ:" block into the generation prompt,
-            # so it is part of the config identity — a changed mapping
-            # invalidates cache/resume exactly like a glossary change.
-            "deterministic_arc_names": [
-                list(pair) for pair in self.deterministic_arc_names
+            # V5 slice-1 deterministic titles: the title map renders a
+            # "CHAPTERS:" block into the generation prompt, so it is part
+            # of the config identity — a change invalidates cache/resume
+            # exactly like a glossary change. (Identity key renamed from
+            # "deterministic_arc_names"; owner §4.2 records the new
+            # derived baseline — no byte-regression required, B4 waived.)
+            "deterministic_title_map": [
+                list(pair) for pair in self.deterministic_title_map
             ],
+            "chapter_pov": {
+                "name": self.chapter_pov_name,
+                "gender": self.chapter_pov_gender,
+            },
             # V4 Efficiency A1.1 (review fix, HIGH): the glossary budgeter
             # changes the actual generation prompts, so the policy version
             # MUST be part of the config identity. Without it, a journal
@@ -784,6 +805,19 @@ def build_strict_lifecycle(
         model_key=_t_key, role="gemma_audit", pair=_pair,
     )
     return router, model_caller, qwen_evaluator, gemma_selector, qwen_audit_evaluator, gemma_audit_evaluator
+
+
+def _chapter_pov_arg(cfg: Any) -> Optional[Dict[str, Optional[str]]]:
+    """Per-chapter POV mapping for ``render_bible_section`` (or None).
+
+    Built from the run config's validated ``chapter_pov_*`` fields
+    (approved chapters.json authority). Centralizes the mapping so the
+    generation path and the adapter-injection path cannot diverge.
+    """
+    name = getattr(cfg, "chapter_pov_name", None)
+    if not name:
+        return None
+    return {"name": name, "gender": getattr(cfg, "chapter_pov_gender", None)}
 
 
 def _model_matrix_block(cfg: Any) -> Optional[List[Dict[str, Any]]]:
@@ -3470,8 +3504,13 @@ def run_chapter_strict(
         # deterministic chapter_index (no "first N" caps); when no
         # chapter_index.json exists the renderer falls back to the legacy
         # full-memory render, so runs without an index keep working.
+        # V5 slice-1: the validated per-chapter POV (approved chapters.json,
+        # matched on the run chapter id) rides into the prompt here — the
+        # generation path. None (default) keeps the legacy output
+        # byte-identical (Pact single narrator, unconfigured runs).
         bible_text = render_bible_section(
-            cfg.chapter_id, memory.chapter_index, memory.book_memory
+            cfg.chapter_id, memory.chapter_index, memory.book_memory,
+            chapter_pov=_chapter_pov_arg(cfg),
         )
         narrator_gender = extract_narrator_gender(memory.book_memory)
         narrator_source_terms = _narrator_glossary_terms(memory.book_memory)
@@ -5807,15 +5846,18 @@ def _run_whole_chapter_strict_impl(
                 )
             except Exception:
                 pass
-        # P1 АРКИ (owner decision 2026-08-14, renamed to CHAPTERS per 2026-09 prompt v7):
-        # deterministic arc-name block from arc_names.json so chapter headings
+        # V5 slice-1 deterministic titles (alternative B): unique arc
+        # pairs in book first-appearance order from the approved
+        # chapters.json, rendered as a "CHAPTERS:" block so chapter headings
         # translate consistently (Bonds = Узы in every chapter). Part of the
-        # bundle identity via bible_text — a changed mapping invalidates the generation cache.
-        if cfg.deterministic_arc_names:
-            arcs_block = "\n".join(
-                f"- {en} → {ru}" for en, ru in cfg.deterministic_arc_names
+        # bundle identity via bible_text — a changed mapping invalidates the
+        # generation cache. Empty map => no block (free title translation,
+        # e.g. Pale pilot).
+        if cfg.deterministic_title_map:
+            titles_block = "\n".join(
+                f"- {en} → {ru}" for en, ru in cfg.deterministic_title_map
             )
-            gen_bible_text = f"{gen_bible_text}\nCHAPTERS:\n{arcs_block}"
+            gen_bible_text = f"{gen_bible_text}\nCHAPTERS:\n{titles_block}"
 
         events_before = runtime.event_count()
         progress.chunk_started(chunk_id=WHOLE_CHAPTER_CHUNK_ID)

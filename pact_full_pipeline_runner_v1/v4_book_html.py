@@ -173,7 +173,7 @@ def render_chapter_body(
     translations: Mapping[str, str],
     *,
     chapter_id: str = "",
-    arc_names: Optional[Mapping[str, str]] = None,
+    title_map: Optional[Mapping[str, str]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Render one chapter body from its source HTML and translations.
 
@@ -182,11 +182,15 @@ def render_chapter_body(
     (``{level, text, anchor}`` for the rendered heading blocks, in source
     order).
 
-    P1 АРКИ (owner decision 2026-08-14): when ``arc_names`` (the
-    ``arc_names.json`` mapping, e.g. ``{"Bonds": "Узы", ...}``) is given, a
-    heading whose text starts with an arc key gets the deterministic Russian
-    arc name substituted — «Узы 1.3» instead of whatever the model produced
-    for «Bonds 1.3». 0 tokens, 0 stochasticity, 100% consistency.
+    V5 slice-1 deterministic titles: when ``title_map`` (derived ONLY
+    from the approved ``chapters.json`` ``en_title``/``ru_title`` records,
+    e.g. ``{"Bonds 1.1": "Узы 1.1", ...}``) is given, a heading whose text
+    starts with a mapped key gets the deterministic Russian title
+    substituted — «Узы 1.3» instead of whatever the model produced for
+    «Bonds 1.3». 0 tokens, 0 stochasticity, 100% consistency.
+    The legacy arc-names sidecar is NOT a runtime input (one-time
+    migration source only). No mapping / no match => the model heading stands (free title
+    translation for unmapped chapters).
     """
     blocks = parse_source_html(source_html_text)
     body_parts: List[str] = []
@@ -204,7 +208,7 @@ def render_chapter_body(
                 f"h{len(headings) + 1}"
             element_id = anchor
             heading_text = _sanitized_visible_text(text)
-            substituted = _substitute_arc_name(heading_text, arc_names)
+            substituted = _substitute_title(heading_text, title_map)
             headings.append({
                 "level": level,
                 "text": substituted,
@@ -217,7 +221,7 @@ def render_chapter_body(
             # survive) and render_block_html below sanitizes it as usual, so
             # body and TOC agree on one substitution and the inline-markup
             # contract is unchanged.
-            text = _substitute_arc_name_html(text, arc_names)
+            text = _substitute_title_html(text, title_map)
         body_parts.append(render_block_html(block, text, element_id=element_id))
     report = {
         "blocks_total": len(blocks),
@@ -228,22 +232,22 @@ def render_chapter_body(
     return "\n".join(body_parts), report
 
 
-def _substitute_arc_name(
+def _substitute_title(
     heading_text: str,
-    arc_names: Optional[Mapping[str, str]],
+    title_map: Optional[Mapping[str, str]],
 ) -> str:
-    """Replace a leading arc key in ``heading_text`` with its Russian name.
+    """Replace a leading title key in ``heading_text`` with its Russian title.
 
-    Deterministic metadata (P1 АРКИ, owner decision 2026-08-14): a heading
-    like ``Bonds 1.3`` becomes ``Узы 1.3`` when ``arc_names`` maps
-    ``Bonds -> Узы``. Case-insensitive on the arc key; the rest of the
+    Deterministic metadata (v5 slice-1, from approved ``chapters.json``):
+    a heading like ``Bonds 1.3`` becomes ``Узы 1.3`` when ``title_map``
+    maps the leading key. Case-insensitive on the key; the rest of the
     heading (chapter number, subtitle) is preserved. No mapping / no match
     => the text is returned unchanged.
     """
-    if not arc_names or not heading_text:
+    if not title_map or not heading_text:
         return heading_text
     lowered = heading_text.casefold()
-    for key, russian in arc_names.items():
+    for key, russian in title_map.items():
         if not key:
             continue
         # Match the arc key as a leading token (followed by a space or the
@@ -253,20 +257,20 @@ def _substitute_arc_name(
     return heading_text
 
 
-def _substitute_arc_name_html(
+def _substitute_title_html(
     raw_text: str,
-    arc_names: Optional[Mapping[str, str]],
+    title_map: Optional[Mapping[str, str]],
 ) -> str:
-    """Apply the arc substitution to RAW heading text (markup-preserving).
+    """Apply the title substitution to RAW heading text (markup-preserving).
 
-    Same deterministic match as ``_substitute_arc_name`` (leading arc key,
+    Same deterministic match as ``_substitute_title`` (leading title key,
     case-insensitive), but applied to the raw translation string so inline
     markup survives: ``<em>Bonds</em> 1.3`` -> ``<em>Узы</em> 1.3``. The
     result still flows through ``render_block_html``'s sanitizer, so the
     sanitization/inline-markup contract is unchanged. No mapping / no match
     => the text is returned unchanged.
     """
-    if not arc_names or not raw_text:
+    if not title_map or not raw_text:
         return raw_text
     # Match against the SANITIZED visible text — what the body will
     # ACTUALLY render after the allowlist sanitizer. A raw
@@ -275,7 +279,7 @@ def _substitute_arc_name_html(
     # while the sanitizer unwraps it into the visible heading (RV2 finding
     # 2, MEDIUM): '<script>Bonds</script> 1.3' must match like 'Bonds 1.3'.
     lowered = _sanitized_visible_text(raw_text).casefold()
-    for key, russian in arc_names.items():
+    for key, russian in title_map.items():
         if not key:
             continue
         if lowered == key.casefold() or lowered.startswith(key.casefold() + " "):
@@ -297,27 +301,43 @@ def _substitute_arc_name_html(
     return raw_text
 
 
-def _load_arc_names(path: Optional[Path]) -> Optional[Dict[str, str]]:
-    """Load ``arc_names.json`` (P1 АРКИ) or ``None`` when unavailable.
+def load_title_map(path: Optional[Path]) -> Optional[Dict[str, str]]:
+    """Derive the deterministic title map from approved ``chapters.json``.
 
-    ``path`` is the explicit ``--arc-names`` argument; when None, the
-    current working directory's ``arc_names.json`` is tried. A missing or
-    unreadable file yields ``None`` (headings are rendered unchanged — the
-    arc substitution is an enhancement, never a failure). Non-str values
-    are dropped; a malformed payload yields ``None``.
+    The ONLY title authority (v5 slice-1): ``{en_title: ru_title}`` over
+    the chapter records with a non-empty ``ru_title``, in chapter order
+    (first occurrence wins). The legacy arc-names sidecar is never read
+    here — it was a one-time migration source.
+
+    ``path`` is the explicit ``--chapters-json`` argument; ``None`` (or a
+    missing/unreadable/malformed file) yields ``None`` — headings are then
+    rendered from the model text unchanged (free title translation). Title
+    substitution is an enhancement, never a failure.
     """
-    candidates = [path] if path is not None else [Path.cwd() / "arc_names.json"]
-    for candidate in candidates:
-        if candidate is None or not candidate.exists():
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    records = raw.get("chapters")
+    if not isinstance(records, list):
+        return None
+    title_map: Dict[str, str] = {}
+    for entry in records:
+        if not isinstance(entry, dict):
             continue
-        try:
-            raw = json.loads(candidate.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
-    return None
+        en_title = entry.get("en_title")
+        ru_title = entry.get("ru_title")
+        if (
+            isinstance(en_title, str) and en_title.strip()
+            and isinstance(ru_title, str) and ru_title.strip()
+            and en_title not in title_map
+        ):
+            title_map[en_title] = ru_title
+    return title_map or None
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +511,7 @@ def render_book(
     title: str = "Книга",
     report_path: Optional[Path] = None,
     run_dirs: Optional[Sequence[Any]] = None,
-    arc_names: Optional[Mapping[str, str]] = None,
+    title_map: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assemble ``book.html`` from per-chapter artifacts on disk.
 
@@ -563,7 +583,7 @@ def render_book(
                 ),
                 translations_path=run_dir / "translations.json",
                 translations_label=str(run_dir / "translations.json"),
-                arc_names=arc_names,
+                title_map=title_map,
             )
     else:
         for chapter_id in chapter_ids:
@@ -577,7 +597,7 @@ def render_book(
                 translations_label=str(
                     out_base / f"chapter_{chapter_id}" / "translations.json"
                 ),
-                arc_names=arc_names,
+                title_map=title_map,
             )
 
     book_html = build_book_html(chapters, title=title)
@@ -612,7 +632,7 @@ def _append_rendered_chapter(
     source_path: Path,
     translations_path: Path,
     translations_label: str,
-    arc_names: Optional[Mapping[str, str]] = None,
+    title_map: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Render one chapter from disk and append its record to ``chapters``.
 
@@ -645,7 +665,7 @@ def _append_rendered_chapter(
         chapter_record["warnings"] = [load_error]
 
     body_html, render_report = render_chapter_body(
-        source_text, translations, chapter_id=chapter_id, arc_names=arc_names,
+        source_text, translations, chapter_id=chapter_id, title_map=title_map,
     )
     chapter_record.update(render_report)
     for pid in render_report["missing_pids"]:
@@ -683,10 +703,11 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="заголовок книги (default: Книга)")
     parser.add_argument("--report", type=Path, default=None,
                         help="путь к отчёту (default: <out-base>/book_html_report.json)")
-    parser.add_argument("--arc-names", type=Path, default=None,
-                        help="arc_names.json (P1 АРКИ): детерминированная "
-                             "подстановка русских названий арков в заголовки "
-                             "(default: <cwd>/arc_names.json если существует)")
+    parser.add_argument("--chapters-json", type=Path, default=None,
+                        help="approved chapters.json (v5 slice-1): единственный "
+                             "авторитет русских заголовков; детерминированная "
+                             "подстановка en_title->ru_title в заголовки "
+                             "(без файла заголовки остаются переводом модели)")
     return parser
 
 
@@ -696,7 +717,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("нужно указать --chapters (v4) или --run-dirs (v4.1)",
               file=sys.stderr)
         return 2
-    arc_names = _load_arc_names(args.arc_names)
+    title_map = load_title_map(args.chapters_json)
     report = render_book(
         out_base=args.out_base,
         chapter_ids=args.chapters or [],
@@ -705,7 +726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         title=args.title,
         report_path=args.report,
         run_dirs=args.run_dirs,
-        arc_names=arc_names,
+        title_map=title_map,
     )
     rendered = sum(1 for ch in report["chapters"] if ch.get("rendered", 0) > 0)
     print(

@@ -1,0 +1,1656 @@
+{
+  "book_slug": "pact",
+  "chapters": [
+    {
+      "en_title": "Bonds 1.1",
+      "file": "0001_bonds-1-1.html",
+      "notes": "",
+      "order": 1,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.1"
+    },
+    {
+      "en_title": "Bonds 1.2",
+      "file": "0002_bonds-1-2.html",
+      "notes": "",
+      "order": 2,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.2"
+    },
+    {
+      "en_title": "Bonds 1.3",
+      "file": "0003_bonds-1-3.html",
+      "notes": "",
+      "order": 3,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.3"
+    },
+    {
+      "en_title": "Bonds 1.4",
+      "file": "0004_bonds-1-4.html",
+      "notes": "",
+      "order": 4,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.4"
+    },
+    {
+      "en_title": "Bonds 1.5",
+      "file": "0005_bonds-1-5.html",
+      "notes": "",
+      "order": 5,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.5"
+    },
+    {
+      "en_title": "Bonds 1.6",
+      "file": "0006_bonds-1-6.html",
+      "notes": "",
+      "order": 6,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.6"
+    },
+    {
+      "en_title": "Bonds 1.7",
+      "file": "0007_bonds-1-7.html",
+      "notes": "",
+      "order": 7,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Узы 1.7"
+    },
+    {
+      "en_title": "Gathered Pages: 1",
+      "file": "0008_gathered-pages-1.html",
+      "notes": "",
+      "order": 8,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Собранные страницы: 1"
+    },
+    {
+      "en_title": "Damages 2.1",
+      "file": "0009_damages-2-1.html",
+      "notes": "",
+      "order": 9,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.1"
+    },
+    {
+      "en_title": "Damages 2.2",
+      "file": "0010_damages-2-2.html",
+      "notes": "",
+      "order": 10,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.2"
+    },
+    {
+      "en_title": "Damages 2.3",
+      "file": "0011_damages-2-3.html",
+      "notes": "",
+      "order": 11,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.3"
+    },
+    {
+      "en_title": "Damages 2.4",
+      "file": "0012_damages-2-4.html",
+      "notes": "",
+      "order": 12,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.4"
+    },
+    {
+      "en_title": "Damages 2.5",
+      "file": "0013_damages-2-5.html",
+      "notes": "",
+      "order": 13,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.5"
+    },
+    {
+      "en_title": "Damages 2.6",
+      "file": "0014_damages-2-6.html",
+      "notes": "",
+      "order": 14,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.6"
+    },
+    {
+      "en_title": "Gathered Pages: 2",
+      "file": "0015_gathered-pages-2.html",
+      "notes": "",
+      "order": 15,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Собранные страницы: 2"
+    },
+    {
+      "en_title": "Damages 2.7",
+      "file": "0016_damages-2-7.html",
+      "notes": "",
+      "order": 16,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Ущерб 2.7"
+    },
+    {
+      "en_title": "Histories (Arc 2)",
+      "file": "0017_histories-arc-2.html",
+      "notes": "",
+      "order": 17,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 2)"
+    },
+    {
+      "en_title": "Breach 3.1",
+      "file": "0018_breach-3-1.html",
+      "notes": "review: Breach→Разрыв uncertain (alt. Пролом/Нарушение)",
+      "order": 18,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Разрыв 3.1"
+    },
+    {
+      "en_title": "Breach 3.2",
+      "file": "0019_breach-3-2.html",
+      "notes": "review: Breach→Разрыв uncertain (alt. Пролом/Нарушение)",
+      "order": 19,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Разрыв 3.2"
+    },
+    {
+      "en_title": "Breach 3.3",
+      "file": "0020_breach-3-3.html",
+      "notes": "review: Breach→Разрыв uncertain (alt. Пролом/Нарушение)",
+      "order": 20,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Разрыв 3.3"
+    },
+    {
+      "en_title": "Breach 3.4",
+      "file": "0021_breach-3-4.html",
+      "notes": "review: Breach→Разрыв uncertain (alt. Пролом/Нарушение)",
+      "order": 21,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Разрыв 3.4"
+    },
+    {
+      "en_title": "Breach 3.5",
+      "file": "0022_breach-3-5.html",
+      "notes": "review: Breach→Разрыв uncertain (alt. Пролом/Нарушение)",
+      "order": 22,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Разрыв 3.5"
+    },
+    {
+      "en_title": "Histories (Arc 3)",
+      "file": "0023_histories-arc-3.html",
+      "notes": "",
+      "order": 23,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 3)"
+    },
+    {
+      "en_title": "Collateral 4.1",
+      "file": "0024_collateral-4-1.html",
+      "notes": "",
+      "order": 24,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.1"
+    },
+    {
+      "en_title": "Collateral 4.2",
+      "file": "0025_collateral-4-2.html",
+      "notes": "",
+      "order": 25,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.2"
+    },
+    {
+      "en_title": "Collateral 4.3",
+      "file": "0026_collateral-4-3.html",
+      "notes": "",
+      "order": 26,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.3"
+    },
+    {
+      "en_title": "Collateral 4.4",
+      "file": "0027_collateral-4-4.html",
+      "notes": "",
+      "order": 27,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.4"
+    },
+    {
+      "en_title": "Collateral 4.5",
+      "file": "0028_collateral-4-5.html",
+      "notes": "",
+      "order": 28,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.5"
+    },
+    {
+      "en_title": "Collateral 4.6",
+      "file": "0029_collateral-4-6.html",
+      "notes": "",
+      "order": 29,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.6"
+    },
+    {
+      "en_title": "Collateral 4.7",
+      "file": "0030_collateral-4-7.html",
+      "notes": "",
+      "order": 30,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.7"
+    },
+    {
+      "en_title": "Collateral 4.8",
+      "file": "0031_collateral-4-8.html",
+      "notes": "",
+      "order": 31,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.8"
+    },
+    {
+      "en_title": "Collateral 4.9",
+      "file": "0032_collateral-4-9.html",
+      "notes": "",
+      "order": 32,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.9"
+    },
+    {
+      "en_title": "Collateral 4.10",
+      "file": "0033_collateral-4-10.html",
+      "notes": "",
+      "order": 33,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.10"
+    },
+    {
+      "en_title": "Collateral 4.11",
+      "file": "0034_collateral-4-11.html",
+      "notes": "",
+      "order": 34,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.11"
+    },
+    {
+      "en_title": "Collateral 4.12",
+      "file": "0035_collateral-4-12.html",
+      "notes": "",
+      "order": 35,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Залог 4.12"
+    },
+    {
+      "en_title": "Gathered Pages: 4",
+      "file": "0036_gathered-pages-4.html",
+      "notes": "",
+      "order": 36,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Собранные страницы: 4"
+    },
+    {
+      "en_title": "Conviction 5.1",
+      "file": "0037_conviction-5-1.html",
+      "notes": "",
+      "order": 37,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Обвинение 5.1"
+    },
+    {
+      "en_title": "Conviction 5.2",
+      "file": "0038_conviction-5-2.html",
+      "notes": "",
+      "order": 38,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Обвинение 5.2"
+    },
+    {
+      "en_title": "Conviction 5.3",
+      "file": "0039_conviction-5-3.html",
+      "notes": "",
+      "order": 39,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Обвинение 5.3"
+    },
+    {
+      "en_title": "Conviction 5.4",
+      "file": "0040_conviction-5-4.html",
+      "notes": "",
+      "order": 40,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Обвинение 5.4"
+    },
+    {
+      "en_title": "Conviction 5.5",
+      "file": "0041_conviction-5-5.html",
+      "notes": "",
+      "order": 41,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Обвинение 5.5"
+    },
+    {
+      "en_title": "Conviction 5.6",
+      "file": "0042_conviction-5-6.html",
+      "notes": "",
+      "order": 42,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Обвинение 5.6"
+    },
+    {
+      "en_title": "Histories (Arc 5)",
+      "file": "0043_histories-arc-5.html",
+      "notes": "",
+      "order": 43,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 5)"
+    },
+    {
+      "en_title": "Subordination 6.1",
+      "file": "0044_subordination-6-1.html",
+      "notes": "",
+      "order": 44,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.1"
+    },
+    {
+      "en_title": "Subordination 6.2",
+      "file": "0045_subordination-6-2.html",
+      "notes": "",
+      "order": 45,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.2"
+    },
+    {
+      "en_title": "Subordination 6.3",
+      "file": "0046_subordination-6-3.html",
+      "notes": "",
+      "order": 46,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.3"
+    },
+    {
+      "en_title": "Subordination 6.4",
+      "file": "0047_subordination-6-4.html",
+      "notes": "",
+      "order": 47,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.4"
+    },
+    {
+      "en_title": "Subordination 6.5",
+      "file": "0048_subordination-6-5.html",
+      "notes": "",
+      "order": 48,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.5"
+    },
+    {
+      "en_title": "Subordination 6.6",
+      "file": "0049_subordination-6-6.html",
+      "notes": "",
+      "order": 49,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.6"
+    },
+    {
+      "en_title": "Subordination 6.7",
+      "file": "0050_subordination-6-7.html",
+      "notes": "",
+      "order": 50,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.7"
+    },
+    {
+      "en_title": "Subordination 6.8",
+      "file": "0051_subordination-6-8.html",
+      "notes": "",
+      "order": 51,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.8"
+    },
+    {
+      "en_title": "Subordination 6.9",
+      "file": "0052_subordination-6-9.html",
+      "notes": "",
+      "order": 52,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.9"
+    },
+    {
+      "en_title": "Subordination 6.10",
+      "file": "0053_subordination-6-10.html",
+      "notes": "",
+      "order": 53,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.10"
+    },
+    {
+      "en_title": "Subordination 6.12",
+      "file": "0054_subordination-6-12.html",
+      "notes": "",
+      "order": 54,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подчинение 6.12"
+    },
+    {
+      "en_title": "Histories (Arc 6)",
+      "file": "0055_histories-arc-6.html",
+      "notes": "",
+      "order": 55,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 6)"
+    },
+    {
+      "en_title": "Void 7.1",
+      "file": "0056_void-7-1.html",
+      "notes": "",
+      "order": 56,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.1"
+    },
+    {
+      "en_title": "Void 7.2",
+      "file": "0057_void-7-2.html",
+      "notes": "",
+      "order": 57,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.2"
+    },
+    {
+      "en_title": "Void 7.3",
+      "file": "0058_void-7-3.html",
+      "notes": "",
+      "order": 58,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.3"
+    },
+    {
+      "en_title": "Void 7.4",
+      "file": "0059_void-7-4.html",
+      "notes": "",
+      "order": 59,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.4"
+    },
+    {
+      "en_title": "Void 7.5",
+      "file": "0060_void-7-5.html",
+      "notes": "",
+      "order": 60,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.5"
+    },
+    {
+      "en_title": "Void 7.6",
+      "file": "0061_void-7-6.html",
+      "notes": "",
+      "order": 61,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.6"
+    },
+    {
+      "en_title": "Void 7.7",
+      "file": "0062_void-7-7.html",
+      "notes": "",
+      "order": 62,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.7"
+    },
+    {
+      "en_title": "Void 7.8",
+      "file": "0063_void-7-8.html",
+      "notes": "",
+      "order": 63,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.8"
+    },
+    {
+      "en_title": "Void 7.9",
+      "file": "0064_void-7-9.html",
+      "notes": "",
+      "order": 64,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.9"
+    },
+    {
+      "en_title": "Void 7.10",
+      "file": "0065_void-7-10.html",
+      "notes": "",
+      "order": 65,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.10"
+    },
+    {
+      "en_title": "Void 7.11",
+      "file": "0066_void-7-11.html",
+      "notes": "",
+      "order": 66,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Пустота 7.11"
+    },
+    {
+      "en_title": "Histories (Arc 7)",
+      "file": "0067_histories-arc-7.html",
+      "notes": "",
+      "order": 67,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 7)"
+    },
+    {
+      "en_title": "Signature 8.1",
+      "file": "0068_signature-8-1.html",
+      "notes": "",
+      "order": 68,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подпись 8.1"
+    },
+    {
+      "en_title": "Signature 8.2",
+      "file": "0069_signature-8-2.html",
+      "notes": "",
+      "order": 69,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подпись 8.2"
+    },
+    {
+      "en_title": "Signature 8.3",
+      "file": "0070_signature-8-3.html",
+      "notes": "",
+      "order": 70,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подпись 8.3"
+    },
+    {
+      "en_title": "Signature 8.4",
+      "file": "0071_signature-8-4.html",
+      "notes": "",
+      "order": 71,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подпись 8.4"
+    },
+    {
+      "en_title": "Signature 8.6",
+      "file": "0072_signature-8-6.html",
+      "notes": "",
+      "order": 72,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подпись 8.6"
+    },
+    {
+      "en_title": "Signature 8.7",
+      "file": "0073_signature-8-7.html",
+      "notes": "",
+      "order": 73,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Подпись 8.7"
+    },
+    {
+      "en_title": "Null 9.1",
+      "file": "0074_null-9-1.html",
+      "notes": "review: Null→Нуль uncertain (alt. Ничто)",
+      "order": 74,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Нуль 9.1"
+    },
+    {
+      "en_title": "Null 9.2",
+      "file": "0075_null-9-2.html",
+      "notes": "review: Null→Нуль uncertain (alt. Ничто)",
+      "order": 75,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Нуль 9.2"
+    },
+    {
+      "en_title": "Null 9.3",
+      "file": "0076_null-9-3.html",
+      "notes": "review: Null→Нуль uncertain (alt. Ничто)",
+      "order": 76,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Нуль 9.3"
+    },
+    {
+      "en_title": "Null 9.4",
+      "file": "0077_null-9-4.html",
+      "notes": "review: Null→Нуль uncertain (alt. Ничто)",
+      "order": 77,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Нуль 9.4"
+    },
+    {
+      "en_title": "Null 9.5",
+      "file": "0078_null-9-5.html",
+      "notes": "review: Null→Нуль uncertain (alt. Ничто)",
+      "order": 78,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Нуль 9.5"
+    },
+    {
+      "en_title": "Null 9.6",
+      "file": "0079_null-9-6.html",
+      "notes": "review: Null→Нуль uncertain (alt. Ничто)",
+      "order": 79,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Нуль 9.6"
+    },
+    {
+      "en_title": "Histories 9",
+      "file": "0080_histories-9.html",
+      "notes": "",
+      "order": 80,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники 9"
+    },
+    {
+      "en_title": "Mala Fide 10.1",
+      "file": "0081_mala-fide-10-1.html",
+      "notes": "",
+      "order": 81,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Mala Fide 10.1"
+    },
+    {
+      "en_title": "Mala Fide 10.2",
+      "file": "0082_mala-fide-10-2.html",
+      "notes": "",
+      "order": 82,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Mala Fide 10.2"
+    },
+    {
+      "en_title": "Mala Fide 10.4",
+      "file": "0083_mala-fide-10-4.html",
+      "notes": "",
+      "order": 83,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Mala Fide 10.4"
+    },
+    {
+      "en_title": "Mala Fide 10.5",
+      "file": "0084_mala-fide-10-5.html",
+      "notes": "",
+      "order": 84,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Mala Fide 10.5"
+    },
+    {
+      "en_title": "Mala Fide 10.6",
+      "file": "0085_mala-fide-10-6.html",
+      "notes": "",
+      "order": 85,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Mala Fide 10.6"
+    },
+    {
+      "en_title": "Mala Fide 10.7",
+      "file": "0086_mala-fide-10-7.html",
+      "notes": "",
+      "order": 86,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Mala Fide 10.7"
+    },
+    {
+      "en_title": "Gathered Pages (Arc 10)",
+      "file": "0087_gathered-pages-arc-10.html",
+      "notes": "",
+      "order": 87,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Собранные страницы (Арка 10)"
+    },
+    {
+      "en_title": "Malfeasance 11.1",
+      "file": "0088_malfeasance-11-1.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 88,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.1"
+    },
+    {
+      "en_title": "Malfeasance 11.2",
+      "file": "0089_malfeasance-11-2.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 89,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.2"
+    },
+    {
+      "en_title": "Malfeasance 11.3",
+      "file": "0090_malfeasance-11-3.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 90,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.3"
+    },
+    {
+      "en_title": "Malfeasance 11.4",
+      "file": "0091_malfeasance-11-4.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 91,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.4"
+    },
+    {
+      "en_title": "Malfeasance 11.5",
+      "file": "0092_malfeasance-11-5.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 92,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.5"
+    },
+    {
+      "en_title": "Malfeasance 11.6",
+      "file": "0093_malfeasance-11-6.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 93,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.6"
+    },
+    {
+      "en_title": "Malfeasance 11.7",
+      "file": "0094_malfeasance-11-7.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 94,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.7"
+    },
+    {
+      "en_title": "Malfeasance 11.8",
+      "file": "0095_malfeasance-11-8.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 95,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.8"
+    },
+    {
+      "en_title": "Malfeasance 11.9",
+      "file": "0096_malfeasance-11-9.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 96,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.9"
+    },
+    {
+      "en_title": "Malfeasance 11.10",
+      "file": "0097_malfeasance-11-10.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 97,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.10"
+    },
+    {
+      "en_title": "Malfeasance 11.11",
+      "file": "0098_malfeasance-11-11.html",
+      "notes": "review: Malfeasance→Злоупотребление uncertain (alt. Злодеяние)",
+      "order": 98,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Злоупотребление 11.11"
+    },
+    {
+      "en_title": "Histories (Arc 11)",
+      "file": "0099_histories-arc-11.html",
+      "notes": "",
+      "order": 99,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 11)"
+    },
+    {
+      "en_title": "Duress 12.1",
+      "file": "0100_duress-12-1.html",
+      "notes": "",
+      "order": 100,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.1"
+    },
+    {
+      "en_title": "Duress 12.2",
+      "file": "0101_duress-12-2.html",
+      "notes": "",
+      "order": 101,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.2"
+    },
+    {
+      "en_title": "Duress 12.3",
+      "file": "0102_duress-12-3.html",
+      "notes": "",
+      "order": 102,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.3"
+    },
+    {
+      "en_title": "Duress 12.4",
+      "file": "0103_duress-12-4.html",
+      "notes": "",
+      "order": 103,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.4"
+    },
+    {
+      "en_title": "Duress 12.5",
+      "file": "0104_duress-12-5.html",
+      "notes": "",
+      "order": 104,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.5"
+    },
+    {
+      "en_title": "Duress 12.6",
+      "file": "0105_duress-12-6.html",
+      "notes": "",
+      "order": 105,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.6"
+    },
+    {
+      "en_title": "Duress 12.7",
+      "file": "0106_duress-12-7.html",
+      "notes": "",
+      "order": 106,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.7"
+    },
+    {
+      "en_title": "Duress 12.8",
+      "file": "0107_duress-12-8.html",
+      "notes": "",
+      "order": 107,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Принуждение 12.8"
+    },
+    {
+      "en_title": "Histories (Arc 12)",
+      "file": "0108_histories-arc-12.html",
+      "notes": "",
+      "order": 108,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 12)"
+    },
+    {
+      "en_title": "Execution 13.1",
+      "file": "0109_execution-13-1.html",
+      "notes": "",
+      "order": 109,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.1"
+    },
+    {
+      "en_title": "Execution 13.2",
+      "file": "0110_execution-13-2.html",
+      "notes": "",
+      "order": 110,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.2"
+    },
+    {
+      "en_title": "Execution 13.3",
+      "file": "0111_execution-13-3.html",
+      "notes": "",
+      "order": 111,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.3"
+    },
+    {
+      "en_title": "Execution 13.4",
+      "file": "0112_execution-13-4.html",
+      "notes": "",
+      "order": 112,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.4"
+    },
+    {
+      "en_title": "Execution 13.5",
+      "file": "0113_execution-13-5.html",
+      "notes": "",
+      "order": 113,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.5"
+    },
+    {
+      "en_title": "Execution 13.6",
+      "file": "0114_execution-13-6.html",
+      "notes": "",
+      "order": 114,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.6"
+    },
+    {
+      "en_title": "Execution 13.7",
+      "file": "0115_execution-13-7.html",
+      "notes": "",
+      "order": 115,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.7"
+    },
+    {
+      "en_title": "Execution 13.8",
+      "file": "0116_execution-13-8.html",
+      "notes": "",
+      "order": 116,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.8"
+    },
+    {
+      "en_title": "Execution 13.9",
+      "file": "0117_execution-13-9.html",
+      "notes": "",
+      "order": 117,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Казнь 13.9"
+    },
+    {
+      "en_title": "Gathered Pages (Arc 13)",
+      "file": "0118_gathered-pages-arc-13.html",
+      "notes": "",
+      "order": 118,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Собранные страницы (Арка 13)"
+    },
+    {
+      "en_title": "Sine Die 14.1",
+      "file": "0119_sine-die-14-1.html",
+      "notes": "",
+      "order": 119,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.1"
+    },
+    {
+      "en_title": "Sine Die 14.2",
+      "file": "0120_sine-die-14-2.html",
+      "notes": "",
+      "order": 120,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.2"
+    },
+    {
+      "en_title": "Sine Die 14.3",
+      "file": "0121_sine-die-14-3.html",
+      "notes": "",
+      "order": 121,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.3"
+    },
+    {
+      "en_title": "Sine Die 14.4",
+      "file": "0122_sine-die-14-4.html",
+      "notes": "",
+      "order": 122,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.4"
+    },
+    {
+      "en_title": "Sine Die 14.5",
+      "file": "0123_sine-die-14-5.html",
+      "notes": "",
+      "order": 123,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.5"
+    },
+    {
+      "en_title": "Sine Die 14.6",
+      "file": "0124_sine-die-14-6.html",
+      "notes": "",
+      "order": 124,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.6"
+    },
+    {
+      "en_title": "Sine Die 14.7",
+      "file": "0125_sine-die-14-7.html",
+      "notes": "",
+      "order": 125,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.7"
+    },
+    {
+      "en_title": "Sine Die 14.8",
+      "file": "0126_sine-die-14-8.html",
+      "notes": "",
+      "order": 126,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.8"
+    },
+    {
+      "en_title": "Sine Die 14.9",
+      "file": "0127_sine-die-14-9.html",
+      "notes": "",
+      "order": 127,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.9"
+    },
+    {
+      "en_title": "Sine Die 14.10",
+      "file": "0128_sine-die-14-10.html",
+      "notes": "",
+      "order": 128,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Sine Die 14.10"
+    },
+    {
+      "en_title": "Histories (Arc 14)",
+      "file": "0129_histories-arc-14.html",
+      "notes": "",
+      "order": 129,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 14)"
+    },
+    {
+      "en_title": "Possession 15.1",
+      "file": "0130_possession-15-1.html",
+      "notes": "",
+      "order": 130,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Одержимость 15.1"
+    },
+    {
+      "en_title": "Possession 15.3",
+      "file": "0131_possession-15-3.html",
+      "notes": "",
+      "order": 131,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Одержимость 15.3"
+    },
+    {
+      "en_title": "Possession 15.4",
+      "file": "0132_possession-15-4.html",
+      "notes": "",
+      "order": 132,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Одержимость 15.4"
+    },
+    {
+      "en_title": "Possession 15.5",
+      "file": "0133_possession-15-5.html",
+      "notes": "",
+      "order": 133,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Одержимость 15.5"
+    },
+    {
+      "en_title": "Possession 15.6",
+      "file": "0134_possession-15-6.html",
+      "notes": "",
+      "order": 134,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Одержимость 15.6"
+    },
+    {
+      "en_title": "Possession 15.7",
+      "file": "0135_possession-15-7.html",
+      "notes": "",
+      "order": 135,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Одержимость 15.7"
+    },
+    {
+      "en_title": "Histories (Arc 15)",
+      "file": "0136_histories-arc-15.html",
+      "notes": "",
+      "order": 136,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Хроники (Арка 15)"
+    },
+    {
+      "en_title": "Judgment 16.1",
+      "file": "0137_judgment-16-1.html",
+      "notes": "",
+      "order": 137,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.1"
+    },
+    {
+      "en_title": "Judgment 16.2",
+      "file": "0138_judgment-16-2.html",
+      "notes": "",
+      "order": 138,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.2"
+    },
+    {
+      "en_title": "Judgment 16.3",
+      "file": "0139_judgment-16-3.html",
+      "notes": "",
+      "order": 139,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.3"
+    },
+    {
+      "en_title": "Judgment 16.4",
+      "file": "0140_judgment-16-4.html",
+      "notes": "",
+      "order": 140,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.4"
+    },
+    {
+      "en_title": "Judgment 16.5",
+      "file": "0141_judgment-16-5.html",
+      "notes": "",
+      "order": 141,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.5"
+    },
+    {
+      "en_title": "Judgment 16.6",
+      "file": "0142_judgment-16-6.html",
+      "notes": "",
+      "order": 142,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.6"
+    },
+    {
+      "en_title": "Judgment 16.7",
+      "file": "0143_judgment-16-7.html",
+      "notes": "",
+      "order": 143,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.7"
+    },
+    {
+      "en_title": "Judgment 16.8",
+      "file": "0144_judgment-16-8.html",
+      "notes": "",
+      "order": 144,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.8"
+    },
+    {
+      "en_title": "Judgment 16.9",
+      "file": "0145_judgment-16-9.html",
+      "notes": "",
+      "order": 145,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.9"
+    },
+    {
+      "en_title": "Judgment 16.10",
+      "file": "0146_judgment-16-10.html",
+      "notes": "",
+      "order": 146,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.10"
+    },
+    {
+      "en_title": "Judgment 16.11",
+      "file": "0147_judgment-16-11.html",
+      "notes": "",
+      "order": 147,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.11"
+    },
+    {
+      "en_title": "Judgment 16.12",
+      "file": "0148_judgment-16-12.html",
+      "notes": "",
+      "order": 148,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.12"
+    },
+    {
+      "en_title": "Judgment 16.13",
+      "file": "0149_judgment-16-13.html",
+      "notes": "",
+      "order": 149,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Суд 16.13"
+    },
+    {
+      "en_title": "Epilogue",
+      "file": "0150_epilogue.html",
+      "notes": "",
+      "order": 150,
+      "pov": {
+        "gender": "male",
+        "name": "Blake Thorburn"
+      },
+      "ru_title": "Эпилог"
+    }
+  ],
+  "schema_version": "pact-v5-approved-chapters/v1"
+}

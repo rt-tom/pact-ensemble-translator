@@ -166,43 +166,43 @@ def test_build_book_html_no_toc_without_headings():
 # ---------------------------------------------------------------------------
 
 
-def test_arc_names_substitute_leading_arc_key_in_heading():
+def test_title_map_substitute_leading_arc_key_in_heading():
     """P1 АРКИ (owner decision 2026-08-14): a heading like 'Bonds 1.3'
-    becomes 'Узы 1.3' deterministically from arc_names.json — the renderer
+    becomes 'Узы 1.3' deterministically from the chapters.json title map — the renderer
     never relies on the model for the arc title."""
     arc_names = {"Bonds": "Узы", "Execution": "Казнь"}
     _src = "<h1>Bonds 1.3</h1><p>Text.</p>"
     _tr = {"p00001": "Узы 1.3", "p00002": "Текст."}
     body, report = render_chapter_body(
-        _src, _tr, chapter_id="0001", arc_names=arc_names,
+        _src, _tr, chapter_id="0001", title_map=arc_names,
     )
     assert report["headings"] == [
         {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
     ]
 
 
-def test_arc_names_heading_exact_match_and_case_insensitive():
+def test_title_map_heading_exact_match_and_case_insensitive():
     arc_names = {"Bonds": "Узы"}
     # Exact match (no number suffix) and lowercase source heading.
     _body, report = render_chapter_body(
         "<h1>BONDS</h1><p>X.</p>",
         {"p00001": "Узы", "p00002": "Икс."},
-        chapter_id="0001", arc_names=arc_names,
+        chapter_id="0001", title_map=arc_names,
     )
     assert report["headings"][0]["text"] == "Узы"
 
 
-def test_arc_names_no_mapping_leaves_heading_unchanged():
+def test_title_map_no_mapping_leaves_heading_unchanged():
     body, report = render_chapter_body(
         "<h1>Prologue</h1><p>X.</p>",
         {"p00001": "Пролог", "p00002": "Икс."},
         chapter_id="0001",
-        arc_names={"Bonds": "Узы"},
+        title_map={"Bonds": "Узы"},
     )
     assert report["headings"][0]["text"] == "Пролог"
 
 
-def test_arc_names_none_and_unknown_key_unchanged():
+def test_title_map_none_and_unknown_key_unchanged():
     # No mapping at all -> unchanged.
     _body, report = render_chapter_body(
         "<h1>Bonds 1.1</h1><p>X.</p>",
@@ -212,7 +212,7 @@ def test_arc_names_none_and_unknown_key_unchanged():
     assert report["headings"][0]["text"] == "Узы 1.1"
 
 
-def test_arc_names_rendered_heading_body_matches_toc():
+def test_title_map_rendered_heading_body_matches_toc():
     """RV finding 3 (MEDIUM): the arc substitution must reach the RENDERED
     <h1> body, not just the TOC metadata. The model produced 'Bonds 1.3'
     (kept the English arc name); the renderer substitutes it to 'Узы 1.3'
@@ -222,7 +222,7 @@ def test_arc_names_rendered_heading_body_matches_toc():
     body, report = render_chapter_body(
         "<h1>Bonds 1.3</h1><p>Text.</p>",
         {"p00001": "Bonds 1.3", "p00002": "Текст."},
-        chapter_id="0001", arc_names=arc_names,
+        chapter_id="0001", title_map=arc_names,
     )
     assert report["headings"] == [
         {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
@@ -233,20 +233,20 @@ def test_arc_names_rendered_heading_body_matches_toc():
     assert "<h1" in body
 
 
-def test_arc_names_rendered_heading_body_preserves_inline_markup():
+def test_title_map_rendered_heading_body_preserves_inline_markup():
     """RV finding 3: the substitution applied to the raw heading text must
     preserve inline markup (the sanitization/inline-markup contract): an
     <em> around the arc name survives the substitution."""
     body, report = render_chapter_body(
         "<h1>Bonds 1.3</h1><p>X.</p>",
         {"p00001": "<em>Bonds</em> 1.3", "p00002": "Икс."},
-        chapter_id="0001", arc_names={"Bonds": "Узы"},
+        chapter_id="0001", title_map={"Bonds": "Узы"},
     )
     assert report["headings"][0]["text"] == "Узы 1.3"
     assert "<em>Узы</em> 1.3" in body
 
 
-def test_arc_names_disallowed_markup_wrapper_still_substitutes():
+def test_title_map_disallowed_markup_wrapper_still_substitutes():
     """RV2 finding 2 (MEDIUM): a heading whose arc key is wrapped in
     DISALLOWED markup (``<script>``) must still get the deterministic arc
     substitution, and the TOC must agree with the rendered body.
@@ -262,7 +262,7 @@ def test_arc_names_disallowed_markup_wrapper_still_substitutes():
     body, report = render_chapter_body(
         "<h1>Bonds 1.3</h1><p>X.</p>",
         {"p00001": "<script>Bonds</script> 1.3", "p00002": "Икс."},
-        chapter_id="0001", arc_names={"Bonds": "Узы"},
+        chapter_id="0001", title_map={"Bonds": "Узы"},
     )
     assert report["headings"] == [
         {"level": 1, "text": "Узы 1.3", "anchor": "ch-0001-h1"},
@@ -276,14 +276,14 @@ def test_arc_names_disallowed_markup_wrapper_still_substitutes():
     assert "<h1" in body
 
 
-def test_arc_names_disallowed_style_wrapper_toc_matches_body():
+def test_title_map_disallowed_style_wrapper_toc_matches_body():
     """RV2 finding 2 (MEDIUM), <style> variant: same sanitized-visible-text
     path for a key wrapped in a style tag — TOC and body agree on one
     substitution and no <style> reaches the output."""
     body, report = render_chapter_body(
         "<h1>Bonds 1.3</h1><p>X.</p>",
         {"p00001": "<style>Bonds</style> 1.3", "p00002": "Икс."},
-        chapter_id="0001", arc_names={"Bonds": "Узы"},
+        chapter_id="0001", title_map={"Bonds": "Узы"},
     )
     assert report["headings"][0]["text"] == "Узы 1.3"
     assert "Узы 1.3" in body

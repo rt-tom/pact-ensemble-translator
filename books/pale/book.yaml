@@ -1,0 +1,21 @@
+schema_version: pact-v5-book-profile/v1
+slug: pale
+title: Pale
+content_kind: prose
+source_lang: en
+target_lang: ru
+source:
+  rt_root: D:/pact/pale_chapters
+  media_root: /home/rt/pale_chapters
+  manifest: manifest.json
+state:
+  media_book_id: "2"
+  rt_root: D:/pact/book_state_pale
+  media_root: /home/rt/pact_runs/workers/media/book-2/state
+out:
+  rt_root: D:/pact/gate_bench_runs
+  media_root: /home/rt/pact_runs/outputs
+chapters: chapters.json
+policy:
+  hard_filters: v4-en-ru
+  editor_pass: russian-editor-v1

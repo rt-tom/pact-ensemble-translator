@@ -1,0 +1,3422 @@
+{
+  "schema_version": "pact-v5-approved-chapters/v1",
+  "book_slug": "pale",
+  "chapters": [
+    {
+      "file": "0001_pale.html",
+      "order": 1,
+      "en_title": "0.0",
+      "ru_title": null,
+      "pov": {
+        "name": "Prologue",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Prologue; One a night!"
+    },
+    {
+      "file": "0002_pale.html",
+      "order": 2,
+      "en_title": "1.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0003_pale.html",
+      "order": 3,
+      "en_title": "1.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0004_pale.html",
+      "order": 4,
+      "en_title": "1.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0005_pale.html",
+      "order": 5,
+      "en_title": "1.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery (again)",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery (again)"
+    },
+    {
+      "file": "0006_pale.html",
+      "order": 6,
+      "en_title": "1.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0007_pale.html",
+      "order": 7,
+      "en_title": "1.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0008_pale.html",
+      "order": 8,
+      "en_title": "1.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0009_pale.html",
+      "order": 9,
+      "en_title": "1.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0010_pale.html",
+      "order": 10,
+      "en_title": "1.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0011_pale.html",
+      "order": 11,
+      "en_title": "2.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0012_pale.html",
+      "order": 12,
+      "en_title": "2.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0013_pale.html",
+      "order": 13,
+      "en_title": "2.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0014_pale.html",
+      "order": 14,
+      "en_title": "2.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0015_pale.html",
+      "order": 15,
+      "en_title": "2.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0016_pale.html",
+      "order": 16,
+      "en_title": "2.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0017_pale.html",
+      "order": 17,
+      "en_title": "2.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona (again)",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona (again)"
+    },
+    {
+      "file": "0018_pale.html",
+      "order": 18,
+      "en_title": "2.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0019_pale.html",
+      "order": 19,
+      "en_title": "2.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0020_pale.html",
+      "order": 20,
+      "en_title": "2.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0021_pale.html",
+      "order": 21,
+      "en_title": "3.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0022_pale.html",
+      "order": 22,
+      "en_title": "3.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0023_pale.html",
+      "order": 23,
+      "en_title": "3.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0024_pale.html",
+      "order": 24,
+      "en_title": "3.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0025_pale.html",
+      "order": 25,
+      "en_title": "3.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0026_pale.html",
+      "order": 26,
+      "en_title": "3.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0027_pale.html",
+      "order": 27,
+      "en_title": "3.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0028_pale.html",
+      "order": 28,
+      "en_title": "3.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy (Again)",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy (Again)"
+    },
+    {
+      "file": "0029_pale.html",
+      "order": 29,
+      "en_title": "3.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0030_pale.html",
+      "order": 30,
+      "en_title": "3.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0031_pale.html",
+      "order": 31,
+      "en_title": "4.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0032_pale.html",
+      "order": 32,
+      "en_title": "4.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0033_pale.html",
+      "order": 33,
+      "en_title": "4.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0034_pale.html",
+      "order": 34,
+      "en_title": "4.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0035_pale.html",
+      "order": 35,
+      "en_title": "4.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0036_pale.html",
+      "order": 36,
+      "en_title": "4.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0037_pale.html",
+      "order": 37,
+      "en_title": "4.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0038_pale.html",
+      "order": 38,
+      "en_title": "4.x",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0039_pale.html",
+      "order": 39,
+      "en_title": "4.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Two weeks ago"
+    },
+    {
+      "file": "0040_pale.html",
+      "order": 40,
+      "en_title": "4.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0041_pale.html",
+      "order": 41,
+      "en_title": "4.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0042_pale.html",
+      "order": 42,
+      "en_title": "5.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0043_pale.html",
+      "order": 43,
+      "en_title": "5.b",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0044_pale.html",
+      "order": 44,
+      "en_title": "5.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0045_pale.html",
+      "order": 45,
+      "en_title": "5.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0046_pale.html",
+      "order": 46,
+      "en_title": "5.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0047_pale.html",
+      "order": 47,
+      "en_title": "5.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0048_pale.html",
+      "order": 48,
+      "en_title": "5.c",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0049_pale.html",
+      "order": 49,
+      "en_title": "5.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0050_pale.html",
+      "order": 50,
+      "en_title": "5.d",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0051_pale.html",
+      "order": 51,
+      "en_title": "6.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0052_pale.html",
+      "order": 52,
+      "en_title": "6.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0053_pale.html",
+      "order": 53,
+      "en_title": "6.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0054_pale.html",
+      "order": 54,
+      "en_title": "6.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0055_pale.html",
+      "order": 55,
+      "en_title": "6.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0056_pale.html",
+      "order": 56,
+      "en_title": "6.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0057_pale.html",
+      "order": 57,
+      "en_title": "6.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0058_pale.html",
+      "order": 58,
+      "en_title": "6.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy (Again)",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy (Again)"
+    },
+    {
+      "file": "0059_pale.html",
+      "order": 59,
+      "en_title": "6.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0060_pale.html",
+      "order": 60,
+      "en_title": "6.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude: Saturday",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude; Saturday"
+    },
+    {
+      "file": "0061_pale.html",
+      "order": 61,
+      "en_title": "7.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0062_pale.html",
+      "order": 62,
+      "en_title": "7.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0063_pale.html",
+      "order": 63,
+      "en_title": "7.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0064_pale.html",
+      "order": 64,
+      "en_title": "7.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0065_pale.html",
+      "order": 65,
+      "en_title": "7.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0066_pale.html",
+      "order": 66,
+      "en_title": "7.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0067_pale.html",
+      "order": 67,
+      "en_title": "7.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0068_pale.html",
+      "order": 68,
+      "en_title": "7.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0069_pale.html",
+      "order": 69,
+      "en_title": "7.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0070_pale.html",
+      "order": 70,
+      "en_title": "7.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0071_pale.html",
+      "order": 71,
+      "en_title": "7.x",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude: Before",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude; Before"
+    },
+    {
+      "file": "0072_pale.html",
+      "order": 72,
+      "en_title": "8.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0073_pale.html",
+      "order": 73,
+      "en_title": "8.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0074_pale.html",
+      "order": 74,
+      "en_title": "8.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0075_pale.html",
+      "order": 75,
+      "en_title": "8.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0076_pale.html",
+      "order": 76,
+      "en_title": "8.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0077_pale.html",
+      "order": 77,
+      "en_title": "8.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0078_pale.html",
+      "order": 78,
+      "en_title": "8.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0079_pale.html",
+      "order": 79,
+      "en_title": "8.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery; Going back a bit"
+    },
+    {
+      "file": "0080_pale.html",
+      "order": 80,
+      "en_title": "8.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0081_pale.html",
+      "order": 81,
+      "en_title": "9.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0082_pale.html",
+      "order": 82,
+      "en_title": "9.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0083_pale.html",
+      "order": 83,
+      "en_title": "9.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0084_pale.html",
+      "order": 84,
+      "en_title": "9.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0085_pale.html",
+      "order": 85,
+      "en_title": "9.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0086_pale.html",
+      "order": 86,
+      "en_title": "9.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0087_pale.html",
+      "order": 87,
+      "en_title": "9.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0088_pale.html",
+      "order": 88,
+      "en_title": "9.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0089_pale.html",
+      "order": 89,
+      "en_title": "9.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0090_pale.html",
+      "order": 90,
+      "en_title": "9.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0091_pale.html",
+      "order": 91,
+      "en_title": "9.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0092_pale.html",
+      "order": 92,
+      "en_title": "9.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0093_pale.html",
+      "order": 93,
+      "en_title": "9.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0094_pale.html",
+      "order": 94,
+      "en_title": "10.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0095_pale.html",
+      "order": 95,
+      "en_title": "10.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0096_pale.html",
+      "order": 96,
+      "en_title": "10.b",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0097_pale.html",
+      "order": 97,
+      "en_title": "10.c",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0098_pale.html",
+      "order": 98,
+      "en_title": "10.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0099_pale.html",
+      "order": 99,
+      "en_title": "10.d",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0100_pale.html",
+      "order": 100,
+      "en_title": "10.e",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0101_pale.html",
+      "order": 101,
+      "en_title": "10.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0102_pale.html",
+      "order": 102,
+      "en_title": "10.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0103_pale.html",
+      "order": 103,
+      "en_title": "10.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0104_pale.html",
+      "order": 104,
+      "en_title": "11.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0105_pale.html",
+      "order": 105,
+      "en_title": "11.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0106_pale.html",
+      "order": 106,
+      "en_title": "11.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0107_pale.html",
+      "order": 107,
+      "en_title": "11.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0108_pale.html",
+      "order": 108,
+      "en_title": "11.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0109_pale.html",
+      "order": 109,
+      "en_title": "11.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0110_pale.html",
+      "order": 110,
+      "en_title": "11.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0111_pale.html",
+      "order": 111,
+      "en_title": "11.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0112_pale.html",
+      "order": 112,
+      "en_title": "11.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0113_pale.html",
+      "order": 113,
+      "en_title": "11.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0114_pale.html",
+      "order": 114,
+      "en_title": "11.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0115_pale.html",
+      "order": 115,
+      "en_title": "11.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0116_pale.html",
+      "order": 116,
+      "en_title": "11.13",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0117_pale.html",
+      "order": 117,
+      "en_title": "11.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0118_pale.html",
+      "order": 118,
+      "en_title": "12.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0119_pale.html",
+      "order": 119,
+      "en_title": "12a Interud",
+      "ru_title": "12a Интерлюдия",
+      "pov": {
+        "name": "Interude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interude"
+    },
+    {
+      "file": "0120_pale.html",
+      "order": 120,
+      "en_title": "12.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery; Early in the Day"
+    },
+    {
+      "file": "0121_pale.html",
+      "order": 121,
+      "en_title": "12.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0122_pale.html",
+      "order": 122,
+      "en_title": "12.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0123_pale.html",
+      "order": 123,
+      "en_title": "12.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0124_pale.html",
+      "order": 124,
+      "en_title": "12.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0125_pale.html",
+      "order": 125,
+      "en_title": "12.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0126_pale.html",
+      "order": 126,
+      "en_title": "12.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude: Eight years, five months ago",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude; Eight years, five months ago"
+    },
+    {
+      "file": "0127_pale.html",
+      "order": 127,
+      "en_title": "12.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0128_pale.html",
+      "order": 128,
+      "en_title": "12.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0129_pale.html",
+      "order": 129,
+      "en_title": "12.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0130_pale.html",
+      "order": 130,
+      "en_title": "12.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0131_pale.html",
+      "order": 131,
+      "en_title": "13.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0132_pale.html",
+      "order": 132,
+      "en_title": "13.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0133_pale.html",
+      "order": 133,
+      "en_title": "13.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0134_pale.html",
+      "order": 134,
+      "en_title": "13.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0135_pale.html",
+      "order": 135,
+      "en_title": "13.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0136_pale.html",
+      "order": 136,
+      "en_title": "13.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0137_pale.html",
+      "order": 137,
+      "en_title": "13.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0138_pale.html",
+      "order": 138,
+      "en_title": "13.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0139_pale.html",
+      "order": 139,
+      "en_title": "13.9",
+      "ru_title": null,
+      "pov": null,
+      "notes": "числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0140_pale.html",
+      "order": 140,
+      "en_title": "B1",
+      "ru_title": null,
+      "pov": null,
+      "notes": "специальный кодированный заголовок; числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0141_pale.html",
+      "order": 141,
+      "en_title": "13.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0142_pale.html",
+      "order": 142,
+      "en_title": "B2",
+      "ru_title": null,
+      "pov": null,
+      "notes": "специальный кодированный заголовок; числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0143_pale.html",
+      "order": 143,
+      "en_title": "13.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0144_pale.html",
+      "order": 144,
+      "en_title": "B3",
+      "ru_title": null,
+      "pov": null,
+      "notes": "специальный кодированный заголовок; числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0145_pale.html",
+      "order": 145,
+      "en_title": "13.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0146_pale.html",
+      "order": 146,
+      "en_title": "B4",
+      "ru_title": null,
+      "pov": {
+        "name": "Cagerattler",
+        "gender": null
+      },
+      "notes": "специальный кодированный заголовок; числовой заголовок; POV-маркер: Cagerattler"
+    },
+    {
+      "file": "0147_pale.html",
+      "order": 147,
+      "en_title": "13.13",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0148_pale.html",
+      "order": 148,
+      "en_title": "B5",
+      "ru_title": null,
+      "pov": null,
+      "notes": "специальный кодированный заголовок; числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0149_pale.html",
+      "order": 149,
+      "en_title": "SB",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "специальный кодированный заголовок; числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0150_pale.html",
+      "order": 150,
+      "en_title": "14.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery; One Week Later"
+    },
+    {
+      "file": "0151_pale.html",
+      "order": 151,
+      "en_title": "14.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0152_pale.html",
+      "order": 152,
+      "en_title": "14.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0153_pale.html",
+      "order": 153,
+      "en_title": "14.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0154_pale.html",
+      "order": 154,
+      "en_title": "14.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0155_pale.html",
+      "order": 155,
+      "en_title": "14.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0156_pale.html",
+      "order": 156,
+      "en_title": "14.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0157_pale.html",
+      "order": 157,
+      "en_title": "15.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0158_pale.html",
+      "order": 158,
+      "en_title": "15.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0159_pale.html",
+      "order": 159,
+      "en_title": "15.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0160_pale.html",
+      "order": 160,
+      "en_title": "15.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0161_pale.html",
+      "order": 161,
+      "en_title": "15.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0162_pale.html",
+      "order": 162,
+      "en_title": "15.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0163_pale.html",
+      "order": 163,
+      "en_title": "15.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0164_pale.html",
+      "order": 164,
+      "en_title": "15.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0165_pale.html",
+      "order": 165,
+      "en_title": "15.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Friday, Afternoon"
+    },
+    {
+      "file": "0166_pale.html",
+      "order": 166,
+      "en_title": "15.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Sunday Morning"
+    },
+    {
+      "file": "0167_pale.html",
+      "order": 167,
+      "en_title": "15.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Monday Afternoon"
+    },
+    {
+      "file": "0168_pale.html",
+      "order": 168,
+      "en_title": "15.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0169_pale.html",
+      "order": 169,
+      "en_title": "16.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona; Monday, October 5th – Earlier"
+    },
+    {
+      "file": "0170_pale.html",
+      "order": 170,
+      "en_title": "16.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0171_pale.html",
+      "order": 171,
+      "en_title": "16.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0172_pale.html",
+      "order": 172,
+      "en_title": "16.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0173_pale.html",
+      "order": 173,
+      "en_title": "16.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0174_pale.html",
+      "order": 174,
+      "en_title": "16.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0175_pale.html",
+      "order": 175,
+      "en_title": "16.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0176_pale.html",
+      "order": 176,
+      "en_title": "16.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0177_pale.html",
+      "order": 177,
+      "en_title": "16.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0178_pale.html",
+      "order": 178,
+      "en_title": "16.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0179_pale.html",
+      "order": 179,
+      "en_title": "16.y",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0180_pale.html",
+      "order": 180,
+      "en_title": "16.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude: 2009, A Bugge",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude; 2009, A Bugge"
+    },
+    {
+      "file": "0181_pale.html",
+      "order": 181,
+      "en_title": "17.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0182_pale.html",
+      "order": 182,
+      "en_title": "17.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0183_pale.html",
+      "order": 183,
+      "en_title": "17.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0184_pale.html",
+      "order": 184,
+      "en_title": "17.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0185_pale.html",
+      "order": 185,
+      "en_title": "17.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0186_pale.html",
+      "order": 186,
+      "en_title": "17.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0187_pale.html",
+      "order": 187,
+      "en_title": "17.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0188_pale.html",
+      "order": 188,
+      "en_title": "17.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0189_pale.html",
+      "order": 189,
+      "en_title": "17.b",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0190_pale.html",
+      "order": 190,
+      "en_title": "17.8",
+      "ru_title": null,
+      "pov": null,
+      "notes": "числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0191_pale.html",
+      "order": 191,
+      "en_title": "17.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0192_pale.html",
+      "order": 192,
+      "en_title": "17.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0193_pale.html",
+      "order": 193,
+      "en_title": "17.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0194_pale.html",
+      "order": 194,
+      "en_title": "17.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0195_pale.html",
+      "order": 195,
+      "en_title": "17.13",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0196_pale.html",
+      "order": 196,
+      "en_title": "17.14",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0197_pale.html",
+      "order": 197,
+      "en_title": "17.15",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0198_pale.html",
+      "order": 198,
+      "en_title": "17.x",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0199_pale.html",
+      "order": 199,
+      "en_title": "17.y",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0200_pale.html",
+      "order": 200,
+      "en_title": "17.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0201_pale.html",
+      "order": 201,
+      "en_title": "18.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0202_pale.html",
+      "order": 202,
+      "en_title": "18.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0203_pale.html",
+      "order": 203,
+      "en_title": "18.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interludes",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interludes"
+    },
+    {
+      "file": "0204_pale.html",
+      "order": 204,
+      "en_title": "18.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0205_pale.html",
+      "order": 205,
+      "en_title": "18.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0206_pale.html",
+      "order": 206,
+      "en_title": "18.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0207_pale.html",
+      "order": 207,
+      "en_title": "18.b",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0208_pale.html",
+      "order": 208,
+      "en_title": "18.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0209_pale.html",
+      "order": 209,
+      "en_title": "18.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0210_pale.html",
+      "order": 210,
+      "en_title": "18.c",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0211_pale.html",
+      "order": 211,
+      "en_title": "18.8",
+      "ru_title": null,
+      "pov": null,
+      "notes": "числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0212_pale.html",
+      "order": 212,
+      "en_title": "18.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0213_pale.html",
+      "order": 213,
+      "en_title": "18.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0214_pale.html",
+      "order": 214,
+      "en_title": "18.y",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0215_pale.html",
+      "order": 215,
+      "en_title": "18.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude: Brie",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude; Brie"
+    },
+    {
+      "file": "0216_pale.html",
+      "order": 216,
+      "en_title": "19.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0217_pale.html",
+      "order": 217,
+      "en_title": "19.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0218_pale.html",
+      "order": 218,
+      "en_title": "19.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0219_pale.html",
+      "order": 219,
+      "en_title": "19.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0220_pale.html",
+      "order": 220,
+      "en_title": "19.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0221_pale.html",
+      "order": 221,
+      "en_title": "19.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0222_pale.html",
+      "order": 222,
+      "en_title": "19.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0223_pale.html",
+      "order": 223,
+      "en_title": "19.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0224_pale.html",
+      "order": 224,
+      "en_title": "19.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0225_pale.html",
+      "order": 225,
+      "en_title": "19.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0226_pale.html",
+      "order": 226,
+      "en_title": "19.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0227_pale.html",
+      "order": 227,
+      "en_title": "19.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0228_pale.html",
+      "order": 228,
+      "en_title": "19.13",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0229_pale.html",
+      "order": 229,
+      "en_title": "19.14",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0230_pale.html",
+      "order": 230,
+      "en_title": "19.15",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0231_pale.html",
+      "order": 231,
+      "en_title": "19.16",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0232_pale.html",
+      "order": 232,
+      "en_title": "19.17",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0233_pale.html",
+      "order": 233,
+      "en_title": "19.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0234_pale.html",
+      "order": 234,
+      "en_title": "20.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0235_pale.html",
+      "order": 235,
+      "en_title": "20.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0236_pale.html",
+      "order": 236,
+      "en_title": "20.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0237_pale.html",
+      "order": 237,
+      "en_title": "20.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0238_pale.html",
+      "order": 238,
+      "en_title": "20.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0239_pale.html",
+      "order": 239,
+      "en_title": "20.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0240_pale.html",
+      "order": 240,
+      "en_title": "20.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0241_pale.html",
+      "order": 241,
+      "en_title": "20.b",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0242_pale.html",
+      "order": 242,
+      "en_title": "20.c",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0243_pale.html",
+      "order": 243,
+      "en_title": "20.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0244_pale.html",
+      "order": 244,
+      "en_title": "20.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0245_pale.html",
+      "order": 245,
+      "en_title": "20.d",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0246_pale.html",
+      "order": 246,
+      "en_title": "20.e",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0247_pale.html",
+      "order": 247,
+      "en_title": "20.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0248_pale.html",
+      "order": 248,
+      "en_title": "20.f",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0249_pale.html",
+      "order": 249,
+      "en_title": "20.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0250_pale.html",
+      "order": 250,
+      "en_title": "21.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0251_pale.html",
+      "order": 251,
+      "en_title": "21.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0252_pale.html",
+      "order": 252,
+      "en_title": "21.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0253_pale.html",
+      "order": 253,
+      "en_title": "21.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0254_pale.html",
+      "order": 254,
+      "en_title": "21.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona; Opening"
+    },
+    {
+      "file": "0255_pale.html",
+      "order": 255,
+      "en_title": "21.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery; Fourth Point of Order"
+    },
+    {
+      "file": "0256_pale.html",
+      "order": 256,
+      "en_title": "21.7",
+      "ru_title": null,
+      "pov": null,
+      "notes": "числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0257_pale.html",
+      "order": 257,
+      "en_title": "21.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0258_pale.html",
+      "order": 258,
+      "en_title": "21.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0259_pale.html",
+      "order": 259,
+      "en_title": "21.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0260_pale.html",
+      "order": 260,
+      "en_title": "21.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0261_pale.html",
+      "order": 261,
+      "en_title": "21.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0262_pale.html",
+      "order": 262,
+      "en_title": "21.13",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0263_pale.html",
+      "order": 263,
+      "en_title": "21.14",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0264_pale.html",
+      "order": 264,
+      "en_title": "22.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0265_pale.html",
+      "order": 265,
+      "en_title": "22.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0266_pale.html",
+      "order": 266,
+      "en_title": "22.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0267_pale.html",
+      "order": 267,
+      "en_title": "22.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Next Chapter"
+    },
+    {
+      "file": "0268_pale.html",
+      "order": 268,
+      "en_title": "22.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0269_pale.html",
+      "order": 269,
+      "en_title": "22.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude: Eight Years Ago",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude; Eight Years Ago"
+    },
+    {
+      "file": "0270_pale.html",
+      "order": 270,
+      "en_title": "22.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona; Next Chapter"
+    },
+    {
+      "file": "0271_pale.html",
+      "order": 271,
+      "en_title": "22.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Previous Chapter; Next Chapter"
+    },
+    {
+      "file": "0272_pale.html",
+      "order": 272,
+      "en_title": "22.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery; Previous Chapter; Next Chapter"
+    },
+    {
+      "file": "0273_pale.html",
+      "order": 273,
+      "en_title": "23.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0274_pale.html",
+      "order": 274,
+      "en_title": "23.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0275_pale.html",
+      "order": 275,
+      "en_title": "23.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0276_pale.html",
+      "order": 276,
+      "en_title": "23.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0277_pale.html",
+      "order": 277,
+      "en_title": "23.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0278_pale.html",
+      "order": 278,
+      "en_title": "23.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy; Later"
+    },
+    {
+      "file": "0279_pale.html",
+      "order": 279,
+      "en_title": "23.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0280_pale.html",
+      "order": 280,
+      "en_title": "23.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0281_pale.html",
+      "order": 281,
+      "en_title": "23.b",
+      "ru_title": null,
+      "pov": null,
+      "notes": "числовой заголовок; POV-маркер: не указан"
+    },
+    {
+      "file": "0282_pale.html",
+      "order": 282,
+      "en_title": "23.c",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0283_pale.html",
+      "order": 283,
+      "en_title": "23.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0284_pale.html",
+      "order": 284,
+      "en_title": "23.d",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0285_pale.html",
+      "order": 285,
+      "en_title": "23.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0286_pale.html",
+      "order": 286,
+      "en_title": "23.e",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0287_pale.html",
+      "order": 287,
+      "en_title": "23.f",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0288_pale.html",
+      "order": 288,
+      "en_title": "23.z",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0289_pale.html",
+      "order": 289,
+      "en_title": "24.1",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0290_pale.html",
+      "order": 290,
+      "en_title": "24.a",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0291_pale.html",
+      "order": 291,
+      "en_title": "24.2",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0292_pale.html",
+      "order": 292,
+      "en_title": "24.3",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0293_pale.html",
+      "order": 293,
+      "en_title": "24.4",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0294_pale.html",
+      "order": 294,
+      "en_title": "24.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0295_pale.html",
+      "order": 295,
+      "en_title": "24.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0296_pale.html",
+      "order": 296,
+      "en_title": "24.7",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0297_pale.html",
+      "order": 297,
+      "en_title": "24.8",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0298_pale.html",
+      "order": 298,
+      "en_title": "24.9",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0299_pale.html",
+      "order": 299,
+      "en_title": "24.10",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0300_pale.html",
+      "order": 300,
+      "en_title": "24.11",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0301_pale.html",
+      "order": 301,
+      "en_title": "24.12",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0302_pale.html",
+      "order": 302,
+      "en_title": "24.13",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0303_pale.html",
+      "order": 303,
+      "en_title": "24.x",
+      "ru_title": null,
+      "pov": {
+        "name": "Interlude",
+        "gender": null
+      },
+      "notes": "числовой заголовок; POV-маркер: Interlude"
+    },
+    {
+      "file": "0304_pale.html",
+      "order": 304,
+      "en_title": "24.14",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Verona"
+    },
+    {
+      "file": "0305_pale.html",
+      "order": 305,
+      "en_title": "24.15",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Lucy"
+    },
+    {
+      "file": "0306_pale.html",
+      "order": 306,
+      "en_title": "24.16",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0307_pale.html",
+      "order": 307,
+      "en_title": "24.17",
+      "ru_title": null,
+      "pov": {
+        "name": "Avery",
+        "gender": "female"
+      },
+      "notes": "числовой заголовок; POV-маркер: Avery"
+    },
+    {
+      "file": "0308_pale.html",
+      "order": 308,
+      "en_title": "E.1",
+      "ru_title": null,
+      "pov": {
+        "name": "3 hours later, Avery",
+        "gender": "female"
+      },
+      "notes": "эпилоговый кодированный заголовок; числовой заголовок; POV-маркер: 3 hours later, Avery"
+    },
+    {
+      "file": "0309_pale.html",
+      "order": 309,
+      "en_title": "E.2",
+      "ru_title": null,
+      "pov": {
+        "name": "3 Days Later, Lucy",
+        "gender": "female"
+      },
+      "notes": "эпилоговый кодированный заголовок; числовой заголовок; POV-маркер: 3 Days Later, Lucy"
+    },
+    {
+      "file": "0310_pale.html",
+      "order": 310,
+      "en_title": "E.3",
+      "ru_title": null,
+      "pov": {
+        "name": "3 weeks later, Verona",
+        "gender": "female"
+      },
+      "notes": "эпилоговый кодированный заголовок; числовой заголовок; POV-маркер: 3 weeks later, Verona"
+    },
+    {
+      "file": "0311_pale.html",
+      "order": 311,
+      "en_title": "E.4",
+      "ru_title": null,
+      "pov": {
+        "name": "3 Months Later, Avery",
+        "gender": "female"
+      },
+      "notes": "эпилоговый кодированный заголовок; числовой заголовок; POV-маркер: 3 Months Later, Avery"
+    },
+    {
+      "file": "0312_pale.html",
+      "order": 312,
+      "en_title": "E.5",
+      "ru_title": null,
+      "pov": {
+        "name": "Lucy, 3 Seasons Later",
+        "gender": "female"
+      },
+      "notes": "эпилоговый кодированный заголовок; числовой заголовок; POV-маркер: Lucy, 3 Seasons Later"
+    },
+    {
+      "file": "0313_pale.html",
+      "order": 313,
+      "en_title": "E.6",
+      "ru_title": null,
+      "pov": {
+        "name": "Verona, 3 Years Later",
+        "gender": "female"
+      },
+      "notes": "эпилоговый кодированный заголовок; числовой заголовок; POV-маркер: Verona, 3 Years Later"
+    }
+  ]
+}

@@ -837,14 +837,15 @@ def test_b3_verified_only_alias_rejects_substring_of_anchor(tmp_path: Path) -> N
 
 
 def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:
-    """P1 АРКИ / CHAPTERS (owner decision 2026-08-14, renamed to CHAPTERS in prompt v7): when the run config carries a
-    deterministic arc mapping, the whole-chapter generation prompt includes
-    a 'CHAPTERS:' block (Bonds → Узы). The block rides inside the book-context
+    """V5 slice-1 deterministic titles (alternative B): when the run config
+    carries a deterministic title map (unique arc pairs from the approved
+    chapters.json records), the whole-chapter generation prompt includes a
+    'CHAPTERS:' block (Bonds → Узы). The block rides inside the book-context
     text, so it is part of the bundle identity (a changed mapping
     invalidates the generation cache)."""
     cfg = _whole_chapter_cfg(
         tmp_path,
-        deterministic_arc_names=(("Bonds", "Узы"), ("Execution", "Казнь")),
+        deterministic_title_map=(("Bonds", "Узы"), ("Execution", "Казнь")),
     )
     backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
     caller = _DefectiveWholeChapterCaller()
@@ -864,7 +865,7 @@ def test_b3_arc_names_block_in_generation_prompt(tmp_path: Path) -> None:
 
 
 def test_b3_no_arc_names_no_arc_block(tmp_path: Path) -> None:
-    cfg = _whole_chapter_cfg(tmp_path)  # deterministic_arc_names=()
+    cfg = _whole_chapter_cfg(tmp_path)  # deterministic_title_map=()
     backend = _B3MockBackend(audit_issues=[], reaudit_issues=[])
     caller = _DefectiveWholeChapterCaller()
     _run_with_b3(cfg, backend, caller=caller, entity_context_enabled=True)

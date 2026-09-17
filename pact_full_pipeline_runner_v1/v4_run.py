@@ -206,11 +206,17 @@ Optional (profile-aware):
   --reasoning {0,1,2,3}
   --markup preserve          Only 'preserve' is accepted.
 
-Host/layout and source (advanced overrides):
-  --chapter-html-pattern PATTERN   Advanced: pattern with {chapter_id}. Default is host source
-                                   root with discovered NNNN_*.html files.
-  --memory-dir DIR                 Advanced: overrides host mutable state root (RT: D:/pact/book_state,
-                                   media: /home/rt/pact_runs/workers/media/book-1/state).
+Host/layout and source (profile authority in simple AND advanced modes):
+  --book SLUG                      V5 slice-1: book profile from books/<slug>/book.yaml
+                                   (omitted = pact, same path). Profile gates/isolation
+                                   plus manifest + approved-chapters enforcement apply
+                                   in BOTH modes; explicit flags below win.
+  --chapter-html-pattern PATTERN   Advanced override: pattern with {chapter_id} (opts out
+                                   of manifest file validation; metadata authority stays).
+                                   Default is the book source root with manifest-listed
+                                   NNNN_*.html files.
+  --memory-dir DIR                 Advanced override: host mutable state root (default is
+                                   the book profile state root, e.g. pact book-1 state).
   --out-base DIR                   Overrides automatic host output root/book_XXXX-XXXX_local|remote_<timestamp>
   Automatic output: host_output/book_0027-0032_local|remote_<timestamp> (label from descriptor).
   Source and mutable state must not be the same directory.
@@ -231,7 +237,7 @@ Audit/formatting (forwarded to strict per-chapter):
   formatting and audit behavior unchanged; --markup preserve only.
 
 Whole-chapter/generation (forwarded to strict per-chapter):
-  --whole-chapter, --stop-after-generation, --lazy-balanced / --no-lazy-balanced, --reasoning, --mixed-script-allow, --arc-names.
+  --whole-chapter, --stop-after-generation, --lazy-balanced / --no-lazy-balanced, --reasoning, --mixed-script-allow, --chapters-json.
 
 Preflight:
   Automatic offline preflight before execution; --preflight / --preflight --json check-only modes.
@@ -691,6 +697,12 @@ def _handle_book(argv: Sequence[str]) -> int:
     # Book mode supports simple (--local/--remote) and advanced (--runtime-config) paths.
     parser = argparse.ArgumentParser(prog="v4_run book", add_help=False)
     parser.add_argument("--chapters", required=False, default=None)
+    parser.add_argument("--book", required=False, default=None,
+                        help="V5 slice-1: book slug from books/<slug>/book.yaml (source/state/out "
+                             "roots, source manifest, approved chapters, media_book_id, policy). "
+                             "Omitted --book resolves to 'pact' through the SAME profile path "
+                             "(CLI backward compatibility, no separate runtime path). "
+                             "The slug selects a book, never a snapshot revision.")
     parser.add_argument("--runtime-config", dest="runtime_config", required=False, default=None)
     parser.add_argument("--profile", dest="profile", required=False, default=None)
     parser.add_argument("--local", nargs="?", const="__LOCAL_DEFAULT__", default=None, metavar="ALIAS", help="Select canonical local pair gemma/qwen (or gemma31/qwen38); --local a/b selects translator a and reviewer b from providers.local.models (case-insensitive, no provider slash); single alias fails with pair required. Hybrid effective reasoning = model base + role delta; never alters run identity/cache/resume")
@@ -808,8 +820,35 @@ def _handle_book(argv: Sequence[str]) -> int:
     chapter_numbers = list(range(start, end + 1))
     label_range = range_label(start, end)
 
-    # Resolve host layout
-    layout = _host_layout()
+    # V5 slice-1: unified book resolution. Omitted --book means 'pact'
+    # through the SAME profile/manifest/chapters path (no separate runtime
+    # path) — the slug selects a book, never a snapshot revision.
+    book_slug = (args.book or "pact").strip() or "pact"
+    try:
+        from pact_v4.phase0b.book_profile import (
+            load_approved_chapters as _load_approved,
+            resolve_book as _resolve_book,
+        )
+        from pact_v4.phase0b.book_manifest import (
+            ManifestError as _ManifestError,
+            load_manifest as _load_manifest,
+            validate_source_manifest as _validate_manifest,
+            verify_set_hash as _verify_set_hash,
+        )
+        resolved_book = _resolve_book(book_slug)
+    except Exception as exc:
+        _error_exit(f"--book {book_slug!r}: {exc}")
+    book_profile = resolved_book.profile
+
+    # V5 slice-1: host layout comes from the resolved book profile in
+    # BOTH modes (advanced included — no legacy source/state bypass).
+    # Test/operator env overrides (PACT_V4_SOURCE/STATE/OUT_ROOT) are
+    # already applied inside resolve_book and re-validated for isolation.
+    layout = {
+        "source": resolved_book.source_root,
+        "state": resolved_book.state_root,
+        "output": resolved_book.out_root,
+    }
     try:
         _validate_layout(layout)
     except Exception as exc:
@@ -825,18 +864,59 @@ def _handle_book(argv: Sequence[str]) -> int:
         except Exception as exc:
             _error_exit(str(exc))
     else:
-        # Advanced: preserve historical defaults (do not enforce layout collision)
-        import os as _os_adv
-        memory_dir = Path(args.memory_dir) if args.memory_dir else (Path(_os_adv.environ["PACT_V4_STATE_ROOT"]) if _os_adv.environ.get("PACT_V4_STATE_ROOT") else Path("D:/pact/pact_chapters"))
+        # Advanced: profile roots are the defaults (explicit --memory-dir /
+        # --out-base / --chapter-html-pattern win). The legacy advanced
+        # memory default (source dir itself) is retired: mutable state
+        # lives in the book's state root, never under a source root.
+        memory_dir = Path(args.memory_dir) if args.memory_dir else layout["state"]
         output_root = None  # derived later from env or default
+        try:
+            _validate_layout({"source": layout["source"], "state": memory_dir,
+                              "output": Path(args.out_base) if args.out_base else layout["output"]})
+        except Exception as exc:
+            _error_exit(str(exc))
 
-    # Resolve chapter sources for simple mode; advanced keeps zero-padded IDs
+    # Resolve chapter sources from the book manifest in BOTH modes (the
+    # pipeline reads only the splitter/migration output, never EPUBs and
+    # never a glob). Manifest validation #1 (preflight); the SAME routine
+    # re-runs immediately before delegation (TOCTOU re-validation).
+    # Explicit --chapter-html-pattern (advanced) opts out of file
+    # validation: the operator takes responsibility for custom sources
+    # while gates/isolation and the chapters metadata authority still
+    # apply; chapter ids then stay zero-padded.
     discovered: dict[int, Path] = {}
     chapter_ids: list[str] = []
     chapter_html_pattern: str
-    if is_simple:
+    book_manifest = None
+    approved_chapters = None
+    manifest_files_validated = False
+    try:
+        book_manifest = _load_manifest(book_profile.source_manifest)
+        if book_manifest.book_slug != book_slug:
+            raise _ManifestError(
+                f"manifest book_slug {book_manifest.book_slug!r} != {book_slug!r} (isolation)"
+            )
+        approved_chapters = _load_approved(book_profile.chapters_path, book_slug)
+        manifest_files = {c.file for c in book_manifest.chapters}
+        approved_files = {c.file for c in approved_chapters.chapters}
+        if manifest_files != approved_files:
+            raise _ManifestError("manifest/chapters file sets differ")
+        use_profile_source = is_simple or not args.chapter_html_pattern
+        if use_profile_source:
+            discovered = _validate_manifest(layout["source"], book_manifest)
+            if book_manifest.source_kind == "directory":
+                _verify_set_hash(layout["source"], book_manifest)
+            manifest_files_validated = True
+    except Exception as exc:
+        _error_exit(str(exc))
+    if manifest_files_validated:
         try:
-            discovered = _discover_chapter_sources(layout["source"], chapter_numbers)
+            missing = [n for n in chapter_numbers if n not in discovered]
+            if missing:
+                raise _ManifestError(
+                    f"chapters not in {book_slug!r} manifest: "
+                    + ", ".join(f"{n:04d}" for n in missing)
+                )
         except Exception as exc:
             _error_exit(str(exc))
         chapter_ids = [discovered[n].stem for n in chapter_numbers]
@@ -845,7 +925,7 @@ def _handle_book(argv: Sequence[str]) -> int:
             chapter_html_pattern = args.chapter_html_pattern
     else:
         chapter_ids = expand_range(start, end)
-        chapter_html_pattern = args.chapter_html_pattern or "D:/pact/pact_chapters/{chapter_id}.html"
+        chapter_html_pattern = args.chapter_html_pattern or str(layout["source"] / "{chapter_id}.html")
 
     # Select runtime profile for simple mode
     if is_simple_local:
@@ -929,8 +1009,9 @@ def _handle_book(argv: Sequence[str]) -> int:
     # Book layout checks
     book_checks = []
     book_errors = []
-    # Source discovery check
-    if is_simple:
+    # Source discovery check (manifest-validated paths in both modes;
+    # explicit-pattern advanced runs keep the legacy directory check)
+    if discovered:
         try:
             # Already discovered above; verify again for preflight report
             for n in chapter_numbers:
@@ -948,7 +1029,8 @@ def _handle_book(argv: Sequence[str]) -> int:
         except Exception as e:
             book_errors.append(str(e))
     else:
-        # Advanced: check pattern directory exists if possible (best effort, not fail if pattern is template)
+        # Explicit-pattern advanced: check pattern directory exists if possible
+        # (best effort, not fail if pattern is template)
         try:
             pat_dir = Path(chapter_html_pattern).parent
             if pat_dir.exists() and pat_dir.is_symlink():
@@ -1009,19 +1091,54 @@ def _handle_book(argv: Sequence[str]) -> int:
         checks=combined_checks,
         errors=combined_errors,
     )
-    # For simple mode, enrich human output with layout info
+    # For simple mode, enrich human output with layout + book identity info
+    def _book_identity_lines():
+        lines = [
+            f"book: {book_slug} (host {resolved_book.host}, media_book_id {book_profile.media_book_id})",
+            f"policy: hard_filters={book_profile.policy_hard_filters} editor_pass={book_profile.policy_editor_pass}",
+        ]
+        if book_manifest is not None:
+            lines.append(
+                f"manifest: {book_manifest.source_kind} {len(book_manifest.chapters)} chapters "
+                f"hash={book_manifest.source_hash[:16]}...",
+            )
+        if approved_chapters is not None:
+            lines.append(f"approved_chapters: sha256={approved_chapters.sha256[:16]}...")
+        return " | ".join(lines)
+
     def _format_with_layout(rep):
         base = rep.format_human()
         extra = f"\\n  source: {layout['source']}\\n  state: {memory_dir}\\n  outputs: {out_root}"
-        if is_simple and discovered:
+        extra += "\\n  " + _book_identity_lines()
+        if discovered:
             extra += "\\n  chapters: " + ", ".join(discovered[n].name for n in chapter_numbers)
         return base + extra
     if is_check_only:
         if is_json:
-            # Enrich JSON with layout
+            # Enrich JSON with layout + book/profile identity
             j = report.to_dict()
             j["layout"] = {"source": str(layout["source"]), "state": str(memory_dir), "output": str(out_root)}
-            if is_simple:
+            j["book"] = {
+                "slug": book_slug,
+                "host": resolved_book.host,
+                "media_book_id": book_profile.media_book_id,
+                "policy": {
+                    "hard_filters": book_profile.policy_hard_filters,
+                    "editor_pass": book_profile.policy_editor_pass,
+                },
+            }
+            if book_manifest is not None:
+                j["book"]["manifest"] = {
+                    "source_kind": book_manifest.source_kind,
+                    "chapters": len(book_manifest.chapters),
+                    "source_hash": book_manifest.source_hash,
+                }
+            if approved_chapters is not None:
+                j["book"]["approved_chapters"] = {
+                    "chapters": len(approved_chapters.chapters),
+                    "sha256": approved_chapters.sha256,
+                }
+            if discovered:
                 j["resolved_chapters"] = {f"{n:04d}": discovered[n].name for n in chapter_numbers if n in discovered}
             import json as _j
             print(_j.dumps(j, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1072,12 +1189,31 @@ def _handle_book(argv: Sequence[str]) -> int:
         except Exception as exc:
             _error_exit(f"cannot create output directory {root}: {exc}")
 
+    # V5 slice-1: identical manifest re-validation immediately before the
+    # state-changing delegation (TOCTOU defense — same routine as preflight).
+    if manifest_files_validated and book_manifest is not None:
+        try:
+            _revalidated = _validate_manifest(layout["source"], book_manifest)
+            if book_manifest.source_kind == "directory":
+                _verify_set_hash(layout["source"], book_manifest)
+            if set(_revalidated) != set(discovered):
+                raise _ManifestError("manifest chapter set changed between preflight and start")
+        except Exception as exc:
+            _error_exit(f"manifest re-validation failed — refusing to start: {exc}")
+
     # Build delegated argv for v4_book_run.main
     delegated: list[str] = []
     delegated += ["--chapters"] + chapter_ids
     delegated += ["--chapter-html-pattern", chapter_html_pattern]
     delegated += ["--memory-dir", str(memory_dir)]
     delegated += ["--out-base", str(out_base)]
+    # V5 slice-1: the approved chapters.json is the title/POV authority for
+    # every chapter run (flows via book extra_args to strict --chapters-json;
+    # --book-slug cross-checks the file belongs to this book). Unknown to
+    # the book parser, it passes through to strict untouched.
+    if approved_chapters is not None:
+        delegated += ["--chapters-json", str(book_profile.chapters_path)]
+        delegated += ["--book-slug", book_slug]
     # Local simple mode: forward --local pair (bare => gemma/qwen, else translator/reviewer) so delegated book run resolves via providers registry.
     # It must NOT also forward --runtime-config, which strict explicitly rejects for --local (mutual exclusion).
     if is_simple_local:
@@ -1114,7 +1250,7 @@ def _handle_book(argv: Sequence[str]) -> int:
     # Media sync defaults for every simple book mode — thread trusted execution host
     execution_host = _detect_execution_host()
     if is_simple:
-        media_book_id = args.media_book_id or _DEFAULT_MEDIA_BOOK_ID
+        media_book_id = args.media_book_id or book_profile.media_book_id
         media_target = args.media_target or _DEFAULT_MEDIA_TARGET
         media_root = args.media_root or _DEFAULT_MEDIA_ROOT
         delegated += ["--media-book-id", media_book_id]

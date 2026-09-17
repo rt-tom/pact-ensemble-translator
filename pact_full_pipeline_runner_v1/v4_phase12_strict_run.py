@@ -191,13 +191,17 @@ def build_argparser() -> argparse.ArgumentParser:
                          "'R.D.T.' unblocks the tokens R/D/T; 'Blake' unblocks "
                          "'Blake'. The combined allowlist is "
                          "bible + glossary + source-derived + this manual set.")
-    p.add_argument("--arc-names", type=Path, default=None, metavar="FILE",
-                   help="P1 АРКИ: arc_names.json (English→Russian arc names, "
-                        "e.g. Bonds→Узы). Rendered as an 'АРКИ:' block in the "
-                        "whole-chapter generation prompt so chapter headings "
-                        "translate consistently. Default: "
-                        "<memory-dir>/../arc_names.json if it exists, else "
-                        "<cwd>/arc_names.json, else no block.")
+    p.add_argument("--book-slug", type=str, default=None, metavar="SLUG",
+                   help="V5 slice-1: assert the --chapters-json file belongs to "
+                        "this book slug (fail-closed cross-check; the file's "
+                        "book_slug must match).")
+    p.add_argument("--chapters-json", type=Path, default=None, metavar="FILE",
+                   help="V5 slice-1: approved chapters.json (title/POV authority). "
+                        "The deterministic title map (unique arc pairs in book "
+                        "first-appearance order, CHAPTERS: block) is derived "
+                        "ONLY from its records; empty map => no block. The legacy "
+                        "arc-names sidecar is NOT a runtime input. Default: "
+                        "no block.")
     p.add_argument("--startup-timeout", type=float, default=240.0)
     p.add_argument("--unload-timeout", type=float, default=30.0)
     p.add_argument("--lazy-balanced", action=argparse.BooleanOptionalAction, default=None,
@@ -513,39 +517,100 @@ def _env_flag(name: str, *, default: bool) -> bool:
     )
 
 
-def _load_arc_names(args: argparse.Namespace) -> Tuple[Tuple[str, str], ...]:
-    """Load the deterministic АРКИ mapping (P1, owner decision 2026-08-14).
+def _load_title_map(args: argparse.Namespace) -> Tuple[Tuple[str, str], ...]:
+    """Load the deterministic title map (V5 slice-1, alternative B).
 
-    Resolution order: explicit ``--arc-names`` path, else
-    ``<memory-dir>/../arc_names.json``, else ``<cwd>/arc_names.json``.
-    Unreadable/missing/foreign payload => empty tuple (no АРКИ block) — the
-    arc block is an enhancement, never a run failure.
+    ONLY from the explicit ``--chapters-json`` path (the approved
+    chapters.json): unique arc pairs in book first-appearance order,
+    derived from its records. The legacy arc-names sidecar is NOT a
+    runtime input: no legacy flag, no parent-dir or cwd fallback.
+
+    Unreadable/missing/foreign payload => () (no title block) — the title
+    block is an enhancement, never a run failure.
+    """
+    from pact_v4.phase0b.book_profile import ProfileError, load_approved_chapters
+
+    chapters_json = getattr(args, "chapters_json", None)
+    if chapters_json is None:
+        return ()
+    slug, enforced = _slug_from_chapters_path(chapters_json, getattr(args, "book_slug", None))
+    try:
+        approved = load_approved_chapters(Path(chapters_json), slug)
+    except ProfileError as exc:
+        if enforced and "book_slug" in str(exc):
+            raise  # fail-closed: asserted slug mismatch is an isolation error
+        return ()
+    except Exception:
+        return ()
+    return approved.prompt_arc_pairs()
+
+
+def _slug_from_chapters_path(path: object, explicit: object = None) -> tuple:
+    """Book slug + enforcement flag for chapters.json validation.
+
+    Explicit ``--book-slug`` wins (enforced); else the ``books/<slug>/``
+    parent layout (enforced — the directory is independent of file
+    content); else the file's own ``book_slug`` field (unenforced
+    best-effort: nothing independent to check against). Unreadable files
+    stay soft (the title block is an enhancement, never a run failure).
     """
     import json as _json
 
-    candidates: List[Path] = []
-    if args.arc_names is not None:
-        candidates.append(Path(args.arc_names))
-    memory_dir = getattr(args, "memory_dir", None)
-    if memory_dir is not None:
-        candidates.append(Path(memory_dir).parent / "arc_names.json")
-    candidates.append(Path.cwd() / "arc_names.json")
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        try:
-            raw = _json.loads(candidate.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        pairs = []
-        for en, ru in raw.items():
-            if isinstance(en, str) and isinstance(ru, str) and en and ru:
-                pairs.append((en, ru))
-        if pairs:
-            return tuple(pairs)
-    return ()
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip(), True
+    try:
+        parent = Path(str(path)).resolve().parent
+        if parent.name and parent.parent.name == "books":
+            return parent.name, True
+    except Exception:
+        pass
+    try:
+        raw = _json.loads(Path(str(path)).read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("book_slug"), str):
+            return str(raw.get("book_slug")), False
+    except Exception:
+        pass
+    return "", False
+
+
+def _title_map_kwargs(args: argparse.Namespace) -> dict:
+    """Build the StrictRunConfig title kwargs from ``--chapters-json``."""
+    return {"deterministic_title_map": _load_title_map(args)}
+
+
+def _load_chapter_pov(args: argparse.Namespace) -> tuple:
+    """Validated per-chapter POV (name, gender) for the run chapter id.
+
+    Same authority as the title map (approved ``chapters.json`` via
+    ``--chapters-json`` + ``--book-slug`` cross-check, matched with
+    ``pov_for_chapter``). Soft ``(None, None)`` when unconfigured or
+    unreadable; asserted-slug mismatch stays fail-closed (isolation).
+    """
+    from pact_v4.phase0b.book_profile import ProfileError, load_approved_chapters
+
+    chapters_json = getattr(args, "chapters_json", None)
+    chapter_id = getattr(args, "chapter_id", None)
+    if chapters_json is None or not chapter_id:
+        return (None, None)
+    slug, enforced = _slug_from_chapters_path(chapters_json, getattr(args, "book_slug", None))
+    try:
+        approved = load_approved_chapters(Path(chapters_json), slug)
+    except ProfileError as exc:
+        if enforced and "book_slug" in str(exc):
+            raise  # fail-closed: asserted slug mismatch is an isolation error
+        return (None, None)
+    except Exception:
+        return (None, None)
+    pov = approved.pov_for_chapter(chapter_id)
+    if pov is None:
+        return (None, None)
+    return (pov.name, pov.gender)
+
+
+def _chapter_pov_kwargs(args: argparse.Namespace) -> dict:
+    """Build the StrictRunConfig per-chapter POV kwargs from ``--chapters-json``."""
+    name, gender = _load_chapter_pov(args)
+    return {"chapter_pov_name": name, "chapter_pov_gender": gender}
 
 
 def _resolve_effective_reasoning(args: argparse.Namespace, backend: Any) -> int:
@@ -722,9 +787,10 @@ def _build_run_config(args: argparse.Namespace, backend: Any, *, reasoning: Opti
         out_dir=args.out_dir, backend=backend,
         max_consecutive_terminal_nonselections=args.max_consecutive_nonselections,
         deterministic_mixed_script_allow=tuple(args.mixed_script_allow or ()),
-        # P1 АРКИ: deterministic arc-name mapping for the whole-chapter
-        # generation prompt (part of the config identity).
-        deterministic_arc_names=_load_arc_names(args),
+        # V5 slice-1: deterministic title map + per-chapter POV from the
+        # approved chapters.json (both part of the config identity).
+        **_title_map_kwargs(args),
+        **_chapter_pov_kwargs(args),
         run_label=args.run_label,
         # V4.1: reasoning budget for Phase 2B generation and early exit after
         # Phase 1-2 generation. Both are part of the config identity
@@ -929,7 +995,12 @@ def _apply_provider_flags(args: argparse.Namespace, backend: Any) -> Any:
     )
 
 
-def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
+def _load_bible_text(
+    memory_dir: Path,
+    chapter_id: str,
+    chapters_json: object = None,
+    book_slug: object = None,
+) -> str:
     """Render the bible for adapter injection (B7, V4.1 A2).
 
     The strict driver renders the bible from the per-chapter
@@ -949,7 +1020,28 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
     from pact_v4.runtime.snapshot_factory import ChapterMemory
 
     memory = ChapterMemory.from_directory(memory_dir)
-    return render_bible_section(chapter_id, memory.chapter_index, memory.book_memory)
+    # V5 slice-1 adapter path: the same validated per-chapter POV as the
+    # generation path (single helper — the two paths cannot diverge).
+    # Unconfigured/unreadable stays soft (legacy output); an asserted-slug
+    # mismatch stays fail-closed (isolation).
+    chapter_pov = _adapter_chapter_pov(chapter_id, chapters_json, book_slug)
+    return render_bible_section(
+        chapter_id, memory.chapter_index, memory.book_memory,
+        chapter_pov=chapter_pov,
+    )
+
+
+def _adapter_chapter_pov(chapter_id: str, chapters_json: object, book_slug: object):
+    """Resolve the adapter-path POV mapping via the shared strict loader."""
+    import argparse as _argparse
+
+    ns = _argparse.Namespace(
+        chapters_json=chapters_json, book_slug=book_slug, chapter_id=chapter_id,
+    )
+    name, gender = _load_chapter_pov(ns)
+    if not name:
+        return None
+    return {"name": name, "gender": gender}
 
 
 # The B3 contract binds the Qwen audit server to the MTP build of the model:
@@ -1355,7 +1447,10 @@ def run_local_default(args: argparse.Namespace) -> int:
     # so the book resume gate sees the identical invocation identity).
     backend, cfg, effective_reasoning = _resolve_backend_and_config(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
+    bible_text = _load_bible_text(
+        args.memory_dir, args.chapter_id,
+        getattr(args, "chapters_json", None), getattr(args, "book_slug", None),
+    )
     # A2 review fix (whole-chapter retry ownership): in whole-chapter mode
     # the GENERATION layer (WholeChapterRetryPolicy) is the single retry
     # owner — the adapter-level JSON retry (JsonRetryPolicy) is disabled for
@@ -1446,7 +1541,10 @@ def run_with_runtime_config(args: argparse.Namespace) -> int:
     # NOTE: backend/cfg above already carry the resolved pair wiring from
     # _resolve_backend_and_config (identical to the historical inline code).
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    bible_text = _load_bible_text(args.memory_dir, args.chapter_id)
+    bible_text = _load_bible_text(
+        args.memory_dir, args.chapter_id,
+        getattr(args, "chapters_json", None), getattr(args, "book_slug", None),
+    )
     runtime = backend.build_runtime(log_dir=args.out_dir / "server_logs")
     # A2 review fix (whole-chapter retry ownership): in whole-chapter mode the
     # GENERATION layer (WholeChapterRetryPolicy) is the single retry owner —
