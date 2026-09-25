@@ -5,6 +5,7 @@
 - [x] 1.3 Implement `effective_reasoning_budget(role, model_alias) = model.reasoning_budget + (role_budgets[role].reasoning_budget or 0)`. Restart/relaunch the same local model when the next role requires a different effective budget; replace (do not append) `--reasoning-budget`. Record actual args for fresh calls. Do not add effective reasoning to run identity or invalidate/reject request cache or resume artifacts; cache hits retain their existing provenance.
 - [x] 1.4 Add `--reasoning-budget-enable` to `gemma`/`qwen` `server_args`; verify `reasoning_budget` agreement; `xhigh` quoted as `"xhigh"`.
 - [x] 1.5 Add `gemma31` and `qwen38` as specified in design §2 (exact PowerShell args minus host/port, `-dev` preserved, `-md` draft for qwen38).
+- [x] 1.6 Tune `qwen` (Qwen3.6-35B-A3B) profile to design §2: `-ub "2048"`, `-ctv q8_0`, remove `--spec-draft-n-max`/`--device`, keep `--reasoning-budget-enable`; keep parity across `configs/providers.yaml`, `configs/runtime_local.example.yaml`, `QWEN_SERVER_ARGS`.
 
 ## 2. Local formatting (model)
 

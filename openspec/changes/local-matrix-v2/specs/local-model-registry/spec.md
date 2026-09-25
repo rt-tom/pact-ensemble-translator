@@ -28,6 +28,14 @@ The registry SHALL allow `providers.local.models.<alias>.request` to contain onl
 
 The registry SHALL contain `gemma31` and `qwen38` with the exact server_args/request/reasoning_budget from design §2 (PowerShell args minus host/port, `-dev` preserved, `-md` draft for `qwen38`, `xhigh` quoted). Existing `gemma`/`qwen` SHALL gain `--reasoning-budget-enable` in `server_args`.
 
+### Requirement: Tuned qwen (Qwen3.6-35B-A3B) server profile
+
+The `qwen` alias SHALL use the exact ordered `server_args` from design §2: `--spec-type draft-mtp` with `-ub "2048"` and `-ctv q8_0`, `--reasoning-budget "8192"` plus required `--reasoning-budget-enable`, and SHALL NOT contain `--spec-draft-n-max` or `--device`. `reasoning_budget` SHALL stay `8192` and agree with `--reasoning-budget`.
+
+#### Scenario: Tuned qwen profile is exact and consistent
+- **WHEN** `qwen` is inspected in `configs/providers.yaml`, `configs/runtime_local.example.yaml`, or `QWEN_SERVER_ARGS`
+- **THEN** its ordered `server_args` SHALL equal the design §2 profile, SHALL contain `--reasoning-budget-enable`, and SHALL NOT contain `--spec-draft-n-max` or `--device`.
+
 #### Scenario: New aliases are resolvable
 - **WHEN** `book --local gemma31/qwen38` is invoked
 - **THEN** `gemma31` SHALL serve translator roles and `qwen38` reviewer roles with their registered paths/server_args.
