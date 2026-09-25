@@ -47,10 +47,6 @@ server_args:
   qwen:
     - --spec-type
     - draft-mtp
-    - --spec-draft-n-max
-    - "3"
-    - --device
-    - SYCL0
     - -fit
     - "on"
     - -fitt
@@ -58,11 +54,11 @@ server_args:
     - -b
     - "2048"
     - -ub
-    - "512"
+    - "2048"
     - -ctk
     - q8_0
     - -ctv
-    - q4_0
+    - q8_0
     - -t
     - "6"
     - -tb
@@ -73,6 +69,7 @@ server_args:
     - "on"
     - --reasoning-budget
     - "8192"
+    - --reasoning-budget-enable
     - -np
     - "1"
     - -c
