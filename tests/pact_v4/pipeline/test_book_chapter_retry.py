@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -460,7 +461,6 @@ def test_legacy_inference_without_manifest(tmp_path: Path):
 
 
 def test_boundary_negatives_symlink_fifo_corrupt_manifest(tmp_path: Path):
-    import os
     cfg = _make_cfg(tmp_path, n_paragraphs=THREE_CHUNKS)
     _run_chapter(cfg, with_repair=True)
     assert chapter_readiness(cfg.out_dir)["ready"] is True
@@ -476,14 +476,17 @@ def test_boundary_negatives_symlink_fifo_corrupt_manifest(tmp_path: Path):
     translations.write_bytes(real)
     assert chapter_readiness(cfg.out_dir)["ready"] is True
     # FIFO in place of an artifact: rejected, never read as JSON.
+    # POSIX-only section (Windows has no os.mkfifo); symlink +
+    # corrupt-manifest assertions above/below still run on Windows.
     formatting = cfg.out_dir / "formatting_report.json"
-    formatting.unlink()
-    os.mkfifo(formatting)
-    ok, _reason = manifest_stage_complete(cfg.out_dir, "formatting")
-    assert ok is False
-    assert first_unfinished_stage(cfg.out_dir)[0] == "formatting"
-    formatting.unlink()
-    formatting.write_text('{"schema": "x"}', encoding="utf-8")
+    if hasattr(os, "mkfifo"):
+        formatting.unlink()
+        os.mkfifo(formatting)
+        ok, _reason = manifest_stage_complete(cfg.out_dir, "formatting")
+        assert ok is False
+        assert first_unfinished_stage(cfg.out_dir)[0] == "formatting"
+        formatting.unlink()
+        formatting.write_text('{"schema": "x"}', encoding="utf-8")
     # Corrupt manifest: never trusted, legacy inference takes over.
     (cfg.out_dir / "stage_manifest.json").write_text("{corrupt", encoding="utf-8")
     assert load_stage_manifest(cfg.out_dir) == {}
@@ -1228,8 +1231,8 @@ def test_symlink_manifest_blocks_promotion(tmp_path: Path):
     assert chapter_readiness(cfg.out_dir)["ready"] is True
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO not available on Windows")
 def test_fifo_manifest_blocks_without_hanging(tmp_path: Path):
-    import os
     from pact_v4.pipeline.v4_retry import (
         load_stage_manifest,
         stage_manifest_present,
@@ -1649,8 +1652,8 @@ def test_atomic_write_never_follows_legacy_symlink_tmp(tmp_path: Path):
     assert not target.is_symlink()
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO not available on Windows")
 def test_atomic_write_ignores_fifo_tmp_without_hanging(tmp_path: Path):
-    import os
     from pact_v4.pipeline.v4_retry import _atomic_write_json
     target = tmp_path / "stage_manifest.json"
     fifo = tmp_path / "stage_manifest.json.tmp"
