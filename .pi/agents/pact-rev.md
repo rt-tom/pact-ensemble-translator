@@ -1,7 +1,7 @@
 ---
 name: pact-rev
 description: Independently reviews implementation against OpenSpec and code quality.
-model: openai-codex/gpt-5.6-terra
+model: openai-codex/gpt-6-luna
 thinking: medium
 async: true
 tools:
