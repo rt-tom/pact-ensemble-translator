@@ -464,19 +464,22 @@ def test_cli_exit_code_halted_early_stays_2():
 
 
 # ---------------------------------------------------------------------------
-# F3 (B3 review): the default local Qwen audit transport is B3-capable (MTP
-# draft, reasoning 8192, context 49k) and a non-B3 local profile fails loudly
-# when the B3 audit would run.
+# F3 (B3 review) + qwen38-gemma31-profile-refresh addendum: the default local
+# Qwen audit transport is B3-capable WITHOUT speculative drafting (no draft
+# selector, reasoning 8192, context 49k) and a non-B3 local profile fails
+# loudly when the B3 audit would run. Reintroducing any draft flag fails too.
 # ---------------------------------------------------------------------------
 
 
 def test_default_local_qwen_profile_is_b3_capable():
-    # QWEN_PATH points at the MTP model variant.
+    # QWEN_PATH points at the MTP model variant (file name unchanged).
     assert "Qwen3.6-35B-A3B-MTP" in str(cli.QWEN_PATH)
-    # Server args express the B3 audit contract: MTP draft, reasoning on,
-    # reasoning-budget 8192, context 49152.
+    # Server args express the B3 audit contract: NO draft selector,
+    # reasoning on, reasoning-budget 8192, context 49152.
     args = cli.QWEN_SERVER_ARGS
-    assert args[args.index("--spec-type") + 1] == "draft-mtp"
+    assert "--spec-type" not in args
+    assert "-md" not in args
+    assert not [a for a in args if a.startswith("--spec-draft")]
     assert args[args.index("--reasoning-budget") + 1] == "8192"
     assert args[args.index("-c") + 1] == "49152"
     assert "--reasoning" in args
@@ -580,10 +583,11 @@ def test_default_local_qwen_transport_in_backend_identity(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# F1 (RV2 B3 review): configs/runtime_local.example.yaml must be internally
-# consistent — the qwen model path/name is the MTP variant when the server
-# args declare MTP draft transport, and _validate_b3_qwen_profile rejects a
-# non-MTP model path with MTP flags instead of silently accepting it.
+# F1 (RV2 B3 review) + qwen38-gemma31-profile-refresh addendum:
+# configs/runtime_local.example.yaml must be internally consistent — the qwen
+# model path/name is the exact MTP-variant file while the server args carry
+# NO draft selector, and _validate_b3_qwen_profile rejects a non-MTP model
+# path or any reintroduced draft flag instead of silently accepting it.
 # ---------------------------------------------------------------------------
 
 
@@ -599,12 +603,11 @@ def _example_local_backend():
 
 
 def test_example_local_profile_qwen_is_mtp_consistent(tmp_path: Path):
-    # F1: the shipped example local profile must be self-consistent — the
-    # qwen model path points at the MTP variant (…/Qwen3.6-35B-A3B-MTP/…)
-    # while the server args declare MTP draft transport. A real
+    # F1 + addendum: the shipped example local profile must be
+    # self-consistent — the qwen model path points at the exact MTP-variant
+    # file while the server args carry NO draft selector. A real
     # --runtime-config configs/runtime_local.example.yaml --whole-chapter
-    # run must pass B3 profile validation, not silently start a non-MTP
-    # server with MTP flags.
+    # run must pass B3 profile validation (audit stays enabled).
     backend = _example_local_backend()
     assert isinstance(backend, LocalLlamaBackendConfig)
     qwen_path = str(backend.model_paths["qwen"])
@@ -617,11 +620,10 @@ def test_example_local_profile_qwen_is_mtp_consistent(tmp_path: Path):
 
 
 def test_non_mtp_model_path_with_mtp_flags_fails_loudly(tmp_path: Path):
-    # F1: a local profile whose qwen server args declare MTP draft but whose
-    # model_paths.qwen points at the NON-MTP variant is an unsupported
-    # mismatch — validation must fail loudly (never launch non-MTP with MTP
-    # flags). This is the exact regression the example config used to have
-    # before the F1 fix.
+    # F1 + addendum: a local profile whose model_paths.qwen points at the
+    # NON-MTP variant is an unsupported mismatch against the exact approved
+    # MTP-variant file identity — validation must fail loudly (never launch
+    # a non-approved model file for the audit).
     args = cli.build_argparser().parse_args(
         _base_args(tmp_path) + ["--whole-chapter"]
     )
@@ -639,12 +641,99 @@ def test_non_mtp_model_path_with_mtp_flags_fails_loudly(tmp_path: Path):
         },
         server_args={
             "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
-            "qwen": cli.QWEN_SERVER_ARGS,  # MTP draft, reasoning 8192, 49k
+            "qwen": cli.QWEN_SERVER_ARGS,  # no draft, reasoning 8192, 49k
         },
         port=args.port, startup_timeout=args.startup_timeout,
         unload_timeout=args.unload_timeout,
     )
     with pytest.raises(ValueError, match="MTP variant"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+# ---------------------------------------------------------------------------
+# qwen38-gemma31-profile-refresh addendum: ordinary qwen B3 negative matrix
+# for the no-draft contract — reintroduced draft selectors, foreign
+# identities and weakened limits all fail closed; the audit stays enabled.
+# ---------------------------------------------------------------------------
+
+
+def _qwen_no_draft_backend(args, mutate=None, qwen_path=None, qwen_name=None):
+    qwen_args = list(cli.QWEN_SERVER_ARGS)
+    if mutate is not None:
+        qwen_args = mutate(qwen_args)
+    return cli.StrictBackendConfig(
+        exe=Path(r"C:\src\llama-sycl-edge\build\bin\llama-server.exe"),
+        device="SYCL0", host=args.host,
+        model_paths={
+            "gemma": cli.GEMMA_PATH,
+            "qwen": qwen_path if qwen_path is not None else cli.QWEN_PATH,
+        },
+        model_names={
+            "gemma": cli.GEMMA_PATH.name,
+            "qwen": qwen_name if qwen_name is not None else cli.QWEN_PATH.name,
+        },
+        server_args={
+            "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
+            "qwen": qwen_args,
+        },
+        port=args.port, startup_timeout=args.startup_timeout,
+        unload_timeout=args.unload_timeout,
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--spec-type", "draft-mtp"],
+        ["--spec-type", "none"],
+        ["-md", "C:/llama-cpp/models/Qwen3.8-27B/MTP/mtp-Qwen3.8-27B-Q4_0.gguf"],
+        ["--spec-draft-n-max", "2"],
+        ["--spec-draft-ngl", "99"],
+        ["--spec-draft-device", "SYCL0"],
+    ],
+)
+def test_qwen_reintroduced_draft_flags_fail_loudly(tmp_path: Path, extra: list):
+    # Any draft selector on the approved no-draft qwen profile fails closed.
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _qwen_no_draft_backend(args, mutate=lambda a: a + extra)
+    with pytest.raises(ValueError, match="absent|draft"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_qwen_duplicate_reasoning_budget_fails_loudly(tmp_path: Path):
+    # Ambiguous capability flags fail closed (never validated silently).
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _qwen_no_draft_backend(
+        args, mutate=lambda a: a + ["--reasoning-budget", "8192"]
+    )
+    with pytest.raises(ValueError, match="reasoning-budget"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_qwen_duplicate_context_fails_loudly(tmp_path: Path):
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _qwen_no_draft_backend(
+        args, mutate=lambda a: a + ["-c", "49152"]
+    )
+    with pytest.raises(ValueError, match="49152"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+def test_qwen_lowered_context_fails_loudly(tmp_path: Path):
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _qwen_no_draft_backend(
+        args,
+        mutate=lambda a: ["32768" if x == "49152" else x for x in a],
+    )
+    with pytest.raises(ValueError, match="49152"):
         cli._validate_b3_qwen_profile(args, backend)
 
 
@@ -677,11 +766,11 @@ def test_non_mtp_model_path_with_mtp_flags_ok_when_skip_audit(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# RV3 (HIGH, t_a0500b7e): _validate_b3_qwen_profile must enforce an EXACT
-# MTP-variant identity on the ACTUAL qwen model path — a substring match
-# (…/Qwen-non-MTP.gguf, …/MTP-disabled/…) or a forged model_names.qwen can
-# never satisfy the B3 MTP requirement, and a misleading name cannot override
-# a non-MTP path.
+# RV3 (HIGH, t_a0500b7e) + round-4 finding: _validate_b3_qwen_profile must
+# enforce the EXACT approved Qwen3.6 path AND matching file name — a
+# substring match (…/Qwen-non-MTP.gguf, …/MTP-disabled/…), a DIFFERENT file
+# under the approved MTP directory, or a forged model_names.qwen can never
+# satisfy the B3 identity, and a misleading name cannot override the path.
 # ---------------------------------------------------------------------------
 
 
@@ -693,7 +782,7 @@ def _b3_local_backend(args, qwen_path: Path, qwen_name: str):
         model_names={"gemma": cli.GEMMA_PATH.name, "qwen": qwen_name},
         server_args={
             "gemma": cli._gemma_server_args_for_reasoning(args.reasoning),
-            "qwen": cli.QWEN_SERVER_ARGS,  # MTP draft, reasoning 8192, 49k
+            "qwen": cli.QWEN_SERVER_ARGS,  # no draft, reasoning 8192, 49k
         },
         port=args.port, startup_timeout=args.startup_timeout,
         unload_timeout=args.unload_timeout,
@@ -728,8 +817,9 @@ def test_mtp_identity_adversarial_paths_fail_loudly(
 
 
 def test_mtp_identity_valid_path_but_name_negates_mtp_fails_loudly(tmp_path: Path):
-    # Name/path coherence: the path IS the exact MTP variant, but a name that
-    # explicitly negates MTP contradicts it — must fail loudly too.
+    # Name/path coherence: the path IS the exact approved file, but a name
+    # that does not match the approved file name contradicts it — must fail
+    # loudly too.
     args = cli.build_argparser().parse_args(
         _base_args(tmp_path) + ["--whole-chapter"]
     )
@@ -738,8 +828,61 @@ def test_mtp_identity_valid_path_but_name_negates_mtp_fails_loudly(tmp_path: Pat
         cli._validate_b3_qwen_profile(args, backend)
 
 
+@pytest.mark.parametrize(
+    "qwen_path, qwen_name",
+    [
+        # Round-4 probe: a DIFFERENT file under the canonical MTP directory
+        # (directory/stem match is NOT sufficient).
+        (Path(r"C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Other-Model-Q4_K_XL.gguf"),
+         "Other-Model-Q4_K_XL.gguf"),
+        # Same-directory lookalike stem with the approved file name forged.
+        (Path(r"C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL-evil.gguf"),
+         "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+        # Approved path but a different approved-looking file name.
+        (cli.QWEN_PATH, "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf".replace("Q4_K_XL", "Q4_0")),
+        # Approved path but a missing name.
+        (cli.QWEN_PATH, ""),
+    ],
+)
+def test_qwen_exact_file_identity_rejects_same_dir_and_name_variants(
+    tmp_path: Path, qwen_path: Path, qwen_name: str
+):
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _b3_local_backend(args, qwen_path, qwen_name)
+    with pytest.raises(ValueError, match="MTP variant|contradicts"):
+        cli._validate_b3_qwen_profile(args, backend)
+
+
+@pytest.mark.parametrize(
+    "qwen_path",
+    [
+        # Backslash spelling of the exact approved file (normalization).
+        Path(r"C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+        # Dot segment resolving INTO the approved directory/file.
+        Path("C:/llama-cpp/models/./Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+        # Dot-dot resolving INTO the approved directory/file.
+        Path("C:/llama-cpp/models/Qwen3.6-35B-A3B/../Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+    ],
+)
+def test_qwen_exact_file_identity_accepts_canonical_spelling_variants(
+    tmp_path: Path, qwen_path: Path
+):
+    # Direction guard: spellings whose EFFECTIVE path is the approved file
+    # keep the identity (rejection applies only to effective non-approved
+    # paths/names).
+    args = cli.build_argparser().parse_args(
+        _base_args(tmp_path) + ["--whole-chapter"]
+    )
+    backend = _b3_local_backend(
+        args, qwen_path, "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+    )
+    cli._validate_b3_qwen_profile(args, backend)  # no exception
+
+
 # ---------------------------------------------------------------------------
-# RV4 (HIGH, t_fc23a704): _is_b3_qwen_mtp_identity must evaluate the
+# RV4 (HIGH, t_fc23a704): the qwen B3 identity must evaluate the
 # NORMALIZED (dot-segment-collapsed) path — a canonical MTP component
 # followed by a ".." segment resolves to the NON-MTP directory and must be
 # rejected even though the raw Path.parts listing still contains the exact

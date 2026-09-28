@@ -106,12 +106,12 @@ GEMMA_SERVER_ARGS = [
     "--ctx-checkpoints", "0",
 ]
 # V4.1 B3 (review fix F3): the Qwen audit server args ARE the B3 profile —
-# MTP draft spec, --reasoning on, --reasoning-budget 8192, context 49152
+# no speculative drafting (--spec-type removed per owner addendum; llama.cpp
+# defaults to none), --reasoning on, --reasoning-budget 8192, context 49152
 # (runtime_local.example.yaml qwen block, plan §3.4 / B1 49k contract).
 # Keeping a stale reasoning-budget 0 / 32k profile here would silently run
 # the audit server differently than the B3 config identity declares.
 QWEN_SERVER_ARGS = [
-    "--spec-type", "draft-mtp",
     "-fit", "on",
     "-fitt", "1280",
     "-b", "2048",
@@ -952,70 +952,33 @@ def _load_bible_text(memory_dir: Path, chapter_id: str) -> str:
 
 
 # The B3 contract binds the Qwen audit server to the MTP build of the model:
-# C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf.
-# The MTP marker is the model-variant DIRECTORY (…\Qwen3.6-35B-A3B-MTP\…); the
-# file stem itself carries no MTP marker (configs/runtime_local.example.yaml
-# model_names.qwen is the plain file name). Identity is therefore verified as an
-# EXACT whole path-component (or file-stem) match against the canonical variant
-# name — a substring test would admit lookalikes (Qwen-non-MTP.gguf,
-# …/MTP-disabled/…, forged model_names.qwen=Qwen-MTP.gguf) as MTP.
+# C:\llama-cpp\models\Qwen3.6-35B-A3B-MTP\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+# (== QWEN_PATH below). Ordinary-qwen B3 identity is the EXACT approved
+# canonical path AND matching file name — a directory/stem match would admit
+# a different GGUF placed under the MTP directory, so the full effective
+# path is compared (round-4 review finding).
 _B3_QWEN_MTP_VARIANT = "Qwen3.6-35B-A3B-MTP"
-# Round-2 HIGH (option B): the approved qwen38 reviewer profile carries its
-# MTP draft as an EXTERNAL draft file (-md) instead of an MTP-variant main
-# model directory, with a 44k context. B3 capability for qwen38 is assessed
-# against this exact approved contract — model-specific, never a broad
-# relaxation: exact draft-file stem, exact main-model stem, spec-type
-# draft-mtp, reasoning >= 8192, context floor 44000.
-_B3_QWEN38_MODEL_STEM = "Qwen3.8-27B-UD-Q4_K_XL"
-_B3_QWEN38_DRAFT_STEM = "mtp-Qwen3.8-27B-Q4_0"
+_B3_QWEN_MODEL_PATH = "C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+_B3_QWEN_MODEL_NAME = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+# qwen38-gemma31-profile-refresh: the approved qwen38 reviewer profile is the
+# Q4_0 build with an EMBEDDED MTP draft (no external draft file), with a 44k
+# context. B3 capability for qwen38 is assessed against this exact approved
+# contract — model-specific, never a broad relaxation: exact approved
+# main-model path/name, embedded draft-mtp spec (n-max 2, p-min 0.5, no
+# external draft flags), --no-reasoning-preserve, reasoning >= 8192
+# (role-effective), context floor 44000. The previous Q4_K_XL build with an
+# external -md draft is rejected under the qwen38 alias after the switch.
+_B3_QWEN38_MODEL_STEM = "Qwen3.8-27B-Q4_0"
+_B3_QWEN38_MODEL_PATH = "C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0.gguf"
+_B3_QWEN38_MODEL_NAME = "Qwen3.8-27B-Q4_0.gguf"
+_B3_QWEN38_N_MAX = "2"
+_B3_QWEN38_P_MIN = "0.5"
 _B3_QWEN38_CONTEXT_FLOOR = 44000
-# A model NAME that explicitly negates MTP contradicts a valid MTP path —
-# name/path coherence guard (the name must never override the path verdict).
-_B3_QWEN_MTP_NEGATION_MARKERS = (
-    "non-mtp",
-    "no-mtp",
-    "mtp-disabled",
-    "mtp-off",
-    "mtp-free",
-    "without-mtp",
-)
-
-
-def _is_b3_qwen_mtp_identity(value: str) -> bool:
-    """Exact MTP-variant identity: a path component or the file stem EQUALS
-    the canonical MTP build name (case-insensitive). Substring lookalikes
-    never match.
-
-    The path is NORMALIZED (dot segments collapsed) before identity
-    evaluation: a canonical MTP component followed by a ``..`` segment can
-    resolve to a NON-MTP directory (…\\Qwen3.6-35B-A3B-MTP\\..\\
-    Qwen3.6-35B-A3B\\…) while still appearing in the raw Path.parts listing
-    — identity is judged on the EFFECTIVE path, not the literal spelling
-    (RV4 HIGH). Malformed/ambiguous values fail closed (False)."""
-    if not value:
-        return False
-    try:
-        path = Path(os.path.normpath(value))
-    except (TypeError, ValueError):
-        # Malformed value (e.g. embedded null byte, invalid Windows path
-        # characters) cannot satisfy the exact MTP identity — fail closed.
-        return False
-    return any(
-        part.lower() == _B3_QWEN_MTP_VARIANT.lower()
-        for part in path.parts
-    ) or path.stem.lower() == _B3_QWEN_MTP_VARIANT.lower()
-
-
-def _name_negates_b3_qwen_mtp(name: str) -> bool:
-    lowered = name.lower()
-    return any(marker in lowered for marker in _B3_QWEN_MTP_NEGATION_MARKERS)
-
-
 def _normalized_path_stem(value: str):
     """Normalized file stem (lowercased) or ``None`` when empty/malformed.
 
-    Same normalization discipline as ``_is_b3_qwen_mtp_identity``: identity
-    is judged on the effective path, and malformed values fail closed.
+    Identity is judged on the effective (normalized) path, and malformed
+    values fail closed.
     """
     if not value or not isinstance(value, str):
         return None
@@ -1025,80 +988,154 @@ def _normalized_path_stem(value: str):
         return None
 
 
-def _is_b3_qwen38_draft_identity(value: str) -> bool:
-    """Exact approved external MTP draft-file identity for the qwen38 reviewer.
+def _canonical_b3_model_path(value: Any):
+    """Canonical model-path spelling (lowercased, slash-unified) or ``None``.
 
-    The approved qwen38 profile declares ``--spec-type draft-mtp`` with the
-    draft carried by ``-md <.../MTP/mtp-Qwen3.8-27B-Q4_0.gguf>``. Only the
-    exact draft-file stem satisfies the B3 draft requirement — substring
-    lookalikes and forged names fail closed (mirrors the exactness of
-    ``_is_b3_qwen_mtp_identity`` for the legacy qwen profile).
+    Identity is judged on the EFFECTIVE path: dot segments are collapsed
+    before comparison, so a noncanonical spelling that escapes the approved
+    model directory (``Qwen3.8-27B/../Qwen3.8-27B-evil/…``) can never satisfy
+    an exact approved identity even though the raw string still contains
+    the approved directory name. Malformed values fail closed (``None``).
     """
-    stem = _normalized_path_stem(value)
-    return stem is not None and stem == _B3_QWEN38_DRAFT_STEM.lower()
+    if value is None:
+        return None
+    try:
+        text = str(value).replace("\\", "/")
+    except (TypeError, ValueError):
+        return None
+    if not text or "\x00" in text:
+        return None
+    try:
+        return os.path.normpath(text).replace("\\", "/").lower()
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_b3_qwen38_model_identity(path_value: Any, name_value: Any) -> bool:
+    """Exact approved Q4_0 main-model identity: canonical path AND name.
+
+    Both the resolved model path (effective spelling) and the model file
+    name must equal the approved Q4_0 build exactly. Substring lookalikes,
+    old-build stems and forged names fail closed.
+    """
+    if not isinstance(name_value, str) or name_value != _B3_QWEN38_MODEL_NAME:
+        return False
+    canonical = _canonical_b3_model_path(path_value)
+    if canonical is None:
+        return False
+    approved = _canonical_b3_model_path(_B3_QWEN38_MODEL_PATH)
+    if canonical != approved:
+        return False
+    stem = _normalized_path_stem(str(path_value))
+    return stem == _B3_QWEN38_MODEL_STEM.lower()
+
+
+def _is_b3_qwen_model_identity(path_value: Any, name_value: Any) -> bool:
+    """Exact approved Qwen3.6 model identity: canonical path AND name.
+
+    Both the resolved model path (effective spelling) and the model file
+    name must equal the approved Qwen3.6 build exactly. A directory/stem
+    match is NOT sufficient: a different GGUF placed under the approved
+    MTP directory (or any lookalike/foreign path or forged name) fails
+    closed — round-4 review finding.
+    """
+    if not isinstance(name_value, str) or name_value != _B3_QWEN_MODEL_NAME:
+        return False
+    canonical = _canonical_b3_model_path(path_value)
+    if canonical is None:
+        return False
+    approved = _canonical_b3_model_path(_B3_QWEN_MODEL_PATH)
+    return canonical == approved
 
 
 def _validate_b3_qwen38_reviewer(rev_args: list, rev_path: Any, rev_name: Any) -> None:
-    """B3 capability for the approved qwen38 reviewer profile (option B).
+    """B3 capability for the approved qwen38 reviewer profile (embedded MTP).
 
-    Accepts ONLY the approved qwen38 contract: ``--spec-type draft-mtp``
-    with the exact external draft file (``-md`` stem
-    ``mtp-Qwen3.8-27B-Q4_0``), the exact approved main-model build,
-    ``--reasoning-budget >= 8192`` (assessed on the ACTUAL qwen_audit
-    role-effective launch args, e.g. 10192), and context floor 44000.
-    Anything else — missing/lookalike draft, wrong main model, lowered
-    budget or context — fails closed. Never a broad relaxation: every
-    check is qwen38-model-specific.
+    Accepts ONLY the approved qwen38 contract: the exact approved Q4_0
+    main-model path/name, ``--spec-type draft-mtp`` with the embedded-MTP
+    spec (``--spec-draft-n-max 2``, ``--spec-draft-p-min 0.5``), no external
+    draft flags (``-md``, ``--spec-draft-ngl``, ``--spec-draft-device``) and
+    no lifecycle-duplicated device flags (``-dev``/``--device``),
+    ``--no-reasoning-preserve``, ``--reasoning-budget >= 8192`` (assessed on
+    the ACTUAL qwen_audit role-effective launch args, e.g. 10192), and
+    context floor 44000. Capability flags must each occur EXACTLY once —
+    absent, duplicated or malformed flags fail closed. Anything else —
+    old Q4_K_XL build, lookalike/noncanonical paths, external draft,
+    missing/incorrect MTP spec, lowered budget or context — fails closed.
+    Never a broad relaxation: every check is qwen38-model-specific.
     """
-    def _arg_value(flag: str):
-        for index, arg in enumerate(rev_args):
-            if arg == flag and index + 1 < len(rev_args):
-                return rev_args[index + 1]
-        return None
+    def _occurrences(flag: str) -> int:
+        return sum(1 for arg in rev_args if arg == flag)
 
-    spec_type = _arg_value("--spec-type")
-    draft = _arg_value("-md")
-    reasoning_budget = _arg_value("--reasoning-budget")
-    context = _arg_value("-c") or _arg_value("--ctx-size")
+    def _single_value(flag: str):
+        """The flag value when the flag occurs exactly once with a value."""
+        if _occurrences(flag) != 1:
+            return None
+        index = rev_args.index(flag)
+        if index + 1 >= len(rev_args):
+            return None
+        value = rev_args[index + 1]
+        if not isinstance(value, str) or not value or value.startswith("-"):
+            return None
+        return value
+
     path_str = str(rev_path) if rev_path is not None else ""
     name_str = str(rev_name) if rev_name is not None else ""
     problems: list = []
+    if not _is_b3_qwen38_model_identity(rev_path, rev_name):
+        problems.append(
+            f"reviewer main model must be the approved {_B3_QWEN38_MODEL_PATH!r} "
+            f"with matching name {_B3_QWEN38_MODEL_NAME!r} "
+            f"(got path={path_str!r}, name={name_str!r})"
+        )
+    spec_type = _single_value("--spec-type")
     if spec_type != "draft-mtp":
-        problems.append("--spec-type draft-mtp (MTP draft)")
-    if not draft or not _is_b3_qwen38_draft_identity(draft):
+        problems.append("--spec-type draft-mtp (MTP draft, exactly once)")
+    if _single_value("--spec-draft-n-max") != _B3_QWEN38_N_MAX:
         problems.append(
-            f"-md {_B3_QWEN38_DRAFT_STEM!r} (exact approved external MTP draft file; "
-            f"got {draft!r})"
+            f"--spec-draft-n-max {_B3_QWEN38_N_MAX} (exactly once; "
+            f"got {_occurrences('--spec-draft-n-max')} occurrence(s))"
         )
-    main_stem = _normalized_path_stem(path_str)
-    if main_stem != _B3_QWEN38_MODEL_STEM.lower():
+    if _single_value("--spec-draft-p-min") != _B3_QWEN38_P_MIN:
         problems.append(
-            f"reviewer main model must be the approved {_B3_QWEN38_MODEL_STEM!r} build "
-            f"(got path={path_str!r})"
+            f"--spec-draft-p-min {_B3_QWEN38_P_MIN} (exactly once; "
+            f"got {_occurrences('--spec-draft-p-min')} occurrence(s))"
         )
-    elif name_str and _name_negates_b3_qwen_mtp(name_str):
-        problems.append(
-            f"reviewer model_names contradicts the MTP draft declaration "
-            f"(got name={name_str!r}, path={path_str!r})"
-        )
+    for _external in ("-md", "--spec-draft-ngl", "--spec-draft-device"):
+        if _external in rev_args:
+            problems.append(
+                f"{_external} must be absent (embedded MTP has no external draft)"
+            )
+    for _dup_dev in ("-dev", "--device"):
+        if _dup_dev in rev_args:
+            problems.append(
+                f"{_dup_dev} must be absent (device is injected by the lifecycle adapter)"
+            )
+    if _occurrences("--no-reasoning-preserve") != 1:
+        problems.append("--no-reasoning-preserve (exactly once)")
+    reasoning_budget = _single_value("--reasoning-budget")
     try:
         budget_ok = reasoning_budget is not None and int(reasoning_budget) >= 8192
     except ValueError:
         budget_ok = False
     if not budget_ok:
-        problems.append("--reasoning-budget >= 8192")
+        problems.append("--reasoning-budget >= 8192 (exactly once)")
+    context = None
+    context_flags = _occurrences("-c") + _occurrences("--ctx-size")
+    if context_flags == 1:
+        context = _single_value("-c") if _occurrences("-c") == 1 else _single_value("--ctx-size")
     try:
         context_ok = context is not None and int(context) >= _B3_QWEN38_CONTEXT_FLOOR
     except ValueError:
         context_ok = False
     if not context_ok:
-        problems.append(f"context -c >= {_B3_QWEN38_CONTEXT_FLOOR}")
+        problems.append(f"context -c >= {_B3_QWEN38_CONTEXT_FLOOR} (exactly once)")
     if problems:
         raise ValueError(
             "B3 audit requires a qwen38 reviewer profile that is B3-capable "
             "(missing: " + "; ".join(problems) + "). The qwen38 audit server "
             "args and the B3 config identity must agree — only the approved "
-            "qwen38 profile (-md external draft, 44k context) is accepted "
+            "qwen38 profile (Q4_0 embedded MTP, 44k context) is accepted "
             "(or pass --skip-audit)."
         )
 
@@ -1164,7 +1201,7 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
         return
     if rev_key != "qwen":
         # Model-specific fail-closed: B3 capability has only been assessed
-        # for the qwen (qwen3.6 MTP) and qwen38 (external-draft) reviewer
+        # for the qwen (qwen3.6 no-draft) and qwen38 (Q4_0 embedded-MTP) reviewer
         # profiles. Any other reviewer model cannot be proven B3-capable.
         raise ValueError(
             f"B3 audit requires a reviewer model with assessed B3 capability "
@@ -1172,62 +1209,88 @@ def _validate_b3_qwen_profile(args: argparse.Namespace, backend: Any) -> None:
             f"unassessed — refusing to audit on an unvalidated profile "
             f"(or pass --skip-audit)."
         )
-    spec_type = _arg_value("--spec-type")
-    reasoning_budget = _arg_value("--reasoning-budget")
-    context = _arg_value("-c") or _arg_value("--ctx-size")
-    # F1 (RV2): the qwen MODEL must itself be the MTP variant when the
-    # server args declare MTP draft transport. The B3 contract binds the
-    # Qwen audit to the MTP build (…/Qwen3.6-35B-A3B-MTP/…); a non-MTP
-    # model path with MTP flags is an unsupported mismatch (the draft spec
-    # is a property of the model build, not just the server args), so it
-    # must fail loudly here instead of silently starting a non-MTP server.
+    # qwen38-gemma31-profile-refresh addendum: ordinary qwen (Qwen3.6) runs
+    # B3 WITHOUT speculative drafting. The model file keeps its MTP-variant
+    # name (no file change), but the server args carry NO draft selector —
+    # llama.cpp then uses its documented default (none). Any draft-mode
+    # flag (-md/--model-draft, --spec-type, any --spec-draft-*) is an
+    # unapproved speculative profile and fails closed; the audit itself and
+    # all hard filters stay enabled.
     qwen_path = rev_path
     qwen_name = rev_name
     path_str = str(qwen_path) if qwen_path is not None else ""
     name_str = str(qwen_name) if qwen_name is not None else ""
     problems: list = []
-    if spec_type != "draft-mtp":
-        problems.append("--spec-type draft-mtp (MTP draft)")
-    if spec_type == "draft-mtp":
-        # MTP transport declared -> the ACTUAL model PATH must carry the
-        # exact MTP-variant identity (…/Qwen3.6-35B-A3B-MTP/…). The check is
-        # exact (whole path component / file stem equal to the canonical MTP
-        # build name), so a substring lookalike (Qwen-non-MTP.gguf,
-        # …/MTP-disabled/…) can never pass, and a misleading model NAME can
-        # never override a non-MTP path. A name that explicitly negates MTP
-        # also contradicts a valid MTP path (name/path coherence).
-        if not _is_b3_qwen_mtp_identity(path_str):
+    # The ACTUAL model PATH AND NAME must equal the exact approved Qwen3.6
+    # build (…/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf). A
+    # directory/stem match is NOT sufficient — a different GGUF under the
+    # approved directory, a substring lookalike (Qwen-non-MTP.gguf,
+    # …/MTP-disabled/…), a noncanonical spelling escaping the directory, or
+    # a forged/missing model NAME can never satisfy the B3 identity. A name
+    # that does not match the approved file contradicts a valid path
+    # (name/path coherence; the name never overrides the path verdict).
+    if not _is_b3_qwen_model_identity(rev_path, rev_name):
+        if _canonical_b3_model_path(rev_path) == _canonical_b3_model_path(
+            _B3_QWEN_MODEL_PATH
+        ):
             problems.append(
-                "qwen model_paths.qwen must be the exact MTP variant build "
-                f"({_B3_QWEN_MTP_VARIANT!r}, e.g. …/Qwen3.6-35B-A3B-MTP/…) — "
-                "substring lookalikes and misleading model_names cannot "
-                "satisfy the B3 MTP identity when --spec-type draft-mtp is "
-                f"set (got path={path_str!r}, name={name_str!r})"
-            )
-        elif name_str and _name_negates_b3_qwen_mtp(name_str):
-            problems.append(
-                "qwen model_names.qwen contradicts the exact MTP model path "
-                f"({_B3_QWEN_MTP_VARIANT!r}) — the name must not negate MTP "
+                "qwen model_names.qwen contradicts the exact approved model path "
+                f"({_B3_QWEN_MODEL_PATH!r}) — the name must match "
+                f"{_B3_QWEN_MODEL_NAME!r} "
                 f"(got name={name_str!r}, path={path_str!r})"
             )
+        else:
+            problems.append(
+                "qwen model_paths.qwen must be the exact approved MTP variant build "
+                f"({_B3_QWEN_MODEL_PATH!r} with matching name "
+                f"{_B3_QWEN_MODEL_NAME!r}) — directory/stem matches, substring "
+                "lookalikes, noncanonical escapes and misleading model_names cannot "
+                f"satisfy the B3 MTP variant identity "
+                f"(got path={path_str!r}, name={name_str!r})"
+            )
+    _DRAFT_SELECTORS = (
+        "--spec-type", "-md", "--model-draft", "--spec-model",
+        "--spec-draft-n-max", "--spec-draft-p-min", "--spec-draft-ngl",
+        "--spec-draft-device", "--draft",
+    )
+    for _selector in _DRAFT_SELECTORS:
+        if _selector in rev_args:
+            problems.append(
+                f"{_selector} must be absent (ordinary qwen runs B3 without "
+                "speculative drafting)"
+            )
+    for _arg in rev_args:
+        if _arg.startswith("--spec-") and _arg not in _DRAFT_SELECTORS:
+            problems.append(
+                f"{_arg} must be absent (ordinary qwen runs B3 without "
+                "speculative drafting)"
+            )
+            break
+    if rev_args.count("--reasoning-budget") != 1:
+        reasoning_budget = None
+    else:
+        reasoning_budget = _arg_value("--reasoning-budget")
+    context = None
+    if rev_args.count("-c") + rev_args.count("--ctx-size") == 1:
+        context = _arg_value("-c") or _arg_value("--ctx-size")
     try:
         budget_ok = reasoning_budget is not None and int(reasoning_budget) >= 8192
     except ValueError:
         budget_ok = False
     if not budget_ok:
-        problems.append("--reasoning-budget >= 8192")
+        problems.append("--reasoning-budget >= 8192 (exactly once)")
     try:
         context_ok = context is not None and int(context) >= 49152
     except ValueError:
         context_ok = False
     if not context_ok:
-        problems.append("context -c >= 49152")
+        problems.append("context -c >= 49152 (exactly once)")
     if problems:
         raise ValueError(
             "B3 audit requires a Qwen server profile that is B3-capable "
             "(missing: " + "; ".join(problems) + "). The Qwen audit server "
-            "args and the B3 config identity must agree — add the B3 profile "
-            "to the runtime config's qwen server_args "
+            "args and the B3 config identity must agree — use the approved "
+            "no-draft qwen server_args "
             "(see configs/runtime_local.example.yaml), or pass --skip-audit."
         )
 

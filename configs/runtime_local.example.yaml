@@ -45,8 +45,6 @@ server_args:
     - --ctx-checkpoints
     - "0"
   qwen:
-    - --spec-type
-    - draft-mtp
     - -fit
     - "on"
     - -fitt

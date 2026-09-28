@@ -444,7 +444,18 @@ def test_production_aliases_shape():
     assert gemma31.request["top_k"] == 64
     assert gemma31.request["min_p"] == 0.0
     assert gemma31.request["repeat_penalty"] == 1.0
-    assert "-dev" in gemma31.server_args  # -dev preserved
+    assert gemma31.model_path == "C:/llama-cpp/models/Gemma4-31B-Q5/gemma-4-31B-it-UD-Q5_K_XL.gguf"
+    assert gemma31.model_name == "gemma-4-31B-it-UD-Q5_K_XL.gguf"
+    assert list(gemma31.server_args) == [
+        "-fit", "on", "-fitt", "512", "-b", "1024", "-ub", "1024",
+        "-ctk", "q8_0", "-ctv", "q4_0", "-t", "12", "-tb", "12",
+        "-fa", "on", "--load-mode", "mmap", "-c", "44000", "-np", "1",
+        "--reasoning", "on", "--reasoning-budget-enable",
+        "--reasoning-budget", "2000", "--cache-ram", "0",
+        "--ctx-checkpoints", "0", "--jinja",
+    ]  # qwen38-gemma31-profile-refresh: -ub 1024, no -dev/--device (lifecycle injects it)
+    assert "-dev" not in gemma31.server_args
+    assert "--device" not in gemma31.server_args
     qwen38 = local["qwen38"]
     assert qwen38.model_key == "qwen38"
     assert qwen38.reasoning_budget == 8192
@@ -453,8 +464,27 @@ def test_production_aliases_shape():
     assert qwen38.request["top_k"] == 20
     assert qwen38.request["min_p"] == 0.0
     assert qwen38.request["presence_penalty"] == 0.0
+    assert qwen38.model_path == "C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0.gguf"
+    assert qwen38.model_name == "Qwen3.8-27B-Q4_0.gguf"
     args = list(qwen38.server_args)
-    assert "-md" in args  # mtp draft preserved
+    assert args == [
+        "--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
+        "--spec-draft-p-min", "0.5", "-ngl", "99", "-c", "44000",
+        "-b", "2048", "-ub", "1024", "-ctk", "q8_0", "-ctv", "q4_0",
+        "-t", "6", "-tb", "12", "--load-mode", "mmap",
+        "--reasoning", "on", "--no-reasoning-preserve",
+        "--reasoning-budget-enable", "--reasoning-effort", "xhigh",
+        "--reasoning-budget", "8192", "-np", "1", "-fa", "on",
+        "--jinja", "--cache-ram", "0", "--ctx-checkpoints", "0",
+    ]  # qwen38-gemma31-profile-refresh: embedded MTP, no external draft, no -dev/--device
+    assert "-md" not in args  # embedded MTP: no external draft file
+    assert "--spec-draft-ngl" not in args
+    assert "--spec-draft-device" not in args
+    assert "-dev" not in args
+    assert "--device" not in args
+    assert "--no-reasoning-preserve" in args
+    assert args[args.index("--spec-draft-n-max") + 1] == "2"
+    assert args[args.index("--spec-draft-p-min") + 1] == "0.5"
     assert args[args.index("--reasoning-effort") + 1] == "xhigh"  # quoted xhigh
     # Existing models gain --reasoning-budget-enable, keep budgets.
     for alias in ("gemma", "qwen"):
@@ -1358,7 +1388,10 @@ def test_cli_preflight_gemma31_qwen38_reasoning_omitted(capsys, tmp_path):
 # passed on qwen3.6/49k settings while launching qwen38/44k. The validator
 # now resolves the pair's reviewer model/key and its ACTUAL qwen_audit
 # role-effective launch args; qwen38 is assessed against its exact approved
-# contract (-md external draft, 44k context), fail-closed and model-specific.
+# contract (Q4_0 embedded MTP, 44k context), fail-closed and model-specific.
+# qwen38-gemma31-profile-refresh supersedes the old external-draft (-md)
+# Q4_K_XL contract: the old build, external draft flags and noncanonical
+# spellings fail closed under the qwen38 alias.
 # ---------------------------------------------------------------------------
 
 def _b3_args():
@@ -1408,23 +1441,194 @@ def _swap(lst, flag, newval):
     return lst
 
 
-def test_b3_rejects_qwen38_wrong_draft():
+def test_b3_rejects_qwen38_old_external_draft_build():
+    """The superseded Q4_K_XL + external -md profile fails under qwen38."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+    from dataclasses import replace
+
+    _, backend = _b3_pair_backend("gemma31/qwen38")
+    sa = dict(backend.server_args)
+    old_args = [
+        "-md", "C:/llama-cpp/models/Qwen3.8-27B/MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+        "--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
+        "--spec-draft-ngl", "99", "--spec-draft-device", "SYCL0",
+    ] + [a for a in sa["qwen38"] if a not in ("--spec-draft-p-min", "0.5")]
+    sa["qwen38"] = old_args
+    paths = dict(backend.model_paths)
+    paths["qwen38"] = "C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    names = dict(backend.model_names)
+    names["qwen38"] = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    backend = replace(backend, server_args=sa, model_paths=paths, model_names=names)
+    with pytest.raises(ValueError, match="approved"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_b3_rejects_qwen38_added_external_draft():
+    """Any -md flag on the embedded-MTP profile fails closed."""
     import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
 
-    backend = _tampered_qwen38_backend(lambda a: _swap(a, "-md", "C:/evil/mtp-evil.gguf"))
+    backend = _tampered_qwen38_backend(
+        lambda a: ["-md", "C:/llama-cpp/models/Qwen3.8-27B/MTP/mtp-Qwen3.8-27B-Q4_0.gguf"] + a
+    )
     with pytest.raises(ValueError, match="-md"):
         cli._validate_b3_qwen_profile(_b3_args(), backend)
 
 
-def test_b3_rejects_qwen38_missing_draft():
+def test_b3_rejects_qwen38_spec_draft_device_flags():
+    """External-draft transport flags fail on the embedded-MTP profile."""
     import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
 
-    def _drop(a):
-        return [x for x in a if x != "-md" and "mtp-Qwen" not in x]
-
-    backend = _tampered_qwen38_backend(_drop)
-    with pytest.raises(ValueError, match="-md"):
+    backend = _tampered_qwen38_backend(
+        lambda a: a + ["--spec-draft-ngl", "99", "--spec-draft-device", "SYCL0"]
+    )
+    with pytest.raises(ValueError, match="spec-draft"):
         cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_b3_rejects_qwen38_missing_spec_config():
+    """Missing n-max or p-min fails closed (absent capability flag)."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    def _drop_nmax(a):
+        out = list(a)
+        i = out.index("--spec-draft-n-max")
+        del out[i:i + 2]
+        return out
+
+    def _drop_pmin(a):
+        out = list(a)
+        i = out.index("--spec-draft-p-min")
+        del out[i:i + 2]
+        return out
+
+    with pytest.raises(ValueError, match="spec-draft-n-max"):
+        cli._validate_b3_qwen_profile(_b3_args(), _tampered_qwen38_backend(_drop_nmax))
+    with pytest.raises(ValueError, match="spec-draft-p-min"):
+        cli._validate_b3_qwen_profile(_b3_args(), _tampered_qwen38_backend(_drop_pmin))
+
+
+def test_b3_rejects_qwen38_duplicate_spec_flags():
+    """Duplicated capability flags fail closed (ambiguous launch args)."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    with pytest.raises(ValueError, match="spec-type"):
+        cli._validate_b3_qwen_profile(
+            _b3_args(),
+            _tampered_qwen38_backend(lambda a: a + ["--spec-type", "draft-mtp"]),
+        )
+    with pytest.raises(ValueError, match="spec-draft-n-max"):
+        cli._validate_b3_qwen_profile(
+            _b3_args(),
+            _tampered_qwen38_backend(lambda a: a + ["--spec-draft-n-max", "2"]),
+        )
+    with pytest.raises(ValueError, match="reasoning-budget"):
+        cli._validate_b3_qwen_profile(
+            _b3_args(),
+            _tampered_qwen38_backend(lambda a: a + ["--reasoning-budget", "8192"]),
+        )
+    with pytest.raises(ValueError, match="44000"):
+        cli._validate_b3_qwen_profile(
+            _b3_args(),
+            _tampered_qwen38_backend(lambda a: a + ["-c", "44000"]),
+        )
+
+
+def test_b3_rejects_qwen38_malformed_spec_values():
+    """Wrong n-max/p-min values fail closed (non-canonical spec)."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _tampered_qwen38_backend(lambda a: _swap(a, "--spec-draft-n-max", "4"))
+    with pytest.raises(ValueError, match="spec-draft-n-max"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+    backend = _tampered_qwen38_backend(lambda a: _swap(a, "--spec-draft-p-min", "0.9"))
+    with pytest.raises(ValueError, match="spec-draft-p-min"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_b3_rejects_qwen38_missing_no_reasoning_preserve():
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _tampered_qwen38_backend(
+        lambda a: [x for x in a if x != "--no-reasoning-preserve"]
+    )
+    with pytest.raises(ValueError, match="no-reasoning-preserve"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_b3_rejects_qwen38_duplicated_device_flag():
+    """-dev/--device must stay lifecycle-injected, never in server_args."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _tampered_qwen38_backend(lambda a: a + ["-dev", "SYCL0"])
+    with pytest.raises(ValueError, match="-dev"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def _path_swapped_qwen38_backend(new_path, new_name):
+    from dataclasses import replace
+
+    _, backend = _b3_pair_backend("gemma31/qwen38")
+    paths = dict(backend.model_paths)
+    paths["qwen38"] = new_path
+    names = dict(backend.model_names)
+    names["qwen38"] = new_name
+    return replace(backend, model_paths=paths, model_names=names)
+
+
+def test_b3_rejects_qwen38_lookalike_and_old_paths():
+    """Old build, lookalike dir/file and forged names fail the identity."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    bad_identities = [
+        # superseded old build (exact previous contract)
+        ("C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+         "Qwen3.8-27B-UD-Q4_K_XL.gguf"),
+        # lookalike directory with the approved file stem
+        ("C:/llama-cpp/models/Qwen3.8-27B-evil/Qwen3.8-27B-Q4_0.gguf",
+         "Qwen3.8-27B-Q4_0.gguf"),
+        # lookalike file stem in the approved directory
+        ("C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0-evil.gguf",
+         "Qwen3.8-27B-Q4_0-evil.gguf"),
+        # forged name cannot override a non-approved path
+        ("C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+         "Qwen3.8-27B-Q4_0.gguf"),
+        # approved path with a mismatched name
+        ("C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0.gguf",
+         "Qwen3.8-27B-UD-Q4_K_XL.gguf"),
+    ]
+    for bad_path, bad_name in bad_identities:
+        backend = _path_swapped_qwen38_backend(bad_path, bad_name)
+        with pytest.raises(ValueError, match="approved"):
+            cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_b3_rejects_qwen38_dotdot_escape_from_approved_dir():
+    """A .. segment escaping the approved directory fails the identity."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _path_swapped_qwen38_backend(
+        "C:/llama-cpp/models/Qwen3.8-27B/../Qwen3.8-27B-evil/Qwen3.8-27B-Q4_0.gguf",
+        "Qwen3.8-27B-Q4_0.gguf",
+    )
+    with pytest.raises(ValueError, match="approved"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_b3_rejects_qwen38_malformed_budget():
+    """A non-numeric --reasoning-budget value fails closed at the gate layer."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    _, backend = _b3_pair_backend("gemma31/qwen38")
+    args = list(backend.server_args["qwen38"])
+    args[args.index("--reasoning-budget") + 1] = "xhigh"
+    # NOTE: assessed at the reviewer-gate layer because the pair-level
+    # validator always evaluates the numeric role-effective launch budget.
+    with pytest.raises(ValueError, match="reasoning-budget"):
+        cli._validate_b3_qwen38_reviewer(
+            args,
+            backend.model_paths["qwen38"],
+            backend.model_names["qwen38"],
+        )
 
 
 def test_b3_rejects_qwen38_low_context():
