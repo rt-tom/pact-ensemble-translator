@@ -35,6 +35,14 @@ v4.2 dev/test copy (where v4.2 branches are synced and tested): D:\pact\pact_tra
 - Commands executed by agents on `media` use Bash/Linux syntax.
 - Commands prepared for the owner to run on `RT` use PowerShell/Windows syntax.
 - Do not assume paths, environments, model servers, or caches exist on both hosts.
+- In any Pact worktree on `media`, run Python tools through `.venv/bin/python`
+  and `.venv/bin/pytest` (or `.venv/bin/python -m pytest`); do not rely on
+  ambient `python`, `python3`, or `pytest` from `PATH`.
+- The worktree-local `.venv` is expected to be a symlink to the shared
+  `/home/rt/.venvs/pact` environment. Verify it with `readlink -f .venv` before
+  Python checks. If it is missing, create the symlink only when `.venv` does not
+  already exist; never replace a different environment or modify/delete the
+  shared environment as part of worktree setup.
 
 ## Production and workspace safety
 
