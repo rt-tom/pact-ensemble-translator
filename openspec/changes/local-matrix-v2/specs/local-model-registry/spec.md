@@ -28,6 +28,10 @@ The registry SHALL allow `providers.local.models.<alias>.request` to contain onl
 
 The registry SHALL contain `gemma31` and `qwen38` with the exact server_args/request/reasoning_budget from design §2 (PowerShell args minus host/port, `-dev` preserved, `-md` draft for `qwen38`, `xhigh` quoted). Existing `gemma`/`qwen` SHALL gain `--reasoning-budget-enable` in `server_args`.
 
+#### Scenario: New models registered with exact profiles
+- **WHEN** the registry is inspected
+- **THEN** it SHALL contain `gemma31` and `qwen38` with the design §2 exact profiles and existing `gemma`/`qwen` SHALL contain `--reasoning-budget-enable`.
+
 ### Requirement: Tuned qwen (Qwen3.6-35B-A3B) server profile
 
 The `qwen` alias SHALL use the exact ordered `server_args` from design §2: `--spec-type draft-mtp` with `-ub "2048"` and `-ctv q8_0`, `--reasoning-budget "8192"` plus required `--reasoning-budget-enable`, and SHALL NOT contain `--spec-draft-n-max` or `--device`. `reasoning_budget` SHALL stay `8192` and agree with `--reasoning-budget`.
