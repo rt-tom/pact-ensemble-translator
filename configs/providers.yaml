@@ -21,7 +21,7 @@
 #   qwen_audit        reviewer    12000*    same                            same                                             10192 (8192+2000)
 #   fidelity_reviewer reviewer    16384*    same                            same                                             8192
 #   russian_selector  reviewer    1024      same                            same                                             8192
-#   entity_extractor  reviewer    12000     same                            same                                             10192 (8192+2000)
+#   entity_extractor  reviewer    20000     same                            same                                             10192 (8192+2000)
 #   russian_editor    reviewer    12000     same                            same                                             8192
 #   glossary_resolver reviewer    4096      same                            same                                             8192
 #   (* floor/span output_budget, see below.) Hybrid effective reasoning is LOCAL only:
@@ -42,7 +42,7 @@ role_budgets:
   qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 2000}
   fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 0}
   russian_selector: {max_output_tokens: 1024, reasoning_budget: 0}
-  entity_extractor: {max_output_tokens: 12000, reasoning_budget: 2000}
+  entity_extractor: {max_output_tokens: 20000, reasoning_budget: 2000}
   russian_editor: {max_output_tokens: 12000, reasoning_budget: 0}
   glossary_resolver: {max_output_tokens: 4096, reasoning_budget: 0}
 providers:
