@@ -656,7 +656,7 @@ def test_matrix_rows_authoritative(tmp_path):
     prod = build_resolved_pair_from_registry(reg, "gemma31", "qwen38")
     prod_rows = {r["role"]: r for r in prod.matrix_rows()}
     assert prod_rows["generator"] == {
-        "role": "generator", "group": "translator", "max_output_tokens": 70000,
+        "role": "generator", "group": "translator", "max_output_tokens": 74048,
         "output_budget": None, "model_key": "gemma31", "model_base": 2000,
         "request": {"min_p": 0.0, "repeat_penalty": 1.0, "temperature": 1.0,
                     "top_k": 64, "top_p": 0.95},

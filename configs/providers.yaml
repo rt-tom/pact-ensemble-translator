@@ -14,16 +14,19 @@
 #
 # Authoritative role x model matrix (local-matrix-v2):
 #   role              group       max_out   model base (server reasoning)   request sampling (model-owned)                 effective (base+delta)
-#   generator         translator  70000     gemma 2048 / gemma31 2000       gemma 0.2/seed7 | gemma31 1.0/0.95/64/0.0/1.0  4000 on gemma31 (2000+2000)
-#   repair            translator  16384*    same as generator               same                                             2000 on gemma31 (2000+0)
-#   gemma_audit       translator  4096      same                            same                                             2000
-#   formatting        reviewer    8000*     qwen 8192 / qwen38 8192+xhigh    qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           8192 on qwen38 (8192+0)
-#   qwen_audit        reviewer    12000*    same                            same                                             10192 (8192+2000)
-#   fidelity_reviewer reviewer    16384*    same                            same                                             8192
-#   russian_selector  reviewer    1024      same                            same                                             8192
-#   entity_extractor  reviewer    20000     same                            same                                             10192 (8192+2000)
-#   russian_editor    reviewer    12000     same                            same                                             8192
-#   glossary_resolver reviewer    4096      same                            same                                             8192
+#   generator         translator  74048     gemma 2048 / gemma31 2000       gemma 0.2/seed7 | gemma31 1.0/0.95/64/0.0/1.0  4048 on gemma (2048+2000)
+#   repair            translator  18432*    same as generator               same                                             2000 on gemma31 (2000+0)
+#   gemma_audit       translator  6144      same                            same                                             2000
+#   formatting        reviewer    16192*    qwen 8192 / qwen38 8192+xhigh    qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           8192 on qwen38 (8192+0)
+#   qwen_audit        reviewer    22192*    same                            same                                             10192 (8192+2000)
+#   fidelity_reviewer reviewer    24576*    same                            same                                             8192
+#   russian_selector  reviewer    9216      same                            same                                             8192
+#   entity_extractor  reviewer    30192     same                            same                                             10192 (8192+2000)
+#   russian_editor    reviewer    20192     same                            same                                             8192
+#   glossary_resolver reviewer    12288     same                            same                                             8192
+#   max_out includes the largest local effective reasoning budget for that role;
+#   shared role ceilings apply to remote calls too. Formula floor/base and ceiling
+#   include the same offset; per-item/per-span increments are unchanged.
 #   (* floor/span output_budget, see below.) Hybrid effective reasoning is LOCAL only:
 #   effective(role, model) = model.reasoning_budget + (role_budgets[role].reasoning_budget or 0).
 #   The router restarts/relaunches the SAME model with a replaced --reasoning-budget when the
@@ -35,16 +38,16 @@
 # Request must NOT contain max_output_tokens/reasoning/reasoning_budget; unknown sampling keys fail closed.
 # Sampling is excluded from run identity (same output dir) but INCLUDED in each request cache key/provenance.
 role_budgets:
-  generator: {max_output_tokens: 70000, reasoning_budget: 2000}
-  repair: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 0}
-  formatting: {max_output_tokens: 8000, output_budget: {mode: span_formula, base_tokens: 8000, per_span_tokens: 64, ceiling: 24576}, reasoning_budget: 0}
-  gemma_audit: {max_output_tokens: 4096, reasoning_budget: 0}
-  qwen_audit: {max_output_tokens: 12000, output_budget: {mode: floor_plus_per_item, floor_tokens: 12000, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 2000}
-  fidelity_reviewer: {max_output_tokens: 16384, output_budget: {mode: floor_plus_per_item, floor_tokens: 16384, per_item_tokens: 128, ceiling: 24576}, reasoning_budget: 0}
-  russian_selector: {max_output_tokens: 1024, reasoning_budget: 0}
-  entity_extractor: {max_output_tokens: 20000, reasoning_budget: 2000}
-  russian_editor: {max_output_tokens: 12000, reasoning_budget: 0}
-  glossary_resolver: {max_output_tokens: 4096, reasoning_budget: 0}
+  generator: {max_output_tokens: 74048, reasoning_budget: 2000}
+  repair: {max_output_tokens: 18432, output_budget: {mode: floor_plus_per_item, floor_tokens: 18432, per_item_tokens: 128, ceiling: 26624}, reasoning_budget: 0}
+  formatting: {max_output_tokens: 16192, output_budget: {mode: span_formula, base_tokens: 16192, per_span_tokens: 64, ceiling: 32768}, reasoning_budget: 0}
+  gemma_audit: {max_output_tokens: 6144, reasoning_budget: 0}
+  qwen_audit: {max_output_tokens: 22192, output_budget: {mode: floor_plus_per_item, floor_tokens: 22192, per_item_tokens: 128, ceiling: 34768}, reasoning_budget: 2000}
+  fidelity_reviewer: {max_output_tokens: 24576, output_budget: {mode: floor_plus_per_item, floor_tokens: 24576, per_item_tokens: 128, ceiling: 32768}, reasoning_budget: 0}
+  russian_selector: {max_output_tokens: 9216, reasoning_budget: 0}
+  entity_extractor: {max_output_tokens: 30192, reasoning_budget: 2000}
+  russian_editor: {max_output_tokens: 20192, reasoning_budget: 0}
+  glossary_resolver: {max_output_tokens: 12288, reasoning_budget: 0}
 providers:
   opencode-go:
     kind: opencode_server
