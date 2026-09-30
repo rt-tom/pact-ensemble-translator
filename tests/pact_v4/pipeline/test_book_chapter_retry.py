@@ -1497,7 +1497,8 @@ class _FakeB3:
         self.degraded = degraded
         self.entity_enabled = entity_enabled
 
-    def entity_context_prepass(self, *, source, out_dir):
+    def entity_context_prepass(self, *, source, out_dir, hint_card=""):
+        self.last_hint_card = hint_card
         return None
 
     def run(self, *, chapter_id, source, snapshot_hash, translation,

@@ -36,6 +36,7 @@ Design rules (konspekt §8.3 + B1.1 review, PROPOSAL reply §1.2/§1.4/§1.5):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -445,12 +446,517 @@ class ValidationReport:
 
 
 # ---------------------------------------------------------------------------
+# Authoritative hint card (entity-context-authoritative-hints, owner-approved).
+#
+# A compact, deterministic, bounded card of previously established English
+# names/aliases/terms that ALSO appear (word-boundary) in the current
+# chapter's source. Sent to the extractor as labeled PRIOR CONTEXT, never
+# evidence: every emitted claim still requires verbatim PID grounding and
+# passes the unchanged 8-point validation. Pure: no model calls, no I/O,
+# deterministic order, hard entry/char cap with truncation diagnostics.
+#
+# Boundary rules (spec: "Only source-matched authoritative hints"):
+# * English source surfaces + canonical English identity ONLY — Russian
+#   translations (canonical_ru / glossary targets) and prose facts NEVER
+#   enter the card (they stay in downstream glossary/bible stages).
+# * Excluded: unresolved conflicts (_conflicts / _excluded_conflict /
+#   glossary-vs-memory canonical-RU disagreement / glossary-internal
+#   multi-target conflict), candidate-only records, current-chapter-only
+#   observations, chapter_local scene records, entries with no
+#   word-boundary source match. Narrator/seed/global-voice exceptions are
+#   NOT force-included here (unlike role views): no source match, no hint.
+# ---------------------------------------------------------------------------
+
+# Owner-approved bounds (proposal §"What Changes" / design §1).
+ENTITY_HINT_MAX_ENTRIES = 32
+ENTITY_HINT_MAX_CHARS = 2048
+
+# Prompt-variant identity bound into the B1.2 cache key for non-empty cards.
+ENTITY_HINT_PROMPT_VARIANT = "pact-v4-entity-extractor-hints/v1"
+
+_ENTITY_HINT_SECTIONS = ("characters", "entities", "terms")
+
+
+@dataclass(frozen=True)
+class EntityHintCard:
+    """One chapter's frozen prior-hint card plus selection diagnostics."""
+
+    text: str  # exact rendered card ("" when no hint survived selection)
+    rows: Tuple[Tuple[str, str], ...] = ()  # (source surface, canonical identity)
+    kept_rows: int = 0
+    matched_rows: int = 0  # rows before cap/truncation (>= kept_rows)
+    truncated_rows: int = 0
+    excluded_conflict: int = 0
+    excluded_candidate: int = 0
+    excluded_current_chapter: int = 0
+    excluded_chapter_local: int = 0
+    excluded_unmatched: int = 0
+    card_hash: str = ""  # sha256 of text ("" when empty)
+
+    def is_empty(self) -> bool:
+        return not self.text.strip()
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "rows": [list(r) for r in self.rows],
+            "kept_rows": self.kept_rows,
+            "matched_rows": self.matched_rows,
+            "truncated_rows": self.truncated_rows,
+            "excluded": {
+                "conflict": self.excluded_conflict,
+                "candidate": self.excluded_candidate,
+                "current_chapter": self.excluded_current_chapter,
+                "chapter_local": self.excluded_chapter_local,
+                "unmatched": self.excluded_unmatched,
+            },
+            "card_hash": self.card_hash,
+            "max_entries": ENTITY_HINT_MAX_ENTRIES,
+            "max_chars": ENTITY_HINT_MAX_CHARS,
+            "prompt_variant": ENTITY_HINT_PROMPT_VARIANT,
+        }
+
+
+def _hint_norm(s: Any) -> str:
+    return str(s or "").strip().casefold().replace("\u2019", "'")
+
+
+def _hint_surface_pattern(surface: str) -> "Optional[re.Pattern[str]]":
+    """Word-boundary regex for one English surface.
+
+    Mirrors ``pact_v4.phase2.risk._term_present`` matching semantics
+    (boundary ``(?<!\\w)..(?!\\w)``, multi-word ``\\s+``,
+    straight/curly-apostrophe tolerance, case-sensitive when the term
+    starts uppercase — proper names must not match lowercase common
+    words — else case-insensitive) and additionally reports match
+    offsets so selection order can use earliest source position.
+    Implemented locally (no import) to keep this module cycle-free.
+    """
+    folded = str(surface or "").replace("\u2019", "'").replace("\u2018", "'")
+    if not folded.strip():
+        return None
+    escaped = re.escape(folded)
+    escaped = escaped.replace(r"\ ", r"\s+")
+    escaped = escaped.replace("'", "['\u2019]")
+    flags = 0 if folded[:1].isupper() else re.IGNORECASE
+    try:
+        return re.compile(rf"(?<!\w){escaped}(?!\w)", flags)
+    except re.error:
+        return None
+
+
+def _hint_record_entries(
+    book_memory: Mapping[str, Any], section: str
+) -> List[Tuple[str, Mapping[str, Any]]]:
+    """(name, attrs) pairs for one memory section (dict or list shape)."""
+    data = book_memory.get(section) if isinstance(book_memory, Mapping) else None
+    out: List[Tuple[str, Mapping[str, Any]]] = []
+    if isinstance(data, Mapping):
+        for name, attrs in data.items():
+            if not name:
+                continue
+            out.append((str(name), attrs if isinstance(attrs, Mapping) else {}))
+    elif isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("name") or entry.get("source") or entry.get("english")
+            if name:
+                out.append((str(name), entry))
+    return out
+
+
+def _hint_record_surfaces(name: str, attrs: Mapping[str, Any]) -> List[str]:
+    """English source surfaces for one record: name + variant/alias keys."""
+    surfaces = [name]
+    variants = attrs.get("variants") if isinstance(attrs, Mapping) else None
+    if isinstance(variants, Mapping):
+        surfaces.extend(str(v) for v in variants.keys() if str(v).strip())
+    elif isinstance(variants, (list, tuple)):
+        surfaces.extend(str(v) for v in variants if str(v).strip())
+    for key in ("aliases", "alias", "surfaces"):
+        extra = attrs.get(key) if isinstance(attrs, Mapping) else None
+        if isinstance(extra, (list, tuple)):
+            surfaces.extend(str(v) for v in extra if str(v).strip())
+        elif isinstance(extra, str) and extra.strip():
+            surfaces.append(extra)
+    seen: set = set()
+    out: List[str] = []
+    for surface in surfaces:
+        key = _hint_norm(surface)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(surface)
+    return out
+
+
+def _hint_is_candidate_only(attrs: Mapping[str, Any]) -> bool:
+    """Explicit candidate-only markers (durable stores verified claims)."""
+    if not isinstance(attrs, Mapping):
+        return False
+    status = attrs.get("status")
+    if isinstance(status, str) and status.strip().casefold() == "candidate":
+        return True
+    if attrs.get("verified") is False:
+        return True
+    return bool(attrs.get("_candidate_only") or attrs.get("candidate_only"))
+
+
+def _hint_is_current_chapter_only(
+    attrs: Mapping[str, Any], chapter_id: str
+) -> bool:
+    """True when record provenance is exclusively the current chapter."""
+    if not chapter_id or not isinstance(attrs, Mapping):
+        return False
+    chapters = attrs.get("chapters")
+    if isinstance(chapters, (list, tuple)) and chapters:
+        chapter_strs = [str(c) for c in chapters if str(c)]
+        if chapter_strs and all(c == chapter_id for c in chapter_strs):
+            return True
+        return False
+    first_seen = attrs.get("first_seen_chapter")
+    if first_seen is not None and str(first_seen) == chapter_id:
+        return True
+    return False
+
+
+def _hint_glossary_entries(
+    glossary: Any,
+) -> List[Tuple[str, Tuple[str, ...]]]:
+    """(source_term, target_terms) pairs; malformed entries skipped."""
+    out: List[Tuple[str, Tuple[str, ...]]] = []
+    if glossary is None:
+        return out
+    # Flat production mapping {source: target}: preserve the keys — they
+    # ARE the source terms. (A previous revision took .values() first and
+    # silently dropped every flat-mapped term.)
+    items: Any = (
+        [{"source": k, "targets": v} for k, v in glossary.items()]
+        if isinstance(glossary, Mapping) else glossary
+    )
+    try:
+        seq = list(items)
+    except TypeError:
+        return out
+    for entry in seq:
+        if isinstance(entry, Mapping):
+            source = entry.get("source_term") or entry.get("source") or entry.get("term")
+            targets = entry.get("target_terms") or entry.get("targets") or ()
+        else:
+            source = getattr(entry, "source_term", "")
+            targets = getattr(entry, "target_terms", ()) or ()
+        if isinstance(targets, str):
+            targets = (targets,)
+        try:
+            target_tuple = tuple(str(t) for t in targets if str(t).strip())
+        except TypeError:
+            continue
+        if str(source or "").strip() and target_tuple:
+            out.append((str(source).strip(), target_tuple))
+    return out
+
+
+def _hint_canonical_ru(attrs: Mapping[str, Any]) -> str:
+    if not isinstance(attrs, Mapping):
+        return ""
+    return str(attrs.get("canonical_ru") or attrs.get("ru") or "").strip()
+
+
+def build_entity_hint_card(
+    *,
+    book_memory: Any,
+    glossary: Any = (),
+    source: Mapping[str, str],
+    chapter_id: str = "",
+    max_entries: int = ENTITY_HINT_MAX_ENTRIES,
+    max_chars: int = ENTITY_HINT_MAX_CHARS,
+) -> EntityHintCard:
+    """Build the bounded prior-hint card for one chapter (pure).
+
+    ``book_memory`` is the frozen PRE-CHAPTER authoritative state
+    (provenance is audit metadata; records whose provenance is
+    exclusively ``chapter_id`` are treated as current-chapter
+    observations and excluded). ``glossary`` is the frozen authoritative
+    glossary (``GlossaryEntry`` objects, entry mappings, or a flat
+    ``{source: target}`` mapping). ``source`` is the current chapter's
+    ordered PID map. Selection/rendering performs no model calls and is
+    fully deterministic.
+    """
+    # Defensive: malformed authoritative inputs yield an empty card (the
+    # extractor then runs the unchanged source-only path), never a crash.
+    bm: Mapping[str, Any] = book_memory if isinstance(book_memory, Mapping) else {}
+    source_map = dict(source or {})
+    pid_list = list(source_map.keys())
+    pid_index = {pid: idx for idx, pid in enumerate(pid_list)}
+
+    conflict_keys: set = set()
+    raw_conflicts = bm.get("_conflicts")
+    if isinstance(raw_conflicts, Mapping):
+        conflict_keys = {_hint_norm(k) for k in raw_conflicts.keys()}
+
+    gloss = _hint_glossary_entries(glossary)
+    # Glossary-internal conflict: one source -> >1 distinct target.
+    gloss_targets: Dict[str, set] = {}
+    for src, targets in gloss:
+        gloss_targets.setdefault(_hint_norm(src), set()).update(
+            _hint_norm(t) for t in targets
+        )
+    gloss_conflicted = {k for k, v in gloss_targets.items() if len(v) > 1}
+    # Glossary lookup by normalized source for memory-RU disagreement.
+    gloss_first_target: Dict[str, str] = {}
+    for src, targets in gloss:
+        gloss_first_target.setdefault(_hint_norm(src), targets[0])
+
+    # Collect candidate (surface, canonical) pairs with eligibility.
+    # Item: (surface, canonical, surface_fold, canonical_fold).
+    candidates: List[Tuple[str, str, str, str]] = []
+    seen_pairs: set = set()
+    # Surfaces suppressed on authority grounds (conflict / candidate-only
+    # / current-chapter): the glossary/approved-term fallbacks below must
+    # not re-admit them as bare terms — an ambiguous identity stays out.
+    authority_excluded: set = set()
+    excluded_conflict = 0
+    excluded_candidate = 0
+    excluded_current = 0
+    excluded_local = 0
+
+    def _add(surface: str, canonical: str) -> None:
+        # English-only card: a Cyrillic surface or canonical is never a
+        # source-matched English hint (Russian forms stay downstream).
+        if _CYRILLIC.search(str(surface) or "") or _CYRILLIC.search(str(canonical) or ""):
+            return
+        key = (_hint_norm(surface), _hint_norm(canonical))
+        if not key[0] or not key[1] or key in seen_pairs:
+            return
+        seen_pairs.add(key)
+        candidates.append((surface, canonical, key[0], key[1]))
+
+    for section in _ENTITY_HINT_SECTIONS:
+        for name, attrs in _hint_record_entries(bm, section):
+            if not isinstance(attrs, Mapping):
+                attrs = {}
+            name_fold = _hint_norm(name)
+            record_folds = {_hint_norm(s) for s in _hint_record_surfaces(name, attrs)}
+            record_folds.discard("")
+            # Durable conflict exclusion (name-level, like role views).
+            if name_fold in conflict_keys or bool(attrs.get("_excluded_conflict")):
+                excluded_conflict += 1
+                authority_excluded.update(record_folds)
+                continue
+            if _hint_is_candidate_only(attrs):
+                excluded_candidate += 1
+                authority_excluded.update(record_folds)
+                continue
+            if _hint_is_current_chapter_only(attrs, chapter_id):
+                excluded_current += 1
+                authority_excluded.update(record_folds)
+                continue
+            if str(attrs.get("memory_class") or "").strip() == "chapter_local":
+                excluded_local += 1
+                authority_excluded.update(record_folds)
+                continue
+            # Glossary-vs-memory canonical-RU disagreement: the identity
+            # is ambiguous, so it must not orient extraction.
+            bm_ru = _hint_canonical_ru(attrs)
+            if bm_ru:
+                surfaces_probe = [name] + [
+                    s for s in _hint_record_surfaces(name, attrs)[1:]
+                ]
+                disagree = False
+                for probe in surfaces_probe:
+                    gl_ru = gloss_first_target.get(_hint_norm(probe))
+                    if gl_ru and _hint_norm(gl_ru) != _hint_norm(bm_ru):
+                        disagree = True
+                        break
+                if disagree:
+                    excluded_conflict += 1
+                    authority_excluded.update(record_folds)
+                    continue
+            for surface in _hint_record_surfaces(name, attrs):
+                if _hint_norm(surface) in conflict_keys:
+                    excluded_conflict += 1
+                    authority_excluded.add(_hint_norm(surface))
+                    continue
+                if _hint_norm(surface) in gloss_conflicted:
+                    excluded_conflict += 1
+                    authority_excluded.add(_hint_norm(surface))
+                    continue
+                _add(surface, name)
+
+    # Ambiguous surfaces: one surface claimed by distinct canonical
+    # identities across memory records. Emitting any single one would
+    # assert an arbitrary identity, so drop ALL claimants and suppress
+    # glossary/approved-term fallback re-admission below.
+    _canon_by_surface: Dict[str, set] = {}
+    for _surf, _canon, _sf, _cf in candidates:
+        _canon_by_surface.setdefault(_sf, set()).add(_cf)
+    _ambiguous = {sf for sf, cfs in _canon_by_surface.items() if len(cfs) > 1}
+    if _ambiguous:
+        _dropped = [t for t in candidates if t[2] in _ambiguous]
+        excluded_conflict += len(_dropped)
+        candidates = [t for t in candidates if t[2] not in _ambiguous]
+        seen_pairs = {(sf, cf) for _s, _c, sf, cf in candidates}
+        authority_excluded.update(_ambiguous)
+
+    # Glossary source terms not covered by a memory record are
+    # authoritative vetted terms in their own right (canonical = itself),
+    # unless suppressed on authority grounds above.
+    for src, _targets in gloss:
+        if _hint_norm(src) in conflict_keys or _hint_norm(src) in gloss_conflicted:
+            continue  # counted at record level when a record exists; else skip silently
+        if _hint_norm(src) in authority_excluded:
+            continue
+        _add(src, src)
+
+    # Policy-approved world terms (book_memory.policy.approved_terms).
+    policy = bm.get("policy")
+    if isinstance(policy, Mapping):
+        approved = policy.get("approved_terms", [])
+        if isinstance(approved, (list, tuple)):
+            for term in approved:
+                if str(term or "").strip():
+                    if _hint_norm(term) in authority_excluded:
+                        continue
+                    _add(str(term).strip(), str(term).strip())
+
+    # Source matching: word-boundary presence, earliest PID/offset first.
+    # matched: (pid_idx, offset, canonical_fold, surface_fold, surface, canonical)
+    matched: List[Tuple[int, int, str, str, str, str]] = []
+    seen_surface: set = set()
+    excluded_unmatched = 0
+    # Precompile per distinct surface for a single scan pass.
+    patterns: Dict[str, Any] = {}
+    for surface, _canonical, surface_fold, _cf in candidates:
+        if surface_fold not in patterns:
+            patterns[surface_fold] = (
+                surface, _hint_surface_pattern(surface)
+            )
+    # Deterministic scan: PIDs in map order, surfaces in candidate order.
+    first_hit: Dict[str, Tuple[int, int, str, str]] = {}
+    for idx, pid in enumerate(pid_list):
+        text = str(source_map.get(pid) or "")
+        if not text:
+            continue
+        for surface_fold, (surface, pattern) in patterns.items():
+            if surface_fold in first_hit or pattern is None:
+                continue
+            match = pattern.search(text)
+            if match:
+                # Canonical is fixed per pair; recover via candidates.
+                first_hit[surface_fold] = (idx, match.start(), surface, "")
+    for surface, canonical, surface_fold, canonical_fold in candidates:
+        hit = first_hit.get(surface_fold)
+        if hit is None:
+            excluded_unmatched += 1
+            continue
+        if surface_fold in seen_surface:
+            continue  # same surface already kept via an earlier pair
+        seen_surface.add(surface_fold)
+        idx, offset = hit[0], hit[1]
+        matched.append((idx, offset, canonical_fold, surface_fold, hit[2], canonical))
+    matched.sort(key=lambda m: (m[0], m[1], m[2], m[3]))
+
+    # Cap: at most max_entries rows; rendered text (header included) fits
+    # max_chars. Truncation drops from the end; truncated items receive
+    # the unchanged source-only treatment. Zero surviving rows -> empty
+    # card (source-only prompt/cache behavior preserved).
+    header = (
+        "PRIOR HINTS \u2014 NOT SOURCE EVIDENCE "
+        "(previously established English names/terms seen in this "
+        "chapter's source; orient reading only, never evidence):"
+    )
+    kept: List[Tuple[str, str]] = [
+        (m[4], m[5]) for m in matched[:max(0, max_entries)]
+    ]
+    matched_rows = len(matched)
+
+    def _render(rows: List[Tuple[str, str]]) -> str:
+        lines = [header] + [f'- "{s}" -> {c}' for s, c in rows]
+        return "\n".join(lines)
+
+    text = _render(kept)
+    while kept and len(text) > max(0, max_chars):
+        kept.pop()
+        text = _render(kept)
+    if not kept:
+        return EntityHintCard(
+            text="",
+            rows=(),
+            kept_rows=0,
+            matched_rows=matched_rows,
+            truncated_rows=matched_rows,
+            excluded_conflict=excluded_conflict,
+            excluded_candidate=excluded_candidate,
+            excluded_current_chapter=excluded_current,
+            excluded_chapter_local=excluded_local,
+            excluded_unmatched=excluded_unmatched,
+            card_hash="",
+        )
+    card_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return EntityHintCard(
+        text=text,
+        rows=tuple(kept),
+        kept_rows=len(kept),
+        matched_rows=matched_rows,
+        truncated_rows=matched_rows - len(kept),
+        excluded_conflict=excluded_conflict,
+        excluded_candidate=excluded_candidate,
+        excluded_current_chapter=excluded_current,
+        excluded_chapter_local=excluded_local,
+        excluded_unmatched=excluded_unmatched,
+        card_hash=card_hash,
+    )
+
+
+def entity_hint_hash(hint_card: Any) -> str:
+    """Cache-identity hash of the exact rendered card ("" when empty)."""
+    if isinstance(hint_card, _HintHashCard):
+        return hint_card.hash
+    if isinstance(hint_card, EntityHintCard):
+        return hint_card.card_hash if hint_card.text.strip() else ""
+    text = str(hint_card or "")
+    if not text.strip():
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _HintHashCard:
+    """Identity-only adapter: restores a persisted hint hash as a card.
+
+    Used only by ``EntityContextCache.from_payload`` to re-validate the
+    stored key against the stored hint hash without the live card text.
+    Never sent to the model.
+    """
+
+    hash: str = ""
+
+
+def _render_hint_prompt_section(hint_text: str) -> str:
+    """Append prior-hint context plus mandatory hint-use rules."""
+    return (
+        "\nPRIOR CONTEXT \u2014 AUTHORITATIVE HINTS, NOT EVIDENCE:\n"
+        f"{hint_text}\n"
+        "\nHINT USE RULES: The hints above only orient reading of the "
+        "SOURCE map. Every anchor span, alias surface, gender value, and "
+        "relation you emit MUST still be grounded in verbatim PIDs of THIS "
+        "chapter's SOURCE map above. A hint NEVER replaces PID evidence, "
+        "NEVER justifies 'verified' by itself, and NEVER justifies omitting "
+        "an entity, alias, or relation the SOURCE establishes. When the "
+        "SOURCE contradicts a hint or shows a new alias, sense, or "
+        "relation, report what the SOURCE shows with the status the SOURCE "
+        "justifies.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Prompt rendering (deterministic: whole chapter source, ordered PIDs)
 # ---------------------------------------------------------------------------
 
 
 def render_entity_extraction_prompt(
     *, chapter_id: str, source: Mapping[str, str],
+    hint_card: "EntityHintCard | str" = "",
 ) -> str:
     """Render the source-only extraction request as one user message.
 
@@ -461,15 +967,27 @@ def render_entity_extraction_prompt(
     The VALID PIDS section lists every PID of the chapter explicitly
     (dead-PID fix, book-run 1-3: the model invented PIDs and 25/25 claims
     were dropped; with the real list the model can copy instead of guess).
+
+    ``hint_card`` (entity-context-authoritative-hints): an optional
+    pre-rendered prior-hint card (see ``build_entity_hint_card``) or an
+    ``EntityHintCard``. An empty card preserves the original source-only
+    prompt byte-for-byte (empty-card cache compatibility). A non-empty
+    card is appended as labeled PRIOR CONTEXT — never evidence: every
+    emitted claim still requires verbatim PID grounding and passes the
+    unchanged 8-point validation.
     """
     src_lines = "\n".join(f"  {pid}: {text}" for pid, text in source.items())
     pids_block = _valid_pids_section(source)
-    return (
+    base = (
         f"{ENTITY_EXTRACTION_V1.instructions}\n\n"
         f"CHAPTER: {chapter_id}\n\n"
         f"SOURCE (PID -> English text, whole chapter):\n{src_lines}\n\n"
         f"{pids_block}\n"
     )
+    hint_text = hint_card.text if isinstance(hint_card, EntityHintCard) else str(hint_card or "")
+    if not hint_text.strip():
+        return base
+    return base + _render_hint_prompt_section(hint_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1093,12 +1611,33 @@ def cached_context_source_valid(
 # ---------------------------------------------------------------------------
 
 
-def entity_context_cache_key(*, source_hash: str, extractor_version: str) -> str:
-    """Deterministic cache identity for one chapter's extraction."""
+def entity_context_cache_key(
+    *, source_hash: str, extractor_version: str,
+    hint_hash: str = "", prompt_variant: str = "",
+) -> str:
+    """Deterministic cache identity for one chapter's extraction.
+
+    Empty-hint calls (``hint_hash == ""``) keep the legacy
+    ``source_hash + extractor_version`` identity byte-for-byte, so
+    pre-existing source-only cache entries remain valid (their prompt
+    and validation contract are unchanged). A non-empty hint binds the
+    exact rendered card (``hint_hash`` = ``entity_hint_hash(card)``)
+    and the hint prompt variant into the key: a changed relevant hint
+    can never reuse stale source-only output, and a source-only entry
+    is never accepted under a hinted key.
+    """
+    if not str(hint_hash or ""):
+        return canonical_json_hash({
+            "artifact": "pact-v4-chapter-entity-context",
+            "source_hash": source_hash,
+            "extractor_version": extractor_version,
+        })
     return canonical_json_hash({
         "artifact": "pact-v4-chapter-entity-context",
         "source_hash": source_hash,
         "extractor_version": extractor_version,
+        "hint_hash": str(hint_hash),
+        "prompt_variant": str(prompt_variant or ENTITY_HINT_PROMPT_VARIANT),
     })
 
 
@@ -1125,30 +1664,49 @@ class EntityContextCache:
 
     def __init__(self) -> None:
         self._store: Dict[str, ChapterEntityContext] = {}
+        self._hint_meta: Dict[str, Tuple[str, str]] = {}
 
     def get(self, key: str) -> Optional[ChapterEntityContext]:
         return self._store.get(key)
 
-    def put(self, key: str, context: ChapterEntityContext) -> None:
+    def put(
+        self, key: str, context: ChapterEntityContext,
+        *, hint_card: Any = "",
+    ) -> None:
+        hint_hash = entity_hint_hash(hint_card)
         expected = entity_context_cache_key(
             source_hash=context.source_hash,
             extractor_version=context.extractor_version,
+            hint_hash=hint_hash,
+            prompt_variant=ENTITY_HINT_PROMPT_VARIANT if hint_hash else "",
         )
         if key != expected:
             raise ValueError(
                 f"refusing to store context under key {key!r}: identity is "
-                f"{expected!r} (source_hash/extractor_version mismatch — "
+                f"{expected!r} (source_hash/extractor_version/hint mismatch — "
                 f"foreign/tampered context)"
             )
         self._store[key] = context
+        # The hint identity travels alongside the entry so a persisted
+        # payload can re-validate key-vs-content without the live card.
+        self._hint_meta[key] = (
+            hint_hash,
+            ENTITY_HINT_PROMPT_VARIANT if hint_hash else "",
+        )
 
     def to_payload(self) -> Dict[str, Any]:
+        entries = []
+        for key, context in sorted(self._store.items()):
+            hint_hash, prompt_variant = self._hint_meta.get(key, ("", ""))
+            entries.append({
+                "key": key,
+                "context": context.to_payload(),
+                "hint_hash": hint_hash,
+                "prompt_variant": prompt_variant,
+            })
         return {
             "schema": CACHE_SCHEMA,
-            "entries": [
-                {"key": key, "context": context.to_payload()}
-                for key, context in sorted(self._store.items())
-            ],
+            "entries": entries,
         }
 
     @classmethod
@@ -1169,17 +1727,34 @@ class EntityContextCache:
             context = ChapterEntityContext.from_payload(item["context"])
             # Fail-closed restore: the stored key must be the identity of
             # the context itself — a tampered/foreign entry is rejected,
-            # never silently accepted.
+            # never silently accepted. Legacy entries (no hint fields)
+            # restore under the source-only identity; hinted entries must
+            # carry a known prompt variant and match the hinted identity.
+            hint_hash = str(item.get("hint_hash") or "")
+            prompt_variant = str(item.get("prompt_variant") or "")
+            if hint_hash:
+                if prompt_variant not in (ENTITY_HINT_PROMPT_VARIANT,):
+                    raise ValueError(
+                        f"cache payload entry key {key!r} carries unknown "
+                        f"hint prompt_variant {prompt_variant!r} — rejected"
+                    )
+            elif prompt_variant:
+                raise ValueError(
+                    f"cache payload entry key {key!r} carries a prompt "
+                    f"variant without a hint hash — rejected"
+                )
             expected = entity_context_cache_key(
                 source_hash=context.source_hash,
                 extractor_version=context.extractor_version,
+                hint_hash=hint_hash,
+                prompt_variant=prompt_variant,
             )
             if key != expected:
                 raise ValueError(
                     f"cache payload entry key {key!r} does not match context "
                     f"identity {expected!r} — tampered/foreign entry rejected"
                 )
-            cache.put(key, context)
+            cache.put(key, context, hint_card=_HintHashCard(hint_hash))
         return cache
 
 
@@ -1246,9 +1821,11 @@ class BackendEntityExtractor:
         chapter_id: str,
         source: Mapping[str, str],
         out_dir: Optional[Path] = None,
+        hint_card: Any = "",
     ) -> str:
+        hint_text = hint_card.text if isinstance(hint_card, EntityHintCard) else str(hint_card or "")
         prompt = render_entity_extraction_prompt(
-            chapter_id=chapter_id, source=dict(source)
+            chapter_id=chapter_id, source=dict(source), hint_card=hint_text,
         )
         reasoning_path: Optional[Path] = None
         if out_dir is not None:
@@ -1375,6 +1952,7 @@ def extract_entity_context(
     extractor_version: str = EXTRACTOR_VERSION,
     retry: Optional[JsonRetryPolicy] = None,
     out_dir: Optional[Path] = None,
+    hint_card: Any = "",
 ) -> EntityExtractionResult:
     """Source-only prepass: cache hit -> reuse; miss -> Qwen -> validate.
 
@@ -1386,7 +1964,20 @@ def extract_entity_context(
     ``b1.2_entity_raw.txt`` artifacts (REASONING-STREAM; artifact only,
     never part of cache identity). The model is called ONCE per chapter
     when the cache misses; the validated result is stored under
-    ``source_hash + extractor_version`` so resume never repeats the call.
+    ``source_hash + extractor_version`` (plus the exact hint-card
+    identity when ``hint_card`` is non-empty) so resume never repeats
+    the call.
+
+    ``hint_card`` (entity-context-authoritative-hints): an
+    ``EntityHintCard`` or pre-rendered card string (see
+    ``build_entity_hint_card``). It is forwarded to hint-aware
+    extractors as labeled prior context (never evidence); legacy
+    extractors that do not accept ``hint_card`` run the unchanged
+    source-only call (the validated output contract is identical —
+    hints never authorize unverified claims). The cache key always
+    binds the exact card: a changed relevant hint recomputes, an
+    identical card reuses with 0 extra model calls, and a source-only
+    entry is never accepted under a hinted key.
 
     Fail-closed (RV t_7e9ab408 findings 1+2, RV2 fix): the model body is
     stamped with the harness-owned top-level metadata (``schema``/
@@ -1401,9 +1992,14 @@ def extract_entity_context(
     ignored and recomputed, never returned ``from_cache=True``.
     """
     source_map = dict(source_artifact.source)
+    hint_text = hint_card.text if isinstance(hint_card, EntityHintCard) else str(hint_card or "")
+    hint_hash = entity_hint_hash(hint_text)
+    hint_variant = ENTITY_HINT_PROMPT_VARIANT if hint_hash else ""
     key = entity_context_cache_key(
         source_hash=source_artifact.source_hash,
         extractor_version=extractor_version,
+        hint_hash=hint_hash,
+        prompt_variant=hint_variant,
     )
     if cache is not None:
         cached = cache.get(key)
@@ -1438,11 +2034,33 @@ def extract_entity_context(
                     "metadata; recomputing", key[:12],
                 )
 
-    raw = extractor(
-        chapter_id=source_artifact.chapter_id,
-        source=source_map,
-        out_dir=out_dir,
-    )
+    try:
+        raw = extractor(
+            chapter_id=source_artifact.chapter_id,
+            source=source_map,
+            out_dir=out_dir,
+            hint_card=hint_text,
+        )
+    except TypeError as exc:
+        # Legacy extractor without a hint_card parameter: run the
+        # unchanged source-only call. The fallback is NARROW — only an
+        # unexpected-keyword rejection naming hint_card qualifies; any
+        # other TypeError (a genuine bug inside the extractor) propagates.
+        # Output validity is unaffected
+        # (hints never authorize unverified claims); the result is still
+        # stored under the hinted key, so key separation is preserved.
+        if "hint_card" not in str(exc):
+            raise
+        LOG.info(
+            "entity_extractor: extractor %r ignores hint_card "
+            "(legacy signature); running source-only call",
+            type(extractor).__name__,
+        )
+        raw = extractor(
+            chapter_id=source_artifact.chapter_id,
+            source=source_map,
+            out_dir=out_dir,
+        )
     payload = parse_model_output(raw)
     stamped = with_entity_context_metadata(
         payload,
@@ -1458,7 +2076,7 @@ def extract_entity_context(
         extractor_version=extractor_version,
     )
     if cache is not None:
-        cache.put(key, context)
+        cache.put(key, context, hint_card=hint_text)
     return EntityExtractionResult(context=context, validation=report)
 
 
@@ -1477,9 +2095,15 @@ __all__ = [
     "ValidationReport",
     "BackendEntityExtractor",
     "BackendEntityExtractorConfig",
+    "ENTITY_HINT_MAX_CHARS",
+    "ENTITY_HINT_MAX_ENTRIES",
+    "ENTITY_HINT_PROMPT_VARIANT",
     "EntityContextCache",
     "EntityExtractionResult",
+    "EntityHintCard",
+    "build_entity_hint_card",
     "entity_context_cache_key",
+    "entity_hint_hash",
     "extract_entity_context",
     "parse_model_output",
     "render_entity_extraction_prompt",
