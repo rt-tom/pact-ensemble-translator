@@ -100,6 +100,7 @@ from pact_v4.audit.chunked_audit import (
     pairs_from_maps,
 )
 from pact_v4.audit.entity_extractor import (
+    ENTITY_HINT_PROMPT_VARIANT,
     EXTRACTOR_VERSION,
     STATUS_VERIFIED,
     AliasRef,
@@ -109,6 +110,8 @@ from pact_v4.audit.entity_extractor import (
     EntityContextCache,
     EntityExtractionResult,
     EntityRecord,
+    build_entity_hint_card,
+    entity_hint_hash,
     extract_entity_context,
 )
 from pact_v4.audit.hard_filters import FilteredIssue, apply_hard_filters
@@ -1028,6 +1031,31 @@ def _entity_validation_report_path(out_dir: Path) -> Path:
 
 def _journal_path(out_dir: Path) -> Path:
     return out_dir / "audit_journal.ndjson"
+
+
+def _entity_stage_hash(
+    entity_payload: Mapping[str, Any],
+    *,
+    hint_hash: str = "",
+    role_card_hash: Optional[str] = None,
+) -> str:
+    """Stage/resume identity for the validated entity context (pure).
+
+    The identity MUST move when any of its inputs move: the validated
+    output (``entity_payload``), the exact prior-hint card
+    (``hint_hash``), or the audit role-view card (``role_card_hash``).
+    With no hint and no role card the legacy output-only hash is kept
+    byte-for-byte so pre-existing audit caches remain valid.
+    """
+    if not hint_hash and role_card_hash is None:
+        return canonical_json_hash(entity_payload)
+    combined: Dict[str, Any] = {"source": entity_payload}
+    if hint_hash:
+        combined["hint_hash"] = hint_hash
+        combined["hint_prompt_variant"] = ENTITY_HINT_PROMPT_VARIANT
+    if role_card_hash is not None:
+        combined["role_card_hash"] = role_card_hash
+    return canonical_json_hash(combined)
 
 
 def _load_entity_cache(out_dir: Path) -> EntityContextCache:
@@ -3448,6 +3476,7 @@ class B3AuditRepair:
         *,
         source: SourceArtifact,
         out_dir: Path,
+        hint_card: Any = "",
     ) -> EntityExtractionResult:
         """Run the source-only entity prepass (B1.2), cache-aware.
 
@@ -3457,7 +3486,16 @@ class B3AuditRepair:
         block; B3's own ``_run_impl`` step 1 calls the same method again
         AFTER generation, which then hits the persisted
         ``entity_context_cache.json`` (identity = source_hash +
-        extractor_version) with 0 extra model calls.
+        extractor_version [+ exact hint-card identity when hints are
+        non-empty]) with 0 extra model calls.
+
+        ``hint_card`` (entity-context-authoritative-hints): the frozen
+        pre-chapter card (``EntityHintCard`` or rendered string) built by
+        the caller via ``build_entity_hint_card``. Generation prepass and
+        B3 replay MUST pass the SAME frozen card; the cache key binds its
+        exact rendering, so a changed relevant hint recomputes while an
+        identical card reuses with 0 extra model calls. Empty card =
+        unchanged source-only behavior.
 
         Fail-closed: a failed extraction raises ``RuntimeError`` (never a
         silent skip). The cache and the validation report are persisted by
@@ -3485,6 +3523,7 @@ class B3AuditRepair:
                 cache=entity_cache,
                 extractor_version=cfg.extractor_version,
                 out_dir=out_dir,
+                hint_card=hint_card,
             )
         except Exception as exc:  # noqa: BLE001 — fail-closed, never silent skip
             LOG.exception(
@@ -3750,22 +3789,47 @@ class B3AuditRepair:
         entity_hash: Optional[str] = None
         entity_payload: Optional[Mapping[str, Any]] = None
         entity_from_cache = False
+        entity_hint_hash_value = ""
         if cfg.entity_context_enabled:
+            # Authoritative hints (entity-context-authoritative-hints):
+            # build the frozen pre-chapter card from the SAME inputs the
+            # runner's generation prepass uses (pre-chapter book_memory +
+            # frozen glossary + current source, same pure builder), so B3
+            # replays the identical card with 0 extra model calls. The
+            # card is orientation-only; output validity stays source-only.
+            entity_hint_card = build_entity_hint_card(
+                book_memory=book_memory,
+                glossary=glossary,
+                source=source_map,
+                chapter_id=chapter_id,
+            )
+            entity_hint_hash_value = entity_hint_hash(entity_hint_card)
             extraction = self.entity_context_prepass(
                 source=source, out_dir=out_dir,
+                hint_card=entity_hint_card,
             )
             entity_from_cache = extraction.from_cache
             entity_payload = extraction.context.to_payload()
             _audit_card = _card_text("audit_repair")
-            entity_hash = canonical_json_hash(entity_payload)
+            # Stage/resume identity binds the validated output, the exact
+            # hint card, and the role card together: a move in ANY of
+            # them invalidates audit replay. Legacy output-only identity
+            # is preserved when both hint and role card are absent.
+            _source_entity_hash = _entity_stage_hash(
+                entity_payload, hint_hash=entity_hint_hash_value,
+            )
+            entity_hash = _source_entity_hash
             # When a role card is present, combine its hash into the entity
             # hash so a card change invalidates replay (finding 5). Keep the
             # source-only hash separately for provenance.
-            _source_entity_hash = entity_hash
             if _audit_card:
                 import hashlib, json as _js2
                 _audit_card_hash = hashlib.sha256(_audit_card.encode("utf-8")).hexdigest()
-                entity_hash = canonical_json_hash({"source": entity_payload, "role_card_hash": _audit_card_hash})
+                entity_hash = _entity_stage_hash(
+                    entity_payload,
+                    hint_hash=entity_hint_hash_value,
+                    role_card_hash=_audit_card_hash,
+                )
             entity_context = render_entity_context_block(
                 extraction.context,
                 role_view_card=_audit_card,
@@ -3785,6 +3849,9 @@ class B3AuditRepair:
                 from_cache=entity_from_cache,
                 entity_count=len(extraction.context.entities),
                 entity_context_hash=entity_hash,
+                entity_hint_hash=entity_hint_hash_value or None,
+                entity_hint_rows=entity_hint_card.kept_rows,
+                entity_hint_truncated=entity_hint_card.truncated_rows,
             )
             self._emit_progress(
                 "entity_context_done",

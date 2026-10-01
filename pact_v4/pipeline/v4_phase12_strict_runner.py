@@ -5753,8 +5753,22 @@ def _run_whole_chapter_strict_impl(
             and cfg.stop_after != "generation"
             and b3_audit_repair is not None
         ):
+            # Authoritative hints (entity-context-authoritative-hints):
+            # the frozen pre-chapter card orients extraction without
+            # becoming evidence. B3's replay derives the SAME card from
+            # the same frozen inputs via the same pure builder (see
+            # B3AuditRepair._run_impl step 1), so generation prepass and
+            # audit share one frozen card with 0 extra model calls.
+            from pact_v4.audit.entity_extractor import build_entity_hint_card as _build_hints
+            _entity_hint_card = _build_hints(
+                book_memory=memory.book_memory,
+                glossary=list(glossary),
+                source=dict(source.source),
+                chapter_id=cfg.chapter_id,
+            )
             extraction = b3_audit_repair.entity_context_prepass(
                 source=source, out_dir=cfg.out_dir,
+                hint_card=_entity_hint_card,
             )
             if extraction is not None:
                 entity_gen_block = render_entity_context_block(
@@ -6023,14 +6037,26 @@ def _run_whole_chapter_strict_impl(
             _cached_cands: list = []
             try:
                 from pathlib import Path as _P2
-                from pact_v4.audit.entity_extractor import EntityContextCache, entity_context_cache_key, is_entity_glossary_candidate
+                from pact_v4.audit.entity_extractor import EntityContextCache, build_entity_hint_card, entity_context_cache_key, entity_hint_hash, is_entity_glossary_candidate
                 from pact_v4.pipeline.b3_audit_repair import render_entity_context_block as _recb2
                 import json as _js3
                 _cache_path = cfg.out_dir / "entity_context_cache.json"
                 if _cache_path.exists():
                     _payload = _js3.loads(_cache_path.read_text(encoding="utf-8"))
                     _cache = EntityContextCache.from_payload(_payload)
-                    _key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=cfg.audit_extractor_version)
+                    # Resume under the SAME hint identity the prepass used:
+                    # rebuild the frozen card from the same inputs so a
+                    # hinted extraction is found (and a stale source-only
+                    # entry is never mistaken for the hinted one).
+                    _resume_hint = build_entity_hint_card(
+                        book_memory=memory.book_memory,
+                        glossary=list(glossary),
+                        source=dict(source.source),
+                        chapter_id=cfg.chapter_id,
+                    )
+                    _resume_hint_hash = entity_hint_hash(_resume_hint)
+                    from pact_v4.audit.entity_extractor import ENTITY_HINT_PROMPT_VARIANT as _hint_variant
+                    _key = entity_context_cache_key(source_hash=source.source_hash, extractor_version=cfg.audit_extractor_version, hint_hash=_resume_hint_hash, prompt_variant=_hint_variant if _resume_hint_hash else "")
                     _ctx = _cache.get(_key)
                     if _ctx is not None and _ctx.chapter_id == cfg.chapter_id:
                         _cached_block = _recb2(_ctx, verified_only=True)

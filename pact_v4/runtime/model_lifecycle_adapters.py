@@ -468,11 +468,23 @@ class LifecycleQwenEntityExtractor:
         chapter_id: str,
         source: Mapping[str, str],
         out_dir: Optional[Path] = None,
+        hint_card: Any = "",
     ) -> str:
         _ensure_role_resident(self._router, self._model_key, role=self._role, pair=self._pair)
-        return self._extractor(
-            chapter_id=chapter_id, source=source, out_dir=out_dir
-        )
+        try:
+            return self._extractor(
+                chapter_id=chapter_id, source=source, out_dir=out_dir,
+                hint_card=hint_card,
+            )
+        except TypeError as exc:
+            # Narrow legacy fallback (same contract as
+            # extract_entity_context): an inner extractor without the
+            # hint_card parameter runs the source-only call.
+            if "hint_card" not in str(exc):
+                raise
+            return self._extractor(
+                chapter_id=chapter_id, source=source, out_dir=out_dir,
+            )
 
     def set_usage_sink(self, sink: Any) -> None:
         """MONITOR-V2 (2.4): forward the per-call usage sink to this
