@@ -1007,7 +1007,7 @@ def test_repair_callable_is_repair_caller_protocol():
             from pact_v4.runtime.backend_protocol import BackendDescriptor
             return BackendDescriptor(
                 kind="local_llama", transport_version="t", endpoint_family="e",
-                public_endpoint="http://127.0.0.1:1", model_bindings={"generator": "g"},
+                public_endpoint="http://127.0.0.1:1", model_bindings={"generator": "g", "repair": "g"},
                 effective_options={},
             )
         def complete(self, request):

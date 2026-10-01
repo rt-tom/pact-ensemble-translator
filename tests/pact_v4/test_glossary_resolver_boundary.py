@@ -76,7 +76,7 @@ def _make_entity(name, glossary_worthy=True, aliases=()):
     )
 
 class _ScriptedResolverBackend(CompletionBackend):
-    _BINDINGS = {"russian_selector": "qwen-test", "fidelity_reviewer": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+    _BINDINGS = {"russian_selector": "qwen-test", "fidelity_reviewer": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
     def __init__(self, proposals):
         self.proposals = proposals
         self.requests = []
@@ -105,6 +105,26 @@ class _TruncatingBackend(CompletionBackend):
     def complete(self, request):
         # Return invalid JSON
         return CompletionResponse(text="{invalid json", model="qwen-test", finish_reason="stop", raw_metadata={})
+
+
+def _glossary_role_policies():
+    """Resolved-policies stub carrying an explicit glossary_resolver policy.
+
+    Production B3 receives resolved role policies from the runtime config
+    (reviewer sampling carries temperature); direct unit construction
+    synthesizes temperature-less registry policies, which the resolver
+    fail-closes on. The stub mirrors production wiring with the fixture's
+    reviewer budget (8192, temperature 0.0); all other roles keep the
+    existing synth fallback (unused — audit/repair are stubbed or skipped
+    in these tests).
+    """
+    import types as _types
+    return _types.SimpleNamespace(policies={
+        "glossary_resolver": _types.SimpleNamespace(
+            request={"temperature": 0.0, "max_output_tokens": 8192},
+            output_budget=None,
+        ),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +430,15 @@ def test_resolver_inherits_reviewer_budget_bounded(tmp_path: Path):
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://127.0.0.1:8094/v1/chat/completions", model_bindings=dict(self._BINDINGS), effective_options={"max_output_tokens": 8192})
     backend = _BudgetBackend([{"entity": "Shotgun", "proposed_ru": "Дробовик", "surface_forms": ["Дробовик"], "evidence_pid": "p00001", "type": "nickname", "confidence": 0.9, "decision": "accept"}])
-    resolver = GlossaryResolver(backend)
+    # Explicit reviewer policy (fail-closed contract: the resolver never
+    # introspects the descriptor for hidden budgets) — the given budget is
+    # reused as is.
+    import types as _types
+    _policy = _types.SimpleNamespace(
+        request={"temperature": 0.0, "max_output_tokens": 8192},
+        output_budget=None,
+    )
+    resolver = GlossaryResolver(backend, role_policy=_policy)
     result = resolver.resolve(chapter_id="0001", entity_records=[rec], source_map=source, translations=trans, allowed_pids=allowed, out_dir=tmp_path)
     assert result is not None
     # Reuse reviewer budget unchanged (8192), not clamped/hard-coded
@@ -419,7 +447,7 @@ def test_resolver_inherits_reviewer_budget_bounded(tmp_path: Path):
     assert backend.requests[0].response_schema is not None
     # Unknown budget -> fail-closed (no hard default)
     class _NoBudgetBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         @property
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://x/v1", model_bindings=dict(self._BINDINGS), effective_options={})
@@ -586,7 +614,7 @@ def test_b3_strict_runner_quarantine_plumbing_via_b3_cache_hit(tmp_path: Path, m
     from pact_v4.pipeline.b3_audit_repair import B3AuditRepair, B3AuditRepairConfig
     from pact_v4.audit.chunked_audit import PROMPT_VERSION as _AUDIT_PROMPT, HARNESS_VERSION as _AUDIT_HARNESS
     class _FakeAuditBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         @property
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://x/v1", model_bindings=dict(self._BINDINGS), effective_options={"max_output_tokens": 8192})
@@ -632,7 +660,7 @@ def test_b3_strict_runner_quarantine_plumbing_via_b3_cache_hit(tmp_path: Path, m
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик"}
     class _ResolverBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         def __init__(self):
             self.calls = 0
         @property
@@ -644,31 +672,31 @@ def test_b3_strict_runner_quarantine_plumbing_via_b3_cache_hit(tmp_path: Path, m
     # Fresh run -> 1 call, writes sidecar with p00001 evidence
     be_fresh = _ResolverBackend()
     cfg = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="recompute", entity_context_enabled=False, russian_editor_enabled=False)
-    b3 = B3AuditRepair(audit_backend=be_fresh, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3 = B3AuditRepair(audit_backend=be_fresh, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     b3.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert be_fresh.calls == 1
     assert (tmp_path / "glossary_proposals.json").exists()
     # Cache-hit with quarantined p00001 + recompute policy -> must recompute (sidecar invalid due to quarantined evidence)
     be_re = _ResolverBackend()
-    b3_re = B3AuditRepair(audit_backend=be_re, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3_re = B3AuditRepair(audit_backend=be_re, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     b3_re.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids={"p00001"})
     assert be_re.calls == 1, "quarantined evidence must invalidate sidecar on cache-hit (recompute) -> 1 call"
     # Cache-hit with quarantined p00001 + fail_closed policy -> 0 calls
     # Reset sidecar to valid (non-quarantined) state first
     be_fresh2 = _ResolverBackend()
-    b3_fresh2 = B3AuditRepair(audit_backend=be_fresh2, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3_fresh2 = B3AuditRepair(audit_backend=be_fresh2, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     # Use separate dir for fail_closed isolation
     import tempfile, pathlib as _p, shutil
     tmp2 = _p.Path(tempfile.mkdtemp())
     try:
         (tmp2 / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
         be_tmp = _ResolverBackend()
-        b3_tmp = B3AuditRepair(audit_backend=be_tmp, repair_backend=_FakeAuditBackend(), config=cfg)
+        b3_tmp = B3AuditRepair(audit_backend=be_tmp, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
         b3_tmp.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp2, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
         assert be_tmp.calls == 1
         cfg_fc = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="fail_closed", entity_context_enabled=False, russian_editor_enabled=False)
         be_fc = _ResolverBackend()
-        b3_fc = B3AuditRepair(audit_backend=be_fc, repair_backend=_FakeAuditBackend(), config=cfg_fc)
+        b3_fc = B3AuditRepair(audit_backend=be_fc, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg_fc)
         b3_fc.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp2, config_identity="cfg", backend_identity_hash="be", quarantined_pids={"p00001"})
         assert be_fc.calls == 0, "quarantined evidence on cache-hit fail_closed must be 0 calls"
     finally:
@@ -798,7 +826,7 @@ def test_b3_cache_hit_valid_via_public_run(tmp_path: Path, monkeypatch):
     from pact_v4.pipeline.b3_audit_repair import B3AuditRepair, B3AuditRepairConfig
     from pact_v4.audit.chunked_audit import PROMPT_VERSION as _AUDIT_PROMPT, HARNESS_VERSION as _AUDIT_HARNESS
     class _FakeAuditBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         @property
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://x/v1", model_bindings=dict(self._BINDINGS), effective_options={"max_output_tokens": 8192})
@@ -844,7 +872,7 @@ def test_b3_cache_hit_valid_via_public_run(tmp_path: Path, monkeypatch):
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик", "p00002": "text"}
     class _ResolverBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         def __init__(self):
             self.calls = 0
         @property
@@ -855,13 +883,13 @@ def test_b3_cache_hit_valid_via_public_run(tmp_path: Path, monkeypatch):
             return CompletionResponse(text=_js.dumps({"proposals": [{"entity": "Shotgun", "proposed_ru": "Дробовик", "surface_forms": ["Дробовик"], "evidence_pid": "p00001", "type": "nickname", "confidence": 0.9, "decision": "accept"}]}, ensure_ascii=False), model="qwen-test", finish_reason="stop", raw_metadata={})
     resolver_be = _ResolverBackend()
     cfg = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="recompute", entity_context_enabled=False, russian_editor_enabled=False)
-    b3 = B3AuditRepair(audit_backend=resolver_be, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3 = B3AuditRepair(audit_backend=resolver_be, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     result1 = b3.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert resolver_be.calls == 1
     assert (tmp_path / "glossary_proposals.json").exists()
     # Second run: same inputs, audit cache hit, valid sidecar -> 0 resolver calls via public run
     resolver_be2 = _ResolverBackend()
-    b3_2 = B3AuditRepair(audit_backend=resolver_be2, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3_2 = B3AuditRepair(audit_backend=resolver_be2, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     result2 = b3_2.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert resolver_be2.calls == 0, "cache-hit valid must be 0 calls via public run"
 
@@ -870,7 +898,7 @@ def test_b3_cache_hit_missing_recompute_and_fail_closed_via_public_run(tmp_path:
     from pact_v4.pipeline.b3_audit_repair import B3AuditRepair, B3AuditRepairConfig
     from pact_v4.audit.chunked_audit import PROMPT_VERSION as _AUDIT_PROMPT, HARNESS_VERSION as _AUDIT_HARNESS
     class _FakeAuditBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         @property
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://x/v1", model_bindings=dict(self._BINDINGS), effective_options={"max_output_tokens": 8192})
@@ -916,7 +944,7 @@ def test_b3_cache_hit_missing_recompute_and_fail_closed_via_public_run(tmp_path:
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик"}
     class _ResolverBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         def __init__(self):
             self.calls = 0
         @property
@@ -931,13 +959,13 @@ def test_b3_cache_hit_missing_recompute_and_fail_closed_via_public_run(tmp_path:
     (case_re / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     be_first = _ResolverBackend()
     cfg_first = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="recompute", entity_context_enabled=False, russian_editor_enabled=False)
-    b3_first = B3AuditRepair(audit_backend=be_first, repair_backend=_FakeAuditBackend(), config=cfg_first)
+    b3_first = B3AuditRepair(audit_backend=be_first, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg_first)
     b3_first.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=case_re, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert (case_re / "glossary_proposals.json").exists()
     (case_re / "glossary_proposals.json").unlink()
     be_re = _ResolverBackend()
     cfg_re = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="recompute", entity_context_enabled=False, russian_editor_enabled=False)
-    b3_re = B3AuditRepair(audit_backend=be_re, repair_backend=_FakeAuditBackend(), config=cfg_re)
+    b3_re = B3AuditRepair(audit_backend=be_re, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg_re)
     b3_re.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=case_re, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert be_re.calls == 1, "recompute missing sidecar on cache-hit must recompute"
     assert (case_re / "glossary_proposals.json").exists()
@@ -946,13 +974,13 @@ def test_b3_cache_hit_missing_recompute_and_fail_closed_via_public_run(tmp_path:
     case_fc.mkdir()
     (case_fc / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     be_first2 = _ResolverBackend()
-    b3_first2 = B3AuditRepair(audit_backend=be_first2, repair_backend=_FakeAuditBackend(), config=cfg_first)
+    b3_first2 = B3AuditRepair(audit_backend=be_first2, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg_first)
     b3_first2.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=case_fc, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert (case_fc / "glossary_proposals.json").exists()
     (case_fc / "glossary_proposals.json").unlink()
     be_fc = _ResolverBackend()
     cfg_fc = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="fail_closed", entity_context_enabled=False, russian_editor_enabled=False)
-    b3_fc = B3AuditRepair(audit_backend=be_fc, repair_backend=_FakeAuditBackend(), config=cfg_fc)
+    b3_fc = B3AuditRepair(audit_backend=be_fc, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg_fc)
     b3_fc.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=case_fc, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert be_fc.calls == 0, "fail_closed missing sidecar on cache-hit must be 0 calls"
     assert not (case_fc / "glossary_proposals.json").exists()
@@ -963,7 +991,7 @@ def test_b3_cache_hit_stale_and_tampered_fail_closed_via_public_run(tmp_path: Pa
     from pact_v4.pipeline.glossary_resolver import build_sidecar_payload, translation_hash, atomic_write_sidecar
     from pact_v4.audit.chunked_audit import PROMPT_VERSION as _AUDIT_PROMPT, HARNESS_VERSION as _AUDIT_HARNESS
     class _FakeAuditBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         @property
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://x/v1", model_bindings=dict(self._BINDINGS), effective_options={"max_output_tokens": 8192})
@@ -1010,7 +1038,7 @@ def test_b3_cache_hit_stale_and_tampered_fail_closed_via_public_run(tmp_path: Pa
     translations = {"p00001": "Дробовик"}
     # First fresh run to populate audit cache (creates valid sidecar)
     class _ResolverBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         def __init__(self):
             self.calls = 0
         @property
@@ -1021,7 +1049,7 @@ def test_b3_cache_hit_stale_and_tampered_fail_closed_via_public_run(tmp_path: Pa
             return CompletionResponse(text=_js.dumps({"proposals": [{"entity": "Shotgun", "proposed_ru": "Дробовик", "surface_forms": ["Дробовик"], "evidence_pid": "p00001", "type": "nickname", "confidence": 0.9, "decision": "accept"}]}, ensure_ascii=False), model="qwen-test", finish_reason="stop", raw_metadata={})
     be_first = _ResolverBackend()
     cfg_first = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="recompute", entity_context_enabled=False, russian_editor_enabled=False)
-    b3_first = B3AuditRepair(audit_backend=be_first, repair_backend=_FakeAuditBackend(), config=cfg_first)
+    b3_first = B3AuditRepair(audit_backend=be_first, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg_first)
     b3_first.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert (tmp_path / "glossary_proposals.json").exists()
     # Overwrite with stale sidecar (wrong candidate hash)
@@ -1029,7 +1057,7 @@ def test_b3_cache_hit_stale_and_tampered_fail_closed_via_public_run(tmp_path: Pa
     atomic_write_sidecar(tmp_path, stale)
     be = _ResolverBackend()
     cfg = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="fail_closed", entity_context_enabled=False, russian_editor_enabled=False)
-    b3 = B3AuditRepair(audit_backend=be, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3 = B3AuditRepair(audit_backend=be, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     b3.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert be.calls == 0, "stale sidecar on cache-hit fail_closed must be 0 calls"
     # Tampered via symlink should also be fail_closed via public run
@@ -1039,7 +1067,7 @@ def test_b3_cache_hit_stale_and_tampered_fail_closed_via_public_run(tmp_path: Pa
     link = tmp_path / "glossary_proposals.json"
     link.symlink_to(real)
     be2 = _ResolverBackend()
-    b3b = B3AuditRepair(audit_backend=be2, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3b = B3AuditRepair(audit_backend=be2, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     b3b.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert be2.calls == 0, "tampered symlink on cache-hit must be 0 calls"
     link.unlink()
@@ -1139,7 +1167,7 @@ def test_b3_run_end_to_end_promotion_via_real_run(tmp_path: Path, monkeypatch):
     from pact_v4.pipeline.glossary_resolver import semantic_translation_hash
     # Fake audit/repair to make B3 succeed without real model, but keep glossary resolver real
     class _FakeAuditBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         @property
         def descriptor(self):
             return BackendDescriptor(kind="local_llama", transport_version="openai-chat-completions/v1", endpoint_family="openai_chat_completions", public_endpoint="http://x/v1", model_bindings=dict(self._BINDINGS), effective_options={"max_output_tokens": 8192})
@@ -1190,7 +1218,7 @@ def test_b3_run_end_to_end_promotion_via_real_run(tmp_path: Path, monkeypatch):
     (tmp_path / "entity_context_cache.json").write_text(_js.dumps(payload_ec), encoding="utf-8")
     translations = {"p00001": "Дробовик", "p00002": "text"}
     class _ResolverBackend(CompletionBackend):
-        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "default": "qwen-test"}
+        _BINDINGS = {"russian_selector": "qwen-test", "qwen_audit": "qwen-test", "glossary_resolver": "qwen-test", "default": "qwen-test"}
         def __init__(self):
             self.calls = 0
         @property
@@ -1201,7 +1229,7 @@ def test_b3_run_end_to_end_promotion_via_real_run(tmp_path: Path, monkeypatch):
             return CompletionResponse(text=_js.dumps({"proposals": [{"entity": "Shotgun", "proposed_ru": "Дробовик", "surface_forms": ["Дробовик"], "evidence_pid": "p00001", "type": "nickname", "confidence": 0.9, "decision": "accept"}]}, ensure_ascii=False), model="qwen-test", finish_reason="stop", raw_metadata={})
     resolver_be = _ResolverBackend()
     cfg = B3AuditRepairConfig(glossary_resolver_mode="promote", glossary_resolver_cache_miss_policy="recompute", entity_context_enabled=False, russian_editor_enabled=False)
-    b3 = B3AuditRepair(audit_backend=resolver_be, repair_backend=_FakeAuditBackend(), config=cfg)
+    b3 = B3AuditRepair(audit_backend=resolver_be, repair_backend=_FakeAuditBackend(), resolved_role_policies=_glossary_role_policies(), config=cfg)
     result = b3.run(chapter_id="0001", source=source, snapshot_hash="snap", translation=translations, book_memory={}, glossary={}, out_dir=tmp_path, config_identity="cfg", backend_identity_hash="be", quarantined_pids=set())
     assert resolver_be.calls == 1
     assert (tmp_path / "glossary_proposals.json").exists()

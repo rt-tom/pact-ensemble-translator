@@ -34,6 +34,7 @@ from tests.pact_v4.repair.test_selective_repair import (
     _hard_filtered,
     _issue,
     _reaudit_response,
+    _repair_cfg,
     _repair_response,
 )
 
@@ -206,7 +207,7 @@ def test_kill_safe_reaudit_cached_1of3_zero_calls() -> None:
     ])
     evaluator = SelectiveRepairEvaluator(
         backend,
-        config=SelectiveRepairConfig(
+        config=_repair_cfg(
             microbatch_trigger=1,
             microbatch_target=1,
             reaudit_max_input_tokens=1,  # 1 pid per reaudit chunk
@@ -283,7 +284,7 @@ def test_kill_safe_reaudit_cached_chunk_preserves_dropped() -> None:
     ])
     evaluator = SelectiveRepairEvaluator(
         backend,
-        config=SelectiveRepairConfig(
+        config=_repair_cfg(
             microbatch_trigger=1,
             microbatch_target=1,
             reaudit_max_input_tokens=1,  # 1 pid per reaudit chunk
@@ -347,7 +348,7 @@ def test_reaudit_fresh_dropped_journaled_with_debug() -> None:
     ])
     evaluator = SelectiveRepairEvaluator(
         backend,
-        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        config=_repair_cfg(reaudit_neighbour_window=2),
         on_progress=_on_progress,
     )
     outcome = evaluator(
@@ -419,7 +420,7 @@ def test_reaudit_fresh_dropped_extra_field_exact_schema_cache_survival(
     ])
     evaluator = SelectiveRepairEvaluator(
         backend,
-        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        config=_repair_cfg(reaudit_neighbour_window=2),
         on_progress=_on_progress,
     )
     outcome = evaluator(
@@ -502,7 +503,7 @@ def test_reaudit_fresh_dropped_extra_field_exact_schema_cache_survival(
     ])
     replay_evaluator = SelectiveRepairEvaluator(
         replay_backend,
-        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        config=_repair_cfg(reaudit_neighbour_window=2),
         on_progress=_on_replay_progress,
     )
     replay_outcome = replay_evaluator(
@@ -594,7 +595,7 @@ def test_reaudit_fresh_dropped_malformed_canonical_fails_closed(
     ])
     evaluator = SelectiveRepairEvaluator(
         backend,
-        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        config=_repair_cfg(reaudit_neighbour_window=2),
         on_progress=_on_progress,
     )
     outcome = evaluator(
@@ -688,7 +689,7 @@ def test_reaudit_fresh_dropped_malformed_canonical_fails_closed(
     ])
     replay_evaluator = SelectiveRepairEvaluator(
         replay_backend,
-        config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        config=_repair_cfg(reaudit_neighbour_window=2),
     )
     replay_outcome = replay_evaluator(
         chapter_id="0001", source=source, translation=translation,

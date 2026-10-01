@@ -253,6 +253,17 @@ def test_run_local_default_whole_chapter_wires_single_retry_owner(
 # ---------------------------------------------------------------------------
 
 PROVIDERS_YAML = """\
+role_budgets:
+  generator: {max_output_tokens: 74048, reasoning_budget: 2000}
+  repair: {max_output_tokens: 18432, output_budget: {mode: floor_plus_per_item, floor_tokens: 18432, per_item_tokens: 128, ceiling: 26624}, reasoning_budget: 0}
+  formatting: {max_output_tokens: 16192, output_budget: {mode: span_formula, base_tokens: 16192, per_span_tokens: 64, ceiling: 32768}, reasoning_budget: 0}
+  gemma_audit: {max_output_tokens: 6144, reasoning_budget: 0}
+  qwen_audit: {max_output_tokens: 22192, output_budget: {mode: floor_plus_per_item, floor_tokens: 22192, per_item_tokens: 128, ceiling: 34768}, reasoning_budget: 2000}
+  fidelity_reviewer: {max_output_tokens: 24576, output_budget: {mode: floor_plus_per_item, floor_tokens: 24576, per_item_tokens: 128, ceiling: 32768}, reasoning_budget: 0}
+  russian_selector: {max_output_tokens: 9216, reasoning_budget: 0}
+  entity_extractor: {max_output_tokens: 30192, reasoning_budget: 2000}
+  russian_editor: {max_output_tokens: 20192, reasoning_budget: 0}
+  glossary_resolver: {max_output_tokens: 12288, reasoning_budget: 0}
 providers:
   opencode-go:
     kind: opencode_server

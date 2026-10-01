@@ -63,6 +63,7 @@ def _setup_memory(tmp_path: Path, book_memory_bytes: bytes | None = None) -> Pat
         # regression can detect any read-modify-write reformatting by bytes.
         (memory / "book_memory.json").write_bytes(book_memory_bytes)
     (memory / "observations.json").write_text("{}", encoding="utf-8")
+    (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
     return memory
 
 
@@ -82,6 +83,8 @@ def _entity_cache_entry(
     claims: list | None = None,
     source_hash: str = "test-hash",
     extractor_version: str = EXTRACTOR_VERSION,
+    memory_class: str | None = None,
+    memory_worthy: bool | None = None,
 ) -> dict:
     """Build a valid single-entry ``entity_context_cache.json`` payload.
 
@@ -111,6 +114,8 @@ def _entity_cache_entry(
                 "anchor": {"pid": anchor_pid, "span": anchor_span},
                 "aliases": [],
                 "claims": claims,
+                **({"memory_class": memory_class} if memory_class is not None else {}),
+                **({"memory_worthy": memory_worthy} if memory_worthy is not None else {}),
             },
         ],
     }
@@ -1310,6 +1315,7 @@ class TestBookRunCliArgs:
                 entity="Rose", canonical_type="woman",
                 anchor_pid="p00001",
                 anchor_span="Rose met Blake at the gate.",
+                memory_class="named_character", memory_worthy=True,
             ),
             record_source_hash="test-hash",
             record_extractor_version=EXTRACTOR_VERSION,
@@ -1330,6 +1336,7 @@ class TestBookRunCliArgs:
             chapter_html_pattern=str(src_dir / "{chapter_id}.html"),
             out_base=out_base,
             promote_existing_dir=existing,
+            glossary_resolver_mode="off",
         )
         assert called["n"] == 0, "promote-only must not call the strict run"
         rec = result["chapters"][0]

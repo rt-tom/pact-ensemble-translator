@@ -78,6 +78,7 @@ class ScriptedRepairBackend(CompletionBackend):
     _BINDINGS = {
         "default": "gemma-4-26b",
         "generator": "gemma-4-26b",
+        "repair": "gemma-4-26b",
         "qwen_audit": "qwen-3.6-35b",
         "fidelity_reviewer": "qwen-3.6-35b",
     }
@@ -142,6 +143,23 @@ def _reaudit_response(issues: Sequence[Mapping[str, str]]) -> CompletionResponse
         model="qwen-3.6-35b",
         finish_reason="stop",
     )
+
+
+def _repair_cfg(**kwargs) -> SelectiveRepairConfig:
+    """Evaluator config with the explicit qwen_audit re-audit policy.
+
+    Production (``B3AuditRepair``) always wires an explicit
+    ``reaudit_role_policy`` from the resolved role policies / shared
+    registry; the evaluator is fail-closed without it (no fallback to the
+    repair policy). Unit tests that commit repairs — and therefore run the
+    re-audit — must provide the same registry-derived policy instead of
+    relying on a fallback the evaluator forbids.
+    """
+    from pact_v4.pipeline.b3_audit_repair import _synth_policy_from_registry
+    kwargs.setdefault(
+        "reaudit_role_policy", _synth_policy_from_registry("qwen_audit")
+    )
+    return SelectiveRepairConfig(**kwargs)
 
 
 def _issue(pid, category, note="", excerpt="", severity="major", confidence="high"):
@@ -833,7 +851,7 @@ def test_repair_and_reaudit_write_raw_reasoning_artifacts(tmp_path):
         }]),
         _reaudit_response([]),  # clean re-audit
     ])
-    evaluator = SelectiveRepairEvaluator(backend)
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
@@ -879,7 +897,7 @@ def test_repair_batch_sends_request_options_reasoning_for_remote(
     # reasoning transport guard resolves to True (request_options path).
     evaluator = SelectiveRepairEvaluator(
         backend,
-        config=SelectiveRepairConfig(repair_reasoning=1),
+        config=_repair_cfg(repair_reasoning=1),
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
@@ -1007,7 +1025,7 @@ def test_repair_streams_reasoning_live_during_call(tmp_path):
             "reason": "source is gender-neutral grandchild",
         }]),
         _reaudit_response([]),  # clean re-audit
-    ]))
+    ]), config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered, out_dir=tmp_path, out_base="b3_repair",
@@ -1120,7 +1138,7 @@ def test_p00193_type_tp_repair_after_verify():
         }]),
         _reaudit_response([]),  # clean re-audit
     ])
-    evaluator = SelectiveRepairEvaluator(backend)
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered,
@@ -1224,7 +1242,7 @@ def test_p00240_type_tier_a_confirmed_repair_directly():
         }]),
         _reaudit_response([]),
     ])
-    evaluator = SelectiveRepairEvaluator(backend)
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered,
@@ -1514,7 +1532,7 @@ def test_failed_reaudit_debt_never_zero_findings():
         ],
         fail_on=(2,),  # re-audit transport failure
     )
-    evaluator = SelectiveRepairEvaluator(backend)
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered,
@@ -1545,7 +1563,7 @@ def test_reaudit_empty_then_valid_retries():
         _reaudit_response([]),  # valid on retry
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(
+        backend, config=_repair_cfg(
             reaudit_retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0),
         )
     )
@@ -1579,7 +1597,7 @@ def test_reaudit_invalid_json_three_attempts_then_debt():
         CompletionResponse(text="still not json", model="qwen-3.6-35b", finish_reason="stop"),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(
+        backend, config=_repair_cfg(
             reaudit_retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0),
         )
     )
@@ -1614,7 +1632,7 @@ def test_reaudit_accepts_fenced_json_no_retry():
         CompletionResponse(text=fenced_ok, model="qwen-3.6-35b", finish_reason="stop"),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(
+        backend, config=_repair_cfg(
             reaudit_retry=JsonRetryPolicy(max_retries=2, base_delay_seconds=0.0),
         )
     )
@@ -1655,7 +1673,7 @@ def test_reaudit_finds_residual_issues_debt():
             "confidence": "high", "note": "residual",
         }]),
     ])
-    evaluator = SelectiveRepairEvaluator(backend)
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=filtered,
@@ -1695,7 +1713,7 @@ def test_reaudit_scope_uses_changed_pids_and_neighbours():
         ]),
         _reaudit_response([]),
     ])
-    evaluator = SelectiveRepairEvaluator(backend, config=SelectiveRepairConfig(
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg(
         reaudit_neighbour_window=2,
     ))
     outcome = evaluator(
@@ -1728,7 +1746,7 @@ def test_reaudit_request_carries_local_context_and_repaired_delta():
         _reaudit_response([]),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(reaudit_neighbour_window=2)
+        backend, config=_repair_cfg(reaudit_neighbour_window=2)
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
@@ -1790,7 +1808,7 @@ def test_reaudit_context_pid_issue_dropped_complete() -> None:
         ]),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(reaudit_neighbour_window=2)
+        backend, config=_repair_cfg(reaudit_neighbour_window=2)
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
@@ -1812,7 +1830,7 @@ def test_reaudit_token_budget_local_region() -> None:
     changed = ("p00010", "p00200", "p00390")
     backend = ScriptedRepairBackend([_reaudit_response([])])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(reaudit_neighbour_window=2),
+        backend, config=_repair_cfg(reaudit_neighbour_window=2),
     )
     outcome = evaluator._run_reaudit(
         chapter_id="0001", source=source, translation=translation,
@@ -1841,7 +1859,7 @@ def test_reaudit_chunked_multiple_calls_for_large_region():
         [_reaudit_response([]) for _ in range(8)]  # enough responses
     )
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(
+        backend, config=_repair_cfg(
             reaudit_neighbour_window=2,
             reaudit_max_input_tokens=300,  # small budget -> many chunks
         ),
@@ -2343,7 +2361,7 @@ def test_review_candidates_accepted_and_rejected_journal():
         _reaudit_response([]),  # single re-audit after the accepted commit
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(findings_cap=10)
+        backend, config=_repair_cfg(findings_cap=10)
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
@@ -2475,7 +2493,7 @@ def test_review_candidates_zero_audit_findings_tear_not_skipped():
                            "reason": "принято"}]),
         _reaudit_response([]),
     ])
-    evaluator = SelectiveRepairEvaluator(backend)
+    evaluator = SelectiveRepairEvaluator(backend, config=_repair_cfg())
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
         filtered=(), review_candidates=review_candidates,
@@ -2821,7 +2839,7 @@ def test_merged_editor_auditor_single_repair_call():
         _reaudit_response([]),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(findings_cap=10)
+        backend, config=_repair_cfg(findings_cap=10)
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
@@ -2897,7 +2915,7 @@ def test_mixed_multiplicity_two_auditors_one_editor_one_index():
         _reaudit_response([]),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(findings_cap=10)
+        backend, config=_repair_cfg(findings_cap=10)
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,
@@ -2982,7 +3000,7 @@ def test_one_pid_auditor_two_editors_single_index_journal_both_bound():
         _reaudit_response([]),
     ])
     evaluator = SelectiveRepairEvaluator(
-        backend, config=SelectiveRepairConfig(findings_cap=10)
+        backend, config=_repair_cfg(findings_cap=10)
     )
     outcome = evaluator(
         chapter_id="0001", source=source, translation=translation,

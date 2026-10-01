@@ -69,16 +69,18 @@ def test_effective_max_tokens_dynamic_values():
     # 5 spans: 40*5+500=700 -> min 800
     assert _effective_max_tokens(5, None) == 800
     assert _effective_max_tokens(5, 0) == 800
-    # explicit larger overrides dynamic
-    assert _effective_max_tokens(5, 1600) == 1600
+    # explicit cfg_max is an upper CAP on the dynamic budget (local-model-aliases
+    # pact-rev round 3), not an override: min(800, 1600) == 800
+    assert _effective_max_tokens(5, 1600) == 800
     # 69 spans: 40*69+500=3260
     assert _effective_max_tokens(69, None) == 3260
     assert _effective_max_tokens(69, 0) == 3260
-    # small explicit larger than needed respects it
-    assert _effective_max_tokens(69, 4000) == 4000
+    # explicit cap above the dynamic need respects the dynamic value
+    assert _effective_max_tokens(69, 4000) == 3260
     # cap at 8192
     assert _effective_max_tokens(300, None) == _FORMATTING_MAX_TOKENS_CAP
-    assert _effective_max_tokens(10, 9000) == _FORMATTING_MAX_TOKENS_CAP
+    # explicit cap above the dynamic need keeps the dynamic value: 40*10+500=900
+    assert _effective_max_tokens(10, 9000) == 900
 
 
 def test_resolve_dynamic_budget_small_chapter(tmp_path: Path):

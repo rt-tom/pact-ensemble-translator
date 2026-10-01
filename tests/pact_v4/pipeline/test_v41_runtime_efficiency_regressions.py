@@ -109,9 +109,10 @@ def test_backend_region_gate_batch_10_splits_deterministically(tmp_path: Path):
     assert len(results) == 10
     # Deterministic split: 2 backend calls (6+4)
     assert len(backend.requests) == 2
-    # Per-chunk max_tokens = min(24576, 4096*len_chunk)
-    assert backend.requests[0].max_output_tokens == min(24576, 4096 * 6)
-    assert backend.requests[1].max_output_tokens == min(24576, 4096 * 4)
+    # Per-chunk max_tokens from shared role_budgets fidelity_reviewer
+    # (floor_plus_per_item: floor 24576 + 128 per item, ceiling 32768).
+    assert backend.requests[0].max_output_tokens == 24576 + 128 * 6
+    assert backend.requests[1].max_output_tokens == 24576 + 128 * 4
 
 
 def test_backend_region_gate_batch_fixed_4096_independent_of_config(tmp_path: Path):
@@ -175,8 +176,8 @@ def test_backend_region_gate_batch_fixed_4096_independent_of_config(tmp_path: Pa
         assert len(results) == 10
         # Must still split 6+4 despite config (fixed 4096 unit)
         assert len(backend.requests) == 2, f"cfg {cfg_tokens}: fixed batch should still split 6+4"
-        assert backend.requests[0].max_output_tokens == min(24576, 4096 * 6), f"cfg {cfg_tokens}"
-        assert backend.requests[1].max_output_tokens == min(24576, 4096 * 4), f"cfg {cfg_tokens}"
+        assert backend.requests[0].max_output_tokens == 24576 + 128 * 6, f"cfg {cfg_tokens}"
+        assert backend.requests[1].max_output_tokens == 24576 + 128 * 4, f"cfg {cfg_tokens}"
         # Also single-chunk case must use 4096*n not cfg*n
         backend2 = ScriptedBackend([_text(verdict(3))])
         gate2 = BackendRegionFidelityGate(
@@ -190,7 +191,7 @@ def test_backend_region_gate_batch_fixed_4096_independent_of_config(tmp_path: Pa
             for i in range(3)
         ]
         gate2.batch(items3)
-        assert backend2.requests[0].max_output_tokens == min(24576, 4096 * 3), f"cfg {cfg_tokens} single chunk"
+        assert backend2.requests[0].max_output_tokens == 24576 + 128 * 3, f"cfg {cfg_tokens} single chunk"
 
 
 # ---------------------------------------------------------------------------
