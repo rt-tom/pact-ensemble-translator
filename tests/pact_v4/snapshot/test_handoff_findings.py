@@ -147,7 +147,7 @@ def test_stale_parent_retry_preserves_rt_content():
                 super().__init__(*a, **kw)
                 self.push_calls = 0
 
-            def push_candidate(self, book_id, candidate_id, local_dir, manifest_dict=None):
+            def push_candidate(self, book_id, candidate_id, local_dir, manifest_dict=None, pinned=None):
                 self.push_calls += 1
                 if self.push_calls == 1:
                     # Advance store externally to rev-0002 with race content
@@ -187,8 +187,8 @@ def test_stale_parent_retry_preserves_rt_content():
                                 tar.addfile(ti2, io.BytesIO(data))
                         _receive_candidate_stream(self.store, "race-cand-preserve", bio.getvalue())
                         promote(self.store, "race-cand-preserve", operator="rt", host="RT")
-                    return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict)
-                return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict)
+                    return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict, pinned=pinned)
+                return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict, pinned=pinned)
 
         transport = StaleOnceTransport(tmp, book_id=BOOK_ID)
         with tempfile.TemporaryDirectory() as wdir:

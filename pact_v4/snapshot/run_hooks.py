@@ -23,14 +23,37 @@ LOG = logging.getLogger(__name__)
 CANONICAL_FILES = ["glossary.json", "book_memory.json", "chapter_index.json", "observations.json"]
 
 def _validate_working_dir_files(working_dir: Path) -> None:
+    # Canonical-only: validate exactly the four named files by direct path.
+    # Unrelated working-dir entries are never listed, rejected, or modified.
+    import os as _os
+    import stat as _stat
+    if working_dir.is_symlink():
+        raise RuntimeError("Working dir is symlink (rejected)")
+    if not working_dir.is_dir():
+        raise RuntimeError("Working dir missing or not a directory")
+    remote_client._check_no_symlink_chain(working_dir)
     for fname in CANONICAL_FILES:
         p = working_dir / fname
         if p.is_symlink():
             raise RuntimeError(f"Working dir file is symlink (rejected): {fname}")
-        if not p.is_file():
-            raise RuntimeError(f"Working dir file missing: {fname}")
+        remote_client._check_no_symlink_chain(p)
         try:
-            json.loads(p.read_text(encoding="utf-8"))
+            st = p.stat()
+        except OSError as e:
+            raise RuntimeError(f"Working dir file missing: {fname}: {e}") from e
+        if not _stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"Working dir file missing or not regular: {fname}")
+        try:
+            fd = _os.open(str(p), _os.O_RDONLY | getattr(_os, "O_NOFOLLOW", 0) | getattr(_os, "O_NONBLOCK", 0))
+        except OSError as e:
+            raise RuntimeError(f"Working dir file cannot be opened safely: {fname}: {e}") from e
+        try:
+            with _os.fdopen(fd, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            raise RuntimeError(f"Working dir file cannot be read: {fname}: {e}") from e
+        try:
+            json.loads(raw.decode("utf-8"))
         except Exception as e:
             raise RuntimeError(f"Working dir file not valid JSON: {fname}: {e}") from e
 
@@ -133,7 +156,11 @@ def post_promote_push(
             for fname, data in preserved.items():
                 if data is not None:
                     try:
-                        (wdir / fname).write_bytes(data)
+                        target = wdir / fname
+                        if target.is_symlink():
+                            raise RuntimeError(f"Restore target is a symlink (rejected): {fname}")
+                        remote_client._check_no_symlink_chain(target)
+                        target.write_bytes(data)
                     except Exception as e:
                         raise RuntimeError(f"Failed to restore preserved state {fname} after re-pull: {e}") from e
             # Need new candidate_id for retry (promote quarantined previous)

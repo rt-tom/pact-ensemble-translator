@@ -17,21 +17,23 @@ def test_missing_canonical_rejected():
         err = _validate_exact_four_file_set(str(tmp))
         assert err is not None and "missing canonical" in err
 
-def test_arbitrary_pact_extra_rejected():
+def test_arbitrary_pact_extra_ignored():
+    # book-state-canonical-only-sync: stray marker/tmp-style files under
+    # unrelated names no longer block local promotion and are left untouched.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _setup(tmp)
         (tmp / ".pact_extra.json").write_text("{}")
-        with pytest.raises(RuntimeError, match="extra entry"):
-            MemoryManager(str(tmp)).promote("complete")
+        MemoryManager(str(tmp)).promote("complete")
+        assert (tmp / ".pact_extra.json").read_text() == "{}"
 
-def test_tmp_extra_rejected():
+def test_tmp_extra_ignored():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _setup(tmp)
         (tmp / "foo.tmp").write_text("{}")
-        with pytest.raises(RuntimeError, match="extra entry"):
-            MemoryManager(str(tmp)).promote("complete")
+        MemoryManager(str(tmp)).promote("complete")
+        assert (tmp / "foo.tmp").read_text() == "{}"
 
 def test_marker_allowed_backup_allowed():
     with tempfile.TemporaryDirectory() as td:
@@ -75,19 +77,16 @@ def test_six_file_media_contract_allowed():
         assert (tmp / "manifest.json").exists()
 
 
-def test_unknown_file_still_rejected():
-    """Unknown extra file and symlink are still rejected."""
+def test_unknown_file_ignored_but_canonical_symlink_rejected():
+    """Unrelated extra files/symlinks are ignored; a symlink AT a canonical
+    name is still rejected."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _setup(tmp)
         (tmp / "rogue.txt").write_text("evil")
         from pact_v4.phase1.memory import _validate_exact_four_file_set
         err = _validate_exact_four_file_set(str(tmp))
-        assert err is not None and "extra entry" in err
-        # Symlink variant
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _setup(tmp)
+        assert err is None, f"unrelated file must not block local check, got: {err}"
         target = tmp / "real.json"
         target.write_text("{}")
         link = tmp / "rogue_link"
@@ -95,9 +94,14 @@ def test_unknown_file_still_rejected():
             link.symlink_to(target)
         except OSError:
             pytest.skip("symlink not supported")
-        from pact_v4.phase1.memory import _validate_exact_four_file_set
         err = _validate_exact_four_file_set(str(tmp))
-        assert err is not None and "extra entry" in err
+        assert err is None, f"unrelated symlink must not block local check, got: {err}"
+        assert (tmp / "rogue.txt").read_text() == "evil"
+        # Symlink AT a canonical name is still fail-closed.
+        (tmp / "glossary.json").unlink()
+        (tmp / "glossary.json").symlink_to(target)
+        err = _validate_exact_four_file_set(str(tmp))
+        assert err is not None and "symlink" in err
 
 
 def test_book_run_promotion_injected_failure_is_non_fatal_writes_debt_and_skips_media_push(tmp_path, monkeypatch, caplog):
