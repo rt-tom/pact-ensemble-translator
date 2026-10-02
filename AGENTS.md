@@ -47,7 +47,7 @@ v4.2 dev/test copy (where v4.2 branches are synced and tested): D:\pact\pact_tra
 ## Production and workspace safety
 
 - Develop only in an isolated branch/worktree on `media`.
-- Never edit tracked production files directly on `RT`.
+- Never edit tracked production files directly on `RT`. The only exception is the explicitly requested, code-only Git fast-forward sync described in "Git, merge, deployment, and pipeline execution" (exact lowercase `ssh rt` only).
 - Never overwrite, delete, migrate, or bulk-rebuild production artifacts, caches,
   snapshots, output books, or persistent data without explicit owner approval.
 - Do not change model settings, runtime routing, provider endpoints, or lifecycle
@@ -173,7 +173,23 @@ Classify work before editing:
   but must not launch it.
 - Before a requested production action, state the exact target checkout, config,
   input, intended output location, and irreversible effects.
-- After every deploy, sync production checkout `D:\pact\pact_translator_v4_1` with `main` (`git pull --ff-only` on `RT`); deployment is not complete until `RT` reports `Already up to date` or the deployed commit.
+- After every production v4.1 deploy, sync production checkout `D:\pact\pact_translator_v4_1` with `main` (`git pull --ff-only` on `RT`); a v4.2 deployment updates only the explicitly selected `D:\pact\pact_translator_v4_2` checkout/branch and never implies a v4.1 production sync. Deployment is not complete until `RT` reports `Already up to date` or the deployed commit.
+- Merge, deploy, and pipeline execution remain separate owner decisions; none implies another. There is no automatic deploy after merge: every deployment needs an explicit owner deploy request for a specific target.
+
+### Agent-run RT code sync (narrow exception, explicit request only)
+
+- An agent may advance an RT checkout's Git working tree only after an explicit owner request to deploy a specific change to a specific target. A merged PR or standing policy alone never authorizes a sync.
+- Allowed targets only, as selected for each request:
+  - `D:\pact\pact_translator_v4_1` on `main` (live production 4.1 checkout); or
+  - `D:\pact\pact_translator_v4_2` on the explicitly requested `dev/v4.2-*` branch (v4.2 dev/test checkout).
+  Never infer or substitute the target; any other path or branch is out of scope.
+- Every remote invocation uses the exact lowercase SSH alias `ssh rt` (never `ssh RT` or any other casing). Command shape (schematic only, quoting follows the documented `ssh rt` + PowerShell pattern): `ssh rt 'powershell -NoProfile -Command "<bounded git sync steps for the selected checkout/branch>"'`.
+- Before execution, report the exact checkout path, branch, expected commit, that no pipeline/config/input/output is involved, and the effect (advance that checkout to the requested commit).
+- Preflight on `RT` before any mutation: verify the checkout exists, the current branch is the expected branch (or the documented first-time branch-switch procedure applies), `git status --porcelain` is empty, and the remote/branch identity is as expected, without printing credentials or secrets. Record the current local `HEAD`; fetch only the approved target branch; verify `origin/<target-branch>` resolves exactly to the owner-requested expected commit before switching or pulling (and, where checked, that the current `HEAD` is an ancestor of that target so the fast-forward is known to be possible). If the remote target does not resolve to the expected commit, stop before any mutation and report.
+- Allowed mutation only: fetch the exact target branch, switch to that branch (creating the local tracking branch only on documented first use), then `git pull --ff-only`. No `reset`, `clean`, force operation, direct file write/copy, configuration edit, arbitrary script, or automatic rollback is allowed.
+- After sync, verify and report the exact `HEAD` commit and branch; claim complete only when `RT` reports the expected commit (or `Already up to date` at that commit).
+- Fail closed: if the tree is dirty, branch/remote identity is unexpected, the alias/authentication is unavailable, the network fails, the fetched remote target does not resolve to the expected commit, or fast-forward is impossible, stop immediately with no cleanup, reset, force, or repair, and report. Never ask the owner to paste secrets into chat.
+- This exception never authorizes direct `RT` file edits, pipeline execution, configuration changes, cache/snapshot/output-book/persistent-data operations, migrations, service or model-server lifecycle actions, or automatic rollback.
 - Run-launch commands (RT / media; `--remote "sol/terra"` translator/reviewer aliases; `--chapters`; `--preflight`; monitor `monitor_pipeline.ps1`; required env vars) are catalogued in `docs/agent_operations/AGENTS_REFERENCE_RU.md` (section «Команды запуска прогона»). When asked to produce a launch or monitor command, consult that section first.
 - When providing shell commands to the owner, ALWAYS prepend the correct `cd` to the repo root so the command runs from the right directory without manual editing: media → `cd ~/projects/pact-ensemble-translator` (agent shell uses `python3`), RT → `cd D:\pact\pact_translator_v4_1` (PowerShell, `python`). Never hand over a bare command that assumes the caller is already in the repo root.
 
