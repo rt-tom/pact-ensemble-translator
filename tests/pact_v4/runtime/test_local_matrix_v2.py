@@ -453,16 +453,20 @@ def test_production_aliases_shape():
     assert gemma31.request["top_k"] == 64
     assert gemma31.request["min_p"] == 0.0
     assert gemma31.request["repeat_penalty"] == 1.0
-    assert gemma31.model_path == "C:/llama-cpp/models/Gemma4-31B-Q5/gemma-4-31B-it-UD-Q5_K_XL.gguf"
-    assert gemma31.model_name == "gemma-4-31B-it-UD-Q5_K_XL.gguf"
+    assert gemma31.model_path == "C:/llama-cpp/models/Gemma4-31B-QAT-Q4/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+    assert gemma31.model_name == "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
     assert list(gemma31.server_args) == [
-        "-fit", "on", "-fitt", "512", "-b", "1024", "-ub", "1024",
-        "-ctk", "q8_0", "-ctv", "q4_0", "-t", "12", "-tb", "12",
+        "--spec-type", "draft-mtp", "--spec-draft-model",
+        "C:/llama-cpp/models/Gemma4-31B-QAT-Q4/MTP/mtp-gemma-4-31B-it.gguf",
+        "--spec-draft-n-max", "3", "--spec-draft-device", "SYCL0",
+        "--spec-draft-ngl", "all",
+        "-fit", "on", "-fitt", "1280", "-b", "2048", "-ub", "2048",
+        "-ctk", "q8_0", "-ctv", "q8_0", "-t", "6", "-tb", "12",
         "-fa", "on", "--load-mode", "mmap", "-c", "44000", "-np", "1",
         "--reasoning", "on", "--reasoning-budget-enable",
         "--reasoning-budget", "2000", "--cache-ram", "0",
         "--ctx-checkpoints", "0", "--jinja",
-    ]  # qwen38-gemma31-profile-refresh: -ub 1024, no -dev/--device (lifecycle injects it)
+    ]  # addendum B (QAT-MTP): QAT identity, -fitt 1280, -b/-ub 2048, -ctv q8_0, -t 6, external draft
     assert "-dev" not in gemma31.server_args
     assert "--device" not in gemma31.server_args
     qwen38 = local["qwen38"]
@@ -500,6 +504,65 @@ def test_production_aliases_shape():
         assert "--reasoning-budget-enable" in local[alias].server_args
     assert local["gemma"].reasoning_budget == 2048
     assert local["qwen"].reasoning_budget == 8192
+
+
+def test_gemma31_qat_mtp_addendum_b_profile():
+    """Addendum B (owner-approved Gemma31 QAT-MTP update).
+
+    Proves the changed profile identity, the exact external-draft args, no
+    lifecycle-duplicated launch flags (``-m``, main ``--device``/``-dev``,
+    host, port, ``--alias``), and unchanged reasoning base 2000, request
+    sampling and role-effective values (generator 4000, repair and
+    gemma-side audit 2000). Qwen38 / ordinary-qwen contracts untouched here.
+    """
+    reg = load_providers_registry(Path("configs/providers.yaml"))
+    gemma31 = reg.providers["local"]["gemma31"]
+    # Changed identity: QAT model, not the frozen Q5 build.
+    assert gemma31.model_key == "gemma31"
+    assert gemma31.model_path == (
+        "C:/llama-cpp/models/Gemma4-31B-QAT-Q4/"
+        "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+    )
+    assert gemma31.model_name == "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf"
+    assert "Gemma4-31B-Q5" not in gemma31.model_path
+    assert "Q5_K_XL" not in gemma31.model_name
+    args = list(gemma31.server_args)
+    # Exact external-MTP draft block (Pact server_args syntax).
+    assert args[:10] == [
+        "--spec-type", "draft-mtp", "--spec-draft-model",
+        "C:/llama-cpp/models/Gemma4-31B-QAT-Q4/MTP/mtp-gemma-4-31B-it.gguf",
+        "--spec-draft-n-max", "3", "--spec-draft-device", "SYCL0",
+        "--spec-draft-ngl", "all",
+    ]
+    assert args[args.index("--spec-draft-n-max") + 1] == "3"
+    assert args[args.index("--spec-draft-device") + 1] == "SYCL0"
+    assert args[args.index("--spec-draft-ngl") + 1] == "all"
+    # Changed throughput values; everything else keeps order/syntax.
+    assert args[args.index("-fitt") + 1] == "1280"
+    assert args[args.index("-b") + 1] == "2048"
+    assert args[args.index("-ub") + 1] == "2048"
+    assert args[args.index("-ctv") + 1] == "q8_0"
+    assert args[args.index("-t") + 1] == "6"
+    # No lifecycle-injected or alias flags in model-specific server_args.
+    for forbidden in ("-m", "-dev", "--device", "--host", "--port",
+                      "--alias", "--model-alias"):
+        assert forbidden not in args
+    assert "-md" not in args  # --spec-draft-model form, not -md
+    # Unchanged reasoning base, sampling and role-effective values.
+    assert gemma31.reasoning_budget == 2000
+    assert args[args.index("--reasoning-budget") + 1] == "2000"
+    assert gemma31.request == {"temperature": 1.0, "top_p": 0.95,
+                               "top_k": 64, "min_p": 0.0,
+                               "repeat_penalty": 1.0}
+    pair = build_resolved_pair_from_registry(reg, "gemma31", "qwen38")
+    assert pair.effective_reasoning_budget("generator") == 4000
+    assert pair.effective_reasoning_budget("repair") == 2000
+    assert pair.effective_reasoning_budget("gemma_audit") == 2000
+    gen_args = pair.launch_args_for_role("generator")
+    assert gen_args[gen_args.index("--reasoning-budget") + 1] == "4000"
+    # Old Q5 profile values are gone.
+    assert "512" not in args[args.index("-fitt") + 1:args.index("-fitt") + 2]
+    assert "Q5" not in " ".join(args)
 
 
 def test_pair_gemma31_qwen38_case_insensitive():

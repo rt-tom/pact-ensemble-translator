@@ -95,9 +95,9 @@ providers:
         request: {temperature: 0.0}
       gemma31:
         model_key: gemma31
-        model_path: C:/llama-cpp/models/Gemma4-31B-Q5/gemma-4-31B-it-UD-Q5_K_XL.gguf
-        model_name: gemma-4-31B-it-UD-Q5_K_XL.gguf
-        server_args: [-fit, "on", -fitt, "512", -b, "1024", -ub, "1024", -ctk, q8_0, -ctv, q4_0, -t, "12", -tb, "12", -fa, "on", --load-mode, mmap, -c, "44000", -np, "1", --reasoning, "on", --reasoning-budget-enable, --reasoning-budget, "2000", --cache-ram, "0", --ctx-checkpoints, "0", --jinja]
+        model_path: C:/llama-cpp/models/Gemma4-31B-QAT-Q4/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf
+        model_name: gemma-4-31B-it-qat-UD-Q4_K_XL.gguf
+        server_args: [--spec-type, draft-mtp, --spec-draft-model, "C:/llama-cpp/models/Gemma4-31B-QAT-Q4/MTP/mtp-gemma-4-31B-it.gguf", --spec-draft-n-max, "3", --spec-draft-device, SYCL0, --spec-draft-ngl, all, -fit, "on", -fitt, "1280", -b, "2048", -ub, "2048", -ctk, q8_0, -ctv, q8_0, -t, "6", -tb, "12", -fa, "on", --load-mode, mmap, -c, "44000", -np, "1", --reasoning, "on", --reasoning-budget-enable, --reasoning-budget, "2000", --cache-ram, "0", --ctx-checkpoints, "0", --jinja]
         reasoning_budget: 2000
         request: {temperature: 1.0, top_p: 0.95, top_k: 64, min_p: 0.0, repeat_penalty: 1.0}
       qwen38:
