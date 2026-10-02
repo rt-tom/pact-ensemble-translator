@@ -1534,10 +1534,29 @@ class _FakeB3:
             r_editor=None)
 
 
+class _LineStubModelCaller(StubModelCaller):
+    """Line-protocol twin of ``StubModelCaller`` for whole-chapter runs.
+
+    translator-line-output: the shared ``StubModelCaller`` still returns the
+    chunked JSON contract and stays untouched — whole-chapter runs use this
+    stub, which renders the same deterministic text as one ``PID: text``
+    line per TARGET PID.
+    """
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        lines = []
+        for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+            digits = "".join(ch for ch in text if ch.isdigit())
+            digit_part = f" ({digits})" if digits else ""
+            lines.append(f"{pid}: Перевод номер{index}{digit_part}")
+        return "\n".join(lines)
+
+
 def _run_wc_chapter(cfg, *, b3=None, model_inner=None):
     """Run the whole-chapter driver with stub backends + optional fake B3."""
     router = _make_router()
-    inner = model_inner or StubModelCaller()
+    inner = model_inner or _LineStubModelCaller()
     result = run_chapter_strict(
         cfg, router=router,
         model_caller=_LifecycleAwareModelCaller(router, inner),

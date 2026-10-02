@@ -106,7 +106,7 @@ def _run_chunked(cfg, **overrides):
 
 def _run_whole_chapter(cfg, model_caller=None):
     router = _make_router()
-    caller = model_caller or StubModelCaller()
+    caller = model_caller or _LineStubModelCaller()
     wrapped = _LifecycleAwareModelCaller(router, caller)
     result = run_chapter_strict(
         cfg,
@@ -118,6 +118,25 @@ def _run_whole_chapter(cfg, model_caller=None):
         gemma_audit_evaluator=_LifecycleAwareGemmaAudit(router, StubGemmaAudit()),
     )
     return result, caller, router
+
+
+class _LineStubModelCaller(StubModelCaller):
+    """Line-protocol twin of ``StubModelCaller`` for whole-chapter runs.
+
+    translator-line-output: the shared ``StubModelCaller`` still returns the
+    chunked JSON contract and stays untouched — whole-chapter runs use this
+    stub, which renders the same deterministic text as one ``PID: text``
+    line per TARGET PID.
+    """
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        lines = []
+        for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+            digits = "".join(ch for ch in text if ch.isdigit())
+            digit_part = f" ({digits})" if digits else ""
+            lines.append(f"{pid}: Перевод номер{index}{digit_part}")
+        return "\n".join(lines)
 
 
 def _read_journal_entries(journal_path: Path) -> List[Dict[str, Any]]:
@@ -246,7 +265,7 @@ def _ok_response(payload: Mapping[str, Any]) -> CompletionResponse:
 
 def _run_whole_chapter_with_b3(cfg, backend: _B3MockBackend, *, caller=None):
     router = _make_router()
-    inner = caller or StubModelCaller()
+    inner = caller or _LineStubModelCaller()
     wrapped = _LifecycleAwareModelCaller(router, inner)
     bundle = B3AuditRepair(
         audit_backend=backend,
@@ -299,7 +318,7 @@ class TestAAppendOnlyAndForeignIdentity:
         # Append empty trailing lines (simulated crash with extra newline)
         journal_path.write_text(before_text + "\n\n", encoding="utf-8")
         # Resume must succeed, ignoring empty lines, with no new generation calls
-        caller2 = StubModelCaller()
+        caller2 = _LineStubModelCaller()
         resumed, _, _ = _run_whole_chapter(wc_cfg, model_caller=caller2)
         assert len(caller2.calls) == 0
         assert resumed.resumed_from_index == 1
@@ -321,7 +340,7 @@ class TestAAppendOnlyAndForeignIdentity:
         before_sel = (wc_cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
         # Append malformed trailing line
         journal_path.write_text(journal_path.read_text(encoding="utf-8") + "{not json\n", encoding="utf-8")
-        caller = StubModelCaller()
+        caller = _LineStubModelCaller()
         with pytest.raises((json.JSONDecodeError, ValueError)):
             _run_whole_chapter(wc_cfg, model_caller=caller)
         assert len(caller.calls) == 0

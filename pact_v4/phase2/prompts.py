@@ -210,6 +210,71 @@ BALANCED_LITERARY_V4 = PromptTemplate(
 )
 
 
+# translator-line-output: verbatim whole-chapter line-protocol output contract
+# (openspec/changes/translator-line-output/design.md §1). Kept verbatim —
+# including the TARGET boundary wording — never paraphrased or redesigned
+# here. Architect decision: TARGET is disambiguated at render time by
+# labelling the whole-chapter source block TARGET (OWNED_SOURCE) (see
+# render_prompt), not by rewriting this block.
+_WHOLE_CHAPTER_LINE_CONTRACT = (
+    "OUTPUT CONTRACT — MANDATORY:\n"
+    "\n"
+    "Return only the translations for the PIDs in TARGET, in the exact order shown there.\n"
+    "Output exactly one line per TARGET PID, using this format:\n"
+    "\n"
+    "p00001: Первая переведённая строка.\n"
+    "p00002: Вторая переведённая строка.\n"
+    "\n"
+    "Preserve each TARGET PID exactly and output it exactly once.\n"
+    "Put exactly one space after the colon.\n"
+    "Keep each translation on a single line; do not merge or split segments.\n"
+    "Do not output context-only PIDs.\n"
+    "Do not output JSON, Markdown, headings, blank lines, notes, or commentary.\n"
+    "Do not add wrapper quotation marks around PIDs or translations.\n"
+    "Preserve punctuation and quotation marks that belong in the Russian translation."
+)
+
+_WHOLE_CHAPTER_JSON_CONTRACT_MARKER = "OUTPUT CONTRACT — MANDATORY AND AUTHORITATIVE:"
+
+
+def _derive_whole_chapter_line_instructions(base: str) -> str:
+    """Derive whole-chapter line instructions from the shared template.
+
+    translator-line-output (Architect decision): the shared
+    BALANCED_LITERARY_V4 template keeps its JSON contract for the chunked
+    path; the whole-chapter-only template reuses every instruction
+    byte-for-byte except the output-contract block, which is replaced IN
+    PLACE (same position, no second contract, no leftover JSON block) with
+    the verbatim line contract above. Fail-closed: exactly one contract
+    marker must exist, it must run to the end of the template, and the
+    removed tail must carry the JSON-contract sentinels — otherwise a base
+    edit has moved the block and derivation refuses to guess.
+    """
+    if base.count(_WHOLE_CHAPTER_JSON_CONTRACT_MARKER) != 1:
+        raise AssertionError(
+            "prompts: expected exactly one JSON output-contract block in "
+            "BALANCED_LITERARY_V4; refusing to derive the whole-chapter "
+            "line template"
+        )
+    head, _, tail = base.partition(_WHOLE_CHAPTER_JSON_CONTRACT_MARKER)
+    if "exactly one top-level JSON object" not in tail or "markdown fences" not in tail:
+        raise AssertionError(
+            "prompts: the JSON output-contract block in BALANCED_LITERARY_V4 "
+            "does not carry the expected JSON sentinels; refusing to derive "
+            "the whole-chapter line template"
+        )
+    return head + _WHOLE_CHAPTER_LINE_CONTRACT
+
+
+BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1 = PromptTemplate(
+    role="balanced_literary",
+    version="pact-v4-prompt-balanced-literary-wc-line/v1",
+    instructions=_derive_whole_chapter_line_instructions(
+        BALANCED_LITERARY_V4.instructions
+    ),
+)
+
+
 # Explicit per-category instructions for the risk categories that Phase 2A's
 # REQUIRED_RISK_CATEGORIES (pact_v4.phase2.risk) always screens for. Kept as
 # a separate, version-controlled mapping (not inlined into the templates
@@ -249,6 +314,70 @@ def required_category_instructions(risk_feature_codes: Iterable[str]) -> Tuple[s
     return tuple(
         _REQUIRED_CATEGORY_INSTRUCTIONS[code] for code in sorted(present)
     )
+
+
+# The FINAL PRE-OUTPUT CHECK checklist, byte-identical for chunked
+# (JSON-contract) generation. The whole-chapter line variant is derived
+# from it by replacing ONLY the JSON-specific pre-output/output-contract
+# validation with line-protocol checks (Architect decision); every
+# fidelity/risk check is retained verbatim. Derived once at import with
+# exact-occurrence asserts so a checklist edit fails closed instead of
+# silently keeping a contradictory JSON mandate in the line prompt.
+_FINAL_CHECK_JSON = (
+    "FINAL PRE-OUTPUT CHECK — APPLY NOW:\n\n"
+    "Before emitting the JSON, perform one final compact risk check. Do not\n"
+    "draft or reproduce the full translation in reasoning.\n\n"
+    "Re-check the high-risk decisions identified during reasoning, especially:\n\n"
+    "- locked glossary spelling/transliteration, allowing normal Russian inflection;\n"
+    "- narrator/character gender, speakers, and referents;\n"
+    "- chronology, numbers, times, quantities, and exact physical details;\n"
+    "- ambiguous passages where the source does not justify added certainty;\n"
+    "- omissions, additions, semantic reversals, or unjustified substitutions;\n"
+    "- unintended English or Latin-script fragments.\n\n"
+    "Then verify the output contract:\n"
+    "- one source PID = one output PID;\n"
+    "- no missing, extra, duplicate, split, merged, or reordered PIDs;\n"
+    "- no translator notes, alternatives, self-corrections, or reasoning text;\n"
+    "- exactly one valid JSON object and nothing else.\n\n"
+    "Then emit the complete translation.\n"
+)
+
+
+def _derive_whole_chapter_final_check(base: str) -> str:
+    checks = base.replace(
+        "Before emitting the JSON, perform one final compact risk check.",
+        "Before emitting the translation, perform one final compact risk check.",
+    )
+    if checks.count(
+        "Before emitting the translation, perform one final compact risk check."
+    ) != 1:
+        raise AssertionError(
+            "prompts: FINAL CHECK pre-output sentence not found exactly once; "
+            "refusing to derive the whole-chapter line checklist"
+        )
+    checks = checks.replace(
+        "- exactly one valid JSON object and nothing else.",
+        "- exactly one `PID: translation` line per TARGET PID, "
+        "in source order, and nothing else.",
+    )
+    if checks.count(
+        "- exactly one `PID: translation` line per TARGET PID, "
+        "in source order, and nothing else."
+    ) != 1:
+        raise AssertionError(
+            "prompts: FINAL CHECK output-contract bullet not found exactly "
+            "once; refusing to derive the whole-chapter line checklist"
+        )
+    if "valid JSON object" in checks or "emitting the JSON" in checks:
+        raise AssertionError(
+            "prompts: leftover JSON mandate in the whole-chapter line checklist"
+        )
+    return checks
+
+
+_FINAL_CHECK_WHOLE_CHAPTER_LINE = _derive_whole_chapter_final_check(
+    _FINAL_CHECK_JSON
+)
 
 
 def render_prompt(bundle: "Any") -> str:
@@ -317,31 +446,31 @@ def render_prompt(bundle: "Any") -> str:
     # when the bible ended in "male" with no newline).
     bible_sep = "\n" if bible_block and not bible_block.endswith("\n") else ""
     glossary_block = "" if inline_glossary else f"GLOSSARY:\n{glossary}\n"
-    final_check = (
-        "FINAL PRE-OUTPUT CHECK — APPLY NOW:\n\n"
-        "Before emitting the JSON, perform one final compact risk check. Do not\n"
-        "draft or reproduce the full translation in reasoning.\n\n"
-        "Re-check the high-risk decisions identified during reasoning, especially:\n\n"
-        "- locked glossary spelling/transliteration, allowing normal Russian inflection;\n"
-        "- narrator/character gender, speakers, and referents;\n"
-        "- chronology, numbers, times, quantities, and exact physical details;\n"
-        "- ambiguous passages where the source does not justify added certainty;\n"
-        "- omissions, additions, semantic reversals, or unjustified substitutions;\n"
-        "- unintended English or Latin-script fragments.\n\n"
-        "Then verify the output contract:\n"
-        "- one source PID = one output PID;\n"
-        "- no missing, extra, duplicate, split, merged, or reordered PIDs;\n"
-        "- no translator notes, alternatives, self-corrections, or reasoning text;\n"
-        "- exactly one valid JSON object and nothing else.\n\n"
-        "Then emit the complete translation.\n"
-    )
+    # translator-line-output (Architect decision): the FINAL CHECK keeps its
+    # JSON wording exactly for chunked generation; whole-chapter generation
+    # retains every fidelity/risk check but validates the line protocol
+    # instead of a JSON object (a JSON mandate here would contradict the
+    # whole-chapter OUTPUT CONTRACT). Selection is per-request from the
+    # bundle identity — "whole_chapter" is the whole-chapter unit marker
+    # (see pact_v4.phase2.generation.generate_whole_chapter).
+    if bundle.chunk_id == "whole_chapter":
+        final_check = _FINAL_CHECK_WHOLE_CHAPTER_LINE
+        owned_source_header = (
+            "TARGET (OWNED_SOURCE — translate exactly these PIDs, "
+            "in this order):"
+        )
+    else:
+        final_check = _FINAL_CHECK_JSON
+        owned_source_header = (
+            "OWNED_SOURCE (translate exactly these PIDs, in this order):"
+        )
     return (
         f"{template_instructions}\n\n"
         f"{bible_block}{bible_sep}"
         f"STYLE_VOICE_CONSTRAINTS: {style_constraints}\n\n"
         f"CHUNK_ID: {bundle.chunk_id}\n"
         f"RISK_BAND: {bundle.risk_band}\n"
-        f"OWNED_SOURCE (translate exactly these PIDs, in this order):\n{owned_source}\n"
+        f"{owned_source_header}\n{owned_source}\n"
         f"left_context (read-only, already-committed Russian): {left_context}\n"
         f"right_context (read-only English source): {right_context}\n"
         f"{glossary_block}"

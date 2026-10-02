@@ -715,6 +715,52 @@ def test_model_caller_raises_after_empty_retries_exhausted():
     assert len(backend.requests) == 3
 
 
+def _whole_chapter_bundle():
+    from pact_v4.phase2.prompts import BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+
+    return replace(
+        _bundle(),
+        chunk_id="whole_chapter",
+        template=BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1,
+        role="balanced_literary",
+    )
+
+
+def test_model_caller_whole_chapter_line_mode_omits_json_schema():
+    # translator-line-output (design §4): the whole-chapter generator must
+    # neither request nor depend on JSON-constrained response mode — the
+    # request carries no response_schema, and line text (not JSON) is
+    # returned verbatim with NO adapter-level JSON classification/retry
+    # (validation + bounded retry belong to the generation layer).
+    lines = "p00001: Один.\np00002: Два: с двоеточием."
+    backend = ScriptedBackend([_text_response(lines)])
+    caller = BackendModelCaller(
+        backend, config=BackendModelCallerConfig(retry=_no_backoff()),
+    )
+    bundle = _whole_chapter_bundle()
+    out = caller(bundle)
+    assert out == lines
+    assert len(backend.requests) == 1
+    request = backend.requests[0]
+    assert request.response_schema is None
+    assert request.messages[0].content == render_prompt(bundle)
+    assert request.label == "phase2b/balanced_literary/whole_chapter"
+    assert request.omit_system_tools is True
+
+
+def test_model_caller_whole_chapter_line_mode_does_not_retry_invalid_lines():
+    # A line-contract violation is returned as-is on the FIRST attempt — the
+    # adapter never re-issues it as a JSON problem (single retry owner =
+    # WholeChapterRetryPolicy in the generation layer).
+    bad = "not pid lines at all"
+    backend = ScriptedBackend([_text_response(bad)])
+    caller = BackendModelCaller(
+        backend, config=BackendModelCallerConfig(retry=_no_backoff()),
+    )
+    assert caller(_whole_chapter_bundle()) == bad
+    assert len(backend.requests) == 1
+
+
 def test_model_caller_does_not_retry_transport_failure():
     attempts = []
 

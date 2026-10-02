@@ -264,7 +264,9 @@ class _DefectiveWholeChapterCaller(StubModelCaller):
         if "p00001" in payload and not self._patched:
             payload["p00001"] = "Перевод номер1 номер1"
             self._patched = True
-        return json.dumps(payload, ensure_ascii=False)
+        # translator-line-output: the whole-chapter generator speaks the PID
+        # line protocol — render the (patched) map as one line per PID.
+        return "\n".join(f"{pid}: {text}" for pid, text in payload.items())
 
 
 # ---------------------------------------------------------------------------

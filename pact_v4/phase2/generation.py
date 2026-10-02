@@ -15,10 +15,14 @@ generation"):
     string) — all of it actually rendered into the request text by
     ``pact_v4.phase2.prompts.render_prompt``, not merely hashed for cache
     purposes.
-  * Model output is a strict ordered PID -> Russian-text JSON map, fully
-    validated (well-formed JSON, exact PID set/order/ownership, no context
-    leakage) before it is wrapped in the immutable ``Candidate`` contract
-    from Phase 1A. The full ``bundle_hash`` is recorded in the candidate's
+  * Model output is a strict ordered PID -> Russian-text map, fully
+    validated (exact PID set/order/ownership, no context leakage) before
+    it is wrapped in the immutable ``Candidate`` contract from Phase 1A:
+    chunked generation parses a well-formed JSON object
+    (``_parse_ordered_pid_pairs``), while whole-chapter generation parses
+    exactly one ``PID: translated text`` line per TARGET PID
+    (``parse_whole_chapter_line_response``). The full ``bundle_hash`` is
+    recorded in the candidate's
     ``decision_trace`` so provenance is recoverable, not just its 16-char
     prefix in ``candidate_id``.
   * Generation identity (prompt template + version, role, risk-routing
@@ -46,6 +50,7 @@ imported here.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -64,6 +69,7 @@ from pact_v4.phase1.models import (
 )
 from pact_v4.phase2.prompts import (
     BALANCED_LITERARY_V4,
+    BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1,
     FIDELITY_FIRST_V1,
     PromptTemplate,
 )
@@ -81,6 +87,8 @@ from pact_v4.phase2.risk import (
     assess_source_risk,
 )
 
+LOG = logging.getLogger(__name__)
+
 __all__ = [
     "GenerationParams",
     "PromptBundle",
@@ -91,6 +99,7 @@ __all__ = [
     "GenerationOutcome",
     "generate_for_chunk",
     "WholeChapterRetryPolicy",
+    "parse_whole_chapter_line_response",
     "validate_whole_chapter_raw",
     "generate_whole_chapter",
 ]
@@ -359,6 +368,16 @@ def _roles_for_band(band: RiskBand, *, lazy_balanced: bool = True) -> Tuple[str,
 _TEMPLATES: Mapping[str, PromptTemplate] = MappingProxyType({
     "fidelity_first": FIDELITY_FIRST_V1,
     "balanced_literary": BALANCED_LITERARY_V4,
+})
+
+
+# translator-line-output: whole-chapter-only templates. The chunked path
+# keeps using _TEMPLATES (JSON contract, byte-for-byte unchanged); the
+# whole-chapter generator uses ONLY this map, so the line contract can never
+# leak into chunked generation. A role without a line entry fails closed in
+# generate_whole_chapter instead of emitting a guaranteed-invalid response.
+_WHOLE_CHAPTER_TEMPLATES: Mapping[str, PromptTemplate] = MappingProxyType({
+    "balanced_literary": BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1,
 })
 
 
@@ -716,8 +735,8 @@ class WholeChapterRetryPolicy:
     Unlike per-chunk generation (whose adapter retries only empty/truncated
     JSON at the transport level), the whole-chapter contract retries EVERY
     failure class at the generation layer — malformed/missing/extra/reordered
-    PID, empty/truncated JSON, and session aborts (Gate 0: 2/5 calls aborted
-    with finish=other/error) — because one call produces the entire chapter
+    PID, blank/continuation lines, empty segment text, empty/truncated output,
+    and session aborts (Gate 0: 2/5 calls aborted with finish=other/error) — because one call produces the entire chapter
     and a transient failure must not silently degrade it. Retries re-issue
     the identical bundle (same identity), so they never change cache/resume
     identity.
@@ -783,9 +802,11 @@ def _CompletionErrorType() -> type:
 def _JsonResilienceErrorTypes() -> tuple:
     """The adapter JSON-resilience failure types, imported lazily.
 
-    ``BackendModelCaller`` retries an empty/truncated body up to its own
-    ``JsonRetryPolicy`` budget (``retry_json_call``) and re-raises
-    ``EmptyResponseError`` / ``TruncatedJSONError`` when exhausted. Those are
+    ``BackendModelCaller`` retries an empty/truncated JSON body up to its own
+    ``JsonRetryPolicy`` budget (``retry_json_call``) on chunked (JSON-mode)
+    calls and re-raises ``EmptyResponseError`` / ``TruncatedJSONError`` when
+    exhausted; whole-chapter line calls bypass adapter JSON classification
+    entirely. Those are
     ``ValueError`` subclasses, NOT ``CompletionError``, so without an explicit
     catch the whole-chapter bounded-retry loop (which catches only
     ``CompletionError`` as a session abort) would let the adapter's exhaustion
@@ -801,21 +822,86 @@ def _JsonResilienceErrorTypes() -> tuple:
     return (EmptyResponseError, TruncatedJSONError)
 
 
+def parse_whole_chapter_line_response(
+    raw: str, pid_map: WholeChapterPidMap
+) -> Tuple[Tuple[str, str], ...]:
+    """Parse a whole-chapter line-protocol response into the ordered PID map.
+
+    translator-line-output: the V4 whole-chapter generator returns exactly
+    one `PID: translated text` line per TARGET PID, in exact source order
+    (no JSON wrapper). Each physical line is one record: split ONLY at the
+    first colon (later colons belong to the translation text), require the
+    PID exactly with exactly one space after the colon, and require
+    non-empty translation text. The parsed PID sequence must equal the exact
+    whole-chapter PID sequence in source order — missing, extra, duplicate,
+    malformed, or reordered records are never silently dropped, reordered,
+    inferred, or merged.
+
+    Failure taxonomy matches the generation contract: ``ValueError`` for
+    structural line violations (empty body, blank or colon-less continuation
+    lines, bad separator, empty segment text) -> ``INVALID_JSON``
+    (invalid-output path); ``_GenerationValidationError`` for PID-set/order
+    violations -> ``PID_MISMATCH``/``CONTEXT_LEAKAGE``. A single trailing
+    newline is the line terminator of the last record, not a blank line.
+    """
+    if not raw or not raw.strip():
+        raise ValueError(
+            "Reject empty whole-chapter line response: expected one "
+            "`PID: translated text` line per TARGET PID"
+        )
+    pairs: list = []
+    for index, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            raise ValueError(
+                "Reject whole-chapter line response: blank line at line "
+                f"{index} (blank/continuation lines are never attached to "
+                "a neighboring segment)"
+            )
+        head, sep, rest = line.partition(":")
+        if not sep:
+            raise ValueError(
+                "Reject whole-chapter line response: line "
+                f"{index} has no PID separator colon: {line!r}"
+            )
+        # The contract demands exactly one space after the colon: no space
+        # ("p00001:text"), two spaces, or a tab are all violations, and the
+        # PID itself is matched exactly (no whitespace tolerance).
+        if not rest.startswith(" ") or rest.startswith("  "):
+            raise ValueError(
+                "Reject whole-chapter line response: line "
+                f"{index} must use exactly one space after the colon: "
+                f"{line!r}"
+            )
+        text = rest[1:]
+        if not text.strip():
+            raise ValueError(
+                "Reject whole-chapter line response: line "
+                f"{index} has empty translation text"
+            )
+        pairs.append((head, text))
+    return _validate_pid_map(
+        pairs, owned_pids=pid_map.pids, context_pids=frozenset()
+    )
+
+
 def validate_whole_chapter_raw(
     raw: str, pid_map: WholeChapterPidMap
 ) -> Tuple[Tuple[str, str], ...]:
-    """Strictly validate a whole-chapter raw snapshot against the A1 contract.
+    """Strictly validate a persisted whole-chapter JSON snapshot.
 
-    Applies the exact same validation a whole-chapter generation attempt
-    performs (``_parse_ordered_pid_pairs`` + ``_validate_pid_map`` over the
-    full chapter map): the text must be a JSON object whose keys are exactly
-    ``pid_map.pids`` in the same source order, all values strings, with
-    literal duplicate keys rejected. Failure taxonomy matches a generation
-    attempt: ``ValueError`` for truncated/invalid/non-object JSON and
-    ``_GenerationValidationError`` for PID-set/order/type violations — so a
-    damaged or partial raw snapshot can never be mistaken for a complete
-    one, whether it arrives as model output (generation) or as a resume
-    snapshot on disk.
+    translator-line-output: this keeps validating the PERSISTED JSON PID-map
+    shape (``translations_raw.json`` — the pre-QA/repair generator snapshot
+    written by the strict runner — and whole-chapter resume, which
+    reconstructs only from that file). Live whole-chapter MODEL responses
+    use the line protocol and are parsed by
+    ``parse_whole_chapter_line_response``; they never reach this function.
+
+    The text must be a JSON object whose keys are exactly ``pid_map.pids``
+    in the same source order, all values strings, with literal duplicate
+    keys rejected. Failure taxonomy: ``ValueError`` for
+    truncated/invalid/non-object JSON and ``_GenerationValidationError``
+    for PID-set/order/type violations — so a damaged or partial snapshot
+    can never be mistaken for a complete one.
     """
     pairs = _parse_ordered_pid_pairs(raw, expected_pids=pid_map.pids)
     return _validate_pid_map(pairs, owned_pids=pid_map.pids, context_pids=frozenset())
@@ -846,11 +932,14 @@ def generate_whole_chapter(
 
     The prompt bundle carries the chapter's full ordered PID map
     (``chunk_id="whole_chapter"``, ``owned_pids``/``owned_source`` = every
-    PID in source order, no left/right context). Output must be a strict JSON
-    object mapping EVERY PID to its Russian text, in exact source order — the
-    same ``_validate_pid_map`` contract as chunked generation, applied to the
-    full chapter map. Validation failures (malformed/missing/extra/reordered
-    PID, empty/truncated JSON) and transport/session aborts are retried
+    PID in source order, no left/right context) under the whole-chapter line
+    template (``BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1``). Output must be
+    exactly one ``PID: translated text`` line per TARGET PID, in exact
+    source order — parsed by ``parse_whole_chapter_line_response`` under the
+    same PID-set/order contract as chunked generation (``_validate_pid_map``)
+    applied to the full chapter map. Validation failures (malformed/missing/
+    extra/reordered PID, blank/continuation lines, empty segment text,
+    empty/truncated output) and transport/session aborts are retried
     boundedly per ``retry``; after the budget the last error is returned with
     ``status="incomplete"`` — never a partial PID map.
 
@@ -945,7 +1034,19 @@ def generate_whole_chapter(
         except Exception:  # noqa: BLE001 — diagnostics hook, never breaks generation
             LOG.debug("whole-chapter live reasoning clear failed", exc_info=True)
 
-    template = _TEMPLATES[role]
+    # translator-line-output: the whole-chapter generator uses ONLY the
+    # whole-chapter line template (never the shared chunked JSON template).
+    # The new template version + instructions enter PromptBundle identity, so
+    # a prior JSON-contract cached outcome hashes differently and cannot be
+    # reused as if produced under the line contract.
+    try:
+        template = _WHOLE_CHAPTER_TEMPLATES[role]
+    except KeyError:
+        raise ValueError(
+            f"generate_whole_chapter: role {role!r} has no whole-chapter "
+            f"line template; supported roles are "
+            f"{sorted(_WHOLE_CHAPTER_TEMPLATES)}"
+        ) from None
     risk = _whole_chapter_risk(source, glossary)
     required_risk_feature_codes = tuple(
         sorted({feature.code for feature in risk.features} & REQUIRED_RISK_CATEGORIES)
@@ -1067,7 +1168,9 @@ def generate_whole_chapter(
         _emit_reasoning(attempt)
 
         try:
-            translation = validate_whole_chapter_raw(raw, pid_map)
+            # translator-line-output: line-protocol parsing only — the
+            # JSON-contract tolerant receiver is not consulted here.
+            translation = parse_whole_chapter_line_response(raw, pid_map)
         except ValueError as exc:
             last_error = GenerationError(
                 role,

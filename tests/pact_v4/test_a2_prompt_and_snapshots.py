@@ -261,9 +261,90 @@ def test_whole_chapter_glossary_filter_uses_full_chapter_text(tmp_path):
     assert "Paige" in dropped
 
 # ---------------------------------------------------------------------------
-# Snapshots: translations_repaired.json + translation_diffs.json (§7)
-#
-# Covered in tests/pact_v4/pipeline/test_v4_phase12_strict_runner_whole_chapter.py
-# (test_whole_chapter_writes_snapshots_with_identity_and_empty_diffs), where
-# the whole-chapter runner fixtures live.
+# translator-line-output: whole-chapter line template + scoped rendering
 # ---------------------------------------------------------------------------
+
+
+def test_whole_chapter_line_template_carries_verbatim_contract():
+    from pact_v4.phase2.prompts import BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+
+    line = BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+    assert line.role == "balanced_literary"
+    assert line.version == "pact-v4-prompt-balanced-literary-wc-line/v1"
+    assert line.version != BALANCED_LITERARY_V4.version
+    # The approved verbatim block is present exactly (TARGET wording kept).
+    verbatim = (
+        "OUTPUT CONTRACT — MANDATORY:\n"
+        "\n"
+        "Return only the translations for the PIDs in TARGET, in the exact order shown there.\n"
+        "Output exactly one line per TARGET PID, using this format:\n"
+        "\n"
+        "p00001: Первая переведённая строка.\n"
+        "p00002: Вторая переведённая строка.\n"
+        "\n"
+        "Preserve each TARGET PID exactly and output it exactly once.\n"
+        "Put exactly one space after the colon.\n"
+        "Keep each translation on a single line; do not merge or split segments.\n"
+        "Do not output context-only PIDs.\n"
+        "Do not output JSON, Markdown, headings, blank lines, notes, or commentary.\n"
+        "Do not add wrapper quotation marks around PIDs or translations.\n"
+        "Preserve punctuation and quotation marks that belong in the Russian translation."
+    )
+    assert verbatim in line.instructions
+    # The retired JSON contract block is gone: no second contract remains.
+    assert "OUTPUT CONTRACT — MANDATORY AND AUTHORITATIVE" not in line.instructions
+    assert "exactly one top-level JSON object" not in line.instructions
+    assert "The complete response must be valid JSON" not in line.instructions
+    # Everything before the contract is byte-identical to the shared template.
+    base = BALANCED_LITERARY_V4.instructions
+    marker = "OUTPUT CONTRACT — MANDATORY AND AUTHORITATIVE:"
+    assert line.instructions.startswith(base[: base.index(marker)])
+
+
+def test_whole_chapter_line_template_leaves_shared_template_untouched():
+    # Chunked JSON generation keeps its exact contract: the shared template
+    # still mandates one JSON object and knows nothing about line output.
+    instructions = BALANCED_LITERARY_V4.instructions
+    assert "OUTPUT CONTRACT — MANDATORY AND AUTHORITATIVE" in instructions
+    assert "exactly one top-level JSON object" in instructions
+    assert "PID: translation" not in instructions
+
+
+def _wc_bundle():
+    import dataclasses
+
+    from pact_v4.phase2.prompts import BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+
+    return dataclasses.replace(
+        _bundle(), template=BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+    )
+
+
+def test_render_prompt_whole_chapter_labels_target_and_line_checks():
+    rendered = render_prompt(_wc_bundle())
+    # Architect decision: the source block carries the TARGET alias so the
+    # verbatim contract's TARGET boundary is unambiguous.
+    assert "TARGET (OWNED_SOURCE" in rendered
+    assert "TARGET PID" in rendered
+    # Line-protocol output checks, no JSON mandate.
+    assert "`PID: translation` line per TARGET PID" in rendered
+    assert "exactly one valid JSON object" not in rendered
+    assert "Before emitting the translation," in rendered
+    # All fidelity/risk checks retained verbatim.
+    assert "locked glossary spelling/transliteration" in rendered
+    assert "narrator/character gender, speakers, and referents" in rendered
+    assert "one source PID = one output PID" in rendered
+    assert "no missing, extra, duplicate, split, merged, or reordered PIDs" in rendered
+
+
+def test_render_prompt_chunked_mode_keeps_json_contract_byte_identical():
+    # Non-whole-chapter bundles render exactly as before: original header +
+    # JSON final check, so the chunked path is contract-compatible.
+    import dataclasses
+
+    rendered = render_prompt(dataclasses.replace(_bundle(), chunk_id="chunk0001"))
+    assert "OWNED_SOURCE (translate exactly these PIDs, in this order):" in rendered
+    assert "TARGET (OWNED_SOURCE" not in rendered
+    assert "exactly one valid JSON object and nothing else" in rendered
+    assert "Before emitting the JSON," in rendered
+    assert "`PID: translation` line per TARGET PID" not in rendered

@@ -1,12 +1,12 @@
 """V4.1 A1 contract tests for whole-chapter generation (generation.py).
 
-The whole-chapter contract (docs/plans/V4_1_WHOLE_CHAPTER_ARCHITECTURE_PLAN_RU.md
-§3.2/§8 A1): one model call per chapter against the full ordered PID map,
-strict ``{pid: text}`` JSON, exact PID set/order, and bounded retry on every
-failure class — malformed/missing/extra/reordered PID, empty/truncated JSON,
-and session abort (Gate 0: 2/5 calls aborted with finish=other/error). After
-the retry budget the result is an honest ``incomplete`` error, never a partial
-success.
+The whole-chapter contract (translator-line-output): one model call per
+chapter against the full ordered PID map, strict PID line-protocol output
+(exactly one ``PID: translated text`` line per TARGET PID, in exact source
+order — no JSON), exact PID set/order, and bounded retry on every failure
+class — malformed/missing/extra/reordered PID, blank/continuation lines,
+empty segment text, and session abort. After the retry budget the result is
+an honest ``incomplete`` error, never a partial success.
 """
 from __future__ import annotations
 
@@ -29,8 +29,12 @@ from pact_v4.phase2.generation import (
     GenerationParams,
     WholeChapterRetryPolicy,
     generate_whole_chapter,
+    parse_whole_chapter_line_response,
 )
-from pact_v4.phase2.prompts import BALANCED_LITERARY_V4
+from pact_v4.phase2.prompts import (
+    BALANCED_LITERARY_V4,
+    BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1,
+)
 from pact_v4.runtime.backend_protocol import CompletionError
 from pact_v4.runtime.snapshot_factory import (
     ChapterMemory,
@@ -90,8 +94,14 @@ def _params() -> GenerationParams:
     return GenerationParams(temperature=0.2, seed=7, max_tokens=32768, reasoning=2)
 
 
+def _lines(pids, texts=None):
+    """Render a valid whole-chapter line-protocol body for ``pids``."""
+    texts = texts or {pid: f"Перевод {pid}" for pid in pids}
+    return "\n".join(f"{pid}: {texts[pid]}" for pid in pids)
+
+
 class _EchoCaller:
-    """Model caller returning a valid full-chapter JSON map in source order."""
+    """Model caller returning a valid full-chapter line body in source order."""
 
     def __init__(self, *, abort_then_succeed: int = 0) -> None:
         self.calls: list = []
@@ -102,10 +112,7 @@ class _EchoCaller:
         if self._abort_then_succeed > 0:
             self._abort_then_succeed -= 1
             raise CompletionError("session abort (finish=other/error)")
-        return json.dumps(
-            {pid: f"Перевод {pid}" for pid, _ in bundle.owned_source},
-            ensure_ascii=False,
-        )
+        return _lines([pid for pid, _ in bundle.owned_source])
 
 
 class _ScriptedCaller:
@@ -160,9 +167,11 @@ def test_whole_chapter_generation_success_full_pid_exact_order(tmp_path):
     assert caller.calls[0].owned_pids == snapshot.pids
     assert caller.calls[0].left_context == ()
     assert caller.calls[0].right_context == ()
-    # The bundle uses the v3 balanced_literary template (A2: full §4 prompt
-    # with the inline BOOK CONTEXT / LOCKED GLOSSARY / STRICT-JSON contract).
-    assert caller.calls[0].template is BALANCED_LITERARY_V4
+    # The bundle uses the whole-chapter line template (translator-line-output:
+    # identical instructions to BALANCED_LITERARY_V4 except the OUTPUT
+    # CONTRACT block, new version) — never the shared chunked JSON template.
+    assert caller.calls[0].template is BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+    assert caller.calls[0].template is not BALANCED_LITERARY_V4
 
 
 @pytest.mark.parametrize(
@@ -180,37 +189,29 @@ def test_whole_chapter_pid_corruption_retries_then_honest_error(tmp_path, corrup
     pids = list(pid_map.pids)
     texts = {pid: f"Перевод {pid}" for pid in pids}
 
-    def _corrupt(payload: dict) -> str:
-        if corrupt == "missing":
-            payload.pop(pids[0])
-        elif corrupt == "extra":
-            payload["p_extra"] = "Лишний"
-        elif corrupt == "reordered":
-            # Re-insert the first PID at the end so the key order differs.
-            first_value = payload.pop(pids[0])
-            payload[pids[0]] = first_value
-        elif corrupt == "duplicate":
-            # Literal duplicate key in the raw JSON text — plain json.loads
-            # would collapse it to last-write-wins before validation can see
-            # it; _parse_ordered_pid_pairs keeps the raw pairs so the
-            # duplicate is detectable.
-            first = pids[0]
+    def _corrupt(kind: str) -> str:
+        if kind == "missing":
+            return _lines([pid for pid in pids if pid != pids[0]], texts)
+        if kind == "extra":
+            return _lines(pids, texts) + "\np_extra: Лишний"
+        if kind == "reordered":
+            return _lines([*pids[1:], pids[0]], texts)
+        if kind == "duplicate":
+            # Literal duplicate PID line — a parsed dict would collapse it
+            # to last-write-wins before validation can see it; the line
+            # parser keeps every record so the duplicate is detectable.
             return (
-                '{"' + first + '": "Первый", '
-                '"' + first + '": "Второй", '
-                + ",".join(
-                    f'"{pid}": {json.dumps(texts[pid], ensure_ascii=False)}'
-                    for pid in pids[1:]
-                )
-                + "}"
+                f"{pids[0]}: Первый\n"
+                f"{pids[0]}: Второй\n"
+                + "\n".join(f"{pid}: {texts[pid]}" for pid in pids[1:])
             )
-        return json.dumps(payload, ensure_ascii=False)
+        raise AssertionError(kind)
 
-    good = json.dumps(texts, ensure_ascii=False)
+    good = _lines(pids, texts)
     # Every attempt fails the same way (corrupt payload every time) -> the
     # bounded budget is exhausted and the run reports an honest incomplete
     # outcome, never a partial PID map.
-    caller = _ScriptedCaller([_corrupt(dict(texts))] * 3)
+    caller = _ScriptedCaller([_corrupt(corrupt)] * 3)
     outcome = generate_whole_chapter(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
         glossary=(), bible_text="", config=config, params=_params(),
@@ -224,7 +225,7 @@ def test_whole_chapter_pid_corruption_retries_then_honest_error(tmp_path, corrup
     assert len(caller.calls) == 3  # bounded: exactly max_attempts calls
     # A corrupt first attempt followed by a good one succeeds (transient
     # corruption is retried, not terminal).
-    caller2 = _ScriptedCaller([_corrupt(dict(texts)), good, good])
+    caller2 = _ScriptedCaller([_corrupt(corrupt), good, good])
     outcome2 = generate_whole_chapter(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
         glossary=(), bible_text="", config=config, params=_params(),
@@ -235,19 +236,52 @@ def test_whole_chapter_pid_corruption_retries_then_honest_error(tmp_path, corrup
     assert outcome2.candidates["balanced_literary"].pid_order() == pid_map.pids
 
 
+def _full_lines_with(pid_map, index, replacement):
+    """Valid line body with line ``index`` (0-based) replaced."""
+    lines = _lines(pid_map.pids).split("\n")
+    lines[index] = replacement
+    return "\n".join(lines)
+
+
 @pytest.mark.parametrize(
-    "raw",
+    "raw_kind",
     [
-        "",
-        "{",
-        '{"p00001": "Только один", }',
-        'not json at all',
-        '["an", "array"]',
+        "empty",
+        "whitespace",
+        "blank_middle",
+        "trailing_blank",
+        "continuation",
+        "no_colon",
+        "no_space",
+        "two_spaces",
+        "empty_text",
     ],
 )
-def test_whole_chapter_invalid_or_truncated_json_retries_then_honest_error(tmp_path, raw):
+def test_whole_chapter_malformed_lines_retry_then_honest_error(tmp_path, raw_kind):
+    # translator-line-output negative matrix (structural): every malformed
+    # line is rejected as invalid output (INVALID_JSON) — never attached to
+    # a neighboring segment — and the bounded budget is exhausted honestly.
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    pids = list(pid_map.pids)
+    if raw_kind == "empty":
+        raw = ""
+    elif raw_kind == "whitespace":
+        raw = "   \n  \n"
+    elif raw_kind == "blank_middle":
+        raw = _full_lines_with(pid_map, 3, "")
+    elif raw_kind == "trailing_blank":
+        raw = _lines(pids) + "\n\n"
+    elif raw_kind == "continuation":
+        raw = _lines(pids) + "\nпродолжение без PID и двоеточия"
+    elif raw_kind == "no_colon":
+        raw = _full_lines_with(pid_map, 0, f"{pids[0]} Перевод без двоеточия")
+    elif raw_kind == "no_space":
+        raw = _full_lines_with(pid_map, 0, f"{pids[0]}:Текст без пробела")
+    elif raw_kind == "two_spaces":
+        raw = _full_lines_with(pid_map, 0, f"{pids[0]}:  Текст с двумя пробелами")
+    else:  # empty_text
+        raw = _full_lines_with(pid_map, 0, f"{pids[0]}: ")
     caller = _ScriptedCaller([raw, raw, raw])
     outcome = generate_whole_chapter(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
@@ -261,124 +295,45 @@ def test_whole_chapter_invalid_or_truncated_json_retries_then_honest_error(tmp_p
     assert len(caller.calls) == 3
 
 
-def test_whole_chapter_pid_colon_comma_repaired_without_retry(tmp_path):
-    # JSON-REPAIR (t_34ceca50, run_remote_004): the whole-chapter generator
-    # occasionally emits `"p00082", "` (COMMA) instead of `"p00082": "`
-    # (COLON) after a PID key on a long output. The deterministic repair in
-    # _parse_ordered_pid_pairs fixes ALL occurrences, so a 400-PID body
-    # with one such error validates on the FIRST attempt — no retry, no
-    # wasted 92k-token regeneration.
-    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+def test_whole_chapter_translation_preserves_colons_and_punctuation(tmp_path):
+    # translator-line-output: only the FIRST colon is protocol syntax —
+    # later colons, commas, typographic quotes, and em-dashes belong to the
+    # Russian text and survive byte-for-byte (the old JSON failure modes
+    # around interior quotes/colons cannot occur: there is no JSON to break).
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    parts = []
-    for pid in pid_map.pids:
-        sep = ", " if pid == "p00082" else ": "
-        parts.append(f'"{pid}"{sep}"Перевод {pid}"')
-    broken_raw = "{" + ", ".join(parts) + "}"
-    assert ", " in broken_raw  # the model error is present in the raw body
-    caller = _ScriptedCaller([broken_raw])
-    outcome = generate_whole_chapter(
-        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
-        glossary=(), bible_text="", config=config, params=_params(),
-        model_caller=caller, cache=GenerationCache(),
-        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
-    )
-    assert outcome.status == "complete"
-    assert len(caller.calls) == 1  # repaired on the first attempt, no retry
-    candidate = outcome.candidates["balanced_literary"]
-    assert candidate.pid_order() == pid_map.pids
-    assert dict(candidate.translation)["p00082"] == "Перевод p00082"
-
-
-def test_whole_chapter_pid_colon_repair_skips_embedded_literals(tmp_path):
-    # F1 regression (t_0626267d): a translation VALUE that legitimately
-    # contains the literal `"p12345", "` (with escaped quotes) must survive
-    # the pid-colon repair byte-for-byte, while a real broken key
-    # (`"p00082", "`) in the SAME object is still fixed. The old global
-    # regex silently rewrote the embedded literal to `"p12345": "`, i.e.
-    # silently corrupted the chapter text even though the parse succeeded.
-    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
-    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    parts = []
-    for pid in pid_map.pids:
-        if pid == "p00001":
-            # Value embeds the collision literal with escaped quotes:
-            #   Перевод p00001: цитата "p12345", "закрыто"
-            value = 'Перевод p00001: цитата \\"p12345\\", \\"закрыто\\"'
-        elif pid == "p00082":
-            value = "Перевод p00082"
-        else:
-            value = f"Перевод {pid}"
-        sep = ", " if pid == "p00082" else ": "
-        parts.append(f'"{pid}"{sep}"{value}"')
-    broken_raw = "{" + ", ".join(parts) + "}"
-    caller = _ScriptedCaller([broken_raw])
-    outcome = generate_whole_chapter(
-        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
-        glossary=(), bible_text="", config=config, params=_params(),
-        model_caller=caller, cache=GenerationCache(),
-        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
-    )
-    assert outcome.status == "complete"
-    assert len(caller.calls) == 1
-    candidate = outcome.candidates["balanced_literary"]
-    assert candidate.pid_order() == pid_map.pids
-    translation = dict(candidate.translation)
-    # The broken key is repaired...
-    assert translation["p00082"] == "Перевод p00082"
-    # ...and the embedded literal in p00001 is UNCHANGED (the value was
-    # parsed as `Перевод p00001: цитата "p12345", "закрыто"`).
-    assert translation["p00001"] == 'Перевод p00001: цитата "p12345", "закрыто"'
-
-
-def test_whole_chapter_ascii_quote_defect_repaired_without_retry(tmp_path):
-    # REPAIR-RECEIVER (t_b590c24f, run_remote_007): the THIRD whole-chapter
-    # JSON defect class — a typographic „ inside a value closed with an
-    # ASCII `"` (p00087: `«Когда я думаю о „побеге из дома", ...»`) breaks
-    # json.loads. The pair extractor splits on the keys and keeps the
-    # interior quote, so a 400-PID body with the defect validates on the
-    # FIRST attempt — no retry, no wasted 92k-token regeneration.
-    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
-    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    parts = []
-    for pid in pid_map.pids:
-        if pid == "p00087":
-            value = "«Когда я думаю о „побеге из дома\", я всегда представляю детей»."
-        else:
-            value = f"Перевод {pid}"
-        parts.append(f'"{pid}": "{value}"')
-    broken_raw = "{" + ", ".join(parts) + "}"
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(broken_raw)  # the defect really breaks strict JSON
-    caller = _ScriptedCaller([broken_raw])
-    outcome = generate_whole_chapter(
-        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
-        glossary=(), bible_text="", config=config, params=_params(),
-        model_caller=caller, cache=GenerationCache(),
-        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
-    )
-    assert outcome.status == "complete"
-    assert len(caller.calls) == 1  # recovered on the first attempt, no retry
-    translation = dict(outcome.candidates["balanced_literary"].translation)
-    assert translation["p00087"] == (
+    texts = {pid: f"Перевод {pid}" for pid in pid_map.pids}
+    texts["p00001"] = 'Перевод p00001: цитата "p12345", "закрыто"'
+    texts["p00002"] = (
         "«Когда я думаю о „побеге из дома\", я всегда представляю детей»."
     )
+    texts["p00003"] = "Время — две минуты первого: 00:02, точно."
+    raw = _lines(pid_map.pids, texts)
+    caller = _ScriptedCaller([raw])
+    outcome = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome.status == "complete"
+    assert len(caller.calls) == 1  # first attempt, no retry
+    translation = dict(outcome.candidates["balanced_literary"].translation)
+    assert translation["p00001"] == texts["p00001"]
+    assert translation["p00002"] == texts["p00002"]
+    assert translation["p00003"] == texts["p00003"]
 
 
-def test_whole_chapter_truncation_below_coverage_fails_closed(tmp_path):
-    # REPAIR-RECEIVER fail-closed: a 400-key body cut off mid-object after
-    # key 350 (unclosed JSON) -> the extractor finds 350 keys, 350/400 =
-    # 87.5% < 90% coverage -> honest INVALID_JSON (bounded retry), never a
-    # partial PID map.
-    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
+def test_whole_chapter_old_json_contract_body_is_rejected(tmp_path):
+    # translator-line-output: a response in the RETIRED JSON contract must
+    # fail closed (PID mismatch — the brace/quote prefix is not a TARGET
+    # PID), never be silently accepted as a translation map.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    parts = [
-        f'"{pid}": "Перевод {pid}"' for pid in pid_map.pids[:350]
-    ]
-    truncated_raw = "{" + ", ".join(parts)  # cut mid-object: no closing brace
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(truncated_raw)  # genuinely unclosed body
-    caller = _ScriptedCaller([truncated_raw, truncated_raw, truncated_raw])
+    raw = json.dumps(
+        {pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False
+    )
+    caller = _ScriptedCaller([raw, raw, raw])
     outcome = generate_whole_chapter(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
         glossary=(), bible_text="", config=config, params=_params(),
@@ -388,50 +343,19 @@ def test_whole_chapter_truncation_below_coverage_fails_closed(tmp_path):
     assert outcome.status == "incomplete"
     assert outcome.candidates == {}
     err = outcome.errors["balanced_literary"]
-    assert err.code == GenerationErrorCode.INVALID_JSON
-    assert len(caller.calls) == 3  # bounded retry
-
-
-def test_whole_chapter_single_missing_key_99_pct_then_pid_mismatch(tmp_path):
-    # REPAIR-RECEIVER: 399 of 400 keys (body cut mid-object after the last
-    # key, so json.loads fails and the extractor runs) -> 399/400 = 99.75%
-    # >= 90% -> the extractor accepts, then the exact PID-set validation
-    # catches the missing key (PID_MISMATCH) — the last value is
-    # sanity-checked and the missing PID is never silently accepted as a
-    # partial map.
-    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
-    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    parts = [
-        f'"{pid}": "Перевод {pid}"' for pid in pid_map.pids[:399]
-    ]
-    raw = "{" + ", ".join(parts)  # cut mid-object after key 399
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(raw)
-    caller = _ScriptedCaller([raw, raw, raw])
-    outcome = generate_whole_chapter(
-        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
-        glossary=(), bible_text="", config=config, params=_params(),
-        model_caller=caller, cache=GenerationCache(),
-        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
-    )
-    assert outcome.status == "incomplete"
-    err = outcome.errors["balanced_literary"]
     assert err.code == GenerationErrorCode.PID_MISMATCH
     assert len(caller.calls) == 3
 
 
-def test_whole_chapter_missing_key_below_coverage_fails_closed(tmp_path):
-    # REPAIR-RECEIVER: a small map with keys dropped mid-body (unclosed) —
-    # 8 of 10 keys = 80% < 90% -> honest INVALID_JSON -> bounded retry.
-    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=10)
+def test_whole_chapter_truncated_line_body_fails_closed(tmp_path):
+    # translator-line-output fail-closed: a 400-line body cut after line 350
+    # is a PID mismatch (missing PIDs, never a partial map), and a body cut
+    # mid-separator (dangling PID with no colon/text) is invalid output —
+    # both exhaust the bounded budget honestly.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=400)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    parts = [
-        f'"{pid}": "Перевод {pid}"' for pid in pid_map.pids[:8]
-    ]
-    raw = "{" + ", ".join(parts)  # cut mid-object: no closing brace
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(raw)
-    caller = _ScriptedCaller([raw, raw, raw])
+    cut_lines = _lines(pid_map.pids[:350])
+    caller = _ScriptedCaller([cut_lines, cut_lines, cut_lines])
     outcome = generate_whole_chapter(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
         glossary=(), bible_text="", config=config, params=_params(),
@@ -439,9 +363,104 @@ def test_whole_chapter_missing_key_below_coverage_fails_closed(tmp_path):
         retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
     )
     assert outcome.status == "incomplete"
-    err = outcome.errors["balanced_literary"]
-    assert err.code == GenerationErrorCode.INVALID_JSON
-    assert len(caller.calls) == 3
+    assert outcome.candidates == {}
+    assert outcome.errors["balanced_literary"].code == GenerationErrorCode.PID_MISMATCH
+    assert len(caller.calls) == 3  # bounded retry
+
+    dangling = cut_lines + "\np00351"
+    caller2 = _ScriptedCaller([dangling, dangling, dangling])
+    outcome2 = generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller2, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    assert outcome2.status == "incomplete"
+    assert outcome2.errors["balanced_literary"].code == GenerationErrorCode.INVALID_JSON
+    assert len(caller2.calls) == 3
+
+
+def test_whole_chapter_malformed_pid_is_pid_mismatch(tmp_path):
+    # translator-line-output: a PID that is not exactly the expected TARGET
+    # PID (wrong digits, wrong case, surrounding whitespace) surfaces as a
+    # PID-set violation (missing + extra), never a silent accept.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    pids = list(pid_map.pids)
+    raws = [
+        _full_lines_with(pid_map, 0, "p00X01: Текст с плохим PID"),
+        _full_lines_with(pid_map, 0, "P00001: Текст в другом регистре"),
+        _full_lines_with(pid_map, 0, f" {pids[0]}: Текст с пробелом перед PID"),
+    ]
+    for raw in raws:
+        caller = _ScriptedCaller([raw, raw, raw])
+        outcome = generate_whole_chapter(
+            source=source, snapshot=snapshot, chunk_plan=chunk_plan,
+            pid_map=pid_map, glossary=(), bible_text="", config=config,
+            params=_params(), model_caller=caller, cache=GenerationCache(),
+            retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        )
+        assert outcome.status == "incomplete"
+        assert outcome.errors["balanced_literary"].code == GenerationErrorCode.PID_MISMATCH
+        assert len(caller.calls) == 3
+
+
+def test_whole_chapter_line_contract_bound_to_cache_identity(tmp_path):
+    # translator-line-output task 1.5: the line template/version enters the
+    # bundle identity, so a prior JSON-contract cached outcome hashes
+    # differently and can never be reused under the line contract.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    caller = _EchoCaller()
+    generate_whole_chapter(
+        source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
+        glossary=(), bible_text="", config=config, params=_params(),
+        model_caller=caller, cache=GenerationCache(),
+        retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+    )
+    line_bundle = caller.calls[0]
+    assert line_bundle.template is BALANCED_LITERARY_WHOLE_CHAPTER_LINE_V1
+    json_bundle_payload = dict(line_bundle._identity_payload())
+    json_bundle_payload["template_version"] = BALANCED_LITERARY_V4.version
+    json_bundle_payload["template_instructions_hash"] = canonical_json_hash(
+        BALANCED_LITERARY_V4.instructions
+    )
+    assert (
+        canonical_json_hash(json_bundle_payload)
+        != line_bundle.bundle_hash
+    )
+
+
+def test_whole_chapter_rejects_role_without_line_template(tmp_path):
+    # translator-line-output isolation: only roles with a whole-chapter line
+    # template can generate whole-chapter output — anything else fails closed
+    # before any model call instead of emitting guaranteed-invalid output.
+    source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
+    caller = _EchoCaller()
+    with pytest.raises(ValueError, match="no whole-chapter line template"):
+        generate_whole_chapter(
+            role="fidelity_first", source=source, snapshot=snapshot,
+            chunk_plan=chunk_plan, pid_map=pid_map, glossary=(), bible_text="",
+            config=config, params=_params(), model_caller=caller,
+            cache=GenerationCache(),
+            retry=WholeChapterRetryPolicy(max_attempts=3, base_delay_seconds=0),
+        )
+    assert caller.calls == []
+
+
+def test_parse_whole_chapter_line_response_tolerates_crlf_and_final_newline(tmp_path):
+    # A CRLF body and a single trailing newline are line terminators, not
+    # blank lines; the parsed mapping equals the in-memory candidate shape.
+    _source, _snapshot, chunk_plan, _config = _artifacts(tmp_path, n=3)
+    pid_map = WholeChapterPidMap.derive(chunk_plan, _snapshot)
+    raw = "\r\n".join(
+        f"{pid}: Перевод {pid}" for pid in pid_map.pids
+    ) + "\n"
+    parsed = parse_whole_chapter_line_response(raw, pid_map)
+    assert parsed == tuple(
+        (pid, f"Перевод {pid}") for pid in pid_map.pids
+    )
 
 
 def test_whole_chapter_session_abort_retried_then_honest_error(tmp_path):
@@ -601,7 +620,7 @@ class _ReasoningCaller:
 def test_whole_chapter_reasoning_sink_receives_successful_attempt(tmp_path):
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    good = _lines(pid_map.pids)
     caller = _ReasoningCaller(
         [good],
         ["model thought about register and gender here"],
@@ -625,9 +644,10 @@ def test_whole_chapter_reasoning_sink_receives_truncated_retry(tmp_path):
     # reasoning must also arrive — each attempt is one sink call.
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    good = _lines(pid_map.pids)
+    truncated = _lines(pid_map.pids[:7]) + "\np00008"  # cut mid-separator
     caller = _ReasoningCaller(
-        ["{truncated json", good],
+        [truncated, good],
         ["attempt 0: thinking cut off mid-argument", "attempt 1: revised approach"],
     )
     received = []
@@ -650,11 +670,12 @@ def test_whole_chapter_raw_sink_receives_every_attempt(tmp_path):
     # RAW-SINK acceptance (architect, run_remote_004/005): the raw model
     # response of EVERY attempt — including a truncated first attempt that
     # would otherwise vanish — must reach the sink, so a disk trail exists
-    # for TruncatedJSONError diagnosis (the run_011 lesson for generation).
+    # for invalid-output diagnosis (the run_011 lesson for generation).
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
-    caller = _ReasoningCaller(["{truncated json", good], ["", ""])
+    good = _lines(pid_map.pids)
+    truncated = _lines(pid_map.pids[:7]) + "\np00008"  # cut mid-separator
+    caller = _ReasoningCaller([truncated, good], ["", ""])
     received = []
     outcome = generate_whole_chapter(
         source=source, snapshot=snapshot, chunk_plan=chunk_plan, pid_map=pid_map,
@@ -666,21 +687,21 @@ def test_whole_chapter_raw_sink_receives_every_attempt(tmp_path):
     assert outcome.status == "complete"
     assert caller.calls == 2
     assert received == [
-        (0, "{truncated json"),  # the failed attempt's raw text survives
+        (0, truncated),  # the failed attempt's raw text survives
         (1, good),
     ]
 
 
 def test_whole_chapter_raw_sink_fallback_after_truncated_retry(tmp_path):
-    # RAW-SINK fallback (architect, run_remote_006): when the transport
-    # returns text but classify rejects it (TruncatedJSONError), the raw
+    # RAW-SINK fallback (architect, run_remote_006): when the generation
+    # layer rejects an attempt's text (line-contract violation), the raw
     # survives in the caller's ``last_raw`` and the sink must still fire —
     # the disk trail exists even for a rejected body. Without the fallback
     # the raw vanishes (the bug that made 004/005/006 diagnosis guesswork).
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
-    broken = '{"p00001": "текст", "p00002", "обрыв"}'
+    good = _lines(pid_map.pids)
+    broken = _lines(pid_map.pids[:4]) + "\n\n" + _lines(pid_map.pids[4:])
     caller = _ReasoningCaller([broken, good], ["", ""])
     received = []
     outcome = generate_whole_chapter(
@@ -703,7 +724,7 @@ def test_whole_chapter_reasoning_sink_absent_reasoning_is_empty(tmp_path):
     # the sink still fires per attempt so the runner can record presence=0.
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    good = _lines(pid_map.pids)
     caller = _ScriptedCaller([good])
     received = []
     outcome = generate_whole_chapter(
@@ -803,7 +824,7 @@ def test_whole_chapter_live_reasoning_writer_grows_file_during_call(tmp_path):
 
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    good = _lines(pid_map.pids)
     reason_path = tmp_path / "out" / "whole_chapter_reasoning.txt"
     caller = _LiveChunkCaller([good], ["полный текст размышлений"], reason_path=reason_path)
 
@@ -838,7 +859,7 @@ def test_whole_chapter_live_reasoning_writer_respects_stub_caller(tmp_path):
     # invoked and the post-completion reasoning_sink path is preserved.
     source, snapshot, chunk_plan, config = _artifacts(tmp_path, n=8)
     pid_map = WholeChapterPidMap.derive(chunk_plan, snapshot)
-    good = json.dumps({pid: f"Перевод {pid}" for pid in pid_map.pids}, ensure_ascii=False)
+    good = _lines(pid_map.pids)
     caller = _ScriptedCaller([good])
     factory_calls = []
     received = []
