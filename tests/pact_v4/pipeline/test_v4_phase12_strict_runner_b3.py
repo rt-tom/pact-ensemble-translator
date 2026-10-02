@@ -76,6 +76,7 @@ class _B3MockBackend(CompletionBackend):
     _BINDINGS = {
         "default": "qwen-3.6-35b",
         "generator": "gemma-4-26b",
+        "repair": "gemma-4-26b",
         "qwen_audit": "qwen-3.6-35b",
         "fidelity_reviewer": "qwen-3.6-35b",
         "entity_extractor": "qwen-3.6-35b",

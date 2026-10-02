@@ -435,16 +435,18 @@ def test_qwen_audit_evaluator_sends_rendered_prompt_and_returns_raw_text():
 
 def test_qwen_audit_evaluator_uses_max_tokens_floor_with_per_pid_headroom():
     # The Qwen max_tokens fix (PR #96) applies to the audit too: the floor
-    # is 16384 and max_tokens scales with chunk size on top of it, capped at
-    # MAX_TOKENS_CEILING -- a large chunk's audit response must not truncate.
+    # comes from shared role_budgets qwen_audit (floor_plus_per_item,
+    # local-matrix-v2: floor 22192 includes the reasoning headroom) and
+    # max_tokens scales with chunk size on top of it (128 per PID), capped
+    # at the role ceiling -- a large chunk's audit response must not truncate.
     canned = json.dumps({"issues": []}, ensure_ascii=False)
     backend = ScriptedBackend([_text_response(canned)])
     evaluator = BackendQwenAuditEvaluator(backend)
     evaluator(chunk_id="c", source=_audit_source(), translation=_audit_translation())
     request = backend.requests[0]
-    assert request.max_output_tokens >= 12000
-    # 2 PIDs * 128 headroom added to the 16384 floor.
-    assert request.max_output_tokens == 12000 + 128 * 2
+    assert request.max_output_tokens >= 22192
+    # 2 PIDs * 128 headroom added to the 22192 floor.
+    assert request.max_output_tokens == 22192 + 128 * 2
 
 
 def test_qwen_audit_evaluator_retries_truncated_json_then_succeeds():

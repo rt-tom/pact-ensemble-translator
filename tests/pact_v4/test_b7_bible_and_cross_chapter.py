@@ -316,6 +316,7 @@ class TestMemoryPromotion:
         tmp_path.mkdir(parents=True, exist_ok=True)
         (tmp_path / "glossary.json").write_text("{}", encoding="utf-8")
         (tmp_path / "book_memory.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "chapter_index.json").write_text("{}", encoding="utf-8")
         (tmp_path / "observations.json").write_text("{}", encoding="utf-8")
         return MemoryManager(str(tmp_path))
 
@@ -377,6 +378,7 @@ class TestBookRunWrapper:
             json.dumps({"pov": {"gender": "male"}}, ensure_ascii=False),
             encoding="utf-8",
         )
+        (memory / "chapter_index.json").write_text("{}", encoding="utf-8")
         (memory / "observations.json").write_text("{}", encoding="utf-8")
         return memory
 
