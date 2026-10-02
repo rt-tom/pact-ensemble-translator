@@ -4,14 +4,20 @@ A small, owner-approved follow-up to `local-matrix-v2`, not a replacement of the
 
 ## 1. Target registry profiles
 
-`gemma31`: retain the current `model_path` and `model_name` (`C:/llama-cpp/models/Gemma4-31B-Q5/gemma-4-31B-it-UD-Q5_K_XL.gguf`) and existing model-owned request sampling. Desired `server_args` (ordered; `-fitt 512` already exists):
+### `gemma31` — current QAT-MTP profile (authoritative)
+
+`model_key: gemma31` remains (no `--alias` added). `model_path`/`model_name` become `C:/llama-cpp/models/Gemma4-31B-QAT-Q4/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf` and its matching basename. Keep reasoning base `2000` and all existing role-budget deltas/sampling (normative retained set in the spec); apply only: `-fitt 1280`; `-b/-ub 2048`; `-ctv q8_0`; `-t 6`. Add the external MTP draft block first:
 
 ```text
--fit on -fitt 512 -b 1024 -ub 1024 -ctk q8_0 -ctv q4_0 -t 12 -tb 12
+--spec-type draft-mtp --spec-draft-model C:/llama-cpp/models/Gemma4-31B-QAT-Q4/MTP/mtp-gemma-4-31B-it.gguf
+--spec-draft-n-max 3 --spec-draft-device SYCL0 --spec-draft-ngl all
+-fit on -fitt 1280 -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 -t 6 -tb 12
 -fa on --load-mode mmap -c 44000 -np 1 --reasoning on
 --reasoning-budget-enable --reasoning-budget 2000
 --cache-ram 0 --ctx-checkpoints 0 --jinja
 ```
+
+There is no `-m`, main `--device`, host, port, or `--alias` in `server_args`: the lifecycle adapter injects model/device/host/port; only draft-specific options belong here. `--spec-draft-device SYCL0` is a draft-offload selector, not a duplicate of the injected main `--device`. The new Gemma31 external draft is translator-side and outside the reviewer-only B3 gate, which is unchanged. Qwen38 and ordinary-`qwen` profiles in §1 below are unchanged.
 
 `qwen38`: `model_path` and `model_name` become `C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0.gguf` and `Qwen3.8-27B-Q4_0.gguf`. Keep the current model-owned request sampling (`temperature 0.2`, `top_p 0.95`, `top_k 20`, `min_p 0.0`, `presence_penalty 0.0`). Desired `server_args` (ordered; the three reasoning-budget/effort flags are retained from Pact, not claimed to have been tested in the owner's manual command):
 
@@ -23,7 +29,7 @@ A small, owner-approved follow-up to `local-matrix-v2`, not a replacement of the
 -np 1 -fa on --jinja --cache-ram 0 --ctx-checkpoints 0
 ```
 
-There is no `-md`, `--spec-draft-ngl`, `--spec-draft-device`, `-dev`, or `--device` in either `server_args`. Owner-approved addendum: in the ordinary `qwen` Qwen3.6 profile (`C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`; registry, `configs/runtime_local.example.yaml`, and `QWEN_SERVER_ARGS`) remove **only** `--spec-type draft-mtp`. Its main model file/path, `--reasoning-budget-enable`, other ordered args, role budgets and request sampling stay as before. Absence of a draft selector uses llama.cpp's documented default `none`; if the RT fork or environment can override it, verify on RT before any owner-approved run rather than claiming that static args prove drafting is off. No registry schema, lifecycle adapter, role budgets, request body, provider endpoints or aliases change. Preserve `gemma31` base 2000 / generator delta +2000 and `qwen38` base 8192 / qwen_audit and entity_extractor delta +2000; the router still replaces the server budget and relaunches when effective reasoning changes.
+There is no `-md`, `--spec-draft-ngl`, `--spec-draft-device`, `-dev`, or `--device` in the `qwen38` `server_args` (addendum B gives `gemma31` its own external-draft flags; see above). Owner-approved addendum: in the ordinary `qwen` Qwen3.6 profile (`C:/llama-cpp/models/Qwen3.6-35B-A3B-MTP/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`; registry, `configs/runtime_local.example.yaml`, and `QWEN_SERVER_ARGS`) remove **only** `--spec-type draft-mtp`. Its main model file/path, `--reasoning-budget-enable`, other ordered args, role budgets and request sampling stay as before. Absence of a draft selector uses llama.cpp's documented default `none`; if the RT fork or environment can override it, verify on RT before any owner-approved run rather than claiming that static args prove drafting is off. No registry schema, lifecycle adapter, role budgets, request body, provider endpoints or aliases change. Preserve `gemma31` base 2000 / generator delta +2000 and `qwen38` base 8192 / qwen_audit and entity_extractor delta +2000; the router still replaces the server budget and relaunches when effective reasoning changes.
 
 ## 2. B3 gate and evidence
 
