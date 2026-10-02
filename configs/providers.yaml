@@ -17,7 +17,7 @@
 #   generator         translator  74048     gemma 2048 / gemma31 2000       gemma 0.2/seed7 | gemma31 1.0/0.95/64/0.0/1.0  4048 on gemma (2048+2000)
 #   repair            translator  18432*    same as generator               same                                             2000 on gemma31 (2000+0)
 #   gemma_audit       translator  6144      same                            same                                             2000
-#   formatting        reviewer    16192*    qwen 8192 / qwen38 8192+xhigh    qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           8192 on qwen38 (8192+0)
+#   formatting        reviewer    16192*    qwen 8192 / qwen38 8192+xhigh    qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           0 via reasoning_budget_override (explicit exception to base+delta)
 #   qwen_audit        reviewer    22192*    same                            same                                             10192 (8192+2000)
 #   fidelity_reviewer reviewer    24576*    same                            same                                             8192
 #   russian_selector  reviewer    9216      same                            same                                             8192
@@ -40,7 +40,7 @@
 role_budgets:
   generator: {max_output_tokens: 74048, reasoning_budget: 2000}
   repair: {max_output_tokens: 18432, output_budget: {mode: floor_plus_per_item, floor_tokens: 18432, per_item_tokens: 128, ceiling: 26624}, reasoning_budget: 0}
-  formatting: {max_output_tokens: 16192, output_budget: {mode: span_formula, base_tokens: 16192, per_span_tokens: 64, ceiling: 32768}, reasoning_budget: 0}
+  formatting: {max_output_tokens: 16192, output_budget: {mode: span_formula, base_tokens: 16192, per_span_tokens: 64, ceiling: 32768}, reasoning_budget: 0, reasoning_budget_override: 0}
   gemma_audit: {max_output_tokens: 6144, reasoning_budget: 0}
   qwen_audit: {max_output_tokens: 22192, output_budget: {mode: floor_plus_per_item, floor_tokens: 22192, per_item_tokens: 128, ceiling: 34768}, reasoning_budget: 2000}
   fidelity_reviewer: {max_output_tokens: 24576, output_budget: {mode: floor_plus_per_item, floor_tokens: 24576, per_item_tokens: 128, ceiling: 32768}, reasoning_budget: 0}

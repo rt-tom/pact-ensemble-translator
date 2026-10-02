@@ -151,14 +151,18 @@ def test_diagnostics_artifacts_include_finish_reason_usage(tmp_path: Path):
 def test_diagnostics_on_parse_failure_logs_and_writes_meta(tmp_path: Path, caplog):
     blocks = _blocks(1, n_pids=1)
     translations = {b.pid: "привет мир" for b in blocks}
-    # Bad JSON triggers parse failure
+    # Bad JSON triggers parse failure (simplify-book-formatting D5: invalid
+    # whole response splits only the failed group; a single-span group is
+    # unsplittable and becomes debt — never an identical retry).
     gen = _FakeGen(content="not json at all", finish_reason="length", usage={"prompt_tokens": 10}, reasoning="bad", response_format_attempted=True)
     client = _FakeClient(gen)
     import logging
     caplog.set_level(logging.WARNING)
-    resolve_format_mappings(client, {"max_tokens": None, "generation_retries": 1}, blocks, translations, out_dir=tmp_path)
-    # Should have warning with finish_reason and usage
-    assert any("finish_reason" in rec.message and "length" in rec.message for rec in caplog.records)
+    result = resolve_format_mappings(client, {"max_tokens": None, "generation_retries": 1}, blocks, translations, out_dir=tmp_path)
+    assert result == {}
+    assert len(client.calls) == 1
+    # Should have warning about the invalid response
+    assert any("invalid response" in rec.message for rec in caplog.records)
     meta_path = tmp_path / "formatting_batch1_meta.json"
     assert meta_path.exists()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -292,13 +296,12 @@ def test_formatting_backend_client_propagates_response_format_from_metadata(tmp_
 
 
 def test_retry_preserves_failed_attempt_artifacts(tmp_path: Path):
-    """v41 round2: retry must not overwrite failed-attempt diagnostics; per-attempt files retained."""
-    blocks = _blocks(1, n_pids=1)
+    """v41 round2 (D5 split semantics): failed whole-group diagnostics retained; halves retried."""
+    # simplify-book-formatting D5: an invalid whole-group response splits only
+    # the failed group (never an identical retry); each half then succeeds.
+    blocks = _blocks(2, n_pids=2)
     translations = {b.pid: "привет мир" for b in blocks}
-    pid = blocks[0].pid
-
-    # First attempt: invalid JSON (parse failure) with reasoning "bad1" and finish_reason length
-    # Second attempt: valid JSON with reasoning "good2"
+    pid0, pid1 = blocks[0].pid, blocks[1].pid
     bad_gen = _FakeGen(
         content="not json at all",
         finish_reason="length",
@@ -306,14 +309,15 @@ def test_retry_preserves_failed_attempt_artifacts(tmp_path: Path):
         reasoning="bad1",
         response_format_attempted=True,
     )
-    good_content = json.dumps({"mappings": [{"pid": pid, "span_id": "em00", "target_text": "привет", "occurrence": 1}]})
-    good_gen = _FakeGen(
-        content=good_content,
-        finish_reason="stop",
-        usage={"prompt_tokens": 10, "completion_tokens": 5},
-        reasoning="good2",
-        response_format_attempted=True,
-    )
+
+    def _good(pid):
+        return _FakeGen(
+            content=json.dumps({"mappings": [{"pid": pid, "span_id": "em00", "target_text": "привет", "occurrence": 1}]}),
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            reasoning="good",
+            response_format_attempted=True,
+        )
 
     class _SeqClient:
         def __init__(self, gens):
@@ -323,88 +327,59 @@ def test_retry_preserves_failed_attempt_artifacts(tmp_path: Path):
             self.calls.append(label)
             return self.gens[len(self.calls) - 1]
 
-    client = _SeqClient([bad_gen, good_gen])
+    client = _SeqClient([bad_gen, _good(pid0), _good(pid1)])
     result = resolve_format_mappings(client, {"max_tokens": None, "generation_retries": 2}, blocks, translations, out_dir=tmp_path)
-    # Should have succeeded on second attempt
-    assert result[(pid, "em00")][0] == "привет"
-    assert len(client.calls) == 2
-
-    # Per-attempt files must exist for both attempts
-    assert (tmp_path / "formatting_batch1_attempt1_raw.txt").exists()
-    assert (tmp_path / "formatting_batch1_attempt2_raw.txt").exists()
-    assert (tmp_path / "formatting_batch1_attempt1_reasoning.txt").read_text(encoding="utf-8") == "bad1"
-    assert (tmp_path / "formatting_batch1_attempt2_reasoning.txt").read_text(encoding="utf-8") == "good2"
-    # Attempt1 meta must capture length finish_reason, attempt2 stop
-    meta1 = json.loads((tmp_path / "formatting_batch1_attempt1_meta.json").read_text(encoding="utf-8"))
-    meta2 = json.loads((tmp_path / "formatting_batch1_attempt2_meta.json").read_text(encoding="utf-8"))
-    assert meta1["finish_reason"] == "length"
-    assert meta1["attempt"] == 1
-    assert meta2["finish_reason"] == "stop"
-    assert meta2["attempt"] == 2
-    # Canonical should reflect final (successful) attempt
-    assert (tmp_path / "formatting_batch1_raw.txt").read_text(encoding="utf-8") == good_content
-    assert (tmp_path / "formatting_batch1_reasoning.txt").read_text(encoding="utf-8") == "good2"
-    # Canonical meta should reflect last attempt
-    meta_canonical = json.loads((tmp_path / "formatting_batch1_meta.json").read_text(encoding="utf-8"))
-    assert meta_canonical["attempt"] == 2
-    assert meta_canonical["finish_reason"] == "stop"
-
-
-def test_retry_parse_failure_then_transport_failure_no_stale_generation(tmp_path: Path):
-    """HIGH round3: parse-failure followed by transport failure must not reuse attempt1's generation.
-    Before fix, attempt2's artifacts/log/meta reused attempt1's raw/reasoning/finish_reason."""
-    blocks = _blocks(1, n_pids=1)
-    translations = {b.pid: "привет мир" for b in blocks}
-
-    bad_gen = _FakeGen(
-        content="not json at all",
-        finish_reason="length",
-        usage={"prompt_tokens": 10},
-        reasoning="bad1",
-        response_format_attempted=True,
-    )
-
-    class _SeqFailClient:
-        def __init__(self, first_gen):
-            self.first_gen = first_gen
-            self.calls = 0
-
-        def complete(self, messages, cfg, max_tokens, label=None):
-            self.calls += 1
-            if self.calls == 1:
-                return self.first_gen
-            raise RuntimeError("transport down")
-
-    client = _SeqFailClient(bad_gen)
-    result = resolve_format_mappings(
-        client, {"max_tokens": None, "generation_retries": 2}, blocks, translations, out_dir=tmp_path
-    )
-    # Both attempts failed -> empty result (debt)
-    assert result == {}
-    assert client.calls == 2
-
-    # Attempt1 diagnostics must preserve bad Gen
+    # Whole-group invalid -> split into halves, each half succeeds
+    assert result[(pid0, "em00")][0] == "привет"
+    assert result[(pid1, "em00")][0] == "привет"
+    assert len(client.calls) == 3
+    # Failed whole-group diagnostics preserved; halves have their own files
     assert (tmp_path / "formatting_batch1_attempt1_raw.txt").read_text(encoding="utf-8") == "not json at all"
     assert (tmp_path / "formatting_batch1_attempt1_reasoning.txt").read_text(encoding="utf-8") == "bad1"
     meta1 = json.loads((tmp_path / "formatting_batch1_attempt1_meta.json").read_text(encoding="utf-8"))
     assert meta1["finish_reason"] == "length"
+    assert (tmp_path / "formatting_batch2_attempt1_raw.txt").exists()
+    assert (tmp_path / "formatting_batch3_attempt1_raw.txt").exists()
+
+
+def test_retry_parse_failure_then_transport_failure_no_stale_generation(tmp_path: Path):
+    """HIGH round3 (D5): transport failure retries once with no stale generation.
+    A persistent transport outage on an unsplittable group becomes debt; the
+    transient retry writes only messages+meta (no raw/reasoning from a prior
+    generation), and no identical parse-retry ever reuses a failed payload."""
+    blocks = _blocks(1, n_pids=1)
+    translations = {b.pid: "привет мир" for b in blocks}
+
+    class _DownClient:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, cfg, max_tokens, label=None):
+            self.calls += 1
+            raise RuntimeError("transport down")
+
+    client = _DownClient()
+    result = resolve_format_mappings(
+        client, {"max_tokens": None, "generation_retries": 2}, blocks, translations, out_dir=tmp_path
+    )
+    # Both transport attempts failed -> empty result (debt); exactly one retry.
+    assert result == {}
+    assert client.calls == 2
+
+    # Transport attempts write messages+meta only — no raw/reasoning files.
+    assert not (tmp_path / "formatting_batch1_attempt1_raw.txt").exists()
+    assert not (tmp_path / "formatting_batch1_attempt1_reasoning.txt").exists()
+    assert not (tmp_path / "formatting_batch1_attempt2_raw.txt").exists()
+    assert not (tmp_path / "formatting_batch1_attempt2_reasoning.txt").exists()
+    meta1 = json.loads((tmp_path / "formatting_batch1_attempt1_meta.json").read_text(encoding="utf-8"))
     assert meta1["attempt"] == 1
-
-    # Attempt2 must NOT reuse attempt1's generation — transport failure has no generation
-    # Hence attempt2_raw/reasoning must not exist or not contain stale "bad1" / "not json"
-    attempt2_raw = tmp_path / "formatting_batch1_attempt2_raw.txt"
-    attempt2_reasoning = tmp_path / "formatting_batch1_attempt2_reasoning.txt"
-    # After fix, transport failure writes no raw/reasoning (gen_obj is None -> only messages+meta)
-    assert not attempt2_raw.exists(), "attempt2 raw must not be written from stale generation"
-    assert not attempt2_reasoning.exists(), "attempt2 reasoning must not be written from stale generation"
-
+    assert meta1["finish_reason"] is None
+    assert "transport down" in meta1["error"]
     meta2 = json.loads((tmp_path / "formatting_batch1_attempt2_meta.json").read_text(encoding="utf-8"))
     assert meta2["attempt"] == 2
     assert meta2["finish_reason"] is None
     assert meta2["usage"] is None
     assert "transport down" in meta2["error"]
-    # Must not leak bad1 finish_reason
-    assert meta2["finish_reason"] != "length"
     assert (tmp_path / "formatting_batch1_attempt2_messages.json").exists()
 
 

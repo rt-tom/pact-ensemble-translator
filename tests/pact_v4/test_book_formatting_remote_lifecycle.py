@@ -195,7 +195,8 @@ def test_run_book_remote_per_chapter_lifecycle_with_logs_and_close(tmp_path, mon
     monkeypatch.setattr(v4_book_run, "_build_formatting_client", fake_build)
 
     # Mock resolve_format_mappings to return real mapping and write batch meta (simulate real behavior)
-    def fake_resolve(client, cfg, blks, trans, out_dir=None):
+    # simplify-book-formatting: production resolve takes role_policy/context_window/require_policy.
+    def fake_resolve(client, cfg, blks, trans, out_dir=None, **kwargs):
         # Write expected batch meta as real resolve would
         from pact_v4.phase5.formatting import _effective_max_tokens
         span_count = sum(len(b.inline_spans) for b in blks)
@@ -389,7 +390,7 @@ def test_formatting_log_isolation_strict_logs_not_copied(tmp_path, monkeypatch):
         return FakeClient()
     monkeypatch.setattr(v4_book_run, "_build_formatting_client", fake_build)
 
-    def fake_resolve(client, cfg, blks, trans, out_dir=None):
+    def fake_resolve(client, cfg, blks, trans, out_dir=None, **kwargs):
         from pact_v4.phase5.formatting import _effective_max_tokens
         span_count = sum(len(b.inline_spans) for b in blks)
         effective = _effective_max_tokens(span_count, cfg.get("max_tokens"))
@@ -524,7 +525,7 @@ def test_formatting_log_collision_same_second_isolated(tmp_path, monkeypatch):
         return FakeClient()
     monkeypatch.setattr(v4_book_run, "_build_formatting_client", fake_build_collision)
 
-    def fake_resolve(client, cfg, blks, trans, out_dir=None):
+    def fake_resolve(client, cfg, blks, trans, out_dir=None, **kwargs):
         from pact_v4.phase5.formatting import _effective_max_tokens
         span_count = sum(len(b.inline_spans) for b in blks)
         effective = _effective_max_tokens(span_count, cfg.get("max_tokens"))

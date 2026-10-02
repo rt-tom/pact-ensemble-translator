@@ -120,10 +120,13 @@ _DEFAULT_FORMATTING_CFG: dict = {
     "tags": ["em", "strong", "i", "b", "a"],
     "required_tags": ["em", "strong", "i", "b", "a"],
     "optional_tags": [],
-    "max_blocks_per_call": 12,
+    "max_blocks_per_call": None,  # explicit safety cap only; budget planner drives grouping (D2)
     "retry_unresolved_spans": True,
     "on_failure": "omit_tag",
-    "formatting_single_call_whole_chapter": True,
+    "formatting_single_call_whole_chapter": True,  # legacy hint; planner prefers single fit (D2)
+    "plan_margin_tokens": 512,
+    "max_calls": 32,
+    "max_split_depth": 6,
 }
 # lenient default: do not block chapter on unresolved italics (debt)
 _DEFAULT_MAX_FORMATTING_INCIDENTS = 999
@@ -1679,9 +1682,20 @@ def run_book(
                             _mappings: dict = {}
                             _per_chapter_fmt_client = None
                             _fmt_health_error: Optional[str] = None
+                            # simplify-book-formatting D3: production path threads the
+                            # resolved formatting RoleCallPolicy explicitly (sampling +
+                            # max_output_tokens policy-owned; no legacy fallback budget).
+                            _prod_policy = getattr(formatting_client, "_role_policy", None) if formatting_client is not None else None
+                            if _prod_policy is None:
+                                try:
+                                    from pact_v4.runtime.backend_role_adapters import _shared_budget_for_role as _shared_fmt_budget
+                                    _prod_policy = _shared_fmt_budget("formatting")
+                                except Exception:
+                                    _prod_policy = None
+                            _prod_ctx = fmt_cfg.get("context_window") or fmt_cfg.get("context_envelope_tokens")
                             if formatting_client is not None:
                                 try:
-                                    _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
+                                    _mappings = resolve_format_mappings(formatting_client, fmt_cfg, _blocks, _translations, out_dir=out_dir, role_policy=_prod_policy, context_window=_prod_ctx, require_policy=True)
                                 except Exception as _fmt_exc:
                                     _fmt_health_error = str(_fmt_exc)
                                     LOG.warning("v41 formatting resolve failed for %s (injected client): %s", chapter_id, _fmt_exc)
@@ -1714,7 +1728,14 @@ def run_book(
                                     _ns = type("FmtArgs", (), {"memory_dir": memory_dir, "runtime_config": None, "translator": None, "reviewer": None, "providers_config": None})()
                                     _per_chapter_fmt_client = _build_formatting_client(_ns, list(extra_args), fmt_cfg, out_dir=out_dir)
                                     if _per_chapter_fmt_client is not None:
-                                        _mappings = resolve_format_mappings(_per_chapter_fmt_client, fmt_cfg, _blocks, _translations, out_dir=out_dir)
+                                        _pc_policy = getattr(_per_chapter_fmt_client, "_role_policy", None)
+                                        if _pc_policy is None:
+                                            try:
+                                                from pact_v4.runtime.backend_role_adapters import _shared_budget_for_role as _shared_fmt_budget2
+                                                _pc_policy = _shared_fmt_budget2("formatting")
+                                            except Exception:
+                                                _pc_policy = None
+                                        _mappings = resolve_format_mappings(_per_chapter_fmt_client, fmt_cfg, _blocks, _translations, out_dir=out_dir, role_policy=_pc_policy, context_window=_prod_ctx, require_policy=True)
                                     else:
                                         _fmt_health_error = "formatting backend unavailable: GET /global/health failed"
                                         LOG.warning("formatting backend unavailable for %s — falling back to lenient debt (GET /global/health failed)", chapter_id)
