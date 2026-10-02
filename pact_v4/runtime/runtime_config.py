@@ -136,7 +136,7 @@ FORBIDDEN_MODEL_REQUEST_FIELDS = frozenset({
 # Role budgets own max_output_tokens / output_budget + optional hybrid
 # reasoning delta (local-matrix-v2: int 0..8192, default 0).
 ALLOWED_OUTPUT_BUDGET_MODES = frozenset({"fixed", "floor_plus_per_item", "span_formula"})
-ALLOWED_ROLE_BUDGET_FIELDS = frozenset({"max_output_tokens", "output_budget", "reasoning_budget"})
+ALLOWED_ROLE_BUDGET_FIELDS = frozenset({"max_output_tokens", "output_budget", "reasoning_budget", "reasoning_budget_override"})
 
 # Hybrid-reasoning range for role deltas (matches model base range).
 ROLE_REASONING_BUDGET_MIN = 0
@@ -348,7 +348,14 @@ class RoleBudget:
     max_output_tokens: int
     output_budget: Optional[OutputBudgetPolicy] = None
     reasoning_budget: int = 0
+    reasoning_budget_override: Optional[int] = None
     def __post_init__(self) -> None:
+        # simplify-book-formatting D4: formatting-only override must be exactly 0 when present.
+        if self.reasoning_budget_override is not None:
+            if not isinstance(self.reasoning_budget_override, int) or isinstance(self.reasoning_budget_override, bool):
+                raise ValueError(f"RoleBudget: reasoning_budget_override must be int 0, got {self.reasoning_budget_override!r}")
+            if int(self.reasoning_budget_override) != 0:
+                raise ValueError(f"RoleBudget: reasoning_budget_override must be 0 (formatting-only), got {self.reasoning_budget_override!r}")
         if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
             raise ValueError(f"RoleBudget: max_output_tokens must be int, got {self.max_output_tokens!r}")
         if self.max_output_tokens <= 0 or self.max_output_tokens > 200000:
@@ -490,10 +497,19 @@ class ResolvedModelPair:
         — e.g. ``gemma31`` (2000) + ``generator`` (2000) = 4000;
         ``qwen38`` (8192) + ``qwen_audit`` (2000) = 10192.
         Universal for all aliases; never part of run identity.
+
+        simplify-book-formatting D4: an explicit formatting-only
+        ``reasoning_budget_override`` of 0 replaces the hybrid formula.
         """
         model = self.model_for_role(role)
+        budget = self.budget_for_role(role)
+        override = getattr(budget, "reasoning_budget_override", None)
+        if override is not None:
+            if role != ROLE_FORMATTING:
+                raise ValueError(f"ResolvedModelPair: reasoning_budget_override only allowed for {ROLE_FORMATTING!r}, got {role!r}")
+            return int(override)
         base = model.reasoning_budget or 0
-        delta = self.budget_for_role(role).reasoning_budget or 0
+        delta = budget.reasoning_budget or 0
         return int(base) + int(delta)
     def launch_args_for_role(self, role: str) -> List[str]:
         """The model's server args with ``--reasoning-budget`` REPLACED
@@ -507,11 +523,13 @@ class ResolvedModelPair:
         actual launch args. Cache hits keep their ORIGINAL provenance — this
         record is written only for fresh calls, never backfilled."""
         model = self.model_for_role(role)
+        budget = self.budget_for_role(role)
         return {
             "model_key": model.model_key,
             "model_base": int(model.reasoning_budget or 0),
             "role": role,
-            "role_delta": int(self.budget_for_role(role).reasoning_budget or 0),
+            "role_delta": int(budget.reasoning_budget or 0),
+            "reasoning_budget_override": getattr(budget, "reasoning_budget_override", None),
             "effective": self.effective_reasoning_budget(role),
             "launch_args": self.launch_args_for_role(role),
         }
@@ -537,6 +555,7 @@ class ResolvedModelPair:
                 "model_base": int(model.reasoning_budget or 0),
                 "request": dict(sorted(model.request.items())),
                 "role_delta": int(budget.reasoning_budget or 0),
+                "reasoning_budget_override": getattr(budget, "reasoning_budget_override", None),
                 "effective": self.effective_reasoning_budget(role),
             })
         return rows
@@ -1838,7 +1857,18 @@ def _validate_role_budgets(payload: Mapping[str, Any], path: Path) -> Dict[str, 
             raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget must be int, got {delta_raw!r}")
         if not (ROLE_REASONING_BUDGET_MIN <= int(delta_raw) <= ROLE_REASONING_BUDGET_MAX):
             raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget must be in [{ROLE_REASONING_BUDGET_MIN},{ROLE_REASONING_BUDGET_MAX}], got {delta_raw!r}")
-        out[role] = RoleBudget(max_output_tokens=int(max_tok), output_budget=ob, reasoning_budget=int(delta_raw))
+        # simplify-book-formatting D4: formatting-only reasoning_budget_override (exactly 0).
+        override_raw = cfg.get("reasoning_budget_override", None)
+        override: Optional[int] = None
+        if override_raw is not None:
+            if role != ROLE_FORMATTING:
+                raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget_override only allowed for {ROLE_FORMATTING!r}")
+            if not isinstance(override_raw, int) or isinstance(override_raw, bool):
+                raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget_override must be int 0, got {override_raw!r}")
+            if int(override_raw) != 0:
+                raise ValueError(f"{path}: role_budgets {role!r} reasoning_budget_override must be 0, got {override_raw!r}")
+            override = int(override_raw)
+        out[role] = RoleBudget(max_output_tokens=int(max_tok), output_budget=ob, reasoning_budget=int(delta_raw), reasoning_budget_override=override)
     return out
 
 def _load_local_model_spec(alias: str, raw_model: Mapping[str, Any], path: Path) -> LocalModelSpec:

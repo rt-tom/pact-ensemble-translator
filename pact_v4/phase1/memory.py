@@ -136,6 +136,8 @@ def load_json(filepath: str, default: Any = None) -> Any:
         return json.load(f)
 
 def _validate_no_symlink_ancestors(base_dir: str, filename: str) -> bool:
+    # Legacy helper kept for backward compatibility: checks the selected path
+    # and its ancestors down to (and including) base_dir for symlinks.
     cur = os.path.join(base_dir, filename)
     while True:
         try:
@@ -155,36 +157,109 @@ def _validate_no_symlink_ancestors(base_dir: str, filename: str) -> bool:
         return False
     return True
 
-def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
+def _validate_no_symlink_chain_full(path: str) -> Optional[str]:
+    """Reject if path or ANY ancestor up to the filesystem root is a symlink.
+
+    Uses lstat (never follows the final component) so a symlink at any level
+    of the chain is observed, not traversed. Returns an error string or None.
+    """
+    cur = os.path.abspath(path)
+    while True:
+        try:
+            if os.path.islink(cur):
+                return f"symlink in path chain: {cur}"
+        except OSError as e:
+            return f"cannot stat path chain {cur}: {e}"
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+def _read_selected_json_nofollow(fpath: str, display: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """Open a selected file with O_NOFOLLOW, require a regular file, read bytes, require valid JSON.
+
+    The open/fstat/read happen on the SAME file descriptor so a swap between
+    the type check and the read cannot escape the selected file. Returns
+    (data, None) on success or (None, error) fail-closed.
+    """
+    import errno as _errno
+    import stat as _stat
+    # Lstat BEFORE open: never block opening a FIFO/socket/device (O_RDONLY
+    # on a FIFO would sleep waiting for a writer). Non-regular names fail here.
     try:
-        entries = os.listdir(base_dir)
+        lst = os.lstat(fpath)
+    except FileNotFoundError:
+        return None, f"missing canonical file {display}"
     except OSError as e:
-        return f"cannot list dir: {e}"
-    # Strict allow-list: only canonical files plus Media revision metadata plus exact marker and backup files are permitted
-    # Any other .pact_*, *.tmp, extra file/dir, symlink, special file is rejected
-    # Media contract is the six-file set: four canonical + CURRENT.json + manifest.json (remote_client.py:190)
-    allowed = set(CANONICAL_FILES) | {"CURRENT.json", "manifest.json"}
-    for e in entries:
-        # Allow marker file exactly
-        if e == MARKER_NAME:
-            continue
-        # Allow backup files exactly ending with BACKUP_SUFFIX
-        if e.endswith(BACKUP_SUFFIX):
-            # Ensure corresponding canonical base exists (e.g., glossary.json.pact_backup)
-            base = e[: -len(BACKUP_SUFFIX)]
-            if base in CANONICAL_FILES:
-                continue
-            return f"extra entry {e!r} not in canonical set (unknown backup)"
-        # Candidate tmp dirs created during transaction: .pact_candidate_* are allowed as transient transaction staging (same-filesystem bundle)
-        if e.startswith(".pact_candidate_"):
-            # Allow transient candidate dirs during transaction; they are not part of canonical set but are known transaction staging
-            continue
-        # Any other .pact_* or *.tmp is rejected
-        if e.startswith(".pact_") or e.endswith(".tmp"):
-            return f"extra entry {e!r} not in canonical set (marker/tmp not allowed)"
-        if e not in allowed:
-            return f"extra entry {e!r} not in canonical set"
-    # Require ALL four canonical files present (no missing allowed)
+        return None, f"cannot stat {display}: {e}"
+    if not _stat.S_ISREG(lst.st_mode):
+        return None, f"non-regular file {display}: mode {oct(lst.st_mode)}"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(fpath, flags)
+    except FileNotFoundError:
+        return None, f"missing canonical file {display}"
+    except OSError as e:
+        if e.errno == _errno.ELOOP:
+            return None, f"symlink not allowed: {display}"
+        return None, f"cannot open {display}: {e}"
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            return None, f"cannot stat {display}: {e}"
+        if not _stat.S_ISREG(st.st_mode):
+            return None, f"non-regular file {display}: mode {oct(st.st_mode)}"
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError as e:
+                return None, f"cannot read {display}: {e}"
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        json.loads(data.decode("utf-8"))
+    except Exception as e:
+        return None, f"invalid JSON {display}: {e}"
+    return data, None
+
+def _validate_canonical_selected_paths(base_dir: str) -> Optional[str]:
+    """Canonical-only local boundary (book-state-canonical-only-sync).
+
+    Validates ONLY the four explicitly named canonical files by direct path:
+    glossary.json, book_memory.json, chapter_index.json, observations.json.
+    The working root is NEVER listed: unrelated top-level files, directories,
+    symlinks, FIFOs or other objects are neither inspected nor rejected and
+    are left byte-for-byte untouched. CURRENT.json / manifest.json /
+    transaction marker / backups are validated only where they are actually
+    used (fetch/push/recovery paths), never as part of this local check.
+
+    Fail-closed for every selected path: the root must be a real directory,
+    no ancestor may be a symlink, and each canonical name must be an
+    existing regular non-symlink file with valid JSON (opened O_NOFOLLOW).
+    """
+    import stat as _stat
+    try:
+        if os.path.islink(base_dir):
+            return "symlink not allowed: base_dir is a symlink"
+        st = os.lstat(base_dir)
+        if not _stat.S_ISDIR(st.st_mode):
+            return f"base_dir is not a directory: mode {oct(st.st_mode)}"
+    except OSError as e:
+        return f"cannot stat base_dir: {e}"
+    chain_err = _validate_no_symlink_chain_full(base_dir)
+    if chain_err is not None:
+        return chain_err
+    # Require ALL four canonical files present (no missing allowed); no silent creation.
     for fname in CANONICAL_FILES:
         fpath = os.path.join(base_dir, fname)
         if not os.path.lexists(fpath):
@@ -193,44 +268,24 @@ def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
             return f"symlink not allowed: {fname}"
         if not _validate_no_symlink_ancestors(base_dir, fname):
             return f"symlink ancestor for {fname}"
-        try:
-            st = os.lstat(fpath)
-            import stat
-            if not stat.S_ISREG(st.st_mode):
-                return f"non-regular file {fname}: mode {oct(st.st_mode)}"
-            if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
-                return f"special file {fname}"
-        except OSError as e:
-            return f"cannot stat {fname}: {e}"
-        try:
-            with open(fpath, 'r', encoding='utf-8') as f:
-                json.load(f)
-        except Exception as e:
-            return f"invalid JSON {fname}: {e}"
-    # Optional Media revision metadata: validate when present (regular file, no symlink, valid JSON)
-    for fname in ("CURRENT.json", "manifest.json"):
-        fpath = os.path.join(base_dir, fname)
-        if not os.path.lexists(fpath):
-            continue
-        if os.path.islink(fpath):
-            return f"symlink not allowed: {fname}"
-        if not _validate_no_symlink_ancestors(base_dir, fname):
-            return f"symlink ancestor for {fname}"
-        try:
-            st = os.lstat(fpath)
-            import stat
-            if not stat.S_ISREG(st.st_mode):
-                return f"non-regular file {fname}: mode {oct(st.st_mode)}"
-            if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
-                return f"special file {fname}"
-        except OSError as e:
-            return f"cannot stat {fname}: {e}"
-        try:
-            with open(fpath, 'r', encoding='utf-8') as f:
-                json.load(f)
-        except Exception as e:
-            return f"invalid JSON {fname}: {e}"
+        chain_err = _validate_no_symlink_chain_full(fpath)
+        if chain_err is not None:
+            return f"symlink ancestor for {fname} ({chain_err})"
+        _, err = _read_selected_json_nofollow(fpath, fname)
+        if err is not None:
+            return err
     return None
+
+def _validate_exact_four_file_set(base_dir: str) -> Optional[str]:
+    """Deprecated alias: now implements the canonical-only local boundary.
+
+    The historical root-listing exact-four check was replaced by
+    ``_validate_canonical_selected_paths`` (book-state-canonical-only-sync):
+    unrelated root entries no longer block local promotion. The strict
+    exact-four membership check is retained only for the private transaction
+    staging bundle and for the Media candidate/snapshot boundary.
+    """
+    return _validate_canonical_selected_paths(base_dir)
 
 class MemoryManager:
     def __init__(self, base_dir: str):
@@ -261,24 +316,70 @@ class MemoryManager:
                     pass
 
     def _recover_if_needed(self):
-        if not os.path.exists(self._marker_path):
+        # Trust checks precede ANY I/O on the untrusted marker path.
+        if not os.path.lexists(self._marker_path):
             return
+        if os.path.islink(self._marker_path):
+            raise RuntimeError("corrupt transaction marker, fail-closed: marker is a symlink")
+        chain_err = _validate_no_symlink_chain_full(self._marker_path)
+        if chain_err is not None:
+            raise RuntimeError(f"corrupt transaction marker, fail-closed: {chain_err}")
         try:
-            marker = json.loads(open(self._marker_path, 'r', encoding='utf-8').read())
+            st = os.lstat(self._marker_path)
+            import stat as _stat
+            if not _stat.S_ISREG(st.st_mode):
+                raise RuntimeError(f"corrupt transaction marker, fail-closed: non-regular marker mode {oct(st.st_mode)}")
+        except OSError as e:
+            raise RuntimeError(f"corrupt transaction marker, fail-closed: cannot stat marker: {e}") from e
+        try:
+            raw = _read_selected_json_nofollow(self._marker_path, MARKER_NAME)[0]
+            if raw is None:
+                raise RuntimeError("corrupt transaction marker, fail-closed: unreadable marker")
+            marker = json.loads(raw.decode("utf-8"))
+        except RuntimeError:
+            raise
         except Exception as e:
             raise RuntimeError(f"corrupt transaction marker, fail-closed: {e}") from e
+        if not isinstance(marker, dict):
+            raise RuntimeError("corrupt transaction marker, fail-closed: marker is not a JSON object")
         pre_hashes = marker.get("pre_hashes", {})
         backups = marker.get("backups", {})
+        if not isinstance(pre_hashes, dict) or not isinstance(backups, dict):
+            raise RuntimeError("corrupt transaction marker, fail-closed: pre_hashes/backups must be objects")
         restore_failed = False
+        base_abs = os.path.abspath(self.base_dir)
         for fname in REPLACEMENT_ORDER:
             bpath = backups.get(fname)
             target = os.path.join(self.base_dir, fname)
             if bpath:
-                if not os.path.exists(bpath):
+                # Confine every backup path to this working root (no escape via marker).
+                if not isinstance(bpath, str):
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: backup path for {fname} is not a string")
+                b_abs = os.path.abspath(bpath)
+                if os.path.commonpath([base_abs, b_abs]) != base_abs:
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: backup escapes working root: {bpath!r}")
+                if os.path.basename(b_abs) != fname + BACKUP_SUFFIX:
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: unexpected backup name: {bpath!r}")
+                if os.path.islink(b_abs):
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: backup is a symlink: {fname}")
+                bchain = _validate_no_symlink_chain_full(b_abs)
+                if bchain is not None:
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: {bchain}")
+                if os.path.islink(target):
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: target is a symlink: {fname}")
+                tchain = _validate_no_symlink_chain_full(target)
+                if tchain is not None:
+                    raise RuntimeError(f"corrupt transaction marker, fail-closed: {tchain}")
+                if not os.path.lexists(b_abs):
                     restore_failed = True
                     continue
                 try:
-                    shutil.copy2(bpath, target)
+                    bst = os.lstat(b_abs)
+                    import stat as _stat2
+                    if not _stat2.S_ISREG(bst.st_mode):
+                        restore_failed = True
+                        continue
+                    shutil.copy2(b_abs, target)
                 except OSError:
                     restore_failed = True
         for fname, expected in pre_hashes.items():
@@ -337,9 +438,9 @@ class MemoryManager:
     def promote(self, status: str, *, quarantined_chunks: Optional[set] = None, _rebuilt_index: Optional[Dict[str, Any]] = None, _chapter_id: Optional[str] = None, _chapter_html: Optional[str] = None, _chapter_ids: Optional[list] = None, _chapter_html_pattern: Optional[str] = None):
         if status not in ('complete', 'accepted_degraded'):
             return
-        err = _validate_exact_four_file_set(self.base_dir)
+        err = _validate_canonical_selected_paths(self.base_dir)
         if err is not None:
-            raise RuntimeError(f"exact-four-file boundary violation before promotion: {err}")
+            raise RuntimeError(f"canonical-only boundary violation before promotion: {err}")
         obs = load_json(self.observations_path, {'glossary': {}, 'book_memory': {}})
         if status == 'accepted_degraded' and quarantined_chunks:
             obs = self._filter_quarantined_obs(obs, quarantined_chunks)
@@ -617,9 +718,9 @@ class MemoryManager:
 
     def _transactional_replace(self, staged: Dict[str, Any]):
         fault_point = os.environ.get("PACT_FAULT_INJECT")
-        err = _validate_exact_four_file_set(self.base_dir)
+        err = _validate_canonical_selected_paths(self.base_dir)
         if err is not None:
-            raise RuntimeError(f"exact-four-file boundary violation before transaction: {err}")
+            raise RuntimeError(f"canonical-only boundary violation before transaction: {err}")
         # Require exactly four canonical files in staged
         staged_keys = set(staged.keys())
         if staged_keys != set(CANONICAL_FILES):
@@ -663,7 +764,8 @@ class MemoryManager:
                     raise RuntimeError(f"candidate non-regular file: {fname}")
                 with open(cpath, "r", encoding="utf-8") as f:
                     json.load(f)
-            err2 = _validate_exact_four_file_set(self.base_dir)
+            # Identical re-validation immediately before the state-changing move (TOCTOU close).
+            err2 = _validate_canonical_selected_paths(self.base_dir)
             if err2 is not None:
                 raise RuntimeError(f"pre-move revalidation failed: {err2}")
         except Exception:
@@ -835,7 +937,7 @@ class MemoryManager:
 # reject/conflict outcomes with an expanded versioned candidate report.
 #
 # PURE: operates on in-memory dicts; never touches disk. The four-file memory
-# state itself is validated by _validate_exact_four_file_set (boundary
+# state itself is validated by _validate_canonical_selected_paths (boundary
 # hardening) before any promote() that consumes the observations this produces.
 # ===========================================================================
 

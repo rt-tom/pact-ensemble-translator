@@ -59,18 +59,30 @@ class FakeTransport:
         cur = self.store.read_current()
         return cur.get("revision_id") if cur else None
 
-    def push_candidate(self, book_id: str, candidate_id: str, local_dir: Path, manifest_dict=None):
+    def push_candidate(self, book_id: str, candidate_id: str, local_dir: Path, manifest_dict=None, pinned=None):
+        # D5: when the client passes the pinned mapping, tar members MUST come
+        # from those exact bytes, never from a live-directory re-read. When
+        # pinned is None (direct test calls), pin once and use that capture
+        # for both manifest hashes and tar members.
+        if pinned is None and manifest_dict is None:
+            from pact_v4.snapshot.remote_client import _pin_canonical_bytes as _pin, _pinned_state_files as _psf
+            pinned = _pin(Path(local_dir))
+        if pinned is not None:
+            import hashlib as _hashlib
+            if set(pinned.keys()) != set(CANONICAL):
+                raise ValueError(f"Pinned set must be exactly {CANONICAL}")
         # Build tar as remote_client would
         if manifest_dict is None:
-            from pact_v4.snapshot.manifest import compute_sha256_and_size
+            assert pinned is not None
             import datetime
             cur = self.store.read_current()
             parent = cur.get("revision_id")
             now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
             state_files = []
             for fname in CANONICAL:
-                h, sz = compute_sha256_and_size(Path(local_dir) / fname)
-                state_files.append({"rel_path": f"state/{fname}", "sha256": h, "size": sz})
+                import hashlib as _hashlib2
+                data = pinned[fname]
+                state_files.append({"rel_path": f"state/{fname}", "sha256": _hashlib2.sha256(data).hexdigest(), "size": len(data)})
             manifest_dict = {
                 "schema_version": "1.0.0",
                 "book_id": book_id,
@@ -93,7 +105,13 @@ class FakeTransport:
             ti.size = len(m_bytes); ti.mtime = 0; ti.mode = 0o644
             tar.addfile(ti, io.BytesIO(m_bytes))
             for fname in CANONICAL:
-                data = (Path(local_dir) / fname).read_bytes()
+                if pinned is not None:
+                    data = pinned[fname]
+                else:
+                    # No pinned capture (tampered-manifest path): fall back to a
+                    # single live read for tar bytes; media hash validation
+                    # still applies.
+                    data = (Path(local_dir) / fname).read_bytes()
                 ti2 = tarfile.TarInfo(name=f"state/{fname}")
                 ti2.size = len(data); ti2.mtime = 0; ti2.mode = 0o644
                 tar.addfile(ti2, io.BytesIO(data))

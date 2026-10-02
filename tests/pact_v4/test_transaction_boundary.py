@@ -10,16 +10,18 @@ def _setup_basic(tmp: Path):
     for fname in ["glossary.json", "book_memory.json", "chapter_index.json", "observations.json"]:
         (tmp / fname).write_text(json.dumps({}) + "\n", encoding="utf-8")
 
-def test_exact_boundary_rejects_extra_file():
+def test_canonical_only_boundary_ignores_extra_file():
+    # book-state-canonical-only-sync: unrelated top-level objects neither block
+    # local promotion nor are modified by it.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _setup_basic(tmp)
         (tmp / "extra.json").write_text("{}", encoding="utf-8")
         mgr = MemoryManager(str(tmp))
-        # promote should fail due to extra file
         mgr.add_observation("glossary", "Test", {"target": "Тест"})
-        with pytest.raises(RuntimeError, match="extra entry"):
-            mgr.promote("complete")
+        mgr.promote("complete")
+        assert (tmp / "extra.json").read_text(encoding="utf-8") == "{}"
+        assert not (tmp / ".pact_transaction_marker.json").exists()
 
 def test_symlink_rejected():
     with tempfile.TemporaryDirectory() as td:

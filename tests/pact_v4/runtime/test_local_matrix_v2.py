@@ -280,7 +280,16 @@ def test_effective_reasoning_production_registry():
     assert pair.effective_reasoning_budget("generator") == 4000  # 2000+2000
     assert pair.effective_reasoning_budget("qwen_audit") == 10192  # 8192+2000
     assert pair.effective_reasoning_budget("entity_extractor") == 10192
-    assert pair.effective_reasoning_budget("formatting") == 8192
+    # simplify-book-formatting D4: production registry carries the
+    # formatting-only zero override (explicit exception to base+delta).
+    assert pair.effective_reasoning_budget("formatting") == 0
+    fmt_args = pair.launch_args_for_role("formatting")
+    assert fmt_args.count("--reasoning-budget") == 1
+    assert fmt_args[fmt_args.index("--reasoning-budget") + 1] == "0"
+    assert pair.reasoning_provenance_for_role("formatting")["effective"] == 0
+    # Other reviewer roles keep base+delta; transitions restore them.
+    audit_args = pair.launch_args_for_role("qwen_audit")
+    assert audit_args[audit_args.index("--reasoning-budget") + 1] == "10192"
     assert pair.effective_reasoning_budget("repair") == 2000
     legacy = build_resolved_pair_from_registry(reg, "gemma", "qwen")
     assert legacy.effective_reasoning_budget("generator") == 4048  # 2048+2000 universal
@@ -660,8 +669,14 @@ def test_matrix_rows_authoritative(tmp_path):
         "output_budget": None, "model_key": "gemma31", "model_base": 2000,
         "request": {"min_p": 0.0, "repeat_penalty": 1.0, "temperature": 1.0,
                     "top_k": 64, "top_p": 0.95},
-        "role_delta": 2000, "effective": 4000,
+        "role_delta": 2000, "reasoning_budget_override": None, "effective": 4000,
     }
+    # simplify-book-formatting D4: production formatting row carries the
+    # zero override and effective 0; other roles keep base+delta.
+    assert prod_rows["formatting"]["reasoning_budget_override"] == 0
+    assert prod_rows["formatting"]["effective"] == 0
+    assert prod_rows["qwen_audit"]["effective"] == 10192
+    assert prod_rows["qwen_audit"]["reasoning_budget_override"] is None
 
 
 def test_model_matrix_block_helper():

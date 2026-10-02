@@ -89,7 +89,7 @@ def test_stale_parent_bounded_retry():
                 super().__init__(*a, **kw)
                 self.push_calls = 0
 
-            def push_candidate(self, book_id, candidate_id, local_dir, manifest_dict=None):
+            def push_candidate(self, book_id, candidate_id, local_dir, manifest_dict=None, pinned=None):
                 self.push_calls += 1
                 if self.push_calls == 1:
                     # Simulate someone else promoted to rev-0002 before our push
@@ -132,8 +132,8 @@ def test_stale_parent_bounded_retry():
                         _receive_candidate_stream(self.store, "race-cand", bio.getvalue())
                         promote(self.store, "race-cand", operator="rt", host="RT")
                     # Now our original push will be stale
-                    return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict)
-                return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict)
+                    return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict, pinned=pinned)
+                return super().push_candidate(book_id, candidate_id, local_dir, manifest_dict, pinned=pinned)
 
         transport = StaleOnceTransport(tmp, book_id=BOOK_ID)
         with tempfile.TemporaryDirectory() as wdir:
@@ -160,7 +160,7 @@ def test_post_push_rejection_preserves_local_state():
             # Instead create valid then corrupt manifest via transport to cause HashMismatch?
             # Use transport that forces hash mismatch by tampering hash
             class TamperTransport(FakeTransport):
-                def push_candidate(self, book_id, candidate_id, local_dir, manifest_dict=None):
+                def push_candidate(self, book_id, candidate_id, local_dir, manifest_dict=None, pinned=None):
                     # Build manifest with wrong hash for first file
                     import datetime
                     from pact_v4.snapshot.manifest import compute_sha256_and_size
@@ -183,7 +183,7 @@ def test_post_push_rejection_preserves_local_state():
                         "source": {"path_on_rt": str(local_dir), "operator": "rt", "host": "RT"},
                         "state_files": state_files, "excludes": [], "code_commit": "unknown",
                     }
-                    return super().push_candidate(book_id, candidate_id, local_dir, manifest)
+                    return super().push_candidate(book_id, candidate_id, local_dir, manifest, pinned=pinned)
 
             tamper = TamperTransport(tmp, book_id=BOOK_ID)
             for fname in CANONICAL:

@@ -345,19 +345,21 @@ def test_four_file_set_accepts_clean():
         assert _validate_exact_four_file_set(d) is None
 
 
-def test_four_file_set_rejects_extra_top_level_file():
+def test_four_file_set_ignores_extra_top_level_file():
+    # book-state-canonical-only-sync: unrelated top-level files are ignored.
     with tempfile.TemporaryDirectory() as d:
         _make_four_file_dir(d)
         with open(os.path.join(d, "extra.json"), "w") as f:
             f.write("{}")
-        assert _validate_exact_four_file_set(d) is not None
+        assert _validate_exact_four_file_set(d) is None
 
 
-def test_four_file_set_rejects_extra_dir():
+def test_four_file_set_ignores_extra_dir():
+    # book-state-canonical-only-sync: unrelated directories are ignored.
     with tempfile.TemporaryDirectory() as d:
         _make_four_file_dir(d)
         os.makedirs(os.path.join(d, "sneaky_dir"))
-        assert _validate_exact_four_file_set(d) is not None
+        assert _validate_exact_four_file_set(d) is None
 
 
 def test_four_file_set_rejects_symlink_canonical():
