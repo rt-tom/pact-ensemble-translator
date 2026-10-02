@@ -260,6 +260,14 @@ class BackendModelCaller:
 
     def __call__(self, bundle: PromptBundle) -> str:
         user_text = render_prompt(bundle)
+        # translator-line-output (design §4): the V4 whole-chapter generator
+        # (``bundle.chunk_id == "whole_chapter"``) uses the PID line protocol
+        # and must neither request nor depend on JSON-constrained response
+        # mode. This is an explicit CALL-SCOPED option: decided per request
+        # from the bundle identity, with no mutation of persistent/shared
+        # client state — every other role keeps ``response_schema`` +
+        # ``retry_json_call`` JSON classification exactly as before.
+        line_protocol = bundle.chunk_id == "whole_chapter"
         # Generation bundle roles are the template roles ("fidelity_first" /
         # "balanced_literary"), while tagged configs bind the model under the
         # plan §8 alias "generator". Resolve either, then fall back to a
@@ -317,7 +325,7 @@ class BackendModelCaller:
             repeat_last_n=_repeat_last_n,
             frequency_penalty=_frequency_penalty,
             presence_penalty=_presence_penalty,
-            response_schema=JSON_OBJECT_SCHEMA,
+            response_schema=None if line_protocol else JSON_OBJECT_SCHEMA,
             label=f"phase2b/{bundle.role}/{bundle.chunk_id}",
             request_options=request_options,
             role="generator",
@@ -375,9 +383,21 @@ class BackendModelCaller:
             self._last_reasoning = str(reasoning) if reasoning is not None else ""
             # RAW-SINK: keep the raw text even if the caller's classify step
             # (retry_json_call → classify_response_text) later rejects it —
-            # the disk trail must survive TruncatedJSONError.
+            # the disk trail must survive TruncatedJSONError. In line mode
+            # there is no classify step (see below); the raw is still kept
+            # here so the generation layer's raw_sink fallback sees it.
             self._last_raw = response.text or ""
             return response.text
+
+        if line_protocol:
+            # Line-protocol whole-chapter call: return the raw text with NO
+            # JSON classification or adapter-level JSON retry — line text is
+            # not JSON and classify_response_text would misfire on every
+            # valid response. Validation and bounded retry belong to the
+            # generation layer (WholeChapterRetryPolicy +
+            # parse_whole_chapter_line_response); transport failures still
+            # propagate as CompletionError via _complete().
+            return _complete()
 
         return retry_json_call(
             _complete, self._config.retry, label=request.label,

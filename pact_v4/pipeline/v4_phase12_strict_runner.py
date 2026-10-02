@@ -5240,7 +5240,8 @@ def _run_whole_chapter_strict(
 
     The generation/provenance contract itself lives in
     ``_run_whole_chapter_strict_impl``: one generation call per chapter with
-    the strict ``{pid: text}`` JSON contract and bounded retry
+    the strict PID line-protocol contract (one ``PID: translated text`` line
+    per TARGET PID) and bounded retry
     (``generate_whole_chapter``), plus the whole-chapter provenance contract
     (journal, ``translations_raw.json``, ``translations.json``,
     ``selection_results.json``, ``generation_outcomes.json``,
@@ -5291,8 +5292,9 @@ def _run_whole_chapter_strict_impl(
 
     Derives the full ordered PID map (``WholeChapterPidMap``) from the
     authoritative multi-chunk ``ChunkPlanArtifact``, generates the whole
-    chapter in a single call with the strict ``{pid: text}`` JSON contract
-    and bounded retry (``generate_whole_chapter``), and writes the
+    chapter in a single call with the strict PID line-protocol contract (one
+    ``PID: translated text`` line per TARGET PID) and bounded retry
+    (``generate_whole_chapter``), and writes the
     whole-chapter provenance contract. Steps 6/7/8 are out of A1 scope and
     recorded as skipped.
     """

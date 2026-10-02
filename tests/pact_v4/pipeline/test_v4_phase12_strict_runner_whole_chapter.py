@@ -25,7 +25,6 @@ from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import (
     FakeLifecycleAdapter,
     StubGemma,
     StubGemmaAudit,
-    StubModelCaller,
     StubQwen,
     StubQwenAudit,
     _LifecycleAwareGemmaAudit,
@@ -48,10 +47,32 @@ def _make_router() -> ModelRouter:
     )
 
 
+class _LineStubModelCaller:
+    """Line-protocol twin of ``StubModelCaller`` for whole-chapter tests.
+
+    translator-line-output: the shared ``StubModelCaller`` (imported from the
+    chunked-runner tests) still returns the chunked JSON contract and must
+    stay untouched — whole-chapter tests use this stub, which renders the
+    same deterministic Russian text as one ``PID: text`` line per TARGET PID.
+    """
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, bundle) -> str:
+        self.calls.append(bundle)
+        lines = []
+        for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+            digits = "".join(ch for ch in text if ch.isdigit())
+            digit_part = f" ({digits})" if digits else ""
+            lines.append(f"{pid}: Перевод номер{index}{digit_part}")
+        return "\n".join(lines)
+
+
 def _run_whole_chapter(cfg, *, model_caller=None):
     router = _make_router()
     model_caller = _LifecycleAwareModelCaller(
-        router, model_caller or StubModelCaller()
+        router, model_caller or _LineStubModelCaller()
     )
     return run_chapter_strict(
         cfg, router=router, model_caller=model_caller,
@@ -70,7 +91,7 @@ def test_whole_chapter_mode_generates_one_call_full_pid_map(tmp_path):
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
         whole_chapter=True,
     )
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     result = _run_whole_chapter(cfg, model_caller=caller)
 
     # Exactly ONE generation call, against the full chapter as a single unit.
@@ -141,7 +162,7 @@ def test_whole_chapter_run_emits_wc_progress_events(tmp_path):
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
         whole_chapter=True,
     )
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     _run_whole_chapter(cfg, model_caller=caller)
 
     events = [
@@ -213,7 +234,7 @@ def test_whole_chapter_resume_reads_raw_snapshot_not_final(tmp_path):
         memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
         whole_chapter=True,
     )
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     first = _run_whole_chapter(cfg, model_caller=caller)
     assert first.processed_count == 1
     assert len(caller.calls) == 1
@@ -227,7 +248,7 @@ def test_whole_chapter_resume_reads_raw_snapshot_not_final(tmp_path):
         encoding="utf-8",
     )
 
-    caller2 = StubModelCaller()
+    caller2 = _LineStubModelCaller()
     resumed = _run_whole_chapter(cfg, model_caller=caller2)
     # Resume replays the journal: no second generation call, no new journal
     # entry beyond the single whole-chapter one.
@@ -311,7 +332,7 @@ def test_whole_chapter_resume_rejects_corrupt_raw_snapshot(tmp_path, corrupt):
     raw_path.write_text(raw, encoding="utf-8")
     final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss"):
         _run_whole_chapter(cfg, model_caller=caller)
     # Fail closed: no generation was attempted and the final alias was never
@@ -331,7 +352,7 @@ def test_whole_chapter_generation_failure_is_honest_incomplete(tmp_path):
     )
 
     class _BrokenCaller:
-        """Always returns malformed JSON: bounded retry exhausts honestly."""
+        """Always returns a malformed line body: bounded retry exhausts honestly."""
 
         def __init__(self):
             self.calls = []
@@ -464,7 +485,7 @@ def test_whole_chapter_resume_preserves_provenance_linkage(tmp_path):
     rec_candidate = outcomes["outcomes"][0]["candidates"]["balanced_literary"]["candidate_id"]
     assert rec_candidate == journal[0]["selected_candidate_id"]
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     resumed = _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
     assert resumed.selected_count == 1
@@ -503,7 +524,7 @@ def test_whole_chapter_resume_fails_when_generation_outcomes_missing(tmp_path):
     sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
     journal_before = (cfg.out_dir / "journal.ndjson").read_text(encoding="utf-8")
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss.*generation_outcomes.json.*missing"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -570,7 +591,7 @@ def test_whole_chapter_resume_rejects_empty_or_mismatched_generation_outcomes(
     sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
     corrupt_artifact_before = gen_path.read_text(encoding="utf-8")
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match=expect):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -598,7 +619,7 @@ def test_whole_chapter_resume_rejects_duplicate_journal_entry(tmp_path):
     final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
     sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="exactly one entry, found 2"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -650,7 +671,7 @@ def test_whole_chapter_resume_rejects_malformed_journal_shape(tmp_path, mutation
     final_before = (cfg.out_dir / "translations.json").read_text(encoding="utf-8")
     sel_before = (cfg.out_dir / "selection_results.json").read_text(encoding="utf-8")
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -679,7 +700,7 @@ def test_whole_chapter_resume_incomplete_replays_honestly(tmp_path):
     assert journal[0]["selected_candidate_id"] is None
     assert journal[0]["candidate_ids"] == []
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     resumed = _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
     assert resumed.incomplete_generation_count == 1
@@ -708,7 +729,7 @@ def test_whole_chapter_resume_incomplete_requires_generation_outcomes(tmp_path):
     assert gen_path.exists()
     gen_path.unlink()
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss.*generation_outcomes.json.*missing"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -870,7 +891,7 @@ def test_whole_chapter_resume_rejects_malformed_linked_generation_record(
     gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
     before = _snapshot_artifacts(cfg)
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss"):
         _run_whole_chapter(cfg, model_caller=caller)
     # Fail closed: no generation call, and every artifact (including the
@@ -928,7 +949,7 @@ def test_whole_chapter_resume_rejects_malformed_incomplete_record(tmp_path, muta
     gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
     before = _snapshot_artifacts(cfg)
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -970,7 +991,7 @@ def test_whole_chapter_resume_rejects_foreign_candidate_role(tmp_path):
     gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
     before = _snapshot_artifacts(cfg)
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss.*fidelity_first"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -991,7 +1012,7 @@ def test_whole_chapter_resume_rejects_extra_expected_role(tmp_path):
     gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
     before = _snapshot_artifacts(cfg)
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss.*expected_roles"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -1022,7 +1043,7 @@ def test_whole_chapter_resume_rejects_foreign_error_role(tmp_path):
     gen_path.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
     before = _snapshot_artifacts(cfg)
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss.*foreign_role"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -1128,7 +1149,7 @@ def test_whole_chapter_resume_fails_closed_on_source_text_change(tmp_path):
     assert "changed0" in cfg.chapter_html_path.read_text(encoding="utf-8")
 
     before = _snapshot_artifacts(cfg)
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Foreign identity.*different snapshot/plan/config"):
         _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
@@ -1147,7 +1168,7 @@ def test_whole_chapter_resume_fails_closed_on_chapter_index_change(tmp_path):
         cfg.chapter_id: {"characters": ["Blake", "Duncan"], "facts": [], "address": []},
     }, ensure_ascii=False), encoding="utf-8")
     before = _snapshot_artifacts(cfg)
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     try:
         _run_whole_chapter(cfg, model_caller=caller)
         assert len(caller.calls) == 0
@@ -1175,7 +1196,7 @@ def test_whole_chapter_resume_chapter_index_other_chapter_change_is_noop(tmp_pat
         "ch999": {"characters": ["Other", "Changed"], "facts": [], "address": []},
     }, ensure_ascii=False), encoding="utf-8")
 
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     resumed = _run_whole_chapter(cfg, model_caller=caller)
     assert len(caller.calls) == 0
     assert resumed.resumed_from_index == 1
@@ -1238,7 +1259,7 @@ def _scripted_model_caller(*scripts: str, adapter_max_retries: int = 0):
     "bad_output",
     [
         "",  # empty body
-        "{truncated json",  # truncated / malformed JSON
+        "{truncated line body",  # truncated / malformed line
     ],
 )
 def test_whole_chapter_empty_or_truncated_output_via_backend_model_caller(
@@ -1271,31 +1292,25 @@ def test_whole_chapter_empty_or_truncated_output_via_backend_model_caller(
     assert journal[0]["outcome"] == "incomplete_generation"
 
 
-@pytest.mark.parametrize(
-    "bad_output",
-    [
-        "",  # empty body
-        "{truncated json",  # truncated / malformed JSON
-    ],
-)
-def test_whole_chapter_adapter_budget_exhaustion_is_classified_not_crash(
-    tmp_path, bad_output
+def test_whole_chapter_adapter_json_budget_inert_for_line_calls(
+    tmp_path,
 ):
-    # A2 RV finding 3 reproduction: with the DEFAULT adapter JSON retry budget
-    # (max_retries=2), BackendModelCaller retries the bad body 3 times and then
-    # re-raises EmptyResponseError/TruncatedJSONError. The whole-chapter
-    # generation layer must catch/classify that (INVALID_JSON inside its own
-    # bounded loop) and return an honest incomplete_generation — NOT crash
-    # with an uncaught adapter exception. Total model calls stay bounded:
-    # max_attempts(3) × adapter budget(3) = 9.
+    # translator-line-output (design §4): the whole-chapter generator must
+    # not depend on JSON-constrained response mode, so the adapter-level
+    # JSON retry budget is INERT for whole-chapter line calls — the adapter
+    # returns each attempt's raw text once, and the generation layer
+    # (WholeChapterRetryPolicy) is the single retry owner. Total model calls
+    # stay exactly max_attempts(3), never max_attempts × adapter budget.
+    # (Replaces the retired A2 expectation that the adapter would re-raise
+    # EmptyResponseError/TruncatedJSONError into the generation loop.)
     from pact_v4.phase2.generation import WholeChapterRetryPolicy
     from pact_v4.runtime.json_resilience import JsonRetryPolicy
 
     cfg = _whole_chapter_cfg(tmp_path)
-    adapter_calls_per_attempt = JsonRetryPolicy().max_retries + 1  # 3
-    total = WholeChapterRetryPolicy().max_attempts * adapter_calls_per_attempt
+    total = WholeChapterRetryPolicy().max_attempts
     caller, backend = _scripted_model_caller(
-        *([bad_output] * total), adapter_max_retries=JsonRetryPolicy().max_retries,
+        *["{not a line body"] * total,
+        adapter_max_retries=JsonRetryPolicy().max_retries,
     )
     result = _run_whole_chapter(cfg, model_caller=caller)
 
@@ -1304,6 +1319,8 @@ def test_whole_chapter_adapter_budget_exhaustion_is_classified_not_crash(
     assert result.halted_early is True
     assert "whole_chapter generation incomplete" in (result.halt_reason or "")
     assert len(backend.requests) == total
+    # No response_schema was requested on any whole-chapter call.
+    assert all(r.response_schema is None for r in backend.requests)
     assert not (cfg.out_dir / "translations_raw.json").exists()
     journal = _whole_chapter_journal(cfg)
     assert journal[0]["outcome"] == "incomplete_generation"
@@ -1409,7 +1426,7 @@ def test_whole_chapter_resume_validation_failure_closes_resources(tmp_path):
     runtime = _CloseTrackingRuntime()
     progress = _CloseTrackingProgress()
     usage = _CloseTrackingUsageWriter()
-    caller = StubModelCaller()
+    caller = _LineStubModelCaller()
     with pytest.raises(ValueError, match="Data loss.*generation_outcomes.json.*missing"):
         run_chapter_strict(
             cfg, runtime=runtime, model_caller=caller,
@@ -1433,7 +1450,7 @@ def test_whole_chapter_success_closes_resources(tmp_path):
     usage = _CloseTrackingUsageWriter()
     result = run_chapter_strict(
         cfg, runtime=runtime, model_caller=_LifecycleAwareModelCaller(
-            _make_router(), StubModelCaller()
+            _make_router(), _LineStubModelCaller()
         ),
         qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
         qwen_audit_evaluator=StubQwenAudit(), gemma_audit_evaluator=StubGemmaAudit(),
@@ -1468,7 +1485,7 @@ def test_whole_chapter_pre_dispatch_source_failure_closes_resources(tmp_path):
     usage = _CloseTrackingUsageWriter()
     with pytest.raises(ValueError, match="no source blocks parsed"):
         run_chapter_strict(
-            cfg, runtime=runtime, model_caller=StubModelCaller(),
+            cfg, runtime=runtime, model_caller=_LineStubModelCaller(),
             qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
             qwen_audit_evaluator=StubQwenAudit(), gemma_audit_evaluator=StubGemmaAudit(),
             progress=progress, usage_writer=usage,
@@ -1502,7 +1519,7 @@ def test_whole_chapter_pre_dispatch_planner_failure_closes_resources(tmp_path):
         with pytest.raises(ValueError, match="planner returned no chunks"):
             run_chapter_strict(
                 _whole_chapter_cfg(tmp_path), runtime=runtime,
-                model_caller=StubModelCaller(),
+                model_caller=_LineStubModelCaller(),
                 qwen_evaluator=StubQwen(), gemma_selector=StubGemma(),
                 qwen_audit_evaluator=StubQwenAudit(),
                 gemma_audit_evaluator=StubGemmaAudit(),
@@ -1710,7 +1727,7 @@ def test_whole_chapter_resume_does_not_depend_on_chunk_plan(tmp_path):
 
     (cfg.out_dir / "chunk_plan.json").unlink()
 
-    caller2 = StubModelCaller()
+    caller2 = _LineStubModelCaller()
     resumed = _run_whole_chapter(cfg, model_caller=caller2)
     assert len(caller2.calls) == 0
     assert resumed.resumed_from_index == 1
@@ -1722,13 +1739,53 @@ def test_whole_chapter_resume_does_not_depend_on_chunk_plan(tmp_path):
     assert json.loads(pid_map_path.read_text(encoding="utf-8"))["pid_count"] == 24
 
 
+def test_whole_chapter_attempt_raw_file_preserves_exact_line_response(tmp_path):
+    # translator-line-output artifact contract: the per-attempt diagnostic
+    # file keeps the EXACT wire text (line protocol, not normalized JSON),
+    # while translations_raw.json remains a JSON PID-to-text map.
+    cfg = _make_cfg(tmp_path, n_paragraphs=24)
+    cfg = type(cfg)(
+        chapter_id=cfg.chapter_id, chapter_html_path=cfg.chapter_html_path,
+        memory_dir=cfg.memory_dir, out_dir=cfg.out_dir, backend=cfg.backend,
+        whole_chapter=True,
+    )
+    caller = _LineStubModelCaller()
+    result = _run_whole_chapter(cfg, model_caller=caller)
+    assert result.selected_count == 1
+    assert len(caller.calls) == 1
+
+    from tests.pact_v4.pipeline.test_v4_phase12_strict_runner import _build_artifacts
+    _, snapshot, _, _ = _build_artifacts(cfg)
+    # Recompute the exact wire text from the recorded bundle (same rule as
+    # the stub, including digit carry-over from source text).
+    bundle = caller.calls[0]
+    expected = []
+    for index, (pid, text) in enumerate(bundle.owned_source, start=1):
+        digits = "".join(ch for ch in text if ch.isdigit())
+        digit_part = f" ({digits})" if digits else ""
+        expected.append(f"{pid}: Перевод номер{index}{digit_part}")
+    wire = "\n".join(expected)
+    # Exact wire text on disk (attempt 0 -> whole_chapter_attempt0_raw.txt).
+    raw_text = (cfg.out_dir / "whole_chapter_attempt0_raw.txt").read_text(
+        encoding="utf-8"
+    )
+    assert raw_text == wire
+    # translations_raw.json is still a JSON object mapping PID -> Russian text.
+    raw_map = json.loads(
+        (cfg.out_dir / "translations_raw.json").read_text(encoding="utf-8")
+    )
+    assert isinstance(raw_map, dict)
+    assert set(raw_map) == set(snapshot.pids)
+    assert all(isinstance(v, str) and v.strip() for v in raw_map.values())
+
+
 # ---------------------------------------------------------------------------
 # V4.1 GEN-REASONING: whole-chapter generation reasoning artifacts
 # ---------------------------------------------------------------------------
 
 
-class _ReasoningStubCaller(StubModelCaller):
-    """StubModelCaller that also reports per-call reasoning text."""
+class _ReasoningStubCaller(_LineStubModelCaller):
+    """_LineStubModelCaller that also reports per-call reasoning text."""
 
     def __init__(self, reasoning: str = "gen-reasoning-diagnostics") -> None:
         super().__init__()
@@ -1736,7 +1793,7 @@ class _ReasoningStubCaller(StubModelCaller):
 
 
 class _TruncatedThenGoodReasoningCaller:
-    """First attempt returns truncated JSON (with reasoning), then success."""
+    """First attempt returns a truncated line body (with reasoning), then success."""
 
     def __init__(self, good: str) -> None:
         self.good = good
@@ -1802,10 +1859,7 @@ def test_whole_chapter_reasoning_truncated_retry_also_on_disk(tmp_path):
     # recoverable; attempt 0's reasoning lives in whole_chapter_reasoning.txt.
     cfg = _whole_chapter_reasoning_cfg(tmp_path)
     _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
-    good = json.dumps(
-        {pid: f"Перевод {pid}" for pid in snapshot.pids},
-        ensure_ascii=False,
-    )
+    good = "\n".join(f"{pid}: Перевод {pid}" for pid in snapshot.pids)
     caller = _TruncatedThenGoodReasoningCaller(good)
     result = _run_whole_chapter(cfg, model_caller=caller)
     assert result.selected_count == 1
@@ -1835,7 +1889,7 @@ def test_whole_chapter_no_reasoning_writes_no_artifact(tmp_path):
     # and the generation record stays byte-identical to the pre-GEN-REASONING
     # shape (no marker key) — reasoning must not change cache/identity.
     cfg = _whole_chapter_reasoning_cfg(tmp_path)
-    result = _run_whole_chapter(cfg)  # plain StubModelCaller: no last_reasoning
+    result = _run_whole_chapter(cfg)  # plain _LineStubModelCaller: no last_reasoning
     assert result.selected_count == 1
 
     assert not (cfg.out_dir / "whole_chapter_reasoning.txt").exists()
@@ -1848,7 +1902,7 @@ def test_whole_chapter_no_reasoning_writes_no_artifact(tmp_path):
 
 
 class _LiveStreamingReasoningCaller:
-    """StubModelCaller that supports the GEN-STREAM live reasoning sink.
+    """_LineStubModelCaller that supports the GEN-STREAM live reasoning sink.
 
     Mirrors the production ``BackendModelCaller.set_reasoning_chunk_sink``
     hook: the generation layer installs a per-attempt writer BEFORE the call,
@@ -1896,10 +1950,7 @@ def test_whole_chapter_reasoning_live_file_grows_during_generation(tmp_path):
     # flush is the final content, no duplication.
     cfg = _whole_chapter_reasoning_cfg_with_reasoning(tmp_path, reasoning=1)
     _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
-    good = json.dumps(
-        {pid: f"Перевод {pid}" for pid in snapshot.pids},
-        ensure_ascii=False,
-    )
+    good = "\n".join(f"{pid}: Перевод {pid}" for pid in snapshot.pids)
     caller = _LiveStreamingReasoningCaller(
         good, reasonings=["полный текст размышлений за главу"]
     )
@@ -1935,10 +1986,7 @@ def test_whole_chapter_reasoning_no_live_file_when_reasoning_off(tmp_path):
     # write still happens when reasoning text exists.
     cfg = _whole_chapter_reasoning_cfg_with_reasoning(tmp_path, reasoning=0)
     _, snapshot, chunk_plan, _ = _build_artifacts(cfg)
-    good = json.dumps(
-        {pid: f"Перевод {pid}" for pid in snapshot.pids},
-        ensure_ascii=False,
-    )
+    good = "\n".join(f"{pid}: Перевод {pid}" for pid in snapshot.pids)
     caller = _LiveStreamingReasoningCaller(good, reasonings=["полный текст размышлений"])
     result = _run_whole_chapter(cfg, model_caller=caller)
     assert result.selected_count == 1
