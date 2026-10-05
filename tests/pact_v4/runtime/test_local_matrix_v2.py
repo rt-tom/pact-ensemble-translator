@@ -486,7 +486,7 @@ def test_production_aliases_shape():
         "-b", "2048", "-ub", "1024", "-ctk", "q8_0", "-ctv", "q4_0",
         "-t", "6", "-tb", "12", "--load-mode", "mmap",
         "--reasoning", "on", "--no-reasoning-preserve",
-        "--reasoning-budget-enable", "--reasoning-effort", "xhigh",
+        "--reasoning-budget-enable", "--reasoning-effort", "low",
         "--reasoning-budget", "8192", "-np", "1", "-fa", "on",
         "--jinja", "--cache-ram", "0", "--ctx-checkpoints", "0",
     ]  # qwen38-gemma31-profile-refresh: embedded MTP, no external draft, no -dev/--device
@@ -498,12 +498,40 @@ def test_production_aliases_shape():
     assert "--no-reasoning-preserve" in args
     assert args[args.index("--spec-draft-n-max") + 1] == "2"
     assert args[args.index("--spec-draft-p-min") + 1] == "0.5"
-    assert args[args.index("--reasoning-effort") + 1] == "xhigh"  # quoted xhigh
+    assert args[args.index("--reasoning-effort") + 1] == "low"  # quoted low (qwen38-reasoning-effort-low)
     # Existing models gain --reasoning-budget-enable, keep budgets.
     for alias in ("gemma", "qwen"):
         assert "--reasoning-budget-enable" in local[alias].server_args
     assert local["gemma"].reasoning_budget == 2048
     assert local["qwen"].reasoning_budget == 8192
+
+
+def test_qwen38_reasoning_effort_low_preserves_budgets():
+    """qwen38-reasoning-effort-low: exactly one ``--reasoning-effort low``.
+
+    Proves the effort value changed ``xhigh`` -> ``low`` with no duplicate
+    flag, while the numeric contract is unchanged: base 8192,
+    ``qwen_audit``/``entity_extractor`` effective 10192, zero-delta
+    reviewer roles 8192, ``formatting`` override 0. Ordinary ``qwen`` and
+    Gemma profiles carry no effort flag and keep their budgets.
+    """
+    reg = load_providers_registry(Path("configs/providers.yaml"))
+    local = reg.providers["local"]
+    args = list(local["qwen38"].server_args)
+    assert args.count("--reasoning-effort") == 1
+    assert args[args.index("--reasoning-effort") + 1] == "low"
+    assert "xhigh" not in args
+    assert local["qwen38"].reasoning_budget == 8192
+    assert args[args.index("--reasoning-budget") + 1] == "8192"
+    pair = build_resolved_pair_from_registry(reg, "gemma31", "qwen38")
+    assert pair.effective_reasoning_budget("qwen_audit") == 10192
+    assert pair.effective_reasoning_budget("entity_extractor") == 10192
+    assert pair.effective_reasoning_budget("fidelity_reviewer") == 8192
+    assert pair.effective_reasoning_budget("formatting") == 0
+    assert local["qwen"].reasoning_budget == 8192
+    assert "--reasoning-effort" not in local["qwen"].server_args
+    assert local["gemma31"].reasoning_budget == 2000
+    assert local["gemma"].reasoning_budget == 2048
 
 
 def test_gemma31_qat_mtp_addendum_b_profile():

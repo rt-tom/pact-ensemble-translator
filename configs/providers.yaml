@@ -17,7 +17,7 @@
 #   generator         translator  74048     gemma 2048 / gemma31 2000       gemma 0.2/seed7 | gemma31 1.0/0.95/64/0.0/1.0  4048 on gemma (2048+2000)
 #   repair            translator  18432*    same as generator               same                                             2000 on gemma31 (2000+0)
 #   gemma_audit       translator  6144      same                            same                                             2000
-#   formatting        reviewer    16192*    qwen 8192 / qwen38 8192+xhigh    qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           0 via reasoning_budget_override (explicit exception to base+delta)
+#   formatting        reviewer    16192*    qwen 8192 / qwen38 8192+low      qwen 0.0 | qwen38 0.2/0.95/20/0.0/0.0           0 via reasoning_budget_override (explicit exception to base+delta)
 #   qwen_audit        reviewer    22192*    same                            same                                             10192 (8192+2000)
 #   fidelity_reviewer reviewer    24576*    same                            same                                             8192
 #   russian_selector  reviewer    9216      same                            same                                             8192
@@ -104,7 +104,7 @@ providers:
         model_key: qwen38
         model_path: C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0.gguf
         model_name: Qwen3.8-27B-Q4_0.gguf
-        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "2", --spec-draft-p-min, "0.5", -ngl, "99", -c, "44000", -b, "2048", -ub, "1024", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --no-reasoning-preserve, --reasoning-budget-enable, --reasoning-effort, "xhigh", --reasoning-budget, "8192", -np, "1", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
+        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "2", --spec-draft-p-min, "0.5", -ngl, "99", -c, "44000", -b, "2048", -ub, "1024", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --no-reasoning-preserve, --reasoning-budget-enable, --reasoning-effort, "low", --reasoning-budget, "8192", -np, "1", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 8192
         request: {temperature: 0.2, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0}
   openai:
