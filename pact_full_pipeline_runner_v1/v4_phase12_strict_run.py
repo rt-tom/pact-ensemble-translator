@@ -92,7 +92,7 @@ QWEN_PATH = LLAMA_ROOT / "models" / "Qwen3.6-35B-A3B-MTP" / "Qwen3.6-35B-A3B-UD-
 CONTEXT_SIZE = 32768
 GEMMA_CONTEXT_SIZE = 49152
 GEMMA_SERVER_ARGS = [
-    "-ngl", "99",
+    "-ngl", "all",
     "-ncmoe", "18",
     "--load-mode", "mmap",
     "--reasoning-budget", "2048",
@@ -1053,8 +1053,9 @@ def _validate_b3_qwen38_reviewer(rev_args: list, rev_path: Any, rev_name: Any) -
 
     Accepts ONLY the approved qwen38 contract: the exact approved Q4_0
     main-model path/name, ``--spec-type draft-mtp`` with the embedded-MTP
-    spec (``--spec-draft-n-max 2``, ``--spec-draft-p-min 0.5``), no external
-    draft flags (``-md``, ``--spec-draft-ngl``, ``--spec-draft-device``) and
+    spec (``--spec-draft-n-max 2``, ``--spec-draft-p-min 0.5``), exactly one
+    ``-ngl all`` and exactly one ``--spec-draft-ngl all`` (full GPU-layer
+    offload), no external draft flags (``-md``, ``--spec-draft-device``) and
     no lifecycle-duplicated device flags (``-dev``/``--device``),
     ``--no-reasoning-preserve``, ``--reasoning-budget >= 8192`` (assessed on
     the ACTUAL qwen_audit role-effective launch args, e.g. 10192), and
@@ -1101,7 +1102,17 @@ def _validate_b3_qwen38_reviewer(rev_args: list, rev_path: Any, rev_name: Any) -
             f"--spec-draft-p-min {_B3_QWEN38_P_MIN} (exactly once; "
             f"got {_occurrences('--spec-draft-p-min')} occurrence(s))"
         )
-    for _external in ("-md", "--spec-draft-ngl", "--spec-draft-device"):
+    if _single_value("-ngl") != "all":
+        problems.append(
+            f"-ngl all (exactly once; "
+            f"got {_occurrences('-ngl')} occurrence(s))"
+        )
+    if _single_value("--spec-draft-ngl") != "all":
+        problems.append(
+            "--spec-draft-ngl all (exactly once; "
+            f"got {_occurrences('--spec-draft-ngl')} occurrence(s))"
+        )
+    for _external in ("-md", "--spec-draft-device"):
         if _external in rev_args:
             problems.append(
                 f"{_external} must be absent (embedded MTP has no external draft)"

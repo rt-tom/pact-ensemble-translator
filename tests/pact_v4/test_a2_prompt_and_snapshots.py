@@ -209,7 +209,7 @@ def test_prompt_cache_identity_changes_with_version_and_instructions():
 def test_gemma_server_args_match_plan_34():
     args = cli.GEMMA_SERVER_ARGS
     assert args == [
-        "-ngl", "99",
+        "-ngl", "all",
         "-ncmoe", "18",
         "--load-mode", "mmap",
         "--reasoning-budget", "2048",

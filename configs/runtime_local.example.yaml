@@ -22,7 +22,7 @@ model_names:
 server_args:
   gemma:
     - -ngl
-    - "99"
+    - all
     - -ncmoe
     - "18"
     - --load-mode

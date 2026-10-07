@@ -83,7 +83,7 @@ providers:
         model_key: gemma
         model_path: C:/llama-cpp/models/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
         model_name: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
-        server_args: [-ngl, "99", -ncmoe, "18", --load-mode, mmap, --reasoning-budget, "2048", --reasoning-budget-enable, -np, "1", -c, "49152", -fa, "on", --jinja, -ctk, q8_0, -ctv, q4_0, --cache-ram, "0", --ctx-checkpoints, "0"]
+        server_args: [-ngl, all, -ncmoe, "18", --load-mode, mmap, --reasoning-budget, "2048", --reasoning-budget-enable, -np, "1", -c, "49152", -fa, "on", --jinja, -ctk, q8_0, -ctv, q4_0, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 2048
         request: {temperature: 0.2, seed: 7}
       qwen:
@@ -104,7 +104,7 @@ providers:
         model_key: qwen38
         model_path: C:/llama-cpp/models/Qwen3.8-27B/Qwen3.8-27B-Q4_0.gguf
         model_name: Qwen3.8-27B-Q4_0.gguf
-        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "2", --spec-draft-p-min, "0.5", -ngl, "99", -c, "44000", -b, "2048", -ub, "1024", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --no-reasoning-preserve, --reasoning-budget-enable, --reasoning-effort, "low", --reasoning-budget, "8192", -np, "1", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
+        server_args: [--spec-type, draft-mtp, --spec-draft-n-max, "2", --spec-draft-p-min, "0.5", --spec-draft-ngl, all, -ngl, all, -c, "44000", -b, "2048", -ub, "1024", -ctk, q8_0, -ctv, q4_0, -t, "6", -tb, "12", --load-mode, mmap, --reasoning, "on", --no-reasoning-preserve, --reasoning-budget-enable, --reasoning-effort, "low", --reasoning-budget, "8192", -np, "1", -fa, "on", --jinja, --cache-ram, "0", --ctx-checkpoints, "0"]
         reasoning_budget: 8192
         request: {temperature: 0.2, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0}
   openai:

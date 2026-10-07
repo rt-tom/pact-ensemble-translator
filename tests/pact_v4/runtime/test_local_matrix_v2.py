@@ -482,16 +482,20 @@ def test_production_aliases_shape():
     args = list(qwen38.server_args)
     assert args == [
         "--spec-type", "draft-mtp", "--spec-draft-n-max", "2",
-        "--spec-draft-p-min", "0.5", "-ngl", "99", "-c", "44000",
+        "--spec-draft-p-min", "0.5", "--spec-draft-ngl", "all",
+        "-ngl", "all", "-c", "44000",
         "-b", "2048", "-ub", "1024", "-ctk", "q8_0", "-ctv", "q4_0",
         "-t", "6", "-tb", "12", "--load-mode", "mmap",
         "--reasoning", "on", "--no-reasoning-preserve",
         "--reasoning-budget-enable", "--reasoning-effort", "low",
         "--reasoning-budget", "8192", "-np", "1", "-fa", "on",
         "--jinja", "--cache-ram", "0", "--ctx-checkpoints", "0",
-    ]  # qwen38-gemma31-profile-refresh: embedded MTP, no external draft, no -dev/--device
+    ]  # local-model-gpu-offload-all: full GPU-layer offload (-ngl all + --spec-draft-ngl all)
     assert "-md" not in args  # embedded MTP: no external draft file
-    assert "--spec-draft-ngl" not in args
+    assert args.count("-ngl") == 1
+    assert args[args.index("-ngl") + 1] == "all"
+    assert args.count("--spec-draft-ngl") == 1
+    assert args[args.index("--spec-draft-ngl") + 1] == "all"
     assert "--spec-draft-device" not in args
     assert "-dev" not in args
     assert "--device" not in args
@@ -1581,11 +1585,15 @@ def test_b3_rejects_qwen38_added_external_draft():
 
 
 def test_b3_rejects_qwen38_spec_draft_device_flags():
-    """External-draft transport flags fail on the embedded-MTP profile."""
+    """External-draft device flag fails on the embedded-MTP profile.
+
+    local-model-gpu-offload-all: ``--spec-draft-ngl all`` is now a required
+    offload flag (covered by the offload negative matrix below); only the
+    unapproved external-draft device transport is asserted here."""
     import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
 
     backend = _tampered_qwen38_backend(
-        lambda a: a + ["--spec-draft-ngl", "99", "--spec-draft-device", "SYCL0"]
+        lambda a: a + ["--spec-draft-device", "SYCL0"]
     )
     with pytest.raises(ValueError, match="spec-draft"):
         cli._validate_b3_qwen_profile(_b3_args(), backend)
@@ -1807,3 +1815,182 @@ def test_b3_rejects_unassessed_reviewer_model():
     backend = apply_resolved_pair_to_config(backend, odd_pair)
     with pytest.raises(ValueError, match="unassessed|assessed B3 capability"):
         cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+# ---------------------------------------------------------------------------
+# 13. local-model-gpu-offload-all: full GPU-layer offload (High risk)
+#
+# Runtime configs use ``-ngl all`` everywhere main offload was ``99`` and
+# every explicitly MTP-enabled profile carries exactly one
+# ``--spec-draft-ngl all``. The Qwen38 B3 gate requires exactly one of each
+# with the exact value ``all``; every other B3 check is preserved.
+# ---------------------------------------------------------------------------
+
+def _offload_flag_value(args: list, flag: str):
+    idx = args.index(flag)
+    return args[idx + 1]
+
+
+def test_gpu_offload_runtime_configs_full_offload():
+    """All three runtime config files use full GPU-layer offload."""
+    import yaml
+
+    root = Path("configs")
+    reg = load_providers_registry(root / "providers.yaml")
+    local = reg.providers["local"]
+    # No configured -ngl 99 remains in the registry.
+    for alias, spec in local.items():
+        args = [str(v) for v in spec.server_args]
+        assert "99" not in [
+            args[i + 1] for i, v in enumerate(args[:-1]) if v == "-ngl"
+        ], f"{alias} still pins -ngl 99"
+    # gemma (no active MTP selector): -ngl all, no draft-layer flag.
+    gemma_args = [str(v) for v in local["gemma"].server_args]
+    assert gemma_args.count("-ngl") == 1
+    assert _offload_flag_value(gemma_args, "-ngl") == "all"
+    assert "--spec-type" not in gemma_args
+    assert "--spec-draft-ngl" not in gemma_args
+    # qwen38 (explicit draft-mtp): exactly one of each, both all.
+    qwen38_args = [str(v) for v in local["qwen38"].server_args]
+    assert qwen38_args.count("-ngl") == 1
+    assert _offload_flag_value(qwen38_args, "-ngl") == "all"
+    assert qwen38_args.count("--spec-draft-ngl") == 1
+    assert _offload_flag_value(qwen38_args, "--spec-draft-ngl") == "all"
+    # gemma31 already used all: preserved with its other draft args.
+    gemma31_args = [str(v) for v in local["gemma31"].server_args]
+    assert gemma31_args.count("--spec-draft-ngl") == 1
+    assert _offload_flag_value(gemma31_args, "--spec-draft-ngl") == "all"
+    # Ordinary qwen has no active MTP selector: unchanged, no draft flag.
+    qwen_args = [str(v) for v in local["qwen"].server_args]
+    assert "--spec-type" not in qwen_args
+    assert "--spec-draft-ngl" not in qwen_args
+    # runtime_local example: gemma -ngl all, no draft flag (no MTP selector).
+    local_example = yaml.safe_load(
+        (root / "runtime_local.example.yaml").read_text(encoding="utf-8")
+    )
+    rl_gemma = [str(v) for v in local_example["server_args"]["gemma"]]
+    assert rl_gemma.count("-ngl") == 1
+    assert _offload_flag_value(rl_gemma, "-ngl") == "all"
+    assert "--spec-draft-ngl" not in rl_gemma
+    rl_qwen = [str(v) for v in local_example["server_args"]["qwen"]]
+    assert "--spec-draft-ngl" not in rl_qwen
+    # runtime_composite example: local gemma explicitly enables draft-mtp,
+    # so it carries exactly one draft offload flag set to all.
+    composite = yaml.safe_load(
+        (root / "runtime_composite.example.yaml").read_text(encoding="utf-8")
+    )
+    comp_gemma = [
+        str(v)
+        for v in composite["backends"]["local"]["server_args"]["gemma"]
+    ]
+    assert "--spec-type" in comp_gemma
+    assert comp_gemma[comp_gemma.index("--spec-type") + 1] == "draft-mtp"
+    assert comp_gemma.count("-ngl") == 1
+    assert _offload_flag_value(comp_gemma, "-ngl") == "all"
+    assert comp_gemma.count("--spec-draft-ngl") == 1
+    assert _offload_flag_value(comp_gemma, "--spec-draft-ngl") == "all"
+
+
+def test_b3_accepts_qwen38_full_offload_profile():
+    """Approved qwen38 profile (both flags all) passes the B3 gate."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    _, backend = _b3_pair_backend("gemma31/qwen38")
+    args = list(backend.server_args["qwen38"])
+    assert args.count("-ngl") == 1
+    assert args[args.index("-ngl") + 1] == "all"
+    assert args.count("--spec-draft-ngl") == 1
+    assert args[args.index("--spec-draft-ngl") + 1] == "all"
+    cli._validate_b3_qwen_profile(_b3_args(), backend)  # must not raise
+
+
+def _drop_flag_pair(args: list, flag: str) -> list:
+    out = list(args)
+    i = out.index(flag)
+    del out[i:i + 2]
+    return out
+
+
+@pytest.mark.parametrize("flag", ["-ngl", "--spec-draft-ngl"])
+def test_b3_rejects_qwen38_missing_offload_flag(flag):
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _tampered_qwen38_backend(lambda a, f=flag: _drop_flag_pair(a, f))
+    with pytest.raises(ValueError, match="ngl"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+@pytest.mark.parametrize("flag", ["-ngl", "--spec-draft-ngl"])
+def test_b3_rejects_qwen38_duplicate_offload_flag(flag):
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _tampered_qwen38_backend(
+        lambda a, f=flag: a + [f, "all"]
+    )
+    with pytest.raises(ValueError, match="ngl"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+@pytest.mark.parametrize("flag", ["-ngl", "--spec-draft-ngl"])
+def test_b3_rejects_qwen38_valueless_offload_flag(flag):
+    """A trailing offload flag with no value fails closed."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    def _strip_value(a, f=flag):
+        out = list(a)
+        del out[out.index(f) + 1]
+        return out
+
+    backend = _tampered_qwen38_backend(_strip_value)
+    with pytest.raises(ValueError, match="ngl"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("-ngl", "99"),
+    ("-ngl", "0"),
+    ("-ngl", "All"),
+    ("-ngl", "ALL"),
+    ("--spec-draft-ngl", "99"),
+    ("--spec-draft-ngl", "0"),
+    ("--spec-draft-ngl", "All"),
+    ("--spec-draft-ngl", "ALL"),
+])
+def test_b3_rejects_qwen38_wrong_offload_value(flag, value):
+    """Only the exact string all is accepted for either offload flag."""
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    backend = _tampered_qwen38_backend(
+        lambda a, f=flag, v=value: _swap(list(a), f, v)
+    )
+    with pytest.raises(ValueError, match="ngl"):
+        cli._validate_b3_qwen_profile(_b3_args(), backend)
+
+
+def test_gpu_offload_executable_gemma_profiles():
+    """Executable Gemma profiles use full GPU-layer offload (static only).
+
+    local-model-gpu-offload-all tasks 1.4/1.5: the default
+    ``GEMMA_SERVER_ARGS`` profile (no MTP) carries exactly one ``-ngl all``
+    and no draft-layer flag; the MTP lifecycle benchmark
+    ``GEMMA_COMMON_ARGS`` profile carries exactly one ``-ngl all`` plus
+    exactly one ``--spec-draft-ngl all``. This test only reads the declared
+    argument lists; it never launches a server or benchmark.
+    """
+    import pact_full_pipeline_runner_v1.v4_model_lifecycle_bench as bench
+    import pact_full_pipeline_runner_v1.v4_phase12_strict_run as cli
+
+    default_args = list(cli.GEMMA_SERVER_ARGS)
+    assert default_args.count("-ngl") == 1
+    assert _offload_flag_value(default_args, "-ngl") == "all"
+    assert "--spec-type" not in default_args
+    assert "--spec-draft-ngl" not in default_args
+    assert "--model-draft" not in default_args
+
+    mtp_args = list(bench.GEMMA_COMMON_ARGS)
+    assert mtp_args.count("--spec-type") == 1
+    assert mtp_args[mtp_args.index("--spec-type") + 1] == "draft-mtp"
+    assert mtp_args.count("-ngl") == 1
+    assert _offload_flag_value(mtp_args, "-ngl") == "all"
+    assert mtp_args.count("--spec-draft-ngl") == 1
+    assert _offload_flag_value(mtp_args, "--spec-draft-ngl") == "all"
