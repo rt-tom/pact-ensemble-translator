@@ -19,4 +19,4 @@
 
 ## Rollout boundary
 
-- [ ] 3.1 Merge/deploy only after separate owner authorization and successful approval, implementation, tests, and review. Do not start a model server or pipeline.
+- [x] 3.1 Direct fast-forward push to `main` and sync `D:\pact\pact_translator_v4_1` after owner authorization and successful approval, implementation, tests, and review. No model server or pipeline started.
